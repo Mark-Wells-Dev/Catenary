@@ -27,7 +27,7 @@ Catenary uses a mix of unit tests and integration tests.
 
 ## Local Development & Testing
 
-To test your changes end-to-end with Claude Code or Gemini CLI without publishing to a marketplace:
+To test your changes end-to-end with Claude Code without publishing to a marketplace:
 
 ### 1. Build Catenary
 
@@ -41,10 +41,10 @@ The binary will be located at `target/release/catenary`.
 
 ### 2. Install Plugin/Extension
 
-Catenary ships plugin/extension manifests for both Claude Code and Gemini CLI.
-These bundle hooks for editing enforcement, command filtering, and agent
-lifecycle tracking, plus an MCP connection for session management and
-workspace root discovery.
+Catenary ships plugin manifests for Claude Code and Antigravity CLI. These
+bundle hooks for editing enforcement, command filtering, and agent lifecycle
+tracking, plus an MCP connection for session management and workspace root
+discovery.
 
 #### Claude Code
 
@@ -59,18 +59,6 @@ The plugin includes:
 - `PreToolUse` hook — editing state enforcement and command filtering
 - Lifecycle hooks — session start/end, turn tracking, agent stop
 
-#### Gemini CLI
-
-```bash
-# Link the local extension for development
-gemini extensions link /path/to/Catenary
-```
-
-The extension includes:
-- MCP connection for session management and root discovery
-- `BeforeTool` hook — editing state enforcement and command filtering
-- Lifecycle hooks — session start/end, turn tracking, agent stop
-
 ### 3. Iterate
 
 After making changes, rebuild and reinstall:
@@ -80,19 +68,18 @@ cargo install --path .
 ```
 
 This places the updated binary at `~/.cargo/bin/catenary`. Restart your
-Claude Code or Gemini CLI session to pick up the new binary.
+Claude Code session to pick up the new binary.
 
-If you change hook definitions in `plugins/catenary/hooks/hooks.json` or
-`hooks/hooks.json`, run `catenary doctor` to check whether the installed
-hooks match the new definitions:
+If you change hook definitions in `plugins/catenary/hooks/hooks.json`, run
+`catenary doctor` to check whether the installed hooks match the new
+definitions:
 
 ```
 Hooks:
   Claude Code 1.3.6 (directory) ✗ stale hooks (reinstall: claude plugin uninstall catenary@catenary && claude plugin install catenary@catenary)
-  Gemini CLI  1.3.6 (linked)    ✓ hooks match
 ```
 
-Reinstall the plugin/extension as indicated to pick up the new hooks.
+Reinstall the plugin as indicated to pick up the new hooks.
 
 ## Licensing and Copyright
 

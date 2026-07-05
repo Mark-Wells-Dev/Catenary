@@ -13,8 +13,6 @@
 //!
 //! [`encode_cwd`] flattens an absolute path into a single filesystem-safe
 //! directory-name component, used as the per-root shard key in the firehose tree.
-//! [`discontinuity_mark_dir`] / [`discontinuity_mark_file`] locate the
-//! per-session Gemini `PreCompress` discontinuity mark under [`runtime_dir`].
 
 use std::path::{Path, PathBuf};
 
@@ -76,10 +74,9 @@ pub fn cache_dir() -> PathBuf {
 /// Flatten a string into one filesystem-safe path component.
 ///
 /// Every character that is not ASCII alphanumeric (path separators, `.`, `_`,
-/// spaces, …) becomes `-`. Shared by [`encode_cwd`] (the firehose shard key)
-/// and [`discontinuity_mark_file`] (the per-session mark name). The mapping is
-/// stable but intentionally lossy — distinct inputs can collide (e.g. `a/b` and
-/// `a.b`) — which is acceptable for the regenerable ephemera both callers key.
+/// spaces, …) becomes `-`. Used by [`encode_cwd`] (the firehose shard key). The
+/// mapping is stable but intentionally lossy — distinct inputs can collide (e.g.
+/// `a/b` and `a.b`) — which is acceptable for the regenerable ephemera it keys.
 fn flatten_component(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -101,32 +98,6 @@ fn flatten_component(s: &str) -> String {
 #[must_use]
 pub fn encode_cwd(path: &Path) -> String {
     flatten_component(&path.to_string_lossy())
-}
-
-/// Directory holding the per-session Gemini `PreCompress` discontinuity marks.
-///
-/// Co-located with the `state.json` snapshot and the diagnostics receipts under
-/// `runtime_dir()/catenary/`, so it shares that ephemeral, tmpfs-backed,
-/// OS-cleared-on-logout lifecycle. The Gemini `pre-compress` hook writes a marker
-/// here on a real (manual) compaction; the next `before-agent` hook consumes it
-/// to re-inject the teaching payload once (teaching-surface ticket 14). The mark
-/// is regenerable ephemera — a lost mark just means one skipped re-injection, and
-/// no daemon is involved.
-#[must_use]
-pub fn discontinuity_mark_dir() -> PathBuf {
-    runtime_dir().join("catenary").join("marks")
-}
-
-/// The per-session discontinuity-mark filename: the host `session_id` flattened
-/// to a single filesystem-safe component (same rule as [`encode_cwd`]) plus
-/// `.mark`.
-///
-/// The flattening is lossy — matching the firehose shard-key tradeoff — so two
-/// session ids differing only in punctuation could share a mark; realistic host
-/// session ids (UUIDs) never collide, and the mark is regenerable ephemera.
-#[must_use]
-pub fn discontinuity_mark_file(session_id: &str) -> String {
-    format!("{}.mark", flatten_component(session_id))
 }
 
 #[cfg(test)]
@@ -156,31 +127,5 @@ mod tests {
     fn encode_cwd_is_stable() {
         let p = Path::new("/a/b/c");
         assert_eq!(encode_cwd(p), encode_cwd(p));
-    }
-
-    #[test]
-    fn discontinuity_mark_file_flattens_session_id() {
-        // A UUID-shaped session id survives verbatim; unsafe punctuation flattens
-        // to `-` (same rule as the diagnostics receipt store).
-        assert_eq!(
-            discontinuity_mark_file("7da239b1-d3c7-42b7-a7a4-38b4205f576a"),
-            "7da239b1-d3c7-42b7-a7a4-38b4205f576a.mark"
-        );
-        assert_eq!(discontinuity_mark_file("sess/1.2"), "sess-1-2.mark");
-    }
-
-    #[test]
-    fn discontinuity_mark_dir_sits_beside_state_json() {
-        // The mark store shares the `runtime_dir()/catenary/` parent with the
-        // `state.json` snapshot and the diagnostics receipts (same ephemeral
-        // lifecycle).
-        let dir = discontinuity_mark_dir();
-        assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some("marks"));
-        assert_eq!(
-            dir.parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str()),
-            Some("catenary")
-        );
     }
 }

@@ -157,11 +157,6 @@ claude plugin marketplace add TwoWells/Catenary
 claude plugin install catenary@catenary
 ```
 
-**Gemini CLI**
-```bash
-gemini extensions install https://github.com/TwoWells/Catenary
-```
-
 **Antigravity CLI** — copy `plugins/catenary-antigravity/` to
 `.agents/plugins/catenary/` in your workspace.
 
@@ -197,7 +192,7 @@ no SQLite database — a legacy one is drained on startup.)
 
 Full documentation at **[twowells.github.io/Catenary](https://twowells.github.io/Catenary/)**
 
-- **[Installation](https://twowells.github.io/Catenary/stable/installation.html)** — setup for Claude Code, Gemini CLI, and Antigravity CLI
+- **[Installation](https://twowells.github.io/Catenary/stable/installation.html)** — setup for Claude Code and Antigravity CLI
 - **[Configuration](https://twowells.github.io/Catenary/stable/configuration.html)** — language servers, routing, command allowlist
 - **[CLI & Dashboard](https://twowells.github.io/Catenary/stable/cli.html)** — the command surface and TUI dashboard
 

@@ -34,14 +34,6 @@ The plugin registers hooks for editing enforcement, command filtering,
 and agent lifecycle tracking, plus an MCP connection for session
 management and workspace root discovery.
 
-### Gemini CLI (recommended: extension)
-
-```bash
-gemini extensions install https://github.com/TwoWells/Catenary
-```
-
-The extension registers hooks and the MCP connection.
-
 ### OpenCode (plugin)
 
 ```bash
@@ -129,20 +121,6 @@ hooks and its MCP connection for that project.
 See the [Claude Code plugin
 docs](https://code.claude.com/docs/en/discover-plugins) and [settings
 precedence](https://code.claude.com/docs/en/settings).
-
-### Gemini CLI
-
-Disable the extension for the current workspace:
-
-```bash
-gemini extensions disable catenary --scope workspace
-```
-
-`--scope workspace` scopes the change to the current project; omit it (or pass
-`--scope user`) to disable Catenary everywhere. The change takes effect on the
-next CLI restart, and turns off the extension's hooks and its MCP server for
-that workspace. See the [Gemini CLI extension
-reference](https://geminicli.com/docs/extensions/reference/).
 
 ### OpenCode
 

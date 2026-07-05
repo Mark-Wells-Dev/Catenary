@@ -238,10 +238,9 @@ live in host-specific JSON files:
 | Host CLI | Hook file | Events |
 |----------|-----------|--------|
 | Claude Code | `plugins/catenary/hooks/hooks.json` | `SessionStart`, `PreToolUse`, `Stop`, `SubagentStop`, `SessionEnd`, `SubagentStart`, `WorktreeRemove` |
-| Gemini CLI | `hooks/hooks.json` | `SessionStart`, `BeforeTool`, `AfterAgent`, `SessionEnd` |
+| Antigravity CLI | `plugins/catenary-antigravity/hooks.json` | `PreInvocation`, `PreToolUse`, `Stop` |
 
-All hooks fire unconditionally (empty matcher). The `PreToolUse` /
-`BeforeTool` hook handles both editing state enforcement and command
+The `PreToolUse` hook handles both editing state enforcement and command
 filtering in a single invocation.
 
 ### Worktree-root teardown
@@ -260,7 +259,7 @@ crash-safe backstops: the watch is in-memory and dies with the daemon. The
 reap (`remove_contributor` + root re-sync) is identical and idempotent
 across all three paths, so a double-reap is a harmless no-op.
 
-The `--format=claude` / `--format=gemini` flag on each `catenary hook`
+The `--format=claude` / `--format=antigravity` flag on each `catenary hook`
 command selects the output format for the host's expected JSON structure.
 
 ### Diagnostic delivery path

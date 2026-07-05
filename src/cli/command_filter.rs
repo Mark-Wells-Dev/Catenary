@@ -3093,19 +3093,19 @@ mod tests {
     }
 
     #[test]
-    fn format_full_read_edit_template_vars_gemini() {
+    fn format_full_read_edit_template_vars_antigravity() {
         let rules = rules_with_guidance();
         let denial = no_cd_denial("cat");
         let msg = format_denial(
             "cat",
             &rules,
             &denial,
-            Some(crate::cli::HostFormat::Gemini),
+            Some(crate::cli::HostFormat::Antigravity),
             None,
         );
         assert!(
             msg.contains("Hint: Use read_file instead"),
-            "{{READ}} should resolve to read_file for Gemini: {msg}",
+            "{{READ}} should resolve to read_file for Antigravity: {msg}",
         );
     }
 

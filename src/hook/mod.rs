@@ -107,14 +107,14 @@ pub(crate) enum HookRequest {
     /// Editing state enforcement: deny or allow a tool call.
     #[serde(rename = "pre-tool/editing-state")]
     PreTool {
-        /// Host CLI tool name (e.g., "Edit", "Write", `"write_file"`).
+        /// Host CLI tool name (e.g., "Edit", "Write", `"write_to_file"`).
         tool_name: String,
         /// Absolute path to the target file. Used for coverage checks —
         /// edits on files without known LSP coverage are allowed without
         /// entering editing mode.
         #[serde(default)]
         file_path: Option<String>,
-        /// Shell command string for Bash/`run_shell_command` tools.
+        /// Shell command string for Bash/`run_command` tools.
         /// Used during editing mode to allow filesystem-only commands
         /// (`rm`, `cp`, `mv`, etc.) without requiring `done_editing`.
         #[serde(default)]
@@ -122,7 +122,7 @@ pub(crate) enum HookRequest {
         /// Agent ID (empty string for the main agent).
         #[serde(default)]
         agent_id: String,
-        /// Host CLI session ID (Claude Code / Gemini CLI UUID).
+        /// Host CLI session ID (Claude Code UUID).
         #[serde(default)]
         session_id: Option<String>,
         /// Resolved shell-write targets to attribute (ws38 ticket 02,
@@ -145,7 +145,7 @@ pub(crate) enum HookRequest {
         /// Agent ID (empty string for the main agent).
         #[serde(default)]
         agent_id: String,
-        /// Host CLI session ID (Claude Code / Gemini CLI UUID).
+        /// Host CLI session ID (Claude Code UUID).
         #[serde(default)]
         session_id: Option<String>,
     },
@@ -156,7 +156,7 @@ pub(crate) enum HookRequest {
         /// Agent ID (empty string for the main agent).
         #[serde(default)]
         agent_id: String,
-        /// Host CLI session ID (Claude Code / Gemini CLI UUID).
+        /// Host CLI session ID (Claude Code UUID).
         #[serde(default)]
         session_id: Option<String>,
         /// Whether this is a retry (Claude Code `stop_hook_active`).
@@ -182,7 +182,7 @@ pub(crate) enum HookRequest {
             reason = "deserialized from IPC protocol, consumed by serde"
         )]
         agent_id: String,
-        /// Host CLI session ID (Claude Code / Gemini CLI UUID).
+        /// Host CLI session ID (Claude Code UUID).
         #[serde(default)]
         #[allow(
             dead_code,
@@ -203,7 +203,7 @@ pub(crate) enum HookRequest {
     /// Clear stale editing state on session start.
     #[serde(rename = "session-start/clear-editing")]
     SessionStart {
-        /// Host CLI session ID (Claude Code / Gemini CLI UUID).
+        /// Host CLI session ID (Claude Code UUID).
         #[serde(default)]
         #[allow(
             dead_code,
@@ -220,7 +220,7 @@ pub(crate) enum HookRequest {
     /// from the refcount tracker.
     #[serde(rename = "session-end/cleanup")]
     SessionEnd {
-        /// Host CLI session ID (Claude Code / Gemini CLI UUID).
+        /// Host CLI session ID (Claude Code UUID).
         #[serde(default)]
         #[allow(
             dead_code,
@@ -881,8 +881,8 @@ mod tests {
     }
 
     #[test]
-    fn gemini_cli_response_shape() {
-        // AfterAgent hook allow with background drain.
+    fn response_envelope_allow_with_background_drain() {
+        // Stop/AfterAgent hook allow with background drain.
         let env = HookResponseEnvelope {
             result: None,
             system_message: Some("─── background ───\n[err] pylsp crashed".into()),

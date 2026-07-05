@@ -389,63 +389,49 @@ enum HookCommand {
     /// Pre-tool: editing state enforcement (`PreToolUse` / `BeforeTool`).
     #[command(name = "pre-tool")]
     PreTool {
-        /// Output format: "claude", "gemini", or "antigravity".
+        /// Output format: "claude" or "antigravity".
         #[arg(long, value_enum)]
         format: HostFormat,
     },
     /// Post-agent: force `done_editing` before agent finishes (`Stop` / `AfterAgent`).
     #[command(name = "post-agent")]
     PostAgent {
-        /// Output format: "claude", "gemini", or "antigravity".
+        /// Output format: "claude" or "antigravity".
         #[arg(long, value_enum)]
         format: HostFormat,
     },
     /// `SessionStart`: clear stale editing state.
     #[command(name = "session-start")]
     SessionStart {
-        /// Output format: "claude", "gemini", or "antigravity".
+        /// Output format: "claude" or "antigravity".
         #[arg(long, value_enum)]
         format: HostFormat,
     },
     /// `PreInvocation`: first-sighting teaching injection (Antigravity).
     #[command(name = "pre-invocation")]
     PreInvocation {
-        /// Output format: "claude", "gemini", or "antigravity".
-        #[arg(long, value_enum)]
-        format: HostFormat,
-    },
-    /// `PreCompress`: lay a discontinuity mark on a real compaction (Gemini).
-    #[command(name = "pre-compress")]
-    PreCompress {
-        /// Output format: "claude", "gemini", or "antigravity".
-        #[arg(long, value_enum)]
-        format: HostFormat,
-    },
-    /// `BeforeAgent`: re-inject the teaching payload once per discontinuity (Gemini).
-    #[command(name = "before-agent")]
-    BeforeAgent {
-        /// Output format: "claude", "gemini", or "antigravity".
+        /// Output format: "claude" or "antigravity".
         #[arg(long, value_enum)]
         format: HostFormat,
     },
     /// `SessionEnd`: clean up session state (roots, editing).
     #[command(name = "session-end")]
     SessionEnd {
-        /// Output format: "claude", "gemini", or "antigravity".
+        /// Output format: "claude" or "antigravity".
         #[arg(long, value_enum)]
         format: HostFormat,
     },
     /// `SubagentStart`: mount the subagent's worktree as a root.
     #[command(name = "subagent-start")]
     SubagentStart {
-        /// Output format: "claude", "gemini", or "antigravity".
+        /// Output format: "claude" or "antigravity".
         #[arg(long, value_enum)]
         format: HostFormat,
     },
     /// `WorktreeRemove`: tear down the subagent's worktree root.
     #[command(name = "worktree-remove")]
     WorktreeRemove {
-        /// Output format: "claude", "gemini", or "antigravity".
+        /// Output format: "claude" or "antigravity".
         #[arg(long, value_enum)]
         format: HostFormat,
     },
@@ -459,9 +445,11 @@ enum InstallHost {
         /// Source: local path (dev install) or repo identifier (release install).
         source: Option<String>,
     },
-    /// Install the Catenary extension for Gemini CLI.
+    /// Gemini CLI: support withdrawn (decision 030) — prints a withdrawal note
+    /// and installs nothing. The subcommand is kept so the withdrawal is
+    /// announced rather than surfacing as an unknown-host error.
     Gemini {
-        /// Source: local path (dev install) or repo identifier (release install).
+        /// Ignored: retained so `catenary install gemini <source>` still parses.
         source: Option<String>,
     },
     /// Install the Catenary plugin for Antigravity CLI.
@@ -710,7 +698,7 @@ fn main() -> Result<()> {
                     cli::install::run_install_claude(&mut out, source.as_deref(), dry_run)
                 }
                 Some(InstallHost::Gemini { source }) => {
-                    cli::install::run_install_gemini(&mut out, source.as_deref(), dry_run)
+                    cli::install::run_install_gemini_withdrawn(&mut out, source.as_deref())
                 }
                 Some(InstallHost::Antigravity { source }) => {
                     cli::install::run_install_antigravity(&mut out, source.as_deref(), dry_run)
@@ -795,8 +783,6 @@ fn main() -> Result<()> {
                 HookCommand::PostAgent { format } => cli::hooks::run_post_agent(format),
                 HookCommand::SessionStart { format } => cli::hooks::run_session_start(format),
                 HookCommand::PreInvocation { format } => cli::hooks::run_pre_invocation(format),
-                HookCommand::PreCompress { format } => cli::hooks::run_pre_compress(format),
-                HookCommand::BeforeAgent { format } => cli::hooks::run_before_agent(format),
                 HookCommand::SessionEnd { format } => cli::hooks::run_session_end(format),
                 HookCommand::SubagentStart { format } => cli::hooks::run_subagent_start(format),
                 HookCommand::WorktreeRemove { format } => cli::hooks::run_worktree_remove(format),
@@ -2150,8 +2136,6 @@ async fn run_root_command(out: &mut cli::Output, path: PathBuf, method: &str) ->
 fn check_stale_hooks() {
     /// Expected Claude Code hooks, embedded at compile time.
     const CLAUDE_HOOKS_EXPECTED: &str = include_str!("../plugins/catenary/hooks/hooks.json");
-    /// Expected Gemini CLI hooks, embedded at compile time.
-    const GEMINI_HOOKS_EXPECTED: &str = include_str!("../hooks/hooks.json");
     /// Expected Antigravity CLI hooks, embedded at compile time.
     const ANTIGRAVITY_HOOKS_EXPECTED: &str =
         include_str!("../plugins/catenary-antigravity/hooks.json");
@@ -2186,10 +2170,6 @@ fn check_stale_hooks() {
     if let Some(hooks_path) = resolve_claude_hooks_path(&home) {
         check_host("Claude Code", &hooks_path, CLAUDE_HOOKS_EXPECTED);
     }
-
-    // Gemini CLI: hooks at ~/.gemini/hooks/hooks.json
-    let gemini_hooks = home.join(".gemini/hooks/hooks.json");
-    check_host("Gemini CLI", &gemini_hooks, GEMINI_HOOKS_EXPECTED);
 
     // Antigravity CLI: hooks at ~/.antigravity/hooks.json
     let antigravity_hooks = home.join(".antigravity/hooks.json");
@@ -2259,7 +2239,7 @@ mod tests {
     #[test]
     fn test_cli_hook_pre_tool() {
         use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "hook", "pre-tool", "--format=gemini"]);
+        let args = Args::try_parse_from(["catenary", "hook", "pre-tool", "--format=claude"]);
         let args = args.expect("hook pre-tool should parse");
         let Some(Command::Hook { command }) = args.command else {
             unreachable!("expected Hook command");
@@ -2281,7 +2261,7 @@ mod tests {
     #[test]
     fn test_cli_hook_session_start() {
         use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "hook", "session-start", "--format=gemini"]);
+        let args = Args::try_parse_from(["catenary", "hook", "session-start", "--format=claude"]);
         let args = args.expect("hook session-start should parse");
         let Some(Command::Hook { command }) = args.command else {
             unreachable!("expected Hook command");
@@ -2313,38 +2293,6 @@ mod tests {
             command,
             HookCommand::PreInvocation {
                 format: HostFormat::Antigravity
-            }
-        ));
-    }
-
-    #[test]
-    fn test_cli_hook_pre_compress() {
-        use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "hook", "pre-compress", "--format=gemini"]);
-        let args = args.expect("hook pre-compress should parse");
-        let Some(Command::Hook { command }) = args.command else {
-            unreachable!("expected Hook command");
-        };
-        assert!(matches!(
-            command,
-            HookCommand::PreCompress {
-                format: HostFormat::Gemini
-            }
-        ));
-    }
-
-    #[test]
-    fn test_cli_hook_before_agent() {
-        use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "hook", "before-agent", "--format=gemini"]);
-        let args = args.expect("hook before-agent should parse");
-        let Some(Command::Hook { command }) = args.command else {
-            unreachable!("expected Hook command");
-        };
-        assert!(matches!(
-            command,
-            HookCommand::BeforeAgent {
-                format: HostFormat::Gemini
             }
         ));
     }
@@ -3188,6 +3136,9 @@ mod tests {
     #[test]
     fn test_cli_install_gemini() {
         use clap::Parser;
+        // Gemini CLI support is withdrawn (decision 030), but the subcommand is
+        // deliberately retained so `catenary install gemini` announces the
+        // withdrawal instead of erroring as an unknown host.
         let args = Args::try_parse_from(["catenary", "install", "gemini"]);
         let args = args.expect("install gemini should parse");
         assert!(matches!(

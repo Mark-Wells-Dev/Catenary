@@ -170,7 +170,7 @@ pub struct ServerEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ClientInfo {
-    /// Host CLI name (`claude` / `gemini` / `antigravity`), from the hook
+    /// Host CLI name (`claude` / `antigravity`), from the hook
     /// `format` field. `"unknown"` when the session was created without one.
     pub name: String,
     /// Host CLI version, when the payload carries it. The hook payloads

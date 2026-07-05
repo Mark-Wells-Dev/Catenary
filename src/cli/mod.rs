@@ -27,8 +27,6 @@ use std::io::{self, Write, stdout};
 pub enum HostFormat {
     /// Claude Code hooks (`PostToolUse` / `PreToolUse`).
     Claude,
-    /// Gemini CLI hooks (`AfterTool` / `BeforeTool`).
-    Gemini,
     /// Antigravity CLI hooks (`PreToolUse` / `Stop`).
     Antigravity,
     /// OpenCode plugin (`tool.execute.before`).
@@ -50,7 +48,6 @@ impl HostFormat {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
-            Self::Gemini => "gemini",
             Self::Antigravity => "antigravity",
             Self::OpenCode => "opencode",
         }
@@ -61,7 +58,7 @@ impl HostFormat {
     pub const fn read_tool(self) -> &'static str {
         match self {
             Self::Claude => "Read",
-            Self::Gemini | Self::Antigravity => "read_file",
+            Self::Antigravity => "read_file",
             Self::OpenCode => "read",
         }
     }
@@ -71,7 +68,6 @@ impl HostFormat {
     pub const fn edit_tool(self) -> &'static str {
         match self {
             Self::Claude => "Edit",
-            Self::Gemini => "write_file",
             Self::Antigravity => "write_to_file",
             Self::OpenCode => "edit",
         }
@@ -404,7 +400,6 @@ mod tests {
     #[test]
     fn host_format_edit_tool_names() {
         assert_eq!(HostFormat::Claude.edit_tool(), "Edit");
-        assert_eq!(HostFormat::Gemini.edit_tool(), "write_file");
         assert_eq!(HostFormat::Antigravity.edit_tool(), "write_to_file");
         assert_eq!(HostFormat::OpenCode.edit_tool(), "edit");
     }
@@ -412,7 +407,6 @@ mod tests {
     #[test]
     fn host_format_read_tool_names() {
         assert_eq!(HostFormat::Claude.read_tool(), "Read");
-        assert_eq!(HostFormat::Gemini.read_tool(), "read_file");
         assert_eq!(HostFormat::Antigravity.read_tool(), "read_file");
         assert_eq!(HostFormat::OpenCode.read_tool(), "read");
     }

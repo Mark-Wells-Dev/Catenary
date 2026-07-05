@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 //! Runtime regeneration of the Antigravity rules file (teaching-surface ticket
-//! 12; the Gemini leg was retired in ticket 14).
+//! 12).
 //!
 //! Antigravity's `always_on` rules file is re-injected into the model context
 //! every conversation turn, so a file rewritten at hook time is the live,
@@ -16,11 +16,7 @@
 //! documents the cadence. The rewrite is correct either way: if the file is
 //! re-read per turn, each turn sees the live surface; if it is cached per
 //! conversation, the rewrite still lands by the next conversation start — strictly
-//! better than install-time-only content. (The Gemini half of the original ticket-12
-//! premise — that its `contextFileName` is re-read per prompt — is now known
-//! **false**: Gemini caches context files at init, refreshing only at startup /
-//! `/memory reload` / MCP refresh / trust change. That machinery was deleted in
-//! ticket 14; Gemini teaching is now hook-only.)
+//! better than install-time-only content.
 //!
 //! The rewrite is:
 //! - **Location-resolved the way `catenary install` does** — the Antigravity plugin

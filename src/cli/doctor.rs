@@ -17,9 +17,6 @@ use crate::lsp;
 /// Expected Claude Code hooks, embedded at compile time.
 const CLAUDE_HOOKS_EXPECTED: &str = include_str!("../../plugins/catenary/hooks/hooks.json");
 
-/// Expected Gemini CLI hooks, embedded at compile time.
-const GEMINI_HOOKS_EXPECTED: &str = include_str!("../../hooks/hooks.json");
-
 /// Expected Antigravity CLI hooks, embedded at compile time.
 const ANTIGRAVITY_HOOKS_EXPECTED: &str =
     include_str!("../../plugins/catenary-antigravity/hooks.json");
@@ -528,7 +525,6 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
     let _ = out.writeln(format_args!(""));
     let _ = out.writeln(format_args!("{}:", out.colors.bold("Hooks")));
     check_claude_hooks(out, show_diff);
-    check_gemini_hooks(out, show_diff);
     check_antigravity_hooks(out, show_diff, project_root);
     check_path_binary(out);
 
@@ -536,14 +532,12 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
     let _ = out.writeln(format_args!(""));
     let _ = out.writeln(format_args!("{}:", out.colors.bold("Agent instructions")));
     check_claude_instructions(out);
-    check_gemini_instructions(out);
     check_antigravity_instructions(out, show_diff, project_root);
 
     // Legacy script migration warnings
     let _ = out.writeln(format_args!(""));
     let _ = out.writeln(format_args!("{}:", out.colors.bold("Command filter")));
     check_constrained_bash_claude(out);
-    check_constrained_bash_gemini(out);
     check_command_filter_config(out, &config);
 
     // Actionable suggestions at the very bottom so they aren't buried
@@ -1587,113 +1581,6 @@ fn read_marketplace_source(home: &Path) -> Option<String> {
         .map(std::string::ToString::to_string)
 }
 
-/// Check Gemini CLI extension hooks against the embedded expected hooks.
-fn check_gemini_hooks(out: &mut Output, show_diff: bool) {
-    let label = format!("{:<14}", "Gemini CLI");
-    let Ok(home_str) = std::env::var("HOME") else {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.dim("- cannot determine home directory"),
-        ));
-        return;
-    };
-    let home = PathBuf::from(home_str);
-
-    // Look for the extension directory
-    let ext_dir = home.join(".gemini/extensions");
-    let candidates = ["Catenary", "catenary"];
-    let ext_path = candidates
-        .iter()
-        .map(|name| ext_dir.join(name))
-        .find(|p| p.is_dir());
-
-    let Some(ext_path) = ext_path else {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.dim("- not installed")
-        ));
-        return;
-    };
-
-    // Read .gemini-extension-install.json to determine install type and source.
-    // Gemini CLI writes this metadata file for both linked and installed extensions.
-    let install_meta_path = ext_path.join(".gemini-extension-install.json");
-    let install_meta = std::fs::read_to_string(&install_meta_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-
-    let install_type = install_meta
-        .as_ref()
-        .and_then(|m| m.get("type").and_then(serde_json::Value::as_str))
-        .unwrap_or("unknown");
-
-    // For linked extensions, the source field is a local path to the actual
-    // extension files. For installed extensions (github-release, etc.), the
-    // files are cloned into the extension directory itself.
-    let resolved = if install_type == "link" {
-        install_meta
-            .as_ref()
-            .and_then(|m| m.get("source").and_then(serde_json::Value::as_str))
-            .map_or_else(|| ext_path.clone(), PathBuf::from)
-    } else {
-        ext_path
-    };
-
-    // Read the extension manifest for version info
-    let manifest_path = resolved.join("gemini-extension.json");
-    let version = std::fs::read_to_string(&manifest_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| {
-            v.get("version")
-                .and_then(serde_json::Value::as_str)
-                .map(std::string::ToString::to_string)
-        });
-
-    let type_label = if install_type == "link" {
-        "linked"
-    } else {
-        "installed"
-    };
-    let version_display = version
-        .as_deref()
-        .map_or_else(|| type_label.to_string(), |v| format!("{v} ({type_label})"));
-    let ver_col = format!("{version_display:<20}");
-
-    // Read hooks and compare against embedded
-    let hooks_path = resolved.join("hooks/hooks.json");
-    match std::fs::read_to_string(&hooks_path) {
-        Ok(installed) => {
-            if normalize_json(&installed) == normalize_json(GEMINI_HOOKS_EXPECTED) {
-                let _ = out.writeln(format_args!(
-                    "  {label}{ver_col}{}",
-                    out.colors.green("✓ hooks match")
-                ));
-            } else {
-                let _ = out.writeln(format_args!(
-                    "  {label}{ver_col}{}",
-                    out.colors.red("✗ stale hooks (update extension)"),
-                ));
-                if show_diff {
-                    show_unified_diff(
-                        out,
-                        &pretty_json(&installed),
-                        &pretty_json(GEMINI_HOOKS_EXPECTED),
-                        "installed",
-                        "expected",
-                    );
-                }
-            }
-        }
-        Err(_) => {
-            let _ = out.writeln(format_args!(
-                "  {label}{ver_col}{}",
-                out.colors.yellow("? hooks.json not found"),
-            ));
-        }
-    }
-}
-
 /// Check Antigravity CLI plugin hooks against the embedded expected hooks.
 ///
 /// Searches three discovery paths (first match wins):
@@ -1910,103 +1797,6 @@ fn check_claude_instructions(out: &mut Output) {
     }
 }
 
-/// Check the installed Gemini CLI extension.
-///
-/// Validates the extension version against the current binary version; linked
-/// extensions are always current by definition. Gemini no longer ships a static
-/// context file — teaching-surface 14 retired it, so teaching rides the
-/// `SessionStart` / `PreCompress` / `BeforeAgent` hooks — so there is no
-/// instruction file to check.
-fn check_gemini_instructions(out: &mut Output) {
-    let label = format!("{:<14}", "Gemini CLI");
-    let Ok(home_str) = std::env::var("HOME") else {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.dim("- cannot determine home directory"),
-        ));
-        return;
-    };
-    let home = PathBuf::from(home_str);
-
-    let ext_dir = home.join(".gemini/extensions");
-    let ext_path = ["Catenary", "catenary"]
-        .iter()
-        .map(|name| ext_dir.join(name))
-        .find(|p| p.is_dir());
-
-    let Some(ext_path) = ext_path else {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.dim("- not installed"),
-        ));
-        return;
-    };
-
-    // Determine install type and resolve path
-    let install_meta_path = ext_path.join(".gemini-extension-install.json");
-    let install_meta = std::fs::read_to_string(&install_meta_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-
-    let install_type = install_meta
-        .as_ref()
-        .and_then(|m| m.get("type").and_then(serde_json::Value::as_str))
-        .unwrap_or("unknown");
-    let is_linked = install_type == "link";
-
-    let resolved = if is_linked {
-        install_meta
-            .as_ref()
-            .and_then(|m| m.get("source").and_then(serde_json::Value::as_str))
-            .map_or_else(|| ext_path.clone(), PathBuf::from)
-    } else {
-        ext_path
-    };
-
-    // Read manifest for version.
-    let manifest_path = resolved.join("gemini-extension.json");
-    let manifest = std::fs::read_to_string(&manifest_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-
-    let version = manifest
-        .as_ref()
-        .and_then(|v| v.get("version").and_then(serde_json::Value::as_str));
-
-    // Version staleness — same reasoning as Claude check above.
-    let expected_version = env!("CARGO_PKG_VERSION");
-
-    if is_linked {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.green("✓ linked (always current)"),
-        ));
-    } else if let Some(v) = version {
-        if v == expected_version {
-            let _ = out.writeln(format_args!(
-                "  {label}{}",
-                out.colors.green(&format!("✓ up to date (v{v})")),
-            ));
-        } else {
-            let _ = out.writeln(format_args!(
-                "  {label}{}",
-                out.colors.red(&format!(
-                    "✗ stale (v{v} installed, v{expected_version} expected)"
-                )),
-            ));
-            let _ = out.writeln(format_args!(
-                "  {label}{}",
-                out.colors.dim("  run: catenary install gemini"),
-            ));
-        }
-    } else {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.yellow("? cannot determine version"),
-        ));
-    }
-}
-
 /// Check Antigravity CLI agent instruction files (rules).
 ///
 /// Compares installed rules file content against the embedded version.
@@ -2100,13 +1890,6 @@ fn check_antigravity_instructions(out: &mut Output, show_diff: bool, project_roo
 /// If found, warns the user to remove it and migrate to `[commands]` config.
 fn check_constrained_bash_claude(out: &mut Output) {
     check_legacy_script(out, "Claude Code", ".claude/settings.json");
-}
-
-/// Check whether `~/.gemini/settings.json` still references the legacy Python script.
-///
-/// If found, warns the user to remove it and migrate to `[commands]` config.
-fn check_constrained_bash_gemini(out: &mut Output) {
-    check_legacy_script(out, "Gemini CLI", ".gemini/settings.json");
 }
 
 /// Check a host CLI settings file for references to the legacy `constrained_bash.py`.

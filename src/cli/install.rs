@@ -66,12 +66,7 @@ struct HostStatus {
 
 /// Detect all hosts and their install status.
 fn detect_hosts() -> Vec<HostStatus> {
-    vec![
-        detect_claude(),
-        detect_gemini(),
-        detect_antigravity(),
-        detect_opencode(),
-    ]
+    vec![detect_claude(), detect_antigravity(), detect_opencode()]
 }
 
 /// Detect Claude Code install status.
@@ -117,79 +112,6 @@ fn claude_install_status() -> String {
         }
         _ => "not installed".to_string(),
     }
-}
-
-/// Detect Gemini CLI install status.
-fn detect_gemini() -> HostStatus {
-    let detected = binary_exists("gemini");
-    let status = if detected {
-        gemini_install_status()
-    } else {
-        "not detected".to_string()
-    };
-    HostStatus {
-        name: "gemini",
-        detected,
-        status,
-    }
-}
-
-/// Get Gemini CLI extension install status.
-fn gemini_install_status() -> String {
-    let Some(home) = dirs::home_dir() else {
-        return "unknown".to_string();
-    };
-    let ext_dir = home.join(".gemini/extensions");
-    let ext_path = ["Catenary", "catenary"]
-        .iter()
-        .map(|name| ext_dir.join(name))
-        .find(|p| p.is_dir());
-
-    let Some(ext_path) = ext_path else {
-        return "not installed".to_string();
-    };
-
-    // Check install type
-    let install_meta_path = ext_path.join(".gemini-extension-install.json");
-    let install_meta = std::fs::read_to_string(&install_meta_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-
-    let install_type = install_meta
-        .as_ref()
-        .and_then(|m| m.get("type").and_then(serde_json::Value::as_str))
-        .unwrap_or("unknown");
-
-    // Resolve manifest path for version
-    let resolved = if install_type == "link" {
-        install_meta
-            .as_ref()
-            .and_then(|m| m.get("source").and_then(serde_json::Value::as_str))
-            .map_or_else(|| ext_path.clone(), PathBuf::from)
-    } else {
-        ext_path
-    };
-
-    let manifest_path = resolved.join("gemini-extension.json");
-    let version = std::fs::read_to_string(&manifest_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| {
-            v.get("version")
-                .and_then(serde_json::Value::as_str)
-                .map(std::string::ToString::to_string)
-        });
-
-    let type_label = if install_type == "link" {
-        "linked"
-    } else {
-        "installed"
-    };
-
-    version.map_or_else(
-        || type_label.to_string(),
-        |v| format!("{type_label} (v{v})"),
-    )
 }
 
 /// Detect Antigravity CLI install status.
@@ -486,297 +408,35 @@ fn read_claude_marketplace_source() -> Option<String> {
         .map(std::string::ToString::to_string)
 }
 
-// ── Gemini CLI install ─────────────────────────────────────────────
+// ── Gemini CLI install (withdrawn) ─────────────────────────────────
 
-/// Run `catenary install gemini`.
+/// Announce that Gemini CLI support is withdrawn and install nothing.
+///
+/// Gemini CLI support was withdrawn 2026-07-05 (decision 030): Google
+/// discontinued individual, free, and Pro-tier access upstream on 2026-06-18,
+/// leaving the host untestable by individuals, and the maintainer declines to
+/// donate support labor to an ecosystem that locked its contributors out. The
+/// `install gemini` subcommand is retained only so the withdrawal is announced
+/// (rather than surfacing as an unknown-host error); it installs nothing and
+/// names the artifact to remove by hand. `source` is ignored.
 ///
 /// # Errors
 ///
-/// Returns an error if the Gemini CLI binary is not found or
-/// extension commands fail.
-pub fn run_install_gemini(out: &mut Output, source: Option<&str>, dry_run: bool) -> Result<()> {
+/// Always returns an error so the command exits nonzero — there is nothing to
+/// install.
+pub fn run_install_gemini_withdrawn(out: &mut Output, _source: Option<&str>) -> Result<()> {
     let _ = out.writeln(format_args!("Gemini CLI:"));
-
-    if !binary_exists("gemini") {
-        let _ = out.writeln(format_args!(
-            "  {}",
-            out.colors.red("✗ `gemini` not found on PATH"),
-        ));
-        return Ok(());
-    }
-
-    match source.map(parse_source) {
-        Some(InstallSource::Local(path)) => {
-            install_gemini_local(out, &path, dry_run)?;
-        }
-        Some(InstallSource::Remote(repo)) => {
-            install_gemini_remote(out, &repo, dry_run)?;
-        }
-        None => {
-            install_gemini_refresh(out, dry_run)?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Install Gemini extension from a local path (link).
-fn install_gemini_local(out: &mut Output, path: &Path, dry_run: bool) -> Result<()> {
-    let current = gemini_current_install();
-
-    // If already linked to same path, no-op
-    if let Some((install_type, source_path)) = &current {
-        if install_type == "link" && source_path.as_deref() == Some(&*path.to_string_lossy()) {
-            let _ = out.writeln(format_args!(
-                "  {} linked → {}",
-                out.colors.green("✓"),
-                path.display(),
-            ));
-            return Ok(());
-        }
-
-        // Different source — uninstall first
-        if dry_run {
-            let _ = out.writeln(format_args!(
-                "  {} extensions uninstall catenary",
-                out.colors.dim("(dry-run)"),
-            ));
-        } else {
-            let _ = Command::new("gemini")
-                .args(["extensions", "uninstall", "catenary"])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .status();
-        }
-    }
-
-    if dry_run {
-        let _ = out.writeln(format_args!(
-            "  {} extensions link {}",
-            out.colors.dim("(dry-run)"),
-            path.display(),
-        ));
-    } else {
-        let status = Command::new("gemini")
-            .args(["extensions", "link", &path.to_string_lossy()])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .status()
-            .context("failed to run `gemini extensions link`")?;
-
-        if status.success() {
-            let _ = out.writeln(format_args!(
-                "  {} linked → {}",
-                out.colors.green("✓"),
-                path.display(),
-            ));
-        } else {
-            let _ = out.writeln(format_args!(
-                "  {} extensions link failed",
-                out.colors.red("✗"),
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-/// Install Gemini extension from a remote repo.
-fn install_gemini_remote(out: &mut Output, repo: &str, dry_run: bool) -> Result<()> {
-    let current = gemini_current_install();
-
-    if let Some((install_type, _)) = &current {
-        if install_type == "link" {
-            // Linked — need to uninstall and install from remote
-            if dry_run {
-                let _ = out.writeln(format_args!(
-                    "  {} extensions uninstall catenary && extensions install {repo}",
-                    out.colors.dim("(dry-run)"),
-                ));
-            } else {
-                let _ = Command::new("gemini")
-                    .args(["extensions", "uninstall", "catenary"])
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .status();
-
-                let status = Command::new("gemini")
-                    .args(["extensions", "install", repo])
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .status()
-                    .context("failed to run `gemini extensions install`")?;
-
-                if status.success() {
-                    let _ = out.writeln(format_args!(
-                        "  {} extension installed from {repo}",
-                        out.colors.green("✓"),
-                    ));
-                } else {
-                    let _ = out.writeln(format_args!(
-                        "  {} extensions install failed",
-                        out.colors.red("✗"),
-                    ));
-                }
-            }
-        } else {
-            // Already installed from remote — update
-            if dry_run {
-                let _ = out.writeln(format_args!(
-                    "  {} extensions update catenary",
-                    out.colors.dim("(dry-run)"),
-                ));
-            } else {
-                let status = Command::new("gemini")
-                    .args(["extensions", "update", "catenary"])
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .status()
-                    .context("failed to run `gemini extensions update`")?;
-
-                if status.success() {
-                    let _ = out.writeln(format_args!(
-                        "  {} extension updated",
-                        out.colors.green("✓"),
-                    ));
-                } else {
-                    let _ = out.writeln(format_args!(
-                        "  {} extensions update failed",
-                        out.colors.red("✗"),
-                    ));
-                }
-            }
-        }
-    } else if dry_run {
-        let _ = out.writeln(format_args!(
-            "  {} extensions install {repo}",
-            out.colors.dim("(dry-run)"),
-        ));
-    } else {
-        let status = Command::new("gemini")
-            .args(["extensions", "install", repo])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .status()
-            .context("failed to run `gemini extensions install`")?;
-
-        if status.success() {
-            let _ = out.writeln(format_args!(
-                "  {} extension installed from {repo}",
-                out.colors.green("✓"),
-            ));
-        } else {
-            let _ = out.writeln(format_args!(
-                "  {} extensions install failed",
-                out.colors.red("✗"),
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-/// Refresh existing Gemini extension install (no source argument).
-fn install_gemini_refresh(out: &mut Output, dry_run: bool) -> Result<()> {
-    let current = gemini_current_install();
-
-    match current {
-        Some((install_type, source_path)) if install_type == "link" => {
-            // Linked — always current, no-op
-            let display = source_path.as_deref().unwrap_or("(unknown)");
-            let _ = out.writeln(format_args!(
-                "  {} linked → {display} (always current)",
-                out.colors.green("✓"),
-            ));
-        }
-        Some(_) => {
-            // Installed from remote — update
-            if dry_run {
-                let _ = out.writeln(format_args!(
-                    "  {} extensions update catenary",
-                    out.colors.dim("(dry-run)"),
-                ));
-            } else {
-                let status = Command::new("gemini")
-                    .args(["extensions", "update", "catenary"])
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .status()
-                    .context("failed to run `gemini extensions update`")?;
-
-                if status.success() {
-                    let _ = out.writeln(format_args!(
-                        "  {} extension updated",
-                        out.colors.green("✓"),
-                    ));
-                } else {
-                    let _ = out.writeln(format_args!(
-                        "  {} extensions update failed",
-                        out.colors.red("✗"),
-                    ));
-                }
-            }
-        }
-        None => {
-            // Not installed — install from default repo
-            let repo = DEFAULT_REPO;
-            if dry_run {
-                let _ = out.writeln(format_args!(
-                    "  {} extensions install {repo}",
-                    out.colors.dim("(dry-run)"),
-                ));
-            } else {
-                let status = Command::new("gemini")
-                    .args(["extensions", "install", repo])
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .status()
-                    .context("failed to run `gemini extensions install`")?;
-
-                if status.success() {
-                    let _ = out.writeln(format_args!(
-                        "  {} extension installed from {repo}",
-                        out.colors.green("✓"),
-                    ));
-                } else {
-                    let _ = out.writeln(format_args!(
-                        "  {} extensions install failed",
-                        out.colors.red("✗"),
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Get current Gemini extension install info: (type, `source_path`).
-fn gemini_current_install() -> Option<(String, Option<String>)> {
-    let home = dirs::home_dir()?;
-    let ext_dir = home.join(".gemini/extensions");
-    let ext_path = ["Catenary", "catenary"]
-        .iter()
-        .map(|name| ext_dir.join(name))
-        .find(|p| p.is_dir())?;
-
-    let install_meta_path = ext_path.join(".gemini-extension-install.json");
-    let meta = std::fs::read_to_string(&install_meta_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-
-    let install_type = meta
-        .as_ref()
-        .and_then(|m| m.get("type").and_then(serde_json::Value::as_str))
-        .unwrap_or("unknown")
-        .to_string();
-
-    let source = meta
-        .as_ref()
-        .and_then(|m| m.get("source").and_then(serde_json::Value::as_str))
-        .map(std::string::ToString::to_string);
-
-    Some((install_type, source))
+    let _ = out.writeln(format_args!(
+        "  {} support withdrawn 2026-07-05 — individual access to Gemini CLI was discontinued upstream (decision 030); nothing installed.",
+        out.colors.red("✗"),
+    ));
+    let _ = out.writeln(format_args!(
+        "  {}",
+        out.colors.dim(
+            "remove any prior install by hand: `gemini extensions uninstall catenary` (or delete ~/.gemini/extensions/catenary)",
+        ),
+    ));
+    anyhow::bail!("Gemini CLI support withdrawn (decision 030)")
 }
 
 // ── Antigravity CLI install ────────────────────────────────────────
@@ -1151,7 +811,6 @@ fn install_opencode_bundled(
 /// Returns an error if any install step fails.
 pub fn refresh_installed_hosts(out: &mut Output) -> Result<()> {
     let claude = binary_exists("claude") && claude_plugin_is_installed();
-    let gemini = binary_exists("gemini") && gemini_current_install().is_some();
     let antigravity = dirs::home_dir()
         .map(|h| h.join(".gemini/config/plugins/catenary"))
         .is_some_and(|p| p.is_dir() || p.is_symlink());
@@ -1162,9 +821,6 @@ pub fn refresh_installed_hosts(out: &mut Output) -> Result<()> {
     if claude {
         run_install_claude(out, None, false)?;
     }
-    if gemini {
-        run_install_gemini(out, None, false)?;
-    }
     if antigravity {
         run_install_antigravity(out, None, false)?;
     }
@@ -1172,7 +828,7 @@ pub fn refresh_installed_hosts(out: &mut Output) -> Result<()> {
         run_install_opencode(out, None, false, false)?;
     }
 
-    if !claude && !gemini && !antigravity && !opencode {
+    if !claude && !antigravity && !opencode {
         let _ = out.writeln(format_args!(
             "  {} no hosts have Catenary installed",
             out.colors.dim("—"),
@@ -1554,10 +1210,7 @@ mod tests {
         // teaching (runtime data excluded) rather than pointing at the primer —
         // the live surface rides the runtime channel (the `PreInvocation` sliver).
         // Its freshness is pinned in `cli::teaching`
-        // (`shipped_antigravity_rules_are_fresh`). Gemini retired its static
-        // context file in teaching-surface 14 — its teaching is hook-only
-        // (`SessionStart` plus the `PreCompress`/`BeforeAgent` discontinuity
-        // re-injection), so no static Gemini surface remains to check.
+        // (`shipped_antigravity_rules_are_fresh`).
         //
         // The Antigravity fallback inlines the teaching — no primer pointer, and
         // no runtime data (the allow surface / build tool only ride the runtime

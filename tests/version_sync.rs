@@ -6,7 +6,7 @@
     clippy::expect_used,
     reason = "tests use expect for readable assertions"
 )]
-//! Ensures that the Cargo.toml version matches the Claude Plugin version.
+//! Ensures that the Cargo.toml version matches the Claude plugin version.
 //! This runs as part of `cargo test`, which is triggered by cargo-husky on push.
 
 use anyhow::{Context, Result};
@@ -29,23 +29,10 @@ fn test_version_sync() -> Result<()> {
         .as_str()
         .context("Failed to get version from marketplace.json")?;
 
-    // 3. Get Gemini extension version
-    let gemini_json = std::fs::read_to_string("gemini-extension.json")
-        .context("Failed to read gemini-extension.json")?;
-    let gemini_data: serde_json::Value =
-        serde_json::from_str(&gemini_json).context("Failed to parse gemini-extension.json")?;
-    let gemini_version = gemini_data["version"]
-        .as_str()
-        .context("Failed to get version from gemini-extension.json")?;
-
-    // 4. Compare
+    // 3. Compare
     assert_eq!(
         cargo_version, plugin_version,
         "Version mismatch! Cargo.toml: {cargo_version}, marketplace.json: {plugin_version}"
-    );
-    assert_eq!(
-        cargo_version, gemini_version,
-        "Version mismatch! Cargo.toml: {cargo_version}, gemini-extension.json: {gemini_version}"
     );
     Ok(())
 }

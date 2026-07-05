@@ -17,10 +17,6 @@
 //! - `run_session_start` — clear stale editing state (`SessionStart`)
 //! - `run_pre_invocation` — first-sighting teaching injection (Antigravity
 //!   `PreInvocation`)
-//! - `run_pre_compress` — lay a discontinuity mark on a real compaction (Gemini
-//!   `PreCompress`)
-//! - `run_before_agent` — re-inject the teaching payload once per pending
-//!   discontinuity mark (Gemini `BeforeAgent`)
 
 #![allow(
     clippy::print_stdout,
@@ -32,13 +28,6 @@ use std::time::Duration;
 
 use crate::cli::HostFormat;
 use crate::cli::command_filter::resolver::LineWrites;
-
-/// The bare JSON object a hook emits when it has nothing to inject or decide.
-///
-/// Used by the Gemini `PreCompress` (advisory, output ignored) and `BeforeAgent`
-/// (no pending discontinuity mark) hot paths. Matches the host contract's
-/// "nothing to do" shape, so it is a safe no-op on every surface.
-const EMPTY_HOOK_OUTPUT: &str = "{}";
 
 // ── Teaching payload injection (ws36 ticket 01) ──────────────────────────
 
@@ -62,15 +51,12 @@ fn session_start_should_announce(source: Option<&str>) -> bool {
 
 /// The teaching payload to inject at `SessionStart`, or `None` when it should
 /// be withheld (a non-inject `source`, or a host whose `SessionStart` cannot
-/// carry it). Claude Code and Gemini CLI both read the identical
-/// `hookSpecificOutput.additionalContext` field at `SessionStart` (Gemini
-/// injects it as the first turn in history), so both receive the payload;
-/// Antigravity and OpenCode use other channels. Computed only when it will be
-/// used, so the config-load IO is skipped on the withhold paths.
+/// carry it). Claude Code reads the `hookSpecificOutput.additionalContext` field
+/// at `SessionStart`; Antigravity and OpenCode use other channels. Computed only
+/// when it will be used, so the config-load IO is skipped on the withhold paths.
 #[must_use]
 fn session_start_context(announce: bool, format: HostFormat) -> Option<String> {
-    (announce && matches!(format, HostFormat::Claude | HostFormat::Gemini))
-        .then(crate::cli::teaching::emitted_payload)
+    (announce && matches!(format, HostFormat::Claude)).then(crate::cli::teaching::emitted_payload)
 }
 
 /// The raw stdout body emitted by `catenary hook session-start
@@ -80,7 +66,7 @@ fn session_start_context(announce: bool, format: HostFormat) -> Option<String> {
 /// and the Claude `SessionStart` `additionalContext` — for the OpenCode plugin
 /// to write into its runtime-regenerated instructions file. Not a JSON
 /// envelope: the plugin captures stdout as the file's content, so this is the
-/// bare payload text (unlike the Claude/Gemini/Antigravity structured
+/// bare payload text (unlike the Claude/Antigravity structured
 /// responses).
 #[must_use]
 fn opencode_session_start_body() -> String {
@@ -232,10 +218,10 @@ fn format_deny(reason: &str, format: HostFormat) -> String {
             }
         })
         .to_string(),
-        // Gemini/Antigravity use `{decision: "deny", reason}`; the OpenCode
-        // plugin consumes the same shape directly (`catenary.js`), surfacing
-        // `reason` as the thrown block message.
-        HostFormat::Gemini | HostFormat::Antigravity | HostFormat::OpenCode => serde_json::json!({
+        // Antigravity uses `{decision: "deny", reason}`; the OpenCode plugin
+        // consumes the same shape directly (`catenary.js`), surfacing `reason` as
+        // the thrown block message.
+        HostFormat::Antigravity | HostFormat::OpenCode => serde_json::json!({
             "decision": "deny",
             "reason": reason
         })
@@ -254,11 +240,6 @@ fn format_stop_block(reason: &str, format: HostFormat) -> String {
             "reason": reason
         })
         .to_string(),
-        HostFormat::Gemini => serde_json::json!({
-            "decision": "retry",
-            "reason": reason
-        })
-        .to_string(),
         HostFormat::Antigravity => serde_json::json!({
             "decision": "continue",
             "reason": reason
@@ -272,7 +253,7 @@ fn format_stop_block(reason: &str, format: HostFormat) -> String {
 /// Each host uses a different field name for the session identifier.
 fn extract_session_id(hook_json: &serde_json::Value, format: HostFormat) -> Option<&str> {
     match format {
-        HostFormat::Claude | HostFormat::Gemini => hook_json.get("session_id"),
+        HostFormat::Claude => hook_json.get("session_id"),
         HostFormat::Antigravity => hook_json.get("conversationId"),
         // OpenCode plugin payload carries `sessionID` (`catenary.js`).
         HostFormat::OpenCode => hook_json.get("sessionID"),
@@ -285,7 +266,7 @@ fn extract_session_id(hook_json: &serde_json::Value, format: HostFormat) -> Opti
 /// Each host uses a different field name and shape for the working directory.
 fn extract_cwd_str(hook_json: &serde_json::Value, format: HostFormat) -> Option<&str> {
     match format {
-        HostFormat::Claude | HostFormat::Gemini => hook_json.get("cwd").and_then(|v| v.as_str()),
+        HostFormat::Claude => hook_json.get("cwd").and_then(|v| v.as_str()),
         HostFormat::Antigravity => hook_json
             .get("workspacePaths")
             .and_then(|v| v.as_array())
@@ -301,9 +282,7 @@ fn extract_cwd_str(hook_json: &serde_json::Value, format: HostFormat) -> Option<
 /// Each host uses a different field path for the tool name.
 fn extract_tool_name(hook_json: &serde_json::Value, format: HostFormat) -> &str {
     match format {
-        HostFormat::Claude | HostFormat::Gemini => {
-            hook_json.get("tool_name").and_then(|v| v.as_str())
-        }
+        HostFormat::Claude => hook_json.get("tool_name").and_then(|v| v.as_str()),
         HostFormat::Antigravity => hook_json
             .get("toolCall")
             .and_then(|tc| tc.get("name"))
@@ -329,7 +308,7 @@ fn extract_agent_id(hook_json: &serde_json::Value) -> &str {
 /// Each host uses a different field path for the edited file.
 fn extract_file_path(hook_json: &serde_json::Value, format: HostFormat) -> Option<String> {
     let file_path = match format {
-        HostFormat::Claude | HostFormat::Gemini => hook_json
+        HostFormat::Claude => hook_json
             .get("tool_input")
             .and_then(|ti| ti.get("file_path").or_else(|| ti.get("file")))
             .and_then(|fp| fp.as_str()),
@@ -626,171 +605,6 @@ fn pre_invocation_first_sighting(hook_json: &serde_json::Value, format: HostForm
         .unwrap_or(false)
 }
 
-// ── Gemini compaction re-injection (PreCompress + BeforeAgent, ticket 14) ────
-
-/// Lay a per-session discontinuity mark on a real compaction (Gemini
-/// `PreCompress` hook handler, teaching-surface ticket 14).
-///
-/// Gemini's `PreCompress` is the only compaction-adjacent hook, but it is a poor
-/// signal. **HARD GATE (bundle-pinned, Gemini CLI 0.46.0):**
-/// `firePreCompressEvent` fires in `ChatCompressionService.compress` *before* the
-/// token-threshold check, and `compress` runs on **every turn** on the default
-/// legacy path (context management defaults off) — so `PreCompress` fires on every
-/// turn, including below-threshold no-ops that compress nothing. Its only
-/// distinguishing field is `trigger` (`auto`|`manual`), and `auto` cannot tell a
-/// real auto-compaction from a per-turn no-op firing. Laying a mark on `auto`
-/// would therefore re-inject the teaching payload on (nearly) every turn, which
-/// the ticket rules "worse than the gap."
-///
-/// So the mark is laid only when compression **provably proceeds** — a `manual`
-/// trigger, which sets `force = true` and bypasses the threshold check (a user's
-/// `/compress`). The next `BeforeAgent` consumes the mark and re-injects once.
-///
-/// This host output is always [`EMPTY_HOOK_OUTPUT`]: `PreCompress` is advisory
-/// (`systemMessage`-only; flow-control fields are ignored per the host contract),
-/// so the mark is a pure side effect. No daemon is involved. Fail-soft: any error
-/// (unreadable stdin, unparsable JSON, `runtime_dir` write failure) logs at
-/// `debug` and still exits successfully with `{}`.
-pub fn run_pre_compress(format: HostFormat) {
-    // Only Gemini registers `PreCompress`; any other host is a defensive no-op.
-    if matches!(format, HostFormat::Gemini)
-        && let Err(e) = lay_discontinuity_mark_from_stdin(format)
-    {
-        tracing::debug!(error = %format!("{e:#}"), "pre-compress discontinuity mark failed");
-    }
-    print!("{EMPTY_HOOK_OUTPUT}");
-}
-
-/// Read the `PreCompress` stdin payload and, when it marks a *real* compaction,
-/// lay the per-session discontinuity mark. Errors propagate to the fail-soft
-/// caller ([`run_pre_compress`]).
-fn lay_discontinuity_mark_from_stdin(format: HostFormat) -> anyhow::Result<()> {
-    let stdin_data = std::io::read_to_string(std::io::stdin())?;
-    let hook_json: serde_json::Value = serde_json::from_str(&stdin_data)?;
-
-    let trigger = hook_json.get("trigger").and_then(serde_json::Value::as_str);
-    if !pre_compress_should_mark(trigger) {
-        return Ok(());
-    }
-
-    let Some(session_id) = extract_session_id(&hook_json, format) else {
-        return Ok(());
-    };
-    lay_discontinuity_mark(session_id)
-}
-
-/// Whether a `PreCompress` firing with the given `trigger` marks a *real* context
-/// discontinuity worth re-injecting the teaching payload for.
-///
-/// Only `manual` qualifies (see [`run_pre_compress`] for the full HARD-GATE
-/// reasoning): `manual` sets `force = true`, which bypasses the token-threshold
-/// check, so a `manual` firing provably proceeds to compress; `auto` fires on
-/// every turn and cannot be told apart from a below-threshold no-op. A
-/// missing/unknown trigger is treated as non-marking (conservative — never
-/// over-inject).
-#[must_use]
-fn pre_compress_should_mark(trigger: Option<&str>) -> bool {
-    trigger == Some("manual")
-}
-
-/// Write the per-session discontinuity marker under `runtime_dir`.
-///
-/// Creates the mark dir if needed and writes the marker (the trigger, for
-/// debuggability — existence is the signal). Keyed on the flattened `session_id`
-/// (the [`crate::paths::discontinuity_mark_file`] pattern).
-fn lay_discontinuity_mark(session_id: &str) -> anyhow::Result<()> {
-    lay_mark_in(&crate::paths::discontinuity_mark_dir(), session_id)
-}
-
-/// [`lay_discontinuity_mark`] against an explicit mark directory (testable
-/// without touching the real `runtime_dir`).
-fn lay_mark_in(dir: &std::path::Path, session_id: &str) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let path = dir.join(crate::paths::discontinuity_mark_file(session_id));
-    std::fs::write(&path, "manual\n")?;
-    Ok(())
-}
-
-/// Re-inject the teaching payload once per pending discontinuity mark (Gemini
-/// `BeforeAgent` hook handler, teaching-surface ticket 14).
-///
-/// `BeforeAgent` fires after a user submits a prompt, before the agent plans, and
-/// can inject `hookSpecificOutput.additionalContext` (appended to the turn's
-/// prompt). When a `PreCompress` mark is pending for this session, this consumes
-/// it and re-injects the full teaching payload once; otherwise it emits
-/// [`EMPTY_HOOK_OUTPUT`]. The hot (no-mark) path is a single filesystem `unlink`
-/// that check-and-clears the mark atomically (see [`take_discontinuity_mark`]).
-///
-/// Only Gemini registers `BeforeAgent`; any other host injects nothing.
-pub fn run_before_agent(format: HostFormat) {
-    if !matches!(format, HostFormat::Gemini) {
-        print!("{EMPTY_HOOK_OUTPUT}");
-        return;
-    }
-
-    // `session_id` (needed to key the mark) rides the payload, so read stdin, then
-    // one `unlink` decides. Any read/parse failure fails soft to the no-op output.
-    let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
-        print!("{EMPTY_HOOK_OUTPUT}");
-        return;
-    };
-    let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
-        print!("{EMPTY_HOOK_OUTPUT}");
-        return;
-    };
-    let Some(session_id) = extract_session_id(&hook_json, format) else {
-        print!("{EMPTY_HOOK_OUTPUT}");
-        return;
-    };
-
-    if take_discontinuity_mark(session_id) {
-        print!(
-            "{}",
-            before_agent_injection(&crate::cli::teaching::emitted_payload())
-        );
-    } else {
-        print!("{EMPTY_HOOK_OUTPUT}");
-    }
-}
-
-/// Consume the per-session discontinuity mark, returning whether one was pending.
-///
-/// The check-and-clear is a single `remove_file`: `Ok` means the mark existed and
-/// is now cleared (→ inject); an `Err` (typically `NotFound`) means no mark was
-/// pending (→ skip). One syscall, so the common no-mark path is cheap. Consuming
-/// the mark guarantees at most one injection per mark — and because a mark is laid
-/// only on a `manual` compaction (never per turn), injection is never per-turn.
-fn take_discontinuity_mark(session_id: &str) -> bool {
-    take_mark_in(&crate::paths::discontinuity_mark_dir(), session_id)
-}
-
-/// [`take_discontinuity_mark`] against an explicit mark directory (testable
-/// without touching the real `runtime_dir`).
-fn take_mark_in(dir: &std::path::Path, session_id: &str) -> bool {
-    let path = dir.join(crate::paths::discontinuity_mark_file(session_id));
-    std::fs::remove_file(&path).is_ok()
-}
-
-/// Build the Gemini `BeforeAgent` output that injects `payload` as
-/// `hookSpecificOutput.additionalContext`.
-///
-/// Bundle-pinned shape (Gemini CLI 0.46.0, `bundle/chunk-7VL2FI5R.js`): the host
-/// reads `hookSpecificOutput.additionalContext` (a string) via
-/// `getAdditionalContext()` (~L333587) and, for the `BeforeAgent` event, appends
-/// it to the turn's prompt as `<hook_context>…</hook_context>` (~L345738); the
-/// shape is documented in `bundle/docs/hooks/reference.md` (the `BeforeAgent`
-/// entry: `hookSpecificOutput.additionalContext` is "Text appended to the prompt
-/// for this turn only"). Reuses the shared [`announcement_hook_specific_output`]
-/// builder; its extra `hookEventName` key is ignored by Gemini, which only checks
-/// for `additionalContext`.
-#[must_use]
-fn before_agent_injection(payload: &str) -> String {
-    serde_json::json!({
-        "hookSpecificOutput": announcement_hook_specific_output("BeforeAgent", payload),
-    })
-    .to_string()
-}
-
 /// Clean up session state on exit (`SessionEnd` hook handler).
 ///
 /// Forwards the session-end signal to the daemon so it can remove
@@ -938,8 +752,7 @@ pub fn run_worktree_remove(format: HostFormat) {
 /// - `hookSpecificOutput.additionalContext` (the silent teaching payload),
 ///   present when `additional_context` is `Some` — the caller
 ///   ([`session_start_context`]) already gates it on the inject `source` and the
-///   host (Claude Code and Gemini CLI both read `additionalContext` at
-///   `SessionStart`).
+///   host (Claude Code reads `additionalContext` at `SessionStart`).
 ///
 /// Returns `None` when neither surface has content, so nothing is emitted.
 fn build_session_start_response(
@@ -969,8 +782,8 @@ fn build_session_start_response(
 /// teaching payload) as a single JSON object.
 ///
 /// The host gate lives in [`session_start_context`], which yields `Some`
-/// context only for the hosts whose `SessionStart` carries `additionalContext`
-/// (Claude Code / Gemini CLI) — so this needs no `format`.
+/// context only for the host whose `SessionStart` carries `additionalContext`
+/// (Claude Code) — so this needs no `format`.
 fn emit_session_start(
     builder: crate::hook::response::SystemMessageBuilder,
     additional_context: Option<&str>,
@@ -985,10 +798,9 @@ fn format_system_message(msg: &str, format: HostFormat) -> String {
     match format {
         // OpenCode reads `decision.systemMessage` (`catenary.js`) — same
         // `{systemMessage}` shape as the other hosts.
-        HostFormat::Claude
-        | HostFormat::Gemini
-        | HostFormat::Antigravity
-        | HostFormat::OpenCode => serde_json::json!({ "systemMessage": msg }).to_string(),
+        HostFormat::Claude | HostFormat::Antigravity | HostFormat::OpenCode => {
+            serde_json::json!({ "systemMessage": msg }).to_string()
+        }
     }
 }
 
@@ -1419,8 +1231,9 @@ pub(crate) fn find_project_config(
 
 /// Extract the shell command string from hook JSON for Bash-like tools.
 ///
-/// Returns `Some(command)` for Claude Code's `Bash` tool and Gemini CLI's
-/// `run_shell_command` tool. Returns `None` for all other tools.
+/// Returns `Some(command)` for the host's shell tool (Claude Code `Bash`,
+/// Antigravity `run_command`, OpenCode `bash`). Returns `None` for all other
+/// tools.
 fn extract_shell_command(
     hook_json: &serde_json::Value,
     tool_name: &str,
@@ -1428,7 +1241,6 @@ fn extract_shell_command(
 ) -> Option<String> {
     let is_shell_tool = match format {
         HostFormat::Claude => tool_name == "Bash",
-        HostFormat::Gemini => tool_name == "run_shell_command",
         HostFormat::Antigravity => tool_name == "run_command",
         // OpenCode's shell tool is `bash`; its command lives in `args.command`,
         // already covered by the `args`/`command` fallbacks below.
@@ -1443,7 +1255,7 @@ fn extract_shell_command(
         // Antigravity CLI: toolCall.args
         .or_else(|| hook_json.get("toolCall").and_then(|tc| tc.get("args")));
     tool_input
-        // Claude Code / Gemini CLI: "command"; Antigravity CLI: "CommandLine"
+        // Claude Code: "command"; Antigravity CLI: "CommandLine"
         .and_then(|ti| ti.get("command").or_else(|| ti.get("CommandLine")))
         .and_then(|c| c.as_str())
         .map(String::from)
@@ -1541,21 +1353,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_format_system_message_gemini() -> Result<()> {
-        let output = format_system_message(
-            "─── background ───\n[err] pylsp crashed",
-            HostFormat::Gemini,
-        );
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).context("should produce valid JSON")?;
-        assert_eq!(
-            parsed["systemMessage"].as_str(),
-            Some("─── background ───\n[err] pylsp crashed"),
-        );
-        Ok(())
-    }
-
     // ── extract_shell_command tests ─────────────────────────────────
 
     #[test]
@@ -1571,18 +1368,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_shell_command_gemini_run_shell() {
-        let json = serde_json::json!({
-            "tool_name": "run_shell_command",
-            "tool_input": { "command": "make test" }
-        });
-        assert_eq!(
-            extract_shell_command(&json, "run_shell_command", HostFormat::Gemini),
-            Some("make test".to_string()),
-        );
-    }
-
-    #[test]
     fn extract_shell_command_non_bash_returns_none() {
         let json = serde_json::json!({
             "tool_name": "Edit",
@@ -1593,24 +1378,12 @@ mod tests {
 
     #[test]
     fn extract_shell_command_wrong_format_returns_none() {
-        // Bash tool name with Gemini format → not a shell tool
+        // Bash tool name with Antigravity format → not a shell tool
         let json = serde_json::json!({
             "tool_name": "Bash",
             "tool_input": { "command": "ls" }
         });
-        assert!(extract_shell_command(&json, "Bash", HostFormat::Gemini).is_none());
-    }
-
-    #[test]
-    fn extract_shell_command_gemini_args_fallback() {
-        let json = serde_json::json!({
-            "tool_name": "run_shell_command",
-            "args": { "command": "git status" }
-        });
-        assert_eq!(
-            extract_shell_command(&json, "run_shell_command", HostFormat::Gemini),
-            Some("git status".to_string()),
-        );
+        assert!(extract_shell_command(&json, "Bash", HostFormat::Antigravity).is_none());
     }
 
     #[test]
@@ -1740,18 +1513,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn format_deny_gemini_structure() -> Result<()> {
-        let output = format_deny("not on allowlist", HostFormat::Gemini);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).context("should produce valid JSON")?;
-        assert_eq!(parsed["decision"], "deny");
-        assert_eq!(parsed["reason"], "not on allowlist");
-        // Gemini format should NOT have hookSpecificOutput.hookEventName
-        assert!(parsed["hookSpecificOutput"].is_null());
-        Ok(())
-    }
-
     // ── check_resolved_command (client-side allowlist gate) tests ─────
     //
     // These pin the *decision* the client-side fallback makes — the gap the
@@ -1845,16 +1606,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn format_stop_block_gemini_structure() -> Result<()> {
-        let output = format_stop_block("editing not released", HostFormat::Gemini);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).context("should produce valid JSON")?;
-        assert_eq!(parsed["decision"], "retry");
-        assert_eq!(parsed["reason"], "editing not released");
-        Ok(())
-    }
-
     // ── extract_file_path tests ──────────────────────────────────────
 
     #[test]
@@ -1874,7 +1625,7 @@ mod tests {
             "tool_input": { "file": "/tmp/test.py" }
         });
         assert_eq!(
-            extract_file_path(&json, HostFormat::Gemini),
+            extract_file_path(&json, HostFormat::Claude),
             Some("/tmp/test.py".to_string()),
         );
     }
@@ -2353,56 +2104,16 @@ mod tests {
     }
 
     #[test]
-    fn session_start_context_carries_payload_for_gemini_inject() {
-        // ws36 ticket 06: Gemini CLI reads the identical
-        // `hookSpecificOutput.additionalContext` at SessionStart (injected as the
-        // first turn in history), so the ungated payload is the same SSOT body
-        // Claude receives — byte-equal to the shared emitted payload (which may
-        // carry the ticket-05 staleness note, so the comparison must go through
-        // the same emission wrapper to stay environment-independent).
-        let ctx = session_start_context(true, HostFormat::Gemini)
-            .expect("Gemini inject should carry the teaching payload");
-        assert_eq!(ctx, crate::cli::teaching::emitted_payload());
-        assert!(
-            ctx.contains("The edit→diagnostics loop"),
-            "payload body should be inlined: {ctx}",
-        );
-    }
-
-    #[test]
     fn session_start_context_absent_when_not_announcing() {
         assert!(session_start_context(false, HostFormat::Claude).is_none());
-        // Gemini also honors the resume/withhold gate.
-        assert!(session_start_context(false, HostFormat::Gemini).is_none());
     }
 
     #[test]
     fn session_start_context_absent_for_other_hosts() {
         // Antigravity and OpenCode carry teaching through other channels — only
-        // Claude Code and Gemini CLI read `additionalContext` at SessionStart.
+        // Claude Code reads `additionalContext` at SessionStart.
         assert!(session_start_context(true, HostFormat::Antigravity).is_none());
         assert!(session_start_context(true, HostFormat::OpenCode).is_none());
-    }
-
-    #[test]
-    fn gemini_session_start_emits_additional_context_equal_to_payload_body() {
-        // End-to-end shape: an announcing Gemini SessionStart produces a
-        // `hookSpecificOutput.additionalContext` byte-equal to the shared
-        // emitted payload — the same field, shape, and content Claude reads
-        // (compared through the emission wrapper so a live stale daemon's
-        // ticket-05 note can't make the assertion environment-dependent).
-        let builder = crate::hook::response::SystemMessageBuilder::new();
-        let ctx = session_start_context(true, HostFormat::Gemini)
-            .expect("Gemini inject should carry the payload");
-        let obj = build_session_start_response(builder, Some(ctx.as_str()))
-            .expect("context should produce an object");
-        assert_eq!(obj["hookSpecificOutput"]["hookEventName"], "SessionStart");
-        assert_eq!(
-            obj["hookSpecificOutput"]["additionalContext"]
-                .as_str()
-                .expect("additionalContext string"),
-            crate::cli::teaching::emitted_payload(),
-        );
     }
 
     #[test]
@@ -2542,8 +2253,8 @@ mod tests {
 
     #[test]
     fn subagent_start_response_non_claude_is_none() {
-        assert!(build_subagent_start_response(HostFormat::Gemini).is_none());
         assert!(build_subagent_start_response(HostFormat::Antigravity).is_none());
+        assert!(build_subagent_start_response(HostFormat::OpenCode).is_none());
     }
 
     // ── Antigravity PreInvocation first-sighting injection (ws36 ticket 03) ─
@@ -2600,74 +2311,6 @@ mod tests {
         assert!(
             v.as_object().expect("object").is_empty(),
             "no injectSteps on the no-op path: {out}",
-        );
-    }
-
-    // ── Gemini PreCompress + BeforeAgent compaction re-injection (ticket 14) ─
-
-    #[test]
-    fn pre_compress_marks_only_on_a_real_manual_compaction() {
-        // HARD GATE: PreCompress fires on every turn (before the threshold check),
-        // and only `manual` (force=true, threshold-bypassing) provably compresses.
-        // `auto` fires on every turn including no-ops, so it must NOT mark — else
-        // the payload re-injects on nearly every turn.
-        assert!(pre_compress_should_mark(Some("manual")));
-        assert!(!pre_compress_should_mark(Some("auto")));
-        assert!(!pre_compress_should_mark(None));
-        assert!(!pre_compress_should_mark(Some("something-else")));
-    }
-
-    #[test]
-    fn discontinuity_mark_is_consumed_at_most_once() {
-        // Lay a mark, then the first take consumes it (→ inject) and every later
-        // take finds nothing (→ skip). This is what bounds BeforeAgent to one
-        // injection per mark; combined with `manual`-only marking, it is never
-        // per-turn.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let sid = "sess-abc-123";
-        assert!(
-            !take_mark_in(dir.path(), sid),
-            "no mark yet → nothing to consume"
-        );
-        lay_mark_in(dir.path(), sid).expect("lay mark");
-        assert!(
-            take_mark_in(dir.path(), sid),
-            "first take consumes the pending mark"
-        );
-        assert!(
-            !take_mark_in(dir.path(), sid),
-            "the mark is cleared — a second take injects nothing"
-        );
-    }
-
-    #[test]
-    fn discontinuity_marks_are_per_session() {
-        // Marks are keyed on session_id, so one session's compaction never
-        // re-injects into another's.
-        let dir = tempfile::tempdir().expect("tempdir");
-        lay_mark_in(dir.path(), "session-a").expect("lay mark a");
-        assert!(
-            !take_mark_in(dir.path(), "session-b"),
-            "session-b has no mark of its own"
-        );
-        assert!(
-            take_mark_in(dir.path(), "session-a"),
-            "session-a's mark is still pending"
-        );
-    }
-
-    #[test]
-    fn before_agent_injection_is_gemini_additional_context() {
-        // Bundle-pinned shape: `hookSpecificOutput.additionalContext` carries the
-        // payload; Gemini reads exactly this field for BeforeAgent.
-        let out = before_agent_injection("PAYLOAD");
-        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
-        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "BeforeAgent");
-        assert_eq!(v["hookSpecificOutput"]["additionalContext"], "PAYLOAD");
-        // No Antigravity `injectSteps` shape leaks into the Gemini output.
-        assert!(
-            v.get("injectSteps").is_none(),
-            "BeforeAgent output must not carry injectSteps: {out}"
         );
     }
 }

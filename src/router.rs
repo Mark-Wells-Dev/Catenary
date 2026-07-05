@@ -497,7 +497,7 @@ struct SessionEntry {
 #[cfg(unix)]
 #[derive(Clone)]
 struct SessionMeta {
-    /// Host CLI name from the hook `format` field (`claude`/`gemini`/…).
+    /// Host CLI name from the hook `format` field (`claude`/`antigravity`/…).
     client_name: Option<String>,
     /// When the session first connected (ISO 8601).
     started_at: String,
@@ -508,8 +508,8 @@ struct SessionMeta {
 
 /// Extracts a session's workspace roots from its hook payload.
 ///
-/// Host-agnostic: Antigravity sends `workspacePaths` (array), Claude Code and
-/// Gemini CLI send `cwd` (string). Returns an empty vec when neither is
+/// Host-agnostic: Antigravity sends `workspacePaths` (array), Claude Code sends
+/// `cwd` (string). Returns an empty vec when neither is
 /// present. Deliberately reads only the session's *own* payload — per the
 /// design, the board does not correlate `session_id` to MCP roots.
 #[cfg(unix)]

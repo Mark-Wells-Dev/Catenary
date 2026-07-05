@@ -43,7 +43,7 @@ applies only to Catenary's own events.
 kind       — "lsp" | "mcp" | "hook" — routes to protocol DB sink
 method     — Protocol method name (LSP/MCP method)
 server     — LSP server name ("rust-analyzer", "pylsp", ...)
-client     — Client identifier ("claude-code", "gemini-cli")
+client     — Client identifier ("claude-code", "antigravity")
 request_id — In-process correlation id (i64)
 parent_id  — Correlation id of the causing event (i64)
 source     — Subsystem that emitted the event (see taxonomy below)

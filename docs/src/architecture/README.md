@@ -22,7 +22,7 @@ Every external interaction crosses one of four boundaries:
 - **LSP** — Catenary ↔ language servers. Catenary spawns and manages
   language server processes, sending requests and receiving
   notifications over JSON-RPC stdio.
-- **Hooks** — host CLI ↔ Catenary. The host CLI (Claude Code, Gemini
+- **Hooks** — host CLI ↔ Catenary. The host CLI (Claude Code, Antigravity
   CLI) fires hooks at lifecycle boundaries (pre-tool, post-agent,
   session start/end). Hook processes connect to the daemon's
   IPC socket and exchange JSON messages.

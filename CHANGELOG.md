@@ -648,6 +648,22 @@ upgrading.
   content (`binary`). A search with nothing skipped renders byte-identically to
   before, and the exit stays `0` on this soft condition.
 
+### Removed
+
+- **Gemini CLI support is withdrawn** (decision 030). Google's June 18, 2026
+  cutoff of individual, free, and Pro-tier Gemini CLI access left the host
+  untestable by individuals, and Catenary is verified by live dogfooding — an
+  unrunnable host can only ship faith-based teaching. The maintainer also
+  declines to donate support labor to an ecosystem that accepted a year of
+  community pull requests against an Apache-2.0 codebase and then locked those
+  contributors out behind a proprietary, paywalled backend. `catenary install
+  gemini` now prints a one-line withdrawal note and installs nothing (remove any
+  prior extension by hand: `gemini extensions uninstall catenary`, or delete
+  `~/.gemini/extensions/catenary`); the `pre-compress` / `before-agent` hooks,
+  the Gemini extension manifest, and the Gemini doctor checks are gone.
+  Antigravity CLI support continues — it is the Google-ecosystem path
+  individuals can still run.
+
 ### Migration
 
 See the [Migration guide](docs/src/migrating-to-2.0.md) for per-change

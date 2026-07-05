@@ -21,9 +21,8 @@ use crate::hook::{HookRequest, HookResult};
 
 /// Returns `true` if the tool is an edit tool that requires `start_editing`.
 ///
-/// Checks all known edit tool names across host CLIs (Claude Code, Gemini CLI,
-/// Antigravity CLI, and OpenCode — whose built-ins are lowercase: `edit`/
-/// `write`/`patch`).
+/// Checks all known edit tool names across host CLIs (Claude Code, Antigravity
+/// CLI, and OpenCode — whose built-ins are lowercase: `edit`/`write`/`patch`).
 #[must_use]
 pub fn is_edit_tool(tool_name: &str) -> bool {
     matches!(
@@ -31,8 +30,6 @@ pub fn is_edit_tool(tool_name: &str) -> bool {
         "Edit"
             | "Write"
             | "NotebookEdit"
-            | "write_file"
-            | "replace"
             | "write_to_file"
             | "replace_file_content"
             | "multi_replace_file_content"
@@ -50,13 +47,10 @@ fn is_read_tool(tool_name: &str) -> bool {
     matches!(tool_name, "Read" | "NotebookRead" | "read_file" | "read")
 }
 
-/// Returns `true` if the tool is a shell tool (`Bash`, `run_shell_command`,
-/// `run_command`, or OpenCode's lowercase `bash`).
+/// Returns `true` if the tool is a shell tool (`Bash`, `run_command`, or
+/// OpenCode's lowercase `bash`).
 fn is_bash_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "Bash" | "run_shell_command" | "run_command" | "bash"
-    )
+    matches!(tool_name, "Bash" | "run_command" | "bash")
 }
 
 /// Filesystem-manipulation commands allowed during editing mode.
@@ -674,9 +668,6 @@ mod tests {
         assert!(is_edit_tool("Edit"));
         assert!(is_edit_tool("Write"));
         assert!(is_edit_tool("NotebookEdit"));
-        // Gemini CLI edit tools
-        assert!(is_edit_tool("write_file"));
-        assert!(is_edit_tool("replace"));
         // Antigravity CLI edit tools
         assert!(is_edit_tool("write_to_file"));
         assert!(is_edit_tool("replace_file_content"));
@@ -1304,7 +1295,6 @@ mod tests {
     #[test]
     fn test_is_bash_tool() {
         assert!(is_bash_tool("Bash"));
-        assert!(is_bash_tool("run_shell_command"));
         assert!(is_bash_tool("run_command")); // Antigravity CLI
         assert!(is_bash_tool("bash")); // OpenCode (lowercase built-in)
         assert!(!is_bash_tool("Edit"));
@@ -1368,9 +1358,9 @@ mod tests {
             "filesystem-only Bash should be allowed during editing, got {result:?}"
         );
 
-        // Gemini CLI shell tool with filesystem command
+        // Antigravity CLI shell tool with filesystem command
         let result = router.handle_enforce_editing(
-            "run_shell_command",
+            "run_command",
             None,
             Some("mkdir -p src/new_module"),
             None,
@@ -1378,7 +1368,7 @@ mod tests {
         );
         assert!(
             result.is_none(),
-            "filesystem-only run_shell_command should be allowed, got {result:?}"
+            "filesystem-only run_command should be allowed, got {result:?}"
         );
     }
 

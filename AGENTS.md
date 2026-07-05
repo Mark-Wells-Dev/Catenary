@@ -1,6 +1,6 @@
 # Catenary Agent Context
 
-This file serves as the single point of truth for AI agents (Claude, Gemini, etc.) working on the Catenary project.
+This file serves as the single point of truth for AI agents (Claude, etc.) working on the Catenary project.
 
 ## Project Grounding
 
@@ -42,11 +42,11 @@ others.
   binding. Each command connects to the daemon over a Unix domain socket,
   delegates to one or more LSP servers, and prints results to stdout.
 - **Hooks:** Catenary registers several lifecycle hooks per host (Claude Code,
-  Gemini CLI, Antigravity CLI); the `PreToolUse` hook handles editing enforcement,
+  Antigravity CLI); the `PreToolUse` hook handles editing enforcement,
   command filtering, and file tracking. Hook definitions (the full per-host set)
   live in
-  `plugins/catenary/hooks/hooks.json` (Claude Code), `hooks/hooks.json`
-  (Gemini CLI), and `plugins/catenary-antigravity/hooks.json` (Antigravity CLI).
+  `plugins/catenary/hooks/hooks.json` (Claude Code) and
+  `plugins/catenary-antigravity/hooks.json` (Antigravity CLI).
 - **CLI commands:** Editing lifecycle invoked via the host's shell tool:
   - Editing starts implicitly on the first edit — there is no explicit start
     step (`catenary editing start` remains as an idempotent no-op).
