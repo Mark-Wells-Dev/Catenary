@@ -504,6 +504,13 @@ upgrading.
 
 ### Fixed
 
+- **Top-level `catenary --version`/`--help` admit only as sole flags.** The
+  canonical-form matcher admits the global informational flags (`--version`/
+  `-V`/`--help`/`-h`) only when the flag is the entire argument vector —
+  `catenary --version extra-arg` and paired flags now fall through to the
+  fail-closed denial instead of being wrongly admitted. The `version`
+  subcommand (which also reports the running daemon's version) keeps its
+  normal lenient admission.
 - **A failing `cd` before a `;` no longer mis-attributes a later relative
   write.** The write resolver simulates `cd` by threading the target through
   the effective cwd, but couldn't tell a `cd` would fail at run time. For

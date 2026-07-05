@@ -663,12 +663,13 @@ impl Sub {
 enum Recog {
     /// An agent-facing subcommand.
     Agent(Sub),
-    /// A global read: `catenary --version`/`-V`, `catenary --help`/`-h`
-    /// (subcommand-less — clap handles them globally, bug 22), or the `version`
-    /// subcommand (the same read plus a stateless daemon-version query, so
-    /// CLI/daemon staleness is visible at a glance). A pure, side-effect-free
-    /// introspection — no handoff, no tracked-set interaction — so it is
-    /// admitted.
+    /// A global read: a sole `catenary --version`/`-V` or `catenary --help`/`-h`
+    /// (subcommand-less — clap handles them globally; admitted only when the
+    /// flag is the sole argument, so `catenary --version extra` stays
+    /// fail-closed, bug 22 / misc 142), or the `version` subcommand (the same
+    /// read plus a stateless daemon-version query, so CLI/daemon staleness is
+    /// visible at a glance). A pure, side-effect-free introspection — no
+    /// handoff, no tracked-set interaction — so it is admitted.
     GlobalRead,
     /// A real catenary subcommand reserved for host hooks / interactive use.
     NotAgent,
@@ -696,14 +697,23 @@ fn recognize_catenary_sub(rest: &[&str]) -> Recog {
             Some("hook" | "stop" | "debug" | "config" | "doctor" | "install" | "update" | "daemon"),
             _,
         ) => Recog::NotAgent,
-        // Global reads. clap's `--version`/`-V` and `--help`/`-h` short-circuit
-        // before any subcommand, so they reach here only when the *first* token
-        // is the flag (the subcommand arms above already claimed
-        // `catenary grep --help` via `grep`). The `version` subcommand is the
-        // same pure read plus a stateless daemon-version query. Placed after
-        // the subcommand arms and before the `_ => Unknown` fallthrough so
-        // everything else stays fail-closed (bug 22).
-        (Some("version" | "--version" | "-V" | "--help" | "-h"), _) => Recog::GlobalRead,
+        // Global reads — pure, side-effect-free introspection (no handoff, no
+        // tracked-set interaction), admitted after the subcommand arms and
+        // before the fail-closed fallthrough (bug 22 / misc 142):
+        //
+        // - `catenary version`: a real subcommand (reports the CLI version and
+        //   the running daemon's) — the richer version probe, recognized like
+        //   the other subcommand arms above.
+        // - a subcommand-less `--version`/`-V` or `--help`/`-h`: clap
+        //   short-circuits these before any subcommand, so they reach here only
+        //   as the *first* token (the subcommand arms above already claimed
+        //   `catenary grep --help` via `grep`). Admitted ONLY as the sole
+        //   argument (`rest.get(1)` is `None`) — a flag plus an extra arg
+        //   (`catenary --version extra`), paired flags, or an unknown flag stay
+        //   fail-closed.
+        (Some("version"), _) | (Some("--version" | "-V" | "--help" | "-h"), None) => {
+            Recog::GlobalRead
+        }
         _ => Recog::Unknown,
     }
 }
@@ -3931,6 +3941,27 @@ mod tests {
     }
 
     #[test]
+    fn matcher_denies_global_flag_with_extra_arg() {
+        // misc 142: the subcommand-less informational flags are admitted only
+        // as the *sole* argument. A flag carrying an extra arg (or a second
+        // flag) is not "exactly one global informational flag", so it stays
+        // fail-closed — only `catenary version` (the subcommand) admits a
+        // richer form.
+        for cmd in [
+            "catenary --version extra",
+            "catenary -V extra",
+            "catenary --help topic",
+            "catenary -h topic",
+            "catenary --help --version",
+        ] {
+            assert!(
+                deny_text(cmd).contains("isn't a recognized"),
+                "{cmd} must deny — a global flag is admitted only as the sole argument",
+            );
+        }
+    }
+
+    #[test]
     fn matcher_subcommand_help_unaffected() {
         // bug 22 scope: subcommand-scoped help still resolves via the
         // subcommand arm (the global-read arm sits after them), so
@@ -4497,6 +4528,8 @@ mod tests {
             ("catenary -h", Allow),
             ("catenary version", Allow), // subcommand form: CLI + daemon versions
             ("catenary --frobnicate", DenyCatenary), // unknown flag stays closed
+            ("catenary --version extra", DenyCatenary), // sole-flag only (misc 142)
+            ("catenary -h topic", DenyCatenary), // sole-flag only (misc 142)
         ];
         for (cmd, want) in cases {
             assert_eq!(&outcome(cmd, &rules), want, "outcome for {cmd:?}");
