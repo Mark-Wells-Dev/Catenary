@@ -606,17 +606,6 @@ struct HookDispatchContext {
     /// `conversationId` the hook has taught, so the persisted `userMessage` is
     /// injected exactly once per conversation.
     first_sightings: FirstSightings,
-    /// Directory holding the per-session `catenary diagnostics` receipt stores
-    /// (misc 139 / bug 60). Defaults to [`crate::paths::diagnostics_receipt_dir`]
-    /// (`runtime_dir()/catenary/receipts`); tests point it at a tempdir so the
-    /// daemon-side store write is isolated from the host runtime dir.
-    receipt_store_dir: PathBuf,
-    /// Covered-file set of each session's last stored receipt, keyed by
-    /// `session_id` (misc 139 / bug 60). Recorded at compute time whenever a
-    /// receipt is persisted; read on a later bare run that diagnosed nothing so
-    /// its `[no edited files]` can still name the prior store and its covered
-    /// files — the killed-client recovery shape.
-    last_receipts: Arc<std::sync::Mutex<HashMap<String, Vec<PathBuf>>>>,
 }
 
 /// A staged hook→CLI handoff, deposited under a [`HandoffKey`] by the
@@ -643,14 +632,16 @@ struct HandoffContext {
 
 /// The payload of a staged [`HandoffContext`].
 enum HandoffPayload {
-    /// `diagnostics` — *data-back*: the hook snapshots the accumulated set and
-    /// the `catenary diagnostics` CLI command retrieves it. The accumulator is
-    /// cleared on successful *consume*, not at prepare (drain-on-consume, bug
-    /// 32): a failed attempt that never consumes leaves the set intact for a
-    /// retry, so the `editing_session`/`agent_id` key rides the handoff for the
-    /// consume step to clear the right `EditingManager` bucket.
+    /// `diagnostics` — *data-back*: the hook snapshots the batch and the
+    /// `catenary diagnostics` CLI command retrieves it. The batch is never
+    /// mutated at prepare *or* consume until delivery (misc 141): its `delivered`
+    /// flags flip only after the response's socket write succeeds, so a failed
+    /// attempt that never delivers leaves the batch and its gate intact for a
+    /// retry. The `editing_session`/`agent_id` key rides the handoff so the flip
+    /// targets the right `EditingManager` bucket.
     Diagnostics {
-        /// Accumulated files snapshotted from the editing session.
+        /// The batch's files snapshotted from the editing session (delivered
+        /// ones included — a bare pull re-diagnoses the whole batch).
         files: Vec<PathBuf>,
         /// Number of files skipped because they were outside tracked workspace
         /// roots (no LSP coverage).
@@ -661,15 +652,15 @@ enum HandoffPayload {
         filtered_roots: std::collections::BTreeSet<PathBuf>,
         /// Host session id (from the staging hook). The bare `catenary
         /// diagnostics` process is identity-less, so the session id rides the
-        /// handoff — the daemon names the per-session overflow file with it.
+        /// handoff — the daemon looks the session up to flip its batch.
         session_id: String,
         /// `EditingManager` session key (the raw `session_id` Option, absent →
-        /// `None`) used to clear the accumulator on consume. Distinct from the
+        /// `None`) used to flip the batch on delivery. Distinct from the
         /// `"default"`-fallback `session_id` above; mirrors how the prepare
         /// snapshot was keyed.
         editing_session: Option<String>,
-        /// Agent id used to clear the accumulator's per-agent bucket on consume
-        /// (bug 37 scoping — drain only the requesting agent's set).
+        /// Agent id used to flip the batch's per-agent bucket on delivery
+        /// (bug 37 scoping — touch only the requesting agent's batch).
         agent_id: String,
     },
 }
@@ -1887,8 +1878,6 @@ impl SessionManager {
             worktree_watcher,
             ephemeral_mounts: EphemeralMounts::new(),
             first_sightings: FirstSightings::new(),
-            receipt_store_dir: crate::paths::diagnostics_receipt_dir(),
-            last_receipts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
         self
     }
@@ -2371,116 +2360,6 @@ fn with_out_of_roots_note(
     } else {
         format!("{output}\n{note}")
     }
-}
-
-/// Formats the trailing store-pointer line for a diagnostics receipt (misc 139 /
-/// bug 60).
-///
-/// Names the store path plus the covered-file list, so the agent always knows
-/// where the last computed diagnostics live and can tell at a glance whether the
-/// store holds the set it just edited or a stale/different one (the maintainer's
-/// "tell at a glance" clause). The store path is rendered absolute so the agent
-/// can `cat` it directly; covered files use the receipt's home-compressed style.
-#[cfg(unix)]
-fn format_receipt_pointer(store_path: &Path, covered: &[PathBuf]) -> String {
-    let mut files: Vec<String> = covered
-        .iter()
-        .map(|p| crate::bridge::compress_home(p))
-        .collect();
-    files.sort();
-    let n = files.len();
-    let plural = if n == 1 { "" } else { "s" };
-    format!(
-        "last computed diagnostics saved to {} \u{b7} covered {n} file{plural}: {}",
-        store_path.display(),
-        files.join(", "),
-    )
-}
-
-/// Persists the rendered diagnostics receipt to the per-session store and returns
-/// the trailing pointer line for stdout (misc 139 / bug 60).
-///
-/// Called at COMPUTE time — after the receipt is rendered, before the response is
-/// written — so a `catenary diagnostics` CLI client killed after dispatch
-/// (SIGKILL, host-tool timeout, Ctrl-C) cannot lose the receipt: the store holds
-/// it and the pointer names it. The bytes written match what stdout carries.
-///
-/// Behaviour by run shape:
-///
-/// - A run that diagnosed files (`covered` non-empty, non-empty `receipt`) writes
-///   `receipt` to the store, records the covered set for the session, and returns
-///   the pointer.
-/// - A bare run that diagnosed nothing (`covered` empty) writes nothing but, when
-///   a prior store for the session still exists on disk, returns the pointer
-///   naming it and its remembered covered set — the killed-client recovery shape.
-///
-/// Fail-soft: any filesystem error is logged at debug and yields `None` (no
-/// pointer), never breaking the receipt — delivery robustness must not add a new
-/// failure mode.
-#[cfg(unix)]
-fn persist_receipt(
-    ctx: &HookDispatchContext,
-    session_id: &str,
-    receipt: &str,
-    covered: &[PathBuf],
-) -> Option<String> {
-    let store_path = ctx
-        .receipt_store_dir
-        .join(crate::paths::diagnostics_receipt_file(session_id));
-
-    if covered.is_empty() {
-        // Recovery shape: this run diagnosed nothing. Point at a prior store when
-        // one still exists, so the agent can compare its covered set against what
-        // it just edited (bug 60's killed-client witness gap).
-        let prior = ctx
-            .last_receipts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(session_id)
-            .cloned()?;
-        if !store_path.exists() {
-            return None;
-        }
-        return Some(format_receipt_pointer(&store_path, &prior));
-    }
-
-    if receipt.trim().is_empty() {
-        // Covered files but an empty receipt is a rare defensive edge (every file
-        // dropped during resolve/validate) with nothing worth storing.
-        return None;
-    }
-
-    if let Some(parent) = store_path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        debug!(
-            source = Source::DaemonDispatch.as_str(),
-            session_id = %session_id,
-            error = %e,
-            "diagnostics receipt store: create_dir_all failed — receipt not persisted",
-        );
-        return None;
-    }
-    if let Err(e) = std::fs::write(&store_path, receipt) {
-        debug!(
-            source = Source::DaemonDispatch.as_str(),
-            session_id = %session_id,
-            error = %e,
-            "diagnostics receipt store: write failed — receipt not persisted",
-        );
-        return None;
-    }
-    ctx.last_receipts
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(session_id.to_string(), covered.to_vec());
-    debug!(
-        source = Source::DaemonDispatch.as_str(),
-        session_id = %session_id,
-        covered = covered.len(),
-        "diagnostics receipt persisted to per-session store",
-    );
-    Some(format_receipt_pointer(&store_path, covered))
 }
 
 /// Decides whether an edited file should auto-mount its enclosing git worktree.
@@ -3213,19 +3092,18 @@ async fn handle_hook_dispatch(
     //
     // `pre-tool/editing-stop` is sent by the PreToolUse hook when
     // the agent runs `catenary diagnostics` (internal method name
-    // unchanged). Acquires the handoff lock, drains files, releases the
-    // editing guardrail, and deposits the file list for the subsequent
-    // CLI command.
+    // unchanged). Acquires the handoff lock and deposits a snapshot of the
+    // batch for the subsequent CLI command — the batch is neither drained nor
+    // its flags flipped here (misc 141): delivery, at consume, does that.
     if method == "pre-tool/editing-stop" {
         let scope_id = uuid::Uuid::new_v4().to_string();
 
         let router = get_or_create_router(&ctx, &session_id, &raw);
 
         // The PreToolUse hook forwards the real `agent_id` from the host CLI.
-        // Drain only the requesting
-        // agent's bucket — flattening every agent's bucket would consume a
-        // sibling subagent's accumulated set, since subagents share the
-        // parent's `session_id` and differ only by `agent_id` (bug 37).
+        // Snapshot only the requesting agent's batch — reading every agent's
+        // bucket would surface a sibling subagent's set, since subagents share
+        // the parent's `session_id` and differ only by `agent_id` (bug 37).
         let agent_id = raw
             .get("agent_id")
             .and_then(|v| v.as_str())
@@ -3244,14 +3122,14 @@ async fn handle_hook_dispatch(
         // — and holds for milliseconds at most.
         let permit = ctx.handoff.acquire(HandoffKey::Diagnostics).await?;
 
-        // Snapshot this agent's accumulated files WITHOUT draining (bug 32:
-        // drain-on-consume). The `EditingManager` is cleared only when
-        // `tool/editing-stop` successfully consumes the slot — a failed or
-        // never-connecting `catenary diagnostics` (clap reject, host-killed
-        // subprocess) then leaves the set intact for a retry, instead of
-        // destroying it the instant the command is attempted. The
-        // `editing_session`/`agent_id` key rides the handoff so the consume
-        // step clears exactly this bucket.
+        // Snapshot the whole of this agent's batch (misc 141): the bare form
+        // re-diagnoses every batch file, delivered or not, so `files()` returns
+        // all of them. The batch is never mutated here — its `delivered` flags
+        // flip only when the consume step's response reaches the client, so a
+        // failed or never-connecting `catenary diagnostics` (clap reject,
+        // host-killed subprocess) leaves the batch and its gate exactly as they
+        // were, ready for a retry. The `editing_session`/`agent_id` key rides the
+        // handoff so the consume step flips exactly this bucket.
         let files = router.session.editing.files(editing_session, &agent_id);
         let filtered = router.session.editing.filtered(editing_session, &agent_id);
         let filtered_roots = router
@@ -3265,16 +3143,16 @@ async fn handle_hook_dispatch(
             agent_id = %agent_id,
             file_count = files.len(),
             filtered,
-            "diagnostics: snapshotted files from EditingManager (clear deferred to consume)",
+            "diagnostics: snapshotted batch from EditingManager (flip deferred to delivery)",
         );
 
-        // The editing guardrail is NOT released here anymore (ws37 ticket 02,
-        // decision 3). The gate is a debt paid by *diagnosing*, so the release
-        // moves to the consume step (`tool/editing-stop`) and goes conditional:
-        // release iff the debt set is empty after the diagnosed files are
-        // dropped. Prepare only snapshots — a scoped pull that leaves debt keeps
-        // the gate armed, and a faulted attempt that never consumes leaves both
-        // the debt set and the lock intact (drain-on-consume, bug 32).
+        // The editing guardrail is NOT released here (ws37 ticket 02, decision 3;
+        // misc 141). The gate is a debt paid by *delivered* diagnostics, so the
+        // release moves to the consume step and goes conditional: release iff no
+        // undelivered debt remains once the response reaches the client. Prepare
+        // only snapshots — a scoped pull that leaves debt keeps the gate armed,
+        // and a faulted attempt that never delivers leaves both the batch and the
+        // lock intact.
 
         // Mint the scope UUID for the done-editing IPC execution.
         // This is separate from the prepare handler's own scope_id —
@@ -3336,9 +3214,9 @@ async fn handle_hook_dispatch(
     if method == "tool/editing-stop" {
         // Scoped paths from the consume request (ws37 ticket 02). The CLI
         // resolves relative paths against its cwd before dispatch, so these are
-        // absolute. The bare form sends an empty set → the whole debt set is
-        // drained and reported (today's behavior); a non-empty set means the
-        // agent named files to diagnose on demand and pay their debt.
+        // absolute. The bare form sends an empty set → the whole batch is
+        // re-diagnosed and its flags flipped; a non-empty set means the agent
+        // named files to diagnose on demand and pay their debt (misc 141).
         let scoped_files: Vec<PathBuf> = raw
             .get("files")
             .and_then(serde_json::Value::as_array)
@@ -3374,71 +3252,17 @@ async fn handle_hook_dispatch(
             )
         });
 
-        // Drain-on-consume (bug 32) + conditional guardrail release (ws37 ticket
-        // 02, decision 3): the slot was just taken, so this attempt owns the
-        // round-trip. Pay the debt NOW — the prepare step only snapshotted it. A
-        // failed attempt that never reached here left the set intact; this
-        // consume is the success that earns the clear. Scoped to the requesting
-        // `(editing_session, agent_id)` bucket so a sibling agent's set survives
-        // (bug 37).
-        //
-        // Bare (no scoped paths) drains the whole bucket; a scoped pull drops
-        // ONLY the named files (never `clear_all`, bug 37) — a named path not in
-        // the bucket is a no-op drop. Then the guardrail releases iff the debt
-        // set is now empty: a partial pull keeps the gate armed, the bare form
-        // always empties → always releases, and re-editing a paid file re-arms
-        // it. Uses the handoff-carried `session_id` (the value prepare would
-        // have released with — the bare consume request itself carries no
-        // session identity).
-        if let Some((_, _, _, session_id, editing_session, agent_id, _)) = &handoff {
-            let editing = ctx
-                .sessions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(session_id)
-                .map(|e| e.router.session.clone());
-            if let Some(session) = editing {
-                if scoped {
-                    let dropped = session.editing.drop_files(
-                        editing_session.as_deref(),
-                        agent_id,
-                        &scoped_files,
-                    );
-                    debug!(
-                        source = Source::DaemonDispatch.as_str(),
-                        session_id = %session_id,
-                        agent_id = %agent_id,
-                        dropped = dropped.len(),
-                        requested = scoped_files.len(),
-                        "diagnostics: paid scoped debt on consume (drain-on-consume)",
-                    );
-                } else {
-                    let (cleared, _) = session
-                        .editing
-                        .drain_and_clear(editing_session.as_deref(), agent_id);
-                    debug!(
-                        source = Source::DaemonDispatch.as_str(),
-                        session_id = %session_id,
-                        agent_id = %agent_id,
-                        cleared = cleared.len(),
-                        "diagnostics: cleared accumulator on consume (drain-on-consume)",
-                    );
-                }
-                // Release the editing guardrail iff the debt is now fully paid.
-                if !session
-                    .editing
-                    .has_files(editing_session.as_deref(), agent_id)
-                {
-                    ctx.editing_guardrail.release_all(session_id);
-                    debug!(
-                        source = Source::DaemonDispatch.as_str(),
-                        session_id = %session_id,
-                        agent_id = %agent_id,
-                        "diagnostics: debt set empty — editing guardrail released",
-                    );
-                }
-            }
-        }
+        // The batch is NOT mutated here (misc 141): a `catenary diagnostics` run
+        // pays its debt by *delivery*, not on consume, so the `delivered` flags
+        // flip only after the response's socket write succeeds (below) — a failed
+        // write must leave the flags false and the gate armed. The keys needed to
+        // flip the right `(editing_session, agent_id)` bucket ride the handoff and
+        // are captured before the borrow-consuming match. Uses the
+        // handoff-carried `session_id` (the value prepare staged — the bare
+        // consume request itself carries no session identity).
+        let flip_keys: Option<(String, Option<String>, String)> = handoff
+            .as_ref()
+            .map(|h| (h.3.clone(), h.4.clone(), h.5.clone()));
 
         // Extract scope_id early so we can emit the incoming hook
         // event before running the diagnostics pipeline. This ensures
@@ -3459,28 +3283,25 @@ async fn handle_hook_dispatch(
             "incoming hook",
         );
 
-        // Session id from the handoff (tuple index 3), kept for the receipt-store
-        // write after the borrow-consuming match below (misc 139 / bug 60).
-        let handoff_session_id: Option<String> = handoff.as_ref().map(|h| h.3.clone());
-
         // `dirty` is a status label only (ws37 ticket 01): the CLI exits `0`
         // whether clean or dirty — the clean/dirty distinction lives in the
         // per-file receipt (`output`), where clean files carry `[clean]` and
         // dirty files their diagnostics. Faults (no daemon, IPC/parse failure)
         // are detected CLI-side and exit `2`. `covered` is the count of covered
         // files in the handoff: it lets the CLI print `[no edited files]` for a
-        // genuinely empty set (covered == 0, empty receipt). `covered_files` is
-        // that same set as paths, for the receipt-store pointer (misc 139).
-        let (dirty, output, covered, covered_files) =
+        // genuinely empty set (covered == 0, empty receipt).
+        let (dirty, output, covered) =
             if let Some((files, filtered, filtered_roots, session_id, _, _, _)) = handoff {
                 // A scoped pull diagnoses exactly the named paths; the bare form
-                // diagnoses the drained debt snapshot. The accumulation-time
-                // `filtered` count (files skipped for lack of coverage) applies only
-                // to the bare drain — a scoped pull names files explicitly, so an
-                // uncovered named file renders its own out-of-scope line in the
-                // receipt and the accumulation note is suppressed.
+                // re-diagnoses the whole batch snapshot (delivered files included).
+                // The accumulation-time `filtered` count (files skipped for lack of
+                // coverage) applies only to the bare form — a scoped pull names files
+                // explicitly, so an uncovered named file renders its own out-of-scope
+                // line in the receipt and the accumulation note is suppressed.
+                // Clone `scoped_files` for the pipeline — the originals are needed
+                // after the match to flip exactly the named files on delivery.
                 let (diag_files, filtered, filtered_roots) = if scoped {
-                    (scoped_files, 0, std::collections::BTreeSet::new())
+                    (scoped_files.clone(), 0, std::collections::BTreeSet::new())
                 } else {
                     (files, filtered, filtered_roots)
                 };
@@ -3501,7 +3322,6 @@ async fn handle_hook_dispatch(
                         false,
                         with_out_of_roots_note(String::new(), filtered, &filtered_roots),
                         covered,
-                        Vec::new(),
                     )
                 } else {
                     // Ephemeral mount (ticket 02): any diagnosed file outside
@@ -3514,8 +3334,7 @@ async fn handle_hook_dispatch(
                     // `process_files_batched` sees the file as covered.
                     ensure_ephemeral_mounts(&ctx, &diag_files, Instant::now(), &session_id).await;
                     // Reflect the run on the session board: status → diagnostics
-                    // for its duration (the editing accumulator was cleared on
-                    // consume, just above), then record the result as last_action
+                    // for its duration, then record the result as last_action
                     // (observability ticket 05). Clone the session Arc and drop the
                     // registry lock before the await.
                     let board_session = ctx
@@ -3591,7 +3410,6 @@ async fn handle_hook_dispatch(
                         outcome.dirty,
                         with_out_of_roots_note(outcome.output, filtered, &filtered_roots),
                         covered,
-                        diag_files,
                     )
                 }
             } else {
@@ -3600,19 +3418,8 @@ async fn handle_hook_dispatch(
                     false,
                     "diagnostics handoff expired — no files available".to_string(),
                     0,
-                    Vec::new(),
                 )
             };
-
-        // Persist the rendered receipt to the per-session store at COMPUTE time,
-        // before the response leaves — so a `catenary diagnostics` CLI client
-        // killed after dispatch cannot lose it — and build the trailing pointer
-        // line stdout appends (misc 139 / bug 60). A bare run that diagnosed
-        // nothing still surfaces a prior store when one exists (killed-client
-        // recovery). Fail-soft: a store error yields no pointer, never a fault.
-        let store_pointer = handoff_session_id
-            .as_deref()
-            .and_then(|session_id| persist_receipt(&ctx, session_id, &output, &covered_files));
 
         emit_hook_event(
             tracing::Level::INFO,
@@ -3627,21 +3434,67 @@ async fn handle_hook_dispatch(
         // the rendered per-file receipt the CLI prints verbatim. `status` is a
         // clean/dirty label the CLI no longer maps to an exit code (ws37 ticket
         // 01) — it is retained for telemetry. `covered` (the diagnosed file
-        // count — the scoped paths, or the drained debt set for a bare pull)
-        // lets the CLI print `[no edited files]` for a genuinely empty set
-        // (covered == 0, empty receipt; scoped pulls are always non-empty).
-        // `store_pointer` (misc 139) names the per-session receipt store and its
-        // covered files; the CLI prints it after the receipt/sentinel. `null`
-        // when no receipt is stored and none was recovered.
+        // count — the scoped paths, or the whole batch for a bare pull) lets the
+        // CLI print `[no edited files]` for a genuinely empty set (covered == 0,
+        // empty receipt; scoped pulls are always non-empty).
         let envelope = serde_json::json!({
             "status": if dirty { "dirty" } else { "clean" },
             "output": output,
             "covered": covered,
-            "store_pointer": store_pointer,
         });
         let mut payload = serde_json::to_vec(&envelope)?;
         payload.push(b'\n');
         writer.write_all(&payload).await?;
+
+        // The response bytes reached the client — flip the `delivered` flags now
+        // (misc 141). `delivered` is a transport fact: a run pays its debt by
+        // delivery, so a bare pull marks the whole batch delivered and a scoped
+        // pull marks exactly the named files. A failed `write_all` above returned
+        // early via `?`, leaving the flags false and the gate armed (the bug-60
+        // killed-client shape recovers by re-running — the next bare re-serves the
+        // batch, fresh). Once no undelivered debt remains, release the cross-
+        // session editing guardrail so another session can claim the root.
+        if let Some((session_id, editing_session, agent_id)) = &flip_keys {
+            let editing = ctx
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(session_id)
+                .map(|e| e.router.session.clone());
+            if let Some(session) = editing {
+                if scoped {
+                    session.editing.mark_delivered(
+                        editing_session.as_deref(),
+                        agent_id,
+                        &scoped_files,
+                    );
+                } else {
+                    session
+                        .editing
+                        .mark_delivered_all(editing_session.as_deref(), agent_id);
+                }
+                debug!(
+                    source = Source::DaemonDispatch.as_str(),
+                    session_id = %session_id,
+                    agent_id = %agent_id,
+                    scoped,
+                    "diagnostics: batch flags flipped on delivery (misc 141)",
+                );
+                if !session
+                    .editing
+                    .has_undelivered(editing_session.as_deref(), agent_id)
+                {
+                    ctx.editing_guardrail.release_all(session_id);
+                    debug!(
+                        source = Source::DaemonDispatch.as_str(),
+                        session_id = %session_id,
+                        agent_id = %agent_id,
+                        "diagnostics: batch fully delivered — editing guardrail released",
+                    );
+                }
+            }
+        }
+
         writer.shutdown().await?;
         return Ok(());
     }
@@ -5176,16 +5029,9 @@ mod tests {
             None,
         ));
 
-        let mut manager =
-            SessionManager::bind_at(&mcp_socket_in(dir), &ipc_socket_in(dir), logging)
-                .expect("bind")
-                .with_session(session);
-        // Isolate the diagnostics receipt store under the test's tempdir so the
-        // daemon-side write never touches the host runtime dir (misc 139).
-        if let Some(ctx) = manager.hook_ctx.as_mut() {
-            ctx.receipt_store_dir = dir.join("receipts");
-        }
-        manager
+        SessionManager::bind_at(&mcp_socket_in(dir), &ipc_socket_in(dir), logging)
+            .expect("bind")
+            .with_session(session)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5481,7 +5327,7 @@ mod tests {
             let sessions = ctx.sessions.lock().expect("lock");
             let router_a = Arc::clone(&sessions.get("session-a").expect("session-a").router);
             drop(sessions);
-            router_a.session.editing.add_file(
+            router_a.session.editing.record_covered_edit(
                 Some("session-a"),
                 "",
                 std::path::PathBuf::from("/src/main.rs"),
@@ -5861,7 +5707,7 @@ mod tests {
         });
         let _ = hook_roundtrip(&ipc_path, &req).await;
 
-        // Prepare handoff — should drain the accumulated file.
+        // Prepare handoff — snapshots the accumulated file.
         let req = serde_json::json!({
             "method": "pre-tool/editing-stop",
             "agent_id": "",
@@ -5888,19 +5734,18 @@ mod tests {
         shutdown.cancel();
     }
 
-    /// Regression guard for bug 37: two agents share one Catenary session
-    /// (a subagent and the main agent, distinguished only by `agent_id`).
-    /// A `catenary diagnostics` for one `agent_id` must drain ONLY that
-    /// agent's accumulated set — the sibling agent's set must survive so its
-    /// own later `catenary diagnostics` still reports its edits. Before the
-    /// fix the drain flattened every agent's bucket, silently emptying the
-    /// others.
+    /// Regression guard for bug 37 (under the misc-141 batch model): two agents
+    /// share one Catenary session (a subagent and the main agent, distinguished
+    /// only by `agent_id`). A `catenary diagnostics` for one `agent_id` must flip
+    /// ONLY that agent's batch — the sibling agent's batch must stay armed so its
+    /// own later `catenary diagnostics` still reports its edits. Two
+    /// `(session_id, agent_id)` pairs never share a batch.
     ///
-    /// Post bug 32 the drain is deferred to the *consume* step
-    /// (`tool/editing-stop`), not the prepare (`pre-tool/editing-stop`): the
-    /// prepare only snapshots. So the assertion runs after the consume.
+    /// The flip is deferred to *delivery* (the consume step's socket write), not
+    /// the prepare (`pre-tool/editing-stop`): the prepare only snapshots. So the
+    /// assertion runs after the consume.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn done_editing_handoff_drains_only_requesting_agent() {
+    async fn done_editing_handoff_flips_only_requesting_agent() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let ipc_path = ipc_socket_in(dir.path());
 
@@ -5930,20 +5775,20 @@ mod tests {
             let sessions = ctx.sessions.lock().expect("lock");
             let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
             drop(sessions);
-            router.session.editing.add_file(
+            router.session.editing.record_covered_edit(
                 Some("sess-1"),
                 "sub-a",
                 std::path::PathBuf::from("/src/a.rs"),
             );
-            router.session.editing.add_file(
+            router.session.editing.record_covered_edit(
                 Some("sess-1"),
                 "",
                 std::path::PathBuf::from("/src/b.rs"),
             );
         }
 
-        // Prepare the handoff for the subagent only. Post bug 32 this snapshots
-        // the subagent's set without draining it.
+        // Prepare the handoff for the subagent only — this snapshots the
+        // subagent's batch.
         let req = serde_json::json!({
             "method": "pre-tool/editing-stop",
             "agent_id": "sub-a",
@@ -5952,39 +5797,45 @@ mod tests {
         let line = hook_roundtrip(&ipc_path, &req).await;
         assert!(line.contains("ok"), "prepare should succeed, got: {line}");
 
-        // Consume the handoff — this is where the drain-on-consume clear fires.
-        // The identity rides the staged payload, so the bare consume request
-        // carries none.
+        // Consume the handoff — delivery flips the subagent's batch. The identity
+        // rides the staged payload, so the bare consume request carries none.
         let req = serde_json::json!({"method": "tool/editing-stop"});
         let _ = hook_roundtrip_full(&ipc_path, &req).await;
 
-        // The subagent's bucket is drained; the main agent's set survives.
+        // The subagent's batch is delivered (gate disarmed); the main agent's
+        // batch stays armed — the two never shared state.
         {
             let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
             let sessions = ctx.sessions.lock().expect("lock");
             let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
             drop(sessions);
             assert!(
-                !router.session.editing.has_files(Some("sess-1"), "sub-a"),
-                "subagent's set should be drained after its consume"
+                !router
+                    .session
+                    .editing
+                    .has_undelivered(Some("sess-1"), "sub-a"),
+                "subagent's batch is delivered after its consume — gate disarmed"
+            );
+            assert!(
+                router.session.editing.has_undelivered(Some("sess-1"), ""),
+                "the main agent's batch stays armed (bug 37 / misc 141)"
             );
             assert_eq!(
                 router.session.editing.files(Some("sess-1"), ""),
                 vec![std::path::PathBuf::from("/src/b.rs")],
-                "main agent's set must survive the subagent's drain (bug 37)"
+                "main agent's batch is untouched by the subagent's delivery"
             );
         }
 
         shutdown.cancel();
     }
 
-    /// Core regression for bug 32: a failed `catenary diagnostics <path>`
-    /// attempt fires `pre-tool/editing-stop` (prepare) but never consumes the
-    /// slot (clap rejects it before the IPC, or the host kills the subprocess).
-    /// Post-fix the prepare only SNAPSHOTS — it no longer drains — so the
-    /// accumulated set survives the abandoned attempt, and a subsequent valid
-    /// `catenary diagnostics` still reports the edited files. Before the fix the
-    /// prepare drained on sight and the set was lost irrecoverably.
+    /// Core regression for bug 32 (under the misc-141 batch model): a failed
+    /// `catenary diagnostics <path>` attempt fires `pre-tool/editing-stop`
+    /// (prepare) but never consumes the slot (clap rejects it before the IPC, or
+    /// the host kills the subprocess). The prepare only SNAPSHOTS — it never
+    /// mutates the batch — so the batch survives the abandoned attempt armed, and
+    /// a subsequent valid `catenary diagnostics` still reports the edited files.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_diagnostics_attempt_preserves_edited_set() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -6009,7 +5860,7 @@ mod tests {
             let sessions = ctx.sessions.lock().expect("lock");
             let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
             drop(sessions);
-            router.session.editing.add_file(
+            router.session.editing.record_covered_edit(
                 Some("sess-1"),
                 "",
                 std::path::PathBuf::from("/src/edited.rs"),
@@ -6032,15 +5883,20 @@ mod tests {
             let sessions = ctx.sessions.lock().expect("lock");
             let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
             drop(sessions);
+            assert!(
+                router.session.editing.has_undelivered(Some("sess-1"), ""),
+                "snapshot prepare must NOT flip — the batch stays armed after the failed attempt"
+            );
             assert_eq!(
                 router.session.editing.files(Some("sess-1"), ""),
                 vec![std::path::PathBuf::from("/src/edited.rs")],
-                "snapshot prepare must NOT drain — the set survives the failed attempt (bug 32)"
+                "the batch survives the failed attempt intact"
             );
         }
 
         // The corrective VALID attempt: prepare again (re-snapshots the still
-        // present set), then consume. The set is still reported, then cleared.
+        // present batch), then consume. The batch is still reported, then flipped
+        // to delivered on the successful response write.
         let line = hook_roundtrip(&ipc_path, &prepare).await;
         assert!(
             line.contains("ok"),
@@ -6054,26 +5910,32 @@ mod tests {
             "valid consume must find the staged files, got: {response}",
         );
 
-        // After the successful consume the accumulator is cleared
-        // (drain-on-consume), so a third valid call reports no edited files.
+        // After delivery the batch is retained but delivered — the gate disarms
+        // (misc 141), while the batch stays available for a repeat bare re-run.
         {
             let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
             let sessions = ctx.sessions.lock().expect("lock");
             let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
             drop(sessions);
             assert!(
-                !router.session.editing.has_files(Some("sess-1"), ""),
-                "consume must clear the accumulator (drain-on-consume)"
+                !router.session.editing.has_undelivered(Some("sess-1"), ""),
+                "delivery disarms the gate (flags flip, batch retained)"
+            );
+            assert_eq!(
+                router.session.editing.files(Some("sess-1"), ""),
+                vec![std::path::PathBuf::from("/src/edited.rs")],
+                "the batch is retained for a repeat bare re-diagnosis"
             );
         }
 
         shutdown.cancel();
     }
 
-    /// ws37 ticket 02: a scoped `catenary diagnostics <path>` pays only the
-    /// named file's debt. The consume carries an explicit `files` param; the
-    /// daemon drops ONLY those from the bucket and, because debt remains, keeps
-    /// the editing guardrail armed. The rest of the debt set survives.
+    /// ws37 ticket 02 (under the misc-141 batch model): a scoped
+    /// `catenary diagnostics <path>` pays only the named file's debt. The consume
+    /// carries an explicit `files` param; the daemon flips ONLY those flags on
+    /// delivery and, because undelivered debt remains, keeps the editing guardrail
+    /// armed. The batch retains every file.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scoped_diagnostics_pays_partial_debt_keeps_gate_armed() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -6104,11 +5966,11 @@ mod tests {
             router
                 .session
                 .editing
-                .add_file(Some("sess-1"), "", file_a.clone());
+                .record_covered_edit(Some("sess-1"), "", file_a.clone());
             router
                 .session
                 .editing
-                .add_file(Some("sess-1"), "", file_b.clone());
+                .record_covered_edit(Some("sess-1"), "", file_b.clone());
             // Arm the guardrail on the root the way a covered edit would.
             ctx.editing_guardrail
                 .try_acquire(&root, "sess-1")
@@ -6140,9 +6002,14 @@ mod tests {
             let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
             drop(sessions);
             assert_eq!(
-                router.session.editing.files(Some("sess-1"), ""),
+                router.session.editing.undelivered_files(Some("sess-1"), ""),
                 vec![file_b.clone()],
-                "a scoped pull drops only the named file; the rest of the debt survives",
+                "a scoped pull flips only the named file; the rest stays undelivered",
+            );
+            assert_eq!(
+                router.session.editing.files(Some("sess-1"), "").len(),
+                2,
+                "the batch retains both files",
             );
             // Debt remains → the guardrail stays armed: another session can't
             // claim the root.
@@ -6155,10 +6022,10 @@ mod tests {
         shutdown.cancel();
     }
 
-    /// ws37 ticket 02: a bare `catenary diagnostics` pays the whole debt. The
-    /// guardrail release moved from prepare to consume (decision 3) and is
-    /// conditional — the bare form always empties the bucket, so it always
-    /// releases the gate.
+    /// ws37 ticket 02 (under the misc-141 batch model): a bare
+    /// `catenary diagnostics` pays the whole debt. The guardrail release is
+    /// conditional on delivery — the bare form flips every flag, so nothing stays
+    /// undelivered and the gate releases. The batch itself is retained.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bare_diagnostics_pays_all_debt_releases_gate() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -6187,11 +6054,11 @@ mod tests {
             router
                 .session
                 .editing
-                .add_file(Some("sess-1"), "", root.join("a.rs"));
+                .record_covered_edit(Some("sess-1"), "", root.join("a.rs"));
             router
                 .session
                 .editing
-                .add_file(Some("sess-1"), "", root.join("b.rs"));
+                .record_covered_edit(Some("sess-1"), "", root.join("b.rs"));
             ctx.editing_guardrail
                 .try_acquire(&root, "sess-1")
                 .expect("arm guardrail");
@@ -6204,7 +6071,8 @@ mod tests {
         });
         let _ = hook_roundtrip(&ipc_path, &prepare).await;
 
-        // Bare consume (no `files`): drains + reports the whole debt set.
+        // Bare consume (no `files`): re-diagnoses the whole batch and flips
+        // every flag on delivery.
         let consume = serde_json::json!({"method": "tool/editing-stop"});
         let _ = hook_roundtrip_full(&ipc_path, &consume).await;
 
@@ -6214,27 +6082,47 @@ mod tests {
             let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
             drop(sessions);
             assert!(
-                !router.session.editing.has_files(Some("sess-1"), ""),
-                "a bare pull drains the whole debt set",
+                !router.session.editing.has_undelivered(Some("sess-1"), ""),
+                "a bare pull delivers the whole batch — nothing stays undelivered",
             );
-            // Debt empty → the guardrail released: another session can claim the
-            // root.
+            assert_eq!(
+                router.session.editing.files(Some("sess-1"), "").len(),
+                2,
+                "the batch is retained for a repeat bare re-diagnosis",
+            );
+            // No undelivered debt → the guardrail released: another session can
+            // claim the root.
             assert!(
                 ctx.editing_guardrail.try_acquire(&root, "other").is_ok(),
-                "the bare form empties the bucket, so the gate releases at consume",
+                "the bare form delivers everything, so the gate releases on delivery",
             );
         }
 
         shutdown.cancel();
     }
 
-    /// misc 139 / bug 60: a normal bare `catenary diagnostics` run persists the
-    /// full rendered receipt to the per-session store at compute time and returns
-    /// a trailing pointer naming the store plus its covered files. The stored
-    /// bytes match the receipt the response carried — a killed client loses
-    /// nothing.
+    /// misc 141 (idiom fix): a bare `catenary diagnostics` run over a completed
+    /// batch re-diagnoses the SAME batch instead of `[no edited files]`. The
+    /// batch is durable daemon state; delivery flips its flags but retains it, so
+    /// a repeat bare run (no intervening edit) computes fresh over the same scope.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn diagnostics_persists_receipt_and_points_at_store() {
+    async fn repeat_bare_re_diagnoses_the_same_batch() {
+        // Drive a bare run (prepare + consume) and return its parsed envelope.
+        async fn bare_run(ipc_path: &Path) -> serde_json::Value {
+            let prepare = serde_json::json!({
+                "method": "pre-tool/editing-stop",
+                "agent_id": "",
+                "session_id": "sess-1"
+            });
+            let _ = hook_roundtrip(ipc_path, &prepare).await;
+            let response = hook_roundtrip_full(
+                ipc_path,
+                &serde_json::json!({"method": "tool/editing-stop"}),
+            )
+            .await;
+            serde_json::from_str(response.trim()).expect("valid diagnostics envelope")
+        }
+
         let dir = tempfile::tempdir().expect("create tempdir");
         let ipc_path = ipc_socket_in(dir.path());
 
@@ -6265,186 +6153,71 @@ mod tests {
             router
                 .session
                 .editing
-                .add_file(Some("sess-1"), "", file_a.clone());
+                .record_covered_edit(Some("sess-1"), "", file_a.clone());
             router
                 .session
                 .editing
-                .add_file(Some("sess-1"), "", file_b.clone());
+                .record_covered_edit(Some("sess-1"), "", file_b.clone());
         }
 
-        let prepare = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &prepare).await;
-
-        let consume = serde_json::json!({"method": "tool/editing-stop"});
-        let response = hook_roundtrip_full(&ipc_path, &consume).await;
-        let parsed: serde_json::Value =
-            serde_json::from_str(response.trim()).expect("valid diagnostics envelope");
-        let output = parsed["output"].as_str().unwrap_or_default();
-        assert!(
-            !output.trim().is_empty(),
-            "the covered receipt must be non-empty, got: {response}",
-        );
-
-        // The store holds the full receipt, byte-for-byte what the response
-        // carried — so a client killed after dispatch recovers it losslessly.
-        let store_path = dir
-            .path()
-            .join("receipts")
-            .join(crate::paths::diagnostics_receipt_file("sess-1"));
-        let stored = std::fs::read_to_string(&store_path).expect("receipt store written");
+        // Run 1: covers the whole batch, flips every flag on delivery.
+        let first = bare_run(&ipc_path).await;
         assert_eq!(
-            stored, output,
-            "the store bytes must match the receipt stdout carried",
-        );
-
-        // The pointer names the store and both covered files.
-        let pointer = parsed["store_pointer"]
-            .as_str()
-            .expect("store_pointer present on a persisted run");
-        assert!(
-            pointer.contains(&store_path.display().to_string()),
-            "the pointer names the store path: {pointer}",
+            first["covered"].as_u64(),
+            Some(2),
+            "run 1 covers the whole batch, got: {first}",
         );
         assert!(
-            pointer.contains("covered 2 files"),
-            "the pointer counts the covered files: {pointer}",
-        );
-        assert!(
-            pointer.contains("a.rs") && pointer.contains("b.rs"),
-            "the pointer lists both covered files: {pointer}",
-        );
-
-        shutdown.cancel();
-    }
-
-    /// misc 139 / bug 60: a `catenary diagnostics` CLI client killed after
-    /// dispatch never surfaces the receipt, but the daemon wrote it to the store
-    /// at compute time (before the response leaves). The next bare run that finds
-    /// nothing edited still names the store and its covered files, so the agent
-    /// recovers the witness it lost.
-    ///
-    /// The daemon-side write precedes the response, so a completed run leaves the
-    /// same store whether or not the client read its output; the test models the
-    /// kill by discarding run 1's output and recovering it on run 2.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn killed_client_receipt_survives_and_next_bare_run_points_at_it() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        // ── Run 1: the daemon completes the run; its client is "killed" ──
-        let start = serde_json::json!({
-            "method": "pre-tool/editing-start",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &start).await;
-
-        let root = dir.path().to_path_buf();
-        let file_a = root.join("a.rs");
-        let file_b = root.join("b.rs");
-        std::fs::write(&file_a, "fn a() {}\n").expect("write a.rs");
-        std::fs::write(&file_b, "fn b() {}\n").expect("write b.rs");
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            router
-                .session
-                .editing
-                .add_file(Some("sess-1"), "", file_a.clone());
-            router
-                .session
-                .editing
-                .add_file(Some("sess-1"), "", file_b.clone());
-        }
-
-        let prepare = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &prepare).await;
-        // Run 1 completes daemon-side. Its output is DISCARDED here — the agent
-        // never saw it (the killed-client witness gap).
-        let _ = hook_roundtrip_full(
-            &ipc_path,
-            &serde_json::json!({"method": "tool/editing-stop"}),
-        )
-        .await;
-
-        let store_path = dir
-            .path()
-            .join("receipts")
-            .join(crate::paths::diagnostics_receipt_file("sess-1"));
-        let stored = std::fs::read_to_string(&store_path)
-            .expect("the killed run's receipt survives in the store");
-        assert!(
-            !stored.trim().is_empty(),
-            "the store holds the full receipt of the killed run",
-        );
-
-        // ── Run 2: a fresh bare run finds nothing edited ────────────────
-        let prepare2 = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &prepare2).await;
-        let response2 = hook_roundtrip_full(
-            &ipc_path,
-            &serde_json::json!({"method": "tool/editing-stop"}),
-        )
-        .await;
-        let parsed2: serde_json::Value =
-            serde_json::from_str(response2.trim()).expect("valid diagnostics envelope");
-        // Nothing diagnosed → covered 0, empty receipt (the CLI's `[no edited
-        // files]` case).
-        assert_eq!(
-            parsed2["covered"].as_u64(),
-            Some(0),
-            "run 2 diagnosed nothing, got: {response2}",
-        );
-        assert!(
-            parsed2["output"]
+            !first["output"]
                 .as_str()
                 .unwrap_or_default()
                 .trim()
                 .is_empty(),
-            "run 2 renders no receipt of its own, got: {response2}",
+            "run 1 renders a receipt, got: {first}",
         );
-        // But the recovery pointer names the prior store and run 1's covered set.
-        let pointer2 = parsed2["store_pointer"]
-            .as_str()
-            .expect("recovery pointer present when a prior store exists");
-        assert!(
-            pointer2.contains(&store_path.display().to_string()),
-            "the recovery pointer names the store: {pointer2}",
+
+        // Run 2, with NO intervening edit: the batch is retained, so a repeat
+        // bare run re-diagnoses the same scope instead of `[no edited files]`.
+        let second = bare_run(&ipc_path).await;
+        assert_eq!(
+            second["covered"].as_u64(),
+            Some(2),
+            "repeat bare re-diagnoses the same batch (not `[no edited files]`), got: {second}",
         );
         assert!(
-            pointer2.contains("a.rs") && pointer2.contains("b.rs"),
-            "the recovery pointer lists run 1's covered files: {pointer2}",
+            !second["output"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .is_empty(),
+            "run 2 renders a fresh receipt over the same batch, got: {second}",
         );
 
         shutdown.cancel();
     }
 
-    /// misc 139: a scoped `catenary diagnostics <path>` updates the store with the
-    /// scoped set — the pointer's covered list is exactly the named files, not the
-    /// whole prior debt.
+    /// misc 141 / bug 60: an undelivered bare run leaves the batch's flags false
+    /// and the gate armed. Modeled as computed-but-undelivered — the client
+    /// half-closes its write side, so the daemon's disconnect-cancel select
+    /// (bug 24) fires and no response reaches it, deterministically avoiding the
+    /// flip. The batch survives, and the next bare run re-serves it in full.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scoped_diagnostics_updates_store_with_scoped_set() {
+    async fn undelivered_run_leaves_flags_false_and_gate_armed() {
+        // Send a request and half-close the write side without reading — the
+        // daemon reads EOF on its cancel probe and returns before writing any
+        // response (bug 24), so delivery never happens.
+        async fn send_and_halfclose(ipc_path: &Path, request: &serde_json::Value) {
+            use tokio::io::AsyncWriteExt;
+            let stream = tokio::net::UnixStream::connect(ipc_path)
+                .await
+                .expect("connect to IPC socket");
+            let (_read, mut write) = stream.into_split();
+            let mut payload = serde_json::to_string(request).expect("serialize");
+            payload.push('\n');
+            write.write_all(payload.as_bytes()).await.expect("write");
+            write.shutdown().await.expect("shutdown write half");
+        }
+
         let dir = tempfile::tempdir().expect("create tempdir");
         let ipc_path = ipc_socket_in(dir.path());
 
@@ -6464,9 +6237,7 @@ mod tests {
 
         let root = dir.path().to_path_buf();
         let file_a = root.join("a.rs");
-        let file_b = root.join("b.rs");
         std::fs::write(&file_a, "fn a() {}\n").expect("write a.rs");
-        std::fs::write(&file_b, "fn b() {}\n").expect("write b.rs");
         {
             let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
             let sessions = ctx.sessions.lock().expect("lock");
@@ -6475,64 +6246,64 @@ mod tests {
             router
                 .session
                 .editing
-                .add_file(Some("sess-1"), "", file_a.clone());
-            router
-                .session
-                .editing
-                .add_file(Some("sess-1"), "", file_b.clone());
+                .record_covered_edit(Some("sess-1"), "", file_a.clone());
         }
 
+        // Prepare, then run a consume whose client half-closes: the disconnect-
+        // cancel path fires, so the batch's flag never flips.
         let prepare = serde_json::json!({
             "method": "pre-tool/editing-stop",
             "agent_id": "",
             "session_id": "sess-1"
         });
         let _ = hook_roundtrip(&ipc_path, &prepare).await;
+        send_and_halfclose(
+            &ipc_path,
+            &serde_json::json!({"method": "tool/editing-stop"}),
+        )
+        .await;
 
-        // Scoped consume: diagnose ONLY a.rs.
-        let consume = serde_json::json!({
-            "method": "tool/editing-stop",
-            "files": [file_a.to_string_lossy()],
-        });
-        let response = hook_roundtrip_full(&ipc_path, &consume).await;
+        // The flag never flipped: the gate stays armed and the batch is intact.
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let sessions = ctx.sessions.lock().expect("lock");
+            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+            drop(sessions);
+            assert!(
+                router.session.editing.has_undelivered(Some("sess-1"), ""),
+                "an undelivered run must leave the gate armed (flags false)"
+            );
+            assert_eq!(
+                router.session.editing.files(Some("sess-1"), ""),
+                vec![file_a.clone()],
+                "the batch survives the undelivered run intact"
+            );
+        }
+
+        // Recovery: the next bare run re-serves the whole batch (the bug-60 shape).
+        let _ = hook_roundtrip(&ipc_path, &prepare).await;
+        let response = hook_roundtrip_full(
+            &ipc_path,
+            &serde_json::json!({"method": "tool/editing-stop"}),
+        )
+        .await;
         let parsed: serde_json::Value =
             serde_json::from_str(response.trim()).expect("valid diagnostics envelope");
-
-        let pointer = parsed["store_pointer"]
-            .as_str()
-            .expect("store_pointer present on a scoped run");
-        assert!(
-            pointer.contains("covered 1 file:"),
-            "the scoped pointer covers exactly the named file: {pointer}",
-        );
-        assert!(
-            pointer.contains("a.rs") && !pointer.contains("b.rs"),
-            "the scoped pointer names a.rs and not b.rs: {pointer}",
-        );
-
-        // The store matches the scoped receipt and never mentions b.rs.
-        let store_path = dir
-            .path()
-            .join("receipts")
-            .join(crate::paths::diagnostics_receipt_file("sess-1"));
-        let stored = std::fs::read_to_string(&store_path).expect("receipt store written");
         assert_eq!(
-            stored,
-            parsed["output"].as_str().unwrap_or_default(),
-            "the store matches the scoped receipt",
-        );
-        assert!(
-            !stored.contains("b.rs"),
-            "the scoped store covers only a.rs: {stored}",
+            parsed["covered"].as_u64(),
+            Some(1),
+            "the next bare run covers the batch (bug-60 recovery), got: {response}",
         );
 
         shutdown.cancel();
     }
 
-    /// misc 139: two sessions' receipt stores never cross — each is named by its
-    /// own `session_id` and holds only its own receipt.
+    /// misc 141: two `(session_id, agent_id)` pairs never share a batch. Each
+    /// session accumulates and delivers its own file; one session's delivery
+    /// leaves the other's batch untouched, and neither batch names the other's
+    /// file.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn two_sessions_receipt_stores_never_cross() {
+    async fn two_sessions_never_share_a_batch() {
         // Drive one session through a full bare run over a single distinctive
         // file (declared first so it precedes the test's statements).
         async fn run_session(
@@ -6552,10 +6323,11 @@ mod tests {
                 let sessions = ctx.sessions.lock().expect("lock");
                 let router = Arc::clone(&sessions.get(session_id).expect("session").router);
                 drop(sessions);
-                router
-                    .session
-                    .editing
-                    .add_file(Some(session_id), "", file.to_path_buf());
+                router.session.editing.record_covered_edit(
+                    Some(session_id),
+                    "",
+                    file.to_path_buf(),
+                );
             }
             let prepare = serde_json::json!({
                 "method": "pre-tool/editing-stop",
@@ -6589,36 +6361,83 @@ mod tests {
         run_session(&ipc_path, &manager, "sess-1", &file_one).await;
         run_session(&ipc_path, &manager, "sess-2", &file_two).await;
 
-        let store_one = dir
-            .path()
-            .join("receipts")
-            .join(crate::paths::diagnostics_receipt_file("sess-1"));
-        let store_two = dir
-            .path()
-            .join("receipts")
-            .join(crate::paths::diagnostics_receipt_file("sess-2"));
-        assert_ne!(
-            store_one, store_two,
-            "the two sessions map to distinct stores"
-        );
+        let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+        let sessions = ctx.sessions.lock().expect("lock");
+        let router_one = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
+        let router_two = Arc::clone(&sessions.get("sess-2").expect("sess-2").router);
+        drop(sessions);
 
-        let one = std::fs::read_to_string(&store_one).expect("sess-1 store written");
-        let two = std::fs::read_to_string(&store_two).expect("sess-2 store written");
-        assert!(
-            one.contains("sess_one_file.rs") && !one.contains("sess_two_file.rs"),
-            "sess-1's store holds only its own receipt: {one}",
+        // Each session's batch holds only its own file, and each was delivered by
+        // its own run — the two batches never crossed.
+        assert_eq!(
+            router_one.session.editing.files(Some("sess-1"), ""),
+            vec![file_one.clone()],
+            "sess-1's batch holds only its own file",
+        );
+        assert_eq!(
+            router_two.session.editing.files(Some("sess-2"), ""),
+            vec![file_two.clone()],
+            "sess-2's batch holds only its own file",
         );
         assert!(
-            two.contains("sess_two_file.rs") && !two.contains("sess_one_file.rs"),
-            "sess-2's store holds only its own receipt: {two}",
+            !router_one
+                .session
+                .editing
+                .has_undelivered(Some("sess-1"), ""),
+            "sess-1's batch was delivered by its own run",
+        );
+        assert!(
+            !router_two
+                .session
+                .editing
+                .has_undelivered(Some("sess-2"), ""),
+            "sess-2's batch was delivered by its own run",
         );
 
         shutdown.cancel();
     }
 
-    /// ws37 ticket 02: re-editing a paid file re-arms the gate. After a scoped
-    /// pull empties the debt and releases the guardrail, editing the file again
-    /// re-accumulates it and re-locks the root.
+    /// misc 141: a fresh session (no edits) still reports `[no edited files]` — a
+    /// bare run over an empty batch is covered 0, exactly as today.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_session_bare_reports_no_edited_files() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // No editing-start, no edits — a fresh session's first bare run.
+        let prepare = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &prepare).await;
+        let response = hook_roundtrip_full(
+            &ipc_path,
+            &serde_json::json!({"method": "tool/editing-stop"}),
+        )
+        .await;
+        let parsed: serde_json::Value =
+            serde_json::from_str(response.trim()).expect("valid diagnostics envelope");
+        assert_eq!(
+            parsed["covered"].as_u64(),
+            Some(0),
+            "a fresh session's bare run is covered 0 (`[no edited files]`), got: {response}",
+        );
+
+        shutdown.cancel();
+    }
+
+    /// ws37 ticket 02 (under the misc-141 batch model): re-editing a paid file
+    /// re-arms the gate. After a scoped pull delivers the only file and releases
+    /// the guardrail, editing that file again discards the completed batch, starts
+    /// a fresh one with the file undelivered, and re-locks the root.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn re_editing_a_paid_file_rearms_the_gate() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -6648,7 +6467,7 @@ mod tests {
             router
                 .session
                 .editing
-                .add_file(Some("sess-1"), "", file_a.clone());
+                .record_covered_edit(Some("sess-1"), "", file_a.clone());
             ctx.editing_guardrail
                 .try_acquire(&root, "sess-1")
                 .expect("arm guardrail");
@@ -6661,7 +6480,7 @@ mod tests {
         });
         let _ = hook_roundtrip(&ipc_path, &prepare).await;
 
-        // Pay file_a's debt in full.
+        // Pay file_a's debt in full (scoped delivery of the only file).
         let consume = serde_json::json!({
             "method": "tool/editing-stop",
             "files": [file_a.to_string_lossy()],
@@ -6674,50 +6493,53 @@ mod tests {
             let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
             drop(sessions);
             assert!(
-                !router.session.editing.has_files(Some("sess-1"), ""),
-                "paying the only file empties the debt set",
+                !router.session.editing.has_undelivered(Some("sess-1"), ""),
+                "delivering the only file disarms the gate (batch now complete)",
             );
             // Released: probe then free it so the re-edit below can re-lock.
             assert!(
                 ctx.editing_guardrail.try_acquire(&root, "other").is_ok(),
-                "paying the only file releases the guardrail",
+                "delivering the only file releases the guardrail",
             );
             ctx.editing_guardrail.release(&root, "other");
 
-            // Re-edit re-arms: the edit hook re-enters editing mode
-            // (`start_editing`, which recreates the entry a full pull removed),
-            // re-accumulates the file, and re-locks the root.
+            // Re-edit re-arms: the edit hook re-affirms editing mode
+            // (`start_editing` is a no-op — the batch entry is retained), then
+            // records the covered edit. The batch was complete, so this discards
+            // it and starts a fresh, undelivered batch with the file, re-locking
+            // the root.
+            let _ = router.session.editing.start_editing(Some("sess-1"), "");
             router
                 .session
                 .editing
-                .start_editing(Some("sess-1"), "")
-                .expect("re-enter editing on re-edit");
-            router
-                .session
-                .editing
-                .add_file(Some("sess-1"), "", file_a.clone());
+                .record_covered_edit(Some("sess-1"), "", file_a.clone());
             ctx.editing_guardrail
                 .try_acquire(&root, "sess-1")
                 .expect("re-arm guardrail on re-edit");
             assert_eq!(
                 router.session.editing.files(Some("sess-1"), ""),
                 vec![file_a.clone()],
-                "the paid file is back in the debt set after re-editing",
+                "the re-edited file is the sole member of the fresh batch",
+            );
+            assert!(
+                router.session.editing.has_undelivered(Some("sess-1"), ""),
+                "re-editing a paid file re-arms the gate (undelivered again)",
             );
             assert!(
                 ctx.editing_guardrail.try_acquire(&root, "other").is_err(),
-                "re-editing a paid file re-arms the gate",
+                "re-editing a paid file re-locks the root",
             );
         }
 
         shutdown.cancel();
     }
 
-    /// ws37 ticket 02: a scoped pull of an UNEDITED path reports diagnostics but
-    /// the gate-drop is a no-op — the debt set is unchanged and the guardrail
-    /// stays armed. One pipeline serves "lint this" and "verify my edit."
+    /// ws37 ticket 02 (under the misc-141 batch model): a scoped pull of an
+    /// UNEDITED path reports diagnostics but the flag-flip is a no-op — the batch
+    /// is unchanged and the guardrail stays armed. One pipeline serves "lint this"
+    /// and "verify my edit."
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scoped_diagnostics_unedited_path_is_noop_drop() {
+    async fn scoped_diagnostics_unedited_path_is_noop() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let ipc_path = ipc_socket_in(dir.path());
 
@@ -6746,7 +6568,7 @@ mod tests {
             router
                 .session
                 .editing
-                .add_file(Some("sess-1"), "", edited.clone());
+                .record_covered_edit(Some("sess-1"), "", edited.clone());
             ctx.editing_guardrail
                 .try_acquire(&root, "sess-1")
                 .expect("arm guardrail");
@@ -6778,20 +6600,24 @@ mod tests {
             assert_eq!(
                 router.session.editing.files(Some("sess-1"), ""),
                 vec![edited.clone()],
-                "querying an unedited file drops nothing — the debt set is unchanged",
+                "querying an unedited file flips nothing — the batch is unchanged",
+            );
+            assert!(
+                router.session.editing.has_undelivered(Some("sess-1"), ""),
+                "the edited file stays undelivered — the gate is unmoved",
             );
             assert!(
                 ctx.editing_guardrail.try_acquire(&root, "other").is_err(),
-                "a no-op drop leaves the gate armed",
+                "a no-op flip leaves the gate armed",
             );
         }
 
         shutdown.cancel();
     }
 
-    /// ws37 ticket 02: drain-on-consume for the scoped path. A scoped consume
-    /// whose handoff was never prepared (a faulted/denied round-trip) is an
-    /// expired slot — it drops nothing, leaving the debt set intact.
+    /// ws37 ticket 02 (under the misc-141 batch model): a scoped consume whose
+    /// handoff was never prepared (a faulted/denied round-trip) is an expired
+    /// slot — it flips nothing, leaving the batch intact and armed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scoped_diagnostics_without_handoff_leaves_debt_intact() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -6821,11 +6647,11 @@ mod tests {
             router
                 .session
                 .editing
-                .add_file(Some("sess-1"), "", file_a.clone());
+                .record_covered_edit(Some("sess-1"), "", file_a.clone());
         }
 
-        // Consume WITHOUT a prepared handoff: the slot is empty (expired), so
-        // the drain-on-consume drop never fires.
+        // Consume WITHOUT a prepared handoff: the slot is empty (expired), so no
+        // flip keys are captured and the batch is left untouched.
         let consume = serde_json::json!({
             "method": "tool/editing-stop",
             "files": [file_a.to_string_lossy()],
@@ -6844,7 +6670,11 @@ mod tests {
             assert_eq!(
                 router.session.editing.files(Some("sess-1"), ""),
                 vec![file_a.clone()],
-                "a faulted scoped call drops nothing (drain-on-consume, bug 32)",
+                "a faulted scoped call flips nothing — the batch is intact",
+            );
+            assert!(
+                router.session.editing.has_undelivered(Some("sess-1"), ""),
+                "the batch stays armed after a faulted scoped call",
             );
         }
 

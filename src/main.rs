@@ -1875,14 +1875,6 @@ struct DiagnosticsResponse {
     /// a silent exit. Absent on a pre-fix daemon → defaults to 0.
     #[serde(default)]
     covered: usize,
-    /// Trailing pointer line naming the per-session receipt store and its
-    /// covered files (misc 139 / bug 60). Printed after the receipt or the
-    /// `[no edited files]` sentinel so the agent always knows where the last
-    /// computed diagnostics live — and, on a bare run that finds nothing edited,
-    /// whether the store holds the set it just edited. Absent (`null`) when no
-    /// receipt is stored and none was recovered; absent on a pre-fix daemon.
-    #[serde(default)]
-    store_pointer: Option<String>,
 }
 
 /// Implements `catenary diagnostics [paths…]`: prints diagnostics for the
@@ -1893,10 +1885,10 @@ struct DiagnosticsResponse {
 /// internal handoff method name is unchanged by the user-facing rename). The
 /// `PreToolUse` hook has already prepared the handoff — this command retrieves
 /// the diagnostics and prints the per-file receipt. When `paths` is non-empty,
-/// they ride the request's `files` param: the daemon diagnoses exactly those
-/// and drops them from the gate (scoped). Relative paths resolve against the
-/// CLI's cwd before dispatch — the daemon runs under a different cwd — matching
-/// how `grep`/`glob` forward paths. Success (clean *or* dirty) returns
+/// they ride the request's `files` param: the daemon diagnoses exactly those and
+/// flips their gate flags on delivery (scoped). Relative paths resolve against
+/// the CLI's cwd before dispatch — the daemon runs under a different cwd —
+/// matching how `grep`/`glob` forward paths. Success (clean *or* dirty) returns
 /// `Ok(())`, which the dispatcher maps to exit `0`.
 ///
 /// # Errors
@@ -1912,7 +1904,7 @@ async fn run_done_editing(out: &mut cli::Output, paths: &[String]) -> Result<()>
 
     // Resolve relative scoped paths against the CLI's cwd (the daemon runs under
     // a different cwd). Bare form (no paths) sends an empty set → the daemon
-    // drains + reports the whole debt set (today's behavior).
+    // re-diagnoses the whole batch and flips its flags on delivery.
     let files: Vec<String> = if paths.is_empty() {
         Vec::new()
     } else {
@@ -1986,18 +1978,6 @@ fn emit_diagnostics_response(out: &mut cli::Output, response: &str) -> Result<()
         }
     } else {
         let _ = out.writeln(format_args!("{trimmed}"));
-    }
-
-    // Trailing store pointer (misc 139 / bug 60): names the per-session receipt
-    // store and its covered files. Printed after the receipt or the
-    // `[no edited files]` sentinel so a killed-client recovery run tells the
-    // agent at a glance where the last computed diagnostics live and whether the
-    // store holds the set it just edited. Absent when nothing is stored.
-    if let Some(pointer) = parsed.store_pointer.as_deref() {
-        let pointer = pointer.trim();
-        if !pointer.is_empty() {
-            let _ = out.writeln(format_args!("{pointer}"));
-        }
     }
 
     Ok(())

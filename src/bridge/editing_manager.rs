@@ -26,24 +26,60 @@ fn editing_key(session_id: Option<&str>, agent_id: &str) -> String {
     }
 }
 
-/// Per-agent editing accumulator.
+/// One covered file in a batch, paired with whether a receipt covering it has
+/// been handed to a client since its last recorded edit.
 ///
-/// Holds both the accumulated covered file paths and the count of files
-/// skipped during accumulation because they lacked LSP coverage (outside
-/// tracked roots). Keeping the filtered count alongside the file set — rather
-/// than as a single session-global counter — means a per-agent drain reports
-/// the requesting agent's own skipped-no-coverage count, never another agent's
-/// (bug 37).
+/// `delivered` is a *transport* fact, not a cleanliness one (misc 141): it flips
+/// true only after the socket write of a `catenary diagnostics` response
+/// succeeds — the daemon cannot know whether the agent actually read the bytes
+/// (a pipe could rewrite them), only that they left. A fresh edit to the file
+/// flips it back to false.
+struct BatchFile {
+    /// Absolute path of the covered file.
+    path: PathBuf,
+    /// Whether a receipt covering this file, computed after its last recorded
+    /// edit, has been handed to a client (misc 141).
+    delivered: bool,
+}
+
+/// Per-agent editing accumulator: one **batch** plus the out-of-coverage note
+/// metadata (misc 141).
+///
+/// The batch is the set of covered files this agent has edited, each carrying a
+/// `delivered` flag. A covered edit into an *incomplete* batch (some flag false)
+/// joins the file / flips its flag false; a covered edit into a *complete* batch
+/// (non-empty, all flags true) discards the batch and starts a new one with that
+/// file (the flat rule — no inside/outside distinction). Bare `catenary
+/// diagnostics` diagnoses the whole batch and flips every flag; scoped
+/// diagnostics flips exactly the named files. The debt gate is armed while any
+/// flag is false. The batch is durable daemon state — diagnostics are always
+/// recomputed over it — so repeat bare runs re-diagnose the same scope.
+///
+/// Holds the covered batch alongside the count of files skipped during
+/// accumulation because they lacked LSP coverage (outside tracked roots), so a
+/// per-agent read reports the requesting agent's own skipped-no-coverage count,
+/// never another agent's (bug 37). Uncovered edits carry no flag: they never
+/// join the batch and never discard it (bug 58 note behavior unchanged).
 #[derive(Default)]
 struct EditingState {
-    /// Accumulated covered file paths for this agent.
-    files: Vec<PathBuf>,
+    /// The current batch: covered files, each with a `delivered` flag.
+    files: Vec<BatchFile>,
     /// Files skipped during accumulation for lack of LSP coverage.
     filtered: usize,
     /// Distinct enclosing project roots of the filtered (out-of-root) edits,
     /// for the root-aware bare-run note (ephemeral-roots ticket 01 / bug 58).
     /// Empty when a filtered edit had no detectable enclosing project root.
     filtered_roots: BTreeSet<PathBuf>,
+}
+
+impl EditingState {
+    /// Whether the batch is complete: non-empty and every file delivered.
+    ///
+    /// An empty batch (no covered files — e.g. a filtered-only entry) is *not*
+    /// complete, so the next covered edit joins it rather than discarding it.
+    fn is_complete(&self) -> bool {
+        !self.files.is_empty() && self.files.iter().all(|f| f.delivered)
+    }
 }
 
 /// In-memory editing state manager.
@@ -113,7 +149,8 @@ impl EditingManager {
             .contains_key(&key)
     }
 
-    /// Returns `true` if the agent has accumulated any files during editing.
+    /// Returns `true` if the agent's batch holds any covered file (delivered or
+    /// not).
     #[must_use]
     pub fn has_files(&self, session_id: Option<&str>, agent_id: &str) -> bool {
         let key = editing_key(session_id, agent_id);
@@ -124,11 +161,29 @@ impl EditingManager {
             .is_some_and(|state| !state.files.is_empty())
     }
 
-    /// Returns a snapshot of the accumulated file paths without draining them.
+    /// Returns `true` while the debt gate is armed: any covered file in the
+    /// agent's batch is still undelivered (misc 141).
     ///
-    /// Unlike [`drain_files`](Self::drain_files) this leaves the editing state
-    /// intact — used to render the boundary-block message, which lists the
-    /// tracked files while the set must remain for `catenary diagnostics`.
+    /// This — not [`has_files`](Self::has_files) — is the gate predicate. A batch
+    /// whose files have all been delivered (`catenary diagnostics` handed a
+    /// covering receipt to a client) is complete: the gate disarms even though
+    /// the batch is retained for the next covered edit to extend or discard.
+    #[must_use]
+    pub fn has_undelivered(&self, session_id: Option<&str>, agent_id: &str) -> bool {
+        let key = editing_key(session_id, agent_id);
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .is_some_and(|state| state.files.iter().any(|f| !f.delivered))
+    }
+
+    /// Returns a snapshot of the whole batch's file paths without mutating it.
+    ///
+    /// Includes delivered files: a bare `catenary diagnostics` re-diagnoses the
+    /// whole batch (a later edit to C can change A's diagnostics in the same
+    /// crate), so the prepare snapshot carries every batch file. Leaves the
+    /// editing state intact.
     #[must_use]
     pub fn files(&self, session_id: Option<&str>, agent_id: &str) -> Vec<PathBuf> {
         let key = editing_key(session_id, agent_id);
@@ -136,7 +191,30 @@ impl EditingManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
-            .map(|state| state.files.clone())
+            .map(|state| state.files.iter().map(|f| f.path.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Returns the batch's still-undelivered file paths — the outstanding debt.
+    ///
+    /// The boundary-block message lists these (the files that "haven't been
+    /// diagnosed yet"), leaving delivered files out. Leaves the editing state
+    /// intact.
+    #[must_use]
+    pub fn undelivered_files(&self, session_id: Option<&str>, agent_id: &str) -> Vec<PathBuf> {
+        let key = editing_key(session_id, agent_id);
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .map(|state| {
+                state
+                    .files
+                    .iter()
+                    .filter(|f| !f.delivered)
+                    .map(|f| f.path.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -178,33 +256,92 @@ impl EditingManager {
             .unwrap_or_default()
     }
 
-    /// Accumulates a modified file path for an agent in editing mode.
+    /// Records a covered edit into the agent's batch (misc 141).
     ///
-    /// Idempotent — duplicate paths are not added.
-    pub fn add_file(&self, session_id: Option<&str>, agent_id: &str, path: PathBuf) {
+    /// The join / flip / discard rule, applied identically wherever a covered
+    /// write is recorded (Edit/Write and resolved shell writes):
+    ///
+    /// - **Batch incomplete** (some flag false, or the batch is empty): the file
+    ///   joins the batch if new, or its flag flips back to false if already
+    ///   present. The iteration extends.
+    /// - **Batch complete** (non-empty, all flags true): the batch is discarded
+    ///   and a new one starts with just this file. The flat discard rule — no
+    ///   inside/outside distinction. The out-of-coverage note metadata rides
+    ///   through the discard (a filtered edit is not part of the covered batch),
+    ///   so an unreported out-of-root edit is not silently dropped.
+    ///
+    /// A no-op if the agent is not in editing mode — the accumulation path only
+    /// calls this for an agent already known to be editing (the entry exists).
+    pub fn record_covered_edit(&self, session_id: Option<&str>, agent_id: &str, path: PathBuf) {
         let key = editing_key(session_id, agent_id);
-        let mut state = self
+        if let Some(entry) = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = state.get_mut(&key)
-            && !entry.files.contains(&path)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&key)
         {
-            entry.files.push(path);
+            if entry.is_complete() {
+                // Post-completion covered edit: discard the batch, start a new one
+                // with this file (the filtered note metadata is preserved).
+                entry.files.clear();
+                entry.files.push(BatchFile {
+                    path,
+                    delivered: false,
+                });
+            } else if let Some(existing) = entry.files.iter_mut().find(|f| f.path == path) {
+                // Already in the incomplete batch — a fresh edit re-arms its gate.
+                existing.delivered = false;
+            } else {
+                entry.files.push(BatchFile {
+                    path,
+                    delivered: false,
+                });
+            }
         }
     }
 
-    /// Returns and clears accumulated file paths for an agent.
-    pub fn drain_files(&self, session_id: Option<&str>, agent_id: &str) -> Vec<PathBuf> {
+    /// Flips every covered file in the agent's batch to delivered (misc 141).
+    ///
+    /// The bare-`catenary diagnostics` payment: it diagnoses the whole batch, so
+    /// on a successful response delivery every file's flag flips true. Called
+    /// only *after* the socket write succeeds — a failed write leaves the flags
+    /// false and the gate armed. A no-op if the agent has no batch.
+    pub fn mark_delivered_all(&self, session_id: Option<&str>, agent_id: &str) {
         let key = editing_key(session_id, agent_id);
-        let mut state = self
+        if let Some(entry) = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_mut(&key)
-            .map(|entry| std::mem::take(&mut entry.files))
-            .unwrap_or_default()
+        {
+            for file in &mut entry.files {
+                file.delivered = true;
+            }
+        }
+    }
+
+    /// Flips exactly the named covered files to delivered (misc 141).
+    ///
+    /// The scoped-`catenary diagnostics path…` payment: partial delivery is the
+    /// flag-flip mechanism itself, so the gate holds for any batch file left
+    /// unnamed. A named path not in the batch is a no-op (a scoped call on a
+    /// never-edited file has no flag to flip). Called only *after* the socket
+    /// write succeeds. Matching is by exact path equality; the caller resolves
+    /// relative paths to absolute before dispatch.
+    pub fn mark_delivered(&self, session_id: Option<&str>, agent_id: &str, files: &[PathBuf]) {
+        let key = editing_key(session_id, agent_id);
+        if let Some(entry) = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&key)
+        {
+            for file in &mut entry.files {
+                if files.contains(&file.path) {
+                    file.delivered = true;
+                }
+            }
+        }
     }
 
     /// Exits editing mode for an agent, removing the entry entirely.
@@ -269,74 +406,6 @@ impl EditingManager {
         drop(state);
     }
 
-    /// Drains accumulated file paths for a single agent and removes its
-    /// editing entry. Returns the agent's file list and its own filtered
-    /// count (files skipped during accumulation for lack of LSP coverage).
-    ///
-    /// Scoped to one `(session_id, agent_id)` key so one agent's
-    /// `catenary diagnostics` does not consume a sibling agent's accumulated
-    /// set when both share a Catenary session (bug 37). This is the drain the
-    /// `pre-tool/editing-stop` hook uses: the hook carries the real
-    /// `agent_id` from the host CLI.
-    pub fn drain_and_clear(
-        &self,
-        session_id: Option<&str>,
-        agent_id: &str,
-    ) -> (Vec<PathBuf>, usize) {
-        let key = editing_key(session_id, agent_id);
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
-            .remove(&key)
-            .map(|entry| (entry.files, entry.filtered))
-            .unwrap_or_default()
-    }
-
-    /// Drops the named file paths from an agent's accumulated set, leaving any
-    /// unlisted files in place. Returns the paths actually removed (a path not
-    /// in the set is a no-op).
-    ///
-    /// The per-file counterpart to [`drain_and_clear`](Self::drain_and_clear):
-    /// `catenary diagnostics <paths>` pays the editing debt for exactly those
-    /// files (ws37 ticket 02, decision 3) — diagnosing a file pays its debt
-    /// regardless of clean/dirty — leaving the rest of the bucket armed. It
-    /// drops only listed files (never `clear_all`, bug 37); when that empties
-    /// the file list the whole `(session_id, agent_id)` entry is removed, so a
-    /// bucket a scoped pull drained looks identical to a bare drain (`is_active`
-    /// / `is_editing` go false, and the caller releases the guardrail). Matching
-    /// is by exact path equality; the caller resolves relative paths to absolute
-    /// before dispatch.
-    pub fn drop_files(
-        &self,
-        session_id: Option<&str>,
-        agent_id: &str,
-        files: &[PathBuf],
-    ) -> Vec<PathBuf> {
-        let key = editing_key(session_id, agent_id);
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(entry) = state.get_mut(&key) else {
-            return Vec::new();
-        };
-        let mut removed = Vec::new();
-        entry.files.retain(|p| {
-            if files.contains(p) {
-                removed.push(p.clone());
-                false
-            } else {
-                true
-            }
-        });
-        if entry.files.is_empty() {
-            state.remove(&key);
-        }
-        removed
-    }
-
     /// Clears all editing state. Returns the number of entries removed.
     ///
     /// Used by `SessionStart` cleanup to clear stale state when the
@@ -384,30 +453,32 @@ mod tests {
     }
 
     #[test]
-    fn add_file_accumulates() {
+    fn record_covered_edit_accumulates() {
         let em = EditingManager::new();
         em.start_editing(None, "").expect("start");
-        em.add_file(None, "", PathBuf::from("/src/main.rs"));
-        em.add_file(None, "", PathBuf::from("/src/lib.rs"));
-        let files = em.drain_files(None, "");
+        em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/lib.rs"));
+        let files = em.files(None, "");
         assert_eq!(files.len(), 2);
+        // Fresh edits are undelivered — the gate is armed.
+        assert!(em.has_undelivered(None, ""), "fresh edits arm the gate");
     }
 
     #[test]
-    fn add_file_deduplicates() {
+    fn record_covered_edit_deduplicates() {
         let em = EditingManager::new();
         em.start_editing(None, "").expect("start");
-        em.add_file(None, "", PathBuf::from("/src/main.rs"));
-        em.add_file(None, "", PathBuf::from("/src/main.rs"));
-        let files = em.drain_files(None, "");
+        em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
+        let files = em.files(None, "");
         assert_eq!(files.len(), 1);
     }
 
     #[test]
-    fn add_file_ignored_when_not_editing() {
+    fn record_covered_edit_ignored_when_not_editing() {
         let em = EditingManager::new();
-        em.add_file(None, "ghost", PathBuf::from("/src/main.rs"));
-        assert!(em.drain_files(None, "ghost").is_empty());
+        em.record_covered_edit(None, "ghost", PathBuf::from("/src/main.rs"));
+        assert!(em.files(None, "ghost").is_empty());
     }
 
     #[test]
@@ -415,7 +486,7 @@ mod tests {
         let em = EditingManager::new();
         em.start_editing(None, "").expect("start");
         assert!(!em.has_files(None, ""), "no files yet");
-        em.add_file(None, "", PathBuf::from("/src/main.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
         assert!(em.has_files(None, ""), "file added");
     }
 
@@ -426,20 +497,20 @@ mod tests {
     }
 
     #[test]
-    fn files_snapshots_without_draining() {
+    fn files_snapshots_the_whole_batch() {
         let em = EditingManager::new();
         em.start_editing(None, "").expect("start");
-        em.add_file(None, "", PathBuf::from("/src/main.rs"));
-        em.add_file(None, "", PathBuf::from("/src/lib.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/lib.rs"));
 
         let snapshot = em.files(None, "");
         assert_eq!(
             snapshot,
             vec![PathBuf::from("/src/main.rs"), PathBuf::from("/src/lib.rs")],
         );
-        // Snapshot did not drain — the files are still tracked.
-        assert!(em.has_files(None, ""), "files() must not drain");
-        assert_eq!(em.drain_files(None, "").len(), 2);
+        // Snapshotting the batch does not mutate it — it stays fully tracked.
+        assert!(em.has_files(None, ""), "files() must not mutate the batch");
+        assert_eq!(em.files(None, "").len(), 2);
     }
 
     #[test]
@@ -449,16 +520,19 @@ mod tests {
     }
 
     #[test]
-    fn filtered_reads_count_without_draining() {
+    fn filtered_reads_count_without_mutating() {
         let em = EditingManager::new();
         em.start_editing(None, "").expect("start");
-        em.add_file(None, "", PathBuf::from("/src/main.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
         em.increment_filtered(None, "");
         em.increment_filtered(None, "");
 
         assert_eq!(em.filtered(None, ""), 2);
-        // Reading the filtered count must not drain the file set.
-        assert!(em.has_files(None, ""), "filtered() must not drain");
+        // Reading the filtered count must not touch the batch.
+        assert!(
+            em.has_files(None, ""),
+            "filtered() must not mutate the batch"
+        );
         // It remains readable on a repeat call (no consume).
         assert_eq!(em.filtered(None, ""), 2);
     }
@@ -526,15 +600,129 @@ mod tests {
         );
     }
 
+    // ── Batch delivery / gate (misc 141) ──────────────────────────────
+
     #[test]
-    fn drain_files_clears() {
+    fn mark_delivered_all_disarms_the_gate_but_retains_the_batch() {
+        // A bare `catenary diagnostics` diagnoses the whole batch and flips every
+        // flag on successful delivery. The gate disarms, but the batch is
+        // retained so a repeat bare run re-diagnoses the same scope.
         let em = EditingManager::new();
         em.start_editing(None, "").expect("start");
-        em.add_file(None, "", PathBuf::from("/src/main.rs"));
-        let first = em.drain_files(None, "");
-        assert_eq!(first.len(), 1);
-        let second = em.drain_files(None, "");
-        assert!(second.is_empty());
+        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/b.rs"));
+        assert!(em.has_undelivered(None, ""), "fresh batch is undelivered");
+
+        em.mark_delivered_all(None, "");
+        assert!(
+            !em.has_undelivered(None, ""),
+            "delivery flips every flag — the gate disarms"
+        );
+        assert_eq!(
+            em.files(None, ""),
+            vec![PathBuf::from("/src/a.rs"), PathBuf::from("/src/b.rs")],
+            "the batch is retained for a repeat bare run to re-diagnose"
+        );
+        assert!(
+            em.undelivered_files(None, "").is_empty(),
+            "no outstanding debt after full delivery"
+        );
+    }
+
+    #[test]
+    fn mid_batch_edit_flips_without_reset() {
+        // A covered edit while the batch is incomplete (some flag false) joins /
+        // re-arms without discarding the batch.
+        let em = EditingManager::new();
+        em.start_editing(None, "").expect("start");
+        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/b.rs"));
+        // Deliver only a.rs (scoped), leaving b.rs undelivered → incomplete.
+        em.mark_delivered(None, "", &[PathBuf::from("/src/a.rs")]);
+        assert_eq!(
+            em.undelivered_files(None, ""),
+            vec![PathBuf::from("/src/b.rs")],
+            "scoped delivery flips only the named file"
+        );
+
+        // A fresh edit to the already-delivered a.rs re-arms it — no reset.
+        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"));
+        assert_eq!(
+            em.files(None, ""),
+            vec![PathBuf::from("/src/a.rs"), PathBuf::from("/src/b.rs")],
+            "the batch is unchanged in membership — a.rs was not re-appended"
+        );
+        assert_eq!(
+            em.undelivered_files(None, ""),
+            vec![PathBuf::from("/src/a.rs"), PathBuf::from("/src/b.rs")],
+            "editing a.rs again flips it back to undelivered"
+        );
+    }
+
+    #[test]
+    fn post_completion_edit_discards_and_starts_fresh_batch() {
+        // A covered edit while the batch is complete (all flags true) discards
+        // the batch and starts a new one with just that file.
+        let em = EditingManager::new();
+        em.start_editing(None, "").expect("start");
+        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/b.rs"));
+        em.mark_delivered_all(None, "");
+
+        // Now the batch is complete → the next covered edit resets it.
+        em.record_covered_edit(None, "", PathBuf::from("/src/c.rs"));
+        assert_eq!(
+            em.files(None, ""),
+            vec![PathBuf::from("/src/c.rs")],
+            "a post-completion covered edit discards the old batch"
+        );
+        assert!(
+            em.has_undelivered(None, ""),
+            "the new batch's sole file is undelivered — the gate re-arms"
+        );
+    }
+
+    #[test]
+    fn empty_batch_is_not_complete_so_covered_edit_joins() {
+        // A filtered-only entry (no covered files) is not a *complete* batch, so
+        // the first covered edit joins it rather than discarding it — the
+        // filtered metadata survives to the next bare run.
+        let em = EditingManager::new();
+        em.record_filtered_edit(None, "", Some(PathBuf::from("/home/dev/Lattice")));
+        assert!(!em.has_files(None, ""), "no covered files yet");
+
+        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"));
+        assert_eq!(
+            em.files(None, ""),
+            vec![PathBuf::from("/src/a.rs")],
+            "the covered edit joins the filtered-only entry"
+        );
+        assert_eq!(
+            em.filtered(None, ""),
+            1,
+            "the filtered count survives the join"
+        );
+    }
+
+    #[test]
+    fn mark_delivered_ignores_unnamed_and_missing() {
+        // A scoped delivery flips only the named files; a name not in the batch
+        // is a no-op.
+        let em = EditingManager::new();
+        em.start_editing(None, "").expect("start");
+        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/b.rs"));
+
+        em.mark_delivered(
+            None,
+            "",
+            &[PathBuf::from("/src/a.rs"), PathBuf::from("/src/never.rs")],
+        );
+        assert_eq!(
+            em.undelivered_files(None, ""),
+            vec![PathBuf::from("/src/b.rs")],
+            "only a.rs flips; the unknown name is ignored and b.rs stays armed"
+        );
     }
 
     #[test]
@@ -549,79 +737,29 @@ mod tests {
     }
 
     #[test]
-    fn drain_and_clear_collects_and_clears() {
+    fn scoped_delivery_pays_partial_debt() {
+        // A scoped `catenary diagnostics a.rs` flips only a.rs; the gate holds
+        // for b.rs, and the batch keeps both files.
         let em = EditingManager::new();
         em.start_editing(None, "agent-a").expect("start");
-        em.add_file(None, "agent-a", PathBuf::from("/src/main.rs"));
-        em.add_file(None, "agent-a", PathBuf::from("/src/lib.rs"));
-        em.increment_filtered(None, "agent-a");
+        em.record_covered_edit(None, "agent-a", PathBuf::from("/src/a.rs"));
+        em.record_covered_edit(None, "agent-a", PathBuf::from("/src/b.rs"));
 
-        let (files, filtered) = em.drain_and_clear(None, "agent-a");
-        assert_eq!(files.len(), 2);
-        assert_eq!(filtered, 1);
-        assert!(!em.is_editing(None, "agent-a"));
-
-        // Empty when nothing is editing
-        let (files, filtered) = em.drain_and_clear(None, "agent-a");
-        assert!(files.is_empty());
-        assert_eq!(filtered, 0);
-    }
-
-    #[test]
-    fn drop_files_pays_partial_debt() {
-        let em = EditingManager::new();
-        em.start_editing(None, "agent-a").expect("start");
-        em.add_file(None, "agent-a", PathBuf::from("/src/a.rs"));
-        em.add_file(None, "agent-a", PathBuf::from("/src/b.rs"));
-
-        let removed = em.drop_files(None, "agent-a", &[PathBuf::from("/src/a.rs")]);
-        assert_eq!(removed, vec![PathBuf::from("/src/a.rs")]);
+        em.mark_delivered(None, "agent-a", &[PathBuf::from("/src/a.rs")]);
         assert_eq!(
-            em.files(None, "agent-a"),
+            em.undelivered_files(None, "agent-a"),
             vec![PathBuf::from("/src/b.rs")],
-            "the unlisted file survives a scoped drop"
+            "the unnamed file stays armed after a scoped delivery"
         );
         assert!(
-            em.has_files(None, "agent-a"),
-            "partial pay leaves the bucket armed"
+            em.has_undelivered(None, "agent-a"),
+            "partial pay leaves the gate armed"
         );
-    }
-
-    #[test]
-    fn drop_files_emptying_bucket_removes_entry() {
-        let em = EditingManager::new();
-        em.start_editing(None, "agent-a").expect("start");
-        em.add_file(None, "agent-a", PathBuf::from("/src/a.rs"));
-
-        let removed = em.drop_files(None, "agent-a", &[PathBuf::from("/src/a.rs")]);
-        assert_eq!(removed, vec![PathBuf::from("/src/a.rs")]);
-        assert!(
-            !em.is_editing(None, "agent-a"),
-            "draining the last file removes the entry (mirrors a bare drain)"
-        );
-        assert!(!em.is_active(), "no accumulator remains");
-    }
-
-    #[test]
-    fn drop_files_unedited_path_is_noop() {
-        let em = EditingManager::new();
-        em.start_editing(None, "agent-a").expect("start");
-        em.add_file(None, "agent-a", PathBuf::from("/src/a.rs"));
-
-        let removed = em.drop_files(None, "agent-a", &[PathBuf::from("/src/unedited.rs")]);
-        assert!(removed.is_empty(), "a path not in the set drops nothing");
         assert_eq!(
-            em.files(None, "agent-a"),
-            vec![PathBuf::from("/src/a.rs")],
-            "the debt set is unchanged by a no-op drop"
+            em.files(None, "agent-a").len(),
+            2,
+            "the batch retains both files"
         );
-    }
-
-    #[test]
-    fn drop_files_missing_entry_is_noop() {
-        let em = EditingManager::new();
-        let removed = em.drop_files(None, "agent-a", &[PathBuf::from("/src/a.rs")]);
-        assert!(removed.is_empty(), "no entry → nothing to drop");
     }
 
     #[test]
@@ -630,8 +768,8 @@ mod tests {
         assert!(!em.is_active(), "no accumulator yet");
         em.start_editing(Some("s1"), "agent").expect("start");
         assert!(em.is_active(), "active after start, even with no files");
-        let (_, _) = em.drain_and_clear(Some("s1"), "agent");
-        assert!(!em.is_active(), "inactive after drain_and_clear");
+        em.done_editing(Some("s1"), "agent");
+        assert!(!em.is_active(), "inactive after done_editing");
 
         // done_editing on the only entry also clears activity.
         em.start_editing(None, "a").expect("start");
@@ -645,7 +783,7 @@ mod tests {
         let em = EditingManager::new();
         em.start_editing(None, "agent-a").expect("start a");
         em.start_editing(None, "agent-b").expect("start b");
-        em.add_file(None, "agent-a", PathBuf::from("/src/main.rs"));
+        em.record_covered_edit(None, "agent-a", PathBuf::from("/src/main.rs"));
         let count = em.clear_all();
         assert_eq!(count, 2);
         assert!(!em.is_editing(None, "agent-a"));
@@ -676,57 +814,60 @@ mod tests {
         em.start_editing(Some("s1"), "").expect("start");
         em.start_editing(Some("s2"), "").expect("start");
 
-        em.add_file(Some("s1"), "", PathBuf::from("/a.rs"));
-        em.add_file(Some("s2"), "", PathBuf::from("/b.rs"));
+        em.record_covered_edit(Some("s1"), "", PathBuf::from("/a.rs"));
+        em.record_covered_edit(Some("s2"), "", PathBuf::from("/b.rs"));
 
-        let s1_files = em.drain_files(Some("s1"), "");
-        assert_eq!(s1_files, vec![PathBuf::from("/a.rs")]);
-
-        let s2_files = em.drain_files(Some("s2"), "");
-        assert_eq!(s2_files, vec![PathBuf::from("/b.rs")]);
+        assert_eq!(em.files(Some("s1"), ""), vec![PathBuf::from("/a.rs")]);
+        assert_eq!(em.files(Some("s2"), ""), vec![PathBuf::from("/b.rs")]);
     }
 
     /// Two agents within ONE session (a subagent and the main agent, which
     /// share `session_id` and differ only by `agent_id`) accumulate into
-    /// separate buckets. Draining one agent's bucket must leave the other's
-    /// files — and filtered count — intact. Regression guard for bug 37,
-    /// where the diagnostics drain flattened every agent's bucket.
+    /// separate batches. Delivering one agent's batch must leave the other's
+    /// files — and gate — intact. Regression guard for bug 37, where the
+    /// diagnostics drain flattened every agent's bucket. Two `(session, agent)`
+    /// pairs never share a batch (misc 141).
     #[test]
-    fn agent_scoped_drain_within_one_session() {
+    fn agent_scoped_delivery_within_one_session() {
         let em = EditingManager::new();
         em.start_editing(Some("S"), "subA").expect("subA start");
         em.start_editing(Some("S"), "").expect("main start");
 
         // Distinct covered files per agent.
-        em.add_file(Some("S"), "subA", PathBuf::from("/a.rs"));
-        em.add_file(Some("S"), "", PathBuf::from("/b.rs"));
+        em.record_covered_edit(Some("S"), "subA", PathBuf::from("/a.rs"));
+        em.record_covered_edit(Some("S"), "", PathBuf::from("/b.rs"));
         // Distinct skipped-no-coverage counts per agent.
         em.increment_filtered(Some("S"), "subA");
         em.increment_filtered(Some("S"), "subA");
         em.increment_filtered(Some("S"), "");
 
-        // Drain only the subagent's bucket.
-        let (sub_files, sub_filtered) = em.drain_and_clear(Some("S"), "subA");
-        assert_eq!(sub_files, vec![PathBuf::from("/a.rs")]);
-        assert_eq!(sub_filtered, 2, "filtered attributed to subA, not shared");
+        // Deliver only the subagent's batch (its bare diagnostics run).
+        em.mark_delivered_all(Some("S"), "subA");
         assert!(
-            !em.is_editing(Some("S"), "subA"),
-            "subA entry removed after its drain"
+            !em.has_undelivered(Some("S"), "subA"),
+            "subA's gate disarms after its delivery"
+        );
+        assert_eq!(
+            em.filtered(Some("S"), "subA"),
+            2,
+            "filtered attributed to subA, not shared"
         );
 
-        // The main agent's bucket survives untouched.
+        // The main agent's batch is untouched — still armed.
         assert!(
-            em.is_editing(Some("S"), ""),
-            "main agent still editing after subA drained"
+            em.has_undelivered(Some("S"), ""),
+            "the main agent's gate stays armed after subA's delivery"
         );
         assert_eq!(
             em.files(Some("S"), ""),
             vec![PathBuf::from("/b.rs")],
-            "main agent's file set survives subA's drain"
+            "main agent's batch survives subA's delivery (bug 37)"
         );
-        let (main_files, main_filtered) = em.drain_and_clear(Some("S"), "");
-        assert_eq!(main_files, vec![PathBuf::from("/b.rs")]);
-        assert_eq!(main_filtered, 1, "main agent keeps its own filtered count");
+        assert_eq!(
+            em.filtered(Some("S"), ""),
+            1,
+            "main agent keeps its own filtered count"
+        );
     }
 
     #[test]

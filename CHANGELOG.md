@@ -208,6 +208,20 @@ upgrading.
 
 ### Changed
 
+- **`catenary diagnostics` becomes idiomatic — the batch replaces the drain.**
+  The tracked set is no longer destroyed at diagnose time. Edits accumulate
+  into a persistent per-`(session, agent)` **batch** whose files each carry a
+  `delivered` flag: a bare run computes fresh diagnostics over the whole batch
+  and flips every flag — but only after the response actually reaches a
+  client, so a killed run leaves the gate armed — and a repeat bare run
+  re-diagnoses the same batch fresh instead of answering `[no edited files]`
+  (stable scope, live truth, the `git status` idiom). Scoped runs flip only
+  the named files; the editing gate holds while any flag is false; the first
+  covered edit after a fully-delivered batch discards it and starts the next.
+  The per-session receipt store and its `last computed diagnostics saved
+  to …` pointer line are retired — recomputing over the surviving batch
+  supersedes re-reading stored bytes, so killed-client recovery is now just
+  "run it again."
 - **The 10 MB size cap falls — content classifies the search.**
   `BINARY_SIZE_THRESHOLD` is deleted: files are classified by a BOM-aware
   quit-at-first-NUL content sniff on every entry path (named, shell-expanded,

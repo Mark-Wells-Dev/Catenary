@@ -18,7 +18,7 @@ The edit→diagnostics loop
   clean or dirty; it never exits `1`, so a dirty result is not a failed call.
   Scope it — `catenary diagnostics path…` — to diagnose and pay off just those
   files; the gate stays armed for any edited file left unpaid. Diagnostics are
-  pulled: you see them only when you run the command.
+  pulled: you see them only when you run it — each run re-diagnoses the set.
 
 Bare-only vs pipe-friendly
   `catenary diagnostics` and `catenary roots …` are bare-only: run each as the

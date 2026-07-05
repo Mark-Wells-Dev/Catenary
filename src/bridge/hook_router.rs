@@ -288,12 +288,12 @@ impl HookRouter {
     /// editing mode (no diagnostics would be produced for them).
     ///
     /// The boundary block — denying non-edit commands until `catenary
-    /// diagnostics` runs — gates on a **non-empty covered tracked set**, not
-    /// the editing-mode bit (Decision 4). An empty set (doc-only / no-server
-    /// edits, or an explicit `editing start` with no coverable edit yet) flows
-    /// free: friction tracks value. While a covered set is pending, Read/Write,
-    /// `ToolSearch`, filesystem-only Bash, and canonical Catenary commands
-    /// (search/lifecycle) stay allowed; everything else is blocked.
+    /// diagnostics` runs — gates on **any undelivered covered file in the batch**,
+    /// not the editing-mode bit (Decision 4). A batch with nothing undelivered (no
+    /// coverable edit yet, or one already fully diagnosed) flows free: friction
+    /// tracks value. While undelivered debt is pending, Read/Write, `ToolSearch`,
+    /// filesystem-only Bash, and canonical Catenary commands (search/lifecycle)
+    /// stay allowed; everything else is blocked.
     fn handle_enforce_editing(
         &self,
         tool_name: &str,
@@ -350,9 +350,9 @@ impl HookRouter {
             return None;
         }
 
-        // Boundary block gates on a non-empty *covered* tracked set, not the
-        // mode bit. Empty set ⇒ nothing to diagnose ⇒ flow free.
-        if !self.session.editing.has_files(session_id, agent_id) {
+        // Boundary block gates on undelivered covered debt, not the mode bit.
+        // Nothing undelivered ⇒ nothing to diagnose ⇒ flow free (misc 141).
+        if !self.session.editing.has_undelivered(session_id, agent_id) {
             return None;
         }
 
@@ -401,7 +401,10 @@ impl HookRouter {
         use std::collections::BTreeMap;
         use std::fmt::Write as _;
 
-        let files = self.session.editing.files(session_id, agent_id);
+        // The gate fires on undelivered debt, so the message lists exactly the
+        // undelivered files — the ones that "haven't been diagnosed yet"
+        // (misc 141); already-delivered batch files are left out.
+        let files = self.session.editing.undelivered_files(session_id, agent_id);
 
         // Group the outstanding files under each feeder tracking them. A file
         // both a language server and a linter cover appears under both — the
@@ -537,13 +540,13 @@ impl HookRouter {
     ) {
         self.session
             .editing
-            .add_file(session_id, agent_id, path.to_path_buf());
+            .record_covered_edit(session_id, agent_id, path.to_path_buf());
         self.session
             .set_last_action(format!("{verb} {}", self.session.display_path(path)));
         debug!(
             source = Source::HookDispatch.as_str(),
             file = %path.display(),
-            "file accumulated for diagnostics",
+            "file recorded in diagnostics batch",
         );
     }
 
@@ -616,12 +619,13 @@ impl HookRouter {
         }
 
         if self.session.editing.is_editing(session_id, agent_id) {
-            if self.session.editing.has_files(session_id, agent_id) {
+            if self.session.editing.has_undelivered(session_id, agent_id) {
                 Some(HookResult::Block(
                     "run `catenary diagnostics` before finishing".into(),
                 ))
             } else {
-                // No files modified — silently clear editing state.
+                // No undelivered debt (nothing edited, or the batch is fully
+                // diagnosed) — silently clear editing state.
                 self.session.editing.done_editing(session_id, agent_id);
                 if let Some(guardrail) = &self.session.editing_guardrail {
                     guardrail.release_all(&self.session.instance_id);
@@ -741,7 +745,7 @@ mod tests {
         router
             .session
             .editing
-            .add_file(None, "", PathBuf::from("/src/main.rs"));
+            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
 
         // Edit tool — should allow during editing mode
         let result = router.handle_enforce_editing("Edit", None, None, None, "");
@@ -767,7 +771,7 @@ mod tests {
         router
             .session
             .editing
-            .add_file(None, "", PathBuf::from("/src/main.rs"));
+            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
 
         // bugs/16: a piped lifecycle command during editing must get a clear
         // pipe-deny from the canonical-form matcher, not the boundary block
@@ -836,7 +840,7 @@ mod tests {
         let result = router.handle_file_accumulation(&lib_rs, None, "", Some("Read"));
         assert!(result.is_none());
 
-        let files = router.session.editing.drain_files(None, "");
+        let files = router.session.editing.files(None, "");
         assert_eq!(files, vec![PathBuf::from(&main_rs)]);
     }
 
@@ -847,7 +851,7 @@ mod tests {
         router
             .session
             .editing
-            .add_file(None, "", PathBuf::from("/src/main.rs"));
+            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
 
         let result = router.handle_require_release(None, "", false);
         let Some(HookResult::Block(reason)) = result else {
@@ -1005,7 +1009,7 @@ mod tests {
             "editing mode entered by the first edit"
         );
 
-        let files = router.session.editing.drain_files(None, "");
+        let files = router.session.editing.files(None, "");
         assert_eq!(
             files,
             vec![PathBuf::from(&in_root)],
@@ -1052,7 +1056,7 @@ mod tests {
         assert!(router.session.editing.is_editing(None, ""));
 
         // Both files land under a single (session, agent) entry.
-        let files = router.session.editing.drain_files(None, "");
+        let files = router.session.editing.files(None, "");
         assert_eq!(files, vec![PathBuf::from(&f1), PathBuf::from(&f2)]);
         assert_eq!(
             router.session.editing.clear_all(),
@@ -1090,10 +1094,13 @@ mod tests {
             !router.session.editing.has_files(None, ""),
             "uncovered edit accumulates no covered file, so it never gates"
         );
-        let (files, filtered) = router.session.editing.drain_and_clear(None, "");
-        assert!(files.is_empty(), "uncovered file not accumulated");
+        assert!(
+            router.session.editing.files(None, "").is_empty(),
+            "uncovered file not accumulated"
+        );
         assert_eq!(
-            filtered, 1,
+            router.session.editing.filtered(None, ""),
+            1,
             "the standalone out-of-root edit is counted as filtered (bug 58)"
         );
     }
@@ -1120,13 +1127,16 @@ mod tests {
         // File outside workspace roots — should not be accumulated
         // but should increment filtered counter.
         router.handle_file_accumulation("/outside/some/file.rs", None, "", Some("Edit"));
-        let files = router.session.editing.drain_files(None, "");
+        let files = router.session.editing.files(None, "");
         assert!(
             files.is_empty(),
             "out-of-root file should not be accumulated"
         );
-        let (_, filtered) = router.session.editing.drain_and_clear(None, "");
-        assert_eq!(filtered, 1, "out-of-root edit should increment filtered");
+        assert_eq!(
+            router.session.editing.filtered(None, ""),
+            1,
+            "out-of-root edit should increment filtered"
+        );
     }
 
     #[test]
@@ -1136,7 +1146,7 @@ mod tests {
 
         let in_root = format!("{}/src/main.rs", root.display());
         router.handle_file_accumulation(&in_root, None, "", Some("Edit"));
-        let files = router.session.editing.drain_files(None, "");
+        let files = router.session.editing.files(None, "");
         assert_eq!(files.len(), 1, "in-root file should be accumulated");
     }
 
@@ -1266,7 +1276,7 @@ mod tests {
 
         let path = format!("/outside/file.{SF_LANG}");
         router.handle_file_accumulation(&path, None, "", Some("Edit"));
-        let files = router.session.editing.drain_files(None, "");
+        let files = router.session.editing.files(None, "");
         assert_eq!(
             files.len(),
             1,
@@ -1282,7 +1292,7 @@ mod tests {
 
         let path = format!("/outside/file.{SF_LANG}");
         router.handle_file_accumulation(&path, None, "", Some("Edit"));
-        let files = router.session.editing.drain_files(None, "");
+        let files = router.session.editing.files(None, "");
         assert!(
             files.is_empty(),
             "runtime-failed out-of-root file should not be accumulated"
@@ -1349,7 +1359,7 @@ mod tests {
         router
             .session
             .editing
-            .add_file(None, "", PathBuf::from("/src/main.rs"));
+            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
 
         // Filesystem-only Bash — should allow during editing
         let result = router.handle_enforce_editing("Bash", None, Some("rm -rf target/"), None, "");
@@ -1380,7 +1390,7 @@ mod tests {
         router
             .session
             .editing
-            .add_file(None, "", PathBuf::from("/src/main.rs"));
+            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
 
         // Non-filesystem Bash — should deny during editing
         let result = router.handle_enforce_editing("Bash", None, Some("cargo build"), None, "");
@@ -1398,7 +1408,7 @@ mod tests {
         router
             .session
             .editing
-            .add_file(None, "", PathBuf::from("/src/main.rs"));
+            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
 
         // Bash without command string — cannot verify, must deny
         let result = router.handle_enforce_editing("Bash", None, None, None, "");
@@ -1553,8 +1563,14 @@ mod tests {
         let main_rs = root.join("src/main.rs");
         let lib_rs = root.join("src/lib.rs");
         let _ = router.session.editing.start_editing(None, "");
-        router.session.editing.add_file(None, "", main_rs.clone());
-        router.session.editing.add_file(None, "", lib_rs.clone());
+        router
+            .session
+            .editing
+            .record_covered_edit(None, "", main_rs.clone());
+        router
+            .session
+            .editing
+            .record_covered_edit(None, "", lib_rs.clone());
 
         let msg = router.boundary_block_message(None, "", Some("make test"), "Bash");
 
@@ -1617,7 +1633,10 @@ mod tests {
         );
 
         let _ = router.session.editing.start_editing(None, "");
-        router.session.editing.add_file(None, "", notes.clone());
+        router
+            .session
+            .editing
+            .record_covered_edit(None, "", notes.clone());
         let msg = router.boundary_block_message(None, "", Some("cargo build"), "Bash");
 
         assert!(msg.contains("mocklint"), "names the linter feeder: {msg}");
@@ -1658,8 +1677,14 @@ mod tests {
         );
 
         let _ = router.session.editing.start_editing(None, "");
-        router.session.editing.add_file(None, "", main_rs.clone());
-        router.session.editing.add_file(None, "", notes.clone());
+        router
+            .session
+            .editing
+            .record_covered_edit(None, "", main_rs.clone());
+        router
+            .session
+            .editing
+            .record_covered_edit(None, "", notes.clone());
         let msg = router.boundary_block_message(None, "", Some("make check"), "Bash");
 
         assert!(msg.contains("rust-analyzer"), "names the LSP feeder: {msg}");
@@ -1951,7 +1976,7 @@ mod tests {
         router
             .session
             .editing
-            .add_file(None, "", PathBuf::from("/src/main.rs"));
+            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
 
         crate::logging::Sink::handle(
             router.session.notification_router.as_ref(),
@@ -2006,7 +2031,7 @@ mod tests {
         router
             .session
             .editing
-            .add_file(None, "", PathBuf::from("/src/main.rs"));
+            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
 
         // Enqueue a notification before the first stop.
         crate::logging::Sink::handle(
@@ -2065,7 +2090,7 @@ mod tests {
         router
             .session
             .editing
-            .add_file(None, "", PathBuf::from("/src/main.rs"));
+            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
 
         // Enqueue a notification.
         crate::logging::Sink::handle(
@@ -2147,7 +2172,7 @@ mod tests {
             writes: Vec::new(),
         });
 
-        let files = router.session.editing.drain_files(None, "");
+        let files = router.session.editing.files(None, "");
         assert_eq!(
             files,
             vec![PathBuf::from(&file)],
@@ -2182,8 +2207,10 @@ mod tests {
             !router.session.editing.is_editing(None, ""),
             "denied first edit must not enter editing mode"
         );
-        let (files, _) = router.session.editing.drain_and_clear(None, "");
-        assert!(files.is_empty(), "denied edit should not accumulate file");
+        assert!(
+            router.session.editing.files(None, "").is_empty(),
+            "denied edit should not accumulate file"
+        );
     }
 
     #[test]
@@ -2201,7 +2228,7 @@ mod tests {
             writes: Vec::new(),
         });
 
-        let files = router.session.editing.drain_files(None, "");
+        let files = router.session.editing.files(None, "");
         assert!(files.is_empty(), "non-edit tool should not accumulate file");
     }
 
@@ -2233,7 +2260,7 @@ mod tests {
             router.session.editing.is_editing(None, ""),
             "first covered shell write enters editing mode"
         );
-        let files = router.session.editing.drain_files(None, "");
+        let files = router.session.editing.files(None, "");
         assert_eq!(files, vec![target], "covered shell write accumulated");
     }
 
@@ -2262,8 +2289,10 @@ mod tests {
             !router.session.editing.is_editing(None, ""),
             "an uncovered shell write must not enter editing mode"
         );
-        let (files, _) = router.session.editing.drain_and_clear(None, "");
-        assert!(files.is_empty(), "uncovered shell write not accumulated");
+        assert!(
+            router.session.editing.files(None, "").is_empty(),
+            "uncovered shell write not accumulated"
+        );
     }
 
     #[test]
@@ -2307,9 +2336,16 @@ mod tests {
             router.session.editing.has_files(None, ""),
             "the covered write arms the boundary block"
         );
-        let (files, filtered) = router.session.editing.drain_and_clear(None, "");
-        assert_eq!(files, vec![covered], "only the covered target accumulated");
-        assert_eq!(filtered, 1, "the uncovered target is counted as filtered");
+        assert_eq!(
+            router.session.editing.files(None, ""),
+            vec![covered],
+            "only the covered target accumulated"
+        );
+        assert_eq!(
+            router.session.editing.filtered(None, ""),
+            1,
+            "the uncovered target is counted as filtered"
+        );
     }
 
     #[test]
@@ -2338,8 +2374,10 @@ mod tests {
             matches!(result.result, Some(HookResult::Deny(_))),
             "guardrail deny expected"
         );
-        let (files, _) = router.session.editing.drain_and_clear(None, "");
-        assert!(files.is_empty(), "a denied call accumulates no writes");
+        assert!(
+            router.session.editing.files(None, "").is_empty(),
+            "a denied call accumulates no writes"
+        );
     }
 
     #[test]
@@ -2382,16 +2420,17 @@ mod tests {
         );
 
         router.handle_file_accumulation(&unserved, None, "", Some("Edit"));
-        let files = router.session.editing.drain_files(None, "");
+        let files = router.session.editing.files(None, "");
         assert!(
             files.is_empty(),
             "non-served in-root edit must not be accumulated"
         );
-        let (_, filtered) = router.session.editing.drain_and_clear(None, "");
         assert_eq!(
-            filtered, 1,
+            router.session.editing.filtered(None, ""),
+            1,
             "non-served in-root edit should increment the filtered counter"
         );
+        router.session.editing.done_editing(None, "");
 
         // Contrast: a served in-root type (`.rs` → rust-analyzer) stays
         // covered and is accumulated, so diagnostics still flow for it.
@@ -2402,7 +2441,7 @@ mod tests {
             "in-root served type must keep LSP coverage"
         );
         router.handle_file_accumulation(&served, None, "", Some("Edit"));
-        let served_files = router.session.editing.drain_files(None, "");
+        let served_files = router.session.editing.files(None, "");
         assert_eq!(
             served_files.len(),
             1,

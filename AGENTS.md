@@ -34,8 +34,7 @@ others.
 - **State & storage:** There is no primary SQLite database (a legacy
   `catenary.db` is drained on startup). State spans three XDG base dirs, chosen for
   their durability semantics (see `src/paths.rs`): the durable Unix **socket**
-  under `state_dir`; the ephemeral `state.json` **session-board snapshot** and
-  per-session diagnostics-receipt stores (`receipts/<session>.txt`) under
+  under `state_dir`; the ephemeral `state.json` **session-board snapshot** under
   `runtime_dir` (tmpfs); and the
   regenerable, per-root-sharded **JSONL telemetry firehose** under `cache_dir`.
 - **CLI search commands:** `catenary grep` and `catenary glob`, invoked via the
@@ -51,14 +50,18 @@ others.
 - **CLI commands:** Editing lifecycle invoked via the host's shell tool:
   - Editing starts implicitly on the first edit — there is no explicit start
     step (`catenary editing start` remains as an idempotent no-op).
-  - `catenary diagnostics` — exit editing mode, print LSP diagnostics for all
-    modified files to stdout, and clear the tracked set.
+  - `catenary diagnostics` — print LSP diagnostics for the current batch of
+    modified files to stdout; delivery flips each file's gate flag but the batch
+    persists, so a repeat bare run re-diagnoses the same set fresh and the next
+    covered edit after a fully-diagnosed batch starts a new one.
   - `catenary roots add <path>` / `catenary roots rm <path>` — manage workspace
     roots.
 - **Diagnostics:** `catenary diagnostics` triggers the diagnostics pipeline:
-  batch all modified files, send to LSP servers, collect diagnostics, print to
-  stdout. The agent sees diagnostics in the shell tool output. Diagnostic events
-  are also emitted to the JSONL telemetry firehose.
+  compute over the current batch of modified files, send to LSP servers, collect
+  diagnostics, print to stdout. The batch (its files, each with a delivered flag)
+  is durable per `(session_id, agent_id)`; diagnostics are recomputed fresh over
+  it each run. The agent sees diagnostics in the shell tool output. Diagnostic
+  events are also emitted to the JSONL telemetry firehose.
 - **Logging:** `LoggingServer` is a `tracing_subscriber::Layer` that subscribes
   to every tracing event and dispatches structured events to two sinks: the
   notification queue (user-facing `systemMessage`) and the per-root-sharded JSONL

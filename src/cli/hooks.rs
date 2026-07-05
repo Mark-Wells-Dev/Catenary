@@ -697,7 +697,7 @@ fn pre_compress_should_mark(trigger: Option<&str>) -> bool {
 ///
 /// Creates the mark dir if needed and writes the marker (the trigger, for
 /// debuggability — existence is the signal). Keyed on the flattened `session_id`
-/// (the [`crate::paths::diagnostics_receipt_file`] pattern).
+/// (the [`crate::paths::discontinuity_mark_file`] pattern).
 fn lay_discontinuity_mark(session_id: &str) -> anyhow::Result<()> {
     lay_mark_in(&crate::paths::discontinuity_mark_dir(), session_id)
 }

@@ -136,10 +136,13 @@ freely — and `--count` answers "how many" without the listing.
 Print LSP diagnostics for the files you've edited, or lint the paths you
 name. Editing is tracked automatically — the first edit to a
 server-covered file starts it, there is no start step. Bare, this command
-is the *end* of an edit batch: it opens every modified file on its server,
+diagnoses the current **batch**: it opens every modified file on its server,
 waits for each to settle, and prints a **per-file receipt** — every
 diagnosed file listed, its errors and warnings beneath it, or `[clean]`
-beside it when the file is clean — then clears the set. When a file's
+beside it when the file is clean. The batch is durable, not consumed: run
+bare again with no intervening edit and it re-diagnoses the same set, fresh
+(the `git status` idiom). Your next covered edit after a fully-diagnosed
+batch starts a new one. When a file's
 server dies before answering — mid-run, or by failing to start at all —
 Catenary makes **one bounded, in-run attempt** to respawn it and re-run the
 remainder (a slight stall, never an unbounded wait); if that fails, coverage
@@ -152,22 +155,18 @@ banner naming the unavailable server** (`unavailable: <server>`) so degraded
 never reads as clean — the absence of evidence is not evidence of absence.
 An all-unverified run can never render as empty stdout (mistakable for a
 hang), and the exit stays `0`: the run completed and its receipt is
-truthful. The gate drains the degraded file exactly as a paid one — editing
+truthful. The gate releases the degraded file exactly as a paid one — editing
 it again re-arms it, and a server that is back next run resumes the normal
 contract. When nothing was edited it prints `[no edited files]`.
 
-**The receipt persists per session.** The daemon writes the full rendered
-receipt to a per-session store under `runtime_dir()/catenary/receipts/` at
-compute time — before the response reaches the CLI — so a `catenary
-diagnostics` invocation killed after dispatch (a backgrounded command reaped
-by the host, a tool-call timeout, a Ctrl-C) can no longer pay the edit debt
-without anyone seeing the result. Every run ends with a short pointer line
-naming the store and the files it covered; a later bare `catenary diagnostics`
-that finds nothing edited still names the prior store and its covered set, so
-you can tell at a glance whether it holds the set you just edited or a stale
-one — `cat` the named path to reread the full receipt. The store is
-regenerable ephemera (same tmpfs lifecycle as `state.json`), and a failed
-store write never affects the printed receipt.
+**The batch survives a killed client.** A `catenary diagnostics` run pays its
+debt by *delivery*, not at dispatch: the batch's per-file flags flip only after
+the daemon's response reaches the CLI. So an invocation killed after dispatch (a
+backgrounded command reaped by the host, a tool-call timeout, a Ctrl-C) leaves
+the flags unflipped and the gate armed — the batch is intact, and the next bare
+run re-diagnoses it in full. A kill *after* a successful write recovers the same
+way: the batch is retained, so re-running bare re-serves it. Recovery is always
+"run it again."
 
 ```bash
 catenary diagnostics                 # the whole edited set
@@ -192,12 +191,13 @@ edit-loop receipt (a handful of files) stays per-file, with `[clean]` or the
 `[unverified — …]` line beside each.
 
 **The edit gate is a debt paid by *diagnosing*, not fixing.** Every
-server-covered file you edit joins the gate; each file's debt is cleared
+server-covered file you edit joins the batch; each file's debt is paid
 by *looking at* it — pulling its diagnostics, clean or dirty — after which
-you choose whether to fix. Bare pays the whole set at once. Naming paths
-pays exactly those and drops them from the gate: a **partial** pull leaves
-the gate **armed** for the files you didn't name, so the command filter
-keeps blocking unrelated commands until the rest are diagnosed. Editing a
+you choose whether to fix. Bare pays the whole batch at once (it diagnoses
+every file, delivered or not, so a later edit's cross-file effects surface).
+Naming paths pays exactly those: a **partial** pull leaves the gate **armed**
+for the files you didn't name, so the command filter keeps blocking unrelated
+commands until the rest are diagnosed. Editing a
 paid file re-arms it. A named path that was never edited is simply linted
 on demand — it pays nothing, since it owed nothing. Relative paths resolve
 against the shell's current working directory. A named path that does not
