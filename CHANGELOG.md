@@ -71,7 +71,9 @@ upgrading.
 - **Agent worktrees live outside the repo.** The Claude Code plugin now
   registers a `WorktreeCreate` hook (`catenary hook worktree-create`): a
   `--worktree` session's or `isolation:"worktree"` subagent's working copy is
-  created at `cache_dir()/catenary/worktrees/<repo>-<id>` instead of nested
+  created out of tree — under the durable state base at
+  `catenary/worktrees/agents/<session>/<agent|name>` with a metadata sidecar
+  recording its origin — instead of nested
   under `.claude/worktrees/` inside the repo — so the parent root's language
   servers can never descend into it and double-index the project
   (rust-analyzer's gitignore-blind cargo discovery). The subagent's own
@@ -236,20 +238,27 @@ upgrading.
 
 ### Changed
 
-- **Subagent worktree roots unmount at SubagentStop, not session end.** When a
-  worktree-isolated subagent finishes, the daemon now reaps its
-  `worktree:{session}:{path}` root the moment the host's SubagentStop reaches
-  the `post-agent/require-release` handler (the payload's `cwd` is the
-  worktree — the exact SubagentStart mount key), shutting down that root's
-  language servers at agent completion instead of leaving a full server set
-  (rust-analyzer included) resident until the parent session ends. Invisible
-  to the stop-gate response; scoped to the worktree contributor class only —
-  a plain Stop event or a non-isolated subagent touches nothing. A resumed
-  subagent regains coverage on its first search or diagnostics run via the
-  ephemeral activity mounts. The worktree directory itself is never deleted —
-  disposal remains the host's (its documented automatic cleanup currently
-  skips hook-created worktrees entirely; see the known-issue trail in
-  anthropics/claude-code#34137).
+- **Subagent worktree roots unmount at agent completion — identity-keyed,
+  outcome-gated, idle-bounded.** When a worktree-isolated subagent truly
+  stops (the stop gate *allows* — a blocked stop leaves the root warm for
+  the mandated diagnostics run), the daemon reaps its worktree root and
+  shuts down that root's language servers, instead of leaving a full server
+  set (rust-analyzer included) resident until the parent session ends. The
+  mount now keys on agent identity (`worktree:{session}:{agent_id}`) rather
+  than a drift-prone working directory: creation records a metadata sidecar
+  (base commit, branch, identity) that a daemon registry rehydrates at
+  startup, the stop reap resolves through the registry with an
+  enclosing-root cwd fallback for foreign worktrees, and divergences are
+  logged. Two backstops bound the no-signal cases: a 30-minute idle timeout
+  unmounts worktree roots whose subagent died without a stop event (never
+  touching disk), and a new `PermissionRequest` observer hook marks an agent
+  waiting at a permission prompt as *blocked* — exempt from idle expiry, so
+  a worker paused on a human answer keeps its warm servers for hours. A
+  resumed subagent regains coverage on its first search or diagnostics run
+  via the ephemeral activity mounts. The worktree directory itself is never
+  deleted — disposal remains the host's (its documented automatic cleanup
+  currently skips hook-created worktrees entirely; see the known-issue trail
+  in anthropics/claude-code#34137).
 - **`catenary diagnostics` becomes idiomatic — the batch replaces the drain.**
   The tracked set is no longer destroyed at diagnose time. Edits accumulate
   into a persistent per-`(session, agent)` **batch** whose files each carry a

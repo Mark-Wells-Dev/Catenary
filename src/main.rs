@@ -436,9 +436,17 @@ enum HookCommand {
         format: HostFormat,
     },
     /// `WorktreeCreate`: create the subagent's worktree out-of-tree under the
-    /// cache dir, printing its absolute path (misc 144).
+    /// durable state dir, printing its absolute path (misc 144 / misc 150).
     #[command(name = "worktree-create")]
     WorktreeCreate {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `PermissionRequest`: observe a permission prompt (pure observer — suspends
+    /// the subagent's worktree idle expiry while blocked; misc 150).
+    #[command(name = "permission-request")]
+    PermissionRequest {
         /// Output format: "claude" or "antigravity".
         #[arg(long, value_enum)]
         format: HostFormat,
@@ -802,6 +810,9 @@ fn main() -> Result<()> {
                         eprintln!("catenary hook worktree-create: {e:#}");
                         std::process::exit(1);
                     }
+                }
+                HookCommand::PermissionRequest { format } => {
+                    cli::hooks::run_permission_request(format);
                 }
             }
             Ok(())
@@ -1244,6 +1255,13 @@ fn run_daemon_main() -> Result<()> {
     // no-op for a session-less manager. These roots have no MCP heartbeat to pin
     // on, so the idle detector is their only release signal (DESIGN.md).
     manager.spawn_ephemeral_root_reaper(rt.handle());
+
+    // Worktree-root idle-expiry reaper (misc 150): unmounts a mounted worktree
+    // root that has gone idle past the (longer) worktree timeout, reclaiming its
+    // language servers' RAM — the reported buildup fix. Never touches disk (a
+    // worktree can hold unlanded work); a blocked-on-permission root is exempt.
+    // Spawned AFTER `with_session` so the tracker + worktree clock exist.
+    manager.spawn_worktree_root_idle_reaper(rt.handle());
 
     info!(
         source = Source::DaemonLifecycle.as_str(),
@@ -2376,6 +2394,18 @@ mod tests {
             unreachable!("expected Hook command");
         };
         assert!(matches!(command, HookCommand::WorktreeCreate { .. }));
+    }
+
+    #[test]
+    fn test_cli_hook_permission_request() {
+        use clap::Parser;
+        let args =
+            Args::try_parse_from(["catenary", "hook", "permission-request", "--format=claude"]);
+        let args = args.expect("hook permission-request should parse");
+        let Some(Command::Hook { command }) = args.command else {
+            unreachable!("expected Hook command");
+        };
+        assert!(matches!(command, HookCommand::PermissionRequest { .. }));
     }
 
     #[test]

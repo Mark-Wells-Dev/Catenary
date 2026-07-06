@@ -7,14 +7,15 @@
     reason = "tests use expect for readable assertions"
 )]
 //! Integration tests for the `catenary hook worktree-create` subcommand
-//! (misc 144): out-of-tree agent worktree creation under the cache dir.
+//! (misc 144 / misc 150): out-of-tree agent worktree creation under the durable
+//! state dir.
 //!
 //! Each test spawns the real binary with a synthetic `WorktreeCreate` payload on
-//! stdin. `isolate_env` points `XDG_CACHE_HOME` at the test tempdir, so the hook
-//! writes its worktrees under `<tempdir>/cache/catenary/worktrees/` instead of
-//! the user's real cache. `isolate_env` clears `PATH` (so stray server defaults
-//! fail fast); these tests restore it afterwards because the hook shells out to
-//! `git`.
+//! stdin. `isolate_env` points `XDG_STATE_HOME` at the test tempdir, so the hook
+//! writes its worktrees under `<tempdir>/state/catenary/worktrees/agents/`
+//! instead of the user's real state dir. `isolate_env` clears `PATH` (so stray
+//! server defaults fail fast); these tests restore it afterwards because the hook
+//! shells out to `git`.
 
 mod common;
 
@@ -24,7 +25,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 
-use common::{isolate_env, xdg_cache_home};
+use common::{isolate_env, xdg_cache_home, xdg_state_home};
 
 /// Runs a git command in `cwd`, asserting success (test setup helper — uses the
 /// test process's real environment, so `git` is on `PATH`).
@@ -116,15 +117,17 @@ fn worktree_create_makes_out_of_tree_worktree_and_prints_path() {
     assert!(worktree.is_absolute(), "printed path must be absolute");
     assert!(worktree.is_dir(), "the worktree dir must exist: {stdout}");
 
-    // It lives OUTSIDE the repo, under the isolated cache dir's worktrees root.
-    let cache_worktrees = xdg_cache_home(home.path())
+    // It lives OUTSIDE the repo, under the isolated state dir's agents subtree
+    // (`state/catenary/worktrees/agents/<session_id>/<segment>`).
+    let agents = xdg_state_home(home.path())
         .join("catenary")
-        .join("worktrees");
+        .join("worktrees")
+        .join("agents");
     assert!(
-        worktree.starts_with(&cache_worktrees),
+        worktree.starts_with(&agents),
         "worktree {} must live under {}",
         worktree.display(),
-        cache_worktrees.display(),
+        agents.display(),
     );
     assert!(
         !worktree.starts_with(&repo),
@@ -134,6 +137,43 @@ fn worktree_create_makes_out_of_tree_worktree_and_prints_path() {
     // A linked git worktree carries a `.git` *file* pointing back at the repo.
     let dot_git = worktree.join(".git");
     assert!(dot_git.is_file(), "worktree must have a `.git` file");
+
+    // The durable sidecar is a SIBLING of the worktree dir (never inside it), and
+    // records the creation metadata.
+    let leaf = worktree
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("worktree leaf");
+    let sidecar = worktree.with_file_name(format!("{leaf}.meta.json"));
+    assert!(
+        sidecar.is_file(),
+        "the sidecar must exist beside the worktree: {}",
+        sidecar.display(),
+    );
+    assert_eq!(
+        sidecar.parent(),
+        worktree.parent(),
+        "the sidecar must be a sibling of the worktree (git status must stay pristine)",
+    );
+    let meta: Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar).expect("read sidecar"))
+            .expect("parse sidecar json");
+    assert_eq!(
+        meta.get("class").and_then(Value::as_str),
+        Some("agent"),
+        "sidecar records the agent class",
+    );
+    assert_eq!(
+        meta.get("source_repo").and_then(Value::as_str),
+        repo.to_str(),
+        "sidecar records the source repo",
+    );
+    assert!(
+        meta.get("base_commit")
+            .and_then(Value::as_str)
+            .is_some_and(|c| !c.is_empty()),
+        "sidecar records a non-empty base commit",
+    );
 
     // git registered it against the source repo.
     let listed = Command::new("git")
@@ -146,6 +186,63 @@ fn worktree_create_makes_out_of_tree_worktree_and_prints_path() {
     assert!(
         listed.contains(&stdout),
         "git worktree list must include the new worktree:\n{listed}",
+    );
+}
+
+#[test]
+fn worktree_create_agent_name_lands_at_identity_segment() {
+    // A subagent spawn payload: `name = agent-<id>`, `session_id` present. The
+    // worktree lands at `agents/<session_id>/<agent_id>` (the identity-in-path
+    // scheme) and the sidecar records the parsed agent id (misc 150).
+    let home = tempfile::tempdir().expect("home tempdir");
+    let repo = home.path().join("repo");
+    init_repo(&repo);
+
+    let output = run_hook(
+        home.path(),
+        &json!({
+            "cwd": repo.to_str().expect("repo path"),
+            "session_id": "sess-abc",
+            "name": "agent-deadbeef",
+            "hook_event_name": "WorktreeCreate",
+        }),
+    );
+    assert!(
+        output.status.success(),
+        "hook must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let worktree = PathBuf::from(&stdout);
+    // `agents/<session_id>/<segment>` where segment is the bare agent id.
+    let tail = Path::new("agents").join("sess-abc").join("deadbeef");
+    assert!(
+        worktree.ends_with(&tail),
+        "worktree {} must land at agents/sess-abc/deadbeef",
+        worktree.display(),
+    );
+
+    let leaf = worktree
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("worktree leaf");
+    let sidecar = worktree.with_file_name(format!("{leaf}.meta.json"));
+    let meta: Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar).expect("read sidecar"))
+            .expect("parse sidecar json");
+    assert_eq!(
+        meta.get("agent_id").and_then(Value::as_str),
+        Some("deadbeef")
+    );
+    assert_eq!(
+        meta.get("name").and_then(Value::as_str),
+        Some("agent-deadbeef"),
+        "the sidecar stores the payload name verbatim",
+    );
+    assert_eq!(
+        meta.get("session_id").and_then(Value::as_str),
+        Some("sess-abc")
     );
 }
 
@@ -226,8 +323,9 @@ fn worktree_create_prunes_orphans_before_creating() {
     let repo = home.path().join("repo");
     init_repo(&repo);
 
-    // Seed a dead orphan under the cache worktrees root: a dir whose `.git`
-    // pointer names a metadata dir that does not exist.
+    // Seed a dead orphan under the LEGACY cache worktrees root (older builds):
+    // a dir whose `.git` pointer names a metadata dir that does not exist. The
+    // create sweeps both the new agents subtree and this legacy location.
     let cache_worktrees = xdg_cache_home(home.path())
         .join("catenary")
         .join("worktrees");

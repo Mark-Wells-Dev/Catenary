@@ -666,6 +666,11 @@ pub fn run_subagent_start(format: HostFormat) {
     if let Some(stream) = hook_connect(&hook_json) {
         let mut request = serde_json::json!({
             "method": "subagent-start/mount-worktree",
+            // Forward the agent identity so the daemon keys the mount
+            // `worktree:{session_id}:{agent_id}` (misc 150) — the reap at
+            // SubagentStop then rebuilds the key from identity alone. Absent
+            // (empty) for a `--worktree` session, which keys by path.
+            "agent_id": extract_agent_id(&hook_json),
             "format": format.as_str(),
         });
         if let Some(sid) = extract_session_id(&hook_json, format) {
@@ -674,6 +679,9 @@ pub fn run_subagent_start(format: HostFormat) {
         if let Some(cwd) = extract_cwd_str(&hook_json, format) {
             request["cwd"] = serde_json::json!(cwd);
         }
+        // Forward the full host payload (symmetry with `post-agent`), the live
+        // drift-net confirming SubagentStart's schema on the first real run.
+        request["host_payload"] = prepare_host_payload(&hook_json);
 
         // Fire and forget — no response processing needed.
         let _ = ipc_exchange(stream, &request);
@@ -744,6 +752,41 @@ pub fn run_worktree_remove(format: HostFormat) {
     let _ = ipc_exchange(stream, &request);
 }
 
+/// Observe a permission prompt so the daemon suspends the subagent's worktree
+/// idle expiry (`PermissionRequest` hook handler).
+///
+/// A **pure observer** (misc 150): it forwards `session_id` + `agent_id` +
+/// the host payload to the daemon, which marks the agent's worktree root
+/// **blocked** — a blocked root is exempt from idle expiry, because a subagent
+/// parked at a permission prompt for hours is *blocked*, not orphaned. It returns
+/// no decision to the host: it **prints nothing on every path** and always exits
+/// `0`, so it can never interfere with the host's permission flow.
+pub fn run_permission_request(format: HostFormat) {
+    let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
+        return;
+    };
+    let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
+        return;
+    };
+
+    let Some(stream) = hook_connect(&hook_json) else {
+        return;
+    };
+
+    let mut request = serde_json::json!({
+        "method": "permission-request/blocked",
+        "agent_id": extract_agent_id(&hook_json),
+        "format": format.as_str(),
+    });
+    if let Some(sid) = extract_session_id(&hook_json, format) {
+        request["session_id"] = serde_json::json!(sid);
+    }
+    request["host_payload"] = prepare_host_payload(&hook_json);
+
+    // Fire and forget — the observer never emits a decision or any stdout.
+    let _ = ipc_exchange(stream, &request);
+}
+
 /// Create an out-of-tree agent worktree (`WorktreeCreate` hook handler).
 ///
 /// Unlike every other hook — which fail *open* so the host CLI's flow is never
@@ -782,25 +825,34 @@ pub fn run_worktree_create(format: HostFormat) -> anyhow::Result<()> {
         payload = %hook_json,
         "WorktreeCreate payload received",
     );
-    forward_worktree_create_payload(&hook_json, format);
 
-    let worktree = crate::worktree_create::create_from_payload(&hook_json)?;
+    let meta = crate::worktree_create::create_from_payload(&hook_json)?;
+
+    // Register the created worktree with the daemon (the in-memory half of the
+    // registry; the sidecar is the durable half). Best-effort — never affects
+    // the creation contract.
+    forward_worktree_create_payload(&hook_json, &meta, format);
 
     // The stdout contract: the created worktree's absolute path, and nothing
     // else. Uses the same bare `print!` (no trailing newline) the other hook
     // subcommands use for stdout — `println!` is denied by the house rules.
-    print!("{}", worktree.display());
+    print!("{}", meta.worktree.display());
     Ok(())
 }
 
-/// Best-effort forward of the `WorktreeCreate` payload to the daemon so it lands
-/// in the JSONL firehose (`catenary query --kind hook`), the maintainer's live
-/// schema-verification surface.
+/// Best-effort forward of the `WorktreeCreate` registration to the daemon.
 ///
-/// Purely for observability: silently skipped when the daemon is unreachable and
-/// its result is ignored, so it can never affect worktree creation (whose
-/// success/failure is the host contract).
-fn forward_worktree_create_payload(hook_json: &serde_json::Value, format: HostFormat) {
+/// Two purposes, one round-trip: the full host payload lands in the JSONL
+/// firehose (`catenary query --kind hook`, the live schema-verification surface),
+/// and the [`WorktreeMeta`](crate::worktree_create::WorktreeMeta) registers the
+/// identity→path map in the daemon registry (misc 150). Silently skipped when
+/// the daemon is unreachable and its result is ignored, so it can never affect
+/// worktree creation (whose success/failure is the host contract).
+fn forward_worktree_create_payload(
+    hook_json: &serde_json::Value,
+    meta: &crate::worktree_create::WorktreeMeta,
+    format: HostFormat,
+) {
     let Some(stream) = hook_connect(hook_json) else {
         return;
     };
@@ -812,6 +864,7 @@ fn forward_worktree_create_payload(hook_json: &serde_json::Value, format: HostFo
         request["session_id"] = serde_json::json!(sid);
     }
     request["host_payload"] = prepare_host_payload(hook_json);
+    request["worktree_meta"] = serde_json::to_value(meta).unwrap_or(serde_json::Value::Null);
     let _ = ipc_exchange(stream, &request);
 }
 

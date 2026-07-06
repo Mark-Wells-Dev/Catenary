@@ -85,6 +85,17 @@
           }
         ]
       }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary hook permission-request --format=claude"
+          }
+        ]
+      }
     ]
   }
 }

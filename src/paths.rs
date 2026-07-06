@@ -100,35 +100,54 @@ pub fn encode_cwd(path: &Path) -> String {
     flatten_component(&path.to_string_lossy())
 }
 
-/// Root directory under [`cache_dir`] that holds relocated agent worktrees.
+/// Root directory under [`state_dir`] that holds Catenary-managed worktrees.
 ///
-/// `<cache_dir>/catenary/worktrees/`. Claude Code's `WorktreeCreate` hook
-/// (`catenary hook worktree-create`) creates each subagent worktree here —
-/// physically *outside* the source repo tree — so gitignore-blind language
-/// server discovery (rust-analyzer's cargo walk) can never descend into it, the
-/// structural fix for the nested-worktree index pollution (bug 53 / misc 144).
-/// The orphan-prune sweep ([`crate::worktree_create::prune_orphans`]) scans this
-/// directory.
+/// `<state_dir>/catenary/worktrees/`. A *durable* base (not the regenerable
+/// cache): a dirty agent worktree can hold the only copy of unlanded work, which
+/// the disposal design refuses to auto-delete, so its home must survive a cache
+/// purge (misc 150 / misc 151 layout). Agent worktrees live under the
+/// [`agents_worktrees_dir`] subtree. Placing worktrees *outside* the source repo
+/// tree is bug 53's structural fix — gitignore-blind server discovery
+/// (rust-analyzer's cargo walk) can never descend into them.
 #[must_use]
 pub fn worktrees_dir() -> PathBuf {
+    state_dir().join("catenary").join("worktrees")
+}
+
+/// Subtree under [`worktrees_dir`] that holds ephemeral agent worktrees.
+///
+/// `<state_dir>/catenary/worktrees/agents/`. Each agent worktree lives at
+/// `agents/<session_id>/<segment>/` ([`agent_worktree_dir`]); the path itself is
+/// the `(session, agent)` key, so a dead session's leftovers group into one
+/// sweepable subtree and registry rehydration is path-derivable even with a
+/// damaged sidecar. The orphan-prune sweep
+/// ([`crate::worktree_create::prune_agent_orphans`]) scans this directory.
+#[must_use]
+pub fn agents_worktrees_dir() -> PathBuf {
+    worktrees_dir().join("agents")
+}
+
+/// Legacy cache-dir worktrees root from older builds.
+///
+/// `<cache_dir>/catenary/worktrees/`. Pre-misc-150 builds created agent
+/// worktrees here (the flattened-repo scheme). No new worktree is ever placed
+/// here; it is retained solely so [`crate::worktree_create::prune_orphans`] can
+/// sweep stragglers left by an older daemon.
+#[must_use]
+pub fn legacy_cache_worktrees_dir() -> PathBuf {
     cache_dir().join("catenary").join("worktrees")
 }
 
-/// Directory for a single relocated agent worktree under [`worktrees_dir`].
+/// Directory for a single agent worktree under [`agents_worktrees_dir`].
 ///
-/// `<cache_dir>/catenary/worktrees/<flattened-repo>-<unique_id>`. The source
-/// repo path is flattened to one filesystem-safe component via
-/// [`flatten_component`] (the same lossy `[^a-zA-Z0-9] -> -` mapping the
-/// firehose shard key uses), then suffixed with `unique_id` so concurrent
-/// worktrees of the same repo never collide. The flattened repo is a human
-/// label, not a reversible encoding — collisions are harmless because
-/// `unique_id` disambiguates.
+/// `<state_dir>/catenary/worktrees/agents/<session_id>/<segment>/`. The
+/// `segment` is the bare agent id when the `WorktreeCreate` payload `name`
+/// parses as `agent-<id>` (a subagent spawn), else the `name` verbatim (a
+/// `--worktree` session). The identity-in-path scheme makes the directory itself
+/// the `(session, agent)` key.
 #[must_use]
-pub fn agent_worktree_dir(repo: &Path, unique_id: &str) -> PathBuf {
-    worktrees_dir().join(format!(
-        "{}-{unique_id}",
-        flatten_component(&repo.to_string_lossy())
-    ))
+pub fn agent_worktree_dir(session_id: &str, segment: &str) -> PathBuf {
+    agents_worktrees_dir().join(session_id).join(segment)
 }
 
 #[cfg(test)]
@@ -161,31 +180,58 @@ mod tests {
     }
 
     #[test]
-    fn worktrees_dir_lives_under_cache() {
+    fn worktrees_dir_lives_under_state() {
         let dir = worktrees_dir();
         assert!(
-            dir.starts_with(cache_dir()),
-            "worktrees dir must live under cache_dir",
+            dir.starts_with(state_dir()),
+            "worktrees dir must live under state_dir (durable, not the cache)",
         );
         assert!(
             dir.ends_with("catenary/worktrees"),
-            "worktrees dir must be `<cache>/catenary/worktrees`, got {}",
+            "worktrees dir must be `<state>/catenary/worktrees`, got {}",
             dir.display(),
         );
     }
 
     #[test]
-    fn agent_worktree_dir_flattens_repo_and_suffixes_id() {
-        let dir = agent_worktree_dir(Path::new("/home/mark/Projects/Catenary"), "abc123");
+    fn agents_worktrees_dir_is_the_agents_subtree() {
+        let dir = agents_worktrees_dir();
         assert!(
             dir.starts_with(worktrees_dir()),
-            "agent worktree dir must live under the worktrees root",
+            "agents subtree must live under the worktrees root",
         );
-        // Final component: the flattened repo (same `[^a-zA-Z0-9] -> -` mapping
-        // as `encode_cwd`) suffixed with the unique id.
         assert!(
-            dir.ends_with("-home-mark-Projects-Catenary-abc123"),
-            "unexpected leaf component: {}",
+            dir.ends_with("catenary/worktrees/agents"),
+            "agents subtree must be `<state>/catenary/worktrees/agents`, got {}",
+            dir.display(),
+        );
+    }
+
+    #[test]
+    fn legacy_cache_worktrees_dir_lives_under_cache() {
+        let dir = legacy_cache_worktrees_dir();
+        assert!(
+            dir.starts_with(cache_dir()),
+            "legacy worktrees dir must live under cache_dir (the old scheme)",
+        );
+        assert!(
+            dir.ends_with("catenary/worktrees"),
+            "legacy worktrees dir must be `<cache>/catenary/worktrees`, got {}",
+            dir.display(),
+        );
+    }
+
+    #[test]
+    fn agent_worktree_dir_is_session_then_segment() {
+        let dir = agent_worktree_dir("sess-abc", "ad9dee0ad90513642");
+        assert!(
+            dir.starts_with(agents_worktrees_dir()),
+            "agent worktree dir must live under the agents subtree",
+        );
+        // `agents/<session_id>/<segment>` — the identity-in-path key.
+        assert!(
+            dir.ends_with("agents/sess-abc/ad9dee0ad90513642"),
+            "unexpected leaf path: {}",
             dir.display(),
         );
     }
