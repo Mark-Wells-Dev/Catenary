@@ -270,6 +270,19 @@ directory lives. As a crash-safety backstop, each create first runs
 `git worktree prune` semantics over the cache dir (`worktree_create::prune_orphans`),
 sweeping any directory whose git linkage is already dead.
 
+Because the hook **replaces** Claude Code's default worktree creation entirely,
+two host behaviors are reimplemented in `worktree_create.rs`. First,
+`.worktreeinclude`: the host normally copies untracked, git-ignored local config
+(the `.env` class) into each new worktree per a `<repo>/.worktreeinclude` file
+(`.gitignore` pattern syntax); `copy_worktree_includes` carries the matched
+files into the relocated worktree, preserving relative paths and skipping any
+path already checked out (so tracked files are never clobbered). Second, VCS
+detection: before any git call, `detect_vcs` examines the payload `cwd` (and its
+ancestors) for a marker — `.git` proceeds on the relocation path, while a non-git
+working copy (`.svn`/`.hg`/`.jj`) or an unversioned directory fails with a single
+honest line naming the detected VCS rather than a raw git error (VCS detection is
+in-scope; non-git VCS *support* is not).
+
 ### Worktree-root teardown
 
 A worktree subagent's root is mounted at `SubagentStart` and meant to be

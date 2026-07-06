@@ -74,7 +74,13 @@ upgrading.
   automatic `git worktree remove` cleanup works unchanged, and the hook
   prunes dead cache-dir entries on each spawn. The hook forwards its payload
   to the firehose (`catenary query --kind hook`) so the live schema is
-  verifiable. `-n`/`--line-number` and `-H`/`--with-filename` now parse and do
+  verifiable. Because a configured WorktreeCreate hook replaces the host's
+  default behavior entirely, the hook **reimplements `.worktreeinclude`**
+  (gitignore-syntax patterns; matching local files like `.env` are copied
+  into the new worktree, existing checked-out files never clobbered) — no
+  host feature is lost. Non-git working copies get an honest named refusal
+  (`.svn`/`.hg`/`.jj` detected and named; "configure your own WorktreeCreate
+  hook") instead of a raw git error. `-n`/`--line-number` and `-H`/`--with-filename` now parse and do
   nothing — line numbers (`path:N`) and filenames are unconditional in the
   output, so the `grep`/ripgrep muscle-memory reach succeeds instead of
   erroring. `-c` joins as a hidden ripgrep-letter short for `--count`.
