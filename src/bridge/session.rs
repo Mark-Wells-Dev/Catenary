@@ -136,10 +136,13 @@ impl ResolvedGlob {
     /// repo-scoped (matching ripgrep and editors): outside a git repository no
     /// `.gitignore` rules apply. Results are sorted for deterministic output.
     ///
-    /// Only meaningful for absolute patterns (the only form the daemon
-    /// receives — the CLI resolves every path argument against `cwd` before
-    /// dispatch). Relative patterns carry no base directory and yield an empty
-    /// list.
+    /// Only meaningful for absolute patterns — the sole form path-argument
+    /// expansion sees, because the daemon absolutizes every relative path
+    /// argument against the request's `cwd` (in `GrepRequest`/`GlobRequest`
+    /// `to_params`) before dispatch (bugs 31, 69). Relative patterns carry no
+    /// base directory and yield an empty list; the relative form survives only
+    /// for `--glob` scope filters, which match root-relative via
+    /// [`is_match`](Self::is_match).
     #[must_use]
     pub fn expand(&self, include_gitignored: bool, include_hidden: bool) -> Vec<PathBuf> {
         self.expand_cancellable(
@@ -206,8 +209,9 @@ impl ResolvedGlob {
 /// repo-scoped (matching ripgrep/editors); outside a git repository nothing is
 /// filtered.
 ///
-/// Paths are expected to be absolute (the CLI resolves them against `cwd`
-/// before dispatch). An empty input yields an empty result; callers
+/// Paths are expected to be absolute — the daemon absolutizes every relative
+/// path argument against the request's `cwd` (in `GrepRequest`/`GlobRequest`
+/// `to_params`) before dispatch. An empty input yields an empty result; callers
 /// distinguish "no path arguments" (search `cwd`) from "arguments that matched
 /// nothing" (empty result) before calling this.
 #[must_use]

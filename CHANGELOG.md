@@ -546,6 +546,15 @@ upgrading.
 
 ### Fixed
 
+- **The stale-hooks notification names the real command.** The daemon-startup
+  staleness check said `Run: catenary install` — a subcommand that only lists
+  detected hosts. It now names the exact per-host command
+  (`catenary install claude` / `catenary install antigravity`), matching the
+  doctor surface's wording. Relatedly, the daemon-side docs claiming "the CLI
+  resolves every path argument against cwd" are trued — the *daemon*
+  absolutizes relative search paths against the request's cwd (`to_params`,
+  since misc 102) — and three regression tests now pin cwd-anchoring for
+  relative `grep`/`glob` patterns from subdirectories and nested checkouts.
 - **`<>` (read-write) redirects lex as one operator.** The faithful shell
   parser had no read-write redirect: `<>` split into a `<` then a `>` — two
   redirects where bash performs one — diverging from the brush oracle (found

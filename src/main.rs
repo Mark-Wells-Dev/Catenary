@@ -2148,6 +2148,17 @@ async fn run_root_command(out: &mut cli::Output, path: PathBuf, method: &str) ->
 /// routes this to the notification queue and the desktop notification
 /// sink automatically.
 ///
+/// Builds the stale-hooks daemon-startup notification.
+///
+/// Names the exact `catenary install <host>` subcommand to run: bare
+/// `catenary install` only *lists* detected hosts (see `cli::install`), so the
+/// notification must carry the host subcommand to be actionable (bug 70). This
+/// mirrors the doctor surface's `run: catenary install <host>` wording.
+#[cfg(unix)]
+fn stale_hooks_message(host: &str, install_cmd: &str) -> String {
+    format!("Stale {host} hooks detected. Run: catenary install {install_cmd}")
+}
+
 /// Only checks hosts that have hooks installed (missing hosts are ignored).
 #[cfg(unix)]
 fn check_stale_hooks() {
@@ -2164,13 +2175,14 @@ fn check_stale_hooks() {
             .unwrap_or_else(|| s.trim().to_string())
     }
 
-    fn check_host(host: &str, installed_path: &std::path::Path, expected: &str) {
+    fn check_host(host: &str, install_cmd: &str, installed_path: &std::path::Path, expected: &str) {
         match std::fs::read_to_string(installed_path) {
             Ok(installed) if normalize_json(&installed) == normalize_json(expected) => {}
             Ok(_) => {
                 tracing::error!(
                     source = Source::HookDispatch.as_str(),
-                    "Stale {host} hooks detected. Run: catenary install",
+                    "{}",
+                    stale_hooks_message(host, install_cmd),
                 );
             }
             Err(_) => {} // Hooks file not found — host not installed, skip.
@@ -2185,13 +2197,14 @@ fn check_stale_hooks() {
     // Claude Code: hooks live inside the plugin install path, which is
     // recorded in installed_plugins.json. Resolve the actual path.
     if let Some(hooks_path) = resolve_claude_hooks_path(&home) {
-        check_host("Claude Code", &hooks_path, CLAUDE_HOOKS_EXPECTED);
+        check_host("Claude Code", "claude", &hooks_path, CLAUDE_HOOKS_EXPECTED);
     }
 
     // Antigravity CLI: hooks at ~/.antigravity/hooks.json
     let antigravity_hooks = home.join(".antigravity/hooks.json");
     check_host(
         "Antigravity CLI",
+        "antigravity",
         &antigravity_hooks,
         ANTIGRAVITY_HOOKS_EXPECTED,
     );
@@ -2249,6 +2262,24 @@ mod tests {
     fn drain_db_at_is_noop_when_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert_eq!(drain_db_at(&dir.path().join("catenary.db")), 0);
+    }
+
+    // ── Stale-hooks notification tests ────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_hooks_message_names_install_subcommand() {
+        // Bare `catenary install` only lists hosts; the notification must name
+        // the host subcommand so following it verbatim actually reinstalls
+        // (bug 70), matching the doctor surface's `run: catenary install <host>`.
+        assert_eq!(
+            stale_hooks_message("Claude Code", "claude"),
+            "Stale Claude Code hooks detected. Run: catenary install claude",
+        );
+        assert_eq!(
+            stale_hooks_message("Antigravity CLI", "antigravity"),
+            "Stale Antigravity CLI hooks detected. Run: catenary install antigravity",
+        );
     }
 
     // ── CLI hook subcommand tests ─────────────────────────────────

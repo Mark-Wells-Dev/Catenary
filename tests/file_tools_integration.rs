@@ -2037,6 +2037,116 @@ fn test_grep_cwd_scoping_prevents_cross_root() -> Result<()> {
     Ok(())
 }
 
+// ─── relative path-argument anchoring (bug 69 / bug 31 family) ─────────
+
+/// A relative *path argument* anchors at the CLI's cwd, not at the enclosing
+/// workspace root. From a subdirectory of a root, `grep <pat> '*.rs'` must
+/// match only files under that subdirectory — never a same-named pattern's hits
+/// elsewhere in the root (bug 69). Absolutization happens in
+/// `GrepRequest::to_params` (`cwd.join`) before the pattern reaches the
+/// gitignore-aware walker.
+#[test]
+fn grep_relative_path_arg_anchors_at_cwd_subdir() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let sub = root.path().join("sub");
+    std::fs::create_dir(&sub)?;
+    // Same needle at the root and under the subdirectory; only the
+    // subdirectory (cwd) copy must surface for a relative `*.rs`.
+    std::fs::write(root.path().join("outer_marker.rs"), "let needle = 1;\n")?;
+    std::fs::write(sub.join("inner_marker.rs"), "let needle = 2;\n")?;
+
+    let mut bridge = spawn_no_lsp(&root.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "grep",
+        &json!({
+            "pattern": "needle",
+            "paths": ["*.rs"],
+            "directory": sub.to_string_lossy().as_ref(),
+        }),
+    )?;
+
+    assert!(
+        text.contains("inner_marker.rs"),
+        "relative `*.rs` must anchor at the cwd subdirectory: {text}"
+    );
+    assert!(
+        !text.contains("outer_marker.rs"),
+        "relative `*.rs` must NOT anchor at the enclosing root: {text}"
+    );
+    Ok(())
+}
+
+/// Glob counterpart of `grep_relative_path_arg_anchors_at_cwd_subdir`: a
+/// relative pattern lists only the cwd subdirectory's files, not the root's.
+#[test]
+fn glob_relative_path_arg_anchors_at_cwd_subdir() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let sub = root.path().join("sub");
+    std::fs::create_dir(&sub)?;
+    std::fs::write(root.path().join("outer_marker.rs"), "// root\n")?;
+    std::fs::write(sub.join("inner_marker.rs"), "// sub\n")?;
+
+    let mut bridge = spawn_no_lsp(&root.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "paths": ["*.rs"],
+            "directory": sub.to_string_lossy().as_ref(),
+        }),
+    )?;
+
+    assert!(
+        text.contains("inner_marker.rs"),
+        "relative `*.rs` glob must anchor at the cwd subdirectory: {text}"
+    );
+    assert!(
+        !text.contains("outer_marker.rs"),
+        "relative `*.rs` glob must NOT anchor at the enclosing root: {text}"
+    );
+    Ok(())
+}
+
+/// Nested-checkout shape: when a marker root *encloses* another, a relative
+/// glob issued from the inner root's directory anchors at that cwd — the inner
+/// root wins over the enclosing one (bug 69's nested-worktree instance).
+#[test]
+fn glob_relative_path_arg_prefers_cwd_over_enclosing_root() -> Result<()> {
+    let outer = tempfile::tempdir()?;
+    let inner = outer.path().join("inner");
+    std::fs::create_dir(&inner)?;
+    std::fs::write(outer.path().join("outer_marker.rs"), "// outer\n")?;
+    std::fs::write(inner.join("inner_marker.rs"), "// inner\n")?;
+
+    let outer_str = outer.path().to_string_lossy().to_string();
+    let inner_str = inner.to_string_lossy().to_string();
+
+    // Both the enclosing and the nested directory are registered roots.
+    let mut bridge = BridgeProcess::spawn_multi_root(&[], &[&outer_str, &inner_str])?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "paths": ["*.rs"],
+            "directory": &inner_str,
+        }),
+    )?;
+
+    assert!(
+        text.contains("inner_marker.rs"),
+        "relative glob from the inner root must anchor at that cwd: {text}"
+    );
+    assert!(
+        !text.contains("outer_marker.rs"),
+        "the enclosing root must not win over the cwd: {text}"
+    );
+    Ok(())
+}
+
 /// Grep from a directory outside all workspace roots shows the LSP
 /// warning header and returns only matches from that directory.
 #[test]
