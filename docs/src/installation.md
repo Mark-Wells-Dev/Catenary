@@ -32,7 +32,10 @@ claude plugin install catenary@catenary
 
 The plugin registers hooks for editing enforcement, command filtering,
 and agent lifecycle tracking, plus an MCP connection for session
-management and workspace root discovery.
+management and workspace root discovery. It also owns worktree creation
+(the `WorktreeCreate` hook), placing each `isolation:"worktree"` subagent
+worktree outside your repo under the cache dir so language servers never
+index it as a duplicate copy of your project.
 
 ### OpenCode (plugin)
 

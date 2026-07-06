@@ -75,6 +75,16 @@
           }
         ]
       }
+    ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary hook worktree-create --format=claude"
+          }
+        ]
+      }
     ]
   }
 }

@@ -744,6 +744,77 @@ pub fn run_worktree_remove(format: HostFormat) {
     let _ = ipc_exchange(stream, &request);
 }
 
+/// Create an out-of-tree agent worktree (`WorktreeCreate` hook handler).
+///
+/// Unlike every other hook — which fail *open* so the host CLI's flow is never
+/// broken — `WorktreeCreate` owns worktree creation under Claude Code's
+/// success/failure contract: on success the created worktree's absolute path is
+/// the **only** stdout output; any failure must exit nonzero so the host fails
+/// worktree creation. This function therefore returns a `Result` (the caller in
+/// `main` prints the error to stderr and exits nonzero); the path print is the
+/// sole `print!` on the success path.
+///
+/// The stdin payload is parsed **leniently** (a bare `serde_json::Value`, so
+/// unknown/extra fields are tolerated) and the full payload is debug-logged plus
+/// best-effort forwarded to the daemon firehose (`catenary query --kind hook`),
+/// so the first live run reveals Claude Code's actual schema — the safety net
+/// for doc drift. Only `cwd` is required (to locate the source repo); the
+/// branch name is taken from a payload-supplied name when present, else
+/// generated.
+///
+/// # Errors
+///
+/// Returns an error when stdin is unreadable/unparseable, when no source repo
+/// can be resolved from the payload, or when `git worktree add` fails.
+pub fn run_worktree_create(format: HostFormat) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let stdin_data =
+        std::io::read_to_string(std::io::stdin()).context("read WorktreeCreate stdin")?;
+    let hook_json = serde_json::from_str::<serde_json::Value>(&stdin_data)
+        .context("parse WorktreeCreate payload as JSON")?;
+
+    // Log the FULL payload so the first live run verifies Claude Code's schema
+    // (the docs do not pin down every field). Emitted locally at debug and — best
+    // effort — forwarded to the daemon so it lands in the queryable firehose.
+    tracing::debug!(
+        source = crate::source::Source::HookDispatch.as_str(),
+        payload = %hook_json,
+        "WorktreeCreate payload received",
+    );
+    forward_worktree_create_payload(&hook_json, format);
+
+    let worktree = crate::worktree_create::create_from_payload(&hook_json)?;
+
+    // The stdout contract: the created worktree's absolute path, and nothing
+    // else. Uses the same bare `print!` (no trailing newline) the other hook
+    // subcommands use for stdout — `println!` is denied by the house rules.
+    print!("{}", worktree.display());
+    Ok(())
+}
+
+/// Best-effort forward of the `WorktreeCreate` payload to the daemon so it lands
+/// in the JSONL firehose (`catenary query --kind hook`), the maintainer's live
+/// schema-verification surface.
+///
+/// Purely for observability: silently skipped when the daemon is unreachable and
+/// its result is ignored, so it can never affect worktree creation (whose
+/// success/failure is the host contract).
+fn forward_worktree_create_payload(hook_json: &serde_json::Value, format: HostFormat) {
+    let Some(stream) = hook_connect(hook_json) else {
+        return;
+    };
+    let mut request = serde_json::json!({
+        "method": "worktree-create/log-payload",
+        "format": format.as_str(),
+    });
+    if let Some(sid) = extract_session_id(hook_json, format) {
+        request["session_id"] = serde_json::json!(sid);
+    }
+    request["host_payload"] = prepare_host_payload(hook_json);
+    let _ = ipc_exchange(stream, &request);
+}
+
 /// Build the single `SessionStart` hook-response object.
 ///
 /// Carries up to two coexisting surfaces in **one** JSON object:

@@ -459,6 +459,43 @@ mod tests {
     }
 
     #[test]
+    fn deletion_emits_for_cache_dir_style_path() {
+        // misc 144: worktrees now live OUTSIDE the repo, under a cache-dir path
+        // (`<cache>/catenary/worktrees/<flattened-repo>-<id>`). The watch is
+        // path-agnostic — it watches the parent dir for the child's deletion,
+        // wherever that is — so a cache-dir-style worktree reaps identically to a
+        // repo-nested one.
+        let (watcher, mut rx) = WorktreeWatcher::new().expect("create watcher");
+        let cache = tempfile::tempdir().expect("tempdir");
+        let worktrees_root = cache.path().join("catenary").join("worktrees");
+        let wt = worktrees_root.join("-home-user-Projects-app-abc123");
+        std::fs::create_dir_all(&wt).expect("mkdir cache-dir worktree");
+        let key = format!("worktree:s1:{}", wt.display());
+
+        assert!(
+            watcher.register(&key, &wt),
+            "the watch registers for a cache-dir worktree path",
+        );
+        std::fs::remove_dir_all(&wt).expect("rm wt");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut got: Option<WorktreeDeleted> = None;
+        while std::time::Instant::now() < deadline {
+            if let Ok(ev) = rx.try_recv()
+                && ev.contributor == key
+            {
+                got = Some(ev);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            got.is_some(),
+            "expected a deletion event for the cache-dir worktree within the deadline",
+        );
+    }
+
+    #[test]
     fn no_deletion_emits_no_event() {
         // SendMessage-no-reap (ticket 05): the watch fires only on a `Remove`, so
         // a resume that reuses the worktree without deleting its dir reaps

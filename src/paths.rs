@@ -100,6 +100,37 @@ pub fn encode_cwd(path: &Path) -> String {
     flatten_component(&path.to_string_lossy())
 }
 
+/// Root directory under [`cache_dir`] that holds relocated agent worktrees.
+///
+/// `<cache_dir>/catenary/worktrees/`. Claude Code's `WorktreeCreate` hook
+/// (`catenary hook worktree-create`) creates each subagent worktree here —
+/// physically *outside* the source repo tree — so gitignore-blind language
+/// server discovery (rust-analyzer's cargo walk) can never descend into it, the
+/// structural fix for the nested-worktree index pollution (bug 53 / misc 144).
+/// The orphan-prune sweep ([`crate::worktree_create::prune_orphans`]) scans this
+/// directory.
+#[must_use]
+pub fn worktrees_dir() -> PathBuf {
+    cache_dir().join("catenary").join("worktrees")
+}
+
+/// Directory for a single relocated agent worktree under [`worktrees_dir`].
+///
+/// `<cache_dir>/catenary/worktrees/<flattened-repo>-<unique_id>`. The source
+/// repo path is flattened to one filesystem-safe component via
+/// [`flatten_component`] (the same lossy `[^a-zA-Z0-9] -> -` mapping the
+/// firehose shard key uses), then suffixed with `unique_id` so concurrent
+/// worktrees of the same repo never collide. The flattened repo is a human
+/// label, not a reversible encoding — collisions are harmless because
+/// `unique_id` disambiguates.
+#[must_use]
+pub fn agent_worktree_dir(repo: &Path, unique_id: &str) -> PathBuf {
+    worktrees_dir().join(format!(
+        "{}-{unique_id}",
+        flatten_component(&repo.to_string_lossy())
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +158,35 @@ mod tests {
     fn encode_cwd_is_stable() {
         let p = Path::new("/a/b/c");
         assert_eq!(encode_cwd(p), encode_cwd(p));
+    }
+
+    #[test]
+    fn worktrees_dir_lives_under_cache() {
+        let dir = worktrees_dir();
+        assert!(
+            dir.starts_with(cache_dir()),
+            "worktrees dir must live under cache_dir",
+        );
+        assert!(
+            dir.ends_with("catenary/worktrees"),
+            "worktrees dir must be `<cache>/catenary/worktrees`, got {}",
+            dir.display(),
+        );
+    }
+
+    #[test]
+    fn agent_worktree_dir_flattens_repo_and_suffixes_id() {
+        let dir = agent_worktree_dir(Path::new("/home/mark/Projects/Catenary"), "abc123");
+        assert!(
+            dir.starts_with(worktrees_dir()),
+            "agent worktree dir must live under the worktrees root",
+        );
+        // Final component: the flattened repo (same `[^a-zA-Z0-9] -> -` mapping
+        // as `encode_cwd`) suffixed with the unique id.
+        assert!(
+            dir.ends_with("-home-mark-Projects-Catenary-abc123"),
+            "unexpected leaf component: {}",
+            dir.display(),
+        );
     }
 }

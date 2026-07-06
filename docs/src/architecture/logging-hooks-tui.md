@@ -202,6 +202,7 @@ Hook methods, each corresponding to a host CLI lifecycle event:
 | `post-agent/require-release` | `Stop` / `AfterAgent` | Force `catenary diagnostics` if the agent stops with covered edits pending |
 | `subagent-start/mount-worktree` | `SubagentStart` | Mount an `isolation:"worktree"` subagent's git worktree as its own `worktree:{session_id}:{path}` LSP root |
 | `worktree-remove/unmount-worktree` | `WorktreeRemove` | Tear down a `worktree:*` root — fires only for non-git VCS / `--worktree` session exit (see worktree-root teardown below) |
+| `worktree-create/log-payload` | `WorktreeCreate` | Best-effort observability sink — the hook forwards its full payload here so it lands in the firehose (`catenary query --kind hook`); worktree creation itself is a self-contained local operation (see worktree relocation below) |
 
 ### Teaching-payload injection
 
@@ -237,11 +238,37 @@ live in host-specific JSON files:
 
 | Host CLI | Hook file | Events |
 |----------|-----------|--------|
-| Claude Code | `plugins/catenary/hooks/hooks.json` | `SessionStart`, `PreToolUse`, `Stop`, `SubagentStop`, `SessionEnd`, `SubagentStart`, `WorktreeRemove` |
+| Claude Code | `plugins/catenary/hooks/hooks.json` | `SessionStart`, `PreToolUse`, `Stop`, `SubagentStop`, `SessionEnd`, `SubagentStart`, `WorktreeRemove`, `WorktreeCreate` |
 | Antigravity CLI | `plugins/catenary-antigravity/hooks.json` | `PreInvocation`, `PreToolUse`, `Stop` |
 
 The `PreToolUse` hook handles both editing state enforcement and command
 filtering in a single invocation.
+
+### Worktree relocation (out of tree)
+
+Claude Code's `WorktreeCreate` hook lets a plugin own worktree creation: the
+hook receives a JSON payload on stdin and must print the created worktree's
+absolute path on stdout (a failure or empty path fails creation). Catenary uses
+it (`catenary hook worktree-create`) to place every subagent worktree **outside
+the source repo tree**, under `<cache_dir>/catenary/worktrees/<flattened-repo>-<id>`
+(see `src/worktree_create.rs` and `paths::agent_worktree_dir`). This is the
+structural fix for nested-worktree index pollution: a worktree nested *inside* a
+tracked root is a second copy of the project that gitignore-blind server
+discovery (rust-analyzer's cargo walk) indexes a second time; a worktree that
+lives outside the repo can never be reached by that downward walk, with zero
+per-server exclude configuration.
+
+Relocation is transparent to the rest of the worktree lifecycle: a git worktree
+records its upstream repo through a `.git` **file** (`gitdir:
+<repo>/.git/worktrees/<name>`), not its filesystem location, so the
+`SubagentStart` mount predicate (`worktree_to_auto_mount`, which resolves the
+worktree's canonical project root from that pointer) and the deletion watch both
+work unchanged for a cache-dir worktree. Cleanup is unchanged too: Claude Code
+removes git worktrees itself with `git worktree remove`, which drops the
+directory and its `.git/worktrees/<name>` metadata regardless of where the
+directory lives. As a crash-safety backstop, each create first runs
+`git worktree prune` semantics over the cache dir (`worktree_create::prune_orphans`),
+sweeping any directory whose git linkage is already dead.
 
 ### Worktree-root teardown
 

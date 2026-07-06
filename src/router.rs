@@ -2896,6 +2896,38 @@ async fn handle_hook_dispatch(
         return Ok(());
     }
 
+    // ── WorktreeCreate payload log (misc 144) ─────────────────────
+    //
+    // Best-effort observability sink for the `WorktreeCreate` hook. The hook
+    // itself is a self-contained local operation (`git worktree add` under the
+    // cache dir, print the path); it forwards its full payload here purely so it
+    // lands in the queryable firehose (`catenary query --kind hook`) — the
+    // maintainer's surface for verifying Claude Code's actual payload schema on
+    // the first live run. No state is touched; the response is empty.
+    if method == "worktree-create/log-payload" {
+        let scope_id = uuid::Uuid::new_v4().to_string();
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            Some(&scope_id),
+            &raw.to_string(),
+            "incoming hook",
+        );
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            Some(&scope_id),
+            "",
+            "outgoing hook response",
+        );
+
+        writer.write_all(b"\n").await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
     // ── Subagent worktree mount (workstream 30, ticket 03) ─────────
     //
     // Fires when the host CLI sends a SubagentStart hook — once at subagent
@@ -7959,6 +7991,53 @@ mod tests {
             worktree_to_auto_mount(&file, &roots),
             None,
             "a file outside any git checkout has no worktree to mount",
+        );
+    }
+
+    #[test]
+    fn auto_mount_out_of_tree_cache_dir_worktree() {
+        // misc 144: the `WorktreeCreate` hook relocates the worktree OUTSIDE the
+        // repo tree, under a cache-dir path. A git worktree records its upstream
+        // through a `.git` *file* (`gitdir: <repo>/.git/worktrees/<name>`), not
+        // its filesystem location, so the mount predicate must still resolve the
+        // canonical project root and mount the worktree — wherever it physically
+        // lives. This is the structural property bug 53's relocation relies on.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+
+        // Main project with a linked-worktree metadata dir.
+        let project = base.join("project");
+        let wt_gitdir = project.join(".git").join("worktrees").join("wt");
+        std::fs::create_dir_all(&wt_gitdir).expect("mkdir worktree gitdir");
+        std::fs::write(wt_gitdir.join("commondir"), "../..\n").expect("write commondir");
+
+        // The worktree lives far from the repo, under a cache-dir-style path
+        // (`<cache>/catenary/worktrees/<flattened-repo>-<id>`).
+        let worktree = base
+            .join("cache")
+            .join("catenary")
+            .join("worktrees")
+            .join("-p-project-abc123");
+        std::fs::create_dir_all(&worktree).expect("mkdir out-of-tree worktree");
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", wt_gitdir.display()),
+        )
+        .expect("write .git file");
+        let file = worktree.join("src").join("lib.rs");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir src");
+        std::fs::write(&file, "").expect("write file");
+
+        // The session tracks the canonical project root.
+        let tracker = RootTracker::new();
+        tracker.set_roots("mcp:1", vec![project]);
+        let roots: HashSet<PathBuf> = tracker.global_roots().into_iter().collect();
+
+        let mount = worktree_to_auto_mount(&file, &roots)
+            .expect("out-of-tree worktree of a tracked project should auto-mount");
+        assert_eq!(
+            mount, worktree,
+            "mounts the out-of-tree worktree, not the canonical root",
         );
     }
 

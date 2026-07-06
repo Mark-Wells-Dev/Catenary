@@ -435,6 +435,14 @@ enum HookCommand {
         #[arg(long, value_enum)]
         format: HostFormat,
     },
+    /// `WorktreeCreate`: create the subagent's worktree out-of-tree under the
+    /// cache dir, printing its absolute path (misc 144).
+    #[command(name = "worktree-create")]
+    WorktreeCreate {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
 }
 
 /// Host targets for the install command.
@@ -786,6 +794,15 @@ fn main() -> Result<()> {
                 HookCommand::SessionEnd { format } => cli::hooks::run_session_end(format),
                 HookCommand::SubagentStart { format } => cli::hooks::run_subagent_start(format),
                 HookCommand::WorktreeRemove { format } => cli::hooks::run_worktree_remove(format),
+                // WorktreeCreate owns git worktree creation under Claude Code's
+                // success/failure contract: on any failure, error loudly on
+                // stderr and exit nonzero so the host fails worktree creation.
+                HookCommand::WorktreeCreate { format } => {
+                    if let Err(e) = cli::hooks::run_worktree_create(format) {
+                        eprintln!("catenary hook worktree-create: {e:#}");
+                        std::process::exit(1);
+                    }
+                }
             }
             Ok(())
         }
@@ -2317,6 +2334,17 @@ mod tests {
             unreachable!("expected Hook command");
         };
         assert!(matches!(command, HookCommand::WorktreeRemove { .. }));
+    }
+
+    #[test]
+    fn test_cli_hook_worktree_create() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "hook", "worktree-create", "--format=claude"]);
+        let args = args.expect("hook worktree-create should parse");
+        let Some(Command::Hook { command }) = args.command else {
+            unreachable!("expected Hook command");
+        };
+        assert!(matches!(command, HookCommand::WorktreeCreate { .. }));
     }
 
     #[test]

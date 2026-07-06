@@ -42,5 +42,7 @@ pub mod state_snapshot;
 pub mod symbol_index;
 /// Interactive TUI for session browsing and event tailing.
 pub mod tui;
+/// Out-of-tree agent worktree creation for Claude Code's `WorktreeCreate` hook.
+pub mod worktree_create;
 /// Bounded directory-deletion watch for subagent worktree roots (ticket 05).
 pub mod worktree_watch;

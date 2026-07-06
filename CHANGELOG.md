@@ -62,8 +62,19 @@ upgrading.
 
 ### Added
 
-- **`catenary grep` accepts the always-on ripgrep reflex flags as hidden
-  no-ops.** `-n`/`--line-number` and `-H`/`--with-filename` now parse and do
+- **Agent worktrees live outside the repo.** The Claude Code plugin now
+  registers a `WorktreeCreate` hook (`catenary hook worktree-create`): a
+  `--worktree` session's or `isolation:"worktree"` subagent's working copy is
+  created at `cache_dir()/catenary/worktrees/<repo>-<id>` instead of nested
+  under `.claude/worktrees/` inside the repo — so the parent root's language
+  servers can never descend into it and double-index the project
+  (rust-analyzer's gitignore-blind cargo discovery). The subagent's own
+  server mounts the relocated worktree exactly as before (the SubagentStart
+  mount and the deletion watcher are location-agnostic), Claude Code's
+  automatic `git worktree remove` cleanup works unchanged, and the hook
+  prunes dead cache-dir entries on each spawn. The hook forwards its payload
+  to the firehose (`catenary query --kind hook`) so the live schema is
+  verifiable. `-n`/`--line-number` and `-H`/`--with-filename` now parse and do
   nothing — line numbers (`path:N`) and filenames are unconditional in the
   output, so the `grep`/ripgrep muscle-memory reach succeeds instead of
   erroring. `-c` joins as a hidden ripgrep-letter short for `--count`.
