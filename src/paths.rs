@@ -127,6 +127,35 @@ pub fn agents_worktrees_dir() -> PathBuf {
     worktrees_dir().join("agents")
 }
 
+/// Subtree under [`worktrees_dir`] that holds durable "feats" worktrees.
+///
+/// `<state_dir>/catenary/worktrees/feats/`. A feats worktree is a deliberate,
+/// long-lived parallel checkout for a disjoint line of work (misc 151), created
+/// only via `catenary worktree add` — never nagged, never auto-disposed, removed
+/// only explicitly. Each lives at `feats/<repo-basename>/<branch>/`
+/// ([`feat_worktree_dir`]). One `worktrees/` root with `agents/` vs `feats/`
+/// beneath it keeps the is-this-ours guard a single prefix check per class.
+#[must_use]
+pub fn feats_worktrees_dir() -> PathBuf {
+    worktrees_dir().join("feats")
+}
+
+/// Directory for a single durable feats worktree under [`feats_worktrees_dir`].
+///
+/// `<state_dir>/catenary/worktrees/feats/<repo-basename>/<branch>/`. The
+/// `repo_basename` is the source repo's directory name (a collision across two
+/// repos of the same basename is refused with a rename hint rather than
+/// uglifying the common case); `branch` slashes map to nested directories, so a
+/// `feature/auth` branch lands at `feats/<repo>/feature/auth/`.
+#[must_use]
+pub fn feat_worktree_dir(repo_basename: &str, branch: &str) -> PathBuf {
+    let mut dir = feats_worktrees_dir().join(repo_basename);
+    for segment in branch.split('/').filter(|s| !s.is_empty()) {
+        dir = dir.join(segment);
+    }
+    dir
+}
+
 /// Legacy cache-dir worktrees root from older builds.
 ///
 /// `<cache_dir>/catenary/worktrees/`. Pre-misc-150 builds created agent
@@ -205,6 +234,41 @@ mod tests {
             "agents subtree must be `<state>/catenary/worktrees/agents`, got {}",
             dir.display(),
         );
+    }
+
+    #[test]
+    fn feats_worktrees_dir_is_the_feats_subtree() {
+        let dir = feats_worktrees_dir();
+        assert!(
+            dir.starts_with(worktrees_dir()),
+            "feats subtree must live under the worktrees root",
+        );
+        assert!(
+            dir.ends_with("catenary/worktrees/feats"),
+            "feats subtree must be `<state>/catenary/worktrees/feats`, got {}",
+            dir.display(),
+        );
+    }
+
+    #[test]
+    fn feat_worktree_dir_nests_branch_slashes() {
+        let dir = feat_worktree_dir("OmniDSP", "feature/accelerate");
+        assert!(
+            dir.starts_with(feats_worktrees_dir()),
+            "feat worktree dir must live under the feats subtree",
+        );
+        // `feats/<repo>/<branch-with-slashes-nested>`.
+        assert!(
+            dir.ends_with("feats/OmniDSP/feature/accelerate"),
+            "unexpected feat leaf path: {}",
+            dir.display(),
+        );
+    }
+
+    #[test]
+    fn feat_worktree_dir_flat_branch() {
+        let dir = feat_worktree_dir("OmniDSP", "accelerate");
+        assert!(dir.ends_with("feats/OmniDSP/accelerate"));
     }
 
     #[test]

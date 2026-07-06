@@ -210,6 +210,17 @@ enum Command {
         command: RootsCommand,
     },
 
+    /// Manage Catenary worktrees (ls, add, rm).
+    ///
+    /// The sanctioned replacement for `git worktree` (denied on the agent
+    /// surface): `ls` shows the registry+sidecar view, `add` creates a durable
+    /// feats-class checkout with a sibling symlink, `rm` removes a worktree
+    /// class-appropriately (misc 151).
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
+    },
+
     /// Output a recommended annotated config template.
     Config,
 
@@ -383,6 +394,27 @@ enum RootsCommand {
     Ls,
 }
 
+/// Worktree lifecycle subcommands (misc 151).
+#[derive(Subcommand, Debug)]
+enum WorktreeCommand {
+    /// List Catenary-managed worktrees (path, class, creator, age, clean/dirty,
+    /// root state, and — for feats — ahead/behind upstream).
+    Ls,
+    /// Create a durable feats-class worktree with a sibling symlink.
+    Add {
+        /// Branch to check out (created from HEAD if it does not exist).
+        branch: String,
+        /// Optional explicit worktree path (default: the feats state scheme).
+        path: Option<PathBuf>,
+    },
+    /// Remove a worktree — class-appropriate (agent asserts captured work; feats
+    /// refuses dirty).
+    Rm {
+        /// Path of the worktree to remove.
+        path: PathBuf,
+    },
+}
+
 /// Hook subcommands invoked by host CLI hooks.
 #[derive(Subcommand, Debug)]
 enum HookCommand {
@@ -510,9 +542,16 @@ fn main() -> Result<()> {
             // For agent-facing subcommands, append `-h` output so the
             // agent sees correct usage without a second round-trip.
             let raw = e.to_string();
-            let subcommand = ["grep", "glob", "diagnostics", "editing", "roots"]
-                .into_iter()
-                .find(|cmd| raw.contains(&format!("catenary {cmd}")));
+            let subcommand = [
+                "grep",
+                "glob",
+                "diagnostics",
+                "editing",
+                "roots",
+                "worktree",
+            ]
+            .into_iter()
+            .find(|cmd| raw.contains(&format!("catenary {cmd}")));
             if let Some(cmd) = subcommand
                 && let Some(sub) = cli.find_subcommand(cmd)
             {
@@ -679,6 +718,21 @@ fn main() -> Result<()> {
         }
         #[cfg(not(unix))]
         Some(Command::Roots { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        #[cfg(unix)]
+        Some(Command::Worktree { command }) => {
+            let mut out = cli::Output::stdout(false);
+            match command {
+                WorktreeCommand::Ls => build_runtime()?.block_on(cli::worktree::run_ls(&mut out)),
+                WorktreeCommand::Add { branch, path } => {
+                    cli::worktree::run_add(&mut out, &branch, path.as_deref())
+                }
+                WorktreeCommand::Rm { path } => {
+                    build_runtime()?.block_on(cli::worktree::run_rm(&mut out, path))
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        Some(Command::Worktree { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         Some(Command::Config) => {
             let mut out = cli::Output::stdout(false);
             cli::config_template::print_template(&mut out);

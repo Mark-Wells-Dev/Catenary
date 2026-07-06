@@ -1605,6 +1605,17 @@ impl WorktreeMounts {
             .collect()
     }
 
+    /// Every mounted worktree root path with its blocked flag (misc 151 —
+    /// the `catenary worktree ls` root-state column).
+    fn mounted_roots(&self) -> Vec<(PathBuf, bool)> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(|clock| (clock.root.clone(), clock.blocked))
+            .collect()
+    }
+
     /// Whether a contributor's root is currently blocked (test-only).
     #[cfg(test)]
     fn is_blocked(&self, contributor: &str) -> bool {
@@ -1667,6 +1678,11 @@ fn reap_idle_worktree_roots(
 #[derive(Clone)]
 struct WorktreeRegistry {
     inner: Arc<std::sync::Mutex<HashMap<PathBuf, crate::worktree_create::WorktreeMeta>>>,
+    /// Worktrees already nagged about this daemon lifetime (misc 151 D-2): the
+    /// lingering nag fires **once per worktree** (a doorbell, not an alarm clock).
+    /// A worktree surviving into a new session gets fresh surfacing from the
+    /// `SessionStart` line, not a re-nag.
+    nagged: Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
 }
 
 #[cfg(unix)]
@@ -1674,7 +1690,17 @@ impl WorktreeRegistry {
     fn new() -> Self {
         Self {
             inner: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            nagged: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Record that a worktree has been nagged about; returns `true` only the
+    /// first time (misc 151 D-2 — once per worktree).
+    fn mark_nagged(&self, worktree: &Path) -> bool {
+        self.nagged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(worktree.to_path_buf())
     }
 
     /// Register (or replace) a worktree by its canonical path.
@@ -1694,6 +1720,37 @@ impl WorktreeRegistry {
         for meta in metas {
             inner.insert(meta.worktree.clone(), meta);
         }
+    }
+
+    /// The registered [`WorktreeMeta`](crate::worktree_create::WorktreeMeta) for a
+    /// canonical worktree path (misc 151 disposal — the in-memory record).
+    fn get(&self, worktree: &Path) -> Option<crate::worktree_create::WorktreeMeta> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(worktree)
+            .cloned()
+    }
+
+    /// Every registered worktree of a session (misc 151 — the `SessionEnd` sweep
+    /// disposes this session's clean worktrees).
+    fn metas_for_session(&self, session_id: &str) -> Vec<crate::worktree_create::WorktreeMeta> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|meta| meta.session_id == session_id)
+            .cloned()
+            .collect()
+    }
+
+    /// Drop a worktree's registration (misc 151 — after a successful disposal, so
+    /// the registry does not carry a stale entry).
+    fn forget(&self, worktree: &Path) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(worktree);
     }
 
     /// The registered worktree path for a `(session_id, agent_id)` identity.
@@ -3001,6 +3058,326 @@ async fn reap_worktree_root(
     );
 }
 
+/// Build one `catenary worktree ls` row (misc 151) from a sidecar meta and the
+/// live mount/blocked map.
+///
+/// Merges the durable sidecar (path, class, creator, age) with the daemon's live
+/// state: `dirty` uses the disposal invariant for agent worktrees (uncommitted or
+/// `HEAD` moved) and the working-tree status for feats (whose local commits are
+/// expected — shown via ahead/behind); `root_state` is `mounted` / `blocked` /
+/// `unmounted`. Feats rows carry `ahead`/`behind` upstream counts when available.
+#[cfg(unix)]
+fn worktree_ls_row(
+    meta: &crate::worktree_create::WorktreeMeta,
+    mounts: &HashMap<PathBuf, bool>,
+) -> serde_json::Value {
+    let is_feat = meta.class == crate::worktree_create::WORKTREE_CLASS_FEAT;
+    let present = meta.worktree.exists();
+    let dirty = if present {
+        if is_feat {
+            crate::worktree_dispose::worktree_status_dirty(&meta.worktree)
+        } else {
+            !crate::worktree_dispose::is_disposable_clean(meta)
+        }
+    } else {
+        false
+    };
+    let root_state = if present {
+        match mounts.get(&meta.worktree) {
+            Some(true) => "blocked",
+            Some(false) => "mounted",
+            None => "unmounted",
+        }
+    } else {
+        "unmounted"
+    };
+    let creator = if is_feat {
+        "cli".to_string()
+    } else {
+        format!(
+            "{} / {}",
+            meta.session_id,
+            meta.agent_id.as_deref().unwrap_or(meta.name.as_str()),
+        )
+    };
+    let mut row = serde_json::json!({
+        "path": meta.worktree.display().to_string(),
+        "class": meta.class,
+        "creator": creator,
+        "created_at": meta.created_at,
+        "present": present,
+        "dirty": dirty,
+        "root_state": root_state,
+    });
+    if is_feat
+        && present
+        && let Some((behind, ahead)) = crate::worktree_dispose::feat_ahead_behind(&meta.worktree)
+    {
+        row["ahead"] = serde_json::Value::from(ahead);
+        row["behind"] = serde_json::Value::from(behind);
+    }
+    row
+}
+
+/// Handle a `tool/worktree-rm` request (misc 151): load the sidecar, reap any
+/// live mount, and dispose class-appropriately, returning the CLI response.
+///
+/// An agent worktree removes on the caller's captured-work assertion (the
+/// force-shaped landing path — firehose-logged); a feats worktree refuses dirty
+/// (uncommitted or unpushed). A path with no sidecar is never ours to touch.
+#[cfg(unix)]
+async fn handle_worktree_rm(
+    ctx: &HookDispatchContext,
+    raw: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(raw_path) = raw.get("path").and_then(|v| v.as_str()) else {
+        return serde_json::json!({ "status": "error", "message": "missing path" });
+    };
+    let worktree = Path::new(raw_path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(raw_path));
+    let sidecar = crate::worktree_create::sidecar_path(&worktree);
+    let Some(meta) = std::fs::read_to_string(&sidecar)
+        .ok()
+        .and_then(|c| serde_json::from_str::<crate::worktree_create::WorktreeMeta>(&c).ok())
+    else {
+        return serde_json::json!({
+            "status": "not_ours",
+            "message": format!("{} is not a Catenary-managed worktree", worktree.display()),
+        });
+    };
+
+    // Reap any live mount so the worktree's servers shut down before removal.
+    if let Some(tracker) = &ctx.root_tracker
+        && let Some((contributor, _)) = tracker
+            .contributors_with_prefix("worktree:")
+            .into_iter()
+            .find(|(_, roots)| roots.iter().any(|r| r == &worktree))
+    {
+        let sid = worktree_contributor_session_id(&contributor)
+            .unwrap_or("default")
+            .to_string();
+        reap_worktree_root(ctx, tracker, &sid, &contributor, &worktree, "worktree rm").await;
+    }
+
+    let disposition = if meta.class == crate::worktree_create::WORKTREE_CLASS_FEAT {
+        crate::worktree_dispose::remove_feat(&meta)
+    } else {
+        // The captured-work assertion is the deliberate force-shaped path — record
+        // it on the firehose (the deliberate user-relevant lifecycle exception is
+        // the dirty-kept nag, not this routine landing).
+        info!(
+            source = Source::DaemonDispatch.as_str(),
+            worktree = %worktree.display(),
+            "worktree rm: agent worktree removed on the caller's captured-work assertion",
+        );
+        crate::worktree_dispose::remove_agent_asserted(&meta)
+    };
+    worktree_rm_response(&disposition, &worktree)
+}
+
+/// Map a disposal [`Disposition`](crate::worktree_dispose::Disposition) to the
+/// `catenary worktree rm` CLI response.
+#[cfg(unix)]
+fn worktree_rm_response(
+    disposition: &crate::worktree_dispose::Disposition,
+    worktree: &Path,
+) -> serde_json::Value {
+    use crate::worktree_dispose::Disposition;
+    match disposition {
+        Disposition::Disposed | Disposition::Remnant => serde_json::json!({
+            "status": "ok",
+            "removed": true,
+            "path": worktree.display().to_string(),
+        }),
+        Disposition::KeptDirty { reason } => serde_json::json!({
+            "status": "kept",
+            "removed": false,
+            "message": reason,
+        }),
+        Disposition::Refused { reason } => serde_json::json!({
+            "status": "refused",
+            "removed": false,
+            "message": reason,
+        }),
+        Disposition::NotOurs => serde_json::json!({
+            "status": "not_ours",
+            "removed": false,
+            "message": "not a Catenary-managed worktree",
+        }),
+    }
+}
+
+/// Load a worktree's [`WorktreeMeta`](crate::worktree_create::WorktreeMeta) from
+/// its sidecar (the durable disposal record), for a background dispose after a
+/// registry miss (daemon restarted since creation).
+#[cfg(unix)]
+fn load_meta_from_sidecar(worktree: &Path) -> Option<crate::worktree_create::WorktreeMeta> {
+    let sidecar = crate::worktree_create::sidecar_path(worktree);
+    let contents = std::fs::read_to_string(sidecar).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+/// Dispose a worktree in a background task (misc 151 triggers 1/2/4).
+///
+/// Blocking (git subprocesses) — call from `spawn_blocking`. On a clean dispose
+/// the registry entry is dropped; on a dirty keep the parent is surfaced
+/// ([`surface_dirty_kept`]) unless the removal was host-initiated (`WorktreeRemove`
+/// logs the divergence inside [`crate::worktree_dispose::dispose`] instead). A
+/// path with no registry entry and no sidecar is silently skipped (never ours).
+#[cfg(unix)]
+fn dispose_worktree_in_background(
+    registry: &WorktreeRegistry,
+    session_id: &str,
+    agent_id: &str,
+    worktree: &Path,
+    host_initiated: bool,
+) {
+    let Some(meta) = registry
+        .get(worktree)
+        .or_else(|| load_meta_from_sidecar(worktree))
+    else {
+        return;
+    };
+    let disposition = crate::worktree_dispose::dispose(&meta, host_initiated);
+    match &disposition {
+        crate::worktree_dispose::Disposition::Disposed
+        | crate::worktree_dispose::Disposition::Remnant => registry.forget(worktree),
+        crate::worktree_dispose::Disposition::KeptDirty { .. } if !host_initiated => {
+            surface_dirty_kept(session_id, agent_id, worktree);
+        }
+        _ => {}
+    }
+}
+
+/// Surface a dirty worktree kept at `SubagentStop` to the *parent* (misc 151, D-1).
+///
+/// Two legs from one queue event. The user leg is the notification queue's
+/// `systemMessage` — routed to the parent session by the `session_id` field (the
+/// deliberate user-relevant lifecycle exception, so `warn!`). The agent leg
+/// (`additionalContext` on the parent's next hook response) is stubbed pending
+/// the hooks-doc delivery-point wiring ([`queue_parent_additional_context`]).
+#[cfg(unix)]
+fn surface_dirty_kept(session_id: &str, agent_id: &str, worktree: &Path) {
+    let message = format!(
+        "subagent `{agent_id}` left a dirty worktree at `{}` (kept; land its work \
+         or `catenary worktree rm` it)",
+        worktree.display(),
+    );
+    warn!(
+        source = Source::DaemonDispatch.as_str(),
+        session_id = %session_id,
+        "{message}",
+    );
+    queue_parent_additional_context(session_id, agent_id, worktree);
+}
+
+/// STUB (misc 151, D-1 agent leg): deliver the dirty-kept notice to the *parent
+/// agent* as `additionalContext` on its next hook response.
+///
+/// Verified against the Claude Code hooks docs: the `SubagentStop` response is
+/// delivered to the *stopping subagent*, not the parent, so the agent leg must
+/// ride a later *parent* hook response. `additionalContext` is a documented
+/// output field of the parent's `PreToolUse`/`UserPromptSubmit` responses, so the
+/// delivery point exists — but wiring it needs a per-session additionalContext
+/// queue the hook-response path drains, which is deferred per the misc-151
+/// priority order. The user leg (systemMessage) is fully wired; this records the
+/// intent so the agent leg is a named, findable stub rather than a silent gap.
+#[cfg(unix)]
+fn queue_parent_additional_context(session_id: &str, agent_id: &str, worktree: &Path) {
+    debug!(
+        source = Source::DaemonDispatch.as_str(),
+        session_id = %session_id,
+        agent_id = agent_id,
+        worktree = %worktree.display(),
+        "dirty-kept agent-context leg stubbed (additionalContext delivery deferred, misc 151)",
+    );
+}
+
+/// The `id`s of background subagents reported **running** in a stop payload's
+/// `background_tasks` array (misc 151 D-2).
+///
+/// The maintainer's awaiting-a-background-subagent case: a worktree whose owning
+/// agent is still running must never be nagged. Reads `host_payload.background_tasks`
+/// (the forwarded live field), falling back to a top-level array. The `id`↔agent
+/// correspondence follows the ticket's live-verified field; a convention drift is
+/// caught by the mount check (a running agent's root is mounted) as a backstop.
+#[cfg(unix)]
+fn running_background_agent_ids(raw: &serde_json::Value) -> Vec<String> {
+    let tasks = raw
+        .get("host_payload")
+        .and_then(|hp| hp.get("background_tasks"))
+        .or_else(|| raw.get("background_tasks"))
+        .and_then(|v| v.as_array());
+    let Some(tasks) = tasks else {
+        return Vec::new();
+    };
+    tasks
+        .iter()
+        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("running"))
+        .filter_map(|t| t.get("id").and_then(|i| i.as_str()).map(String::from))
+        .collect()
+}
+
+/// The lingering-worktree nag message, or `None` when nothing qualifies (misc 151
+/// D-2).
+///
+/// Collects the session's registered worktrees satisfying ALL of: dir present,
+/// root **not** mounted, owning agent **not** running in `background_tasks`, and
+/// not yet nagged this daemon lifetime (marked here — once per worktree). Empty
+/// → `None` (no block). The caller blocks the stop once with this list; the
+/// `stop_hook_active` retry passes.
+#[cfg(unix)]
+fn lingering_worktree_nag(
+    ctx: &HookDispatchContext,
+    session_id: &str,
+    raw: &serde_json::Value,
+) -> Option<String> {
+    let running = running_background_agent_ids(raw);
+    let mounted: HashSet<PathBuf> = ctx
+        .worktree_mounts
+        .mounted_roots()
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+
+    let mut lingering = Vec::new();
+    for meta in ctx.worktree_registry.metas_for_session(session_id) {
+        if !meta.worktree.exists() {
+            continue; // dir gone — a remnant, not a lingering worktree
+        }
+        if mounted.contains(&meta.worktree) {
+            continue; // root still mounted (a live or blocked agent)
+        }
+        let owner = meta.agent_id.as_deref().unwrap_or(meta.name.as_str());
+        if running
+            .iter()
+            .any(|id| id == owner || id == &meta.name || id == &format!("agent-{owner}"))
+        {
+            continue; // owning agent is still running in the background
+        }
+        if !ctx.worktree_registry.mark_nagged(&meta.worktree) {
+            continue; // already nagged this daemon lifetime (once per worktree)
+        }
+        lingering.push(meta.worktree.clone());
+    }
+
+    if lingering.is_empty() {
+        return None;
+    }
+    let list = lingering
+        .iter()
+        .map(|p| format!("  {}", p.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let count = lingering.len();
+    let noun = if count == 1 { "worktree" } else { "worktrees" };
+    Some(format!(
+        "{count} agent {noun} linger (root unmounted, owner not running):\n{list}\n\
+         Land their work or `catenary worktree rm <path>` each. (Nagged once per worktree.)"
+    ))
+}
+
 /// Streams a grep outcome as a chunk-frame sequence (misc 140 phase 2).
 ///
 /// One [`GrepFrame::Chunk`] per rendered hunk in global sort order, then one
@@ -3241,6 +3618,50 @@ async fn handle_hook_dispatch(
         return Ok(());
     }
 
+    // ── worktree ls — the registry+sidecar view (misc 151) ─────────────
+    //
+    // `tool/worktree-ls` is sent by `catenary worktree ls`. Scans the agent and
+    // feats sidecars, merges the daemon's live mount/blocked state, and returns a
+    // row per worktree (path, class, creator, age, dirty, root state, and — for
+    // feats — ahead/behind upstream). Daemon-level, no per-session state.
+    if method == "tool/worktree-ls" {
+        let mounts: HashMap<PathBuf, bool> =
+            ctx.worktree_mounts.mounted_roots().into_iter().collect();
+        let mut metas =
+            crate::worktree_create::scan_sidecars(&crate::paths::agents_worktrees_dir());
+        metas.extend(crate::worktree_create::scan_sidecars_recursive(
+            &crate::paths::feats_worktrees_dir(),
+        ));
+
+        let rows: Vec<serde_json::Value> = metas
+            .into_iter()
+            .map(|meta| worktree_ls_row(&meta, &mounts))
+            .collect();
+
+        let response = serde_json::json!({ "status": "ok", "worktrees": rows });
+        let mut payload = serde_json::to_vec(&response)?;
+        payload.push(b'\n');
+        writer.write_all(&payload).await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
+    // ── worktree rm — one removal verb, class-appropriate (misc 151) ───
+    //
+    // `tool/worktree-rm` is sent by `catenary worktree rm <path>`. Loads the
+    // sidecar, reaps any live mount (so its servers shut down), then disposes by
+    // class: an agent worktree removes on the caller's captured-work assertion
+    // (the force-shaped landing path, firehose-logged); a feats worktree refuses
+    // dirty (uncommitted or unpushed). Daemon-level.
+    if method == "tool/worktree-rm" {
+        let response = handle_worktree_rm(&ctx, &raw).await;
+        let mut payload = serde_json::to_vec(&response)?;
+        payload.push(b'\n');
+        writer.write_all(&payload).await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
     // Extract session_id for routing. Falls back to "default" for hooks
     // that don't carry a session_id (backward compatibility).
     let session_id = raw
@@ -3371,6 +3792,24 @@ async fn handle_hook_dispatch(
                 session_id = %session_id,
                 "session ended: roots cleaned up",
             );
+        }
+
+        // misc 151 trigger 2: dispose this session's CLEAN agent worktrees — the
+        // resume window is over. Dirty ones are kept (they become cross-session
+        // orphans surfaced at the next SessionStart, not the now-gone session's
+        // queue). The roots were just swept above, so the worktrees are
+        // unmounted; the git work runs in the background so session-end is prompt.
+        let session_metas = ctx.worktree_registry.metas_for_session(&session_id);
+        if !session_metas.is_empty() {
+            let registry = ctx.worktree_registry.clone();
+            tokio::task::spawn_blocking(move || {
+                for meta in session_metas {
+                    let disposition = crate::worktree_dispose::dispose(&meta, false);
+                    if disposition.is_disposed() {
+                        registry.forget(&meta.worktree);
+                    }
+                }
+            });
         }
 
         emit_hook_event(
@@ -3593,6 +4032,17 @@ async fn handle_hook_dispatch(
                 "worktree removal",
             )
             .await;
+
+            // misc 151 trigger 4: the WorktreeRemove handler, armed. The host
+            // decided removal, so dispose with `host_initiated` — the clean check
+            // is advisory (still refuses dirty; a dirty keep logs the divergence
+            // inside `dispose`, host asked/we declined). Background for git.
+            let registry = ctx.worktree_registry.clone();
+            let sid = session_id.clone();
+            let wt = canonical.clone();
+            tokio::task::spawn_blocking(move || {
+                dispose_worktree_in_background(&registry, &sid, "", &wt, true);
+            });
         }
 
         emit_hook_event(
@@ -4531,7 +4981,36 @@ async fn handle_hook_dispatch(
     let request: HookRequest =
         serde_json::from_value(raw.clone()).map_err(|e| anyhow!("Invalid hook request: {e}"))?;
 
-    let result = router.dispatch(request);
+    let mut result = router.dispatch(request);
+
+    // ── Lingering-worktree nag at the parent's Stop (misc 151 D-2) ─────
+    //
+    // Block-once with the list of the session's worktrees that satisfy ALL of:
+    // dir present, root NOT mounted, owning agent NOT running in the stop
+    // payload's `background_tasks`, and not yet nagged (once per worktree). A
+    // doorbell, not a wall — the `stop_hook_active` retry passes. Fires only on a
+    // clean turn: not already blocking on the editing gate, and no pending
+    // notifications to drain first (delivering those keeps `result` an allow this
+    // turn; the nag takes the next clean stop). Scoped to the **top-level Stop**
+    // (`hook_event_name == "Stop"`) so a leaf subagent's SubagentStop is never
+    // held for a sibling's lingering worktree; the mid-tier-parent SubagentStop
+    // case is a deferred refinement.
+    if method == "post-agent/require-release"
+        && raw
+            .get("host_payload")
+            .and_then(|hp| hp.get("hook_event_name"))
+            .and_then(serde_json::Value::as_str)
+            == Some("Stop")
+        && !raw
+            .get("stop_hook_active")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        && result.result.is_none()
+        && result.system_message.is_none()
+        && let Some(nag) = lingering_worktree_nag(&ctx, &session_id, &raw)
+    {
+        result.result = Some(crate::hook::HookResult::Block(nag));
+    }
 
     // ── Subagent worktree teardown at stop (misc 150) ──────────
     //
@@ -4580,6 +5059,20 @@ async fn handle_hook_dispatch(
                     "subagent stop worktree teardown skipped (no live worktree root for identity/cwd)",
                 );
             }
+
+            // misc 151 trigger 1: dispose the subagent's worktree in the
+            // background (spawn_blocking for the git subprocesses) so the
+            // stop-gate response latency is untouched (decision 029). Clean →
+            // auto-disposed; dirty → kept and surfaced to the parent (D-1). Runs
+            // whether or not the root was still mounted (an idle-reaped worktree
+            // still disposes).
+            let registry = ctx.worktree_registry.clone();
+            let sid = session_id.clone();
+            let aid = agent_id.to_string();
+            let wt = worktree.clone();
+            tokio::task::spawn_blocking(move || {
+                dispose_worktree_in_background(&registry, &sid, &aid, &wt, false);
+            });
         }
     }
 
@@ -8334,6 +8827,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn running_background_agent_ids_reads_running_tasks_from_host_payload() {
+        // misc 151 D-2: the nag skips a worktree whose owning agent is still
+        // running in the stop payload's `background_tasks`.
+        let raw = serde_json::json!({
+            "host_payload": {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    { "id": "sub-1", "status": "running" },
+                    { "id": "sub-2", "status": "completed" },
+                ],
+            },
+        });
+        let running = running_background_agent_ids(&raw);
+        assert_eq!(running, vec!["sub-1".to_string()], "only running tasks");
+    }
+
+    #[test]
+    fn running_background_agent_ids_empty_without_tasks() {
+        let raw = serde_json::json!({ "host_payload": { "hook_event_name": "Stop" } });
+        assert!(running_background_agent_ids(&raw).is_empty());
+    }
+
+    #[test]
+    fn worktree_registry_mark_nagged_is_once_per_worktree() {
+        // The lingering nag fires once per worktree per daemon lifetime (D-2).
+        let registry = WorktreeRegistry::new();
+        let wt = PathBuf::from("/state/catenary/worktrees/agents/s/a");
+        assert!(registry.mark_nagged(&wt), "first nag marks");
+        assert!(!registry.mark_nagged(&wt), "second nag is suppressed");
+    }
+
     // ── Companion roots (workstream 29) ──────────────────────────────────
     //
     // These exercise the `on_roots_changed` seam: the callback recomputes
@@ -9490,6 +10015,7 @@ mod tests {
             session_id: "sess-1".to_string(),
             created_at: "2026-07-06T00:00:00.000Z".to_string(),
             class: "agent".to_string(),
+            link: None,
         };
         let _ = hook_roundtrip(
             &ipc_path,
@@ -9561,6 +10087,7 @@ mod tests {
             session_id: "sess-1".to_string(),
             created_at: "2026-07-06T00:00:00.000Z".to_string(),
             class: "agent".to_string(),
+            link: None,
         };
         crate::worktree_create::write_sidecar(&meta).expect("write sidecar");
 

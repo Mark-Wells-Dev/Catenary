@@ -469,6 +469,22 @@ fn check_parsed_command(
         return None;
     }
 
+    // `git worktree` is denied on the agent surface (misc 151): the sanctioned
+    // `catenary worktree` surface owns worktree lifecycle, and a hand-run
+    // `git worktree add` inside a repo re-opens the bug-53 nesting hazard.
+    // Always denied — regardless of whether `git` is otherwise allowlisted —
+    // with a teaching message pointing at the replacement (like `git grep`, but
+    // built in rather than config-sourced so the pointer always lands).
+    if name == "git" && command.argv.first().map(String::as_str) == Some("worktree") {
+        return Some(Denial {
+            command: "git worktree".to_string(),
+            reason: DenialReason::DeniedSubcommand,
+            unresolved_cd: cwd.saw_unresolved_cd,
+            effective_cwd: cwd.effective_cwd.clone(),
+            message: Some(git_worktree_teaching()),
+        });
+    }
+
     // Output redirection is no longer denied here: the write resolver
     // (`resolver::resolve_script`, run by `check_command` after this walk)
     // resolves every redirect to its complete target set or denies the line
@@ -634,17 +650,27 @@ enum Sub {
     Primer,
     /// `catenary commands` — prints the allowed-command surface.
     Commands,
+    /// `catenary worktree ls` — registry+sidecar view (misc 151). Search-class:
+    /// no handoff, output is complete and client-owned, so it chains and pipes
+    /// like `query`.
+    WorktreeLs,
+    /// `catenary worktree add` / `catenary worktree rm` — the durable-worktree
+    /// lifecycle verbs (misc 151). Bare-only lifecycle: each mutates the on-disk
+    /// worktree set and must run as the sole command.
+    WorktreeAddRm,
 }
 
 impl Sub {
     /// Correlation class governing the canonical-form rules.
     const fn class(self) -> CatenaryClass {
         match self {
-            Self::Grep | Self::Glob | Self::Query => CatenaryClass::Search,
+            Self::Grep | Self::Glob | Self::Query | Self::WorktreeLs => CatenaryClass::Search,
             Self::Sed | Self::Diagnostics | Self::EditingStop => CatenaryClass::Correlated,
-            Self::EditingStart | Self::Roots | Self::Primer | Self::Commands => {
-                CatenaryClass::Lifecycle
-            }
+            Self::EditingStart
+            | Self::Roots
+            | Self::Primer
+            | Self::Commands
+            | Self::WorktreeAddRm => CatenaryClass::Lifecycle,
         }
     }
 
@@ -661,6 +687,8 @@ impl Sub {
             Self::Roots => "roots",
             Self::Primer => "primer",
             Self::Commands => "commands",
+            Self::WorktreeLs => "worktree ls",
+            Self::WorktreeAddRm => "worktree add/rm",
         }
     }
 }
@@ -694,6 +722,11 @@ fn recognize_catenary_sub(rest: &[&str]) -> Recog {
         (Some("editing"), Some("start")) => Recog::Agent(Sub::EditingStart),
         (Some("editing"), Some("stop")) => Recog::Agent(Sub::EditingStop),
         (Some("roots"), Some("add" | "rm" | "ls")) => Recog::Agent(Sub::Roots),
+        // `worktree ls` is Search-class (pipe-friendly registry view); `worktree
+        // add`/`rm` are bare-only lifecycle verbs (misc 151). Split before the
+        // bare-word arms so the two-word forms are matched exactly.
+        (Some("worktree"), Some("ls")) => Recog::Agent(Sub::WorktreeLs),
+        (Some("worktree"), Some("add" | "rm")) => Recog::Agent(Sub::WorktreeAddRm),
         (Some("grep"), _) => Recog::Agent(Sub::Grep),
         (Some("glob"), _) => Recog::Agent(Sub::Glob),
         (Some("query"), _) => Recog::Agent(Sub::Query),
@@ -916,11 +949,12 @@ const fn occ_needs_isolation(occ: &CatenaryOcc) -> bool {
             | Sub::Sed
             | Sub::Roots
             | Sub::Primer
-            | Sub::Commands,
+            | Sub::Commands
+            | Sub::WorktreeAddRm,
         ) => true,
-        // search (grep/glob), the subcommand-less global read, and the
-        // already-denied non-agent/unknown forms carry no handoff.
-        Recog::Agent(Sub::Grep | Sub::Glob | Sub::Query)
+        // search (grep/glob/query/worktree ls), the subcommand-less global read,
+        // and the already-denied non-agent/unknown forms carry no handoff.
+        Recog::Agent(Sub::Grep | Sub::Glob | Sub::Query | Sub::WorktreeLs)
         | Recog::GlobalRead
         | Recog::NotAgent
         | Recog::Unknown => false,
@@ -1069,8 +1103,8 @@ fn catenary_occ_denial(occ: &CatenaryOcc) -> Option<String> {
 
 /// The recognized agent-facing command surface, for "unknown subcommand" denials.
 const CATENARY_SURFACE: &str = "Available: `grep`, `glob`, `query`, `diagnostics`, \
-     `editing start`, `roots add/rm/ls`, `commands`, `primer`, `version`. Run \
-     `catenary primer` for the workflow.";
+     `editing start`, `roots add/rm/ls`, `worktree ls/add/rm`, `commands`, \
+     `primer`, `version`. Run `catenary primer` for the workflow.";
 
 fn unknown_subcommand_denial() -> String {
     format!("That isn't a recognized `catenary` command. {CATENARY_SURFACE}")
@@ -1105,10 +1139,14 @@ fn stdin_denial(sub: Sub) -> Option<String> {
         // Search reads stdin now — a downstream pipe is valid, not an error.
         Sub::Grep | Sub::Glob => None,
         // Search-class but stdin-less: telemetry comes from the daemon, so a
-        // pipe INTO query is a no-op; its output still pipes freely.
+        // pipe INTO query / worktree ls is a no-op; their output still pipes
+        // freely.
         Sub::Query => {
             Some("`catenary query` takes no stdin — invoke it first in the pipeline.".to_string())
         }
+        Sub::WorktreeLs => Some(
+            "`catenary worktree ls` takes no stdin — invoke it first in the pipeline.".to_string(),
+        ),
         Sub::Diagnostics => {
             Some("`catenary diagnostics` takes no input — run it bare.".to_string())
         }
@@ -1117,7 +1155,8 @@ fn stdin_denial(sub: Sub) -> Option<String> {
         | Sub::EditingStop
         | Sub::Roots
         | Sub::Primer
-        | Sub::Commands => Some(format!(
+        | Sub::Commands
+        | Sub::WorktreeAddRm => Some(format!(
             "`catenary {}` takes no stdin — run it bare.",
             sub.label()
         )),
@@ -1188,6 +1227,21 @@ fn bare_only_denial(subs: &[Sub]) -> String {
          command (no `cd` prefix, no `&&`/`;`/`||` chain, not combined with another \
          command). It must reach the daemon promptly to attribute correctly."
     )
+}
+
+/// The agent-surface denial for `git worktree` (misc 151).
+///
+/// The sanctioned `catenary worktree` surface owns worktree lifecycle. A
+/// hand-run `git worktree add` inside a repo re-opens the bug-53 nesting hazard,
+/// so every `git worktree` subcommand is denied here, pointing at the
+/// replacement (the deny is agent-side only; the human/daemon still uses raw
+/// git).
+fn git_worktree_teaching() -> String {
+    "`git worktree` isn't allowed — use `catenary worktree` instead: `catenary \
+     worktree ls` to list, `catenary worktree add <branch> [path]` to create a \
+     durable checkout, `catenary worktree rm <path>` to remove one. Catenary \
+     owns worktree placement and disposal (misc 144/151)."
+        .to_string()
 }
 
 /// Redirect for the retired `catenary editing stop` — renamed to
@@ -1407,6 +1461,17 @@ pub fn format_denial(
             return msg.clone();
         }
         return format_opening_line(denied_cmd, denial.reason);
+    }
+
+    // A denied subcommand carrying a teaching message (the built-in `git
+    // worktree` deny, misc 151) surfaces that message as the whole denial — it
+    // names the sanctioned `catenary worktree` replacement. Config-sourced
+    // denied subcommands (`git grep`) carry no message and fall through to the
+    // generic opening line below.
+    if denial.reason == DenialReason::DeniedSubcommand
+        && let Some(msg) = &denial.message
+    {
+        return msg.clone();
     }
 
     // Form-lever denial (`allow_flags`): the config-sourced message naming the
@@ -2020,6 +2085,38 @@ mod tests {
         // of the heredoc. (Outcome preserved.)
         let rules = basic_rules();
         assert!(check_command("cat file.txt <<EOF\nhello\nEOF", &rules, None).is_some());
+    }
+
+    // ── git worktree — the built-in agent-surface deny (misc 151) ────
+
+    #[test]
+    fn git_worktree_denied_with_catenary_pointer() {
+        // `git` is allowlisted in basic_rules, yet every `git worktree`
+        // subcommand is denied on the agent surface, with a teaching message
+        // pointing at `catenary worktree`.
+        let rules = basic_rules();
+        for cmd in [
+            "git worktree add ../wt topic",
+            "git worktree list",
+            "git worktree remove ../wt",
+        ] {
+            let denial = check_command(cmd, &rules, None).expect("git worktree must be denied");
+            assert_eq!(denial.command, "git worktree");
+            assert_eq!(denial.reason, DenialReason::DeniedSubcommand);
+            let msg = format_denial(&denial.command, &rules, &denial, None, None);
+            assert!(
+                msg.contains("catenary worktree"),
+                "`{cmd}` denial must point at catenary worktree, got: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn git_non_worktree_subcommands_still_allowed() {
+        // The built-in deny is surgical: other `git` subcommands are unaffected.
+        let rules = basic_rules();
+        assert!(check_command("git status", &rules, None).is_none());
+        assert!(check_command("git commit -m x", &rules, None).is_none());
     }
 
     // ── Subshell recursion ───────────────────────────────────────────
@@ -3919,6 +4016,51 @@ mod tests {
                 "{cmd} should be a bare allow",
             );
         }
+    }
+
+    #[test]
+    fn worktree_ls_is_search_class_pipes_and_chains() {
+        // `catenary worktree ls` is Search-class (misc 151): pipe-friendly,
+        // chainable, no isolation.
+        assert_eq!(
+            analyze_catenary_command("catenary worktree ls"),
+            CatenaryAction::Allow { has_foreign: false },
+        );
+        assert_eq!(
+            analyze_catenary_command("catenary worktree ls | grep feat"),
+            CatenaryAction::Allow { has_foreign: true },
+            "worktree ls pipes into a downstream filter",
+        );
+    }
+
+    #[test]
+    fn worktree_add_rm_are_bare_only_lifecycle() {
+        // `add`/`rm` mutate the on-disk worktree set: bare-only lifecycle.
+        for cmd in [
+            "catenary worktree add feature/auth",
+            "catenary worktree rm /some/path",
+        ] {
+            assert_eq!(
+                analyze_catenary_command(cmd),
+                CatenaryAction::Allow { has_foreign: false },
+                "{cmd} should be a bare allow",
+            );
+        }
+        // Chained or piped → bare-only violation.
+        assert!(
+            matches!(
+                analyze_catenary_command("cd /repo && catenary worktree add topic"),
+                CatenaryAction::Deny(_),
+            ),
+            "worktree add must be the sole command",
+        );
+        assert!(
+            matches!(
+                analyze_catenary_command("catenary worktree rm /p | tee log"),
+                CatenaryAction::Deny(_),
+            ),
+            "worktree rm must not pipe out",
+        );
     }
 
     #[test]

@@ -44,5 +44,7 @@ pub mod symbol_index;
 pub mod tui;
 /// Out-of-tree agent worktree creation for Claude Code's `WorktreeCreate` hook.
 pub mod worktree_create;
+/// Guarded in-house disposal of Catenary-created worktrees (misc 151).
+pub mod worktree_dispose;
 /// Bounded directory-deletion watch for subagent worktree roots (ticket 05).
 pub mod worktree_watch;

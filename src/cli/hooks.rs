@@ -59,6 +59,46 @@ fn session_start_context(announce: bool, format: HostFormat) -> Option<String> {
     (announce && matches!(format, HostFormat::Claude)).then(crate::cli::teaching::emitted_payload)
 }
 
+/// Append the cross-session lingering-worktree line (misc 151 D-2) to a
+/// `SessionStart` context, when there is one and orphans exist.
+///
+/// Only augments a `Some` context (the announce+Claude path), so the pure
+/// [`session_start_context`] stays hermetic and this filesystem scan runs only in
+/// the live hook.
+fn with_orphan_line(ctx: Option<String>) -> Option<String> {
+    let base = ctx?;
+    match cross_session_orphan_line(&crate::paths::agents_worktrees_dir()) {
+        Some(line) => Some(format!("{base}\n\n{line}")),
+        None => Some(base),
+    }
+}
+
+/// A one-line mention of agent worktrees lingering from previous sessions (misc
+/// 151 D-2 cross-session orphans), or `None` when there are none.
+///
+/// Scans `agents_root` for sidecars whose worktree dir still exists — a present
+/// agent worktree at session start belongs to a prior (now-dead) session. These
+/// get this passive mention plus the `catenary worktree ls` pointer, not a block
+/// (the nag is a same-session doorbell).
+#[must_use]
+fn cross_session_orphan_line(agents_root: &std::path::Path) -> Option<String> {
+    let count = crate::worktree_create::scan_sidecars(agents_root)
+        .into_iter()
+        .filter(|meta| meta.worktree.exists())
+        .count();
+    if count == 0 {
+        return None;
+    }
+    let verb = if count == 1 {
+        "worktree lingers"
+    } else {
+        "worktrees linger"
+    };
+    Some(format!(
+        "{count} agent {verb} from previous sessions — run `catenary worktree ls`."
+    ))
+}
+
 /// The raw stdout body emitted by `catenary hook session-start
 /// --format=opencode`.
 ///
@@ -476,7 +516,7 @@ pub fn run_session_start(format: HostFormat) {
     let announce = session_start_should_announce(source);
 
     let Some(stream) = hook_connect(&hook_json) else {
-        let ctx = session_start_context(announce, format);
+        let ctx = with_orphan_line(session_start_context(announce, format));
         emit_session_start(builder, ctx.as_deref());
         return;
     };
@@ -514,7 +554,7 @@ pub fn run_session_start(format: HostFormat) {
         }
     }
 
-    let ctx = session_start_context(announce, format);
+    let ctx = with_orphan_line(session_start_context(announce, format));
     emit_session_start(builder, ctx.as_deref());
 }
 
@@ -2210,6 +2250,43 @@ mod tests {
         // Unknown source: only `resume` provably already carries the payload,
         // so anything else injects.
         assert!(session_start_should_announce(Some("something-new")));
+    }
+
+    // ── Cross-session lingering-worktree line (misc 151 D-2) ──────────
+
+    #[test]
+    fn cross_session_orphan_line_counts_present_worktrees() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let agents = tmp.path().join("agents");
+        let wt = agents.join("sess-x").join("a");
+        std::fs::create_dir_all(&wt).expect("mkdir worktree");
+        let meta = crate::worktree_create::WorktreeMeta {
+            worktree: wt,
+            source_repo: std::path::PathBuf::from("/repo"),
+            base_commit: "deadbeef".to_string(),
+            branch: "agent-a".to_string(),
+            name: "agent-a".to_string(),
+            agent_id: Some("a".to_string()),
+            session_id: "sess-x".to_string(),
+            created_at: "2026-07-06T00:00:00.000Z".to_string(),
+            class: crate::worktree_create::WORKTREE_CLASS_AGENT.to_string(),
+            link: None,
+        };
+        crate::worktree_create::write_sidecar(&meta).expect("write sidecar");
+
+        let line = cross_session_orphan_line(&agents).expect("one lingering worktree");
+        assert!(
+            line.contains("1 agent worktree lingers"),
+            "count line: {line}"
+        );
+        assert!(line.contains("catenary worktree ls"), "pointer: {line}");
+    }
+
+    #[test]
+    fn cross_session_orphan_line_none_when_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // No sidecars → no line.
+        assert!(cross_session_orphan_line(&tmp.path().join("agents")).is_none());
     }
 
     // ── session_start_context: inject/host gating carries the live payload ─

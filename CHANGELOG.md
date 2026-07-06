@@ -62,6 +62,32 @@ upgrading.
 
 ### Added
 
+- **Catenary owns the agent-worktree lifecycle end to end: the
+  `catenary worktree` surface and guarded disposal.** Two worktree classes:
+  *agent* worktrees (hook-created isolation copies) and *feats* worktrees —
+  deliberate long-lived parallel checkouts created by
+  `catenary worktree add <branch>`, placed under the durable state base with
+  a human-friendly sibling symlink (`<repo>-<branch>`) beside the main repo.
+  `catenary worktree ls` lists every tracked worktree with class, creator,
+  age, clean/dirty, and mount state (feats also show ahead/behind their
+  remote); `catenary worktree rm` is the one removal verb — for agent
+  worktrees the caller's captured-work assertion replaces the clean proof,
+  for feats it refuses anything uncommitted or unpushed. Raw `git worktree`
+  is denied on the agent surface with a pointer at the sanctioned commands
+  (which also closes the last manual route to in-repo worktree nesting).
+  Clean agent worktrees now dispose automatically — at subagent stop, at
+  session end, and via a 24-hour age sweep — through one guarded routine:
+  provably clean only (pristine status AND HEAD at the recorded base
+  commit), always via `git worktree remove` (never force, never touching
+  locks — git's refusal outranks Catenary's own checks), branch names taken
+  from the creation sidecar, the sidecar deleted last as the transaction
+  record so any interruption converges on the next sweep. Dirty worktrees
+  are never auto-deleted, at any age, by any trigger: a subagent leaving
+  unlanded work notifies the parent session at the moment it stops, a
+  lingering worktree nags once per session at the top-level stop (never
+  while its agent runs in the background or waits at a permission prompt),
+  and orphans from previous sessions get a session-start line pointing at
+  `catenary worktree ls`.
 - **`catenary query` joins the agent command surface.** The read-only
   telemetry query command is now agent-invocable — pure observability, so it
   classifies with `grep`/`glob`: it chains and pipes out freely and needs no
@@ -81,9 +107,9 @@ upgrading.
   mount and the deletion watcher are location-agnostic). Git tracks the
   relocated worktree by metadata, so `git worktree remove` handles it
   unchanged — but in live testing Claude Code never ran its documented
-  automatic cleanup for a hook-created worktree; the hook prunes dead
-  cache-dir entries on each spawn, and prompt in-daemon teardown at subagent
-  stop is tracked as follow-up work. The hook forwards its payload
+  automatic cleanup for a hook-created worktree; Catenary therefore owns
+  teardown and disposal itself (see the `catenary worktree` entry and the
+  subagent-stop reap entry). The hook forwards its payload
   to the firehose (`catenary query --kind hook`) so the live schema is
   verifiable. Because a configured WorktreeCreate hook replaces the host's
   default behavior entirely, the hook **reimplements `.worktreeinclude`**
@@ -255,10 +281,10 @@ upgrading.
   waiting at a permission prompt as *blocked* — exempt from idle expiry, so
   a worker paused on a human answer keeps its warm servers for hours. A
   resumed subagent regains coverage on its first search or diagnostics run
-  via the ephemeral activity mounts. The worktree directory itself is never
-  deleted — disposal remains the host's (its documented automatic cleanup
-  currently skips hook-created worktrees entirely; see the known-issue trail
-  in anthropics/claude-code#34137).
+  via the ephemeral activity mounts. Disposal of the directory itself is
+  in-house too (see the `catenary worktree` entry above) — the host's
+  documented automatic cleanup never runs for hook-created worktrees
+  (known-issue trail in anthropics/claude-code#34137).
 - **`catenary diagnostics` becomes idiomatic — the batch replaces the drain.**
   The tracked set is no longer destroyed at diagnose time. Edits accumulate
   into a persistent per-`(session, agent)` **batch** whose files each carry a

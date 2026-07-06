@@ -14,6 +14,8 @@ pub mod jsonl_reader;
 pub mod teaching;
 pub mod update;
 pub mod version;
+#[cfg(unix)]
+pub mod worktree;
 
 use clap::ValueEnum;
 use crossterm::tty::IsTty;

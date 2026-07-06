@@ -85,10 +85,19 @@ use crate::source::Source;
 
 /// Worktree class recorded in the sidecar and the daemon registry.
 ///
-/// Only `"agent"` exists today (misc 150); durable "feats" worktrees (misc 151)
-/// will add a second class. Stored as a plain string so an unknown future class
+/// The ephemeral, hook-created class: subagent isolation copies under the
+/// [`paths::agents_worktrees_dir`] subtree, subject to the full auto-dispose
+/// lifecycle (misc 150/151). Stored as a plain string so an unknown future class
 /// round-trips through an older reader.
 pub const WORKTREE_CLASS_AGENT: &str = "agent";
+
+/// The durable, deliberately long-lived class (misc 151).
+///
+/// Parallel checkouts for disjoint lines of work under the
+/// [`paths::feats_worktrees_dir`] subtree, created only via
+/// `catenary worktree add`. Never nagged, never auto-disposed; removed only
+/// explicitly and its `rm` refuses dirty (uncommitted or unpushed).
+pub const WORKTREE_CLASS_FEAT: &str = "feat";
 
 /// Durable creation metadata written beside each agent worktree as a
 /// `<worktree-dir>.meta.json` **sibling** (never inside the worktree, so
@@ -122,8 +131,15 @@ pub struct WorktreeMeta {
     pub session_id: String,
     /// Creation timestamp (RFC 3339).
     pub created_at: String,
-    /// Worktree class ([`WORKTREE_CLASS_AGENT`]).
+    /// Worktree class ([`WORKTREE_CLASS_AGENT`] or [`WORKTREE_CLASS_FEAT`]).
     pub class: String,
+    /// The sibling symlink planted beside the source repo for a durable feats
+    /// worktree (`<repo-parent>/<repo-basename>-<branch>`), recorded so disposal
+    /// can unlink it — but only after `readlink` still resolves to this worktree
+    /// (a user-replaced link is left alone). `None` for agent worktrees, which
+    /// plant no link. `#[serde(default)]` so a pre-misc-151 sidecar round-trips.
+    #[serde(default)]
+    pub link: Option<PathBuf>,
 }
 
 /// Create an out-of-tree agent worktree from a `WorktreeCreate` payload.
@@ -185,6 +201,22 @@ pub fn create_from_payload(payload: &Value) -> Result<WorktreeMeta> {
         );
     }
 
+    // misc 151 trigger 3: age sweep — dispose CLEAN agent worktrees older than
+    // the conservative threshold, from ANY session (a crashed subagent, a dead
+    // session). Dirty worktrees are kept at any age; remnants converge. Runs at
+    // exactly the cadence the worktrees dir grows, like the prune above.
+    let swept = crate::worktree_dispose::sweep_aged_agents(
+        std::time::SystemTime::now(),
+        crate::worktree_dispose::AGENT_DISPOSE_MAX_AGE,
+    );
+    if !swept.is_empty() {
+        debug!(
+            source = Source::HookDispatch.as_str(),
+            count = swept.len(),
+            "age-swept clean agent worktrees before create",
+        );
+    }
+
     let unique_id = short_id();
     let raw_name = payload
         .get("name")
@@ -236,6 +268,7 @@ pub fn create_from_payload(payload: &Value) -> Result<WorktreeMeta> {
         session_id,
         created_at: crate::state_snapshot::now_iso(),
         class: WORKTREE_CLASS_AGENT.to_string(),
+        link: None,
     };
 
     // The durable half of the registry — a sidecar beside (never inside) the
@@ -251,6 +284,168 @@ pub fn create_from_payload(payload: &Value) -> Result<WorktreeMeta> {
     }
 
     Ok(meta)
+}
+
+/// Create a durable **feats**-class worktree from `catenary worktree add`
+/// (misc 151).
+///
+/// Places the worktree at `explicit_path` when given, else the default
+/// `<state>/catenary/worktrees/feats/<repo-basename>/<branch>` scheme
+/// ([`paths::feat_worktree_dir`], branch slashes → nested dirs). Plants a sibling
+/// symlink beside the source repo — `<repo-parent>/<repo-basename>-<branch>` with
+/// branch slashes sanitized to dashes — pointing at the worktree, refusing to
+/// overwrite an existing entry and refusing to plant inside any VCS root (the
+/// bug-53 nesting guard). Copies `.worktreeinclude` local config and writes a
+/// `class = "feat"` sidecar recording the link path (so disposal can unlink it).
+///
+/// # Errors
+///
+/// Returns an error when `cwd` is not a git working tree, the default path or the
+/// symlink target already exists (basename collision — with a rename hint), the
+/// link would land inside a VCS root, or `git worktree add` fails.
+pub fn create_feat_worktree(
+    cwd: &Path,
+    branch: &str,
+    explicit_path: Option<&Path>,
+) -> Result<WorktreeMeta> {
+    match detect_vcs(cwd) {
+        VcsPosture::Git => {}
+        VcsPosture::Foreign(vcs) => bail!("{}", vcs.refusal()),
+        VcsPosture::Unversioned => bail!(
+            "{} is not a git repository — `catenary worktree add` needs a git working tree",
+            cwd.display(),
+        ),
+    }
+    let trimmed = branch.trim();
+    if trimmed.is_empty() {
+        bail!("a branch name is required: `catenary worktree add <branch> [path]`");
+    }
+
+    let repo = repo_toplevel(cwd)
+        .with_context(|| format!("cannot resolve a git repository from {}", cwd.display()))?;
+    let repo_basename = repo
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow!("cannot determine the repo basename from {}", repo.display()))?
+        .to_string();
+
+    let worktree = explicit_path.map_or_else(
+        || paths::feat_worktree_dir(&repo_basename, trimmed),
+        Path::to_path_buf,
+    );
+    if worktree.exists() {
+        bail!(
+            "a worktree already exists at {} — pick a different branch name, or pass an \
+             explicit path: `catenary worktree add {trimmed} <path>`",
+            worktree.display(),
+        );
+    }
+
+    // The sibling symlink beside the source repo, with both refusal guards.
+    let link = feat_link_path(&repo, &repo_basename, trimmed)?;
+
+    if let Some(parent) = worktree.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create feats dir {}", parent.display()))?;
+    }
+    git_worktree_add_feat(&repo, &worktree, trimmed)?;
+    copy_worktree_includes(&repo, &worktree);
+
+    let base_commit = git_head(&repo).unwrap_or_default();
+    let worktree = worktree.canonicalize().unwrap_or(worktree);
+
+    // Plant the human-friendly symlink (Unix only; the daemon is Unix-only).
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&worktree, &link)
+        .with_context(|| format!("plant worktree symlink {}", link.display()))?;
+    #[cfg(not(unix))]
+    {
+        let _ = &link;
+        bail!("`catenary worktree add` requires Unix (symlink planting)");
+    }
+
+    let meta = WorktreeMeta {
+        worktree,
+        source_repo: repo,
+        base_commit,
+        branch: trimmed.to_string(),
+        name: trimmed.to_string(),
+        agent_id: None,
+        session_id: "cli".to_string(),
+        created_at: crate::state_snapshot::now_iso(),
+        class: WORKTREE_CLASS_FEAT.to_string(),
+        link: Some(link),
+    };
+    write_sidecar(&meta).with_context(|| "write feats worktree sidecar")?;
+    Ok(meta)
+}
+
+/// The sibling symlink path for a feats worktree, with the two refusal guards.
+///
+/// `<repo-parent>/<repo-basename>-<branch>` with branch slashes → dashes. Refuses
+/// when the entry already exists (never overwrite) or when the link's parent is
+/// inside a VCS root (a symlink inside a repo re-opens the bug-53 nesting class).
+fn feat_link_path(repo: &Path, repo_basename: &str, branch: &str) -> Result<PathBuf> {
+    let parent = repo.parent().ok_or_else(|| {
+        anyhow!(
+            "{} has no parent directory to plant a sibling link",
+            repo.display()
+        )
+    })?;
+    // Never plant inside a VCS root: marker-walk the link's parent.
+    if !matches!(detect_vcs(parent), VcsPosture::Unversioned) {
+        bail!(
+            "cannot plant the worktree symlink in {} — it is inside a version-controlled \
+             directory (a symlink inside a repo re-opens the nesting hazard). Pass an \
+             explicit path outside any repo.",
+            parent.display(),
+        );
+    }
+    let sanitized = branch.replace('/', "-");
+    let link = parent.join(format!("{repo_basename}-{sanitized}"));
+    if link.exists() || std::fs::symlink_metadata(&link).is_ok() {
+        bail!(
+            "{} already exists — refusing to overwrite it. Remove it or pick a different \
+             branch name.",
+            link.display(),
+        );
+    }
+    Ok(link)
+}
+
+/// `git worktree add` for a feats worktree: reuses an existing local branch, else
+/// creates it with `-b`.
+fn git_worktree_add_feat(repo: &Path, worktree: &Path, branch: &str) -> Result<()> {
+    let exists = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .output()
+        .is_ok_and(|o| o.status.success());
+
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo).args(["worktree", "add"]);
+    if exists {
+        cmd.arg(worktree).arg(branch);
+    } else {
+        cmd.args(["-b", branch]).arg(worktree);
+    }
+    let output = cmd.output().context("run `git worktree add`")?;
+    if !output.status.success() {
+        bail!(
+            "`git worktree add` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+    }
+    debug!(
+        source = Source::HookDispatch.as_str(),
+        repo = %repo.display(),
+        worktree = %worktree.display(),
+        branch,
+        "created durable feats worktree",
+    );
+    Ok(())
 }
 
 /// Parse the bare agent id out of a `WorktreeCreate` payload `name`.
@@ -353,6 +548,46 @@ pub fn scan_sidecars(agents_root: &Path) -> Vec<WorktreeMeta> {
         }
     }
     metas
+}
+
+/// Recursively scan `root` for `*.meta.json` sidecars, returning every readable
+/// [`WorktreeMeta`].
+///
+/// Unlike [`scan_sidecars`] (which knows the fixed two-level agents layout), this
+/// walks the variable-depth feats subtree (`feats/<repo>/<branch nested>`). It
+/// never descends into a worktree directory itself (any dir carrying a `.git`
+/// entry is a checkout), so it stays cheap and never mistakes a project's own
+/// `*.meta.json` for a sidecar. Best-effort: unreadable dirs/files are skipped; a
+/// missing `root` yields an empty vec. Used by `catenary worktree ls`.
+#[must_use]
+pub fn scan_sidecars_recursive(root: &Path) -> Vec<WorktreeMeta> {
+    let mut metas = Vec::new();
+    scan_sidecars_into(root, &mut metas);
+    metas
+}
+
+/// Recursion helper for [`scan_sidecars_recursive`].
+fn scan_sidecars_into(dir: &Path, out: &mut Vec<WorktreeMeta>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // Never descend into a checkout (a worktree dir carries a `.git`).
+            if !path.join(".git").exists() {
+                scan_sidecars_into(&path, out);
+            }
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".meta.json"))
+            && let Ok(contents) = std::fs::read_to_string(&path)
+            && let Ok(meta) = serde_json::from_str::<WorktreeMeta>(&contents)
+        {
+            out.push(meta);
+        }
+    }
 }
 
 /// Resolve the toplevel of the git working tree containing `cwd`.
@@ -733,10 +968,107 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        ForeignVcs, VcsPosture, WorktreeMeta, branch_name, copy_worktree_includes, detect_vcs,
-        linkage_dead, parse_agent_id, prune_agent_orphans, prune_orphans, scan_sidecars,
-        sidecar_path, worktree_segment, write_sidecar,
+        ForeignVcs, VcsPosture, WorktreeMeta, branch_name, copy_worktree_includes,
+        create_feat_worktree, detect_vcs, linkage_dead, parse_agent_id, prune_agent_orphans,
+        prune_orphans, scan_sidecars, sidecar_path, worktree_segment, write_sidecar,
     };
+
+    /// Run a git command in `dir` with a pinned, isolated identity.
+    fn tgit(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// A committed repo at `<tmp>/<name>/repo` (so the repo's parent is a clean,
+    /// non-VCS dir for the sibling symlink).
+    fn feat_repo() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("proj").join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        tgit(&repo, &["init", "-q"]);
+        tgit(&repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(repo.join("f.txt"), "x").expect("write");
+        tgit(&repo, &["add", "f.txt"]);
+        tgit(&repo, &["commit", "-qm", "c"]);
+        (tmp, repo)
+    }
+
+    #[test]
+    fn feat_create_plants_dir_sidecar_and_symlink() {
+        let (tmp, repo) = feat_repo();
+        let dest = tmp.path().join("dest");
+        let meta = create_feat_worktree(&repo, "accelerate", Some(&dest)).expect("create feat");
+
+        assert_eq!(meta.class, super::WORKTREE_CLASS_FEAT);
+        assert!(meta.worktree.exists(), "worktree dir created");
+        assert!(sidecar_path(&meta.worktree).exists(), "sidecar written");
+        // The sibling symlink beside the repo resolves to the worktree.
+        let link = meta.link.expect("link recorded");
+        assert_eq!(
+            link.file_name().and_then(|n| n.to_str()),
+            Some("repo-accelerate"),
+            "link is `<basename>-<branch>` beside the repo",
+        );
+        assert_eq!(
+            std::fs::read_link(&link).expect("readlink"),
+            meta.worktree,
+            "symlink points at the worktree",
+        );
+    }
+
+    #[test]
+    fn feat_create_refuses_existing_symlink() {
+        let (tmp, repo) = feat_repo();
+        // Pre-plant the link name so creation refuses rather than overwriting.
+        let squatter = repo.parent().expect("repo parent").join("repo-accelerate");
+        std::fs::write(&squatter, "squatter").expect("write squatter");
+        let dest = tmp.path().join("dest");
+        let err = create_feat_worktree(&repo, "accelerate", Some(&dest))
+            .expect_err("must refuse to overwrite the link");
+        assert!(
+            err.to_string().contains("already exists"),
+            "refusal names the collision: {err}",
+        );
+    }
+
+    #[test]
+    fn feat_create_refuses_link_inside_a_repo() {
+        // Repo whose PARENT is itself a git repo → the sibling link would land
+        // inside a VCS root (bug-53 nesting) → refuse.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outer = tmp.path().join("outer");
+        std::fs::create_dir_all(&outer).expect("mkdir outer");
+        tgit(&outer, &["init", "-q"]);
+        let repo = outer.join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        tgit(&repo, &["init", "-q"]);
+        tgit(&repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(repo.join("f.txt"), "x").expect("write");
+        tgit(&repo, &["add", "f.txt"]);
+        tgit(&repo, &["commit", "-qm", "c"]);
+
+        let dest = tmp.path().join("dest");
+        let err = create_feat_worktree(&repo, "topic", Some(&dest))
+            .expect_err("must refuse a link inside a repo");
+        assert!(
+            err.to_string().contains("version-controlled"),
+            "refusal names the nesting hazard: {err}",
+        );
+    }
 
     #[test]
     fn branch_name_prefers_payload_name() {
@@ -890,6 +1222,7 @@ mod tests {
             session_id: "sess-1".to_string(),
             created_at: "2026-07-06T00:00:00.000Z".to_string(),
             class: super::WORKTREE_CLASS_AGENT.to_string(),
+            link: None,
         }
     }
 
