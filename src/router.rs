@@ -1031,6 +1031,19 @@ impl RootTracker {
         inner.reconcile_roots();
     }
 
+    /// Returns whether `contributor` currently contributes any roots.
+    ///
+    /// Lets a teardown caller (`SubagentStop`) run the reap only for a live
+    /// worktree mount, so a stop whose `cwd` never mounted a worktree is a true
+    /// no-op — no re-sync, no misleading teardown log.
+    fn has_contributor(&self, contributor: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contributors
+            .contains_key(contributor)
+    }
+
     /// Removes every contributor whose key `starts_with(prefix)`, in one shot.
     ///
     /// Sweeps a whole namespace at once — e.g. all `worktree:{session_id}:*`
@@ -2504,6 +2517,61 @@ fn worktree_to_auto_mount(file_path: &Path, tracked: &HashSet<PathBuf>) -> Optio
     }
 }
 
+/// Canonicalizes a subagent worktree path and builds its
+/// `worktree:{session_id}:{path}` root-contributor key, returning both the
+/// canonical path (for logging) and the key.
+///
+/// Uses the same `.canonicalize().unwrap_or(raw)` fallback
+/// [`worktree_to_auto_mount`] applies at mount, so the `WorktreeRemove` and
+/// `SubagentStop` teardown routes rebuild the exact key the mount installed
+/// whenever the worktree dir still exists on disk.
+#[cfg(unix)]
+fn worktree_contributor(session_id: &str, path: &Path) -> (PathBuf, String) {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let contributor = format!("worktree:{session_id}:{}", canonical.display());
+    (canonical, contributor)
+}
+
+/// Tears down a mounted subagent worktree root: drops the `contributor` and its
+/// in-memory deletion watch, then re-syncs the reduced root set so the worktree's
+/// language servers shut down.
+///
+/// Idempotent — [`RootTracker::remove_contributor`] of an absent key is a no-op,
+/// so a caller may invoke it whether or not the key is currently mounted.
+/// Internal lifecycle only: `debug!`, never `warn!`/`error!`
+/// (`docs/src/tracing-conventions`). `trigger` names the firing edge
+/// (`"worktree removal"`, `"subagent stop"`) for the teardown log.
+#[cfg(unix)]
+async fn reap_worktree_root(
+    ctx: &HookDispatchContext,
+    tracker: &RootTracker,
+    session_id: &str,
+    contributor: &str,
+    worktree: &Path,
+    trigger: &str,
+) {
+    tracker.remove_contributor(contributor);
+    // Drop the in-memory deletion watch too (ticket 05) so it never outlives the
+    // root; idempotent vs the watch reaper and the GC.
+    if let Some(ref watcher) = ctx.worktree_watcher {
+        watcher.unregister(contributor);
+    }
+    let global = tracker.global_roots_rich();
+    if let Err(e) = ctx.primary.sync_roots(global).await {
+        debug!(
+            source = Source::DaemonDispatch.as_str(),
+            "root sync after {trigger} teardown failed: {e}",
+        );
+    }
+    debug!(
+        source = Source::DaemonDispatch.as_str(),
+        session_id = %session_id,
+        worktree = %worktree.display(),
+        contributor = %contributor,
+        "tore down worktree root at {trigger}",
+    );
+}
+
 /// Streams a grep outcome as a chunk-frame sequence (misc 140 phase 2).
 ///
 /// One [`GrepFrame::Chunk`] per rendered hunk in global sort order, then one
@@ -3044,29 +3112,16 @@ async fn handle_hook_dispatch(
         if let Some(ref tracker) = ctx.root_tracker
             && let Some(raw_path) = raw.get("worktree_path").and_then(|v| v.as_str())
         {
-            let raw_path = PathBuf::from(raw_path);
-            let canonical = raw_path.canonicalize().unwrap_or(raw_path);
-            let contributor = format!("worktree:{session_id}:{}", canonical.display());
-            tracker.remove_contributor(&contributor);
-            // Drop the in-memory deletion watch too (ticket 05) so it never
-            // outlives the root; idempotent vs the watch reaper and the GC.
-            if let Some(ref watcher) = ctx.worktree_watcher {
-                watcher.unregister(&contributor);
-            }
-            let global = tracker.global_roots_rich();
-            if let Err(e) = ctx.primary.sync_roots(global).await {
-                debug!(
-                    source = Source::DaemonDispatch.as_str(),
-                    "root sync after worktree-remove teardown failed: {e}",
-                );
-            }
-            debug!(
-                source = Source::DaemonDispatch.as_str(),
-                session_id = %session_id,
-                worktree = %canonical.display(),
-                contributor = %contributor,
-                "tore down worktree root at worktree removal",
-            );
+            let (canonical, contributor) = worktree_contributor(&session_id, Path::new(raw_path));
+            reap_worktree_root(
+                &ctx,
+                tracker,
+                &session_id,
+                &contributor,
+                &canonical,
+                "worktree removal",
+            )
+            .await;
         }
 
         emit_hook_event(
@@ -3948,6 +4003,47 @@ async fn handle_hook_dispatch(
         serde_json::from_value(raw.clone()).map_err(|e| anyhow!("Invalid hook request: {e}"))?;
 
     let result = router.dispatch(request);
+
+    // ── Subagent worktree teardown at stop (misc 150 leg 1) ──────────
+    //
+    // A Claude Code SubagentStop reaches the daemon as this same
+    // `post-agent/require-release`; its `host_payload.cwd` is the subagent's
+    // working dir — the worktree itself for an `isolation:"worktree"` subagent,
+    // the exact `SubagentStart` mount key. Reap that root now so the worktree's
+    // language servers shut down at agent completion, not at the parent's
+    // SessionEnd sweep (misc 150 — the RAM fix).
+    //
+    // A pure side effect (decision 029): invisible to the require-release
+    // response computed above. Self-scopes to exactly the worktree subagents —
+    // gated on a live `worktree:{session_id}:{cwd}` contributor, so a `Stop`
+    // event, a payload without `hook_event_name`, or a non-worktree subagent
+    // (cwd = the main checkout) touches nothing.
+    if method == "post-agent/require-release"
+        && let Some(ref tracker) = ctx.root_tracker
+        && let Some(hp) = raw.get("host_payload")
+        && hp.get("hook_event_name").and_then(|v| v.as_str()) == Some("SubagentStop")
+        && let Some(cwd) = hp.get("cwd").and_then(|v| v.as_str())
+    {
+        let (worktree, contributor) = worktree_contributor(&session_id, Path::new(cwd));
+        if tracker.has_contributor(&contributor) {
+            reap_worktree_root(
+                &ctx,
+                tracker,
+                &session_id,
+                &contributor,
+                &worktree,
+                "subagent stop",
+            )
+            .await;
+        } else {
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                session_id = %session_id,
+                cwd = cwd,
+                "subagent stop worktree teardown skipped (cwd is not a mounted worktree root)",
+            );
+        }
+    }
 
     // Edit tracking is a qualifying activity (ticket 02): a `PreToolUse` edit of
     // a file under an ephemeral root refreshes that root's idle clock, so an
@@ -8309,6 +8405,217 @@ mod tests {
         );
         assert_eq!(after.len(), 1, "only the project root remains: {after:?}");
         assert_eq!(after[0].0, project.display().to_string());
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subagent_stop_tears_down_mounted_worktree() {
+        // Leg 1 (misc 150): a SubagentStop reaches the daemon as
+        // `post-agent/require-release` with `host_payload.cwd` = the mounted
+        // worktree. The handler reaps that root as a side effect while still
+        // serving the require-release contract (allow — no editing debt).
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, worktree) = linked_worktree_layout(&base);
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "tool/roots-add",
+                "path": project.display().to_string(),
+            }),
+        )
+        .await;
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "subagent-start/mount-worktree",
+                "session_id": "sess-1",
+                "cwd": worktree.display().to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            roots_ls(&ipc_path)
+                .await
+                .iter()
+                .any(|(p, _)| Path::new(p) == worktree),
+            "precondition: worktree mounted",
+        );
+
+        // SubagentStop carried on the require-release `host_payload`. The dir
+        // still exists, so the reap key agrees with the mount key.
+        let resp = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "post-agent/require-release",
+                "session_id": "sess-1",
+                "agent_id": "sub-1",
+                "stop_hook_active": false,
+                "host_payload": {
+                    "hook_event_name": "SubagentStop",
+                    "cwd": worktree.display().to_string(),
+                },
+            }),
+        )
+        .await;
+        // Require-release contract intact: a subagent with no editing debt is
+        // allowed to stop — empty response, never a block. The teardown is a
+        // pure side effect (decision 029).
+        assert!(
+            resp.trim().is_empty(),
+            "require-release still allows the stop (teardown is invisible): {resp:?}",
+        );
+
+        let roots = roots_ls(&ipc_path).await;
+        assert!(
+            !roots.iter().any(|(p, _)| Path::new(p) == worktree),
+            "worktree torn down at SubagentStop: {roots:?}",
+        );
+        // The seeded project root (other contributor) is untouched.
+        assert!(
+            roots.iter().any(|(p, _)| Path::new(p) == project),
+            "the project root (hook contributor) survives teardown",
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subagent_stop_stop_event_leaves_worktree_mounted() {
+        // A `Stop` event (the parent agent finishing, not a subagent) shares the
+        // `post-agent/require-release` method but must NOT reap the worktree —
+        // only `hook_event_name == "SubagentStop"` triggers the teardown.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, worktree) = linked_worktree_layout(&base);
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "tool/roots-add",
+                "path": project.display().to_string(),
+            }),
+        )
+        .await;
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "subagent-start/mount-worktree",
+                "session_id": "sess-1",
+                "cwd": worktree.display().to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            roots_ls(&ipc_path)
+                .await
+                .iter()
+                .any(|(p, _)| Path::new(p) == worktree),
+            "precondition: worktree mounted",
+        );
+
+        // Same worktree cwd, but a `Stop` event — no teardown.
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "post-agent/require-release",
+                "session_id": "sess-1",
+                "agent_id": "",
+                "stop_hook_active": false,
+                "host_payload": {
+                    "hook_event_name": "Stop",
+                    "cwd": worktree.display().to_string(),
+                },
+            }),
+        )
+        .await;
+
+        assert!(
+            roots_ls(&ipc_path)
+                .await
+                .iter()
+                .any(|(p, _)| Path::new(p) == worktree),
+            "worktree still mounted after a Stop (non-SubagentStop) event",
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subagent_stop_leaves_non_worktree_root_mounted() {
+        // A SubagentStop whose `cwd` is a pinned (non-worktree) root — a
+        // non-isolated subagent running in the main checkout — matches no
+        // `worktree:{session}:{cwd}` contributor, so the reap is a no-op and the
+        // pinned root survives. Only the worktree contributor class is touched.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let pinned = base.join("pinned");
+        std::fs::create_dir(&pinned).expect("mkdir pinned");
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Pin the root under the `hook` contributor (never a `worktree:*` key).
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "tool/roots-add",
+                "path": pinned.display().to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            roots_ls(&ipc_path)
+                .await
+                .iter()
+                .any(|(p, _)| Path::new(p) == pinned),
+            "precondition: pinned root tracked",
+        );
+
+        // SubagentStop with the pinned root as cwd — a no-op for the reap.
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "post-agent/require-release",
+                "session_id": "sess-1",
+                "agent_id": "sub-1",
+                "stop_hook_active": false,
+                "host_payload": {
+                    "hook_event_name": "SubagentStop",
+                    "cwd": pinned.display().to_string(),
+                },
+            }),
+        )
+        .await;
+
+        let roots = roots_ls(&ipc_path).await;
+        assert!(
+            roots.iter().any(|(p, _)| Path::new(p) == pinned),
+            "pinned non-worktree root survives a SubagentStop: {roots:?}",
+        );
 
         shutdown.cancel();
     }

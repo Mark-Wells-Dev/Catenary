@@ -236,6 +236,20 @@ upgrading.
 
 ### Changed
 
+- **Subagent worktree roots unmount at SubagentStop, not session end.** When a
+  worktree-isolated subagent finishes, the daemon now reaps its
+  `worktree:{session}:{path}` root the moment the host's SubagentStop reaches
+  the `post-agent/require-release` handler (the payload's `cwd` is the
+  worktree — the exact SubagentStart mount key), shutting down that root's
+  language servers at agent completion instead of leaving a full server set
+  (rust-analyzer included) resident until the parent session ends. Invisible
+  to the stop-gate response; scoped to the worktree contributor class only —
+  a plain Stop event or a non-isolated subagent touches nothing. A resumed
+  subagent regains coverage on its first search or diagnostics run via the
+  ephemeral activity mounts. The worktree directory itself is never deleted —
+  disposal remains the host's (its documented automatic cleanup currently
+  skips hook-created worktrees entirely; see the known-issue trail in
+  anthropics/claude-code#34137).
 - **`catenary diagnostics` becomes idiomatic — the batch replaces the drain.**
   The tracked set is no longer destroyed at diagnose time. Edits accumulate
   into a persistent per-`(session, agent)` **batch** whose files each carry a
