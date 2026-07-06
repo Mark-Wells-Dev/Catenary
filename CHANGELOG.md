@@ -62,6 +62,12 @@ upgrading.
 
 ### Added
 
+- **`catenary query` joins the agent command surface.** The read-only
+  telemetry query command is now agent-invocable — pure observability, so it
+  classifies with `grep`/`glob`: it chains and pipes out freely and needs no
+  isolation. It reads no stdin, so piping *into* it is denied with a teaching
+  message instead of silently doing nothing. Previously agents got the
+  unknown-subcommand denial.
 - **Agent worktrees live outside the repo.** The Claude Code plugin now
   registers a `WorktreeCreate` hook (`catenary hook worktree-create`): a
   `--worktree` session's or `isolation:"worktree"` subagent's working copy is
@@ -70,9 +76,12 @@ upgrading.
   servers can never descend into it and double-index the project
   (rust-analyzer's gitignore-blind cargo discovery). The subagent's own
   server mounts the relocated worktree exactly as before (the SubagentStart
-  mount and the deletion watcher are location-agnostic), Claude Code's
-  automatic `git worktree remove` cleanup works unchanged, and the hook
-  prunes dead cache-dir entries on each spawn. The hook forwards its payload
+  mount and the deletion watcher are location-agnostic). Git tracks the
+  relocated worktree by metadata, so `git worktree remove` handles it
+  unchanged — but in live testing Claude Code never ran its documented
+  automatic cleanup for a hook-created worktree; the hook prunes dead
+  cache-dir entries on each spawn, and prompt in-daemon teardown at subagent
+  stop is tracked as follow-up work. The hook forwards its payload
   to the firehose (`catenary query --kind hook`) so the live schema is
   verifiable. Because a configured WorktreeCreate hook replaces the host's
   default behavior entirely, the hook **reimplements `.worktreeinclude`**
@@ -80,7 +89,9 @@ upgrading.
   into the new worktree, existing checked-out files never clobbered) — no
   host feature is lost. Non-git working copies get an honest named refusal
   (`.svn`/`.hg`/`.jj` detected and named; "configure your own WorktreeCreate
-  hook") instead of a raw git error. `-n`/`--line-number` and `-H`/`--with-filename` now parse and do
+  hook") instead of a raw git error.
+- **`grep` flag muscle-memory.** `-n`/`--line-number` and
+  `-H`/`--with-filename` now parse and do
   nothing — line numbers (`path:N`) and filenames are unconditional in the
   output, so the `grep`/ripgrep muscle-memory reach succeeds instead of
   erroring. `-c` joins as a hidden ripgrep-letter short for `--count`.

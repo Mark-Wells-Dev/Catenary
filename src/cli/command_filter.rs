@@ -615,6 +615,10 @@ enum CatenaryClass {
 enum Sub {
     Grep,
     Glob,
+    /// `catenary query` — read-only telemetry introspection (maintainer
+    /// ruling, misc 149: "pure observability"). Search-class: no handoff, no
+    /// tracked-set interaction, output is complete and client-owned.
+    Query,
     /// Retired: `catenary sed` came out in ws38 ticket 06 — native `sed -i` is
     /// a resolved, tracked write now. Still recognized so a stray invocation
     /// gets a retirement redirect, not a generic "unknown command".
@@ -636,7 +640,7 @@ impl Sub {
     /// Correlation class governing the canonical-form rules.
     const fn class(self) -> CatenaryClass {
         match self {
-            Self::Grep | Self::Glob => CatenaryClass::Search,
+            Self::Grep | Self::Glob | Self::Query => CatenaryClass::Search,
             Self::Sed | Self::Diagnostics | Self::EditingStop => CatenaryClass::Correlated,
             Self::EditingStart | Self::Roots | Self::Primer | Self::Commands => {
                 CatenaryClass::Lifecycle
@@ -649,6 +653,7 @@ impl Sub {
         match self {
             Self::Grep => "grep",
             Self::Glob => "glob",
+            Self::Query => "query",
             Self::Sed => "sed",
             Self::Diagnostics => "diagnostics",
             Self::EditingStart => "editing start",
@@ -691,6 +696,7 @@ fn recognize_catenary_sub(rest: &[&str]) -> Recog {
         (Some("roots"), Some("add" | "rm" | "ls")) => Recog::Agent(Sub::Roots),
         (Some("grep"), _) => Recog::Agent(Sub::Grep),
         (Some("glob"), _) => Recog::Agent(Sub::Glob),
+        (Some("query"), _) => Recog::Agent(Sub::Query),
         (Some("sed"), _) => Recog::Agent(Sub::Sed),
         (Some("diagnostics"), _) => Recog::Agent(Sub::Diagnostics),
         (Some("primer"), _) => Recog::Agent(Sub::Primer),
@@ -914,7 +920,7 @@ const fn occ_needs_isolation(occ: &CatenaryOcc) -> bool {
         ) => true,
         // search (grep/glob), the subcommand-less global read, and the
         // already-denied non-agent/unknown forms carry no handoff.
-        Recog::Agent(Sub::Grep | Sub::Glob)
+        Recog::Agent(Sub::Grep | Sub::Glob | Sub::Query)
         | Recog::GlobalRead
         | Recog::NotAgent
         | Recog::Unknown => false,
@@ -1062,7 +1068,7 @@ fn catenary_occ_denial(occ: &CatenaryOcc) -> Option<String> {
 }
 
 /// The recognized agent-facing command surface, for "unknown subcommand" denials.
-const CATENARY_SURFACE: &str = "Available: `grep`, `glob`, `diagnostics`, \
+const CATENARY_SURFACE: &str = "Available: `grep`, `glob`, `query`, `diagnostics`, \
      `editing start`, `roots add/rm/ls`, `commands`, `primer`, `version`. Run \
      `catenary primer` for the workflow.";
 
@@ -1098,6 +1104,11 @@ fn stdin_denial(sub: Sub) -> Option<String> {
     match sub {
         // Search reads stdin now — a downstream pipe is valid, not an error.
         Sub::Grep | Sub::Glob => None,
+        // Search-class but stdin-less: telemetry comes from the daemon, so a
+        // pipe INTO query is a no-op; its output still pipes freely.
+        Sub::Query => {
+            Some("`catenary query` takes no stdin — invoke it first in the pipeline.".to_string())
+        }
         Sub::Diagnostics => {
             Some("`catenary diagnostics` takes no input — run it bare.".to_string())
         }
@@ -4139,6 +4150,25 @@ mod tests {
                 "{cmd} should be an allow with foreign downstream",
             );
         }
+    }
+
+    #[test]
+    fn matcher_admits_query_as_search_class() {
+        // Misc 149 (maintainer ruling: "pure observability"): `catenary query`
+        // is Search-class — read-only telemetry with complete, client-owned
+        // output — so it admits bare, chains, and pipes out freely.
+        assert_eq!(recognize_catenary_sub(&["query"]), Recog::Agent(Sub::Query));
+        assert_eq!(
+            analyze_catenary_command("catenary query --kind hook --search worktree-create"),
+            CatenaryAction::Allow { has_foreign: false },
+        );
+        assert_eq!(
+            analyze_catenary_command("catenary query --kind hook | head"),
+            CatenaryAction::Allow { has_foreign: true },
+        );
+        // Unlike grep/glob, query reads no stdin — a pipe INTO it teaches
+        // instead of silently no-opping.
+        assert!(deny_text("cat log.jsonl | catenary query").contains("takes no stdin"));
     }
 
     #[test]
