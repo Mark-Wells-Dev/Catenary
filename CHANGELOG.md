@@ -622,6 +622,15 @@ upgrading.
 
 ### Fixed
 
+- **`catenary glob --exclude-pattern` now excludes pattern matches.** The
+  compiled exclude reached only named-directory walks, so files matched by a
+  glob pattern argument leaked past it — in both the listing and `--count`
+  (`'**/*' --include-hidden --exclude-pattern '**/.git/**'` returned the
+  `.git` contents anyway). Pattern matches, directory entries, `--count`,
+  and the LSP nudge now filter identically, and a pattern whose every match
+  is excluded reports the honest no-matches line instead of vanishing.
+  `catenary grep --exclude-pattern` was unaffected and is now pinned by a
+  regression guard.
 - **The stale-hooks notification names the real command.** The daemon-startup
   staleness check said `Run: catenary install` — a subcommand that only lists
   detected hosts. It now names the exact per-host command

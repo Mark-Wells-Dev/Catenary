@@ -35,9 +35,7 @@ use super::SourceLines;
 use super::filesystem_manager::{
     FilesystemManager, STAT_RETRY_ATTEMPTS, format_file_size, mtime_nanos,
 };
-use super::session::{
-    ResolvedGlob, expand_search_paths_cancellable, expand_search_paths_grouped_cancellable,
-};
+use super::session::{ArgResolution, ResolvedGlob, expand_search_paths_grouped_cancellable};
 use crate::lsp::{LspClientManager, WalkBreadth};
 use crate::symbol_index::{Symbol, SymbolIndex};
 
@@ -345,7 +343,7 @@ impl GlobServer {
         // cardinality header; the flat set drives the nudge, exactly as before.
         // The pattern expansion runs off the runtime thread so a massive pattern
         // base directory is cancellable mid-walk (misc 140 phase 2).
-        let groups = {
+        let mut groups = {
             let paths = paths.to_vec();
             let include_gitignored = input.include_gitignored;
             let include_hidden = input.include_hidden;
@@ -361,6 +359,17 @@ impl GlobServer {
             .await
             .map_err(|e| anyhow!("glob path expansion task failed: {e}"))?
         };
+
+        // Apply the compiled exclude to each glob pattern's matches so a pattern
+        // argument honors `--exclude-pattern` exactly as a named-directory
+        // argument does (bug 73). Filtering here — before the flat set feeds the
+        // scoped nudge and before the render loop — keeps the listing, the nudge,
+        // and the `--count` leg (which filters identically) in agreement, and
+        // leaves a pattern whose every match is excluded with an empty
+        // `resolved`, so it falls through to the honest `no matches for pattern`
+        // report below rather than vanishing.
+        apply_exclude_to_groups(&self.fs_manager, &mut groups, exclude);
+
         let resolved: Vec<PathBuf> = groups
             .iter()
             .flat_map(|g| g.resolved.iter().cloned())
@@ -826,8 +835,19 @@ impl GlobServer {
         exclude: Option<&ResolvedGlob>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<usize> {
-        let resolved =
-            expand_search_paths_cancellable(paths, include_gitignored, include_hidden, cancel);
+        // Resolve per-argument so the exclude filter distinguishes a glob
+        // pattern's matches (filtered) from a directly-named path (never filtered
+        // — a named directory's entries are filtered downstream). This mirrors
+        // the rendered listing exactly, so `--count` and the listing agree under
+        // an exclude (bug 73).
+        let mut groups = expand_search_paths_grouped_cancellable(
+            paths,
+            include_gitignored,
+            include_hidden,
+            cancel,
+        );
+        apply_exclude_to_groups(fs_manager, &mut groups, exclude);
+        let resolved: Vec<PathBuf> = groups.into_iter().flat_map(|g| g.resolved).collect();
         let mut total = 0usize;
         for path in &resolved {
             if cancel.is_cancelled() {
@@ -1113,6 +1133,62 @@ fn count_dir_children(
         }
     }
     (files, dirs)
+}
+
+// ─── Exclude filtering ────────────────────────────────────────────────
+
+/// Drops each glob **pattern's** matched paths that the compiled `exclude`
+/// selects, so a pattern argument honors `--exclude-pattern` exactly as a
+/// named-directory argument does (bug 73).
+///
+/// Only pattern groups ([`ArgResolution::is_pattern`]) are filtered: naming a
+/// file or directory is a direct request whose own path is never excluded — a
+/// named directory's *entries* are filtered downstream by the listing
+/// ([`GlobServer::collect_dir_entries`]) and count walks, so both argument kinds
+/// surface the same surviving set. A no-op when `exclude` is `None`.
+///
+/// Shared by [`GlobServer::handle_literal_paths`] (rendered listing) and
+/// [`GlobServer::count_paths`] (`--count`) so the two never diverge, and applied
+/// before the flat set feeds glob's scoped nudge so the nudge tracks only the
+/// files the query surfaces. A pattern whose every match is excluded is left
+/// with an empty `resolved`, so it renders the honest `no matches for pattern`
+/// report rather than vanishing.
+fn apply_exclude_to_groups(
+    fs_manager: &FilesystemManager,
+    groups: &mut [ArgResolution],
+    exclude: Option<&ResolvedGlob>,
+) {
+    let Some(rg) = exclude else {
+        return;
+    };
+    for group in groups.iter_mut().filter(|g| g.is_pattern) {
+        group
+            .resolved
+            .retain(|path| !path_matches_exclude(fs_manager, rg, path));
+    }
+}
+
+/// Whether `exclude` selects `path`, resolving the root a relative pattern
+/// strips.
+///
+/// An absolute exclude matches the full path (the root is ignored); a basename
+/// exclude (the `**/<name>` form the router expands a no-slash pattern into) is
+/// root-relative, so the path's owning workspace root is stripped first —
+/// falling back to the path's parent, then the path itself, when no root owns
+/// it. `**/<name>` is depth-independent, so any ancestor root yields the same
+/// verdict. This mirrors the entry-level filter
+/// [`GlobServer::collect_dir_entries`] and the grep walk apply, so a
+/// pattern-matched path is excluded on the same terms as a directory entry.
+fn path_matches_exclude(
+    fs_manager: &FilesystemManager,
+    exclude: &ResolvedGlob,
+    path: &Path,
+) -> bool {
+    let root = fs_manager
+        .resolve_root(path)
+        .or_else(|| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| path.to_path_buf());
+    exclude.is_match(path, &root)
 }
 
 // ─── Directory rendering ─────────────────────────────────────────────
@@ -1499,6 +1575,60 @@ mod tests {
             match_count_header(42, "src/**/*.rs"),
             "42 files match src/**/*.rs"
         );
+    }
+
+    // ─── exclude filtering (bug 73) ──────────────────────────────────
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn apply_exclude_to_groups_filters_patterns_not_named_args() {
+        // A glob pattern's matches are filtered by the exclude; a directly-named
+        // argument (is_pattern == false) is a direct request and stays, even when
+        // its own path matches the exclude — a named directory's entries are
+        // filtered downstream, not the argument itself (bug 73).
+        let fs = FilesystemManager::new();
+        let exclude = ResolvedGlob::new("**/*.rs").expect("compile exclude");
+
+        let mut groups = vec![
+            ArgResolution {
+                resolved: vec![
+                    PathBuf::from("/root/a.rs"),
+                    PathBuf::from("/root/keep.txt"),
+                    PathBuf::from("/root/sub/b.rs"),
+                ],
+                is_pattern: true,
+            },
+            ArgResolution {
+                resolved: vec![PathBuf::from("/root/named.rs")],
+                is_pattern: false,
+            },
+        ];
+
+        apply_exclude_to_groups(&fs, &mut groups, Some(&exclude));
+
+        // Pattern group: every `.rs` match dropped, the `.txt` survives.
+        assert_eq!(
+            groups[0].resolved,
+            vec![PathBuf::from("/root/keep.txt")],
+            "pattern matches honor the exclude"
+        );
+        // Named argument: untouched even though it matches the exclude.
+        assert_eq!(
+            groups[1].resolved,
+            vec![PathBuf::from("/root/named.rs")],
+            "a directly-named argument is never excluded"
+        );
+    }
+
+    #[test]
+    fn apply_exclude_to_groups_none_is_noop() {
+        let fs = FilesystemManager::new();
+        let mut groups = vec![ArgResolution {
+            resolved: vec![PathBuf::from("/root/a.rs")],
+            is_pattern: true,
+        }];
+        apply_exclude_to_groups(&fs, &mut groups, None);
+        assert_eq!(groups[0].resolved, vec![PathBuf::from("/root/a.rs")]);
     }
 
     #[test]

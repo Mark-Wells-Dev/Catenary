@@ -2430,3 +2430,191 @@ fn grep_atomic_rename_in_workflow_returns_match() -> Result<()> {
     }
     Ok(())
 }
+
+// ── exclude-pattern reaches glob-pattern matches (bug 73) ──────────
+
+/// The same exclude over the same tree yields the same surviving set whether
+/// reached by a glob **pattern** argument or a **named-directory** argument —
+/// a pattern argument now honors `--exclude-pattern` exactly as a named dir
+/// does (bug 73).
+#[test]
+fn glob_exclude_pattern_matches_named_dir_parity() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir(dir.path().join("src"))?;
+    std::fs::write(dir.path().join("src/a.rs"), "fn a() {}")?;
+    std::fs::write(dir.path().join("src/b.rs"), "fn b() {}")?;
+    std::fs::write(dir.path().join("src/keep.txt"), "keep")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    // Named-directory argument: the directory listing filters its entries.
+    let named = bridge.call_glob(&json!({
+        "paths": [dir.path().join("src").to_string_lossy().as_ref()],
+        "exclude": "*.rs",
+    }))?;
+
+    // Glob-pattern argument: the pattern's matches are filtered.
+    let pattern = bridge.call_glob(&json!({
+        "paths": ["src/*"],
+        "exclude": "*.rs",
+    }))?;
+
+    for out in [named.as_str(), pattern.as_str()] {
+        assert!(out.contains("keep.txt"), "keep.txt survives: {out}");
+        assert!(!out.contains("a.rs"), "a.rs excluded: {out}");
+        assert!(!out.contains("b.rs"), "b.rs excluded: {out}");
+    }
+    Ok(())
+}
+
+/// `--count` and the rendered listing agree under an exclude: a pattern's count
+/// reports the surviving cardinality, not the pre-exclude match total (bug 73).
+#[test]
+fn glob_exclude_pattern_count_matches_listing() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir(dir.path().join("src"))?;
+    std::fs::write(dir.path().join("src/a.rs"), "fn a() {}")?;
+    std::fs::write(dir.path().join("src/b.rs"), "fn b() {}")?;
+    std::fs::write(dir.path().join("src/keep.txt"), "keep")?;
+    std::fs::write(dir.path().join("src/notes.md"), "notes")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    // Listing: the two non-`.rs` files survive; the `.rs` matches drop.
+    let listing = bridge.call_glob(&json!({
+        "paths": ["src/*"],
+        "exclude": "*.rs",
+    }))?;
+    assert!(listing.contains("keep.txt"), "keep.txt survives: {listing}");
+    assert!(listing.contains("notes.md"), "notes.md survives: {listing}");
+    assert!(!listing.contains("a.rs"), "a.rs excluded: {listing}");
+    assert!(!listing.contains("b.rs"), "b.rs excluded: {listing}");
+
+    // `--count` reports the same surviving cardinality (2), not the 4 matches.
+    let raw = bridge.call_search_raw(
+        "tool/glob",
+        &json!({ "paths": ["src/*"], "exclude": "*.rs", "count": true }),
+    )?;
+    let paths = raw.get("paths").and_then(serde_json::Value::as_u64);
+    assert_eq!(paths, Some(2), "count agrees with the listing: {raw}");
+    Ok(())
+}
+
+/// The reporter's exact shape: `<root>/**/* --include-hidden --exclude-pattern
+/// '**/.git/**'` returns no `.git` file contents, while non-`.git` files still
+/// surface — the exclude is targeted, not absent (bug 73).
+#[test]
+fn glob_exclude_pattern_drops_git_contents() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(dir.path().join(".git/hooks"))?;
+    std::fs::write(dir.path().join(".git/COMMIT_EDITMSG"), "wip")?;
+    std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n")?;
+    std::fs::write(
+        dir.path().join(".git/hooks/pre-commit.sample"),
+        "#!/bin/sh\n",
+    )?;
+    std::fs::create_dir(dir.path().join("src"))?;
+    std::fs::write(dir.path().join("src/main.rs"), "fn main() {}")?;
+    std::fs::write(dir.path().join("README.md"), "# readme")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let pattern = format!("{}/**/*", dir.path().to_string_lossy());
+    let text = bridge.call_glob(&json!({
+        "paths": [pattern],
+        "include_hidden": true,
+        "exclude": "**/.git/**",
+    }))?;
+
+    assert!(
+        !text.contains(".git/COMMIT_EDITMSG"),
+        ".git contents excluded: {text}"
+    );
+    assert!(
+        !text.contains(".git/HEAD"),
+        ".git contents excluded: {text}"
+    );
+    assert!(
+        !text.contains("pre-commit.sample"),
+        ".git hook samples excluded: {text}"
+    );
+    // The exclude is targeted — non-`.git` files still surface.
+    assert!(text.contains("README.md"), "non-.git files survive: {text}");
+    assert!(text.contains("main.rs"), "non-.git files survive: {text}");
+    Ok(())
+}
+
+/// A pattern whose every match is excluded renders the honest no-match report
+/// (the daemon's `no_match_patterns`, echoing the original spelling) with empty
+/// output — it must not silently vanish (bug 73).
+#[test]
+fn glob_exclude_pattern_all_excluded_reports_no_match() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir(dir.path().join("src"))?;
+    std::fs::write(dir.path().join("src/a.rs"), "fn a() {}")?;
+    std::fs::write(dir.path().join("src/b.rs"), "fn b() {}")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    let raw = bridge.call_search_raw(
+        "tool/glob",
+        &json!({ "paths": ["src/*.rs"], "exclude": "*.rs" }),
+    )?;
+
+    let output = raw
+        .get("output")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    assert!(
+        output.trim().is_empty(),
+        "no surviving match renders nothing in output: {output:?}"
+    );
+    let no_match = raw
+        .get("no_match_patterns")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert!(
+        no_match.iter().any(|p| p == "src/*.rs"),
+        "the all-excluded pattern is reported as a no-match: {no_match:?}"
+    );
+    Ok(())
+}
+
+/// Guard: `grep --exclude-pattern` continues to drop matching files — the glob
+/// fix (bug 73) must not disturb grep's already-working exclude.
+#[test]
+fn grep_exclude_pattern_still_excludes() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("code.rs"), "let needle = 1;\n")?;
+    std::fs::write(dir.path().join("notes.txt"), "needle here\n")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    // Without an exclude both files match.
+    let all = bridge.call_grep(&json!({ "pattern": "needle" }))?;
+    assert!(all.contains("code.rs"), "code.rs matches: {all}");
+    assert!(all.contains("notes.txt"), "notes.txt matches: {all}");
+
+    // With `--exclude-pattern *.rs` the `.rs` file drops out.
+    let excluded = bridge.call_grep(&json!({ "pattern": "needle", "exclude": "*.rs" }))?;
+    assert!(
+        !excluded.contains("code.rs"),
+        "grep exclude drops code.rs: {excluded}"
+    );
+    assert!(
+        excluded.contains("notes.txt"),
+        "grep exclude keeps notes.txt: {excluded}"
+    );
+    Ok(())
+}
