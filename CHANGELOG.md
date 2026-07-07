@@ -264,6 +264,13 @@ upgrading.
 
 ### Changed
 
+- **Root detection is repo-shaped, not git-shaped.** The
+  enclosing-project-root probe — the anchor behind ephemeral automount,
+  out-of-scope diagnostics receipts, and out-of-root edit notes — now
+  recognizes `.svn`, `.hg`, and `.jj` markers alongside `.git` (dir or
+  file), so Subversion, Mercurial, and Jujutsu projects get automount and
+  ordinary `grep`/`glob`/`diagnostics` coverage. Ignore semantics remain
+  gitignore-based for now.
 - **Subagent worktree roots unmount at agent completion — identity-keyed,
   outcome-gated, idle-bounded.** When a worktree-isolated subagent truly
   stops (the stop gate *allows* — a blocked stop leaves the root warm for

@@ -303,24 +303,40 @@ pub fn canonical_project_root(r: &Path) -> PathBuf {
     )
 }
 
-/// Resolves a file path to the toplevel of its enclosing git worktree.
+/// Version-control root markers, in probe order.
 ///
-/// Walks the path's ancestors looking for a `.git` entry — a **directory**
-/// (normal checkout / main worktree) or a **file** (`gitdir:` pointer for a
-/// linked worktree). The first ancestor that has one is the worktree toplevel.
-/// Returns `None` if no ancestor carries a `.git` (the file is outside any
-/// checkout).
+/// A directory carrying any of these is a repository / working-copy toplevel:
+/// `.git` (Git — a **directory** for a normal checkout / main worktree, or a
+/// **file** carrying a `gitdir:` pointer for a linked worktree), `.svn`
+/// (Subversion), `.hg` (Mercurial), or `.jj` (Jujutsu). Detection is
+/// marker-presence only; git-worktree linkage resolution (see [`read_gitdir`]
+/// and [`canonical_project_root`]) stays git-specific.
+const REPO_MARKERS: [&str; 4] = [".git", ".svn", ".hg", ".jj"];
+
+/// Resolves a file path to the toplevel of its enclosing repository.
+///
+/// Walks the path's ancestors looking for a version-control root marker
+/// ([`REPO_MARKERS`]): `.git` — a **directory** (normal checkout / main
+/// worktree) or a **file** (`gitdir:` pointer for a linked worktree) — or a
+/// `.svn`/`.hg`/`.jj` directory. The first ancestor that carries any marker is
+/// the repository toplevel; where markers nest, the walk resolves to the
+/// *nearest* enclosing one. Returns `None` if no ancestor carries a marker (the
+/// file is outside any repository).
 ///
 /// This is the worktree-root analogue of [`canonical_project_root`]: the latter
-/// maps a worktree root to its *canonical project*; this maps a *file* to the
-/// worktree root that [`canonical_project_root`] then resolves. Used by the
-/// auto-mount path to find the worktree an edited file lives in. Parsing is pure
-/// [`std::fs`] — no git crate, no subprocess — and tolerates a non-existent
-/// `.git` (the ancestor simply doesn't match).
+/// maps a worktree root to its *canonical project* (git-worktree linkage only);
+/// this maps a *file* to the repository root that [`canonical_project_root`]
+/// then resolves. Used by the auto-mount path to find the repository an edited
+/// file lives in. Parsing is pure [`std::fs`] — no VCS crate, no subprocess —
+/// and tolerates a non-existent marker (the ancestor simply doesn't match).
 #[must_use]
 pub fn enclosing_worktree_root(file: &Path) -> Option<PathBuf> {
     file.ancestors()
-        .find(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok())
+        .find(|dir| {
+            REPO_MARKERS
+                .iter()
+                .any(|marker| std::fs::symlink_metadata(dir.join(marker)).is_ok())
+        })
         .map(Path::to_path_buf)
 }
 
@@ -529,6 +545,44 @@ mod tests {
         fs::write(&file, "").expect("write file");
 
         assert_eq!(enclosing_worktree_root(&file), Some(root));
+    }
+
+    #[test]
+    fn enclosing_worktree_root_finds_nongit_markers() {
+        // A project rooted by any non-git VCS marker is detected just like `.git`.
+        for marker in [".svn", ".hg", ".jj"] {
+            let dir = tempdir().expect("tempdir");
+            let root = canon(dir.path());
+            fs::create_dir(root.join(marker)).expect("mkdir marker");
+            let src = root.join("src");
+            fs::create_dir(&src).expect("mkdir src");
+            let file = src.join("lib.rs");
+            fs::write(&file, "").expect("write file");
+
+            assert_eq!(
+                enclosing_worktree_root(&file),
+                Some(root),
+                "marker {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn enclosing_worktree_root_picks_nearest_marker() {
+        // An inner `.hg` project nested inside an outer `.git` checkout: the walk
+        // stops at the nearest enclosing marker, not the outermost.
+        let dir = tempdir().expect("tempdir");
+        let outer = canon(dir.path());
+        fs::create_dir(outer.join(".git")).expect("mkdir outer .git");
+        let inner = outer.join("vendor").join("dep");
+        fs::create_dir_all(&inner).expect("mkdir inner");
+        fs::create_dir(inner.join(".hg")).expect("mkdir inner .hg");
+        let src = inner.join("src");
+        fs::create_dir(&src).expect("mkdir src");
+        let file = src.join("mod.rs");
+        fs::write(&file, "").expect("write file");
+
+        assert_eq!(enclosing_worktree_root(&file), Some(inner));
     }
 
     #[test]

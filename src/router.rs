@@ -1388,14 +1388,15 @@ impl FirstSightings {
 /// - the touched path is **not** already inside any tracked root (equal to or
 ///   under one — the "outside every mounted root" test, which also rejects a
 ///   path under a mounted sub-root), and
-/// - an enclosing project root is detectable by walking `.git` up from the path
+/// - an enclosing project root is detectable by walking repository markers
+///   (`.git`/`.svn`/`.hg`/`.jj`) up from the path
 ///   ([`crate::companions::enclosing_worktree_root`]), and
 /// - that root is not itself already tracked.
 ///
 /// `canonical_touched` should be canonicalized by the caller when the path
 /// exists so the comparison lines up with the tracker's canonical roots; a glob
 /// pattern or not-yet-existing path (which cannot canonicalize) still resolves
-/// its enclosing `.git` by lexical ancestor walk. Scope guard: only the single
+/// its enclosing repository root by lexical ancestor walk. Scope guard: only the single
 /// enclosing root is returned — never a sibling — and companion templating is
 /// never applied to it.
 #[cfg(unix)]

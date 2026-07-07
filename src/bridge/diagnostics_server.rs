@@ -1926,8 +1926,9 @@ fn format_diagnostics_entries(
 /// reasons, and the receipt must say which: the path does not exist (it will
 /// not canonicalize → [`OutOfScopeKind::Missing`]), or it exists but resolves
 /// outside every mounted root ([`OutOfScopeKind::OutsideRoots`]). For the
-/// latter, the enclosing project root is detected by walking `.git` up from the
-/// path (the general anchor, [`crate::companions::enclosing_worktree_root`]) so
+/// latter, the enclosing project root is detected by walking repository markers
+/// (`.git`/`.svn`/`.hg`/`.jj`) up from the path (the general anchor,
+/// [`crate::companions::enclosing_worktree_root`]) so
 /// the receipt can name what a `catenary roots add` would mount; a path with no
 /// enclosing project root carries `None`.
 fn classify_out_of_scope(resolved: &std::path::Path) -> OutOfScopeEntry {

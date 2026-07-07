@@ -500,8 +500,8 @@ impl HookRouter {
             // diagnostics` after only out-of-root edits lied with
             // `[no edited files]` (bug 58 / ephemeral-roots ticket 01).
             // `record_filtered_edit` creates the entry when needed and carries
-            // the enclosing project root (walk `.git` up) for the root-aware
-            // note. The entry holds no files, so it never trips the gate and is
+            // the enclosing project root (walk repository markers up) for the
+            // root-aware note. The entry holds no files, so it never trips the gate and is
             // cleared silently at stop if never diagnosed.
             let root = crate::companions::enclosing_worktree_root(path);
             self.session
