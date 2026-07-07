@@ -1294,6 +1294,10 @@ impl DiagnosticsServer {
             let diagnostics = {
                 let cached = client.get_diagnostics(uri);
                 if !cached.is_empty() {
+                    // Push is authoritative when present: a server that
+                    // publishes keeps its exact behavior, and pull is never
+                    // consulted, so a push+pull server reports one source per
+                    // file per run (no double-reporting).
                     cached
                 } else if client.supports_pull_diagnostics() {
                     match client.pull_diagnostics(uri).await {
@@ -1305,7 +1309,14 @@ impl DiagnosticsServer {
                         }
                     }
                 } else {
-                    Vec::new()
+                    // No push recorded and no advertised pull capability. Some
+                    // servers still answer `textDocument/diagnostic` on demand
+                    // without advertising it (lattice): ask directly rather than
+                    // report a false `[clean]` for a fast publisher whose first
+                    // publish the settle-then-collect pipeline cleared (bug 74).
+                    // Errors map to empty, so a genuinely push-only server is
+                    // unchanged.
+                    client.try_pull_diagnostics(uri).await
                 }
             };
 

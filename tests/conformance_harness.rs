@@ -434,25 +434,27 @@ fn conformance_bash_ls() -> Result<()> {
     sentinel("bash-ls")
 }
 
-// ── Fast push-only sentinels (ignored: cold-pull finding) ─────────────
+// ── Formerly-ignored cold-diagnose sentinels (bug 74, now fixed) ──────
 //
-// lattice and vscode-json publish their diagnostics once, right after
-// `didOpen`, then go idle. A *cold* Catenary daemon (never having opened the
-// file before) deterministically misses that first publish through the
-// settle-then-pull path — a warm daemon captures it fine — so as make-check
-// sentinels they would fail deterministically on an idle host. They remain full
-// conformance CASES (the CI matrix runs them via `conformance_selected_server`,
-// which is where this genuine cold-pull limitation should surface for review)
-// and stay runnable here via `make test-ignored`. See the tui-rework 07 report.
+// lattice and vscode-json each returned a deterministic `[clean]` on a cold
+// daemon. The tui-rework 07 report filed both under one "cold-pull" heading, but
+// they were two distinct gaps the conformance harness caught: lattice publishes
+// once on its workspace scan (which `clear_stale_diagnostics` wipes before the
+// batch reopens the unchanged file) and never advertises `diagnosticProvider`,
+// so the settle-then-collect pipeline never pulled it — even though it answers
+// `textDocument/diagnostic` on demand (fixed: best-effort pull on an empty push
+// cache); vscode-json is pull-only and *was* pulled, but Catenary's empty
+// `workspace/didChangeConfiguration {}` at init disabled its JSON validation, so
+// the pull returned an empty report (fixed: an empty settings push is no longer
+// sent, letting the server keep its defaults). Both now diagnose their fixture
+// on a cold daemon, so they are ordinary skip-if-missing sentinels again.
 
 #[test]
-#[ignore = "cold-pull finding: fast push-only diagnostic missed by a cold daemon (see report)"]
 fn conformance_lattice() -> Result<()> {
     sentinel("lattice")
 }
 
 #[test]
-#[ignore = "cold-pull finding: fast push-only diagnostic missed by a cold daemon (see report)"]
 fn conformance_vscode_json() -> Result<()> {
     sentinel("vscode-json")
 }

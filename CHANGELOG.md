@@ -741,6 +741,18 @@ upgrading.
 
 ### Fixed
 
+- **Two false-`[clean]` bugs the conformance harness caught in its first
+  week.** A server that answers `textDocument/diagnostic` pulls without
+  advertising the capability (lattice publishes once on workspace scan,
+  then a reopened unchanged document never re-publishes) now gets a
+  best-effort pull when its push cache is empty — one source per server
+  per run, deterministically: push cache, then advertised pull, then
+  best-effort, so a push server never double-reports. And Catenary no
+  longer sends an **empty** `workspace/didChangeConfiguration {}` at
+  initialize — vscode-json reads that as "configuration is now empty"
+  and silently disables JSON validation; a server with no configured
+  settings now keeps its own defaults. Both un-ignored conformance
+  sentinels are the regression tests.
 - **`catenary glob --exclude-pattern` now excludes pattern matches.** The
   compiled exclude reached only named-directory walks, so files matched by a
   glob pattern argument leaked past it — in both the listing and `--count`

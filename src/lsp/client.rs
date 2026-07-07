@@ -405,19 +405,25 @@ impl LspClient {
         // Send initialized notification
         self.notify("initialized", json!({})).await?;
 
-        // Push current settings. Pull-model servers will also send
-        // workspace/configuration requests, but the push is harmless
-        // and required by legacy servers that don't use the pull model.
-        let settings = self
-            .server
-            .settings()
-            .cloned()
-            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-        self.notify(
-            "workspace/didChangeConfiguration",
-            json!({"settings": settings}),
-        )
-        .await?;
+        // Push configured settings — but only when there are some. Pull-model
+        // servers request what they need via `workspace/configuration`; the
+        // push is for legacy servers that don't. An *empty* `{}` push, however,
+        // is not the no-op it looks like: some servers read it as "the entire
+        // configuration is now empty" and drop their built-in defaults —
+        // vscode-json disables JSON validation on an empty settings push, which
+        // silently suppressed every diagnostic it would otherwise report
+        // (bug 74). A server with no configured settings keeps its own
+        // defaults, which is exactly what "no configuration" should mean, so we
+        // send nothing rather than an empty object that clobbers them.
+        if let Some(settings) = self.server.settings()
+            && !settings.as_object().is_some_and(serde_json::Map::is_empty)
+        {
+            self.notify(
+                "workspace/didChangeConfiguration",
+                json!({ "settings": settings }),
+            )
+            .await?;
+        }
 
         // Mark as probing — server unproven until health probe or
         // first successful tool request transitions to Healthy.
@@ -855,6 +861,36 @@ impl LspClient {
             )
             .await?;
         Ok(super::extract::document_diagnostic_report(&result))
+    }
+
+    /// Best-effort `textDocument/diagnostic` pull that neither requires the
+    /// advertised `diagnosticProvider` capability nor downgrades on failure.
+    ///
+    /// Some servers answer the pull request even though they never advertise
+    /// the pull model — `lattice` publishes once on its workspace scan and then
+    /// serves `textDocument/diagnostic` on demand without a `diagnosticProvider`
+    /// capability. When the push cache is empty (the fast-publisher's first
+    /// publish was cleared before the batch reopened the file and it did not
+    /// re-publish an unchanged document — bug 74), asking the server directly is
+    /// the authoritative way to learn the truth. A server that does not
+    /// implement the request answers with an error, which maps to an empty
+    /// result — the same outcome as not pulling, so a genuinely push-only
+    /// server sees no change in reported diagnostics. Never called when the push
+    /// cache already holds diagnostics, so it can never double-report.
+    pub async fn try_pull_diagnostics(&self, uri: &str) -> Vec<Value> {
+        match self
+            .request(
+                "textDocument/diagnostic",
+                params::text_document_diagnostic(uri),
+            )
+            .await
+        {
+            Ok(result) => super::extract::document_diagnostic_report(&result),
+            Err(e) => {
+                debug!("best-effort pull returned no diagnostics: {e}");
+                Vec::new()
+            }
+        }
     }
 
     /// Pulls whole-workspace diagnostics via `workspace/diagnostic`.
