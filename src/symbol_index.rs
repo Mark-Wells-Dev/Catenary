@@ -341,7 +341,7 @@ impl SymbolIndex {
     /// per-file symbol map.
     ///
     /// Called when `root` leaves the tracked set (MCP disconnect,
-    /// `catenary roots rm`, `SubagentStop`) so an untracked path can no longer
+    /// `catenary unpin`, `SubagentStop`) so an untracked path can no longer
     /// serve a dead session's cached outline (bug #36), and so caches for gone
     /// roots do not accumulate across sessions (a leak). Aligns the
     /// `SymbolIndex` lifetime with the tracked-root set.

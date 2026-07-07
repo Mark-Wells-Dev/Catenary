@@ -68,7 +68,7 @@ opened for that request is closed.
 
 This is a deliberate design choice from the waitv2 rewrite. Stateless
 lifecycle eliminates migration concerns when routing changes mid-session
-— for example, when `catenary roots add` shifts which server handles a file, or
+— for example, when `catenary pin` shifts which server handles a file, or
 when a project-scoped server is spawned that shadows a workspace
 instance. There is no accumulated document state to reconcile when
 ownership changes.

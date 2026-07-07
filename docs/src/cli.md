@@ -205,7 +205,7 @@ exist, or that resolves **outside every mounted root**, is never dropped in
 silence. When the path has a detectable enclosing project root (walking
 `.git` up from it), Catenary **mounts that root ephemerally** and diagnoses
 the file from the freshly-attached server — the mount then expires after a
-few minutes of inactivity (or `catenary roots add` pins it). When no
+few minutes of inactivity (or `catenary pin` pins it). When no
 enclosing root is detectable, the receipt names the path on its own line and
 says why (`path does not exist`, or that it is outside every mounted root).
 
@@ -252,6 +252,29 @@ catenary query --server rust-analyzer --level warn --follow
 | `--follow` | Live-tail the selected files |
 | `--limit <n>` | Max rows (0 = unlimited; default 100) |
 | `--format <fmt>` | Output format: `table` (default) or `json` |
+
+### `catenary pin` / `catenary unpin` / `catenary roots`
+
+Manage workspace-root **lifetime**. Coverage is automatic — Catenary mounts and
+serves the workspace for you — so these change only how long a root lives, not
+whether it is served.
+
+```bash
+catenary pin /path/to/project     # stop idle expiry, pre-warm servers, upgrade an ephemeral mount
+catenary unpin /path/to/project   # drop the pin added by `catenary pin`
+catenary roots                    # list the current roots with their contributor classes
+```
+
+`catenary pin` adds the pin contributor and pre-warms the root's language
+servers; on an activity-mounted (ephemeral) root it upgrades the mount to pinned
+so it stops expiring. `catenary unpin` removes **only** the pin contributor,
+matching the stored/normalized path — so it works even after the directory has
+been deleted, and repeating it is a harmless no-op. The worktree, ephemeral, and
+`mcp:` contributor classes own their own lifecycles and are untouched. Bare
+`catenary roots` lists the current roots (`catenary roots ls` is a kept alias).
+
+The old `catenary roots add` / `catenary roots rm` spellings are retired: use
+`catenary pin` / `catenary unpin`.
 
 ### `catenary doctor`
 

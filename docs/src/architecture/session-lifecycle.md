@@ -151,7 +151,7 @@ commands, and canonical Catenary commands) are allowed without running
 
 ## Mid-session root addition
 
-When a workspace root is added (`catenary roots add <path>` via the
+When a workspace root is added (`catenary pin <path>` via the
 host's shell tool, or via MCP `roots/list` update), Catenary processes
 it through `Session::sync_roots`:
 

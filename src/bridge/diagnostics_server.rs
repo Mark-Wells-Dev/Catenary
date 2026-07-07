@@ -152,8 +152,8 @@ enum OutOfScopeKind {
     /// The named path does not exist on disk (it could not be canonicalized).
     Missing,
     /// The named path exists but resolves outside every mounted root. Carries
-    /// the enclosing project root when one is detectable (walk `.git` up from
-    /// the path) — what a `catenary roots add` would mount — or `None` when no
+    /// the enclosing project root when one is detectable (walk repository markers up from
+    /// the path) — what a `catenary pin` would mount — or `None` when no
     /// enclosing project root is found.
     OutsideRoots { enclosing_root: Option<PathBuf> },
 }
@@ -1929,7 +1929,7 @@ fn format_diagnostics_entries(
 /// latter, the enclosing project root is detected by walking repository markers
 /// (`.git`/`.svn`/`.hg`/`.jj`) up from the path (the general anchor,
 /// [`crate::companions::enclosing_worktree_root`]) so
-/// the receipt can name what a `catenary roots add` would mount; a path with no
+/// the receipt can name what a `catenary pin` would mount; a path with no
 /// enclosing project root carries `None`.
 fn classify_out_of_scope(resolved: &std::path::Path) -> OutOfScopeEntry {
     resolved.canonicalize().map_or_else(

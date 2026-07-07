@@ -1099,7 +1099,7 @@ impl FilesystemManager {
     /// permanently: the next walk diffs against the already-advanced shared
     /// baseline and emits nothing (even across a respawn — the baseline is torn
     /// down only by [`remove_root_baseline`](Self::remove_root_baseline) on
-    /// `roots rm`). Reverting the affected entries makes the next walk re-emit them
+    /// `catenary unpin`). Reverting the affected entries makes the next walk re-emit them
     /// to **all** covering servers; a duplicate `didChangeWatchedFiles` to a server
     /// that already received the change is harmless/idempotent. Delivery is
     /// **best-effort**, and because the baseline is shared a revert may re-notify a

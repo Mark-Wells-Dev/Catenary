@@ -58,11 +58,15 @@ The edit→diagnostics loop
   pulled: you see them only when you run it — each run re-diagnoses the set.
 
 Bare-only vs pipe-friendly
-  `catenary diagnostics` and `catenary roots …` are bare-only: run each as the
-  sole command — no pipe, no `&&`/`;`, no redirect — then read its output.
-  `catenary grep` and `catenary glob` are pipe-friendly: they compose freely
-  (`| head`, `| grep`) and their output is always complete, so a pipe never
-  drops results (use `--count` for a bare tally).
+  `catenary diagnostics` is bare-only: run it as the sole command — no pipe, no
+  `&&`/`;`, no redirect — then read its output. `catenary grep` and
+  `catenary glob` are pipe-friendly: they compose freely (`| head`, `| grep`)
+  and their output is always complete, so a pipe never drops results (use
+  `--count` for a bare tally).
+
+Work in isolated subagents
+  Coverage is automatic — you never manage roots. Two agents in one workspace
+  step on each other and, sharing its language server, break settle detection.
 
 Navigate through Catenary
   Search contents with `catenary grep`, find files with `catenary glob`. Quote
@@ -520,6 +524,35 @@ mod tests {
     }
 
     #[test]
+    fn primer_omits_root_management_but_mentions_isolated_subagents() {
+        // misc 146: coverage is automatic, so the primer must not teach agents
+        // to manage roots — `pin`/`unpin`/`roots` live in `catenary -h` only.
+        // In their place the primer carries one informative mention: work in
+        // isolated subagents (the shared-language-server settle-detection gotcha),
+        // stated as a capability fact, not an instruction to manage roots.
+        let body = render(Some(&fixture_surface()), &["make".to_string()]);
+        for instruction in ["catenary pin", "catenary unpin", "catenary roots"] {
+            assert!(
+                !body.contains(instruction),
+                "primer teaches root management ({instruction:?}): {body}"
+            );
+        }
+        assert!(
+            body.contains("isolated subagents"),
+            "primer missing the isolated-subagents mention: {body}"
+        );
+        assert!(
+            body.contains("settle detection"),
+            "primer missing the settle-detection gotcha: {body}"
+        );
+        // Stated as capability, not an imperative to add/pin roots.
+        assert!(
+            body.contains("never manage roots"),
+            "primer must frame coverage as automatic, not a root-management chore: {body}"
+        );
+    }
+
+    #[test]
     fn allow_surface_reflects_the_live_config() {
         // The configured command name appears — the surface is projected from
         // the resolved config, not a hardcoded list.
@@ -955,16 +988,17 @@ mod tests {
     #[test]
     fn payload_stays_in_the_token_band() {
         // Size guard: the ticket targets ~600–800 tokens. Using a ~4 chars/token
-        // proxy that band is ~2400–3200 chars; we allow a slightly wider
-        // 2400..3300 window so ordinary wording tweaks and the small config-driven
-        // Tier 1 don't trip it, while a tier being dropped or doubled still does.
-        // Rendered against a minimal active fixture surface — a large real
-        // allowlist grows Tier 1 further, which is expected and unbounded here.
+        // proxy that band is ~2400–3200 chars; we allow a wider 2400..3500 window
+        // so ordinary wording tweaks, the small config-driven Tier 1, and the
+        // brief isolated-subagents mention (misc 146) don't trip it, while a tier
+        // being dropped or doubled (a ~1000-char swing) still does. Rendered
+        // against a minimal active fixture surface — a large real allowlist grows
+        // Tier 1 further, which is expected and unbounded here.
         let chars = render(Some(&fixture_surface()), &["make".to_string()])
             .chars()
             .count();
         assert!(
-            (2400..=3300).contains(&chars),
+            (2400..=3500).contains(&chars),
             "teaching payload is {chars} chars (~{} tokens); expected the ~600–800 token band",
             chars / 4
         );

@@ -83,6 +83,50 @@ pub async fn run_ls_roots(out: &mut Output) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a `pin`/`unpin` path to the form matched against the daemon's
+/// tracked set.
+///
+/// `catenary pin` / `catenary unpin` match the stored/normalized path.
+/// Canonicalize when the directory exists (so a symlinked spelling resolves to
+/// the tracked form the daemon stored at pin time); when it does not — an
+/// `unpin` after the directory was removed (bug 54 gap 1) — fall back to the
+/// lexically-absolutized spelling rather than hard-erroring, so a deleted-dir
+/// pin is still removable. Never fails: a `pin` targets a real directory
+/// (canonicalization succeeds), while an `unpin` must tolerate a vanished one.
+#[must_use]
+pub fn resolve_root_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.canonicalize()
+        .unwrap_or_else(|_| std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()))
+}
+
+/// Interpret the daemon's response to a `roots-add` (pin) / `roots-rm` (unpin)
+/// request for the pin/unpin CLI surface.
+///
+/// `Ok(line)` is printed to stdout; `Err(msg)` bails the command. A `not_found`
+/// on unpin is a benign, idempotent no-op — the pin contributor was already
+/// absent (a repeat `unpin`, or a path that was never pinned) — so it is
+/// reported as success rather than an error. `is_pin` selects the verb; only
+/// unpin can see `not_found` (a pin targets a live directory).
+///
+/// # Errors
+///
+/// Returns `Err(message)` when the daemon reports a failure (any status other
+/// than `ok`/`not_found`), carrying the daemon's message when present.
+pub fn render_root_outcome(
+    status: &str,
+    is_pin: bool,
+    path: &str,
+    daemon_msg: Option<&str>,
+) -> Result<String, String> {
+    match status {
+        "ok" if is_pin => Ok(format!("pinned root: {path}")),
+        "ok" => Ok(format!("unpinned root: {path}")),
+        // Idempotent unpin: the pin contributor was already gone. Not an error.
+        "not_found" => Ok(format!("not pinned (nothing to unpin): {path}")),
+        _ => Err(daemon_msg.unwrap_or("unexpected response").to_string()),
+    }
+}
+
 /// The writes half of the write-model line closing the active-allowlist
 /// `catenary commands` output (ws38 / decision 026). The lists above govern
 /// which programs may *run*; this states how their *writes* are judged —
@@ -517,6 +561,67 @@ fn clip(s: &str, max: usize) -> String {
 )]
 mod tests {
     use super::*;
+
+    // ── pin / unpin path + outcome (misc 146, bug 54) ────────────────
+
+    #[test]
+    fn resolve_root_path_canonicalizes_an_existing_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            resolve_root_path(dir.path()),
+            dir.path()
+                .canonicalize()
+                .expect("canonicalize existing dir"),
+        );
+    }
+
+    #[test]
+    fn resolve_root_path_falls_back_for_a_missing_dir() {
+        // bug 54 gap 1: `unpin` after the directory is gone must still resolve a
+        // matchable path — never hard-error on a failed canonicalize. The
+        // fallback is the lexically-absolutized spelling, which matches the
+        // canonical form the daemon stored at pin time (no symlink components).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gone = dir.path().join("removed-worktree"); // never created on disk
+        assert_eq!(
+            resolve_root_path(&gone),
+            std::path::absolute(&gone).expect("absolutize"),
+        );
+    }
+
+    #[test]
+    fn pin_and_unpin_report_their_verbs() {
+        assert!(
+            render_root_outcome("ok", true, "/p", None)
+                .expect("pin ok")
+                .starts_with("pinned"),
+        );
+        assert!(
+            render_root_outcome("ok", false, "/p", None)
+                .expect("unpin ok")
+                .starts_with("unpinned"),
+        );
+    }
+
+    #[test]
+    fn unpin_of_an_absent_pin_is_idempotent_success() {
+        // A repeat `unpin` (pin already dropped) or an unpin of a never-pinned
+        // path succeeds — never errors, so the command is idempotent.
+        let outcome = render_root_outcome("not_found", false, "/gone", None);
+        let line = outcome.expect("not_found is a benign success for unpin");
+        assert!(line.contains("/gone"), "{line}");
+    }
+
+    #[test]
+    fn root_outcome_bails_on_daemon_error() {
+        let err =
+            render_root_outcome("error", true, "/p", Some("boom")).expect_err("error status bails");
+        assert_eq!(err, "boom");
+        // Missing message falls back to a generic reason.
+        let err =
+            render_root_outcome("weird", false, "/p", None).expect_err("unknown status bails");
+        assert_eq!(err, "unexpected response");
+    }
 
     // ── render_command_lines tests ───────────────────────────────────
 

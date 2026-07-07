@@ -5,7 +5,7 @@ Catenary loads configuration from multiple sources, in order of priority
 
 1. **Built-in defaults**: Server definitions (`defaults/servers.toml`) and language classification with server bindings (`defaults/languages.toml`). Common language servers work without any config — if the binary is on PATH, Catenary uses it.
 2. **User config**: `~/.config/catenary/config.toml`.
-3. **Project config**: `.catenary.toml` in each workspace root. Discovered when roots are added (at startup or via `catenary roots add`). Scoped to `[lsp]` (the `disable` toggle plus `[lsp.server.*]` / `[lsp.language.*]` definitions), `[linter]` (`disable` plus `[linter.rule.*]`), `[diagnostics]` (`disable`), and `[commands]` `build` only — every other `[commands]` key and all other sections are user-level (see [Project-scoped commands](#project-scoped-commands)).
+3. **Project config**: `.catenary.toml` in each workspace root. Discovered when roots are added (at startup or via `catenary pin`). Scoped to `[lsp]` (the `disable` toggle plus `[lsp.server.*]` / `[lsp.language.*]` definitions), `[linter]` (`disable` plus `[linter.rule.*]`), `[diagnostics]` (`disable`), and `[commands]` `build` only — every other `[commands]` key and all other sections are user-level (see [Project-scoped commands](#project-scoped-commands)).
 4. **Explicit file**: `--config <path>`.
 5. **Environment variables**: Prefixed with `CATENARY_` (e.g., `CATENARY_LOG_RETENTION_DAYS=30`). Use `__` for nested keys (e.g., `CATENARY_ICONS__PRESET=nerd`).
 
@@ -350,7 +350,7 @@ build tool only — command **enforcement** is user-level; see
 `~/.config/catenary/config.toml`.
 
 Project config is discovered when roots are added (at startup or via
-`catenary roots add`). Changes to `.catenary.toml` require restarting
+`catenary pin`). Changes to `.catenary.toml` require restarting
 the session.
 
 ### Disabling feeders per root
@@ -372,7 +372,7 @@ disable = true   # diagnostics surface off, navigation kept
 
 - **`[lsp] disable`** — drops the LSP feeder: no language servers spawn for
   this root, so there is no grep/glob enrichment and no LSP diagnostics.
-  The root stays tracked everywhere else (`catenary roots ls`, the build
+  The root stays tracked everywhere else (`catenary roots`, the build
   tool, command resolution, the editing gate). Useful for media
   collections, data directories, or any root where a language server is
   pure overhead. (Polarity flip of the old `lsp = false`.)
@@ -773,7 +773,7 @@ a commented-out `[commands]` section.
 The `[roots.companions]` table auto-mounts a **derived sibling root** alongside
 each workspace root a host declares — so opening `~/Projects/Catenary` (the code)
 also mounts `~/Projects/CatenaryInternal` (the planning repo) for LSP
-intelligence, with no manual `catenary roots add` each session.
+intelligence, with no manual `catenary pin` each session.
 
 **Off by default.** Catenary ships no table and assumes no naming convention; an
 absent `[roots.companions]` disables the feature entirely.

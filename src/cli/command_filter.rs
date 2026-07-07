@@ -646,7 +646,18 @@ enum Sub {
     /// recognized so a stray invocation gets a redirect, not a generic
     /// "unknown command".
     EditingStop,
+    /// Bare `catenary roots` (and the kept `roots ls` alias) — lists the
+    /// current roots. Bare-only lifecycle.
     Roots,
+    /// Retired: `catenary roots add`/`roots rm` were renamed to the top-level
+    /// `catenary pin`/`catenary unpin` (misc 146). Still recognized so a stray
+    /// invocation gets a redirect naming the new spelling, not a generic
+    /// "unknown command".
+    RootsAddRm,
+    /// `catenary pin <path>` — pin a workspace root. Bare-only lifecycle.
+    Pin,
+    /// `catenary unpin <path>` — unpin a workspace root. Bare-only lifecycle.
+    Unpin,
     Primer,
     /// `catenary commands` — prints the allowed-command surface.
     Commands,
@@ -668,6 +679,9 @@ impl Sub {
             Self::Sed | Self::Diagnostics | Self::EditingStop => CatenaryClass::Correlated,
             Self::EditingStart
             | Self::Roots
+            | Self::RootsAddRm
+            | Self::Pin
+            | Self::Unpin
             | Self::Primer
             | Self::Commands
             | Self::WorktreeAddRm => CatenaryClass::Lifecycle,
@@ -685,6 +699,9 @@ impl Sub {
             Self::EditingStart => "editing start",
             Self::EditingStop => "editing stop",
             Self::Roots => "roots",
+            Self::RootsAddRm => "roots add/rm",
+            Self::Pin => "pin",
+            Self::Unpin => "unpin",
             Self::Primer => "primer",
             Self::Commands => "commands",
             Self::WorktreeLs => "worktree ls",
@@ -721,7 +738,13 @@ fn recognize_catenary_sub(rest: &[&str]) -> Recog {
     match (rest.first().copied(), rest.get(1).copied()) {
         (Some("editing"), Some("start")) => Recog::Agent(Sub::EditingStart),
         (Some("editing"), Some("stop")) => Recog::Agent(Sub::EditingStop),
-        (Some("roots"), Some("add" | "rm" | "ls")) => Recog::Agent(Sub::Roots),
+        // `roots add`/`roots rm` retired to `catenary pin`/`catenary unpin` (misc
+        // 146): recognized before the bare-word arm so they get a rename redirect.
+        // Bare `catenary roots` (and the kept `roots ls` alias) lists the roots.
+        (Some("roots"), Some("add" | "rm")) => Recog::Agent(Sub::RootsAddRm),
+        (Some("roots"), _) => Recog::Agent(Sub::Roots),
+        (Some("pin"), _) => Recog::Agent(Sub::Pin),
+        (Some("unpin"), _) => Recog::Agent(Sub::Unpin),
         // `worktree ls` is Search-class (pipe-friendly registry view); `worktree
         // add`/`rm` are bare-only lifecycle verbs (misc 151). Split before the
         // bare-word arms so the two-word forms are matched exactly.
@@ -884,6 +907,18 @@ pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
         return CatenaryAction::Deny(sed_retired_denial());
     }
 
+    // `catenary roots add`/`roots rm` are retired — renamed to the top-level
+    // `catenary pin`/`catenary unpin` (misc 146). Catch in any form, before the
+    // output-ownership and bare-only denials, so the agent learns the new
+    // spelling rather than a generic complaint.
+    if scan
+        .occs
+        .iter()
+        .any(|o| matches!(o.recog, Recog::Agent(Sub::RootsAddRm)))
+    {
+        return CatenaryAction::Deny(roots_add_rm_retired_denial());
+    }
+
     // First occurrence with a per-command problem wins (document order).
     for occ in &scan.occs {
         if let Some(msg) = catenary_occ_denial(occ) {
@@ -948,6 +983,9 @@ const fn occ_needs_isolation(occ: &CatenaryOcc) -> bool {
             | Sub::EditingStop
             | Sub::Sed
             | Sub::Roots
+            | Sub::RootsAddRm
+            | Sub::Pin
+            | Sub::Unpin
             | Sub::Primer
             | Sub::Commands
             | Sub::WorktreeAddRm,
@@ -1103,7 +1141,7 @@ fn catenary_occ_denial(occ: &CatenaryOcc) -> Option<String> {
 
 /// The recognized agent-facing command surface, for "unknown subcommand" denials.
 const CATENARY_SURFACE: &str = "Available: `grep`, `glob`, `query`, `diagnostics`, \
-     `editing start`, `roots add/rm/ls`, `worktree ls/add/rm`, `commands`, \
+     `editing start`, `pin`, `unpin`, `roots`, `worktree ls/add/rm`, `commands`, \
      `primer`, `version`. Run `catenary primer` for the workflow.";
 
 fn unknown_subcommand_denial() -> String {
@@ -1154,6 +1192,9 @@ fn stdin_denial(sub: Sub) -> Option<String> {
         | Sub::EditingStart
         | Sub::EditingStop
         | Sub::Roots
+        | Sub::RootsAddRm
+        | Sub::Pin
+        | Sub::Unpin
         | Sub::Primer
         | Sub::Commands
         | Sub::WorktreeAddRm => Some(format!(
@@ -1258,6 +1299,17 @@ fn sed_retired_denial() -> String {
     "`catenary sed` is retired — native `sed -i 's/a/b/' <files>` is tracked \
      (write-resolution). Preview with plain `sed 's/a/b/' <file>` to stdout and \
      review with `git diff`."
+        .to_string()
+}
+
+/// Teaching redirect for the retired `catenary roots add`/`roots rm` — renamed
+/// to the top-level `catenary pin`/`catenary unpin` (misc 146). Coverage is
+/// automatic, so root management is not the agent's job; the redirect names the
+/// new spelling rather than a generic "unknown command".
+fn roots_add_rm_retired_denial() -> String {
+    "`catenary roots add`/`roots rm` are retired — use `catenary pin <path>` to \
+     pin a workspace root and `catenary unpin <path>` to unpin one. Bare \
+     `catenary roots` lists the current roots."
         .to_string()
 }
 
@@ -4005,8 +4057,10 @@ mod tests {
     #[test]
     fn matcher_accepts_bare_correlated_and_lifecycle() {
         for cmd in [
-            "catenary roots add /tmp/p",
+            "catenary roots",
             "catenary roots ls",
+            "catenary pin /tmp/p",
+            "catenary unpin /tmp/p",
             "catenary primer",
             "catenary commands",
         ] {
@@ -4016,6 +4070,67 @@ mod tests {
                 "{cmd} should be a bare allow",
             );
         }
+    }
+
+    #[test]
+    fn pin_unpin_and_bare_roots_recognized_as_lifecycle() {
+        // misc 146: `pin`/`unpin` join the bare-only lifecycle class (like
+        // `roots`), and bare `catenary roots` (plus the `ls` alias) lists.
+        assert_eq!(
+            recognize_catenary_sub(&["pin", "/p"]),
+            Recog::Agent(Sub::Pin)
+        );
+        assert_eq!(
+            recognize_catenary_sub(&["unpin", "/p"]),
+            Recog::Agent(Sub::Unpin),
+        );
+        assert_eq!(recognize_catenary_sub(&["roots"]), Recog::Agent(Sub::Roots));
+        assert_eq!(
+            recognize_catenary_sub(&["roots", "ls"]),
+            Recog::Agent(Sub::Roots),
+        );
+        for sub in [Sub::Pin, Sub::Unpin, Sub::Roots] {
+            assert_eq!(sub.class(), CatenaryClass::Lifecycle);
+        }
+    }
+
+    #[test]
+    fn roots_add_rm_retired_to_pin_unpin() {
+        // The old `roots add`/`roots rm` spellings retire with a rename redirect
+        // in every form — never routed, never a generic "unknown command".
+        for cmd in [
+            "catenary roots add /tmp/p",
+            "catenary roots rm /tmp/p",
+            "/usr/local/bin/catenary roots add /tmp/p",
+            "catenary roots rm /tmp/p | head",
+            "cd src && catenary roots add /tmp/p",
+        ] {
+            let msg = deny_text(cmd);
+            assert!(
+                msg.contains("catenary pin") && msg.contains("catenary unpin"),
+                "{cmd} should redirect to pin/unpin, got: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn pin_unpin_are_bare_only_lifecycle() {
+        // Chained or piped-out → bare-only violation (they take the daemon
+        // handoff, like `roots`).
+        assert!(
+            matches!(
+                analyze_catenary_command("cd /repo && catenary pin ."),
+                CatenaryAction::Deny(_),
+            ),
+            "pin must be the sole command",
+        );
+        assert!(
+            matches!(
+                analyze_catenary_command("catenary unpin /p | tee log"),
+                CatenaryAction::Deny(_),
+            ),
+            "unpin must not pipe out",
+        );
     }
 
     #[test]
@@ -4347,7 +4462,7 @@ mod tests {
             "piped-in diagnostics must still deny",
         );
         assert!(
-            deny_text("echo x | catenary roots add /tmp/p").contains("stdin"),
+            deny_text("echo x | catenary pin /tmp/p").contains("stdin"),
             "piped-in lifecycle command must still deny on stdin",
         );
     }

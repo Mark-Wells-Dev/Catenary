@@ -204,10 +204,33 @@ enum Command {
         command: EditingCommand,
     },
 
-    /// Workspace root management (add, rm, ls).
+    /// Pin a workspace root: stop idle expiry, pre-warm its language servers,
+    /// and upgrade an ephemeral mount to pinned.
+    ///
+    /// Coverage is automatic — pinning changes a root's *lifetime*, not whether
+    /// it is served. Matches the stored/normalized path.
+    Pin {
+        /// Path to pin as a workspace root.
+        path: PathBuf,
+    },
+
+    /// Unpin a workspace root: drop the pin contributor added by `catenary pin`.
+    ///
+    /// Matches the stored/normalized path, so it works even after the directory
+    /// is removed, and is idempotent. Touches only the pin contributor — the
+    /// worktree, ephemeral, and mcp classes own their own lifecycles.
+    Unpin {
+        /// Path to unpin.
+        path: PathBuf,
+    },
+
+    /// List the current workspace roots with their contributor classes.
+    ///
+    /// Bare `catenary roots` lists the roots. The old `roots add`/`roots rm`
+    /// spellings are retired — use `catenary pin` / `catenary unpin`.
     Roots {
         #[command(subcommand)]
-        command: RootsCommand,
+        command: Option<RootsCommand>,
     },
 
     /// Manage Catenary worktrees (ls, add, rm).
@@ -377,20 +400,24 @@ enum EditingCommand {
     Start,
 }
 
-/// Workspace root management subcommands.
+/// Workspace root subcommands.
+///
+/// Bare `catenary roots` lists the roots; `ls` is a kept alias. The mutating
+/// verbs moved to the top-level `catenary pin` / `catenary unpin` (misc 146) —
+/// `add`/`rm` remain only to teach the rename.
 #[derive(Subcommand, Debug)]
 enum RootsCommand {
-    /// Add a workspace root.
+    /// Retired: use `catenary pin <path>`.
     Add {
-        /// Path to add as a workspace root.
+        /// Path (retired — use `catenary pin`).
         path: PathBuf,
     },
-    /// Remove a workspace root.
+    /// Retired: use `catenary unpin <path>`.
     Rm {
-        /// Path to remove from workspace roots.
+        /// Path (retired — use `catenary unpin`).
         path: PathBuf,
     },
-    /// List all tracked workspace roots with their source.
+    /// List all tracked workspace roots (alias for bare `catenary roots`).
     Ls,
 }
 
@@ -547,6 +574,8 @@ fn main() -> Result<()> {
                 "glob",
                 "diagnostics",
                 "editing",
+                "pin",
+                "unpin",
                 "roots",
                 "worktree",
             ]
@@ -702,18 +731,38 @@ fn main() -> Result<()> {
         #[cfg(not(unix))]
         Some(Command::Editing { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
+        Some(Command::Pin { path }) => {
+            let mut out = cli::Output::stdout(false);
+            build_runtime()?.block_on(run_root_command(&mut out, path, "tool/roots-add"))
+        }
+        #[cfg(not(unix))]
+        Some(Command::Pin { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        #[cfg(unix)]
+        Some(Command::Unpin { path }) => {
+            let mut out = cli::Output::stdout(false);
+            build_runtime()?.block_on(run_root_command(&mut out, path, "tool/roots-rm"))
+        }
+        #[cfg(not(unix))]
+        Some(Command::Unpin { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        #[cfg(unix)]
         Some(Command::Roots { command }) => {
             let mut out = cli::Output::stdout(false);
             match command {
-                RootsCommand::Add { path } => {
-                    build_runtime()?.block_on(run_root_command(&mut out, path, "tool/roots-add"))
-                }
-                RootsCommand::Rm { path } => {
-                    build_runtime()?.block_on(run_root_command(&mut out, path, "tool/roots-rm"))
-                }
-                RootsCommand::Ls => {
+                // Bare `catenary roots` (and the kept `ls` alias) lists the roots.
+                None | Some(RootsCommand::Ls) => {
                     build_runtime()?.block_on(cli::commands::run_ls_roots(&mut out))
                 }
+                // Retired spellings: teach the rename (honest rename, not a
+                // silent alias). Agents are taught the same by the command
+                // filter before the command runs.
+                Some(RootsCommand::Add { .. }) => Err(anyhow::anyhow!(
+                    "`catenary roots add` is retired — use `catenary pin <path>` \
+                     to pin a workspace root."
+                )),
+                Some(RootsCommand::Rm { .. }) => Err(anyhow::anyhow!(
+                    "`catenary roots rm` is retired — use `catenary unpin <path>` \
+                     to unpin a workspace root."
+                )),
             }
         }
         #[cfg(not(unix))]
@@ -2142,23 +2191,26 @@ fn emit_diagnostics_response(out: &mut cli::Output, response: &str) -> Result<()
     Ok(())
 }
 
-/// Sends an add-root or rm-root request to the running daemon.
+/// Sends a pin (`roots-add`) or unpin (`roots-rm`) request to the running
+/// daemon and prints the outcome.
 ///
-/// Canonicalizes the path, connects to the daemon's IPC socket, and
-/// prints the result. If no daemon is running, prints an error and
-/// exits non-zero.
+/// Resolves the path to the form matched against the tracked set — canonical
+/// when the directory exists, its lexically-absolutized spelling when it does
+/// not — so an `unpin` of an already-removed directory still deregisters the
+/// pin instead of hard-erroring (bug 54 gap 1). Both resolution
+/// ([`resolve_root_path`](cli::commands::resolve_root_path)) and response
+/// interpretation ([`render_root_outcome`](cli::commands::render_root_outcome))
+/// are pure; this function owns only the IPC. A `not_found` on unpin is a
+/// benign, idempotent no-op.
 ///
 /// # Errors
 ///
-/// Returns an error if the path cannot be canonicalized or the daemon
-/// request fails.
+/// Returns an error if no daemon is running or the daemon reports a failure.
 #[cfg(unix)]
 async fn run_root_command(out: &mut cli::Output, path: PathBuf, method: &str) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let canonical = path
-        .canonicalize()
-        .with_context(|| format!("cannot resolve path: {}", path.display()))?;
+    let resolved = cli::commands::resolve_root_path(&path);
 
     let ipc_path = catenary_mcp::router::socket_path();
 
@@ -2169,7 +2221,7 @@ async fn run_root_command(out: &mut cli::Output, path: PathBuf, method: &str) ->
     let (reader, mut writer) = stream.into_split();
     let request = serde_json::json!({
         "method": method,
-        "path": canonical.display().to_string(),
+        "path": resolved.display().to_string(),
     });
     let mut payload = serde_json::to_string(&request)?;
     payload.push('\n');
@@ -2184,33 +2236,21 @@ async fn run_root_command(out: &mut cli::Output, path: PathBuf, method: &str) ->
         .get("status")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
+    let daemon_msg = response.get("message").and_then(|v| v.as_str());
+    let is_pin = method.contains("roots-add");
 
-    match status {
-        "ok" => {
-            let verb = if method.contains("roots-add") {
-                "added"
-            } else {
-                "removed"
-            };
-            let _ = out.writeln(format_args!("{verb} root: {}", canonical.display()));
+    match cli::commands::render_root_outcome(
+        status,
+        is_pin,
+        &resolved.display().to_string(),
+        daemon_msg,
+    ) {
+        Ok(line) => {
+            let _ = out.writeln(format_args!("{line}"));
+            Ok(())
         }
-        "not_found" => {
-            let msg = response
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("root not found in hook-managed roots");
-            let _ = out.writeln(format_args!("{msg}"));
-        }
-        _ => {
-            let msg = response
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unexpected response");
-            anyhow::bail!("{msg}");
-        }
+        Err(msg) => anyhow::bail!("{msg}"),
     }
-
-    Ok(())
 }
 
 /// Check installed hooks against embedded expected hooks at daemon startup.
@@ -3063,45 +3103,73 @@ mod tests {
         assert!(result.is_err(), "glob without path should fail");
     }
 
-    // ── CLI roots subcommand tests ──────────────────────────────────
+    // ── CLI pin / unpin / roots subcommand tests ────────────────────
 
     #[test]
-    fn test_cli_roots_add() {
+    fn test_cli_pin() {
         use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "roots", "add", "/tmp/project"]);
-        let args = args.expect("roots add should parse");
-        let Some(Command::Roots {
-            command: RootsCommand::Add { path },
-        }) = args.command
-        else {
-            unreachable!("expected Roots Add command");
+        let args = Args::try_parse_from(["catenary", "pin", "/tmp/project"]);
+        let args = args.expect("pin should parse");
+        let Some(Command::Pin { path }) = args.command else {
+            unreachable!("expected Pin command");
         };
         assert_eq!(path, PathBuf::from("/tmp/project"));
     }
 
     #[test]
-    fn test_cli_roots_rm() {
+    fn test_cli_unpin() {
         use clap::Parser;
-        let args = Args::try_parse_from(["catenary", "roots", "rm", "/tmp/project"]);
-        let args = args.expect("roots rm should parse");
-        let Some(Command::Roots {
-            command: RootsCommand::Rm { path },
-        }) = args.command
-        else {
-            unreachable!("expected Roots Rm command");
+        let args = Args::try_parse_from(["catenary", "unpin", "/tmp/project"]);
+        let args = args.expect("unpin should parse");
+        let Some(Command::Unpin { path }) = args.command else {
+            unreachable!("expected Unpin command");
         };
         assert_eq!(path, PathBuf::from("/tmp/project"));
     }
 
     #[test]
-    fn test_cli_roots_ls() {
+    fn test_cli_roots_bare_lists() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "roots"]);
+        let args = args.expect("bare roots should parse");
+        assert!(matches!(
+            args.command,
+            Some(Command::Roots { command: None })
+        ));
+    }
+
+    #[test]
+    fn test_cli_roots_ls_alias() {
         use clap::Parser;
         let args = Args::try_parse_from(["catenary", "roots", "ls"]);
         let args = args.expect("roots ls should parse");
         assert!(matches!(
             args.command,
             Some(Command::Roots {
-                command: RootsCommand::Ls
+                command: Some(RootsCommand::Ls)
+            })
+        ));
+    }
+
+    #[test]
+    fn test_cli_roots_add_rm_still_parse_for_the_rename_teaching() {
+        // The retired spellings still *parse* (so the dispatch can teach the
+        // rename) — they route to a teaching error, not to a pin/unpin.
+        use clap::Parser;
+        assert!(matches!(
+            Args::try_parse_from(["catenary", "roots", "add", "/tmp/p"])
+                .expect("roots add parses")
+                .command,
+            Some(Command::Roots {
+                command: Some(RootsCommand::Add { .. })
+            })
+        ));
+        assert!(matches!(
+            Args::try_parse_from(["catenary", "roots", "rm", "/tmp/p"])
+                .expect("roots rm parses")
+                .command,
+            Some(Command::Roots {
+                command: Some(RootsCommand::Rm { .. })
             })
         ));
     }
@@ -3130,11 +3198,12 @@ mod tests {
             "primer should emit the edit→diagnostics invariant"
         );
         // The flag-synopsis tier plus its point-of-use `--help` breadcrumbs.
+        // Root management (`pin`/`unpin`/`roots`) lives in `catenary -h`, not
+        // the primer — coverage is automatic (misc 146).
         for needle in [
             "catenary grep",
             "catenary glob",
             "catenary diagnostics",
-            "catenary roots",
             "--count",
             "full: catenary grep --help",
             "full: catenary glob --help",

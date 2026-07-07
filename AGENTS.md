@@ -54,8 +54,10 @@ others.
     modified files to stdout; delivery flips each file's gate flag but the batch
     persists, so a repeat bare run re-diagnoses the same set fresh and the next
     covered edit after a fully-diagnosed batch starts a new one.
-  - `catenary roots add <path>` / `catenary roots rm <path>` — manage workspace
-    roots.
+  - `catenary pin <path>` / `catenary unpin <path>` — pin or unpin a workspace
+    root; bare `catenary roots` lists the current roots. Coverage is automatic —
+    pinning changes a root's lifetime (stops idle expiry, pre-warms servers),
+    not whether it is served.
 - **Diagnostics:** `catenary diagnostics` triggers the diagnostics pipeline:
   compute over the current batch of modified files, send to LSP servers, collect
   diagnostics, print to stdout. The batch (its files, each with a delivered flag)

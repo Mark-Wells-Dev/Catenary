@@ -2066,7 +2066,7 @@ impl LspClientManager {
                 // otherwise lose these changes for this server permanently — the
                 // next walk diffs against the advanced baseline and emits nothing
                 // (even across respawn; the baseline is torn down only on
-                // `roots rm`). Revert exactly the entries routed here so the NEXT
+                // `catenary unpin`). Revert exactly the entries routed here so the NEXT
                 // walk re-emits them to all covering servers (an idempotent
                 // duplicate to servers that did receive it). Best-effort: see
                 // `revert_baseline_changes` for the Deleted (full-walk-only)

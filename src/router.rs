@@ -598,7 +598,7 @@ impl crate::state_snapshot::RootBoard for RootBoardImpl {
 /// A root is ephemeral iff **every** contributor holding it is an
 /// `ephemeral:*` key — i.e. it is held only by activity mounts. Any pinned
 /// contributor (`hook` / `mcp:*` / `worktree:*`) makes it pinned, which is why
-/// `roots add` upgrades a root by adding a `hook` contributor (and this feature
+/// `catenary pin` upgrades a root by adding a `hook` contributor (and this feature
 /// then drops the ephemeral one). An empty source list is never ephemeral.
 #[cfg(unix)]
 fn root_is_ephemeral(sources: &[String]) -> bool {
@@ -2856,9 +2856,9 @@ fn get_or_create_router(
 /// `output` unchanged when nothing was filtered.
 ///
 /// `filtered_roots` carries the distinct enclosing project roots of those
-/// filtered edits (walk `.git` up from each). When non-empty the note names
+/// filtered edits (walk repository markers up from each). When non-empty the note names
 /// them — "no language servers running for `~/Projects/Lattice`" — pointing at
-/// what a `catenary roots add` would mount (ephemeral-roots ticket 01); when
+/// what a `catenary pin` would mount (ephemeral-roots ticket 01); when
 /// empty (no detectable root) it falls back to the plain count.
 #[cfg(unix)]
 fn with_out_of_roots_note(
@@ -3584,7 +3584,7 @@ async fn handle_hook_dispatch(
 
     // ── List tracked roots ─────────────────────────────────────
     //
-    // `tool/roots-ls` is sent by `catenary roots ls`. Returns all
+    // `tool/roots-ls` is sent by bare `catenary roots`. Returns all
     // tracked workspace roots with their contributor sources.
     if method == "tool/roots-ls" {
         let roots = ctx
@@ -4840,7 +4840,7 @@ async fn handle_hook_dispatch(
     // ── Root management ──────────────────────────────────────────
     //
     // `tool/roots-add` and `tool/roots-rm` are sent by the CLI commands
-    // (`catenary roots add`, `catenary roots rm`). The PreToolUse hook
+    // (`catenary pin`, `catenary unpin`). The PreToolUse hook
     // only bypasses the command filter — no hook-side IPC needed
     // since "hook" is a shared contributor with no session identity.
     //
@@ -10372,7 +10372,7 @@ mod tests {
     // project root under an `ephemeral:{path}` contributor; the idle reaper
     // tears it down. The pure predicate + idle clock + reaper are driven with an
     // injected `now`/`idle` (no wall-clock sleep — zero-flake doctrine), and the
-    // live mount + `roots add` upgrade are exercised over the IPC socket.
+    // live mount + `pin` upgrade are exercised over the IPC socket.
 
     /// A minimal marker-ed project: a dir with a `.git` dir and one non-code
     /// file (so no LSP server spawns for it — the tests stay off real servers).
@@ -10721,7 +10721,7 @@ mod tests {
             "project starts ephemeral",
         );
 
-        // `roots add` on it upgrades it to pinned (and stops expiry).
+        // `pin` on it upgrades it to pinned (and stops expiry).
         let _ = hook_roundtrip(
             &ipc_path,
             &serde_json::json!({

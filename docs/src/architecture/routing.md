@@ -79,7 +79,7 @@ file outside all roots resolves to nothing for them.
 
 ### Roots are explicit (pinned), with ephemeral activity mounts
 
-Roots added via `--root`, `catenary roots add`, or the MCP workspace-roots
+Roots added via `--root`, `catenary pin`, or the MCP workspace-roots
 channel are **pinned**: active for the session's lifetime. Catenary does not
 auto-discover pinned roots from file paths — implicit pinned discovery would
 make the routing model hard to predict, especially in multi-root sessions where
@@ -91,8 +91,8 @@ mounted root** is the one exception: Catenary detects the enclosing project root
 query is enriched/diagnosed from a real server. An ephemeral mount is scoped to
 the single enclosing root (never a sibling, no companion templating) and
 **expires after a few minutes of inactivity** — every qualifying activity
-refreshes its idle clock, and `catenary roots add` on it upgrades it to pinned.
-`catenary roots ls` and the `state.json` root board distinguish the two classes.
+refreshes its idle clock, and `catenary pin` on it upgrades it to pinned.
+Bare `catenary roots` and the `state.json` root board distinguish the two classes.
 A file with no detectable enclosing project root still has no owning root; it
 routes only to single-file-capable servers (tier 3).
 

@@ -21,11 +21,15 @@ The edit→diagnostics loop
   pulled: you see them only when you run it — each run re-diagnoses the set.
 
 Bare-only vs pipe-friendly
-  `catenary diagnostics` and `catenary roots …` are bare-only: run each as the
-  sole command — no pipe, no `&&`/`;`, no redirect — then read its output.
-  `catenary grep` and `catenary glob` are pipe-friendly: they compose freely
-  (`| head`, `| grep`) and their output is always complete, so a pipe never
-  drops results (use `--count` for a bare tally).
+  `catenary diagnostics` is bare-only: run it as the sole command — no pipe, no
+  `&&`/`;`, no redirect — then read its output. `catenary grep` and
+  `catenary glob` are pipe-friendly: they compose freely (`| head`, `| grep`)
+  and their output is always complete, so a pipe never drops results (use
+  `--count` for a bare tally).
+
+Work in isolated subagents
+  Coverage is automatic — you never manage roots. Two agents in one workspace
+  step on each other and, sharing its language server, break settle detection.
 
 Navigate through Catenary
   Search contents with `catenary grep`, find files with `catenary glob`. Quote

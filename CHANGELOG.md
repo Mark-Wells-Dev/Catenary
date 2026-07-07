@@ -264,6 +264,20 @@ upgrading.
 
 ### Changed
 
+- **Root management renamed to what it does: `catenary pin` / `catenary
+  unpin`.** Coverage became automatic (activity automount, worktree mounts,
+  MCP roots), so `roots add` never granted coverage — it pinned: stop idle
+  expiry, pre-warm servers, upgrade an ephemeral mount. The commands now say
+  so: `catenary pin <path>` / `catenary unpin <path>` replace
+  `roots add`/`roots rm` (the old spellings return a teaching error naming
+  the new one), and bare `catenary roots` lists the tracked roots with their
+  contributor classes (`roots ls` stays as a working alias). `unpin` matches
+  the stored path, so unpinning a directory that no longer exists on disk
+  works and repeating it is a no-op (bug 54). The agent primer teaches none
+  of this — root lifecycle is not the agent's job; in its place, one
+  capability fact: parallel agents belong in isolated worktrees, because two
+  agents sharing a workspace also share its language servers and break
+  settle detection.
 - **Root detection is repo-shaped, not git-shaped.** The
   enclosing-project-root probe — the anchor behind ephemeral automount,
   out-of-scope diagnostics receipts, and out-of-root edit notes — now
