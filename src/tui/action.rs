@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Guided-mutation UX: the consent overlay state and the pending-restart tracker
-//! (tui-rework 05).
+//! Guided-mutation and guided-install UX: the consent overlay state and the
+//! pending-restart tracker (tui-rework 05/06).
 //!
 //! A fix-it becomes an action here. The cursored finding or entity yields a
 //! [`Mutation`]; the user reviews exactly what will be written — key, value, and
@@ -11,10 +11,17 @@
 //! restart to take effect, an applied mutation leaves a [`PendingRestart`] marker
 //! that clears only when the snapshot shows the daemon has returned under a new
 //! identity (a fresh instance id or start time).
+//!
+//! A suggestion for a *blessed* server yields an [`InstallState`] instead: the
+//! same modal shape (exact preview, Enter/Esc), but the confirm runs the
+//! guided-install engine ([`crate::install`]) rather than writing config — the
+//! pinned command/artifact and its verification tier are shown, and the streamed
+//! outcome replaces the preview on completion.
 
 use std::path::PathBuf;
 
 use crate::config::{BindingSpec, ConfigLayer, LanguageConfig, Mutation};
+use crate::install::{InstallOutcome, InstallPlan};
 use crate::state_snapshot::Snapshot;
 
 /// A change written to disk but not yet live.
@@ -231,6 +238,68 @@ fn has_legacy_tables(raw: &toml::Value) -> bool {
             t.iter()
                 .any(|(k, v)| k != "rule" && k != "disable" && v.is_table())
         })
+}
+
+/// The modal consent state for a guided install (tui-rework 06).
+///
+/// Mirrors [`ActionState`]'s modal shape but for a process, not a config write:
+/// it holds the server name and either a resolved [`InstallPlan`] to preview and
+/// run, or a refusal message (an npm/pip recipe that carries no verifiable hash).
+/// Once [`execute`](crate::install::execute)d, the [`InstallOutcome`] is stored
+/// and shown in place of the preview; the modal is dismissed with the escape key.
+pub struct InstallState {
+    /// The server the install targets.
+    server: String,
+    /// The resolved plan, or a refusal reason when the recipe cannot be run
+    /// safely (an unverifiable npm/pip artifact).
+    plan: Result<InstallPlan, String>,
+    /// The execution outcome, once the install has run.
+    outcome: Option<InstallOutcome>,
+}
+
+impl InstallState {
+    /// Build a consent state for `server` from a resolved plan or a refusal.
+    #[must_use]
+    pub const fn new(server: String, plan: Result<InstallPlan, String>) -> Self {
+        Self {
+            server,
+            plan,
+            outcome: None,
+        }
+    }
+
+    /// The server the install targets.
+    #[must_use]
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
+    /// The resolved plan, or the refusal reason.
+    ///
+    /// # Errors
+    ///
+    /// The `Err` arm carries the refusal message shown in the overlay (an
+    /// unverifiable npm/pip recipe) — it is a display state, not a fault.
+    pub fn plan(&self) -> Result<&InstallPlan, &str> {
+        self.plan.as_ref().map_err(String::as_str)
+    }
+
+    /// The execution outcome, once the install has run.
+    #[must_use]
+    pub const fn outcome(&self) -> Option<&InstallOutcome> {
+        self.outcome.as_ref()
+    }
+
+    /// Whether a confirm would run the install (a runnable plan, not yet run).
+    #[must_use]
+    pub const fn can_execute(&self) -> bool {
+        self.plan.is_ok() && self.outcome.is_none()
+    }
+
+    /// Record the execution outcome.
+    pub fn set_outcome(&mut self, outcome: InstallOutcome) {
+        self.outcome = Some(outcome);
+    }
 }
 
 #[cfg(test)]

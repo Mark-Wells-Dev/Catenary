@@ -22,6 +22,8 @@ pub mod filter;
 pub mod health;
 /// IPC server for host CLI hook integration (diagnostics and root sync).
 pub mod hook;
+/// Guided-install engine: consented, verified per-ecosystem installs (tui-rework 06).
+pub mod install;
 /// Multi-sink tracing dispatcher for Catenary telemetry.
 pub mod logging;
 /// LSP client implementation and server management.

@@ -16,7 +16,7 @@ use crate::config::{Config, ConfigLayer};
 use crate::health::Severity;
 use crate::state_snapshot::{ServerEntry, SessionEntry, SessionStatus, Snapshot};
 
-use super::action::{ActionState, PendingRestart};
+use super::action::{ActionState, InstallState, PendingRestart};
 use super::findings::{OwnedFinding, Owner};
 use super::format::{elapsed_short, seconds_since, truncate_to_width};
 use super::icons::{IconSet, basename};
@@ -452,6 +452,83 @@ pub fn action_overlay_lines(state: &ActionState, theme: &Theme) -> Vec<Line<'sta
     lines
 }
 
+/// Render the guided-install consent overlay: the pinned command/artifact, the
+/// verification tier, and exactly what runs — or, once run, the streamed outcome.
+///
+/// The overlay shows the exact pinned artifact a confirm fetches, verifies, and
+/// installs; no unpinned or unverified install is ever presented.
+#[must_use]
+pub fn install_overlay_lines(state: &InstallState, theme: &Theme) -> Vec<Line<'static>> {
+    // Once the install has run, show the streamed outcome in place of the preview.
+    if let Some(outcome) = state.outcome() {
+        let head = if outcome.success {
+            Span::styled(format!("  Installed {} ✓", state.server()), theme.success)
+        } else {
+            Span::styled(
+                format!("  Install {} failed ✗", state.server()),
+                theme.error,
+            )
+        };
+        let mut lines = vec![Line::from(head), Line::from("")];
+        for entry in &outcome.log {
+            lines.push(Line::from(vec![Span::styled(
+                format!("  {entry}"),
+                theme.muted,
+            )]));
+        }
+        lines.push(Line::from(""));
+        lines.push(dismiss_hint(theme));
+        return lines;
+    }
+
+    let mut lines = vec![
+        title(format!("  Install {}?", state.server()), theme),
+        Line::from(""),
+    ];
+    match state.plan() {
+        Err(reason) => {
+            lines.push(Line::from(vec![Span::styled(
+                format!("  ✗ {reason}"),
+                theme.error,
+            )]));
+            lines.push(Line::from(""));
+            lines.push(dismiss_hint(theme));
+        }
+        Ok(plan) => {
+            lines.push(kv(
+                "via",
+                format!("{} · {}", plan.ecosystem().as_str(), plan.verify_summary()),
+                theme,
+            ));
+            lines.push(kv(
+                "package",
+                format!("{}@{}", plan.package(), plan.version()),
+                theme,
+            ));
+            if let Some(url) = plan.fetch_url() {
+                lines.push(kv("fetch", url.to_string(), theme));
+            }
+            lines.push(kv("runs", plan.display_command(), theme));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  Enter".to_string(), theme.hint_key),
+                Span::styled(" install   ".to_string(), theme.hint_label),
+                Span::styled("Esc".to_string(), theme.hint_key),
+                Span::styled(" cancel".to_string(), theme.hint_label),
+            ]));
+        }
+    }
+    lines
+}
+
+/// The `Esc close` hint line shared by the install overlay's terminal states.
+fn dismiss_hint(theme: &Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  Esc".to_string(), theme.hint_key),
+        Span::styled(" close".to_string(), theme.hint_label),
+    ])
+}
+
 // ── Header / footer strips ───────────────────────────────────────────
 
 /// The one-line verdict span sequence (`● working` / `✗ N problems`), with a
@@ -830,6 +907,10 @@ fn session_detail(id: &str, snapshot: &Snapshot, theme: &Theme) -> Vec<Line<'sta
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
 
@@ -877,6 +958,55 @@ mod tests {
         assert!(
             text.contains("2 suggestions"),
             "honest suggestion tail: {text}"
+        );
+    }
+
+    #[test]
+    fn install_overlay_previews_pinned_command_and_verification() {
+        use crate::install::{BlessedRecipe, InstallPlan};
+        use crate::recipes::{
+            BlessedEntry, BlessedManifest, Ecosystem, InstallRecipe, VerificationTier,
+        };
+
+        let recipe = InstallRecipe {
+            ecosystem: Ecosystem::Cargo,
+            package: "taplo-cli".to_string(),
+            version: "0.10.0".to_string(),
+            tier: VerificationTier::CargoLocked,
+            draft: true,
+            hash: None,
+            note: None,
+            runtime: None,
+        };
+        let mut manifest = BlessedManifest::default();
+        manifest.blessed.insert(
+            "taplo".to_string(),
+            BlessedEntry {
+                version: "0.10.0".to_string(),
+                platform: "linux-x86_64".to_string(),
+                date: "2026-07-07".to_string(),
+                tier: None,
+            },
+        );
+        let blessed = BlessedRecipe::resolve("taplo", &recipe, &manifest).expect("blessed");
+        let plan = InstallPlan::resolve(&blessed).expect("plan");
+        let state = InstallState::new("taplo".to_string(), Ok(plan));
+
+        let lines = install_overlay_lines(&state, &Theme::new());
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("Install taplo?"), "titles the server: {text}");
+        assert!(
+            text.contains("cargo install taplo-cli --version =0.10.0 --locked"),
+            "shows the exact pinned command: {text}",
+        );
+        assert!(text.contains("--locked"), "states the verification: {text}");
+        assert!(
+            text.contains("Enter") && text.contains("install"),
+            "offers explicit consent: {text}",
         );
     }
 }

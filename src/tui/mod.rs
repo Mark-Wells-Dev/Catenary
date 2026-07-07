@@ -168,6 +168,11 @@ struct PanelRects {
 
 /// Handle a key event.
 fn handle_key(app: &mut App<'_>, code: KeyCode) {
+    // A guided-install consent overlay is modal: Enter runs, Esc dismisses.
+    if app.pending_install.is_some() {
+        handle_install_key(app, code);
+        return;
+    }
     // A guided-mutation consent overlay is modal: it captures every key until
     // the user confirms or declines. Value edits (a binary path) take chars.
     if app.pending_action.is_some() {
@@ -211,6 +216,16 @@ fn handle_action_key(app: &mut App<'_>, code: KeyCode) {
         KeyCode::Tab | KeyCode::BackTab => app.action_cycle_layer(),
         KeyCode::Backspace => app.action_backspace(),
         KeyCode::Char(c) => app.action_push_char(c),
+        _ => {}
+    }
+}
+
+/// Handle a key while the guided-install consent overlay is open. Enter runs the
+/// pinned, verified install (a no-op once it has run); the escape key dismisses.
+fn handle_install_key(app: &mut App<'_>, code: KeyCode) {
+    match code {
+        KeyCode::Enter => app.confirm_install(),
+        KeyCode::Esc => app.cancel_install(),
         _ => {}
     }
 }
@@ -268,8 +283,8 @@ fn handle_mouse(
     row: u16,
     rects: &PanelRects,
 ) {
-    // The consent overlay is keyboard-only; ignore clicks behind it.
-    if app.pending_action.is_some() {
+    // The consent overlays are keyboard-only; ignore clicks behind them.
+    if app.pending_action.is_some() || app.pending_install.is_some() {
         return;
     }
     let pos = Rect {
@@ -663,12 +678,21 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
     rects.problems = br;
 
     draw_action_overlay(app, area, buf, theme);
+    draw_install_overlay(app, area, buf, theme);
 }
 
 /// Draw the guided-mutation consent overlay centered over the grid, when open.
 fn draw_action_overlay(app: &App<'_>, area: Rect, buf: &mut Buffer, theme: &Theme) {
     if let Some(state) = &app.pending_action {
         let lines = render::action_overlay_lines(state, theme);
+        draw_overlay(&lines, area, buf, theme);
+    }
+}
+
+/// Draw the guided-install consent overlay centered over the grid, when open.
+fn draw_install_overlay(app: &App<'_>, area: Rect, buf: &mut Buffer, theme: &Theme) {
+    if let Some(state) = &app.pending_install {
+        let lines = render::install_overlay_lines(state, theme);
         draw_overlay(&lines, area, buf, theme);
     }
 }

@@ -9,16 +9,22 @@
 //! snapshot content changes; the per-tick reload re-reads the small snapshot
 //! and re-clamps cursors, so a growing time-in-state surfaces without a rebuild.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::Result;
 
 use crate::config::{Config, Mutation};
 use crate::health::{FindingCode, servers::binary_exists};
+use crate::install::{
+    BlessedRecipe, CommandRunner, InstallPlan, ProcessRunner, TarballFetcher, UreqFetcher,
+};
+use crate::recipes::{BlessedManifest, InstallRecipe};
 use crate::state_snapshot::Snapshot;
 
-use super::action::{ActionState, PendingRestart, binding_specs, find_migration_source};
+use super::action::{
+    ActionState, InstallState, PendingRestart, binding_specs, find_migration_source,
+};
 use super::data::DataSource;
 use super::findings::{self, OwnedFinding, Owner};
 use super::icons::IconSet;
@@ -116,10 +122,23 @@ pub struct App<'a> {
 
     /// The open guided-mutation consent overlay, if any (tui-rework 05).
     pub pending_action: Option<ActionState>,
+    /// The open guided-install consent overlay, if any (tui-rework 06).
+    pub pending_install: Option<InstallState>,
     /// Applied mutations awaiting a daemon restart to take effect. They stay
     /// marked until the snapshot shows the daemon has come back under a new
     /// identity.
     pub pending_restarts: Vec<PendingRestart>,
+
+    /// CI-internal pinned install recipes, keyed by canonical server name. The
+    /// guided-install action reads these only through the blessing gate.
+    recipes: BTreeMap<String, InstallRecipe>,
+    /// The blessed-manifest: the only recipe-derived data a user surface may
+    /// consult. Empty in production until CI conformance blesses a server.
+    blessed: BlessedManifest,
+    /// The command runner the guided install spawns argv through.
+    runner: Box<dyn CommandRunner>,
+    /// The tarball fetcher the npm verified-install path fetches through.
+    fetcher: Box<dyn TarballFetcher>,
 
     /// Cached filesystem-detected languages, keyed by the root-path set.
     lang_cache: HashSet<String>,
@@ -188,7 +207,12 @@ impl<'a> App<'a> {
             keybinds_expanded: false,
             quit: false,
             pending_action: None,
+            pending_install: None,
             pending_restarts: Vec::new(),
+            recipes: crate::recipes::default_recipes().unwrap_or_default(),
+            blessed: crate::recipes::default_blessed_manifest().unwrap_or_default(),
+            runner: Box::new(ProcessRunner),
+            fetcher: Box::new(UreqFetcher),
             lang_cache: HashSet::new(),
             lang_cache_key: Vec::new(),
             last_generated_at: String::new(),
@@ -218,6 +242,25 @@ impl<'a> App<'a> {
         data: Box<dyn DataSource>,
     ) -> Result<Self> {
         Self::build(theme, icons, project_root, data, Some(config), None, false)
+    }
+
+    /// Inject a synthetic recipe set, blessed manifest, and install backends —
+    /// the seam the guided-install tests drive to exercise the (production-empty)
+    /// blessing gate deterministically. Recomputes findings + rows afterward.
+    #[cfg(test)]
+    pub fn inject_install_env(
+        &mut self,
+        recipes: BTreeMap<String, InstallRecipe>,
+        blessed: BlessedManifest,
+        runner: Box<dyn CommandRunner>,
+        fetcher: Box<dyn TarballFetcher>,
+    ) {
+        self.recipes = recipes;
+        self.blessed = blessed;
+        self.runner = runner;
+        self.fetcher = fetcher;
+        self.recompute_findings();
+        self.rebuild_rows();
     }
 
     /// Whether the daemon is present (a snapshot has been generated).
@@ -267,7 +310,31 @@ impl<'a> App<'a> {
                 findings::gather_snapshot(snapshot, cfg, active)
             }
         });
+        self.enrich_blessed_suggestions();
         self.verdict = model::verdict(&self.findings);
+    }
+
+    /// Rewrite the fix-it text of each install-suggestion finding whose server is
+    /// blessed (a matching-version manifest entry) to the exact pinned form. An
+    /// unblessed suggestion keeps naming the binary only — Catenary never prints
+    /// an unpinned install command. Text-only: severity and the verdict are
+    /// untouched, so a suggestion still never counts as a problem.
+    fn enrich_blessed_suggestions(&mut self) {
+        let recipes = &self.recipes;
+        let blessed = &self.blessed;
+        for owned in &mut self.findings {
+            if owned.finding.code != FindingCode::ServerInstallSuggestion {
+                continue;
+            }
+            let Owner::Server(server) = &owned.owner else {
+                continue;
+            };
+            if let Some(recipe) = recipes.get(server)
+                && let Some(br) = BlessedRecipe::resolve(server, recipe, blessed)
+            {
+                owned.finding.fix_it = Some(br.pinned_fix_it());
+            }
+        }
     }
 
     /// Active workspace languages: the cheap live-instance set unioned with a
@@ -704,8 +771,13 @@ impl<'a> App<'a> {
         })
     }
 
-    /// Open the consent overlay for the current context's mutation, if any.
+    /// Open the consent overlay for the current context's action, if any. A
+    /// blessed install-suggestion opens the guided-install overlay; otherwise a
+    /// guided mutation opens its own.
     pub fn begin_action(&mut self) {
+        if self.begin_install() {
+            return;
+        }
         let Some(mutation) = self.available_mutation() else {
             return;
         };
@@ -715,6 +787,79 @@ impl<'a> App<'a> {
             _ => None,
         };
         self.pending_action = Some(ActionState::new(mutation, candidates, 0, value));
+    }
+
+    // ── Guided install (tui-rework 06) ───────────────────────────────
+
+    /// The blessed install the action key offers for the current context, if
+    /// any: a cursored install-suggestion row whose server has a blessed recipe.
+    ///
+    /// The blessing gate is structural — [`BlessedRecipe::resolve`] returns a
+    /// value only when a manifest entry matches the recipe's pin — so an
+    /// unblessed suggestion simply yields `None` here (no offer to construct).
+    #[must_use]
+    pub fn available_install(&self) -> Option<BlessedRecipe> {
+        if self.focus != Pane::Problems {
+            return None;
+        }
+        let row = self.problem_rows.get(self.problem_cursor.index)?;
+        if row.code != FindingCode::ServerInstallSuggestion {
+            return None;
+        }
+        let Owner::Server(server) = &row.owner else {
+            return None;
+        };
+        let recipe = self.recipes.get(server)?;
+        BlessedRecipe::resolve(server, recipe, &self.blessed)
+    }
+
+    /// Open the guided-install overlay for the cursored suggestion, if offerable.
+    /// Returns whether an overlay was opened.
+    fn begin_install(&mut self) -> bool {
+        let Some(blessed) = self.available_install() else {
+            return false;
+        };
+        let plan = InstallPlan::resolve(&blessed).map_err(|e| format!("{e:#}"));
+        self.pending_install = Some(InstallState::new(blessed.server().to_owned(), plan));
+        true
+    }
+
+    /// Run the pending install through the injected seams, store its outcome on
+    /// the overlay, and — on success — re-derive health so the suggestion
+    /// vanishes once the probe (a `$PATH` check) sees the now-installed binary.
+    /// A first Enter runs it; once run, Enter is a no-op (the escape key
+    /// dismisses). On failure the overlay carries the error.
+    pub fn confirm_install(&mut self) {
+        // Take the plan out without holding a borrow across execution.
+        let plan = match self.pending_install.as_ref() {
+            Some(state) if state.can_execute() => match state.plan() {
+                Ok(plan) => plan.clone(),
+                Err(_) => return,
+            },
+            _ => return,
+        };
+        let outcome = crate::install::execute(&plan, self.runner.as_ref(), self.fetcher.as_ref());
+        let success = outcome.success;
+        if let Some(state) = self.pending_install.as_mut() {
+            state.set_outcome(outcome);
+        }
+        if success {
+            self.rederive_health();
+        }
+    }
+
+    /// Close the guided-install overlay (escape-equivalent).
+    pub fn cancel_install(&mut self) {
+        self.pending_install = None;
+    }
+
+    /// Recompute findings and rebuild rows so a completed install's effect (the
+    /// suggestion clearing once the binary is on `$PATH`) surfaces immediately —
+    /// re-running the availability check rather than assuming success.
+    fn rederive_health(&mut self) {
+        self.recompute_findings();
+        self.needs_rebuild = true;
+        self.rebuild_rows();
     }
 
     /// Cancel the open consent overlay without writing (escape-equivalent).
@@ -1052,6 +1197,217 @@ mod tests {
         assert!(
             app.pending_restarts.is_empty(),
             "the marker clears once the daemon returns under a new identity",
+        );
+    }
+
+    // ── Guided install (tui-rework 06) ───────────────────────────────
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::health::{Finding, Severity};
+    use crate::install::{CommandOutcome, InstallCommand};
+    use crate::recipes::{BlessedEntry, Ecosystem, VerificationTier};
+
+    /// A runner that records each program it is asked to run and always succeeds.
+    struct RecordingRunner(Rc<RefCell<Vec<String>>>);
+
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, command: &InstallCommand) -> Result<CommandOutcome> {
+            self.0.borrow_mut().push(command.program().to_owned());
+            Ok(CommandOutcome {
+                success: true,
+                code: Some(0),
+                output: String::new(),
+            })
+        }
+    }
+
+    /// A fetcher never reached by the cargo-recipe tests.
+    struct NoFetch;
+
+    impl TarballFetcher for NoFetch {
+        fn fetch(&self, _url: &str) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn cargo_recipe() -> InstallRecipe {
+        InstallRecipe {
+            ecosystem: Ecosystem::Cargo,
+            package: "taplo-cli".to_string(),
+            version: "0.10.0".to_string(),
+            tier: VerificationTier::CargoLocked,
+            draft: true,
+            hash: None,
+            note: None,
+            runtime: None,
+        }
+    }
+
+    fn recipes_map(server: &str, recipe: InstallRecipe) -> BTreeMap<String, InstallRecipe> {
+        let mut m = BTreeMap::new();
+        m.insert(server.to_string(), recipe);
+        m
+    }
+
+    fn blessed_manifest(server: &str, version: &str) -> BlessedManifest {
+        let mut m = BlessedManifest::default();
+        m.blessed.insert(
+            server.to_string(),
+            BlessedEntry {
+                version: version.to_string(),
+                platform: "linux-x86_64".to_string(),
+                date: "2026-07-07".to_string(),
+                tier: None,
+            },
+        );
+        m
+    }
+
+    fn suggestion_row(server: &str) -> ProblemRow {
+        ProblemRow {
+            code: FindingCode::ServerInstallSuggestion,
+            severity: Severity::Suggestion,
+            message: format!("{server}: not installed"),
+            fix_it: Some(format!(
+                "Install `{server}`. Catenary never runs installs for you."
+            )),
+            owner: Owner::Server(server.to_string()),
+            is_suggestion: true,
+        }
+    }
+
+    fn install_app<'a>(
+        theme: &'a Theme,
+        icons: &'a IconSet,
+        blessed: BlessedManifest,
+        calls: &Rc<RefCell<Vec<String>>>,
+    ) -> App<'a> {
+        let mut app = app_with(theme, icons, snap_with_servers(1), Config::default());
+        app.inject_install_env(
+            recipes_map("taplo", cargo_recipe()),
+            blessed,
+            Box::new(RecordingRunner(calls.clone())),
+            Box::new(NoFetch),
+        );
+        app.problem_rows = vec![suggestion_row("taplo")];
+        app.focus = Pane::Problems;
+        app.problem_cursor.index = 0;
+        app
+    }
+
+    #[test]
+    fn blessed_suggestion_offers_install_unblessed_does_not() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+        let calls = Rc::new(RefCell::new(Vec::new()));
+
+        // A matching-version manifest entry unlocks the offer.
+        let app = install_app(&theme, &icons, blessed_manifest("taplo", "0.10.0"), &calls);
+        assert!(
+            app.available_install().is_some(),
+            "a blessed suggestion offers an install",
+        );
+
+        // An empty manifest (production reality) offers nothing.
+        let app = install_app(&theme, &icons, BlessedManifest::default(), &calls);
+        assert!(
+            app.available_install().is_none(),
+            "an unblessed suggestion is structurally unofferable",
+        );
+
+        // A version-skewed entry does not match the recipe pin.
+        let app = install_app(&theme, &icons, blessed_manifest("taplo", "0.9.0"), &calls);
+        assert!(
+            app.available_install().is_none(),
+            "a version-skewed manifest entry does not unlock the offer",
+        );
+    }
+
+    #[test]
+    fn action_key_opens_install_overlay_and_confirm_runs_the_pinned_command() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut app = install_app(&theme, &icons, blessed_manifest("taplo", "0.10.0"), &calls);
+
+        app.begin_action();
+        assert!(
+            app.pending_install.is_some(),
+            "the action key opens the install overlay for a blessed suggestion",
+        );
+        assert!(
+            app.pending_action.is_none(),
+            "an install does not open a mutation overlay",
+        );
+
+        app.confirm_install();
+        let state = app
+            .pending_install
+            .as_ref()
+            .expect("the overlay stays open showing the outcome");
+        let outcome = state.outcome().expect("the install ran");
+        assert!(
+            outcome.success,
+            "the pinned cargo install succeeds: {:?}",
+            outcome.log
+        );
+        assert!(
+            calls.borrow().iter().any(|c| c.as_str() == "cargo"),
+            "confirm ran `cargo install` via argv",
+        );
+    }
+
+    #[test]
+    fn enrich_blessed_suggestion_rewrites_fix_it_to_pinned_form() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+        let mut app = app_with(&theme, &icons, snap_with_servers(1), Config::default());
+        app.recipes = recipes_map("taplo", cargo_recipe());
+
+        // Blessed → the fix-it becomes the exact pinned form.
+        app.blessed = blessed_manifest("taplo", "0.10.0");
+        app.findings = vec![OwnedFinding {
+            finding: Finding::new(
+                FindingCode::ServerInstallSuggestion,
+                Severity::Suggestion,
+                "taplo: not installed",
+            )
+            .with_fix_it("Install `taplo-cli`. Catenary never runs installs for you."),
+            owner: Owner::Server("taplo".to_string()),
+        }];
+        app.enrich_blessed_suggestions();
+        let fix = app.findings[0]
+            .finding
+            .fix_it
+            .as_deref()
+            .expect("fix-it present");
+        assert!(
+            fix.contains("cargo install taplo-cli --version =0.10.0 --locked"),
+            "blessed suggestion shows the pinned form: {fix}",
+        );
+
+        // Unblessed → the fix-it keeps naming the binary only.
+        app.blessed = BlessedManifest::default();
+        app.findings = vec![OwnedFinding {
+            finding: Finding::new(
+                FindingCode::ServerInstallSuggestion,
+                Severity::Suggestion,
+                "taplo: not installed",
+            )
+            .with_fix_it("Install `taplo-cli`. Catenary never runs installs for you."),
+            owner: Owner::Server("taplo".to_string()),
+        }];
+        app.enrich_blessed_suggestions();
+        let fix = app.findings[0]
+            .finding
+            .fix_it
+            .as_deref()
+            .expect("fix-it present");
+        assert!(
+            !fix.contains("Pinned:"),
+            "an unblessed suggestion keeps the binary-only text: {fix}",
         );
     }
 }

@@ -62,6 +62,21 @@ upgrading.
 
 ### Added
 
+- **Guided install: a blessed suggestion is one consented keypress from
+  working coverage.** On a suggestion row whose server has a
+  blessed-manifest entry matching its recipe pin, `a` opens the consent
+  overlay showing exactly what will run — package, pinned version, the
+  fetch URL, and the verification step — before anything executes. npm
+  installs fetch the pinned tarball, verify its sha512 against the recipe
+  (a mismatch aborts before any install), and install the verified
+  artifact with `--ignore-scripts`; cargo uses `--locked` version pins;
+  go rides the checksum DB; pip requires hashes or politely refuses.
+  Everything is spawned as literal argv — no shell strings, no curl|bash.
+  Blessing is structural: an unblessed or version-skewed recipe cannot
+  construct an install action at all, and the shipped manifest starts
+  empty — nothing is offerable until CI conformance blesses it. On
+  success the health model re-probes and the suggestion vanishes. The
+  engine is user-surface only; agents get no install verb.
 - **Guided mutations: the dashboard's fix-its become executable.** On a
   broken-server problem row or a cursored server, `a` opens a consent
   overlay showing exactly what will be written — key, value, target file —
