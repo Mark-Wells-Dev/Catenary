@@ -62,6 +62,24 @@ upgrading.
 
 ### Added
 
+- **Non-git agent worktrees: Subversion and Mercurial projects get real
+  isolated working copies.** Where the project is `.svn` or `.hg`, the
+  WorktreeCreate hook now creates a genuine working copy under the same
+  agents scheme instead of refusing — svn via a fresh `checkout` of the
+  working copy's URL (recording `URL@revision` in the sidecar; note svn
+  checkouts don't share the source's store, so local uncommitted changes
+  don't carry over — surfaced at creation, not hidden), hg via `hg share`
+  (the true worktree analog, extension enabled inline) with `hg clone` as
+  the fallback. Disposal dispatches per VCS with the same guarantees and
+  simpler proofs: svn clean = `svn status` empty (no local-commit class,
+  so no unpushed leg); hg clean = status empty and no draft changesets
+  beyond the recorded base; a clean copy is a plain directory delete — no
+  branch or registration legs. The armed WorktreeRemove handler — dormant
+  for git, where the host never fires it — is live for non-git from day
+  one, same scheme-and-sidecar guard, same dirty refusal.
+  `.worktreeinclude` and `catenary worktree rm` work across VCSes; feats
+  stay git-only; `.jj` keeps the named refusal (no binary to verify
+  against).
 - **Catenary owns the agent-worktree lifecycle end to end: the
   `catenary worktree` surface and guarded disposal.** Two worktree classes:
   *agent* worktrees (hook-created isolation copies) and *feats* worktrees —
@@ -115,9 +133,11 @@ upgrading.
   default behavior entirely, the hook **reimplements `.worktreeinclude`**
   (gitignore-syntax patterns; matching local files like `.env` are copied
   into the new worktree, existing checked-out files never clobbered) — no
-  host feature is lost. Non-git working copies get an honest named refusal
-  (`.svn`/`.hg`/`.jj` detected and named; "configure your own WorktreeCreate
-  hook") instead of a raw git error.
+  host feature is lost. Non-git working copies originally got an honest
+  named refusal (`.svn`/`.hg`/`.jj` detected and named) instead of a raw
+  git error; later in the release `.svn`/`.hg` graduated to real working
+  copies (see the non-git worktrees entry) and only `.jj` keeps the
+  refusal.
 - **`grep` flag muscle-memory.** `-n`/`--line-number` and
   `-H`/`--with-filename` now parse and do
   nothing — line numbers (`path:N`) and filenames are unconditional in the

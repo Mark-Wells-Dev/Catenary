@@ -4037,7 +4037,12 @@ async fn handle_hook_dispatch(
             // misc 151 trigger 4: the WorktreeRemove handler, armed. The host
             // decided removal, so dispose with `host_initiated` — the clean check
             // is advisory (still refuses dirty; a dirty keep logs the divergence
-            // inside `dispose`, host asked/we declined). Background for git.
+            // inside `dispose`, host asked/we declined). This is the LIVE leg for
+            // non-git (svn/hg) worktrees (misc 148): the host fires WorktreeRemove
+            // for them and expects the copy deleted, and `dispose` dispatches on
+            // the sidecar VCS to a plain directory delete after its clean proof.
+            // The guard is unchanged — never a path outside our scheme or without
+            // a sidecar. (Dormant for git, whose worktrees the host removes itself.)
             let registry = ctx.worktree_registry.clone();
             let sid = session_id.clone();
             let wt = canonical.clone();
@@ -10017,6 +10022,7 @@ mod tests {
             created_at: "2026-07-06T00:00:00.000Z".to_string(),
             class: "agent".to_string(),
             link: None,
+            vcs: crate::worktree_create::WORKTREE_VCS_GIT.to_string(),
         };
         let _ = hook_roundtrip(
             &ipc_path,
@@ -10089,6 +10095,7 @@ mod tests {
             created_at: "2026-07-06T00:00:00.000Z".to_string(),
             class: "agent".to_string(),
             link: None,
+            vcs: crate::worktree_create::WORKTREE_VCS_GIT.to_string(),
         };
         crate::worktree_create::write_sidecar(&meta).expect("write sidecar");
 

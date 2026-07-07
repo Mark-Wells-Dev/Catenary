@@ -42,14 +42,27 @@
 //! reimplements the copy ([`copy_worktree_includes`]) or the host feature would
 //! silently regress (misc 144).
 //!
-//! ## VCS detection
+//! ## VCS detection and non-git support (misc 148)
 //!
-//! `cwd` is examined for a version-control marker before any git call: `.git`
-//! (a dir or a worktree file) proceeds on the git path; a non-git marker (`.svn`,
-//! `.hg`, `.jj`, in `cwd` or an ancestor) fails with a single honest line that
-//! names the detected VCS; no marker at all fails as "not a version-controlled
-//! directory". A non-git working copy therefore never sees a raw git error
-//! (misc 144 — VCS detection is in-scope, VCS *support* is not).
+//! `cwd` is examined for a version-control marker before any VCS call: `.git`
+//! (a dir or a worktree file), `.svn`, or `.hg` (in `cwd` or an ancestor) each
+//! create a real working copy under the agents scheme; `.jj` keeps a single
+//! honest line naming the detected VCS (decision-030 gate still closed — no
+//! jujutsu binary on the host); no marker at all fails as "not a
+//! version-controlled directory". A `.jj`/unversioned directory therefore never
+//! sees a raw VCS error.
+//!
+//! Each backing VCS gets its worktree-shaped analog: git — `git worktree add`
+//! (shared object store); **hg — `hg share`** ([`create_hg_copy`]: the true
+//! analog — a shared store with a separate working dir, `hg clone` as the
+//! fallback when the bundled `share` extension is unavailable); **svn —
+//! `svn checkout <URL@revision>`** ([`create_svn_copy`]: a second, independent
+//! working copy). svn's checkout does not share the source working copy's object
+//! store, so **local uncommitted changes in the source do NOT carry over** — an
+//! inherent parity gap, surfaced honestly at creation (a `warn!`) rather than
+//! hidden. The sidecar records the VCS ([`WorktreeMeta::vcs`]) and its per-VCS
+//! base marker ([`WorktreeMeta::base_commit`]), which the disposal clean proof
+//! consumes (misc 148/151).
 //!
 //! ## Orphan prune
 //!
@@ -99,6 +112,28 @@ pub const WORKTREE_CLASS_AGENT: &str = "agent";
 /// explicitly and its `rm` refuses dirty (uncommitted or unpushed).
 pub const WORKTREE_CLASS_FEAT: &str = "feat";
 
+/// Sidecar `vcs` value for a git worktree (the default; misc 148).
+///
+/// Stored as a plain string so an unknown future VCS round-trips through an older
+/// reader, and so a pre-misc-148 sidecar (which carried no `vcs` field)
+/// deserializes as git via [`default_vcs`].
+pub const WORKTREE_VCS_GIT: &str = "git";
+
+/// Sidecar `vcs` value for a Subversion working-copy worktree (misc 148).
+pub const WORKTREE_VCS_SVN: &str = "svn";
+
+/// Sidecar `vcs` value for a Mercurial shared/cloned worktree (misc 148).
+pub const WORKTREE_VCS_HG: &str = "hg";
+
+/// The `vcs` a sidecar without the field defaults to — git.
+///
+/// A pre-misc-148 sidecar predates non-git support, so it can only describe a git
+/// worktree; the `#[serde(default = "default_vcs")]` on [`WorktreeMeta::vcs`]
+/// therefore round-trips it as [`WORKTREE_VCS_GIT`].
+fn default_vcs() -> String {
+    WORKTREE_VCS_GIT.to_string()
+}
+
 /// Durable creation metadata written beside each agent worktree as a
 /// `<worktree-dir>.meta.json` **sibling** (never inside the worktree, so
 /// `git status` stays pristine).
@@ -113,9 +148,12 @@ pub struct WorktreeMeta {
     pub worktree: PathBuf,
     /// The source repo the worktree was cut from (`git rev-parse --show-toplevel`).
     pub source_repo: PathBuf,
-    /// `HEAD` commit at `git worktree add` time — the exact base the disposal
-    /// clean-check compares `HEAD` against (misc 151), so it is recorded, not
-    /// heuristic.
+    /// The per-VCS **base marker** recorded at creation, the exact base the
+    /// disposal clean-check compares against (misc 151/148), so it is recorded,
+    /// not heuristic. Per [`vcs`](Self::vcs): git records the `HEAD` commit; svn
+    /// records the checked-out `URL@revision` (there is no local-commit class, so
+    /// this is a record, not a clean-check lever); hg records the base changeset
+    /// node (the clean-check rejects draft changesets beyond it).
     pub base_commit: String,
     /// The branch created for the worktree (`git worktree add -b <branch>`).
     pub branch: String,
@@ -140,6 +178,14 @@ pub struct WorktreeMeta {
     /// plant no link. `#[serde(default)]` so a pre-misc-151 sidecar round-trips.
     #[serde(default)]
     pub link: Option<PathBuf>,
+    /// The version-control system backing this worktree ([`WORKTREE_VCS_GIT`],
+    /// [`WORKTREE_VCS_SVN`], or [`WORKTREE_VCS_HG`]; misc 148). Governs the
+    /// disposal clean-proof and removal mechanics — a git worktree is removed with
+    /// `git worktree remove`, a non-git working copy is a plain directory delete
+    /// after its VCS-appropriate clean proof. `#[serde(default = "default_vcs")]`
+    /// so a pre-misc-148 sidecar (no field) round-trips as git.
+    #[serde(default = "default_vcs")]
+    pub vcs: String,
 }
 
 /// Create an out-of-tree agent worktree from a `WorktreeCreate` payload.
@@ -150,23 +196,29 @@ pub struct WorktreeMeta {
 ///
 /// 1. Resolve the payload's `cwd` (Claude Code sends the repo root), falling back
 ///    to the process working directory.
-/// 2. Detect the VCS at `cwd` ([`detect_vcs`]): git proceeds; a non-git working
-///    copy (`.svn`/`.hg`/`.jj`) or an unversioned directory fails with an honest,
-///    VCS-named line — never a raw git error.
-/// 3. Resolve the source repo with `git rev-parse --show-toplevel`.
-/// 4. Prune orphaned worktrees under the agents subtree and the legacy cache
-///    location ([`prune_agent_orphans`] / [`prune_orphans`]).
-/// 5. `git -C <repo> worktree add -b <branch> <agents-subtree path>`.
-/// 6. Copy `.worktreeinclude`-matched local config into the worktree
-///    ([`copy_worktree_includes`]).
-/// 7. Write the durable sidecar ([`write_sidecar`], best-effort).
+/// 2. Detect the VCS at `cwd` ([`detect_vcs`]): git, svn, and hg each create a
+///    real working copy; `.jj` keeps the named refusal (decision-030 gate still
+///    closed — no binary on the host); an unversioned directory fails with an
+///    honest, VCS-named line — never a raw VCS error.
+/// 3. Prune orphaned worktrees under the agents subtree and the legacy cache
+///    location ([`prune_agent_orphans`] / [`prune_orphans`]) and age-sweep clean
+///    stragglers.
+/// 4. Create the per-VCS working copy under the agents scheme:
+///    git — `git worktree add -b <branch>` (shared object store); svn —
+///    `svn checkout <URL@revision>` (a second working copy; local uncommitted
+///    changes do NOT carry over — see [`create_svn_copy`]); hg — `hg share` (the
+///    worktree analog: shared store, separate working dir), falling back to
+///    `hg clone` when the bundled `share` extension is unavailable.
+/// 5. Copy `.worktreeinclude`-matched local config into the worktree
+///    ([`copy_worktree_includes`]) — applies to every VCS.
+/// 6. Write the durable sidecar ([`write_sidecar`], best-effort) recording the
+///    VCS and its per-VCS base marker.
 ///
 /// # Errors
 ///
 /// Returns an error — the loud, nonzero-exit failure the host contract requires
-/// — when no repo can be resolved (missing/invalid `cwd`, a non-git or
-/// unversioned `cwd`, or `cwd` outside any git working tree) or when
-/// `git worktree add` fails.
+/// — when no repo can be resolved (missing/invalid `cwd`, a `.jj` or unversioned
+/// `cwd`, or `cwd` outside any working tree) or when the VCS copy command fails.
 pub fn create_from_payload(payload: &Value) -> Result<WorktreeMeta> {
     let cwd = payload
         .get("cwd")
@@ -175,19 +227,20 @@ pub fn create_from_payload(payload: &Value) -> Result<WorktreeMeta> {
         .or_else(|| std::env::current_dir().ok())
         .ok_or_else(|| anyhow!("no `cwd` in payload and no process working directory"))?;
 
-    // VCS detection precedes any git call so a non-git working copy gets an
-    // honest, VCS-named refusal instead of a raw git error (misc 144, item 5).
-    match detect_vcs(&cwd) {
-        VcsPosture::Git => {}
-        VcsPosture::Foreign(vcs) => bail!("{}", vcs.refusal()),
+    // VCS detection precedes any VCS call. git/svn/hg each get a real working
+    // copy (misc 148); `.jj` keeps the honest named refusal (decision-030 gate
+    // still closed), and an unversioned dir gets the marker-list error — never a
+    // raw VCS error.
+    let vcs = match detect_vcs(&cwd) {
+        VcsPosture::Git => CreateVcs::Git,
+        VcsPosture::Foreign(ForeignVcs::Svn) => CreateVcs::Svn,
+        VcsPosture::Foreign(ForeignVcs::Hg) => CreateVcs::Hg,
+        VcsPosture::Foreign(ForeignVcs::Jj) => bail!("{}", ForeignVcs::Jj.refusal()),
         VcsPosture::Unversioned => bail!(
             "{} is not a version-controlled directory (no .git, .svn, .hg, or .jj marker found)",
             cwd.display(),
         ),
-    }
-
-    let repo = repo_toplevel(&cwd)
-        .with_context(|| format!("cannot resolve a git repository from {}", cwd.display()))?;
+    };
 
     // Prune before adding — cheap (a readdir + a stat per entry), self-contained,
     // and run at exactly the cadence the worktrees dir grows. Sweep BOTH the new
@@ -235,24 +288,26 @@ pub fn create_from_payload(payload: &Value) -> Result<WorktreeMeta> {
     let worktree = paths::agent_worktree_dir(&session_id, &segment);
     let branch = branch_name(payload, &unique_id);
 
-    // Ensure the worktrees root exists; `git worktree add` creates the leaf.
+    // Ensure the worktrees root exists; the VCS copy command creates the leaf.
     if let Some(parent) = worktree.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create worktrees dir {}", parent.display()))?;
     }
 
-    git_worktree_add(&repo, &worktree, &branch)?;
+    // Per-VCS working-copy creation. Each arm returns the source root, the base
+    // marker, and the VCS tag for the sidecar.
+    let created = match vcs {
+        CreateVcs::Git => create_git_copy(&cwd, &worktree, &branch)?,
+        CreateVcs::Svn => create_svn_copy(&cwd, &worktree)?,
+        CreateVcs::Hg => create_hg_copy(&cwd, &worktree)?,
+    };
 
     // Reimplement Claude Code's `.worktreeinclude` copy: the hook replaces the
     // host default entirely, so untracked local config (the `.env` class) a fresh
     // checkout lacks must be carried into the worktree here (misc 144, hard
-    // requirement). Best-effort — never fails a created worktree.
-    copy_worktree_includes(&repo, &worktree);
-
-    // The base commit the disposal clean-check compares against (misc 151):
-    // `HEAD` right after creation. Best-effort — an empty base is a keep-forever
-    // conservative default, never a wrong deletion.
-    let base_commit = git_head(&repo).unwrap_or_default();
+    // requirement — applies to every VCS). Best-effort — never fails a created
+    // worktree.
+    copy_worktree_includes(&created.source_repo, &worktree);
 
     // Canonicalize so the registry value matches the daemon's canonicalized
     // mount key; the dir exists now, so canonicalization succeeds.
@@ -260,8 +315,8 @@ pub fn create_from_payload(payload: &Value) -> Result<WorktreeMeta> {
 
     let meta = WorktreeMeta {
         worktree,
-        source_repo: repo,
-        base_commit,
+        source_repo: created.source_repo,
+        base_commit: created.base_marker,
         branch,
         name: raw_name.unwrap_or("").to_string(),
         agent_id,
@@ -269,6 +324,7 @@ pub fn create_from_payload(payload: &Value) -> Result<WorktreeMeta> {
         created_at: crate::state_snapshot::now_iso(),
         class: WORKTREE_CLASS_AGENT.to_string(),
         link: None,
+        vcs: created.vcs.to_string(),
     };
 
     // The durable half of the registry — a sidecar beside (never inside) the
@@ -375,6 +431,7 @@ pub fn create_feat_worktree(
         created_at: crate::state_snapshot::now_iso(),
         class: WORKTREE_CLASS_FEAT.to_string(),
         link: Some(link),
+        vcs: WORKTREE_VCS_GIT.to_string(),
     };
     write_sidecar(&meta).with_context(|| "write feats worktree sidecar")?;
     Ok(meta)
@@ -590,6 +647,264 @@ fn scan_sidecars_into(dir: &Path, out: &mut Vec<WorktreeMeta>) {
     }
 }
 
+/// The supported creation VCSes (misc 148) — the subset of [`detect_vcs`]'s
+/// postures that yield a real working copy. `.jj` and unversioned dirs never
+/// reach this enum (they bail in [`create_from_payload`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateVcs {
+    /// git — `git worktree add` (shared object store, separate working dir).
+    Git,
+    /// svn — `svn checkout` of the source working copy's `URL@revision`.
+    Svn,
+    /// hg — `hg share` (shared store), falling back to `hg clone`.
+    Hg,
+}
+
+/// What a per-VCS creation function reports back to [`create_from_payload`]: the
+/// source root, the per-VCS base marker, and the `vcs` tag for the sidecar.
+struct VcsCreation {
+    /// The source working-copy/repo root (git toplevel, svn wc-root, hg root).
+    source_repo: PathBuf,
+    /// The per-VCS base marker recorded in the sidecar
+    /// ([`WorktreeMeta::base_commit`]): git `HEAD`, svn `URL@revision`, hg node.
+    base_marker: String,
+    /// The sidecar `vcs` tag ([`WORKTREE_VCS_GIT`] / [`WORKTREE_VCS_SVN`] /
+    /// [`WORKTREE_VCS_HG`]).
+    vcs: &'static str,
+}
+
+/// Create the git working copy: `git worktree add -b <branch>` (shared object
+/// store) and record `HEAD` as the base commit.
+fn create_git_copy(cwd: &Path, worktree: &Path, branch: &str) -> Result<VcsCreation> {
+    let repo = repo_toplevel(cwd)
+        .with_context(|| format!("cannot resolve a git repository from {}", cwd.display()))?;
+    git_worktree_add(&repo, worktree, branch)?;
+    // The base commit the disposal clean-check compares against (misc 151): `HEAD`
+    // right after creation. Best-effort — an empty base is a keep-forever
+    // conservative default, never a wrong deletion.
+    let base_marker = git_head(&repo).unwrap_or_default();
+    Ok(VcsCreation {
+        source_repo: repo,
+        base_marker,
+        vcs: WORKTREE_VCS_GIT,
+    })
+}
+
+/// Create the svn working copy: `svn checkout` of the source working copy's URL
+/// into the agents scheme (misc 148).
+///
+/// svn has no worktree concept and its checkouts do **not** share the source
+/// working copy's object store the way a git worktree does, so this is a second,
+/// independent working copy checked out at the repository's current state (HEAD)
+/// of the source's URL. **Local uncommitted changes in the source working copy do
+/// NOT carry over** — an inherent parity gap (a git worktree shares the object
+/// store; an svn checkout re-materializes committed state from the repository).
+/// The gap is surfaced honestly, not hidden: a `warn!` at creation names it (and
+/// the module docs record it), so the caller who needs those changes commits them
+/// in the source working copy first.
+///
+/// The recorded base marker is `URL@revision`, where `revision` is the revision
+/// the fresh checkout landed at (read back from the copy — a fresh checkout is
+/// uniform-revision, so this is exact, sidestepping the mixed-revision root a
+/// live source working copy can carry). svn has no local-commit class (commits go
+/// straight to the repository), so the disposal clean proof is `svn status` empty
+/// alone — there is no unpushed leg.
+fn create_svn_copy(cwd: &Path, worktree: &Path) -> Result<VcsCreation> {
+    let url = svn_info_item(cwd, "url")?;
+    let wc_root = svn_info_item(cwd, "wc-root").map_or_else(|_| cwd.to_path_buf(), PathBuf::from);
+
+    let output = Command::new("svn")
+        .args(["checkout", "--non-interactive"])
+        .arg(&url)
+        .arg(worktree)
+        .output()
+        .context("run `svn checkout`")?;
+    if !output.status.success() {
+        bail!(
+            "`svn checkout` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+    }
+
+    // Read the revision the fresh checkout landed at (uniform across a fresh
+    // checkout — no mixed-revision ambiguity), recorded as the base marker.
+    let revision = svn_info_item(worktree, "revision").unwrap_or_else(|_| "HEAD".to_string());
+    let peg = format!("{url}@{revision}");
+
+    // Surface the inherent parity gap (user-relevant + actionable, so `warn!`):
+    // unlike a git worktree, an svn checkout re-materializes committed state, so
+    // uncommitted changes in the source working copy are absent from the copy.
+    warn!(
+        source = Source::HookDispatch.as_str(),
+        worktree = %worktree.display(),
+        base = %peg,
+        "created svn worktree copy at {peg}; an svn checkout does not share the source \
+         working copy's store, so local uncommitted changes did NOT carry over — commit \
+         them in the source working copy first if the copy needs them",
+    );
+    debug!(
+        source = Source::HookDispatch.as_str(),
+        worktree = %worktree.display(),
+        base = %peg,
+        "created out-of-tree svn worktree copy",
+    );
+    Ok(VcsCreation {
+        source_repo: wc_root,
+        base_marker: peg,
+        vcs: WORKTREE_VCS_SVN,
+    })
+}
+
+/// Create the hg working copy: `hg share` (the git-worktree analog — a shared
+/// store with a separate working dir), falling back to `hg clone` (misc 148).
+///
+/// **Posture (share, not clone):** `hg share` is the true worktree analog — the
+/// dest carries only a `.hg/sharedpath` pointer at the source's store, so
+/// changesets committed in the copy land in the shared store (visible to the
+/// source) exactly as a git worktree's commits land in the shared object store.
+/// The bundled `share` extension is enabled inline (`--config extensions.share=`)
+/// so the posture holds regardless of the user's hgrc. **Fallback (clone):** when
+/// `hg share` fails (a build without the bundled extension), a full `hg clone` is
+/// taken instead — a self-contained copy whose store is its own. Disposal is
+/// identical for both: a clean copy (status empty + no draft beyond the recorded
+/// base) is a plain directory delete, so neither posture can lose committed work.
+///
+/// The recorded base marker is the copy's working-dir parent changeset node.
+fn create_hg_copy(cwd: &Path, worktree: &Path) -> Result<VcsCreation> {
+    let root = hg_root(cwd)?;
+    if let Err(share_err) = hg_share(&root, worktree) {
+        debug!(
+            source = Source::HookDispatch.as_str(),
+            error = %share_err,
+            "`hg share` unavailable; falling back to `hg clone`",
+        );
+        hg_clone(&root, worktree)?;
+    }
+    // The base changeset the disposal clean-check compares draft descendants
+    // against (misc 148): the copy's working-dir parent right after creation.
+    let base_marker = hg_node(worktree).unwrap_or_default();
+    debug!(
+        source = Source::HookDispatch.as_str(),
+        worktree = %worktree.display(),
+        base = %base_marker,
+        "created out-of-tree hg worktree copy",
+    );
+    Ok(VcsCreation {
+        source_repo: root,
+        base_marker,
+        vcs: WORKTREE_VCS_HG,
+    })
+}
+
+/// Read a single `svn info --show-item <item>` value for `dir` (the source
+/// working copy). Errors loudly (the hook contract) on any svn failure or an
+/// empty value.
+fn svn_info_item(dir: &Path, item: &str) -> Result<String> {
+    let output = Command::new("svn")
+        .args(["info", "--show-item", item])
+        .arg(dir)
+        .output()
+        .with_context(|| format!("run `svn info --show-item {item}`"))?;
+    if !output.status.success() {
+        bail!(
+            "`svn info --show-item {item}` failed for {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        bail!(
+            "`svn info --show-item {item}` returned no value for {}",
+            dir.display(),
+        );
+    }
+    Ok(value)
+}
+
+/// Resolve the Mercurial repository root containing `dir` (`hg --cwd <dir> root`).
+fn hg_root(dir: &Path) -> Result<PathBuf> {
+    let output = Command::new("hg")
+        .arg("--cwd")
+        .arg(dir)
+        .arg("root")
+        .output()
+        .context("run `hg root`")?;
+    if !output.status.success() {
+        bail!(
+            "`hg root` failed for {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        bail!("`hg root` returned no path for {}", dir.display());
+    }
+    Ok(PathBuf::from(path))
+}
+
+/// `hg share <source> <dest>` with the bundled `share` extension enabled inline.
+///
+/// The dest is created sharing the source's store with its own working dir,
+/// updated to the source's tip. Errors when the command fails (e.g. the extension
+/// is unavailable), which the caller treats as the signal to fall back to a clone.
+fn hg_share(source: &Path, dest: &Path) -> Result<()> {
+    let output = Command::new("hg")
+        .args(["--config", "extensions.share="])
+        .arg("share")
+        .arg(source)
+        .arg(dest)
+        .output()
+        .context("run `hg share`")?;
+    if !output.status.success() {
+        bail!(
+            "`hg share` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+    }
+    Ok(())
+}
+
+/// `hg clone <source> <dest>` — the self-contained fallback when `hg share` is
+/// unavailable.
+fn hg_clone(source: &Path, dest: &Path) -> Result<()> {
+    let output = Command::new("hg")
+        .arg("clone")
+        .arg(source)
+        .arg(dest)
+        .output()
+        .context("run `hg clone`")?;
+    if !output.status.success() {
+        bail!(
+            "`hg clone` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+    }
+    Ok(())
+}
+
+/// The working-dir parent changeset node of the hg working copy at `dir`
+/// (`hg --cwd <dir> log -r . -T {node}`), or `None` on any hg failure — the
+/// caller records an empty base as a keep-forever conservative default.
+#[allow(
+    clippy::literal_string_with_formatting_args,
+    reason = "`{node}` is an hg output template, not a Rust format argument"
+)]
+fn hg_node(dir: &Path) -> Option<String> {
+    let output = Command::new("hg")
+        .arg("--cwd")
+        .arg(dir)
+        .args(["log", "-r", ".", "-T", "{node}"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let node = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!node.is_empty()).then_some(node)
+}
+
 /// Resolve the toplevel of the git working tree containing `cwd`.
 ///
 /// Runs `git -C <cwd> rev-parse --show-toplevel`. Errors when `cwd` is not
@@ -787,7 +1102,14 @@ fn copy_worktree_includes(repo: &Path, worktree: &Path) {
 
     let walker = ignore::WalkBuilder::new(repo)
         .standard_filters(false) // include hidden + git-ignored files (the point)
-        .filter_entry(|entry| entry.file_name() != ".git")
+        // Never descend into a VCS metadata dir — for any backing VCS (misc 148),
+        // its internal store is not `.worktreeinclude` config.
+        .filter_entry(|entry| {
+            !matches!(
+                entry.file_name().to_str(),
+                Some(".git" | ".svn" | ".hg" | ".jj")
+            )
+        })
         .build();
 
     let mut copied = 0usize;
@@ -933,14 +1255,22 @@ pub fn prune_agent_orphans(agents_root: &Path) -> usize {
     removed
 }
 
-/// Whether a cache-dir worktree directory's git linkage is dead.
+/// Whether a worktree directory's git linkage is dead (a prune-by-linkage
+/// candidate).
 ///
-/// Reads the worktree's `.git` file (`gitdir: <metadata>`); the linkage is dead
-/// when the file is missing/unreadable, carries no `gitdir:` line, or names a
-/// metadata directory that no longer exists on disk. A relative `gitdir:` is
-/// resolved against the worktree directory (git writes an absolute path by
-/// default, but tolerate both).
+/// A non-git working copy (svn `.svn` / hg `.hg`; misc 148) is **never** a dead
+/// git worktree — it is a live copy whose only disposal paths are the VCS-aware
+/// age sweep and the `WorktreeRemove` handler, not this git-linkage prune — so it
+/// is always kept here. Otherwise the linkage is read from the worktree's `.git`
+/// file (`gitdir: <metadata>`): dead when the file is missing/unreadable, carries
+/// no `gitdir:` line, or names a metadata directory that no longer exists on disk
+/// (a relative `gitdir:` resolves against the worktree directory — git writes an
+/// absolute path by default, but tolerate both).
 fn linkage_dead(worktree: &Path) -> bool {
+    // A live non-git working copy is not a dead git worktree — keep it.
+    if worktree.join(".svn").exists() || worktree.join(".hg").exists() {
+        return false;
+    }
     let Ok(contents) = std::fs::read_to_string(worktree.join(".git")) else {
         return true;
     };
@@ -969,9 +1299,22 @@ mod tests {
 
     use super::{
         ForeignVcs, VcsPosture, WorktreeMeta, branch_name, copy_worktree_includes,
-        create_feat_worktree, detect_vcs, linkage_dead, parse_agent_id, prune_agent_orphans,
-        prune_orphans, scan_sidecars, sidecar_path, worktree_segment, write_sidecar,
+        create_feat_worktree, create_hg_copy, create_svn_copy, detect_vcs, linkage_dead,
+        parse_agent_id, prune_agent_orphans, prune_orphans, scan_sidecars, sidecar_path,
+        worktree_segment, write_sidecar,
     };
+
+    /// Whether `bin` is on PATH (runs `<bin> --version`). Binary-gated svn/hg
+    /// tests skip when their VCS is absent, so CI without it stays green while
+    /// this host (both installed) exercises the real end-to-end flow (misc 148).
+    fn have_bin(bin: &str) -> bool {
+        std::process::Command::new(bin)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
 
     /// Run a git command in `dir` with a pinned, isolated identity.
     fn tgit(dir: &Path, args: &[&str]) {
@@ -1223,6 +1566,7 @@ mod tests {
             created_at: "2026-07-06T00:00:00.000Z".to_string(),
             class: super::WORKTREE_CLASS_AGENT.to_string(),
             link: None,
+            vcs: super::WORKTREE_VCS_GIT.to_string(),
         }
     }
 
@@ -1480,14 +1824,154 @@ mod tests {
     }
 
     #[test]
-    fn refusal_names_each_detected_vcs() {
-        assert!(ForeignVcs::Svn.refusal().contains("svn"));
-        assert!(ForeignVcs::Hg.refusal().contains("mercurial"));
-        assert!(ForeignVcs::Hg.refusal().contains("hg"));
+    fn refusal_names_jj_the_still_refused_vcs() {
+        // svn/hg now create real copies (misc 148); `.jj` keeps the named refusal.
         assert!(ForeignVcs::Jj.refusal().contains("jujutsu"));
         assert!(ForeignVcs::Jj.refusal().contains("jj"));
-        // The refusal is a single line — never a raw git error.
-        assert!(!ForeignVcs::Svn.refusal().contains('\n'));
-        assert!(ForeignVcs::Svn.refusal().contains("git repos"));
+        // The refusal is a single line — never a raw VCS error.
+        assert!(!ForeignVcs::Jj.refusal().contains('\n'));
+        assert!(ForeignVcs::Jj.refusal().contains("git repos"));
+    }
+
+    // ── Sidecar VCS field (misc 148) ───────────────────────────────────────
+
+    #[test]
+    fn sidecar_default_vcs_is_git() {
+        // A pre-misc-148 sidecar carries no `vcs` field; it must round-trip as git.
+        let json = r#"{
+            "worktree": "/state/catenary/worktrees/agents/s/a",
+            "source_repo": "/repo",
+            "base_commit": "deadbeef",
+            "branch": "agent-a",
+            "name": "agent-a",
+            "agent_id": "a",
+            "session_id": "s",
+            "created_at": "2026-07-06T00:00:00.000Z",
+            "class": "agent"
+        }"#;
+        let meta: WorktreeMeta = serde_json::from_str(json).expect("deserialize legacy sidecar");
+        assert_eq!(meta.vcs, super::WORKTREE_VCS_GIT);
+        assert_eq!(meta.link, None);
+    }
+
+    #[test]
+    fn sidecar_records_and_scans_the_vcs_and_base_marker() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let agents = tmp.path().join("agents");
+        let wt = agents.join("sess-1").join("svncopy");
+        std::fs::create_dir_all(&wt).expect("mkdir worktree");
+        let mut meta = meta_for(&wt);
+        meta.vcs = super::WORKTREE_VCS_SVN.to_string();
+        meta.base_commit = "file:///srv/repo@42".to_string();
+        write_sidecar(&meta).expect("write sidecar");
+
+        let scanned = scan_sidecars(&agents);
+        assert_eq!(scanned.len(), 1, "one sidecar recovered: {scanned:?}");
+        assert_eq!(scanned[0].vcs, super::WORKTREE_VCS_SVN);
+        assert_eq!(
+            scanned[0].base_commit, "file:///srv/repo@42",
+            "the svn URL@revision base marker round-trips",
+        );
+    }
+
+    // ── End-to-end non-git creation (binary-gated; misc 148) ───────────────
+
+    #[test]
+    fn create_svn_copy_checks_out_a_second_working_copy() {
+        if !have_bin("svn") || !have_bin("svnadmin") {
+            return; // binary-gated: CI without svn stays green
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("svnrepo");
+        let cfg = tmp.path().join("svncfg");
+        let wc = tmp.path().join("wc");
+
+        assert!(
+            std::process::Command::new("svnadmin")
+                .arg("create")
+                .arg(&repo)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("run svnadmin")
+                .success(),
+            "svnadmin create failed",
+        );
+        let url = format!("file://{}", repo.display());
+        let svn = |args: &[&str]| {
+            let status = std::process::Command::new("svn")
+                .arg("--config-dir")
+                .arg(&cfg)
+                .arg("--non-interactive")
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("run svn");
+            assert!(status.success(), "svn {args:?} failed");
+        };
+        svn(&["checkout", &url, &wc.to_string_lossy()]);
+        std::fs::write(wc.join("tracked.txt"), "hello").expect("write tracked");
+        svn(&["add", &wc.join("tracked.txt").to_string_lossy()]);
+        svn(&["commit", "-m", "c", &wc.to_string_lossy()]);
+
+        let dest = tmp.path().join("copy");
+        let created = create_svn_copy(&wc, &dest).expect("create svn copy");
+        assert_eq!(created.vcs, super::WORKTREE_VCS_SVN);
+        assert!(
+            created.base_marker.contains('@'),
+            "base marker is URL@revision: {}",
+            created.base_marker,
+        );
+        assert!(
+            dest.join(".svn").exists(),
+            "the copy is an svn working copy"
+        );
+        assert!(
+            dest.join("tracked.txt").exists(),
+            "the committed file materialized in the second working copy",
+        );
+    }
+
+    #[test]
+    fn create_hg_copy_makes_a_working_copy() {
+        if !have_bin("hg") {
+            return; // binary-gated: CI without hg stays green
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("hgrepo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        // Use the ambient hg config (so the source repo's format matches the copy
+        // `hg share`/`hg clone` creates), pinning only the commit identity.
+        let thg = |args: &[&str]| {
+            let status = std::process::Command::new("hg")
+                .arg("--cwd")
+                .arg(&repo)
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("run hg");
+            assert!(status.success(), "hg {args:?} failed");
+        };
+        thg(&["init"]);
+        std::fs::write(repo.join("tracked.txt"), "hello").expect("write tracked");
+        thg(&["add", "tracked.txt"]);
+        thg(&["--config", "ui.username=catenary-test", "commit", "-m", "c"]);
+
+        let dest = tmp.path().join("copy");
+        let created = create_hg_copy(&repo, &dest).expect("create hg copy");
+        assert_eq!(created.vcs, super::WORKTREE_VCS_HG);
+        assert_eq!(
+            created.base_marker.len(),
+            40,
+            "base marker is a full changeset node: {}",
+            created.base_marker,
+        );
+        assert!(dest.join(".hg").exists(), "the copy is an hg working copy");
+        assert!(
+            dest.join("tracked.txt").exists(),
+            "the committed file is present in the copy",
+        );
     }
 }

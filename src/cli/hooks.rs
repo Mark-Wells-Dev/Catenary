@@ -2271,6 +2271,7 @@ mod tests {
             created_at: "2026-07-06T00:00:00.000Z".to_string(),
             class: crate::worktree_create::WORKTREE_CLASS_AGENT.to_string(),
             link: None,
+            vcs: crate::worktree_create::WORKTREE_VCS_GIT.to_string(),
         };
         crate::worktree_create::write_sidecar(&meta).expect("write sidecar");
 

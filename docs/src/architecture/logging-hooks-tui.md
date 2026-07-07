@@ -277,11 +277,24 @@ two host behaviors are reimplemented in `worktree_create.rs`. First,
 (`.gitignore` pattern syntax); `copy_worktree_includes` carries the matched
 files into the relocated worktree, preserving relative paths and skipping any
 path already checked out (so tracked files are never clobbered). Second, VCS
-detection: before any git call, `detect_vcs` examines the payload `cwd` (and its
-ancestors) for a marker — `.git` proceeds on the relocation path, while a non-git
-working copy (`.svn`/`.hg`/`.jj`) or an unversioned directory fails with a single
-honest line naming the detected VCS rather than a raw git error (VCS detection is
-in-scope; non-git VCS *support* is not).
+detection and per-VCS creation: before any VCS call, `detect_vcs` examines the
+payload `cwd` (and its ancestors) for a marker, and each supported VCS gets its
+worktree-shaped analog under the agents scheme —
+
+- **git** — `git worktree add` (shared object store, separate working dir);
+- **hg** — `hg share` (the true worktree analog: a shared store with a separate
+  working dir), falling back to `hg clone` when the bundled `share` extension is
+  unavailable;
+- **svn** — `svn checkout` of the source working copy's `URL@revision` (a second,
+  independent working copy). svn has no shared-store worktree concept, so local
+  uncommitted changes in the source do **not** carry over — an inherent parity
+  gap, surfaced honestly at creation (a user notification) rather than hidden.
+
+`.jj` keeps the single honest refusal line naming the detected VCS (decision-030
+gate still closed — no jujutsu binary on the host), and an unversioned directory
+gets the marker-list error rather than a raw VCS error. The sidecar records the
+backing VCS and its per-VCS base marker (git `HEAD`, svn `URL@revision`, hg base
+changeset), which the disposal clean proof consumes (misc 148).
 
 ### Worktree-root teardown
 
@@ -290,7 +303,13 @@ torn down at `WorktreeRemove`. But `WorktreeRemove` **never fires for git
 worktrees**: the host runs `git worktree remove` itself and invokes the
 hook only for the non-git VCS / `--worktree` session-exit path. So for the
 common git case the prompt teardown signal is the **directory deletion**
-itself. The daemon reaps the `worktree:{session_id}:{path}` root via a
+itself. For a **non-git (svn/hg) worktree** the host *does* fire
+`WorktreeRemove` and expects the hook to delete the copy: the handler runs
+the same guarded disposal routine (`worktree_dispose::dispose` with
+`host_initiated`) that every other trigger uses — a clean copy is deleted,
+a dirty one is refused with a logged divergence, and a path outside our
+scheme or lacking a sidecar is never touched (misc 148). This is the live
+leg of the arming that stays dormant for git. The daemon reaps the `worktree:{session_id}:{path}` root via a
 bounded, non-recursive directory-deletion watch (`notify`/inotify) on each
 mounted worktree dir — registered at mount, fired the instant the dir
 disappears (see `src/worktree_watch.rs`). The hourly dir-gone GC

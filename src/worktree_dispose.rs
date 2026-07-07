@@ -11,13 +11,14 @@
 //!
 //! # Safety invariant — never delete information
 //!
-//! A worktree is *disposable* only when it provably contains nothing:
-//! `git status --porcelain` empty (no changes, no untracked) **and** `HEAD`
-//! equals the base commit recorded at `git worktree add` time
-//! ([`crate::worktree_create::WorktreeMeta::base_commit`]). Anything else — one
-//! untracked scratch file, one local commit — is *dirty* and is **never**
-//! auto-deleted; it is kept and surfaced. Owning creation makes the base check
-//! exact, not heuristic.
+//! A worktree is *disposable* only when it provably contains nothing. The proof
+//! is per backing VCS ([`clean_reason`]; misc 148): **git** — `git status
+//! --porcelain` empty **and** `HEAD` equal to the recorded base commit; **svn** —
+//! `svn status` empty (svn has no local-commit class, so there is no unpushed
+//! leg); **hg** — `hg status` empty **and** no draft changesets beyond the
+//! recorded base changeset. Anything else — one untracked scratch file, one local
+//! commit — is *dirty* and is **never** auto-deleted; it is kept and surfaced.
+//! Owning creation makes the base check exact, not heuristic.
 //!
 //! # One guarded routine, called by every trigger
 //!
@@ -29,9 +30,16 @@
 //!
 //! # Filesystem procedure
 //!
-//! A worktree is four artifacts — the dir (with its `gitdir:` `.git` file), the
-//! main repo's `.git/worktrees/<name>/` registration, the branch ref, and our
-//! sidecar. Disposal keeps them consistent:
+//! **Non-git (svn/hg) disposal is *simpler* than git** (misc 148): there is no
+//! main-repo registration and no branch ref, so a clean svn checkout or hg share
+//! is a plain `remove_dir_all` after the proof, then the sidecar and emptied
+//! parents. (An hg share's store lives in the source repo, so deleting the
+//! working dir loses nothing the clean proof did not already clear.) The
+//! sidecar-as-transaction-record and remnant rules apply unchanged.
+//!
+//! For **git**, a worktree is four artifacts — the dir (with its `gitdir:` `.git`
+//! file), the main repo's `.git/worktrees/<name>/` registration, the branch ref,
+//! and our sidecar. Disposal keeps them consistent:
 //!
 //! - Deletion is always `git worktree remove` (never `rm -rf`, never `--force`):
 //!   git removes dir + registration in one consistent operation and re-checks
@@ -55,7 +63,10 @@ use tracing::debug;
 
 use crate::paths;
 use crate::source::Source;
-use crate::worktree_create::{WORKTREE_CLASS_FEAT, WorktreeMeta, scan_sidecars, sidecar_path};
+use crate::worktree_create::{
+    WORKTREE_CLASS_FEAT, WORKTREE_VCS_HG, WORKTREE_VCS_SVN, WorktreeMeta, scan_sidecars,
+    sidecar_path,
+};
 
 /// Age threshold for the creation-time sweep (misc 151, trigger 3).
 ///
@@ -157,15 +168,78 @@ fn git(dir: &Path, args: &[&str]) -> Option<(bool, String, String)> {
     Some((output.status.success(), stdout, stderr))
 }
 
-/// The clean-proof reason a worktree is *not* disposable, or `None` when it is
-/// provably clean.
+/// Run `program` (svn/hg) in `dir`, returning `(success, stdout_trimmed,
+/// stderr_trimmed)` — `None` when the program could not be spawned (misc 148).
 ///
-/// Clean requires BOTH proofs to pass: `git status --porcelain` empty, and
-/// `HEAD` equal to the recorded base commit. An empty recorded base (creation
-/// could not read `HEAD`) is a keep-forever conservative default. Any git
-/// failure keeps the worktree (we cannot prove it empty).
+/// Like [`git`] but for the non-git worktree VCSes, which take the working copy
+/// as the process working directory rather than a `-C` flag. Uses the user's real
+/// VCS configuration (no isolation) so auth/hooks behave as expected; the
+/// operations here (`status`, `log`) are read-only.
+fn run_in(program: &str, dir: &Path, args: &[&str]) -> Option<(bool, String, String)> {
+    let output = Command::new(program)
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Some((output.status.success(), stdout, stderr))
+}
+
+/// The backing VCS of a worktree, resolved from its sidecar `vcs` tag (misc 148).
+///
+/// An unknown or empty tag falls back to [`Vcs::Git`] — the pre-misc-148 default,
+/// consistent with [`crate::worktree_create::default_vcs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Vcs {
+    /// git — removed with `git worktree remove`, branch + registration cleaned.
+    Git,
+    /// svn — a plain directory delete after `svn status` proves it clean.
+    Svn,
+    /// hg — a plain directory delete after `hg status` + no-draft-beyond-base.
+    Hg,
+}
+
+/// Map a [`WorktreeMeta::vcs`] tag to the disposal [`Vcs`] (git by default).
+fn vcs_of(meta: &WorktreeMeta) -> Vcs {
+    match meta.vcs.as_str() {
+        WORKTREE_VCS_SVN => Vcs::Svn,
+        WORKTREE_VCS_HG => Vcs::Hg,
+        _ => Vcs::Git,
+    }
+}
+
+/// Whether a [`Vcs`] is a non-git working copy (svn/hg): its disposal is a plain
+/// directory delete with no registration or branch leg (misc 148).
+const fn is_nongit(vcs: Vcs) -> bool {
+    matches!(vcs, Vcs::Svn | Vcs::Hg)
+}
+
+/// The clean-proof reason a worktree is *not* disposable, or `None` when it is
+/// provably clean — dispatched per backing VCS (misc 148).
+///
+/// - **git** ([`git_clean_reason`]): `git status --porcelain` empty **and** `HEAD`
+///   equal to the recorded base commit.
+/// - **svn** ([`svn_clean_reason`]): `svn status` empty. svn has no local-commit
+///   class (commits go straight to the repository), so this is the whole proof —
+///   the git/hg "unpushed"/"local commit" leg does not exist.
+/// - **hg** ([`hg_clean_reason`]): `hg status` empty **and** no draft changesets
+///   beyond the recorded base changeset.
+///
+/// Any VCS failure keeps the worktree (we cannot prove it empty).
 #[must_use]
 pub fn clean_reason(meta: &WorktreeMeta) -> Option<String> {
+    match vcs_of(meta) {
+        Vcs::Git => git_clean_reason(meta),
+        Vcs::Svn => svn_clean_reason(&meta.worktree),
+        Vcs::Hg => hg_clean_reason(meta),
+    }
+}
+
+/// The git clean proof: `git status --porcelain` empty and `HEAD` at the recorded
+/// base commit. An empty recorded base (creation could not read `HEAD`) is a
+/// keep-forever conservative default.
+fn git_clean_reason(meta: &WorktreeMeta) -> Option<String> {
     let worktree = &meta.worktree;
     if meta.base_commit.trim().is_empty() {
         return Some("the base commit was not recorded at creation (kept conservatively)".into());
@@ -181,6 +255,56 @@ pub fn clean_reason(meta: &WorktreeMeta) -> Option<String> {
         Some((true, head, _)) if head == meta.base_commit => None,
         Some((true, _, _)) => Some("HEAD has moved off the recorded base (local commits)".into()),
         _ => Some("`git rev-parse HEAD` could not verify the base commit".into()),
+    }
+}
+
+/// The svn clean proof (misc 148): `svn status` empty.
+///
+/// A non-empty `svn status` (local modifications *or* an unversioned `?` file) is
+/// dirty. svn has no local-commit class — commits go straight to the repository —
+/// so an empty status is the complete proof; there is no unpushed leg to check.
+fn svn_clean_reason(worktree: &Path) -> Option<String> {
+    match run_in("svn", worktree, &["status"]) {
+        Some((true, out, _)) if out.is_empty() => None,
+        Some((true, _, _)) => Some("uncommitted or unversioned changes present".into()),
+        _ => Some("`svn status` could not verify the working copy is clean".into()),
+    }
+}
+
+/// The hg clean proof (misc 148): `hg status` empty **and** no draft changesets
+/// beyond the recorded base changeset.
+///
+/// Proof 1 rejects any working-copy change (modified/added/removed/missing/
+/// unknown). Proof 2 rejects local commits: a `draft() and descendants(<base>)
+/// and not <base>` revset that matches any changeset means the copy carries
+/// unlanded commits — kept. An empty recorded base is a keep-forever conservative
+/// default; any hg failure keeps the copy.
+#[allow(
+    clippy::literal_string_with_formatting_args,
+    reason = "`{node}` is an hg output template, not a Rust format argument"
+)]
+fn hg_clean_reason(meta: &WorktreeMeta) -> Option<String> {
+    let worktree = &meta.worktree;
+    // Proof 1: working copy pristine.
+    match run_in("hg", worktree, &["status"]) {
+        Some((true, out, _)) if out.is_empty() => {}
+        Some((true, _, _)) => return Some("uncommitted or unknown changes present".into()),
+        _ => return Some("`hg status` could not verify the working copy is clean".into()),
+    }
+    // Proof 2: no draft changesets beyond the recorded base (no local commits).
+    let base = meta.base_commit.trim();
+    if base.is_empty() {
+        return Some(
+            "the base changeset was not recorded at creation (kept conservatively)".into(),
+        );
+    }
+    let revset = format!("draft() and descendants({base}) and not {base}");
+    match run_in("hg", worktree, &["log", "-r", &revset, "-T", "{node}\n"]) {
+        Some((true, out, _)) if out.is_empty() => None,
+        Some((true, _, _)) => {
+            Some("draft changesets beyond the recorded base (local commits)".into())
+        }
+        _ => Some("`hg log` could not verify draft changesets against the base".into()),
     }
 }
 
@@ -301,11 +425,13 @@ fn remove_empty_parents(worktree: &Path, scheme_root: &Path) {
 /// dirty), but a kept-dirty outcome logs the divergence ("host asked, we
 /// declined"). Every other trigger passes `false`.
 ///
-/// Steps on a clean, present worktree: `git worktree remove` (no `--force`) →
-/// `git branch -D` (sidecar's branch) → unlink a resolving feats link →
-/// remove the sidecar → `git worktree prune` → rmdir emptied parents. A missing
-/// dir routes to the remnant rule; a dirty proof or a git refusal keeps the
-/// worktree.
+/// Steps on a clean, present **git** worktree: `git worktree remove` (no
+/// `--force`) → `git branch -D` (sidecar's branch) → unlink a resolving feats
+/// link → remove the sidecar → `git worktree prune` → rmdir emptied parents. A
+/// clean **non-git** (svn/hg) working copy is *simpler* — no registration and no
+/// branch leg — so it is a plain directory delete after the proof, then sidecar +
+/// emptied parents (misc 148). A missing dir routes to the remnant rule; a dirty
+/// proof or a removal refusal keeps the worktree.
 #[must_use]
 pub fn dispose(meta: &WorktreeMeta, host_initiated: bool) -> Disposition {
     dispose_in(meta, &scheme_root(), host_initiated)
@@ -317,9 +443,10 @@ fn dispose_in(meta: &WorktreeMeta, scheme_root: &Path, host_initiated: bool) -> 
     if !under_root(&meta.worktree, scheme_root) || !sidecar_path(&meta.worktree).exists() {
         return Disposition::NotOurs;
     }
+    let vcs = vcs_of(meta);
     // Remnant rule: the dir is already gone — converge without a clean proof.
     if !meta.worktree.exists() {
-        return dispose_remnant(meta, scheme_root);
+        return dispose_remnant(meta, scheme_root, vcs);
     }
     // Clean proof (advisory for a host-initiated removal, but still enforced).
     if let Some(reason) = clean_reason(meta) {
@@ -332,6 +459,32 @@ fn dispose_in(meta: &WorktreeMeta, scheme_root: &Path, host_initiated: bool) -> 
             );
         }
         return Disposition::KeptDirty { reason };
+    }
+    if is_nongit(vcs) {
+        // A clean svn/hg working copy holds nothing to lose: a plain directory
+        // delete (no registration, no branch). For an hg share the shared store
+        // lives in the source repo, so this removes only the working dir + pointer.
+        if let Err(e) = std::fs::remove_dir_all(&meta.worktree) {
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                worktree = %meta.worktree.display(),
+                error = %e,
+                "worktree disposal: could not remove non-git working copy — kept",
+            );
+            return Disposition::Refused {
+                reason: e.to_string(),
+            };
+        }
+        unlink_recorded_link(meta, false);
+        remove_sidecar(meta);
+        remove_empty_parents(&meta.worktree, scheme_root);
+        debug!(
+            source = Source::DaemonDispatch.as_str(),
+            worktree = %meta.worktree.display(),
+            vcs = %meta.vcs,
+            "disposed clean non-git working copy (dir + sidecar removed)",
+        );
+        return Disposition::Disposed;
     }
     // git's refusal outranks our checks: stop, keep, log.
     if let Err(refusal) = git_worktree_remove(&meta.source_repo, &meta.worktree, false) {
@@ -359,20 +512,25 @@ fn dispose_in(meta: &WorktreeMeta, scheme_root: &Path, host_initiated: bool) -> 
 
 /// The remnant rule: the worktree dir is gone but the sidecar remains.
 ///
-/// Prune the dead registration, delete the recorded branch iff its tip still
-/// equals the recorded base (so no local commits are lost), unlink a dangling
-/// recorded link, and remove the sidecar last. All idempotent.
-fn dispose_remnant(meta: &WorktreeMeta, scheme_root: &Path) -> Disposition {
-    git_worktree_prune(&meta.source_repo);
-    if let Some(tip) = branch_tip(&meta.source_repo, &meta.branch) {
-        if !meta.base_commit.is_empty() && tip == meta.base_commit {
-            git_branch_delete(&meta.source_repo, &meta.branch);
-        } else {
-            debug!(
-                source = Source::DaemonDispatch.as_str(),
-                branch = %meta.branch,
-                "worktree remnant: branch tip diverged from base — branch kept",
-            );
+/// For **git**, prune the dead registration and delete the recorded branch iff
+/// its tip still equals the recorded base (so no local commits are lost). For
+/// **non-git** (svn/hg) there is no registration and no branch leg, so the
+/// remnant is just the sidecar and any dangling recorded link (misc 148). Either
+/// way, unlink a dangling recorded link and remove the sidecar last. All
+/// idempotent.
+fn dispose_remnant(meta: &WorktreeMeta, scheme_root: &Path, vcs: Vcs) -> Disposition {
+    if !is_nongit(vcs) {
+        git_worktree_prune(&meta.source_repo);
+        if let Some(tip) = branch_tip(&meta.source_repo, &meta.branch) {
+            if !meta.base_commit.is_empty() && tip == meta.base_commit {
+                git_branch_delete(&meta.source_repo, &meta.branch);
+            } else {
+                debug!(
+                    source = Source::DaemonDispatch.as_str(),
+                    branch = %meta.branch,
+                    "worktree remnant: branch tip diverged from base — branch kept",
+                );
+            }
         }
     }
     unlink_recorded_link(meta, true);
@@ -403,8 +561,22 @@ fn remove_agent_asserted_in(meta: &WorktreeMeta, scheme_root: &Path) -> Disposit
     if !under_root(&meta.worktree, scheme_root) || !sidecar_path(&meta.worktree).exists() {
         return Disposition::NotOurs;
     }
+    let vcs = vcs_of(meta);
     if !meta.worktree.exists() {
-        return dispose_remnant(meta, scheme_root);
+        return dispose_remnant(meta, scheme_root, vcs);
+    }
+    if is_nongit(vcs) {
+        // The captured-work assertion substitutes for the clean proof: force a
+        // plain directory delete of the non-git working copy (misc 148).
+        if let Err(e) = std::fs::remove_dir_all(&meta.worktree) {
+            return Disposition::Refused {
+                reason: e.to_string(),
+            };
+        }
+        unlink_recorded_link(meta, false);
+        remove_sidecar(meta);
+        remove_empty_parents(&meta.worktree, scheme_root);
+        return Disposition::Disposed;
     }
     if let Err(refusal) = git_worktree_remove(&meta.source_repo, &meta.worktree, true) {
         return Disposition::Refused { reason: refusal };
@@ -434,7 +606,8 @@ fn remove_feat_in(meta: &WorktreeMeta, scheme_root: &Path) -> Disposition {
         return Disposition::NotOurs;
     }
     if !meta.worktree.exists() {
-        return dispose_remnant(meta, scheme_root);
+        // Feats are git-only (created solely via `catenary worktree add`).
+        return dispose_remnant(meta, scheme_root, Vcs::Git);
     }
     // Refuse uncommitted/untracked changes first (feats clean = status empty).
     match git(&meta.worktree, &["status", "--porcelain"]) {
@@ -566,6 +739,10 @@ fn sweep_aged_agents_in(
     clippy::expect_used,
     reason = "tests use expect for readable assertions"
 )]
+#[allow(
+    clippy::literal_string_with_formatting_args,
+    reason = "`{node}` is an hg output template, not a Rust format argument"
+)]
 mod tests {
     use super::*;
     use crate::worktree_create::WORKTREE_CLASS_AGENT;
@@ -660,6 +837,7 @@ mod tests {
             created_at: crate::state_snapshot::now_iso(),
             class: class.to_string(),
             link: None,
+            vcs: crate::worktree_create::WORKTREE_VCS_GIT.to_string(),
         };
         crate::worktree_create::write_sidecar(&meta).expect("write sidecar");
         (tmp, scheme_root, repo, worktree, meta)
@@ -775,6 +953,7 @@ mod tests {
             created_at: crate::state_snapshot::now_iso(),
             class: WORKTREE_CLASS_AGENT.to_string(),
             link: None,
+            vcs: crate::worktree_create::WORKTREE_VCS_GIT.to_string(),
         })
         .expect("sidecar");
         let meta = WorktreeMeta {
@@ -788,6 +967,7 @@ mod tests {
             created_at: crate::state_snapshot::now_iso(),
             class: WORKTREE_CLASS_AGENT.to_string(),
             link: None,
+            vcs: crate::worktree_create::WORKTREE_VCS_GIT.to_string(),
         };
         assert_eq!(dispose_in(&meta, &root, false), Disposition::NotOurs);
         assert!(elsewhere.exists(), "outside-scheme path untouched");
@@ -892,5 +1072,279 @@ mod tests {
         let created = chrono::DateTime::<chrono::Utc>::from(now).to_rfc3339();
         assert!(!is_older_than(&created, now, AGENT_DISPOSE_MAX_AGE));
         assert!(!is_older_than("not-a-date", now, Duration::from_secs(0)));
+    }
+
+    // ── Non-git disposal (misc 148) ────────────────────────────────────────
+
+    /// Whether `bin` is on PATH (`<bin> --version`) — binary-gated svn/hg tests
+    /// skip when their VCS is absent so CI without it stays green.
+    fn have_bin(bin: &str) -> bool {
+        Command::new(bin)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// A minimal non-git `WorktreeMeta` (no VCS binary needed) for the synthetic
+    /// guards.
+    fn bare_meta(worktree: &Path, vcs: &str) -> WorktreeMeta {
+        WorktreeMeta {
+            worktree: worktree.to_path_buf(),
+            source_repo: PathBuf::from("/nonexistent-repo"),
+            base_commit: "file:///srv/repo@1".to_string(),
+            branch: "x".to_string(),
+            name: "agent-x".to_string(),
+            agent_id: Some("x".to_string()),
+            session_id: "sess-1".to_string(),
+            created_at: crate::state_snapshot::now_iso(),
+            class: WORKTREE_CLASS_AGENT.to_string(),
+            link: None,
+            vcs: vcs.to_string(),
+        }
+    }
+
+    #[test]
+    fn vcs_of_maps_the_sidecar_tag_defaulting_to_git() {
+        let wt = Path::new("/x");
+        assert_eq!(vcs_of(&bare_meta(wt, WORKTREE_VCS_SVN)), Vcs::Svn);
+        assert_eq!(vcs_of(&bare_meta(wt, WORKTREE_VCS_HG)), Vcs::Hg);
+        assert_eq!(
+            vcs_of(&bare_meta(wt, crate::worktree_create::WORKTREE_VCS_GIT)),
+            Vcs::Git,
+        );
+        assert_eq!(
+            vcs_of(&bare_meta(wt, "unknown-future-vcs")),
+            Vcs::Git,
+            "an unknown tag defaults to git",
+        );
+    }
+
+    #[test]
+    fn nongit_remnant_dir_gone_sweeps_sidecar_without_touching_git() {
+        // A non-git remnant (dir already gone) converges on the sidecar alone —
+        // no registration, no branch, and no VCS binary needed. The bogus
+        // `source_repo` proves no git leg runs on it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("worktrees")).expect("mkdir scheme");
+        let scheme_root = tmp
+            .path()
+            .join("worktrees")
+            .canonicalize()
+            .expect("canon scheme");
+        let worktree = scheme_root.join("agents").join("sess-1").join("svncopy");
+        std::fs::create_dir_all(worktree.parent().expect("parent")).expect("mkdir parents");
+        let meta = bare_meta(&worktree, WORKTREE_VCS_SVN);
+        crate::worktree_create::write_sidecar(&meta).expect("write sidecar");
+        assert!(sidecar_path(&worktree).exists(), "sidecar present");
+
+        assert_eq!(dispose_in(&meta, &scheme_root, false), Disposition::Remnant);
+        assert!(
+            !sidecar_path(&worktree).exists(),
+            "the non-git remnant sidecar is swept",
+        );
+        assert!(
+            !scheme_root.join("agents").join("sess-1").exists(),
+            "the emptied session parent is rmdir'd",
+        );
+    }
+
+    /// Build an svn working copy directly under a tempdir scheme root, with a
+    /// sidecar, so the disposal guard sees it as "ours". `None` when svn is
+    /// absent (binary-gated skip).
+    fn svn_fixture(branch: &str) -> Option<(tempfile::TempDir, PathBuf, PathBuf, WorktreeMeta)> {
+        if !have_bin("svn") || !have_bin("svnadmin") {
+            return None;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("worktrees")).expect("mkdir scheme");
+        let scheme_root = tmp
+            .path()
+            .join("worktrees")
+            .canonicalize()
+            .expect("canon scheme");
+        let repo = tmp.path().join("svnrepo");
+        let cfg = tmp.path().join("svncfg");
+        assert!(
+            Command::new("svnadmin")
+                .arg("create")
+                .arg(&repo)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("run svnadmin")
+                .success(),
+            "svnadmin create failed",
+        );
+        let url = format!("file://{}", repo.display());
+        let svn = |args: &[&str]| {
+            let status = Command::new("svn")
+                .arg("--config-dir")
+                .arg(&cfg)
+                .arg("--non-interactive")
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("run svn");
+            assert!(status.success(), "svn {args:?} failed");
+        };
+        let sub = scheme_root.join("agents").join("sess-1").join(branch);
+        std::fs::create_dir_all(sub.parent().expect("parent")).expect("mkdir parents");
+        svn(&["checkout", &url, &sub.to_string_lossy()]);
+        std::fs::write(sub.join("f.txt"), "hello").expect("write");
+        svn(&["add", &sub.join("f.txt").to_string_lossy()]);
+        svn(&["commit", "-m", "c", &sub.to_string_lossy()]);
+
+        let worktree = sub.canonicalize().expect("canon wt");
+        let meta = WorktreeMeta {
+            worktree: worktree.clone(),
+            source_repo: repo,
+            base_commit: format!("{url}@1"),
+            branch: branch.to_string(),
+            name: format!("agent-{branch}"),
+            agent_id: Some(branch.to_string()),
+            session_id: "sess-1".to_string(),
+            created_at: crate::state_snapshot::now_iso(),
+            class: WORKTREE_CLASS_AGENT.to_string(),
+            link: None,
+            vcs: WORKTREE_VCS_SVN.to_string(),
+        };
+        crate::worktree_create::write_sidecar(&meta).expect("write sidecar");
+        Some((tmp, scheme_root, worktree, meta))
+    }
+
+    #[test]
+    fn svn_clean_copy_disposes_by_directory_delete() {
+        let Some((_tmp, root, worktree, meta)) = svn_fixture("agent-svn-clean") else {
+            return;
+        };
+        assert_eq!(dispose_in(&meta, &root, false), Disposition::Disposed);
+        assert!(!worktree.exists(), "clean svn copy dir removed");
+        assert!(!sidecar_path(&worktree).exists(), "sidecar removed");
+    }
+
+    #[test]
+    fn svn_dirty_copy_is_kept() {
+        let Some((_tmp, root, worktree, meta)) = svn_fixture("agent-svn-dirty") else {
+            return;
+        };
+        // Modify a tracked file → `svn status` shows `M` → dirty.
+        std::fs::write(worktree.join("f.txt"), "changed").expect("modify");
+        let d = dispose_in(&meta, &root, false);
+        assert!(d.is_kept_dirty(), "dirty svn copy kept: {d:?}");
+        assert!(worktree.exists(), "dirty svn copy preserved");
+        assert!(sidecar_path(&worktree).exists(), "sidecar preserved");
+    }
+
+    /// Run hg in `cwd` with a pinned commit identity (build-time only). Asserts
+    /// success.
+    fn hg_run(cwd: &Path, args: &[&str]) {
+        let status = Command::new("hg")
+            .arg("--cwd")
+            .arg(cwd)
+            .args(["--config", "ui.username=catenary-test"])
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run hg");
+        assert!(status.success(), "hg {args:?} failed");
+    }
+
+    /// Build an hg working copy (a clone, so it needs no `share` extension) under
+    /// a tempdir scheme root, with a sidecar. `None` when hg is absent.
+    fn hg_fixture(branch: &str) -> Option<(tempfile::TempDir, PathBuf, PathBuf, WorktreeMeta)> {
+        if !have_bin("hg") {
+            return None;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("worktrees")).expect("mkdir scheme");
+        let scheme_root = tmp
+            .path()
+            .join("worktrees")
+            .canonicalize()
+            .expect("canon scheme");
+        let repo = tmp.path().join("hgrepo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        hg_run(&repo, &["init"]);
+        std::fs::write(repo.join("f.txt"), "hello").expect("write");
+        hg_run(&repo, &["add", "f.txt"]);
+        hg_run(&repo, &["commit", "-m", "c"]);
+
+        let sub = scheme_root.join("agents").join("sess-1").join(branch);
+        std::fs::create_dir_all(sub.parent().expect("parent")).expect("mkdir parents");
+        hg_run(
+            &repo,
+            &["clone", &repo.to_string_lossy(), &sub.to_string_lossy()],
+        );
+
+        // Base marker: the copy's working-dir parent node.
+        let node = {
+            let out = Command::new("hg")
+                .arg("--cwd")
+                .arg(&sub)
+                .args(["log", "-r", ".", "-T", "{node}"])
+                .output()
+                .expect("hg log");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let worktree = sub.canonicalize().expect("canon wt");
+        let meta = WorktreeMeta {
+            worktree: worktree.clone(),
+            source_repo: repo,
+            base_commit: node,
+            branch: branch.to_string(),
+            name: format!("agent-{branch}"),
+            agent_id: Some(branch.to_string()),
+            session_id: "sess-1".to_string(),
+            created_at: crate::state_snapshot::now_iso(),
+            class: WORKTREE_CLASS_AGENT.to_string(),
+            link: None,
+            vcs: WORKTREE_VCS_HG.to_string(),
+        };
+        crate::worktree_create::write_sidecar(&meta).expect("write sidecar");
+        Some((tmp, scheme_root, worktree, meta))
+    }
+
+    #[test]
+    fn hg_clean_copy_disposes_by_directory_delete() {
+        let Some((_tmp, root, worktree, meta)) = hg_fixture("agent-hg-clean") else {
+            return;
+        };
+        assert_eq!(dispose_in(&meta, &root, false), Disposition::Disposed);
+        assert!(!worktree.exists(), "clean hg copy dir removed");
+        assert!(!sidecar_path(&worktree).exists(), "sidecar removed");
+    }
+
+    #[test]
+    fn hg_uncommitted_copy_is_kept() {
+        let Some((_tmp, root, worktree, meta)) = hg_fixture("agent-hg-dirty") else {
+            return;
+        };
+        // Modify a tracked file → `hg status` shows `M` → dirty (proof 1).
+        std::fs::write(worktree.join("f.txt"), "changed").expect("modify");
+        let d = dispose_in(&meta, &root, false);
+        assert!(d.is_kept_dirty(), "uncommitted hg copy kept: {d:?}");
+        assert!(worktree.exists());
+    }
+
+    #[test]
+    fn hg_local_commit_is_kept_as_draft_beyond_base() {
+        let Some((_tmp, root, worktree, meta)) = hg_fixture("agent-hg-commit") else {
+            return;
+        };
+        // Commit a change in the copy: `hg status` is empty again, but the new
+        // DRAFT changeset descends from the recorded base → kept (proof 2).
+        std::fs::write(worktree.join("g.txt"), "y").expect("write");
+        hg_run(&worktree, &["add", "g.txt"]);
+        hg_run(&worktree, &["commit", "-m", "local"]);
+        let d = dispose_in(&meta, &root, false);
+        assert!(
+            d.is_kept_dirty(),
+            "a local hg commit (draft beyond base) is kept: {d:?}",
+        );
+        assert!(worktree.exists());
     }
 }
