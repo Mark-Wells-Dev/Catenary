@@ -62,6 +62,25 @@ upgrading.
 
 ### Added
 
+- **Language-server conformance: every shipped server definition is now a
+  testable claim.** A conformance harness drives the real Catenary
+  lifecycle — spawn through the shipped defaults with live
+  `workspace/configuration` delivery, edit, settle, collect, clean
+  shutdown — against a per-language fixture carrying one intentional
+  diagnostic, under a generous-but-finite wall bound that catches the
+  never-yields class (the pyright 44-minute incident is the type
+  specimen). The dogfooded fleet runs as always-on sentinels in ordinary
+  CI; a matrix workflow conformance-tests any recipe change one server
+  per isolated job. Shipped server definitions gain **pinned install
+  recipes** (exact version + content hash per ecosystem's verification
+  tier — npm tarball sha512 verified before an `--ignore-scripts`
+  install; cargo `--locked`; go checksum-DB; all marked draft) and a
+  **blessed-manifest** that alone can ever feed a user-facing
+  recommendation — drafts structurally cannot. `make refresh-recipes`
+  re-resolves and re-hashes pins into a reviewable diff. No retry
+  absorption anywhere: a server that loses its first publish to the
+  cold-pull race fails loudly (that race is bug 74, a real settle/pull
+  gap the harness itself discovered).
 - **Non-git agent worktrees: Subversion and Mercurial projects get real
   isolated working copies.** Where the project is `.svn` or `.hg`, the
   WorktreeCreate hook now creates a genuine working copy under the same

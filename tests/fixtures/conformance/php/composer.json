@@ -1,0 +1,5 @@
+{
+  "name": "conformance/php",
+  "description": "intelephense conformance fixture",
+  "require": {}
+}

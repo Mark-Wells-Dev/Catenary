@@ -1,0 +1,6 @@
+{
+  "name": "conformance-svelte",
+  "private": true,
+  "type": "module",
+  "devDependencies": {}
+}

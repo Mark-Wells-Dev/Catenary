@@ -1,0 +1,222 @@
+name: Conformance
+
+# Language-server conformance harness (tui-rework 07): install each pinned,
+# hash-verified server on the runner, then drive the REAL Catenary lifecycle
+# against its fixture (initialize with the shipped default config → edit →
+# diagnostics batch with settle → collect → shutdown), asserting settle reaches
+# idle inside a finite wall bound, the intentional diagnostic publishes, and
+# shutdown is clean.
+#
+# Cadence rides the pins (a pinned, hash-verified artifact cannot drift, so a
+# schedule proves nothing): the matrix runs when a recipe/defaults/fixture/harness
+# file changes. It is diff-scoped on ordinary recipe edits and full on
+# refresh-recipes PRs (where every pin can move) or any structural change.
+#
+# Blessing = the green matrix job + the human review of the PR. This workflow
+# EMITS a candidate blessed-manifest as a build artifact (server → conformed
+# version / platform / date); nothing is pushed — the maintainer blesses by
+# committing the conformed entries in the reviewed PR.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "defaults/recipes.toml"
+      - "defaults/servers.toml"
+      - "defaults/languages.toml"
+      - "tests/fixtures/conformance/**"
+      - "tests/conformance_harness.rs"
+      - "tests/common/mod.rs"
+      - "tools/refresh_recipes.py"
+      - "tools/conformance_matrix.py"
+      - ".github/workflows/conformance.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  discover:
+    name: Discover matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      empty: ${{ steps.gen.outputs.empty }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # base ref needed for diff-scoping
+
+      - name: Generate matrix
+        id: gen
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          scope_full=1
+          # workflow_dispatch (no PR base) and structural changes run the full
+          # matrix; an ordinary recipe edit is diff-scoped to changed recipes.
+          if [ -n "$base" ]; then
+            changed="$(git diff --name-only "$base" "${{ github.sha }}")"
+            echo "changed files:"; echo "$changed"
+            if echo "$changed" | grep -qvE '^defaults/recipes\.toml$'; then
+              scope_full=1  # a non-recipes file changed → any server may be affected
+            else
+              scope_full=0  # only recipes.toml changed → scope to changed recipes
+            fi
+          fi
+          if [ "$scope_full" -eq 0 ]; then
+            git show "$base:defaults/recipes.toml" > /tmp/base-recipes.toml
+            matrix="$(python3 tools/conformance_matrix.py --base /tmp/base-recipes.toml)"
+          else
+            matrix="$(python3 tools/conformance_matrix.py)"
+          fi
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          count="$(printf '%s' "$matrix" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["include"]))')"
+          if [ "$count" -eq 0 ]; then echo "empty=true" >> "$GITHUB_OUTPUT"; else echo "empty=false" >> "$GITHUB_OUTPUT"; fi
+
+  conform:
+    name: "Conform ${{ matrix.server }}"
+    needs: discover
+    if: needs.discover.outputs.empty != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+
+      - name: Provision runtime dependency (${{ matrix.runtime_name }})
+        if: matrix.runtime_name == 'jdk'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.runtime_version || '21' }}
+
+      # Some servers derive diagnostics from an external linter named in the
+      # recipe `note` (bash-ls → shellcheck, ansible-ls → ansible-lint, elm-ls →
+      # the elm compiler). Provisioned here so the intentional diagnostic can
+      # publish. (These should graduate to structured `runtime` fields.)
+      - name: Provision diagnostic dependencies
+        run: |
+          set -euo pipefail
+          case "${{ matrix.server }}" in
+            bash-ls) sudo apt-get update && sudo apt-get install -y shellcheck ;;
+            ansible-ls) pipx install ansible-lint || pip install ansible-lint ;;
+            elm-ls) npm install -g --ignore-scripts elm ;;
+            *) echo "no extra diagnostic dependency for ${{ matrix.server }}" ;;
+          esac
+
+      - name: Install pinned server (${{ matrix.ecosystem }} ${{ matrix.package }}@${{ matrix.version }})
+        run: |
+          set -euo pipefail
+          case "${{ matrix.ecosystem }}" in
+            npm)
+              # npm-tarball-sha512: fetch the exact tarball, verify OUR pinned
+              # sha512, then install the verified artifact with --ignore-scripts
+              # (install scripts never run).
+              tarball="$(npm view "${{ matrix.package }}@${{ matrix.version }}" dist.tarball)"
+              curl -sSL "$tarball" -o pkg.tgz
+              actual="sha512-$(openssl dgst -sha512 -binary pkg.tgz | openssl base64 -A)"
+              if [ -n "${{ matrix.hash }}" ] && [ "$actual" != "${{ matrix.hash }}" ]; then
+                echo "integrity mismatch for ${{ matrix.package }}@${{ matrix.version }}"
+                echo "  expected ${{ matrix.hash }}"
+                echo "  actual   $actual"
+                exit 1
+              fi
+              npm install -g --ignore-scripts ./pkg.tgz
+              ;;
+            cargo)
+              cargo install "${{ matrix.package }}" --version "${{ matrix.version }}" --locked
+              ;;
+            pip)
+              if [ -n "${{ matrix.hash }}" ]; then
+                printf '%s==%s --hash=sha256:%s\n' "${{ matrix.package }}" "${{ matrix.version }}" "${{ matrix.hash }}" > req.txt
+                pip install --require-hashes -r req.txt
+              else
+                pip install "${{ matrix.package }}==${{ matrix.version }}"
+              fi
+              ;;
+            go)
+              go install "${{ matrix.package }}@${{ matrix.version }}"
+              echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+              ;;
+            *)
+              echo "unknown ecosystem: ${{ matrix.ecosystem }}"; exit 1 ;;
+          esac
+
+      - name: Run conformance harness (${{ matrix.server }})
+        env:
+          CATENARY_CONFORMANCE: ${{ matrix.server }}
+        run: |
+          cargo nextest run --workspace --features mockls --no-fail-fast \
+            --status-level all -E 'binary(conformance_harness)'
+
+      - name: Emit blessed entry
+        run: |
+          set -euo pipefail
+          mkdir -p blessed
+          cat > "blessed/${{ matrix.server }}.toml" <<EOF
+          [blessed.${{ matrix.server }}]
+          version = "${{ matrix.version }}"
+          platform = "linux-x86_64"
+          date = "$(date -u +%Y-%m-%d)"
+          tier = "verified-on-linux"
+          EOF
+          cat "blessed/${{ matrix.server }}.toml"
+
+      - name: Upload blessed entry
+        uses: actions/upload-artifact@v4
+        with:
+          name: blessed-${{ matrix.server }}
+          path: blessed/${{ matrix.server }}.toml
+          retention-days: 7
+
+  bless:
+    name: Assemble blessed-manifest
+    needs: conform
+    if: ${{ always() && needs.conform.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download conformed entries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: blessed-*
+          path: entries
+          merge-multiple: true
+
+      - name: Assemble candidate manifest
+        run: |
+          set -euo pipefail
+          # Start from the committed manifest's header comment, then append every
+          # entry that conformed green this run. This is a CANDIDATE artifact for
+          # review — nothing is pushed; the maintainer blesses by committing the
+          # conformed entries into defaults/blessed-manifest.toml in the PR.
+          sed -n '/^#/p' defaults/blessed-manifest.toml > candidate-blessed-manifest.toml
+          echo >> candidate-blessed-manifest.toml
+          for f in $(find entries -name '*.toml' | sort); do
+            cat "$f" >> candidate-blessed-manifest.toml
+            echo >> candidate-blessed-manifest.toml
+          done
+          {
+            echo '## Candidate blessed-manifest (this run)';
+            echo '';
+            echo 'Copy the conformed entries below into `defaults/blessed-manifest.toml`';
+            echo 'to bless them — nothing is pushed automatically.';
+            echo '';
+            echo '```toml';
+            cat candidate-blessed-manifest.toml;
+            echo '```';
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload candidate manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-blessed-manifest
+          path: candidate-blessed-manifest.toml
+          retention-days: 30

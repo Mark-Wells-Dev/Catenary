@@ -34,6 +34,8 @@ pub mod notify;
 pub mod paths;
 /// Protocol classification shared by core and display layers.
 pub mod protocol;
+/// CI-internal install recipes and the blessed-manifest (conformance harness).
+pub mod recipes;
 /// Daemon session manager and MCP socket listener.
 pub mod router;
 /// Canonical `source` taxonomy for structured tracing events.

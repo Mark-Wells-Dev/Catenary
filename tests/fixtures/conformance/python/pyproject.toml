@@ -1,0 +1,6 @@
+# Root marker: bounds pyright's project to this tiny fixture so it never
+# auto-discovers the system Python environment (the 44-minute class, waitv2
+# findings 5/6).
+[project]
+name = "conformance-python"
+version = "0.0.0"

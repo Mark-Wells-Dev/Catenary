@@ -1,0 +1,207 @@
+# CI-INTERNAL install recipe DRAFTS — NOT user-visible, NOT blessable.
+#
+# Each `[recipe.<server>]` keys a canonical server name from
+# `defaults/servers.toml`. A recipe records how a conformance CI matrix job
+# installs that server, pinned, before running the harness against it:
+#   ecosystem  npm | cargo | pip | go
+#   package    the package/module id within the ecosystem
+#   version    an EXACT pin (never a range)
+#   tier       how the artifact is verified (see below)
+#   draft      always true — a draft is CI-internal and never reaches a user
+#              surface; only the blessed-manifest (defaults/blessed-manifest.toml)
+#              feeds any recommendation, and a draft never enters it.
+#   hash       (optional) the pinned content hash for hash-carrying tiers
+#   note       (optional) residual supply-chain risk, stated honestly
+#   runtime    (optional) an extra runtime dep, e.g.
+#              runtime = { name = "jdk", version = ">=17" } — declared LAST in a
+#              stanza (it is a sub-table). No tranche-1/2 draft needs one yet.
+#
+# Verification tiers (tui-rework 06 §"Recipes as data"):
+#   go-checksumdb        version pin; the Go checksum DB verifies transparently
+#                        (no explicit hash carried).
+#   cargo-locked         exact version installed with `--locked`; cargo verifies
+#                        the registry index checksums (no explicit hash carried).
+#   pip-hashes           installed with `--require-hashes`; the sha256 set is
+#                        pinned in `hash` + generated over the full dep closure.
+#   npm-tarball-sha512   exact version + the expected tarball sha512 (`hash`, in
+#                        SRI form); the engine fetches, verifies, then installs
+#                        with `--ignore-scripts`.
+#
+# HASHES: npm `hash` values are the registry `dist.integrity` (SRI sha512) for
+# the pinned version, obtained mechanically from the npm registry metadata
+# (`registry.npmjs.org/<pkg>/<version>`) — never hand-computed or invented.
+# `make refresh-recipes` re-resolves versions and re-fetches these on every bump,
+# and the conformance install VERIFIES the pin against `hash`, so a mis-pasted
+# value fails the matrix loudly rather than shipping. Versions resolved
+# 2026-07-07. Where a hash-carrying tier has no `hash` it is marked pending: the
+# pip closure needs `pip-compile --generate-hashes` over the whole dep tree,
+# which refresh-recipes runs — a single-artifact hash would not satisfy
+# `--require-hashes` and so is honestly omitted rather than half-filled.
+
+# ── npm tranche ──────────────────────────────────────────────────────
+# node is the implied host runtime for every npm recipe (no `runtime` field).
+
+[recipe.bash-ls]
+ecosystem = "npm"
+package = "bash-language-server"
+version = "5.6.0"
+tier = "npm-tarball-sha512"
+draft = true
+hash = "sha512-DCuV+/BZAAozsp5blvi6jDnU/ZDaTpJpWM0zqwGjnirfqv7iBsMK32xOze/jipxU0PUZ6CBUKgRUMKI7Kk70Lg=="
+note = "diagnostics come from shellcheck; a conformance job provisions it too."
+
+[recipe.yaml-ls]
+ecosystem = "npm"
+package = "yaml-language-server"
+version = "1.23.0"
+tier = "npm-tarball-sha512"
+draft = true
+hash = "sha512-3qVyCOexLCWw06PQa5kRPwvMWMZ/eZeCRWUvgD6a0OkqL/4iCnxy2WumbWifa937Uo5xhyWJ0uxlU39ljhNh7A=="
+
+# vscode-langservers-extracted ships four bundled servers (json/css/html/eslint)
+# from one package; each server gets its own recipe so the matrix runs one job
+# per conformed binary. The package is bundled (webpacked) — no transitive deps
+# resolve at install time. All four share the one package tarball's sha512.
+[recipe.vscode-json]
+ecosystem = "npm"
+package = "vscode-langservers-extracted"
+version = "4.10.0"
+tier = "npm-tarball-sha512"
+draft = true
+hash = "sha512-EFf9uQI4dAKbzMQFjDvVm1xJq1DXAQvBEuEfPGrK/xzfsL5xWTfIuRr90NgfmqwO+IEt6vLZm9EOj6R66xIifg=="
+
+[recipe.vscode-css]
+ecosystem = "npm"
+package = "vscode-langservers-extracted"
+version = "4.10.0"
+tier = "npm-tarball-sha512"
+draft = true
+hash = "sha512-EFf9uQI4dAKbzMQFjDvVm1xJq1DXAQvBEuEfPGrK/xzfsL5xWTfIuRr90NgfmqwO+IEt6vLZm9EOj6R66xIifg=="
+
+[recipe.vscode-html]
+ecosystem = "npm"
+package = "vscode-langservers-extracted"
+version = "4.10.0"
+tier = "npm-tarball-sha512"
+draft = true
+hash = "sha512-EFf9uQI4dAKbzMQFjDvVm1xJq1DXAQvBEuEfPGrK/xzfsL5xWTfIuRr90NgfmqwO+IEt6vLZm9EOj6R66xIifg=="
+
+[recipe.vscode-eslint]
+ecosystem = "npm"
+package = "vscode-langservers-extracted"
+version = "4.10.0"
+tier = "npm-tarball-sha512"
+draft = true
+hash = "sha512-EFf9uQI4dAKbzMQFjDvVm1xJq1DXAQvBEuEfPGrK/xzfsL5xWTfIuRr90NgfmqwO+IEt6vLZm9EOj6R66xIifg=="
+
+[recipe.typescript-ls]
+ecosystem = "npm"
+package = "typescript-language-server"
+version = "5.3.0"
+tier = "npm-tarball-sha512"
+draft = true
+hash = "sha512-5puofxZHgFdAYtfNpmwCAvgtaYgg8wrUnH30m7Ze3QuguId5RNRadKASpOpyDxTyUdAF51FjhTdjntLw/EuWcQ=="
+note = "resolves transitive deps at install time within the pinned version; the engine's --ignore-scripts install caps the residual to non-executing dep code."
+
+# pyright's npm package is bundled (ships its own bundled node code); minimal
+# residual install-time dependency risk. The pyright class (findings 5/6) is why
+# the harness runs the shipped config as one unit — the wall bound catches a
+# server that never yields on an under-configured workspace.
+[recipe.pyright]
+ecosystem = "npm"
+package = "pyright"
+version = "1.1.411"
+tier = "npm-tarball-sha512"
+draft = true
+hash = "sha512-03S/vmS5lF1S/tVbKc2WNXCMq8JWCwta/qIYjj1jvqbQhoy+N3NgBzHTSmUlbYD6DJwqQ5XHf108QujoqeURvw=="
+
+[recipe.intelephense]
+ecosystem = "npm"
+package = "intelephense"
+version = "1.18.5"
+tier = "npm-tarball-sha512"
+draft = true
+hash = "sha512-dqCH1YNCRlHGBLND+iUFjBJlGwM4pPimX2jm8AaP/6K2WZNM2K2+E8dOWCD3ZYMP2zC2ICBD9Soe2oxKtU9d9A=="
+
+[recipe.svelte-ls]
+ecosystem = "npm"
+package = "svelte-language-server"
+version = "0.18.3"
+tier = "npm-tarball-sha512"
+draft = true
+hash = "sha512-60hbZVquRLjP/VIU3BS82IXQDT4JsDIJ15NvcnlMimy6tQfAkAv+og3SXGP3IT7TlaPdCrqmFe/kjOQOKtWTfw=="
+note = "resolves transitive deps at install time within the pinned version."
+
+[recipe.elm-ls]
+ecosystem = "npm"
+package = "@elm-tooling/elm-language-server"
+version = "2.8.0"
+tier = "npm-tarball-sha512"
+draft = true
+hash = "sha512-SOmEr2EaYAy/QYK84zOyEJDxvEu0B7xDszCBzGMGaFSoksGrYAo54Ot0g9I7wEpcr2H+LLFTDjPsbaHcP1T2lA=="
+note = "the elm compiler itself is a separate runtime the server shells out to; a conformance job installs it via the elm npm package."
+
+[recipe.docker-ls]
+ecosystem = "npm"
+package = "dockerfile-language-server-nodejs"
+version = "0.15.0"
+tier = "npm-tarball-sha512"
+draft = true
+hash = "sha512-iS3GUUAn1bC3sDdLyg6CUnIaVQfViJBh+FhWBPftK6kJkhUMxFG2sr25OqMVaZgRsVuJEoNpflgJN3FCbkA01A=="
+
+[recipe.ansible-ls]
+ecosystem = "npm"
+package = "@ansible/ansible-language-server"
+version = "26.6.0"
+tier = "npm-tarball-sha512"
+draft = true
+hash = "sha512-DPTmckrnNCf8KdeSu9pE/mjnovSL28InnQhDS2lsuDrLI8obapMxAU0KLDYnC++aTjCK8bZhhkR5HFh3lDddqw=="
+note = "diagnostics depend on ansible-lint being present; a conformance job provisions it (pip) as well."
+
+[recipe.vim-ls]
+ecosystem = "npm"
+package = "vim-language-server"
+version = "2.3.1"
+tier = "npm-tarball-sha512"
+draft = true
+hash = "sha512-Y9Zy3NKzfndLUfuZRrITkpfGvpL2K7hNPV8sJ1iB6mf1YRxIX3Hs6lwZimoD5pmvamUaOQhNGYMS/Ox9itzA4Q=="
+
+[recipe.sql-ls]
+ecosystem = "npm"
+package = "sql-language-server"
+version = "1.7.1"
+tier = "npm-tarball-sha512"
+draft = true
+hash = "sha512-HiS8siZQJD9EzkMhY7Jnz3XBbu/rZ99VSmCJE0+gF2CHEtlQCeA+X4Dee0BNjpbJ3dVFMAXmEw4tsM5Y6GbU0w=="
+note = "resolves transitive deps at install time within the pinned version."
+
+# ── cargo tranche ────────────────────────────────────────────────────
+# cargo is the implied host toolchain; `--locked` + index checksums verify.
+
+[recipe.taplo]
+ecosystem = "cargo"
+package = "taplo-cli"
+version = "0.10.0"
+tier = "cargo-locked"
+draft = true
+
+# ── pip tranche ──────────────────────────────────────────────────────
+# python is the implied host runtime; `--require-hashes` pins the sha256 set.
+
+[recipe.cmake-ls]
+ecosystem = "pip"
+package = "cmake-language-server"
+version = "0.1.11"
+tier = "pip-hashes"
+draft = true
+note = "hash pending: --require-hashes needs the sha256 of every artifact in the resolved closure (pip-compile --generate-hashes), which refresh-recipes produces — a single-package hash is not shippable, so it is honestly omitted."
+
+# ── go tranche ───────────────────────────────────────────────────────
+# the go toolchain is the implied host; the checksum DB verifies transparently.
+
+[recipe.gopls]
+ecosystem = "go"
+package = "golang.org/x/tools/gopls"
+version = "v0.22.0"
+tier = "go-checksumdb"
+draft = true

@@ -304,6 +304,66 @@ impl BridgeProcess {
         })
     }
 
+    /// Spawns the daemon with the SHIPPED default config against a fixture root
+    /// — the conformance-harness spawn (tui-rework 07).
+    ///
+    /// Unlike the mock-driven spawns, this sets neither `CATENARY_SERVERS` nor
+    /// `CATENARY_CONFIG`: the daemon loads its built-in `defaults/servers.toml`
+    /// and `languages.toml`, so the harness exercises the *exact* server command,
+    /// language binding, and `workspace/configuration` delivery a user gets (the
+    /// pyright-44-minute class — waitv2 findings 5/6 — lives on that delivery
+    /// path). It restores the inherited `PATH` that [`isolate_env`] clears so the
+    /// real, pinned language-server binary resolves; the XDG bases stay isolated
+    /// under a per-test tempdir exactly as every other spawn.
+    ///
+    /// `root` is the fixture project directory (owned by the caller's `TempDir`,
+    /// which must outlive the returned process). It becomes both the sole
+    /// workspace root and the IPC `cwd`.
+    pub fn spawn_conformance(root: &Path) -> Result<Self> {
+        let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+        let root_env = root.to_path_buf();
+        let mut proc = Self::spawn_with(|cmd| {
+            cmd.env("PATH", inherited_path);
+            cmd.env("CATENARY_ROOTS", &root_env);
+        })?;
+        proc.ipc_cwd = Some(root.to_path_buf());
+        Ok(proc)
+    }
+
+    /// Gracefully shuts the bridge down and asserts it exited without a kill —
+    /// the harness's "shutdown is clean" assertion (tui-rework 07).
+    ///
+    /// Closes stdin (the same EOF the [`Drop`] path uses as the graceful-shutdown
+    /// signal) and reaps the child within `grace`. Reaping here caches the exit
+    /// status, so the subsequent `Drop` observes it immediately rather than
+    /// repeating the grace wait.
+    ///
+    /// "Clean" means the bridge **exited on its own** (WIFEXITED) inside `grace`
+    /// — neither hung (needing a kill) nor crashed (signal-killed). The exit
+    /// *code* is deliberately not asserted: the MCP bridge returns non-zero on
+    /// stdin EOF by design (a normal client disconnect), so a nonzero code is
+    /// expected, while a signal death (segfault/abort) or a hang is not.
+    pub fn shutdown_clean(&mut self, grace: Duration) -> Result<()> {
+        self.stdin.take(); // EOF → graceful shutdown.
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            if let Some(status) = self.child.try_wait().context("wait on bridge")? {
+                if status.code().is_some() {
+                    return Ok(());
+                }
+                bail!("bridge was terminated by a signal ({status:?}) — unclean shutdown (crash)");
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                bail!(
+                    "bridge did not exit within {grace:?} of stdin close — unclean shutdown (hang)"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     pub fn send(&mut self, request: &Value) -> Result<()> {
         let json = serde_json::to_string(request)?;
         let stdin = self.stdin.as_mut().context("Stdin already closed")?;

@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: bench bench-test build-release check deny fuzz machete mdbook mockgrep mockglob mdgrep mdglob rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish tag-current
+.PHONY: bench bench-test build-release check conformance deny fuzz machete mdbook mockgrep mockglob mdgrep mdglob refresh-recipes rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -229,6 +229,27 @@ test-ignored:
 test:
 	@if [ "$(MEMLIMIT_KB)" != unlimited ]; then ulimit -v $(MEMLIMIT_KB); fi; \
 	 cargo nextest run --workspace --features mockls --status-level fail --final-status-level slow --cargo-quiet $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
+
+# ── conformance harness (tui-rework 07) ───────────────────────────────
+# Runs ONLY the language-server conformance harness. On the maintainer host the
+# dogfooded-fleet sentinels exercise it (each skips where its binary is absent);
+# select one server for an exact run — mirroring a CI matrix job — with
+# CATENARY_CONFORMANCE, e.g.:
+#   make conformance                        # dogfooded fleet, skip-if-missing
+#   make conformance CONFORMANCE=pyright    # exactly pyright, require its binary
+conformance:
+	@$(if $(CONFORMANCE),CATENARY_CONFORMANCE=$(CONFORMANCE),) \
+	 cargo nextest run --workspace --features mockls --no-fail-fast --status-level all \
+	   -E 'binary(conformance_harness)'
+
+# Re-resolve, re-hash, and rewrite the CI-internal install-recipe pins in
+# defaults/recipes.toml, then show the reviewable diff. This PREPARES a pin bump
+# for review; it never merges — the merge policy (mechanical gates, auto-merge on
+# green) is tui-rework 08's concern. Offline-tolerant: a per-server resolve
+# failure keeps that pin and is reported; the file is never partially rewritten.
+refresh-recipes:
+	@python3 tools/refresh_recipes.py
+	@git --no-pager diff -- defaults/recipes.toml || true
 
 # ── isolated server harness (tickets 00b / 00c) ───────────────────────
 # A hermetic "build and see" harness for eyeballing enriched `catenary

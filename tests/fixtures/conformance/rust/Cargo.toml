@@ -1,0 +1,13 @@
+# Conformance fixture (tui-rework 07): a tiny standalone crate rust-analyzer
+# compiles so the harness can drive its real lifecycle. Excluded from the
+# Catenary workspace (see the root Cargo.toml `exclude`) so no ordinary `cargo`
+# invocation descends into it.
+[package]
+name = "conformance-rust"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "conformance-rust"
+path = "src/main.rs"

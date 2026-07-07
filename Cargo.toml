@@ -9,8 +9,10 @@ members = ["crates/catenary-proc"]
 # (ticket 00c, `make rustgrep`/`make rustglob`). It is a standalone crate that
 # only rust-analyzer ever compiles; excluding it keeps every workspace `cargo`
 # invocation (`make check`, `cargo deny`, `cargo machete`) from descending into a
-# nested non-member package.
-exclude = ["fuzz", "tests/fixtures/rust_repo"]
+# nested non-member package. `tests/fixtures/conformance/rust` is the same
+# story for the conformance harness (tui-rework 07): a standalone crate only
+# rust-analyzer compiles, so it is excluded for the identical reason.
+exclude = ["fuzz", "tests/fixtures/rust_repo", "tests/fixtures/conformance/rust"]
 
 [package]
 name = "catenary-mcp"

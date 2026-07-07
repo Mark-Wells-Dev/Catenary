@@ -1,0 +1,5 @@
+# Conformance fixture (tui-rework 07).
+# Intentional diagnostic: the array is never closed, so taplo publishes a syntax
+# error.
+title = "conformance"
+values = [1, 2, 3

@@ -1,0 +1,29 @@
+# The blessed-manifest — the committed record of servers that have PASSED the
+# CI conformance gate. This is the ONLY recipe-derived data a user surface is
+# ever allowed to consult (the suggestion/fix-it surface ships later, in
+# tickets 03/06); recipe DRAFTS (defaults/recipes.toml) never appear here.
+#
+# Format — one `[blessed.<server>]` per conformed server, keyed by the same
+# canonical name as `defaults/servers.toml`:
+#
+#   [blessed.<server>]
+#   version  = "1.2.3"            # the exact version that conformed
+#   platform = "linux-x86_64"     # where the conformance job ran
+#   date     = "2026-07-07"       # ISO date the green job landed
+#   tier     = "verified-on-linux"  # honesty tier (initial tier; expands on
+#                                    # sightings, decision-030 style)
+#
+# UPDATE FLOW (no auto-push — the human blesses by merging):
+#   1. A conformance matrix job (.github/workflows/conformance.yml) installs the
+#      pinned server and runs the harness with CATENARY_CONFORMANCE=<server>.
+#   2. On green, the job emits its `[blessed.<server>]` entry as a build
+#      artifact; an aggregate step combines the per-server entries and uploads
+#      the merged manifest as a PR artifact and prints it in the job summary.
+#   3. A human reviews the refresh-recipes PR (new pins + their conformance
+#      results together) and commits the updated manifest into this file. Nothing
+#      is pushed automatically — blessing IS that human merge.
+#
+# This file ships with ZERO blessed entries: the blessing gate is the green CI
+# matrix job, which has not yet run for any server. The dogfooded fleet passes
+# the harness LOCALLY as the sentinel, but a local run is not the CI gate and so
+# does not bless. Entries appear here only via the flow above.
