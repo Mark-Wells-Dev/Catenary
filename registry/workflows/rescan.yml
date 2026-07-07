@@ -1,0 +1,76 @@
+# Continuous advisory re-scan (tui-rework 08) — TEMPLATE for the external
+# registry repo's .github/workflows/. Runs DAILY: OSV-checks every currently
+# pinned version, rolls an advised pin back to its last known-clean predecessor,
+# re-signs, and republishes — so the fleet is safe at its next registry fetch.
+# Revocation latency is fetch-cadence, not release-cadence.
+#
+# TODO before use: the same <REGISTRY_REPO> / <PAGES_PUBLISH> /
+# secrets.CATENARY_REGISTRY_SIGNING_KEY markers as gate-pipeline.yml.
+
+name: Advisory re-scan
+
+on:
+  schedule:
+    - cron: "0 5 * * *" # daily — compromise is often discovered post-pin
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: registry-publish # never republish concurrently with the gate pipeline
+  cancel-in-progress: false
+
+jobs:
+  rescan:
+    name: Re-scan pinned versions
+    runs-on: ubuntu-latest
+    outputs:
+      action: ${{ steps.scan.outputs.action }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: OSV re-scan + rollback
+        id: scan
+        run: |
+          set -euo pipefail
+          # Rolls advised pins back into recipes.toml (version only; the pipeline
+          # re-resolves + re-verifies the hash before republishing).
+          if python3 registry/rescan.py \
+               --recipes recipes.toml \
+               --history clean_history.toml \
+               --report rescan-report.json \
+               --pins-out recipes.toml; then
+            echo "action=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "action=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload re-scan report
+        uses: actions/upload-artifact@v4
+        with:
+          name: rescan-report
+          path: rescan-report.json
+          retention-days: 30
+
+  republish:
+    name: Re-sign + republish rolled-back pins
+    needs: rescan
+    if: needs.rescan.outputs.action == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Reuses the sign + publish steps from gate-pipeline.yml. Factor these into a
+      # composite action or a reusable workflow so the signing logic lives once.
+      - name: Sign + publish + open rollback issue
+        env:
+          CATENARY_REGISTRY_SIGNING_KEY: ${{ secrets.CATENARY_REGISTRY_SIGNING_KEY }} # TODO
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "TODO: assemble registry.toml (cat recipes.toml blessed-manifest.toml),"
+          echo "sign it (see gate-pipeline.yml 'Sign the payload' step — secret to a"
+          echo "job-scoped tempfile, openssl sign, shred), publish to <PAGES_PUBLISH>,"
+          echo "commit the rolled-back recipes.toml, and open a rollback issue on"
+          echo "<REGISTRY_REPO> with rescan-report.json for the maintainer's record."

@@ -16,8 +16,8 @@ use crate::logging::reaper::ReapPolicy;
 
 use super::commands::{self, CommandsConfig};
 use super::{
-    Config, IconConfig, LanguageConfig, LinterConfig, NotificationConfig, RootsConfig,
-    ServerBinding, ServerDef, ToolsConfig, default_log_retention_days,
+    Config, IconConfig, LanguageConfig, LinterConfig, NotificationConfig, RegistryConfig,
+    RootsConfig, ServerBinding, ServerDef, ToolsConfig, default_log_retention_days,
 };
 
 /// Embedded default classification config (lowest-priority layer).
@@ -76,6 +76,9 @@ pub(super) struct RawConfig {
 
     #[serde(default)]
     roots: Option<RootsConfig>,
+
+    #[serde(default)]
+    registry: Option<RegistryConfig>,
 
     #[serde(default)]
     linter: RawLinterSection,
@@ -504,7 +507,8 @@ fn parse_linter_defaults(contents: &str) -> Result<HashMap<String, LinterConfig>
 /// Later source wins per-key; keys absent from the later source are preserved.
 ///
 /// **Structured sections** (`notifications`, `icons`, `tools`,
-/// `observability`, `roots`): `Option<T>` on `Config`. `None` means the source
+/// `observability`, `roots`, `registry`): `Option<T>` on `Config`. `None` means
+/// the source
 /// did not mention the section; `Some` means it was present (even if all values
 /// match defaults). Merge only overwrites when the later source is `Some`, so an
 /// earlier source's explicit setting survives an unrelated later source.
@@ -541,6 +545,9 @@ fn merge(config: &mut Config, other: RawConfig) {
     }
     if other.roots.is_some() {
         config.roots = other.roots;
+    }
+    if other.registry.is_some() {
+        config.registry = other.registry;
     }
     for (key, value) in other.linter.rule {
         config.linter.insert(key, value);

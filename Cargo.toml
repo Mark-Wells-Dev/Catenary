@@ -87,6 +87,17 @@ toml_edit = "0.25"
 crossterm = "0.28"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_28"] }
 dirs = "6.0.0"
+# `ed25519-dalek` verifies the detached signature on the fetched registry
+# artifact (tui-rework 08). The trust root (public key) ships in-binary; a bad
+# signature is a loud finding and the loader degrades to the cached/seed
+# registry — never to unpinned behaviour. Signature verification is NEVER
+# hand-rolled (a hard rule): this is the audited, reference ed25519
+# implementation. BSD-3-Clause; its transitive crypto crates (curve25519-dalek
+# BSD-3-Clause, ed25519 / sha2 / signature / subtle / zeroize under MIT OR
+# Apache-2.0) are all deny.toml-clean. Production uses `VerifyingKey`; tests
+# derive an ephemeral keypair from a fixed seed (`SigningKey::from_bytes`) — no
+# real key, no RNG, no network.
+ed25519-dalek = "2"
 futures = "0.3"
 globset = "0.4"
 grep-matcher = "0.1.8"

@@ -636,6 +636,26 @@
       },
       "type": "object"
     },
+    "RegistryConfig": {
+      "additionalProperties": false,
+      "description": "External signed-registry configuration (`[registry]`, tui-rework 08).\n\nControls the signed-registry loader ([`crate::registry`]): whether the daemon fetches the published recipes+blessed-manifest artifact, and from where. **Shipped default is seed-only** — `url` absent (or `disable = true`) means the loader serves the in-binary seed and never touches the network, so nothing changes for users until the maintainer stands up the registry endpoint and flips `url` on. A fetch failure or a bad signature degrades to the cached copy, then the seed — never to unpinned behaviour.\n\n# Examples\n\n```toml [registry] url = \"https://registry.catenary.dev/registry.toml\" disable = false ```",
+      "properties": {
+        "disable": {
+          "default": false,
+          "description": "Force seed-only operation even when a `url` is set (default `false`). A user flips this to opt out of registry fetching without deleting their `url`.",
+          "type": "boolean"
+        },
+        "url": {
+          "default": null,
+          "description": "The registry artifact URL. **Absent ⇒ seed-only** (the shipped default). The loader fetches `<url>` (the signed payload) and `<url>.sig` (the detached ed25519 signature). See [`crate::registry::DEFAULT_REGISTRY_URL`] for the placeholder the maintainer sets at go-live.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "RootsConfig": {
       "additionalProperties": false,
       "description": "Workspace-root configuration (`[roots]`).\n\nUser-level only. The lone field today is [`companions`](Self::companions); the section exists so companion-root rules have a stable home as more root-policy knobs land.",
@@ -886,6 +906,17 @@
       "anyOf": [
         {
           "$ref": "#/definitions/ReapPolicy"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "registry": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RegistryConfig"
         },
         {
           "type": "null"

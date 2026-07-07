@@ -265,7 +265,7 @@ pub struct BlessedEntry {
 }
 
 /// The committed blessed-manifest: server → conformed record.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlessedManifest {
     /// Blessed entries keyed by canonical server name.
     #[serde(default)]

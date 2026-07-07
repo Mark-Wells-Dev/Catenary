@@ -38,6 +38,8 @@ pub mod paths;
 pub mod protocol;
 /// CI-internal install recipes and the blessed-manifest (conformance harness).
 pub mod recipes;
+/// External signed-registry loader: fetched-verified → cache → seed (tui-rework 08).
+pub mod registry;
 /// Daemon session manager and MCP socket listener.
 pub mod router;
 /// Canonical `source` taxonomy for structured tracing events.

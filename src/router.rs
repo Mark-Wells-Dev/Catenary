@@ -2722,6 +2722,54 @@ impl SessionManager {
         });
     }
 
+    /// Spawns the external signed-registry refresh task (tui-rework 08).
+    ///
+    /// Resolves the registry ([`crate::registry::refresh_once`]) once **on daemon
+    /// start**, then — when the registry is enabled — again on the slow
+    /// [`crate::registry::DEFAULT_REFRESH_INTERVAL`] (hours-class) cadence. Each
+    /// resolution logs its provenance and any degradation findings
+    /// ([`crate::registry::log_resolution`]): a bad signature or a stale/failed
+    /// refresh becomes a `warn` that reaches the user-notification surface and the
+    /// firehose. The shipped default is seed-only (no URL), so the first
+    /// resolution is a network-free no-op and the loop exits immediately — nothing
+    /// happens for users until the maintainer turns the registry on.
+    ///
+    /// A fully detached task mirroring the sibling spawn_* reapers; the config is
+    /// read independently in a blocking sub-task so a slow config load never
+    /// stalls the runtime.
+    #[allow(
+        clippy::unused_self,
+        reason = "mirrors the sibling spawn_* reapers' &self signature; the task is \
+                  detached and reads config independently"
+    )]
+    pub fn spawn_registry_refresh(&self, rt: &tokio::runtime::Handle) {
+        rt.spawn(async move {
+            loop {
+                let joined = tokio::task::spawn_blocking(|| {
+                    let cfg = crate::config::Config::load()
+                        .ok()
+                        .and_then(|c| c.registry)
+                        .unwrap_or_default();
+                    let resolved = crate::registry::refresh_once(&cfg);
+                    let enabled = cfg.effective_url().is_some();
+                    (resolved, enabled)
+                })
+                .await;
+                let Ok((resolved, enabled)) = joined else {
+                    // The blocking sub-task panicked (unexpected) — stop the loop.
+                    break;
+                };
+                crate::registry::log_resolution(&resolved);
+                if !enabled {
+                    // Seed-only (the shipped default): nothing to refresh on a
+                    // timer, so the task retires after the startup resolution.
+                    break;
+                }
+                tokio::time::sleep(crate::registry::DEFAULT_REFRESH_INTERVAL).await;
+            }
+        });
+    }
+
     /// Returns the number of active sessions in the registry.
     #[must_use]
     pub fn session_count(&self) -> usize {

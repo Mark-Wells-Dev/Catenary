@@ -2497,6 +2497,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            registry: None,
             linter: HashMap::new(),
         }
     }
@@ -2572,6 +2573,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            registry: None,
             linter: HashMap::new(),
         })
     }
@@ -2606,6 +2608,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            registry: None,
             linter: HashMap::new(),
         })
     }
@@ -2650,6 +2653,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            registry: None,
             linter: HashMap::new(),
         })
     }
@@ -2694,6 +2698,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            registry: None,
             linter: HashMap::new(),
         })
     }
@@ -2741,6 +2746,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            registry: None,
             linter: HashMap::new(),
         })
     }
@@ -2919,6 +2925,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            registry: None,
             linter: HashMap::new(),
         });
 
@@ -3369,6 +3376,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            registry: None,
             linter: HashMap::new(),
         });
 
@@ -3872,6 +3880,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            registry: None,
             linter: HashMap::new(),
         });
 
@@ -3930,6 +3939,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            registry: None,
             linter: HashMap::new(),
         });
 
@@ -3987,6 +3997,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            registry: None,
             linter: HashMap::new(),
         });
 
@@ -4080,6 +4091,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            registry: None,
             linter: HashMap::new(),
         });
 
@@ -5325,6 +5337,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            registry: None,
             linter: HashMap::new(),
         })
     }
@@ -5364,6 +5377,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            registry: None,
             linter: HashMap::new(),
         })
     }
@@ -6592,6 +6606,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            registry: None,
             linter: HashMap::new(),
         })
     }
@@ -6628,6 +6643,7 @@ mod tests {
             resolved_commands: None,
             observability: None,
             roots: None,
+            registry: None,
             linter: HashMap::new(),
         })
     }

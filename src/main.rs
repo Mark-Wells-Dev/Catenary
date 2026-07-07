@@ -1360,6 +1360,13 @@ fn run_daemon_main() -> Result<()> {
     // Spawned AFTER `with_session` so the tracker + worktree clock exist.
     manager.spawn_worktree_root_idle_reaper(rt.handle());
 
+    // External signed-registry refresh (tui-rework 08): resolve the published,
+    // signed recipes+blessed-manifest artifact on start and on the slow
+    // hours-class cadence, degrading fetched-verified → cache → seed and surfacing
+    // any bad-signature / stale finding. The shipped default is seed-only, so this
+    // is a network-free no-op until the maintainer stands up the registry.
+    manager.spawn_registry_refresh(rt.handle());
+
     info!(
         source = Source::DaemonLifecycle.as_str(),
         "daemon serving workspace: {workspace_display}",

@@ -1,0 +1,150 @@
+# Gated auto-pinning pipeline (tui-rework 08) — TEMPLATE for the external
+# registry repo's .github/workflows/. It PREPARES a pin bump behind mechanical
+# gates, dispatches conformance back against the Catenary repo, and — only when
+# every gate is green AND conformance passes — signs and publishes the registry
+# artifact. Any red gate opens an exception issue for the maintainer.
+#
+# TODO before use:
+#   - <REGISTRY_REPO>      this registry repo (owner/name).
+#   - <CATENARY_REPO>      the Catenary repo whose conformance matrix conforms the
+#                          bumped bytes (e.g. TwoWells/Catenary).
+#   - <PAGES_PUBLISH>      wherever the fleet fetches the artifact from — the
+#                          `[registry] url` (gh-pages, a release asset, a bucket).
+#   - secrets.CATENARY_REGISTRY_SIGNING_KEY   the Ed25519 private key (PEM), stored
+#                          encrypted; materialised to a job-scoped tempfile, never
+#                          echoed. Mint it OFFLINE (registry/sign_registry.py keygen).
+#   - secrets.CONFORMANCE_DISPATCH_TOKEN      a fine-grained PAT with
+#                          `actions: write` on <CATENARY_REPO> for the dispatch.
+
+name: Gate pipeline
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # weekly — pins move slowly; the daily job is rescan.yml
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # commit the bumped pins / publish the artifact
+  issues: write # open the exception issue on a red gate
+
+concurrency:
+  group: gate-pipeline
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Resolve + gate
+    runs-on: ubuntu-latest
+    outputs:
+      mergeable: ${{ steps.run.outputs.mergeable }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the gate pipeline
+        id: run
+        run: |
+          set -euo pipefail
+          # Resolves latest per ecosystem, runs cooling-off / OSV / provenance /
+          # anomaly gates, writes the green pins into recipes.toml, emits the report.
+          if python3 registry/gate_pipeline.py \
+               --recipes recipes.toml \
+               --report gate-report.json \
+               --pins-out recipes.toml; then
+            echo "mergeable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mergeable=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload gate report
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-report
+          path: gate-report.json
+          retention-days: 30
+
+      - name: Upload candidate pins
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-recipes
+          path: recipes.toml
+          retention-days: 30
+
+  conformance:
+    name: Conform bumped bytes (dispatch)
+    needs: gate
+    if: needs.gate.outputs.mergeable == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Fire the Catenary repo's conformance matrix against the bumped recipes.
+      # A pinned, hash-verified artifact cannot drift, so conformance runs when
+      # the pins move — exactly here. See registry/workflows/conformance-dispatch.yml
+      # for the standalone dispatch template.
+      - name: Dispatch conformance
+        env:
+          GH_TOKEN: ${{ secrets.CONFORMANCE_DISPATCH_TOKEN }} # TODO
+        run: |
+          set -euo pipefail
+          gh workflow run conformance.yml \
+            --repo <CATENARY_REPO> \
+            --ref main
+          echo "TODO: poll the dispatched run to completion (gh run watch) and fail"
+          echo "this job if conformance is red, so publish never runs on a red matrix."
+
+  publish:
+    name: Sign + publish
+    needs: [gate, conformance]
+    if: needs.gate.outputs.mergeable == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble the signed payload
+        run: |
+          set -euo pipefail
+          # One artifact: recipes + blessed-manifest concatenated into the combined
+          # [recipe.*] + [blessed.*] document the client parses (src/registry.rs).
+          cat recipes.toml blessed-manifest.toml > registry.toml
+
+      - name: Sign the payload (key never in plaintext)
+        env:
+          CATENARY_REGISTRY_SIGNING_KEY: ${{ secrets.CATENARY_REGISTRY_SIGNING_KEY }} # TODO
+        run: |
+          set -euo pipefail
+          umask 077
+          keyfile="$(mktemp)"
+          trap 'shred -u "$keyfile" 2>/dev/null || rm -f "$keyfile"' EXIT
+          printf '%s' "$CATENARY_REGISTRY_SIGNING_KEY" > "$keyfile"
+          CATENARY_REGISTRY_KEY_FILE="$keyfile" \
+            python3 registry/sign_registry.py sign --payload registry.toml
+          # registry.toml.sig now holds the raw 64-byte Ed25519 signature.
+
+      - name: Publish artifact + signature
+        run: |
+          set -euo pipefail
+          echo "TODO: publish registry.toml + registry.toml.sig to <PAGES_PUBLISH>"
+          echo "so the fleet fetches <url> and <url>.sig. Also append the newly"
+          echo "blessed versions to clean_history.toml (rescan.py's rollback source)"
+          echo "and commit the bumped recipes.toml."
+
+  exception:
+    name: Open exception issue
+    needs: gate
+    if: needs.gate.outputs.mergeable != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: gate-report
+      - name: File the exception
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh issue create \
+            --repo <REGISTRY_REPO> \
+            --title "Gate pipeline: a pin bump is held (red gate)" \
+            --body-file <(printf '%s\n\n```json\n%s\n```\n' \
+              "One or more candidates failed a mechanical gate. Review below." \
+              "$(cat gate-report.json)")

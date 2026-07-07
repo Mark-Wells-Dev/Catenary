@@ -82,6 +82,50 @@ pub struct RootsConfig {
     pub companions: Option<CompanionRules>,
 }
 
+/// External signed-registry configuration (`[registry]`, tui-rework 08).
+///
+/// Controls the signed-registry loader ([`crate::registry`]): whether the daemon
+/// fetches the published recipes+blessed-manifest artifact, and from where.
+/// **Shipped default is seed-only** — `url` absent (or `disable = true`) means the
+/// loader serves the in-binary seed and never touches the network, so nothing
+/// changes for users until the maintainer stands up the registry endpoint and
+/// flips `url` on. A fetch failure or a bad signature degrades to the cached copy,
+/// then the seed — never to unpinned behaviour.
+///
+/// # Examples
+///
+/// ```toml
+/// [registry]
+/// url = "https://registry.catenary.dev/registry.toml"
+/// disable = false
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct RegistryConfig {
+    /// The registry artifact URL. **Absent ⇒ seed-only** (the shipped default).
+    /// The loader fetches `<url>` (the signed payload) and `<url>.sig` (the
+    /// detached ed25519 signature). See [`crate::registry::DEFAULT_REGISTRY_URL`]
+    /// for the placeholder the maintainer sets at go-live.
+    pub url: Option<String>,
+    /// Force seed-only operation even when a `url` is set (default `false`). A
+    /// user flips this to opt out of registry fetching without deleting their
+    /// `url`.
+    #[serde(default)]
+    pub disable: bool,
+}
+
+impl RegistryConfig {
+    /// The effective fetch URL: `None` when disabled or unset (⇒ seed-only).
+    #[must_use]
+    pub fn effective_url(&self) -> Option<&str> {
+        if self.disable {
+            None
+        } else {
+            self.url.as_deref()
+        }
+    }
+}
+
 /// Overall configuration for Catenary.
 ///
 /// This is the resolved form produced by config loading. TOML
@@ -140,6 +184,12 @@ pub struct Config {
     /// `None` when no source specified `[roots]`. User-config only. Read via
     /// [`Config::companion_rules`].
     pub roots: Option<RootsConfig>,
+
+    /// External signed-registry policy (`[registry]`, tui-rework 08).
+    ///
+    /// `None` when no source specified `[registry]` (⇒ seed-only, the shipped
+    /// default). Drives the [`crate::registry`] loader; user-config only.
+    pub registry: Option<RegistryConfig>,
 
     /// Standalone-linter definitions keyed by linter name (`[linter.rule.*]`).
     ///
@@ -399,6 +449,7 @@ impl Default for Config {
             resolved_commands: None,
             observability: None,
             roots: None,
+            registry: None,
             linter: HashMap::new(),
         }
     }
@@ -1485,6 +1536,56 @@ command = "rust-analyzer"
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         fs::write(&path, "[roots]\nbogus = true\n").expect("write");
+
+        assert!(Config::load_from_sources(&[path]).is_err());
+    }
+
+    #[test]
+    fn registry_absent_is_seed_only() -> anyhow::Result<()> {
+        // The shipped default: no `[registry]` section ⇒ seed-only.
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "")?;
+
+        let config = Config::load_from_sources(&[path])?;
+        assert!(config.registry.is_none());
+        // A default RegistryConfig resolves to no effective url (seed-only).
+        assert!(RegistryConfig::default().effective_url().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn registry_parses_url_and_disable() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[registry]\nurl = \"https://registry.example/registry.toml\"\ndisable = false\n",
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let registry = config.registry.expect("registry configured");
+        assert_eq!(
+            registry.effective_url(),
+            Some("https://registry.example/registry.toml")
+        );
+
+        // `disable = true` overrides the url back to seed-only.
+        let disabled = RegistryConfig {
+            url: Some("https://registry.example/registry.toml".to_owned()),
+            disable: true,
+        };
+        assert!(disabled.effective_url().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn registry_rejects_unknown_field() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[registry]\nbogus = true\n").expect("write");
 
         assert!(Config::load_from_sources(&[path]).is_err());
     }

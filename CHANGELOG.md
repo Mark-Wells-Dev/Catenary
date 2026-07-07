@@ -62,6 +62,23 @@ upgrading.
 
 ### Added
 
+- **The recipe registry can live outside the binary, behind a signature.**
+  A new `[registry]` config table points Catenary at a published registry
+  artifact (recipes + blessed-manifest); the loader resolves
+  fetched-and-verified → cached copy (re-verified on read, so a tampered
+  cache is caught) → the in-binary seed, never degrading to unpinned
+  behavior. The artifact's ed25519 signature is verified against a trust
+  root that ships in the binary — the registry moves out, the key that
+  vouches for it doesn't. Failures surface as health findings
+  (`registry-stale`, `registry-bad-signature`) and fall down the chain;
+  seed-only is the shipped default, so nothing changes until the registry
+  is stood up. The registry repo's entire automation is staged in-repo
+  under `registry/`: the gate pipeline (cooling-off window, OSV advisory
+  checks, provenance where the ecosystem offers it, anomaly bounds), a
+  daily re-scan that rolls back an advised pin at fetch-cadence, signing
+  tooling, and workflow templates — pinning becomes automated behind
+  mechanical gates, with the maintainer as exception handler rather than
+  approval button.
 - **Guided install: a blessed suggestion is one consented keypress from
   working coverage.** On a suggestion row whose server has a
   blessed-manifest entry matching its recipe pin, `a` opens the consent

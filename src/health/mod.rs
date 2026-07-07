@@ -184,6 +184,14 @@ pub enum FindingCode {
     LegacyScript,
     /// The resolved command-filter status.
     CommandFilterStatus,
+    /// The external signed registry could not be refreshed (fetch failed or the
+    /// cached copy is past its freshness horizon); a cached/seed registry is in
+    /// use (tui-rework 08).
+    RegistryStale,
+    /// A fetched (or cached) registry artifact failed ed25519 signature
+    /// verification against the in-binary trust root — a loud finding; the loader
+    /// fell back to the cached/seed registry (tui-rework 08).
+    RegistryBadSignature,
 }
 
 impl FindingCode {
@@ -222,6 +230,8 @@ impl FindingCode {
             Self::PathOk => "path-ok",
             Self::LegacyScript => "legacy-script",
             Self::CommandFilterStatus => "command-filter-status",
+            Self::RegistryStale => "registry-stale",
+            Self::RegistryBadSignature => "registry-bad-signature",
         }
     }
 }

@@ -1,0 +1,51 @@
+# Conformance dispatch (tui-rework 08) — TEMPLATE for the external registry repo.
+#
+# The 07 conformance matrix lives in the CATENARY repo (.github/workflows/
+# conformance.yml): it installs each pinned, hash-verified server and drives the
+# real Catenary lifecycle against its fixture. A pinned artifact cannot drift, so
+# conformance runs when the PINS MOVE — which happens here, in the registry repo,
+# not in Catenary. This workflow fires that matrix against a candidate pin set and
+# gates publication on its result.
+#
+# This is split out from gate-pipeline.yml so it can also be dispatched by hand
+# (workflow_dispatch) when validating a candidate recipes.toml before a manual
+# publish.
+#
+# TODO before use:
+#   - <CATENARY_REPO>                          e.g. TwoWells/Catenary.
+#   - secrets.CONFORMANCE_DISPATCH_TOKEN       fine-grained PAT, `actions: write`
+#                                              on <CATENARY_REPO>.
+#   - The Catenary conformance.yml reads its recipe set from ITS checkout. To
+#     conform a candidate set that only exists here, either (a) open the pin-bump PR
+#     against <CATENARY_REPO> first and dispatch conformance on that ref, or (b)
+#     extend conformance.yml with a `recipes_url` dispatch input pointing at this
+#     run's candidate-recipes artifact. Pick one and delete the other TODO.
+
+name: Dispatch conformance
+
+on:
+  workflow_dispatch:
+    inputs:
+      recipes_ref:
+        description: "Catenary ref (branch/sha) whose recipes to conform"
+        required: false
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    name: Fire the Catenary conformance matrix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger conformance.yml on the Catenary repo
+        env:
+          GH_TOKEN: ${{ secrets.CONFORMANCE_DISPATCH_TOKEN }} # TODO
+        run: |
+          set -euo pipefail
+          gh workflow run conformance.yml \
+            --repo <CATENARY_REPO> \
+            --ref "${{ inputs.recipes_ref || 'main' }}"
+          echo "Dispatched. TODO: capture the run id and 'gh run watch' it so this"
+          echo "job's success/failure mirrors the matrix's, letting a caller gate on it."

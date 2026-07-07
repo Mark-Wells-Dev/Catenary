@@ -745,4 +745,22 @@ mod tests {
             "a fully-known config must be silent: {found:?}"
         );
     }
+
+    /// The `[registry]` section (tui-rework 08) is a known table with `url` and
+    /// `disable` keys; a typo inside it is flagged with the table's header path.
+    #[test]
+    fn unknown_keys_registry_section_is_known() {
+        let clean = unknown_keys(
+            "[registry]\nurl = \"https://registry.example/registry.toml\"\ndisable = false\n",
+        );
+        assert!(
+            clean.is_empty(),
+            "a valid [registry] must be silent: {clean:?}"
+        );
+
+        let typo = unknown_keys("[registry]\nurll = \"https://x\"\n");
+        assert_eq!(typo.len(), 1, "{typo:?}");
+        assert_eq!(typo[0].key, "urll");
+        assert_eq!(typo[0].location, "registry");
+    }
 }

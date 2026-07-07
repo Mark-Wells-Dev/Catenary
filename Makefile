@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: bench bench-test build-release check conformance deny fuzz machete mdbook mockgrep mockglob mdgrep mdglob refresh-recipes rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish tag-current
+.PHONY: bench bench-test build-release check conformance deny fuzz machete mdbook mockgrep mockglob mdgrep mdglob refresh-recipes registry-selftest rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -250,6 +250,15 @@ conformance:
 refresh-recipes:
 	@python3 tools/refresh_recipes.py
 	@git --no-pager diff -- defaults/recipes.toml || true
+
+# Exercise the STAGED external-registry pipeline scripts (tui-rework 08). These
+# live under registry/ as ready-to-instantiate content for the registry repo (see
+# registry/README.md); they never run in this repo's CI. --self-test runs their
+# pure gate/rollback logic with no network, so the maintainer can validate the
+# staged scripts here before instantiating the registry repo.
+registry-selftest:
+	@python3 registry/gate_pipeline.py --self-test
+	@python3 registry/rescan.py --self-test
 
 # ── isolated server harness (tickets 00b / 00c) ───────────────────────
 # A hermetic "build and see" harness for eyeballing enriched `catenary
