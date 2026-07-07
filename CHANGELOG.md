@@ -284,6 +284,21 @@ upgrading.
 
 ### Changed
 
+- **One health model: doctor's checks extracted into a typed findings
+  library, and dormant servers stop presenting as errors.** Every check
+  `catenary doctor` performs now resolves in `src/health/` into typed
+  findings — severity, a stable machine-readable code, the message, and
+  fix-it guidance as data — with doctor reduced to a one-shot renderer
+  (its tests pin finding codes, not prose). The library distinguishes
+  **routed** servers (a language binding routes to them and the language
+  is live in a tracked root) from **dormant inventory** (configured,
+  routed-to by nothing): a missing binary for a dormant server is now an
+  informational inventory line, not an error — the "two broken servers
+  drowning among fifty dormant defaults" report reads clean. Version-skew
+  detection joins the model. The same findings feed the upcoming TUI
+  health dashboard through a feed seam (doctor probes daemon-down; the
+  TUI will read live daemon state) — the two renderers can never diverge
+  in what they know.
 - **The session board tells the truth: respawn history, teardown removal,
   degradation state, contributor classes.** Four `state.json` enrichments
   (schema 2, additive — old readers unaffected) that make the snapshot fit

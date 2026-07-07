@@ -1,219 +1,64 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Doctor command: check language server health and hook configuration.
+//! Doctor command: a one-shot renderer over the [`crate::health`] model.
+//!
+//! Every check doctor performs — config migration, validation, unknown keys,
+//! unreferenced/duplicate/project config, server probes, the routing table, and
+//! hooks/instructions/filter staleness — lives in [`crate::health`] as typed
+//! findings. This module gathers doctor's own probe feed (daemon-down capable),
+//! asks the model for findings, and renders them. The finding *set* is the
+//! contract (pinned by the model's tests); the prose here may reflow freely.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::tty::IsTty;
 
-use crate::cli::{ColorConfig, Output};
+use crate::cli::Output;
+use crate::health::servers::{HealthFeed, ProbeFeed, ServerStatus};
+use crate::health::{Finding, Severity};
 use crate::lsp;
 
-/// Expected Claude Code hooks, embedded at compile time.
-const CLAUDE_HOOKS_EXPECTED: &str = include_str!("../../plugins/catenary/hooks/hooks.json");
+/// Maximum number of stderr lines to capture in verbose doctor mode.
+const STDERR_MAX_LINES: usize = 50;
 
-/// Expected Antigravity CLI hooks, embedded at compile time.
-const ANTIGRAVITY_HOOKS_EXPECTED: &str =
-    include_str!("../../plugins/catenary-antigravity/hooks.json");
-
-/// Expected Antigravity rules file, embedded at compile time.
-const ANTIGRAVITY_RULES_EXPECTED: &str =
-    include_str!("../../plugins/catenary-antigravity/rules/catenary.md");
-
-/// Migration guidance for users who still have the legacy Python script configured.
-const CONSTRAINED_BASH_MIGRATION: &str = "Command filtering is now built into `catenary hook pre-tool`. \
-     Remove the constrained_bash.py hook from your settings and use \
-     `[commands]` in your Catenary config instead. \
-     Run `catenary config` to generate a recommended template.";
-
-/// Default per-server timeout for the initialize probe (5 minutes).
-///
-/// Julia's `LanguageServer.jl` compiles on first run and can take minutes
-/// without a precompiled sysimage. 5 minutes is generous enough to avoid
-/// false negatives for legitimately slow servers.
-///
-/// Override with `CATENARY_DOCTOR_TIMEOUT_SECS` for testing.
-fn probe_timeout() -> Duration {
-    std::env::var("CATENARY_DOCTOR_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map_or_else(|| Duration::from_mins(5), Duration::from_secs)
-}
-
-/// Threshold after which a still-pending server gets a slow-startup hint.
-const SLOW_HINT_DELAY: Duration = Duration::from_secs(5);
-
-/// Result of probing a single server.
-struct ServerProbeResult {
-    /// Server name (sorted key).
-    name: String,
-    /// Status line to display (without the name prefix).
-    status: ProbeStatus,
-    /// Extracted capabilities (empty on failure).
-    capabilities: Vec<&'static str>,
-    /// `file_patterns` from the server definition (for the status suffix).
-    file_patterns: Vec<String>,
-}
-
-/// Outcome of a server probe.
-enum ProbeStatus {
-    /// Server initialized successfully.
-    Ready,
-    /// Binary not found on `$PATH`.
-    BinaryNotFound(String),
-    /// Process spawn failed.
-    SpawnFailed(String),
-    /// Initialize request failed.
-    InitializeFailed(String),
-    /// Initialize timed out after [`probe_timeout()`].
-    TimedOut,
-}
-
-impl ServerProbeResult {
-    /// Format the status line (everything after the name column).
-    fn format_status(&self, colors: &ColorConfig) -> String {
-        match &self.status {
-            ProbeStatus::Ready => {
-                let status = if self.file_patterns.is_empty() {
-                    "✓ ready".to_string()
-                } else {
-                    format!(
-                        "✓ ready  file_patterns: [{}]",
-                        self.file_patterns
-                            .iter()
-                            .map(|p| format!("\"{p}\""))
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    )
-                };
-                colors.green(&status)
-            }
-            ProbeStatus::BinaryNotFound(cmd) => colors.red(&format!("✗ {cmd}: command not found")),
-            ProbeStatus::SpawnFailed(e) => colors.red(&format!("✗ spawn failed: {e}")),
-            ProbeStatus::InitializeFailed(e) => colors.red(&format!("✗ initialize failed: {e}")),
-            ProbeStatus::TimedOut => colors.red("✗ initialize timed out"),
-        }
-    }
-}
-
-/// Polling interval for the work-gate monitor (matches `settle.rs`).
-const WORK_GATE_POLL: Duration = Duration::from_millis(50);
-
-/// Probe a single server: binary check → spawn → initialize → capabilities → shutdown.
-///
-/// If `work_started_tx` is `Some`, spawns a work-gate monitor that polls
-/// the server's process tree and sends the server name on the channel
-/// once cumulative CPU ticks advance from the pre-initialize baseline.
-/// This lets the caller defer slow-startup hints until the server has
-/// actually been scheduled CPU time, avoiding false hints under contention.
-async fn probe_server(
-    name: String,
-    command: String,
-    args: Vec<String>,
-    initialization_options: Option<serde_json::Value>,
-    env: Option<HashMap<String, String>>,
-    file_patterns: Vec<String>,
-    work_started_tx: Option<tokio::sync::mpsc::Sender<String>>,
-) -> ServerProbeResult {
-    if !binary_exists(&command) {
-        return ServerProbeResult {
-            name,
-            status: ProbeStatus::BinaryNotFound(command),
-            capabilities: Vec::new(),
-            file_patterns,
-        };
-    }
-
-    let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let spawn_result = lsp::LspClient::spawn_quiet(
-        &command,
-        &args_refs,
-        &name,
-        &name,
-        crate::logging::LoggingServer::new(),
-        env.as_ref(),
-    );
-
-    let mut client = match spawn_result {
-        Ok(client) => client,
-        Err(e) => {
-            return ServerProbeResult {
-                name,
-                status: ProbeStatus::SpawnFailed(e.to_string()),
-                capabilities: Vec::new(),
-                file_patterns,
-            };
-        }
+/// Render one finding: the glyph + message, its fix-it (indented, dim), and —
+/// only under `--diff` — its stale-content diff.
+fn render_finding(out: &mut Output, finding: &Finding, show_diff: bool) {
+    let body = match finding.severity {
+        Severity::Error => out.colors.red(&format!("✗  {}", finding.message)),
+        Severity::Warning => out.colors.yellow(&format!("⚠  {}", finding.message)),
+        Severity::Ok => out.colors.green(&format!("✓  {}", finding.message)),
+        Severity::Info => out.colors.dim(&finding.message),
     };
+    let _ = out.writeln(format_args!("  {body}"));
 
-    // Spawn work-gate monitor: detect when the server actually gets CPU time.
-    let gate_cancel = tokio_util::sync::CancellationToken::new();
-    if let Some(tx) = work_started_tx {
-        let server = std::sync::Arc::clone(client.server());
-        let baseline_ticks = server.sample_tree().map_or(0, |s| s.cumulative_ticks);
-        let gate_name = name.clone();
-        let cancel = gate_cancel.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    () = tokio::time::sleep(WORK_GATE_POLL) => {}
-                    () = cancel.cancelled() => return,
-                }
-                let advanced = server
-                    .sample_tree()
-                    .is_some_and(|s| s.cumulative_ticks > baseline_ticks);
-                if advanced {
-                    let _ = tx.send(gate_name).await;
-                    return;
-                }
-            }
-        });
-    }
-
-    let init_result = tokio::time::timeout(
-        probe_timeout(),
-        client.initialize(&[], initialization_options),
-    )
-    .await;
-
-    gate_cancel.cancel();
-
-    match init_result {
-        Ok(Ok(result)) => {
-            let tools =
-                extract_capabilities(&result["capabilities"], client.supports_type_hierarchy());
-            let _ = client.shutdown().await;
-            ServerProbeResult {
-                name,
-                status: ProbeStatus::Ready,
-                capabilities: tools,
-                file_patterns,
-            }
-        }
-        Ok(Err(e)) => {
-            let _ = client.shutdown().await;
-            ServerProbeResult {
-                name,
-                status: ProbeStatus::InitializeFailed(e.to_string()),
-                capabilities: Vec::new(),
-                file_patterns,
-            }
-        }
-        Err(_) => {
-            let _ = client.shutdown().await;
-            ServerProbeResult {
-                name,
-                status: ProbeStatus::TimedOut,
-                capabilities: Vec::new(),
-                file_patterns,
-            }
+    if let Some(fix_it) = &finding.fix_it {
+        for line in fix_it.lines() {
+            let styled = out.colors.dim(line);
+            let _ = out.writeln(format_args!("     {styled}"));
         }
     }
+
+    if show_diff && let Some(diff) = &finding.diff {
+        show_unified_diff(
+            out,
+            &diff.installed,
+            &diff.expected,
+            "installed",
+            "expected",
+        );
+    }
+}
+
+/// Render a slice of findings, returning whether any were rendered (for spacing).
+fn render_findings(out: &mut Output, findings: &[Finding], show_diff: bool) -> bool {
+    for finding in findings {
+        render_finding(out, finding, show_diff);
+    }
+    !findings.is_empty()
 }
 
 /// Run the doctor command: check all configured language servers.
@@ -223,31 +68,40 @@ async fn probe_server(
 /// Returns an error if the configuration cannot be loaded.
 #[allow(
     clippy::too_many_lines,
-    reason = "Doctor command has sequential output logic"
+    reason = "Doctor command has sequential output sections"
 )]
 pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) -> Result<()> {
-    // Print version header
     let _ = out.writeln(format_args!("Catenary {}", env!("CATENARY_VERSION")));
     let _ = out.writeln(format_args!(""));
 
-    // Check config sources for old-format entries before loading. The walker
-    // reports whether it printed migration guidance, so the config-load error
-    // below can drop the self-referential "run catenary doctor" pointer.
-    let printed_guidance = doctor_check_config(out, &crate::config::config_sources());
+    // Version skew (binary vs the running daemon's recorded version) — surfaced
+    // up top so a stale daemon is the first thing seen. Daemon down → no
+    // finding.
+    let daemon_version = read_daemon_version();
+    if let Some(finding) =
+        crate::health::skew::skew_finding(env!("CATENARY_VERSION"), daemon_version.as_deref())
+    {
+        render_finding(out, &finding, show_diff);
+        let _ = out.writeln(format_args!(""));
+    }
 
-    // Load configuration — report errors inline instead of bailing
+    // Config migration walk — runs before the load so its rename guidance can
+    // print above a config-load error. A non-empty set also lets the load-error
+    // path drop the self-referential "run catenary doctor" pointer.
+    let migration =
+        crate::health::config_checks::migration_findings(&crate::config::config_sources());
+    if render_findings(out, &migration, show_diff) {
+        let _ = out.writeln(format_args!(""));
+    }
+
     let config = match crate::config::Config::load() {
         Ok(c) => c,
         Err(e) => {
             let rendered = format!("{e:#}");
-            // When the walker printed rename guidance directly above, rewrite
-            // the guard's self-referential pointer to point at that guidance
-            // instead of back at the command the user is already inside
-            // (feedback 08 finding 1).
-            let rendered = if printed_guidance {
-                rewrite_guard_pointer(&rendered)
-            } else {
+            let rendered = if migration.is_empty() {
                 rendered
+            } else {
+                crate::health::config_checks::rewrite_guard_pointer(&rendered)
             };
             let _ = out.writeln(format_args!(
                 "{}",
@@ -258,7 +112,6 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
         }
     };
 
-    // Print config header
     let config_source = std::env::var("CATENARY_CONFIG")
         .ok()
         .unwrap_or_else(|| "default paths".to_string());
@@ -269,54 +122,33 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
     ));
     let _ = out.writeln(format_args!(""));
 
-    // Validation errors
-    let validation_errors = config.validate();
-    for err in &validation_errors {
-        let _ = out.writeln(format_args!("{}", out.colors.red(&format!("✗  {err}"))));
-    }
-
-    // Unknown config keys (misc 131). Reached only after a successful load, so a
-    // structurally-invalid config (pre-namespacing renames, inline server fields)
-    // is owned by `doctor_check_config` above and never double-reported here —
-    // this pass surfaces only the keys serde silently accepted.
-    let unknown_keys_found = doctor_check_unknown_keys(out, &crate::config::config_sources());
-
-    // Unreferenced server warnings — user-defined servers only. An embedded
-    // default orphaned by a user [lsp.language.*] override is normal operation,
-    // not user error (feedback 08 finding 2).
-    let unreferenced = unreferenced_user_servers(&config);
-    for name in &unreferenced {
-        let _ = out.writeln(format_args!(
-            "{}",
-            out.colors.yellow(&format!(
-                "⚠  Server '{name}' is defined but not referenced by any [lsp.language.*] entry"
-            )),
-        ));
-    }
-
-    // Duplicate extension warnings
-    let dup_exts =
-        crate::bridge::filesystem_manager::ClassificationTables::find_duplicate_extensions(&config);
-    for (ext, first, second) in &dup_exts {
-        let _ = out.writeln(format_args!(
-            "{}",
-            out.colors.yellow(&format!(
-                "⚠  Extension '.{ext}' claimed by both [lsp.language.{first}] and \
-                 [lsp.language.{second}] — first wins"
-            )),
-        ));
-    }
-
-    if !validation_errors.is_empty()
-        || unknown_keys_found
-        || !unreferenced.is_empty()
-        || !dup_exts.is_empty()
-    {
+    // Config-block findings: validation, unknown keys, unreferenced servers,
+    // duplicate extensions.
+    let sources = crate::config::config_sources();
+    let mut config_findings = crate::health::config_checks::validation_findings(&config);
+    config_findings.extend(crate::health::config_checks::unknown_key_findings(&sources));
+    config_findings.extend(crate::health::config_checks::unreferenced_server_findings(
+        &config,
+    ));
+    config_findings.extend(crate::health::config_checks::duplicate_extension_findings(
+        &config,
+    ));
+    if render_findings(out, &config_findings, show_diff) {
         let _ = out.writeln(format_args!(""));
     }
 
-    // ── Project config section ──────────────────────────────────────
-    doctor_check_project_config(out, project_root, &config);
+    // Project config section.
+    if let Some(path) = crate::health::config_checks::project_config_path(project_root) {
+        let _ = out.writeln(format_args!(
+            "{} {}",
+            out.colors.bold("Project config:"),
+            path.display(),
+        ));
+        let project_findings =
+            crate::health::config_checks::project_config_findings(project_root, &config);
+        render_findings(out, &project_findings, show_diff);
+        let _ = out.writeln(format_args!(""));
+    }
 
     if config.language.is_empty() && config.server.is_empty() {
         let _ = out.writeln(format_args!("No language servers configured."));
@@ -324,174 +156,100 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
     }
 
     // ── Servers section ──────────────────────────────────────────────
-    // Spawn all server probes concurrently, updating lines in-place.
-    let mut server_names: Vec<String> = config.server.keys().cloned().collect();
-    server_names.sort_unstable();
-
-    let max_server_width = server_names.iter().map(String::len).max().unwrap_or(10);
-
-    let is_tty = std::io::stdout().is_tty();
-
+    // Gather the probe feed (concurrent one-shot probes), then render the
+    // server findings the model derives from it — routed breaks are errors,
+    // dormant breaks are inventory.
+    let feed = gather_probe_feed(&config, project_root, daemon_version).await;
     let _ = out.writeln(format_args!("{}:", out.colors.bold("Servers")));
+    let server_findings = crate::health::servers::server_findings(&config, &feed);
+    render_findings(out, &server_findings, show_diff);
 
-    // Build index: server name → line offset (distance from bottom).
-    // Binary-not-found servers are printed immediately and excluded from
-    // the pending set.
-    let mut pending_names: Vec<String> = Vec::new();
-    let mut immediate_results: Vec<ServerProbeResult> = Vec::new();
-
-    for name in &server_names {
-        let server_def = &config.server[name.as_str()];
-        if binary_exists(&server_def.command) {
-            pending_names.push(name.clone());
-        } else {
-            immediate_results.push(ServerProbeResult {
-                name: name.clone(),
-                status: ProbeStatus::BinaryNotFound(server_def.command.clone()),
-                capabilities: Vec::new(),
-                file_patterns: server_def.file_patterns.clone(),
-            });
-        }
-    }
-
-    // Print binary-not-found results immediately
-    for result in &immediate_results {
-        let name_display = format!("  {:<max_server_width$}", result.name);
-        let _ = out.writeln(format_args!(
-            "{name_display}  {}",
-            result.format_status(&out.colors)
-        ));
-    }
-
-    // Print pending lines and spawn concurrent probes
-    if is_tty {
-        // Print all pending lines with ⏳ status
-        for name in &pending_names {
-            let name_display = format!("  {name:<max_server_width$}");
-            let _ = out.writeln(format_args!("{name_display}  ⏳ checking..."));
-        }
-    }
-
-    // Spawn probes into a JoinSet.
-    // TTY mode gets a work-gate channel so hint timers start only after
-    // the server has actually consumed CPU time.
-    let pending_count = pending_names.len();
-    let (work_tx, mut work_rx) = tokio::sync::mpsc::channel::<String>(pending_count.max(1));
-
-    let mut join_set = tokio::task::JoinSet::new();
-    for name in &pending_names {
-        let server_def = &config.server[name.as_str()];
-        let tx = if is_tty { Some(work_tx.clone()) } else { None };
-        join_set.spawn(probe_server(
-            name.clone(),
-            server_def.command.clone(),
-            server_def.args.clone(),
-            server_def.initialization_options.clone(),
-            server_def.env.clone(),
-            server_def.file_patterns.clone(),
-            tx,
-        ));
-    }
-    drop(work_tx); // Drop the original sender
-
-    // Collect results, updating lines in-place (TTY) or batching (piped).
-    let mut completed: HashMap<String, ServerProbeResult> = HashMap::new();
-    let mut slow_hinted: HashSet<String> = HashSet::new();
-
-    if is_tty && pending_count > 0 {
-        // Per-server hint deadlines, started when the work gate fires.
-        let mut hint_deadlines: HashMap<String, tokio::time::Instant> = HashMap::new();
-
-        while completed.len() < pending_count {
-            // Find the earliest pending hint deadline.
-            let next_deadline = hint_deadlines
-                .iter()
-                .filter(|(n, _)| !completed.contains_key(*n) && !slow_hinted.contains(*n))
-                .map(|(_, &d)| d)
-                .min();
-
-            tokio::select! {
-                Some(join_result) = join_set.join_next() => {
-                    if let Ok(result) = join_result {
-                        update_server_line(
-                            out,
-                            &result,
-                            &pending_names,
-                            pending_count,
-                            max_server_width,
-                        );
-                        completed.insert(result.name.clone(), result);
-                    }
-                }
-                Some(name) = work_rx.recv() => {
-                    // Work gate fired — server has consumed CPU time.
-                    // Start the per-server hint timer from now.
-                    hint_deadlines.insert(
-                        name,
-                        tokio::time::Instant::now() + SLOW_HINT_DELAY,
-                    );
-                }
-                () = async {
-                    match next_deadline {
-                        Some(d) => tokio::time::sleep_until(d).await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    // Fire hints for all servers past their deadline.
-                    let now = tokio::time::Instant::now();
-                    for (name, deadline) in &hint_deadlines {
-                        if *deadline <= now
-                            && !completed.contains_key(name)
-                            && slow_hinted.insert(name.clone())
-                        {
-                            update_server_line_raw(
-                                out,
-                                name,
-                                "⏳ checking... (slow — see your language server's docs)",
-                                &pending_names,
-                                pending_count,
-                                max_server_width,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        // Non-TTY: collect all results, then print sequentially.
-        while let Some(join_result) = join_set.join_next().await {
-            if let Ok(result) = join_result {
-                completed.insert(result.name.clone(), result);
-            }
-        }
-        // Print in sorted order
-        for name in &pending_names {
-            if let Some(result) = completed.get(name) {
-                let name_display = format!("  {name:<max_server_width$}");
-                let _ = out.writeln(format_args!(
-                    "{name_display}  {}",
-                    result.format_status(&out.colors)
-                ));
-            }
-        }
-    }
-
-    // Build the capabilities map from all results
-    let mut server_capabilities: HashMap<&str, Vec<&'static str>> = HashMap::new();
-    for result in immediate_results.iter().chain(completed.values()) {
-        if !result.capabilities.is_empty() {
-            // Borrow the name from server_names (which lives long enough)
-            if let Some(name_ref) = server_names.iter().find(|n| **n == result.name) {
-                server_capabilities.insert(name_ref.as_str(), result.capabilities.clone());
-            }
-        }
-    }
-
-    // ── Languages section ────────────────────────────────────────────
+    // ── Languages section (the routing table) ────────────────────────
     let _ = out.writeln(format_args!(""));
     let _ = out.writeln(format_args!("{}:", out.colors.bold("Languages")));
+    render_languages(out, &config, &feed);
 
-    // Build sorted list of (language, server_name) pairs
+    // ── Hooks section ────────────────────────────────────────────────
+    let _ = out.writeln(format_args!(""));
+    let _ = out.writeln(format_args!("{}:", out.colors.bold("Hooks")));
+    let mut hook_findings = crate::health::install_checks::claude_hooks_findings();
+    hook_findings.extend(crate::health::install_checks::antigravity_hooks_findings(
+        project_root,
+    ));
+    hook_findings.extend(crate::health::install_checks::path_binary_findings());
+    render_findings(out, &hook_findings, show_diff);
+
+    // ── Agent instructions section ───────────────────────────────────
+    let _ = out.writeln(format_args!(""));
+    let _ = out.writeln(format_args!("{}:", out.colors.bold("Agent instructions")));
+    let mut instruction_findings = crate::health::install_checks::claude_instructions_findings();
+    instruction_findings
+        .extend(crate::health::install_checks::antigravity_instructions_findings(project_root));
+    render_findings(out, &instruction_findings, show_diff);
+
+    // ── Command filter section ───────────────────────────────────────
+    let _ = out.writeln(format_args!(""));
+    let _ = out.writeln(format_args!("{}:", out.colors.bold("Command filter")));
+    let mut filter_findings = crate::health::install_checks::legacy_script_findings();
+    filter_findings.extend(crate::health::install_checks::command_filter_findings(
+        &config,
+    ));
+    render_findings(out, &filter_findings, show_diff);
+
+    // Actionable suggestions at the very bottom so they aren't buried.
+    let suggestions = collect_suggestions(&config, dirs::config_dir());
+    if !suggestions.is_empty() {
+        let _ = out.writeln(format_args!(""));
+        let _ = out.writeln(format_args!("{}:", out.colors.bold("Suggestions")));
+        for suggestion in &suggestions {
+            let _ = out.writeln(format_args!("  {}", out.colors.dim(suggestion)));
+        }
+    }
+
+    Ok(())
+}
+
+/// Gather doctor's one-shot probe feed: concurrent `initialize` probes for every
+/// configured server, the languages detected in the workspace, and the observed
+/// daemon version.
+async fn gather_probe_feed(
+    config: &crate::config::Config,
+    project_root: &Path,
+    daemon_version: Option<String>,
+) -> ProbeFeed {
+    let mut join_set = tokio::task::JoinSet::new();
+    for (name, def) in &config.server {
+        join_set.spawn(crate::health::servers::probe_server(
+            name.clone(),
+            def.command.clone(),
+            def.args.clone(),
+            def.initialization_options.clone(),
+            def.env.clone(),
+        ));
+    }
+
+    let mut statuses: HashMap<String, ServerStatus> = HashMap::new();
+    while let Some(joined) = join_set.join_next().await {
+        if let Ok((name, status)) = joined {
+            statuses.insert(name, status);
+        }
+    }
+
+    let configured_keys: HashSet<&str> = config.language.keys().map(String::as_str).collect();
+    let roots = project_root
+        .canonicalize()
+        .map(|r| vec![r])
+        .unwrap_or_default();
+    let manager = crate::bridge::filesystem_manager::FilesystemManager::with_classification(
+        crate::bridge::filesystem_manager::ClassificationTables::from_config(config),
+    );
+    let active_languages = manager.detect_workspace_languages(&roots, &configured_keys);
+
+    ProbeFeed::new(statuses, active_languages, daemon_version)
+}
+
+/// Render the language→server routing table with each server's capabilities.
+fn render_languages(out: &mut Output, config: &crate::config::Config, feed: &dyn HealthFeed) {
     let mut lang_entries: Vec<(&str, &str)> = Vec::new();
     for (lang, lc) in &config.language {
         if let Some(binding) = lc.servers().first() {
@@ -509,52 +267,32 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
     for (lang, target) in &lang_entries {
         let lang_display = format!("  {lang:<max_lang_width$}");
         let _ = out.writeln(format_args!("{lang_display}  → {target}"));
-        // Show capabilities from the server, indented
-        if let Some(tools) = server_capabilities.get(target)
-            && !tools.is_empty()
+        if let Some(ServerStatus::Ready { capabilities }) = feed.server_status(target)
+            && !capabilities.is_empty()
         {
             let _ = out.writeln(format_args!(
                 "{}    {}",
                 " ".repeat(max_lang_width + 2),
-                out.colors.dim(&tools.join(" ")),
+                out.colors.dim(&capabilities.join(" ")),
             ));
         }
     }
-
-    // Hooks health section
-    let _ = out.writeln(format_args!(""));
-    let _ = out.writeln(format_args!("{}:", out.colors.bold("Hooks")));
-    check_claude_hooks(out, show_diff);
-    check_antigravity_hooks(out, show_diff, project_root);
-    check_path_binary(out);
-
-    // Agent instructions section
-    let _ = out.writeln(format_args!(""));
-    let _ = out.writeln(format_args!("{}:", out.colors.bold("Agent instructions")));
-    check_claude_instructions(out);
-    check_antigravity_instructions(out, show_diff, project_root);
-
-    // Legacy script migration warnings
-    let _ = out.writeln(format_args!(""));
-    let _ = out.writeln(format_args!("{}:", out.colors.bold("Command filter")));
-    check_constrained_bash_claude(out);
-    check_command_filter_config(out, &config);
-
-    // Actionable suggestions at the very bottom so they aren't buried
-    let suggestions = collect_suggestions(&config, dirs::config_dir());
-    if !suggestions.is_empty() {
-        let _ = out.writeln(format_args!(""));
-        let _ = out.writeln(format_args!("{}:", out.colors.bold("Suggestions")));
-        for suggestion in &suggestions {
-            let _ = out.writeln(format_args!("  {}", out.colors.dim(suggestion)));
-        }
-    }
-
-    Ok(())
 }
 
-/// Maximum number of stderr lines to capture in verbose doctor mode.
-const STDERR_MAX_LINES: usize = 50;
+/// Read the running daemon's version from the `state.json` snapshot, if present.
+///
+/// Read-only: the snapshot is the same source the TUI's snapshot feed will use.
+/// A missing/unparseable snapshot or an empty version yields `None` (daemon down
+/// or unknown), so version skew simply does not fire.
+fn read_daemon_version() -> Option<String> {
+    let path = crate::paths::runtime_dir()
+        .join("catenary")
+        .join("state.json");
+    let contents = std::fs::read_to_string(path).ok()?;
+    let snapshot: crate::state_snapshot::Snapshot = serde_json::from_str(&contents).ok()?;
+    let version = snapshot.daemon.version;
+    (!version.is_empty()).then_some(version)
+}
 
 /// Run the doctor command for a single server with verbose output.
 ///
@@ -588,7 +326,7 @@ pub async fn run_doctor_single(
         }
     };
 
-    // Merge project config if present
+    // Merge project config if present.
     let merged_config = match crate::config::load_project_config(
         &project_root
             .canonicalize()
@@ -604,7 +342,7 @@ pub async fn run_doctor_single(
         _ => config,
     };
 
-    // Look up server
+    // Look up server.
     let Some(server_def) = merged_config.server.get(server_name) else {
         let _ = out.writeln(format_args!(
             "{}\n",
@@ -632,7 +370,6 @@ pub async fn run_doctor_single(
     let _ = out.writeln(format_args!(""));
 
     // ── 1b. Root markers ────────────────────────────────────────────
-    // Find languages that bind to this server and show their markers.
     let mut shown_markers = false;
     for (lang_name, lang_config) in &merged_config.language {
         if lang_config.servers().iter().any(|b| b.name == server_name)
@@ -651,7 +388,7 @@ pub async fn run_doctor_single(
 
     // ── 2. Binary check ────────────────────────────────────────────
     let _ = out.writeln(format_args!("{}:", out.colors.bold("Binary")));
-    if let Some(path) = resolve_binary(command) {
+    if let Some(path) = crate::health::servers::resolve_binary(command) {
         let _ = out.writeln(format_args!(
             "  {} {}",
             out.colors.green("✓"),
@@ -692,7 +429,7 @@ pub async fn run_doctor_single(
         }
     };
 
-    // Start stderr reader task
+    // Start stderr reader task.
     let stderr_task = child_stderr.map(|stderr| {
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
@@ -717,7 +454,6 @@ pub async fn run_doctor_single(
         .map(|r| vec![r])
         .unwrap_or_default();
 
-    // Build init params for display
     let workspace_folders: Vec<(String, String)> = resolved_roots
         .iter()
         .map(|root| {
@@ -761,8 +497,10 @@ pub async fn run_doctor_single(
             let _ = out.writeln(format_args!(""));
 
             // ── 5. Capabilities summary ─────────────────────────────
-            let tools =
-                extract_capabilities(&result["capabilities"], client.supports_type_hierarchy());
+            let tools = crate::health::servers::extract_capabilities(
+                &result["capabilities"],
+                client.supports_type_hierarchy(),
+            );
             let _ = out.writeln(format_args!("{}:", out.colors.bold("Capabilities")));
             if tools.is_empty() {
                 let _ = out.writeln(format_args!("  {}", out.colors.dim("(none)")));
@@ -786,7 +524,6 @@ pub async fn run_doctor_single(
 
     // ── 7. Server stderr ───────────────────────────────────────────
     if let Some(task) = stderr_task {
-        // Give the task a moment to finish collecting output
         let lines = tokio::time::timeout(Duration::from_secs(2), task)
             .await
             .ok()
@@ -812,481 +549,12 @@ pub async fn run_doctor_single(
     Ok(())
 }
 
-/// Check config source files for old-format entries and print migration guidance.
-///
-/// Reads each config file as raw TOML (independent of `Config::load`) to detect:
-/// - the pre-namespacing top-level `[server.*]` / `[language.*]` /
-///   `[linter.<name>]` tables (renamed under `[lsp.*]` / `[linter.rule.*]` in
-///   linters ticket 04) — walked so nested sub-tables (e.g.
-///   `[server.<name>.sources]`) migrate too
-/// - `[lsp.language.*]` entries containing `command`/`args` etc. (fields that
-///   belong on `[lsp.server.*]`) or the removed `inherit` field
-///
-/// Prints the equivalent new-format config for each detected old entry.
-///
-/// Returns whether any migration issue was found (and thus whether guidance was
-/// printed) so the caller can drop the self-referential "run catenary doctor"
-/// pointer from a subsequent config-load error (feedback 08 finding 1).
-fn doctor_check_config(out: &mut Output, sources: &[PathBuf]) -> bool {
-    let mut found_issues = false;
-
-    for source in sources {
-        let Ok(contents) = std::fs::read_to_string(source) else {
-            continue;
-        };
-        // Document parse: `str::parse::<toml::Value>()` uses `FromStr for
-        // Value`, which parses a value *expression* and fails on every
-        // document — the bug that made this whole walker dead code (bug 57).
-        let Ok(raw) = toml::from_str::<toml::Value>(&contents) else {
-            continue;
-        };
-
-        // Pre-namespacing top-level definition tables (linters ticket 04).
-        if let Some(table) = raw.get("server").and_then(toml::Value::as_table) {
-            found_issues = true;
-            print_namespace_rename(out, source, "server", "lsp.server", table);
-        }
-        if let Some(table) = raw.get("language").and_then(toml::Value::as_table) {
-            found_issues = true;
-            print_namespace_rename(out, source, "language", "lsp.language", table);
-        }
-        // Old `[linter.<name>]` definitions — any `[linter]` sub-table other than
-        // the namespaced `rule` map and the `disable` toggle.
-        if let Some(linter_table) = raw.get("linter").and_then(toml::Value::as_table) {
-            let old_defs: toml::map::Map<String, toml::Value> = linter_table
-                .iter()
-                .filter(|(k, v)| k.as_str() != "rule" && k.as_str() != "disable" && v.is_table())
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            if !old_defs.is_empty() {
-                found_issues = true;
-                print_namespace_rename(out, source, "linter", "linter.rule", &old_defs);
-            }
-        }
-
-        // [lsp.language.*] entries with removed or stale fields
-        if let Some(table) = raw
-            .get("lsp")
-            .and_then(|v| v.get("language"))
-            .and_then(toml::Value::as_table)
-        {
-            for (key, entry) in table {
-                if let Some(entry_table) = entry.as_table() {
-                    // Removed field: inherit
-                    if entry_table.contains_key("inherit") {
-                        found_issues = true;
-                        let target = entry_table
-                            .get("inherit")
-                            .and_then(toml::Value::as_str)
-                            .unwrap_or("?");
-                        let _ = out.writeln(format_args!(
-                            "{}",
-                            out.colors.yellow(&format!(
-                                "⚠  {}: [lsp.language.{key}] uses removed `inherit` field — \
-                                 copy `servers` list from [lsp.language.{target}] into \
-                                 [lsp.language.{key}] instead.",
-                                source.display(),
-                            )),
-                        ));
-                    }
-
-                    // Inline server definition fields — belong on [lsp.server.*].
-                    let has_server_fields = crate::config::SERVER_DEF_KEYS
-                        .iter()
-                        .any(|k| entry_table.contains_key(*k));
-                    if has_server_fields {
-                        found_issues = true;
-                        print_migration(out, source, key, entry_table);
-                    }
-                }
-            }
-        }
-
-        // [commands] entries with old denylist-format fields
-        if let Some(cmd_table) = raw.get("commands").and_then(toml::Value::as_table) {
-            if cmd_table.contains_key("deny_when_first") {
-                found_issues = true;
-                let _ = out.writeln(format_args!(
-                    "{}",
-                    out.colors.yellow(&format!(
-                        "⚠  {}: [commands] uses removed `deny_when_first` field — \
-                         Catenary now uses an allowlist model. \
-                         Run `catenary config` for the recommended template.",
-                        source.display(),
-                    )),
-                ));
-            }
-
-            if let Some(deny_table) = cmd_table.get("deny").and_then(toml::Value::as_table) {
-                for (key, value) in deny_table {
-                    if value.is_str() {
-                        found_issues = true;
-                        let _ = out.writeln(format_args!(
-                            "{}",
-                            out.colors.yellow(&format!(
-                                "⚠  {}: [commands.deny.{key}] has a string value — \
-                                 the old guidance-string format is removed. `deny` now \
-                                 maps commands to arrays of denied subcommands \
-                                 (e.g., `git = [\"grep\", \"ls-files\"]`).",
-                                source.display(),
-                            )),
-                        ));
-                        break; // One message per file is enough.
-                    }
-                }
-            }
-        }
-    }
-
-    if found_issues {
-        let _ = out.writeln(format_args!(""));
-    }
-    found_issues
-}
-
-/// Warn per unknown key found in the user config sources (misc 131).
-///
-/// Reads each source as raw TOML and walks it against the embedded user-config
-/// JSON Schema ([`crate::config::schema::unknown_user_config_keys`]), whose
-/// closed key set is the same SSOT taplo validates against in-editor (misc 133),
-/// so the two surfaces can never disagree and doctor inherits every future key
-/// for free. Openness is read from the schema, so the server pass-through
-/// subtrees (`initialization_options`, `settings`, `env`) and wildcard-keyed
-/// maps (`[lsp.server.*]`, `[roots.companions]`) never false-positive.
-///
-/// Unknown keys warn, never error: forward compatibility means an older binary
-/// reading a newer config keeps working. Doctor is the audit surface — nothing
-/// reaches the notification queue. Returns whether any warning was printed (for
-/// output spacing).
-fn doctor_check_unknown_keys(out: &mut Output, sources: &[PathBuf]) -> bool {
-    let mut warned = false;
-    for source in sources {
-        let Ok(contents) = std::fs::read_to_string(source) else {
-            continue;
-        };
-        let Ok(raw) = toml::from_str::<toml::Value>(&contents) else {
-            continue;
-        };
-        for unknown in crate::config::schema::unknown_user_config_keys(&raw) {
-            warned = true;
-            let location = if unknown.location.is_empty() {
-                "top level".to_string()
-            } else {
-                format!("in [{}]", unknown.location)
-            };
-            let _ = out.writeln(format_args!(
-                "{}",
-                out.colors.yellow(&format!(
-                    "⚠  {}: `{}` ({location}) is not a Catenary config key — remove it",
-                    source.display(),
-                    unknown.key,
-                )),
-            ));
-        }
-    }
-    warned
-}
-
-/// User-defined servers that no `[lsp.language.*]` entry routes to.
-///
-/// Embedded defaults are exempt: a default server orphaned by a user language
-/// override is normal operation, not user error (feedback 08 finding 2 /
-/// misc 120). Only servers absent from the embedded default set warn. The
-/// result is sorted for stable output.
-fn unreferenced_user_servers(config: &crate::config::Config) -> Vec<&str> {
-    let referenced: HashSet<&str> = config
-        .language
-        .values()
-        .flat_map(|lc| lc.servers().iter().map(|b| b.name.as_str()))
-        .collect();
-    let defaults = crate::config::default_server_names();
-    let mut unreferenced: Vec<&str> = config
-        .server
-        .keys()
-        .filter(|name| !referenced.contains(name.as_str()) && !defaults.contains(name.as_str()))
-        .map(String::as_str)
-        .collect();
-    unreferenced.sort_unstable();
-    unreferenced
-}
-
-/// Rewrite a config-load error for doctor's own render.
-///
-/// The migration walker's rename guidance prints directly above the error in
-/// doctor, so the guard's "run `catenary doctor`" pointer is rewritten to point
-/// at that guidance instead of back at the command the user is already inside
-/// (feedback 08 finding 1). Other surfaces keep the pointer verbatim.
-fn rewrite_guard_pointer(rendered: &str) -> String {
-    rendered.replace(
-        crate::config::MIGRATION_GUIDANCE_POINTER,
-        "See the rename guidance above.",
-    )
-}
-
-/// Check a project root for `.catenary.toml` and validate its contents.
-///
-/// Reports unsupported sections, parse errors, the per-root feeder toggles,
-/// and orphan server definitions. Called with `--root` (defaults to cwd).
-#[allow(clippy::too_many_lines, reason = "sequential per-section reporting")]
-fn doctor_check_project_config(
-    out: &mut Output,
-    project_root: &Path,
-    user_config: &crate::config::Config,
-) {
-    let Ok(resolved) = project_root.canonicalize() else {
-        return;
-    };
-
-    let config_path = resolved.join(".catenary.toml");
-    if !config_path.exists() {
-        return;
-    }
-
-    let _ = out.writeln(format_args!(
-        "{} {}",
-        out.colors.bold("Project config:"),
-        config_path.display(),
-    ));
-
-    // Flag the removed `lsp`/`enabled` kill switch before parsing (workstream
-    // 34 ticket 00). `load_project_config` now hard-errors on these keys; this
-    // gives a targeted migration hint pointing at the replacement toggle.
-    let removed_key = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|c| toml::from_str::<toml::Value>(&c).ok())
-        .and_then(|raw| {
-            // A `[lsp]` *table* is valid (it carries `disable`); only a bare
-            // scalar `lsp`, or any `enabled`, is the removed key.
-            if matches!(raw.get("lsp"), Some(v) if !v.is_table()) {
-                Some("lsp")
-            } else if raw.get("enabled").is_some() {
-                Some("enabled")
-            } else {
-                None
-            }
-        });
-
-    if let Some(key) = removed_key {
-        let _ = out.writeln(format_args!(
-            "  {}",
-            out.colors.red(&format!(
-                "✗  bare `{key}` was removed — use a `[lsp]` table with `disable` \
-                 (`lsp = false` becomes `[lsp]` / `disable = true`)"
-            )),
-        ));
-    }
-
-    match crate::config::load_project_config(&resolved) {
-        Ok(Some(pc)) => {
-            // Count entries
-            let lang_count = pc.language.len();
-            let server_count = pc.server.len();
-            let _ = out.writeln(format_args!(
-                "  {}",
-                out.colors.green(&format!(
-                    "✓ {lang_count} language{}, {server_count} server{}",
-                    if lang_count == 1 { "" } else { "s" },
-                    if server_count == 1 { "" } else { "s" },
-                )),
-            ));
-
-            // Report the per-root feeder/surface toggles when set (linters 02:
-            // nested under their subsystem tables).
-            for (section, set, note) in [
-                (
-                    "lsp",
-                    pc.disable_lsp,
-                    "no LSP servers, grep/glob enrichment, or LSP diagnostics",
-                ),
-                ("linter", pc.disable_lint, "no linter diagnostics"),
-                (
-                    "diagnostics",
-                    pc.disable_diag,
-                    "diagnostics surface off; LSP navigation kept",
-                ),
-            ] {
-                if set {
-                    let _ = out.writeln(format_args!(
-                        "  {}",
-                        out.colors.dim(&format!("[{section}] disable — {note}")),
-                    ));
-                }
-            }
-
-            // Orphan server warnings
-            for (server_name, server_def) in &pc.server {
-                if server_def.command.is_empty() {
-                    continue;
-                }
-
-                let referenced_by_project = pc
-                    .language
-                    .values()
-                    .any(|lc| lc.servers().iter().any(|b| b.name == *server_name));
-
-                let referenced_by_user = user_config
-                    .language
-                    .values()
-                    .any(|lc| lc.servers().iter().any(|b| b.name == *server_name));
-
-                if !referenced_by_project && !referenced_by_user {
-                    let _ = out.writeln(format_args!(
-                        "  {}",
-                        out.colors.yellow(&format!(
-                            "⚠  [lsp.server.{server_name}] has a `command` but no \
-                             [lsp.language.*] references it"
-                        )),
-                    ));
-                }
-            }
-
-            // Server ref validation — project language refs must resolve
-            // against the combined (user + project) server set.
-            for (lang_key, lang_config) in &pc.language {
-                for binding in lang_config.servers() {
-                    if !pc.server.contains_key(&binding.name)
-                        && !user_config.server.contains_key(&binding.name)
-                    {
-                        let _ = out.writeln(format_args!(
-                            "  {}",
-                            out.colors.red(&format!(
-                                "✗  [lsp.language.{lang_key}] references server '{}', \
-                                 but no [lsp.server.{}] is defined in project or user config",
-                                binding.name, binding.name,
-                            )),
-                        ));
-                    }
-                }
-            }
-        }
-        Ok(None) => {} // No project config — already handled by the exists check above.
-        Err(e) => {
-            let _ = out.writeln(format_args!(
-                "  {}",
-                out.colors
-                    .red(&format!("✗ {}: {e:#}", config_path.display())),
-            ));
-        }
-    }
-
-    let _ = out.writeln(format_args!(""));
-}
-
-/// Print a namespace-rename hint for a pre-04 top-level definition table.
-///
-/// Walks every nested table header under `old_root` — so sub-tables like
-/// `[server.<name>.sources]` or `[server.<name>.initialization_options]` migrate
-/// too, not just the top-level key — and prints each `[old] → [new]` rename
-/// (`new_root` prefix-swapped for `old_root`).
-fn print_namespace_rename(
-    out: &mut Output,
-    source: &Path,
-    old_root: &str,
-    new_root: &str,
-    table: &toml::map::Map<String, toml::Value>,
-) {
-    let _ = out.writeln(format_args!(
-        "{}",
-        out.colors.yellow(&format!(
-            "⚠  {}: [{old_root}.*] moved under [{new_root}.*] (linters ticket 04) — \
-             rename these table headers:",
-            source.display(),
-        )),
-    ));
-
-    let mut headers = Vec::new();
-    for (name, value) in table {
-        if let Some(sub) = value.as_table() {
-            collect_table_headers(&format!("{old_root}.{name}"), sub, &mut headers);
-        }
-    }
-    for header in &headers {
-        // `header` is guaranteed to start with `old_root`; swap the prefix.
-        let new_header = format!("{new_root}{}", &header[old_root.len()..]);
-        let _ = out.writeln(format_args!("    [{header}]  →  [{new_header}]"));
-    }
-    let _ = out.writeln(format_args!(""));
-}
-
-/// Collects the header path for `table` and every nested sub-table, parent
-/// first, into `headers`. `path` is the dotted TOML header for `table`.
-fn collect_table_headers(
-    path: &str,
-    table: &toml::map::Map<String, toml::Value>,
-    headers: &mut Vec<String>,
-) {
-    headers.push(path.to_string());
-    for (key, value) in table {
-        if let Some(sub) = value.as_table() {
-            collect_table_headers(&format!("{path}.{key}"), sub, headers);
-        }
-    }
-}
-
-/// Print migration guidance for a `[lsp.language.*]` entry that inlines server
-/// definition fields (they belong on `[lsp.server.*]`).
-fn print_migration(
-    out: &mut Output,
-    source: &Path,
-    key: &str,
-    entry: &toml::map::Map<String, toml::Value>,
-) {
-    let _ = out.writeln(format_args!(
-        "{}",
-        out.colors.yellow(&format!(
-            "⚠  {}: [lsp.language.{key}] inlines server definition fields — \
-             split into [lsp.language.*] + [lsp.server.*]:",
-            source.display(),
-        )),
-    ));
-
-    // Determine server name from command, falling back to the key
-    let server_name = entry
-        .get("command")
-        .and_then(toml::Value::as_str)
-        .unwrap_or(key);
-
-    // Build old-format display
-    let _ = out.writeln(format_args!(""));
-    let _ = out.writeln(format_args!("  Old:"));
-    let _ = out.writeln(format_args!("    [lsp.language.{key}]"));
-    for (k, v) in entry {
-        let _ = out.writeln(format_args!("    {k} = {v}"));
-    }
-
-    // Build new-format display
-    let server_fields: Vec<(&str, &toml::Value)> = crate::config::SERVER_DEF_KEYS
-        .iter()
-        .filter_map(|k| entry.get(*k).map(|v| (*k, v)))
-        .collect();
-    let lang_fields: Vec<(&str, &toml::Value)> = entry
-        .iter()
-        .filter(|(k, _)| !crate::config::SERVER_DEF_KEYS.contains(&k.as_str()))
-        .map(|(k, v)| (k.as_str(), v))
-        .collect();
-
-    let _ = out.writeln(format_args!(""));
-    let _ = out.writeln(format_args!("  New:"));
-    let _ = out.writeln(format_args!("    [lsp.language.{key}]"));
-    let _ = out.writeln(format_args!("    servers = [\"{server_name}\"]"));
-    for (k, v) in &lang_fields {
-        let _ = out.writeln(format_args!("    {k} = {v}"));
-    }
-    let _ = out.writeln(format_args!(""));
-    let _ = out.writeln(format_args!("    [lsp.server.{server_name}]"));
-    for (k, v) in &server_fields {
-        let _ = out.writeln(format_args!("    {k} = {v}"));
-    }
-    let _ = out.writeln(format_args!(""));
-}
-
 /// Return the user config file path if it exists on disk.
 ///
 /// Uses `config_base` as the parent directory (e.g. `~/.config`).
-/// Returns `None` when the base is unknown or the file doesn't exist.
 fn user_config_path_in(config_base: Option<PathBuf>) -> Option<PathBuf> {
     let path = config_base?.join("catenary").join("config.toml");
-    if path.exists() { Some(path) } else { None }
+    path.exists().then_some(path)
 }
 
 /// Collect actionable suggestions based on current config state.
@@ -1320,686 +588,6 @@ fn collect_suggestions(
     suggestions
 }
 
-/// Update a server's status line in-place using crossterm cursor movement.
-///
-/// Moves the cursor up to the target line, clears it, prints the new status,
-/// and moves back down. Only called when stdout is a TTY.
-fn update_server_line(
-    out: &mut Output,
-    result: &ServerProbeResult,
-    pending_names: &[String],
-    pending_count: usize,
-    max_server_width: usize,
-) {
-    let status = result.format_status(&out.colors);
-    overwrite_line(
-        out,
-        &result.name,
-        &status,
-        pending_names,
-        pending_count,
-        max_server_width,
-    );
-}
-
-/// Update a server's status line with a raw string (no `ServerProbeResult`).
-///
-/// Used for the slow-startup hint update.
-fn update_server_line_raw(
-    out: &mut Output,
-    name: &str,
-    status: &str,
-    pending_names: &[String],
-    pending_count: usize,
-    max_server_width: usize,
-) {
-    overwrite_line(
-        out,
-        name,
-        status,
-        pending_names,
-        pending_count,
-        max_server_width,
-    );
-}
-
-/// Overwrite a server's line in-place via crossterm cursor movement.
-///
-/// `pending_names` defines the line order; `pending_count` is the total
-/// number of pending lines. The cursor is assumed to sit on the line
-/// immediately after the last pending line.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "server count will never exceed u16::MAX"
-)]
-fn overwrite_line(
-    out: &mut Output,
-    name: &str,
-    status: &str,
-    pending_names: &[String],
-    pending_count: usize,
-    max_server_width: usize,
-) {
-    let Some(idx) = pending_names.iter().position(|n| n == name) else {
-        return;
-    };
-    // Lines are printed top-to-bottom, cursor is after the last line.
-    // Line at index `idx` is `pending_count - 1 - idx` lines above the cursor.
-    let lines_up = (pending_count - 1 - idx) as u16;
-    let name_display = format!("  {name:<max_server_width$}");
-
-    if lines_up > 0 {
-        let _ = crossterm::execute!(out, crossterm::cursor::MoveUp(lines_up));
-    }
-    let _ = crossterm::execute!(
-        out,
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
-    );
-    // \r to return to column 0 after Clear
-    let _ = write!(out, "\r{name_display}  {status}");
-    if lines_up > 0 {
-        let _ = crossterm::execute!(out, crossterm::cursor::MoveDown(lines_up));
-    }
-    // Return to column 0 on the bottom line
-    let _ = write!(out, "\r");
-    let _ = out.flush();
-}
-
-/// Checks whether a binary can be found on `$PATH`.
-fn binary_exists(command: &str) -> bool {
-    resolve_binary(command).is_some()
-}
-
-/// Resolves a binary command to its full path on `$PATH`.
-///
-/// Returns `None` if the binary cannot be found.
-fn resolve_binary(command: &str) -> Option<PathBuf> {
-    // If the command contains a path separator, check it directly
-    if command.contains('/') {
-        let p = PathBuf::from(command);
-        return if p.exists() { Some(p) } else { None };
-    }
-
-    // Search PATH
-    let path_var = std::env::var("PATH").unwrap_or_default();
-    std::env::split_paths(&path_var)
-        .map(|dir| dir.join(command))
-        .find(|p| p.is_file())
-}
-
-/// Extracts Catenary tool names from LSP server capabilities.
-fn extract_capabilities(caps: &serde_json::Value, type_hierarchy: bool) -> Vec<&'static str> {
-    let has = |key: &str| caps.get(key).is_some_and(|v| !v.is_null());
-
-    let mut tools = Vec::new();
-
-    if has("hoverProvider") {
-        tools.push("hover");
-    }
-    if has("definitionProvider") {
-        tools.push("definition");
-    }
-    if has("typeDefinitionProvider") {
-        tools.push("type_definition");
-    }
-    if has("implementationProvider") {
-        tools.push("implementation");
-    }
-    if has("referencesProvider") {
-        tools.push("references");
-    }
-    if has("documentSymbolProvider") {
-        tools.push("document_symbols");
-    }
-    if has("workspaceSymbolProvider") {
-        tools.push("search");
-    }
-    if has("codeActionProvider") {
-        tools.push("code_actions");
-    }
-    if has("callHierarchyProvider") {
-        tools.push("call_hierarchy");
-    }
-    if type_hierarchy {
-        tools.push("type_hierarchy");
-    }
-
-    tools
-}
-
-/// Check Claude Code plugin hooks against the embedded expected hooks.
-fn check_claude_hooks(out: &mut Output, show_diff: bool) {
-    let label = format!("{:<14}", "Claude Code");
-    let Ok(home_str) = std::env::var("HOME") else {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.dim("- cannot determine home directory"),
-        ));
-        return;
-    };
-    let home = PathBuf::from(home_str);
-
-    let plugins_file = home.join(".claude/plugins/installed_plugins.json");
-    let Ok(plugins_json) = std::fs::read_to_string(&plugins_file) else {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.dim("- not installed")
-        ));
-        return;
-    };
-
-    let Ok(plugins) = serde_json::from_str::<serde_json::Value>(&plugins_json) else {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.yellow("? cannot parse installed_plugins.json"),
-        ));
-        return;
-    };
-
-    // Look up catenary@catenary in plugins.plugins
-    let entries = match plugins
-        .get("plugins")
-        .and_then(|p| p.get("catenary@catenary"))
-        .and_then(serde_json::Value::as_array)
-    {
-        Some(arr) if !arr.is_empty() => arr,
-        _ => {
-            let _ = out.writeln(format_args!(
-                "  {label}{}",
-                out.colors.dim("- not installed")
-            ));
-            return;
-        }
-    };
-
-    // Use the first (most recent) entry
-    let entry = &entries[0];
-    let version = entry
-        .get("version")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("?");
-    let Some(install_path_str) = entry.get("installPath").and_then(serde_json::Value::as_str)
-    else {
-        let _ = out.writeln(format_args!(
-            "  {label}{version:<8}{}",
-            out.colors.yellow("? missing installPath"),
-        ));
-        return;
-    };
-    let install_path = PathBuf::from(install_path_str);
-
-    // Determine marketplace source type
-    let source_type = read_marketplace_source(&home);
-    let version_display = source_type
-        .as_deref()
-        .map_or_else(|| version.to_string(), |src| format!("{version} ({src})"));
-    let ver_col = format!("{version_display:<20}");
-
-    // Read installed hooks and compare
-    let hooks_path = install_path.join("hooks/hooks.json");
-    match std::fs::read_to_string(&hooks_path) {
-        Ok(installed) => {
-            if normalize_json(&installed) == normalize_json(CLAUDE_HOOKS_EXPECTED) {
-                let _ = out.writeln(format_args!(
-                    "  {label}{ver_col}{}",
-                    out.colors.green("✓ hooks match")
-                ));
-            } else {
-                let _ = out.writeln(format_args!(
-                    "  {label}{ver_col}{}",
-                    out.colors.red("✗ stale hooks (reinstall: claude plugin uninstall catenary@catenary && claude plugin install catenary@catenary)"),
-                ));
-                if show_diff {
-                    show_unified_diff(
-                        out,
-                        &pretty_json(&installed),
-                        &pretty_json(CLAUDE_HOOKS_EXPECTED),
-                        "installed",
-                        "expected",
-                    );
-                }
-            }
-        }
-        Err(_) => {
-            let _ = out.writeln(format_args!(
-                "  {label}{ver_col}{}",
-                out.colors.red("✗ hooks.json not found in plugin cache"),
-            ));
-        }
-    }
-}
-
-/// Read the catenary marketplace source type from `known_marketplaces.json`.
-fn read_marketplace_source(home: &Path) -> Option<String> {
-    let path = home.join(".claude/plugins/known_marketplaces.json");
-    let contents = std::fs::read_to_string(path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&contents).ok()?;
-    json.get("catenary")
-        .and_then(|c| c.get("source"))
-        .and_then(|s| s.get("source"))
-        .and_then(serde_json::Value::as_str)
-        .map(std::string::ToString::to_string)
-}
-
-/// Check Antigravity CLI plugin hooks against the embedded expected hooks.
-///
-/// Searches three discovery paths (first match wins):
-/// 1. `<project_root>/.agents/plugins/catenary/` (workspace)
-/// 2. `<project_root>/_agents/plugins/catenary/` (workspace)
-/// 3. `~/.gemini/config/plugins/catenary/` (global)
-fn check_antigravity_hooks(out: &mut Output, show_diff: bool, project_root: &Path) {
-    let label = format!("{:<14}", "Antigravity");
-
-    let resolved_root = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-
-    // Workspace-level paths (relative to --root).
-    let workspace_candidates = [
-        resolved_root.join(".agents/plugins/catenary"),
-        resolved_root.join("_agents/plugins/catenary"),
-    ];
-
-    // Global path.
-    let global_candidate = std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join(".gemini/config/plugins/catenary"));
-
-    let (plugin_dir, scope) = workspace_candidates
-        .iter()
-        .find(|p| p.is_dir())
-        .map(|p| (p.clone(), "workspace"))
-        .or_else(|| {
-            global_candidate
-                .filter(|p| p.is_dir())
-                .map(|p| (p, "global"))
-        })
-        .unzip();
-
-    let Some(plugin_dir) = plugin_dir else {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.dim("- not installed")
-        ));
-        return;
-    };
-    let scope = scope.unwrap_or("unknown");
-    let scope_col = format!("{scope:<20}");
-
-    let hooks_path = plugin_dir.join("hooks.json");
-    match std::fs::read_to_string(&hooks_path) {
-        Ok(installed) => {
-            if normalize_json(&installed) == normalize_json(ANTIGRAVITY_HOOKS_EXPECTED) {
-                let _ = out.writeln(format_args!(
-                    "  {label}{scope_col}{}",
-                    out.colors.green("✓ hooks match")
-                ));
-            } else {
-                let _ = out.writeln(format_args!(
-                    "  {label}{scope_col}{}",
-                    out.colors.red("✗ stale hooks (reinstall plugin)"),
-                ));
-                if show_diff {
-                    show_unified_diff(
-                        out,
-                        &pretty_json(&installed),
-                        &pretty_json(ANTIGRAVITY_HOOKS_EXPECTED),
-                        "installed",
-                        "expected",
-                    );
-                }
-            }
-        }
-        Err(_) => {
-            let _ = out.writeln(format_args!(
-                "  {label}{scope_col}{}",
-                out.colors.yellow("? hooks.json not found"),
-            ));
-        }
-    }
-}
-
-/// Check whether the running binary matches what `$PATH` would resolve.
-fn check_path_binary(out: &mut Output) {
-    let label = format!("{:<14}", "PATH");
-    let spacer = " ".repeat(20);
-
-    let Some(current_exe) = std::env::current_exe()
-        .ok()
-        .and_then(|p| std::fs::canonicalize(p).ok())
-    else {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.yellow("? cannot determine current executable"),
-        ));
-        return;
-    };
-
-    // Find catenary on PATH
-    let path_var = std::env::var("PATH").unwrap_or_default();
-    let Some(path_binary) = std::env::split_paths(&path_var)
-        .map(|dir| dir.join("catenary"))
-        .find(|p| p.is_file())
-    else {
-        let _ = out.writeln(format_args!(
-            "  {label}{spacer}{}",
-            out.colors.red("✗ catenary not found on PATH"),
-        ));
-        return;
-    };
-
-    let resolved_path = std::fs::canonicalize(&path_binary).unwrap_or(path_binary);
-
-    if current_exe == resolved_path {
-        let _ = out.writeln(format_args!(
-            "  {label}{spacer}{}",
-            out.colors.green(&format!("✓ {}", resolved_path.display())),
-        ));
-    } else {
-        let _ = out.writeln(format_args!(
-            "  {label}{spacer}{}",
-            out.colors.red(&format!(
-                "✗ {} differs from {}",
-                resolved_path.display(),
-                current_exe.display(),
-            )),
-        ));
-    }
-}
-
-/// Check the Claude Code plugin registration.
-///
-/// Validates the installed plugin version against the current binary version.
-fn check_claude_instructions(out: &mut Output) {
-    let label = format!("{:<14}", "Claude Code");
-    let Ok(home_str) = std::env::var("HOME") else {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.dim("- cannot determine home directory"),
-        ));
-        return;
-    };
-    let home = PathBuf::from(home_str);
-
-    let plugins_file = home.join(".claude/plugins/installed_plugins.json");
-    let Ok(plugins_json) = std::fs::read_to_string(&plugins_file) else {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.dim("- not installed"),
-        ));
-        return;
-    };
-
-    let Ok(plugins) = serde_json::from_str::<serde_json::Value>(&plugins_json) else {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.yellow("? cannot parse installed_plugins.json"),
-        ));
-        return;
-    };
-
-    let entries = match plugins
-        .get("plugins")
-        .and_then(|p| p.get("catenary@catenary"))
-        .and_then(serde_json::Value::as_array)
-    {
-        Some(arr) if !arr.is_empty() => arr,
-        _ => {
-            let _ = out.writeln(format_args!(
-                "  {label}{}",
-                out.colors.dim("- not installed"),
-            ));
-            return;
-        }
-    };
-
-    let entry = &entries[0];
-    let installed_version = entry
-        .get("version")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("?");
-    // Compare against CARGO_PKG_VERSION (the Cargo.toml semver that
-    // matches marketplace.json), not CATENARY_VERSION which includes
-    // git-describe commit distance on dev builds.
-    let expected_version = env!("CARGO_PKG_VERSION");
-
-    if entry
-        .get("installPath")
-        .and_then(serde_json::Value::as_str)
-        .is_none()
-    {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.yellow("? missing installPath"),
-        ));
-        return;
-    }
-
-    // Version staleness check
-    let is_stale = installed_version != expected_version;
-    if is_stale {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.red(&format!(
-                "✗ stale (v{installed_version} installed, v{expected_version} expected)"
-            )),
-        ));
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.dim("  run: catenary install claude"),
-        ));
-    } else {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors
-                .green(&format!("✓ up to date (v{installed_version})")),
-        ));
-    }
-}
-
-/// Check Antigravity CLI agent instruction files (rules).
-///
-/// Compares installed rules file content against the embedded version.
-/// Symlinked installs are always current by definition.
-fn check_antigravity_instructions(out: &mut Output, show_diff: bool, project_root: &Path) {
-    let label = format!("{:<14}", "Antigravity");
-
-    let resolved_root = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-
-    // Discovery: same paths as check_antigravity_hooks
-    let workspace_candidates = [
-        resolved_root.join(".agents/plugins/catenary"),
-        resolved_root.join("_agents/plugins/catenary"),
-    ];
-
-    let global_candidate = std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join(".gemini/config/plugins/catenary"));
-
-    let plugin_dir = workspace_candidates
-        .iter()
-        .find(|p| p.is_dir())
-        .cloned()
-        .or_else(|| global_candidate.filter(|p| p.is_dir()));
-
-    let Some(plugin_dir) = plugin_dir else {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.dim("- not installed"),
-        ));
-        return;
-    };
-
-    // Symlinked installs are always current
-    if plugin_dir.is_symlink() {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.green("✓ symlinked (always current)"),
-        ));
-        return;
-    }
-
-    // Content comparison
-    let rules_path = plugin_dir.join("rules/catenary.md");
-    if let Ok(content) = std::fs::read_to_string(&rules_path) {
-        if content == ANTIGRAVITY_RULES_EXPECTED {
-            let _ = out.writeln(format_args!(
-                "  {label}{}",
-                out.colors.green("✓ rules up to date"),
-            ));
-        } else if crate::cli::teaching::is_runtime_stamped(&content) {
-            // Teaching-surface 12: the installed rules file is rewritten per turn
-            // to the live surface, so it diverges from the shipped bootstrap by
-            // design. A valid runtime generation stamp marks it as current.
-            let _ = out.writeln(format_args!(
-                "  {label}{}",
-                out.colors.green("✓ rules up to date (runtime-updated)"),
-            ));
-        } else {
-            let _ = out.writeln(format_args!("  {label}{}", out.colors.red("✗ stale rules")));
-            let _ = out.writeln(format_args!(
-                "  {label}{}",
-                out.colors.dim("  run: catenary install antigravity"),
-            ));
-            if show_diff {
-                show_unified_diff(
-                    out,
-                    &content,
-                    ANTIGRAVITY_RULES_EXPECTED,
-                    "installed",
-                    "expected",
-                );
-            }
-        }
-    } else {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.red("✗ rules/catenary.md not found"),
-        ));
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.dim("  run: catenary install antigravity"),
-        ));
-    }
-}
-
-/// Check whether `~/.claude/settings.json` still references the legacy Python script.
-///
-/// If found, warns the user to remove it and migrate to `[commands]` config.
-fn check_constrained_bash_claude(out: &mut Output) {
-    check_legacy_script(out, "Claude Code", ".claude/settings.json");
-}
-
-/// Check a host CLI settings file for references to the legacy `constrained_bash.py`.
-fn check_legacy_script(out: &mut Output, client: &str, settings_rel: &str) {
-    let label = format!("{client:<14}");
-
-    let Ok(home_str) = std::env::var("HOME") else {
-        return;
-    };
-    let home = PathBuf::from(home_str);
-
-    let settings_path = home.join(settings_rel);
-    let Ok(settings_json) = std::fs::read_to_string(&settings_path) else {
-        return;
-    };
-
-    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&settings_json) else {
-        return;
-    };
-
-    if find_script_path_in_json(&settings, "constrained_bash.py").is_some() {
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.yellow("⚠  legacy constrained_bash.py detected"),
-        ));
-        let _ = out.writeln(format_args!(
-            "  {label}{}",
-            out.colors.dim(&format!("  {CONSTRAINED_BASH_MIGRATION}")),
-        ));
-    }
-}
-
-/// Report the status of the built-in command filter configuration.
-fn check_command_filter_config(out: &mut Output, config: &crate::config::Config) {
-    match &config.resolved_commands {
-        Some(resolved) if resolved.client_enforcement_only => {
-            let _ = out.writeln(format_args!(
-                "  {}",
-                out.colors
-                    .dim("client_enforcement_only — Catenary enforcement disabled"),
-            ));
-        }
-        Some(resolved) if resolved.is_active() => {
-            let total = resolved.allow.len() + resolved.pipeline.len();
-            let build_suffix = if !resolved.default_build.is_empty() {
-                let tools = resolved.default_build.join(", ");
-                format!(
-                    ", build tool{}: {tools}",
-                    if resolved.default_build.len() == 1 {
-                        ""
-                    } else {
-                        "s"
-                    },
-                )
-            } else if !resolved.build.is_empty() {
-                let mut tools: Vec<&str> = resolved
-                    .build
-                    .values()
-                    .flat_map(|v| v.iter().map(String::as_str))
-                    .collect::<std::collections::HashSet<_>>()
-                    .into_iter()
-                    .collect();
-                tools.sort_unstable();
-                format!(
-                    ", build tool{}: {}",
-                    if tools.len() == 1 { "" } else { "s" },
-                    tools.join(", ")
-                )
-            } else {
-                String::new()
-            };
-            let _ = out.writeln(format_args!(
-                "  {}",
-                out.colors.green(&format!(
-                    "✓ {total} command{} allowed{build_suffix}",
-                    if total == 1 { "" } else { "s" },
-                )),
-            ));
-        }
-        Some(_) | None => {
-            let _ = out.writeln(format_args!(
-                "  {}",
-                out.colors
-                    .dim("no [commands] section — all shell commands allowed"),
-            ));
-        }
-    }
-}
-
-/// Normalize a JSON string for comparison (parse and re-serialize).
-///
-/// Returns the compact re-serialized form, or the original string (trimmed)
-/// if parsing fails.
-fn normalize_json(s: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(s)
-        .ok()
-        .and_then(|v| serde_json::to_string(&v).ok())
-        .unwrap_or_else(|| s.trim().to_string())
-}
-
-/// Pretty-print a JSON string for use in human-readable diffs.
-///
-/// Returns the pretty-printed form, or the original string if parsing fails.
-fn pretty_json(s: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(s)
-        .ok()
-        .and_then(|v| serde_json::to_string_pretty(&v).ok())
-        .unwrap_or_else(|| s.to_string())
-}
-
 /// Print a unified diff between `old` and `new` using the `similar` crate.
 fn show_unified_diff(out: &mut Output, old: &str, new: &str, old_label: &str, new_label: &str) {
     use similar::TextDiff;
@@ -2012,26 +600,6 @@ fn show_unified_diff(out: &mut Output, old: &str, new: &str, old_label: &str, ne
     ));
 }
 
-/// Walk all string values in `json` and return the whitespace-split token
-/// that contains `needle`, searching depth-first.
-///
-/// Returns `None` if no string value in the tree mentions `needle`.
-fn find_script_path_in_json(json: &serde_json::Value, needle: &str) -> Option<String> {
-    match json {
-        serde_json::Value::String(s) if s.contains(needle) => s
-            .split_whitespace()
-            .find(|token| token.contains(needle))
-            .map(std::string::ToString::to_string),
-        serde_json::Value::Object(map) => map
-            .values()
-            .find_map(|v| find_script_path_in_json(v, needle)),
-        serde_json::Value::Array(arr) => {
-            arr.iter().find_map(|v| find_script_path_in_json(v, needle))
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -2041,186 +609,7 @@ mod tests {
     use super::*;
     use std::fs;
 
-    // ── doctor_check_config walker (bug 57) ─────────────────────────
-
-    #[test]
-    fn doctor_check_config_walks_all_three_pre_namespacing_classes() {
-        // Regression for bug 57: the walker raw-parsed each source with
-        // `contents.parse::<toml::Value>()`, which in toml 0.9 parses a value
-        // *expression* and fails on every document — silently skipping every
-        // source, so the walker printed nothing at runtime. A pre-namespacing
-        // config file must now produce the rename block for all three
-        // namespaces in one pass.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cfg = tmp.path().join("config.toml");
-        fs::write(
-            &cfg,
-            "[server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
-             [language.rust]\nservers = [\"rust-analyzer\"]\n\n\
-             [linter.shellcheck]\ncommand = \"shellcheck\"\n",
-        )
-        .expect("write config");
-
-        let mut out = Output::buffer(200);
-        let found = doctor_check_config(&mut out, &[cfg]);
-        let text = out.into_string();
-
-        assert!(found, "walker should report issues, got:\n{text}");
-        assert!(
-            text.contains("[server.rust-analyzer]  →  [lsp.server.rust-analyzer]"),
-            "server rename block missing:\n{text}",
-        );
-        assert!(
-            text.contains("[language.rust]  →  [lsp.language.rust]"),
-            "language rename block missing:\n{text}",
-        );
-        assert!(
-            text.contains("[linter.shellcheck]  →  [linter.rule.shellcheck]"),
-            "linter rename block missing:\n{text}",
-        );
-    }
-
-    #[test]
-    fn doctor_check_config_silent_for_namespaced_config() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cfg = tmp.path().join("config.toml");
-        fs::write(
-            &cfg,
-            "[lsp.server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
-             [lsp.language.rust]\nservers = [\"rust-analyzer\"]\n\n\
-             [linter.rule.shellcheck]\ncommand = \"shellcheck\"\npatterns = [\"**/*.sh\"]\n",
-        )
-        .expect("write config");
-
-        let mut out = Output::buffer(200);
-        let found = doctor_check_config(&mut out, &[cfg]);
-        assert!(
-            !found,
-            "a fully namespaced config should trigger no migration guidance",
-        );
-        assert!(out.into_string().is_empty(), "no output for a clean config");
-    }
-
-    // ── doctor_check_unknown_keys walker (misc 131) ─────────────────
-
-    #[test]
-    fn doctor_check_unknown_keys_names_dead_top_level_key() {
-        // The misc-131 repro: `smart_wait = true` — a key nothing in the repo
-        // defines — must be named with its top-level location.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cfg = tmp.path().join("config.toml");
-        fs::write(&cfg, "smart_wait = true\n").expect("write config");
-
-        let mut out = Output::buffer(200);
-        let warned = doctor_check_unknown_keys(&mut out, &[cfg]);
-        let text = out.into_string();
-
-        assert!(warned, "walker should warn, got:\n{text}");
-        assert!(
-            text.contains("`smart_wait` (top level) is not a Catenary config key"),
-            "top-level location missing:\n{text}",
-        );
-    }
-
-    #[test]
-    fn doctor_check_unknown_keys_names_nested_typo_with_table_path() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cfg = tmp.path().join("config.toml");
-        fs::write(&cfg, "[tui]\ntypo_key = 1\n").expect("write config");
-
-        let mut out = Output::buffer(200);
-        let warned = doctor_check_unknown_keys(&mut out, &[cfg]);
-        let text = out.into_string();
-
-        assert!(warned, "walker should warn, got:\n{text}");
-        assert!(
-            text.contains("`typo_key` (in [tui]) is not a Catenary config key"),
-            "nested location missing:\n{text}",
-        );
-    }
-
-    #[test]
-    fn doctor_check_unknown_keys_silent_for_known_and_passthrough() {
-        // A fully-known config with arbitrary content in the pass-through
-        // subtrees must produce no warnings.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cfg = tmp.path().join("config.toml");
-        fs::write(
-            &cfg,
-            "[tui]\nauto_add_sessions = false\n\n\
-             [lsp.server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
-             [lsp.server.rust-analyzer.initialization_options]\ncheck = { command = \"clippy\" }\n\n\
-             [lsp.server.rust-analyzer.settings]\nanything = true\n",
-        )
-        .expect("write config");
-
-        let mut out = Output::buffer(200);
-        let warned = doctor_check_unknown_keys(&mut out, &[cfg]);
-        assert!(
-            !warned,
-            "known + pass-through config must be silent:\n{}",
-            out.into_string(),
-        );
-    }
-
-    // ── guard pointer rewrite (feedback 08 finding 1) ───────────────
-
-    #[test]
-    fn guard_pointer_rewritten_for_doctor_render() {
-        // In doctor's own render the migration guidance prints above the error,
-        // so the guard's "run catenary doctor" pointer must be rewritten —
-        // pointing a user at the command they are already inside is unhelpful.
-        let msg = format!(
-            "Failed to parse config file: /x/config.toml: config uses \
-             pre-namespacing top-level keys — foo. {}",
-            crate::config::MIGRATION_GUIDANCE_POINTER,
-        );
-        let rewritten = rewrite_guard_pointer(&msg);
-        assert!(
-            !rewritten.contains("catenary doctor"),
-            "doctor render must not point back at itself: {rewritten}",
-        );
-        assert!(
-            rewritten.contains("See the rename guidance above."),
-            "rewrite should point at the guidance above: {rewritten}",
-        );
-    }
-
-    // ── unreferenced-server warning scope (feedback 08 finding 2) ────
-
-    #[test]
-    fn unreferenced_warning_exempts_embedded_defaults() {
-        // A user server nothing routes to warns; an embedded default orphaned
-        // by a user language override does not (feedback 08 finding 2).
-        let defaults = crate::config::default_server_names();
-        let a_default = defaults
-            .iter()
-            .next()
-            .expect("embedded defaults must be non-empty")
-            .clone();
-
-        let mut config = crate::config::Config::default();
-        config
-            .server
-            .insert(a_default.clone(), crate::config::ServerDef::default());
-        config.server.insert(
-            "user-orphan-xyz".to_string(),
-            crate::config::ServerDef::default(),
-        );
-        // No [lsp.language.*] entry references either server.
-
-        let unref = unreferenced_user_servers(&config);
-        assert!(
-            unref.contains(&"user-orphan-xyz"),
-            "a genuinely orphaned user server must still warn: {unref:?}",
-        );
-        assert!(
-            !unref.iter().any(|n| *n == a_default),
-            "an orphaned embedded default must be exempt: {unref:?}",
-        );
-    }
-
-    // ── user_config_path_in tests ───────────────────────────────
+    // ── user_config_path_in ─────────────────────────────────────────
 
     #[test]
     fn config_path_none_when_base_is_none() {
@@ -2242,10 +631,10 @@ mod tests {
         fs::write(&config_file, "# empty").expect("write config");
 
         let result = user_config_path_in(Some(tmp.path().to_path_buf()));
-        assert_eq!(result.expect("should find config file"), config_file,);
+        assert_eq!(result.expect("should find config file"), config_file);
     }
 
-    // ── collect_suggestions tests ───────────────────────────────
+    // ── collect_suggestions ─────────────────────────────────────────
 
     #[test]
     fn suggestions_no_config_file() {
@@ -2256,13 +645,9 @@ mod tests {
         assert!(
             suggestions
                 .iter()
-                .any(|s| s.contains("No config file found")),
-            "should mention missing config file",
+                .any(|s| s.contains("No config file found"))
         );
-        assert!(
-            suggestions.iter().any(|s| s.contains("catenary config")),
-            "should suggest `catenary config`",
-        );
+        assert!(suggestions.iter().any(|s| s.contains("catenary config")));
     }
 
     #[test]
@@ -2278,14 +663,12 @@ mod tests {
         assert!(
             suggestions
                 .iter()
-                .any(|s| s.contains("No [commands] section")),
-            "should mention missing [commands] section",
+                .any(|s| s.contains("No [commands] section"))
         );
         assert!(
             !suggestions
                 .iter()
-                .any(|s| s.contains("No config file found")),
-            "should not mention missing config file when file exists",
+                .any(|s| s.contains("No config file found"))
         );
     }
 
@@ -2304,10 +687,7 @@ mod tests {
         config.resolved_commands = Some(crate::config::ResolvedCommands::default());
         let suggestions = collect_suggestions(&config, Some(tmp.path().to_path_buf()));
 
-        assert!(
-            suggestions.is_empty(),
-            "should have no suggestions when config file and commands exist",
-        );
+        assert!(suggestions.is_empty());
     }
 
     #[test]
@@ -2322,318 +702,31 @@ mod tests {
             .join("config.toml")
             .display()
             .to_string();
-        assert!(
-            suggestions.iter().any(|s| s.contains(&expected_path)),
-            "suggestion should include the platform-resolved config path",
-        );
+        assert!(suggestions.iter().any(|s| s.contains(&expected_path)));
     }
 
     #[test]
     fn suggestions_none_base_falls_back() {
         let config = crate::config::Config::default();
         let suggestions = collect_suggestions(&config, None);
-
         assert!(
             suggestions
                 .iter()
-                .any(|s| s.contains("~/.config/catenary/config.toml")),
-            "should fall back to ~/.config path when config_dir is None",
+                .any(|s| s.contains("~/.config/catenary/config.toml"))
         );
     }
 
-    // ── probe_timeout tests ─────────────────────────────────────────
+    // ── render_finding ──────────────────────────────────────────────
 
     #[test]
-    fn probe_timeout_default_is_five_minutes() {
-        // Assumes CATENARY_DOCTOR_TIMEOUT_SECS is not set in the test
-        // environment. The default is 5 minutes (300 seconds).
-        let timeout = probe_timeout();
-        assert_eq!(
-            timeout,
-            Duration::from_mins(5),
-            "default probe timeout should be 5 minutes",
-        );
-    }
-
-    // ── extract_capabilities tests ──────────────────────────────────
-
-    #[test]
-    fn extract_capabilities_hover() {
-        let caps = serde_json::json!({"hoverProvider": true});
-        let result = extract_capabilities(&caps, false);
-        assert!(
-            result.contains(&"hover"),
-            "should include hover capability, got: {result:?}",
-        );
-    }
-
-    #[test]
-    fn extract_capabilities_definition() {
-        let caps = serde_json::json!({"definitionProvider": true});
-        let result = extract_capabilities(&caps, false);
-        assert!(
-            result.contains(&"definition"),
-            "should include definition capability, got: {result:?}",
-        );
-    }
-
-    #[test]
-    fn extract_capabilities_empty_when_none() {
-        let caps = serde_json::json!({});
-        let result = extract_capabilities(&caps, false);
-        assert!(result.is_empty(), "empty caps should yield nothing");
-    }
-
-    #[test]
-    fn extract_capabilities_ignores_null_values() {
-        // LSP servers may explicitly set a capability to null.
-        let caps = serde_json::json!({"hoverProvider": null});
-        let result = extract_capabilities(&caps, false);
-        assert!(
-            !result.contains(&"hover"),
-            "null provider should not be included",
-        );
-    }
-
-    // ── binary_exists / resolve_binary tests ────────────────────────
-
-    #[test]
-    fn binary_exists_finds_known_binary() {
-        // "sh" should exist on any Unix system.
-        assert!(binary_exists("sh"));
-    }
-
-    #[test]
-    fn binary_exists_rejects_nonexistent() {
-        assert!(!binary_exists("catenary_nonexistent_binary_xyz"));
-    }
-
-    #[test]
-    fn resolve_binary_finds_known_binary() {
-        let result = resolve_binary("sh");
-        assert!(result.is_some(), "should resolve 'sh'");
-    }
-
-    #[test]
-    fn resolve_binary_returns_none_for_nonexistent() {
-        assert!(resolve_binary("catenary_nonexistent_binary_xyz").is_none());
-    }
-
-    // ── normalize_json / pretty_json tests ──────────────────────────
-
-    #[test]
-    fn normalize_json_canonicalizes() {
-        let input = r#"{ "b": 2, "a": 1 }"#;
-        let result = normalize_json(input);
-        // Should be parseable as valid JSON.
-        assert!(
-            serde_json::from_str::<serde_json::Value>(&result).is_ok(),
-            "normalized JSON should be valid, got: {result}",
-        );
-    }
-
-    #[test]
-    fn pretty_json_formats_readably() {
-        let input = r#"{"a":1,"b":2}"#;
-        let result = pretty_json(input);
-        assert!(
-            result.contains('\n'),
-            "pretty JSON should be multi-line, got: {result}",
-        );
-    }
-
-    // ── embedded instruction file tests ────────────────────────────
-
-    #[test]
-    fn embedded_antigravity_rules_non_empty() {
-        assert!(
-            !ANTIGRAVITY_RULES_EXPECTED.trim().is_empty(),
-            "embedded antigravity rules should not be empty",
-        );
-    }
-
-    // ── runtime-updated instruction files (teaching-surface 12) ─────────
-
-    #[test]
-    fn antigravity_instructions_accepts_runtime_stamped_rules() {
-        // The installed rules file is rewritten per turn to the live surface, so
-        // it no longer byte-matches the shipped bootstrap. A valid runtime
-        // generation stamp must read as current, not "stale rules".
-        let root = tempfile::tempdir().expect("tempdir");
-        let plugin_dir = root.path().join(".agents/plugins/catenary/rules");
-        fs::create_dir_all(&plugin_dir).expect("create workspace plugin dir");
-        fs::write(
-            plugin_dir.join("catenary.md"),
-            crate::cli::teaching::antigravity_rules_file(),
-        )
-        .expect("write runtime-stamped rules");
-
+    fn render_finding_includes_message_and_fix_it() {
+        use crate::health::{Finding, FindingCode, Severity};
+        let finding = Finding::new(FindingCode::ServerRoutedBroken, Severity::Error, "boom")
+            .with_fix_it("do the thing");
         let mut out = Output::buffer(80);
-        check_antigravity_instructions(&mut out, false, root.path());
+        render_finding(&mut out, &finding, false);
         let text = out.into_string();
-        assert!(
-            text.contains("runtime-updated"),
-            "a runtime-stamped rules file must read as current, got: {text}",
-        );
-        assert!(
-            !text.contains("stale rules"),
-            "a runtime-stamped rules file must not read as stale, got: {text}",
-        );
-    }
-
-    #[test]
-    fn antigravity_instructions_flags_unstamped_divergent_rules() {
-        // A file that neither byte-matches the bootstrap nor carries a stamp is
-        // genuine drift and must still be flagged.
-        let root = tempfile::tempdir().expect("tempdir");
-        let plugin_dir = root.path().join(".agents/plugins/catenary/rules");
-        fs::create_dir_all(&plugin_dir).expect("create workspace plugin dir");
-        fs::write(plugin_dir.join("catenary.md"), "handwritten drift\n").expect("write drift");
-
-        let mut out = Output::buffer(80);
-        check_antigravity_instructions(&mut out, false, root.path());
-        let text = out.into_string();
-        assert!(
-            text.contains("stale rules"),
-            "unstamped divergent rules must be flagged stale, got: {text}",
-        );
-    }
-
-    // ── check_command_filter_config tests ───────────────────────────
-    //
-    // These pin the exact diagnostic line each branch renders, so the match
-    // guards (`client_enforcement_only`, `is_active()`), the `total` arithmetic
-    // (`allow.len() + pipeline.len()`), and the two `!…is_empty()` build-suffix
-    // selectors cannot mutate without a test failing.
-
-    /// Render `check_command_filter_config` for a given `resolved_commands` into
-    /// a captured buffer and return the emitted text (colors disabled).
-    fn render_command_filter_config(resolved: Option<crate::config::ResolvedCommands>) -> String {
-        let config = crate::config::Config {
-            resolved_commands: resolved,
-            ..Default::default()
-        };
-        let mut out = Output::buffer(80);
-        check_command_filter_config(&mut out, &config);
-        out.into_string()
-    }
-
-    #[test]
-    fn command_filter_config_client_enforcement_only_line() {
-        // Guard `resolved.client_enforcement_only` must select this branch even
-        // when the set would otherwise be active (allow is non-empty here).
-        let resolved = crate::config::ResolvedCommands {
-            client_enforcement_only: true,
-            allow: std::iter::once("git".to_string()).collect(),
-            ..Default::default()
-        };
-        let text = render_command_filter_config(Some(resolved));
-        assert!(
-            text.contains("client_enforcement_only — Catenary enforcement disabled"),
-            "client_enforcement_only must render the disabled line, got: {text:?}",
-        );
-    }
-
-    #[test]
-    fn command_filter_config_active_count_and_arithmetic() {
-        // allow.len() == 3, pipeline.len() == 2 → total 5 (kills + → -, + → *,
-        // and the `is_active() → false` guard). Not client_enforcement_only, so
-        // the `client_enforcement_only → true` guard mutant is killed too.
-        let resolved = crate::config::ResolvedCommands {
-            allow: ["git", "cat", "ls"].into_iter().map(String::from).collect(),
-            pipeline: ["grep", "head"].into_iter().map(String::from).collect(),
-            ..Default::default()
-        };
-        let text = render_command_filter_config(Some(resolved));
-        assert!(
-            text.contains("✓ 5 commands allowed"),
-            "active set of allow=3 + pipeline=2 must report 5 commands, got: {text:?}",
-        );
-        assert!(
-            !text.contains("client_enforcement_only"),
-            "active set must not render the client_enforcement_only line, got: {text:?}",
-        );
-        assert!(
-            !text.contains("no [commands] section"),
-            "active set must not render the no-section line, got: {text:?}",
-        );
-    }
-
-    #[test]
-    fn command_filter_config_singular_command() {
-        // A single allowed command must read "1 command allowed" (no plural).
-        let resolved = crate::config::ResolvedCommands {
-            allow: std::iter::once("git".to_string()).collect(),
-            ..Default::default()
-        };
-        let text = render_command_filter_config(Some(resolved));
-        assert!(
-            text.contains("✓ 1 command allowed"),
-            "a single command must read singular, got: {text:?}",
-        );
-    }
-
-    #[test]
-    fn command_filter_config_inactive_some_renders_no_section() {
-        // A `Some` but inactive set (no allow/pipeline/build, not
-        // client_enforcement_only) must fall to the no-section line. Kills the
-        // `is_active() → true` guard, which would instead report "0 commands".
-        let text = render_command_filter_config(Some(crate::config::ResolvedCommands::default()));
-        assert!(
-            text.contains("no [commands] section — all shell commands allowed"),
-            "an inactive Some(_) must render the no-section line, got: {text:?}",
-        );
-        assert!(
-            !text.contains('✓'),
-            "an inactive set must not render the active count line, got: {text:?}",
-        );
-    }
-
-    #[test]
-    fn command_filter_config_none_renders_no_section() {
-        // `None` resolved_commands must also render the no-section line. Also
-        // pins that the function writes output at all (kills the `-> ()` body
-        // mutant for this input).
-        let text = render_command_filter_config(None);
-        assert!(
-            text.contains("no [commands] section — all shell commands allowed"),
-            "None must render the no-section line, got: {text:?}",
-        );
-    }
-
-    #[test]
-    fn command_filter_config_default_build_suffix() {
-        // A non-empty `default_build` selects the user-level build suffix
-        // (`!resolved.default_build.is_empty()`). Deleting that `!` would skip
-        // this branch and drop the build tool from the line.
-        let resolved = crate::config::ResolvedCommands {
-            allow: std::iter::once("git".to_string()).collect(),
-            default_build: vec!["make".to_string()],
-            ..Default::default()
-        };
-        let text = render_command_filter_config(Some(resolved));
-        assert!(
-            text.contains("build tool: make"),
-            "default_build must contribute `build tool: make`, got: {text:?}",
-        );
-    }
-
-    #[test]
-    fn command_filter_config_per_root_build_suffix() {
-        // Empty `default_build` but a non-empty per-root `build` selects the
-        // second build-suffix branch (`!resolved.build.is_empty()`). Deleting
-        // that `!` would skip it and drop the build tool.
-        let build = std::iter::once((std::path::PathBuf::from("/repo"), vec!["cargo".to_string()]))
-            .collect();
-        let resolved = crate::config::ResolvedCommands {
-            allow: std::iter::once("git".to_string()).collect(),
-            build,
-            ..Default::default()
-        };
-        let text = render_command_filter_config(Some(resolved));
-        assert!(
-            text.contains("build tool: cargo"),
-            "per-root build must contribute `build tool: cargo`, got: {text:?}",
-        );
+        assert!(text.contains("boom"), "message rendered: {text}");
+        assert!(text.contains("do the thing"), "fix-it rendered: {text}");
     }
 }

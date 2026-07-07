@@ -1,0 +1,234 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Mark Wells <contact@markwells.dev>
+
+//! Health model: the single source of truth for "is it working?".
+//!
+//! Every check `catenary doctor` performs — config migration walk, validation,
+//! unknown keys, unreferenced servers, duplicate extensions, project-config
+//! warnings, server probes, the routing table, and hooks/instructions/filter
+//! staleness — resolves here into **typed findings** ([`Finding`]): a
+//! [`Severity`], a stable [`FindingCode`], a one-line message, and optional
+//! fix-it text carried as data rather than baked into a render.
+//!
+//! `doctor` (see [`crate::cli::doctor`]) is a one-shot renderer over this
+//! model. The TUI (a later phase) renders the same findings live. The two never
+//! diverge in *what they can know* — the only permitted difference is the data
+//! **feed**, expressed through the [`servers::HealthFeed`] seam:
+//!
+//! - the **probe feed** ([`servers::ProbeFeed`]) — doctor's own one-shot
+//!   `initialize` probes, which work with the daemon down;
+//! - the **snapshot feed** — `state.json`, consumed by the TUI in a later
+//!   phase (this module defines the trait; the consumer is out of scope here).
+//!
+//! Routed-vs-dormant derivation lives in the model
+//! ([`servers::is_routed`]): a server is *routed* iff a configured language
+//! binding targets it and that language is active in a tracked root (detected
+//! files, or — via a snapshot feed — a live per-root instance). Everything
+//! else configured is *dormant inventory*, never a warning.
+
+pub mod config_checks;
+pub mod install_checks;
+pub mod servers;
+pub mod skew;
+
+/// Severity of a health finding — the `:checkhealth` OK/WARN/ERROR ladder,
+/// split so a renderer can distinguish a healthy state from silent inventory.
+///
+/// Only [`Severity::Error`] and [`Severity::Warning`] are *problems*
+/// ([`Finding::is_problem`]) — the two levels a health verdict counts.
+/// [`Severity::Ok`] marks a confirmed-healthy state and [`Severity::Info`]
+/// marks non-actionable inventory or notes; neither ever shouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    /// A user-actionable failure (routed-but-broken server, config error).
+    Error,
+    /// A user-actionable warning (unknown key, stale hooks, version skew).
+    Warning,
+    /// A confirmed-healthy state (server ready, hooks match, up to date).
+    Ok,
+    /// Non-actionable inventory or a note (dormant server, disable toggle).
+    Info,
+}
+
+impl Severity {
+    /// Whether this severity denotes a user-actionable *problem*
+    /// ([`Severity::Error`] or [`Severity::Warning`]).
+    #[must_use]
+    pub const fn is_problem(self) -> bool {
+        matches!(self, Self::Error | Self::Warning)
+    }
+}
+
+/// A stable, machine-readable identifier for a class of [`Finding`].
+///
+/// The code is the contract tests pin: a renderer may reflow the prose, but the
+/// set of codes a given config/daemon state produces may not silently change.
+/// Reach for [`FindingCode::as_str`] for the stable kebab-case string form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindingCode {
+    /// A pre-namespacing top-level `[server.*]`/`[language.*]`/`[linter.*]`
+    /// table that moved under `[lsp.*]`/`[linter.rule.*]` (linters ticket 04).
+    ConfigLegacyNamespace,
+    /// A `[lsp.language.*]` entry using the removed `inherit` field.
+    ConfigLanguageInherit,
+    /// A `[lsp.language.*]` entry inlining `[lsp.server.*]` definition fields.
+    ConfigLanguageInlinesServer,
+    /// A `[commands]` entry using a removed denylist-era field.
+    ConfigLegacyCommandsField,
+    /// A config key no Catenary schema defines (misc 131).
+    ConfigUnknownKey,
+    /// A `Config::validate` error.
+    ConfigValidationError,
+    /// A user-defined server no `[lsp.language.*]` entry routes to.
+    ConfigUnreferencedServer,
+    /// An extension claimed by two `[lsp.language.*]` entries.
+    ConfigDuplicateExtension,
+    /// A project `.catenary.toml` using a removed bare `lsp`/`enabled` toggle.
+    ProjectRemovedToggle,
+    /// A project `.catenary.toml` that fails to load.
+    ProjectLoadError,
+    /// A project `.catenary.toml` summary (language/server counts).
+    ProjectSummary,
+    /// A project per-root feeder/surface `disable` toggle in effect.
+    ProjectDisableToggle,
+    /// A project `[lsp.server.*]` with a `command` nothing references.
+    ProjectOrphanServer,
+    /// A project `[lsp.language.*]` referencing an undefined server.
+    ProjectUnresolvedServerRef,
+    /// Project `[commands]` enforcement keys ignored at project scope.
+    ProjectIgnoredEnforcement,
+    /// A routed server that failed its probe (missing binary, init failure).
+    ServerRoutedBroken,
+    /// A configured server nothing routes to — dormant inventory.
+    ServerDormant,
+    /// A server that probed ready.
+    ServerReady,
+    /// The running daemon serves a different build than this binary.
+    VersionSkew,
+    /// Installed host hooks diverge from the shipped set.
+    HooksStale,
+    /// Installed host hooks are missing from the plugin cache.
+    HooksMissing,
+    /// A host plugin registration could not be read or parsed.
+    HooksUnreadable,
+    /// Installed host hooks match the shipped set.
+    HooksOk,
+    /// A host integration is not installed.
+    NotInstalled,
+    /// Installed agent instructions diverge from the shipped set.
+    InstructionsStale,
+    /// Installed agent instructions are up to date.
+    InstructionsOk,
+    /// The running binary differs from what `$PATH` resolves.
+    PathMismatch,
+    /// The running binary matches `$PATH`.
+    PathOk,
+    /// A legacy `constrained_bash.py` hook is still configured.
+    LegacyScript,
+    /// The resolved command-filter status.
+    CommandFilterStatus,
+}
+
+impl FindingCode {
+    /// The stable kebab-case string form of this code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfigLegacyNamespace => "config-legacy-namespace",
+            Self::ConfigLanguageInherit => "config-language-inherit",
+            Self::ConfigLanguageInlinesServer => "config-language-inlines-server",
+            Self::ConfigLegacyCommandsField => "config-legacy-commands-field",
+            Self::ConfigUnknownKey => "config-unknown-key",
+            Self::ConfigValidationError => "config-validation-error",
+            Self::ConfigUnreferencedServer => "config-unreferenced-server",
+            Self::ConfigDuplicateExtension => "config-duplicate-extension",
+            Self::ProjectRemovedToggle => "project-removed-toggle",
+            Self::ProjectLoadError => "project-load-error",
+            Self::ProjectSummary => "project-summary",
+            Self::ProjectDisableToggle => "project-disable-toggle",
+            Self::ProjectOrphanServer => "project-orphan-server",
+            Self::ProjectUnresolvedServerRef => "project-unresolved-server-ref",
+            Self::ProjectIgnoredEnforcement => "project-ignored-enforcement",
+            Self::ServerRoutedBroken => "server-routed-broken",
+            Self::ServerDormant => "server-dormant",
+            Self::ServerReady => "server-ready",
+            Self::VersionSkew => "version-skew",
+            Self::HooksStale => "hooks-stale",
+            Self::HooksMissing => "hooks-missing",
+            Self::HooksUnreadable => "hooks-unreadable",
+            Self::HooksOk => "hooks-ok",
+            Self::NotInstalled => "not-installed",
+            Self::InstructionsStale => "instructions-stale",
+            Self::InstructionsOk => "instructions-ok",
+            Self::PathMismatch => "path-mismatch",
+            Self::PathOk => "path-ok",
+            Self::LegacyScript => "legacy-script",
+            Self::CommandFilterStatus => "command-filter-status",
+        }
+    }
+}
+
+/// Stale installed-vs-expected content, carried on a [`Finding`] so a renderer
+/// can show a unified diff on demand (`catenary doctor --diff`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleDiff {
+    /// The content currently installed on disk.
+    pub installed: String,
+    /// The content Catenary ships and expects.
+    pub expected: String,
+}
+
+/// A single typed health finding: severity, a stable code, a one-line message,
+/// and optional fix-it guidance (and, for staleness findings, a diff payload).
+///
+/// The message is the rendered one-liner; `fix_it` is the misc-120 guidance as
+/// data — a renderer shows it indented under the message, or a future guided
+/// mutation turns it into an action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finding {
+    /// The stable class identifier.
+    pub code: FindingCode,
+    /// How loud this finding is.
+    pub severity: Severity,
+    /// The one-line human message (no leading glyph or color).
+    pub message: String,
+    /// Optional fix-it guidance, rendered under the message.
+    pub fix_it: Option<String>,
+    /// Optional stale-content diff, rendered only under `--diff`.
+    pub diff: Option<StaleDiff>,
+}
+
+impl Finding {
+    /// Build a finding with a code, severity, and message.
+    #[must_use]
+    pub fn new(code: FindingCode, severity: Severity, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            severity,
+            message: message.into(),
+            fix_it: None,
+            diff: None,
+        }
+    }
+
+    /// Attach fix-it guidance (chainable).
+    #[must_use]
+    pub fn with_fix_it(mut self, fix_it: impl Into<String>) -> Self {
+        self.fix_it = Some(fix_it.into());
+        self
+    }
+
+    /// Attach a stale-content diff payload (chainable).
+    #[must_use]
+    pub fn with_diff(mut self, diff: StaleDiff) -> Self {
+        self.diff = Some(diff);
+        self
+    }
+
+    /// Whether this finding is a user-actionable problem
+    /// ([`Severity::is_problem`]).
+    #[must_use]
+    pub const fn is_problem(&self) -> bool {
+        self.severity.is_problem()
+    }
+}

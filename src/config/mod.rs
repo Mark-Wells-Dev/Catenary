@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 use crate::companions::CompanionRules;
 use crate::logging::reaper::ReapPolicy;
 
-pub use commands::{BuildContext, BuildGuidance, CommandsConfig, GuidanceEntry, ResolvedCommands};
+pub use commands::{
+    BuildContext, BuildGuidance, CommandsConfig, GuidanceEntry, PROJECT_IGNORED_COMMAND_KEYS,
+    ResolvedCommands,
+};
 pub use language::{DispatchMethod, LanguageConfig, ServerBinding};
 pub use linter::LinterConfig;
 pub use parse::{

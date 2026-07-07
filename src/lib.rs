@@ -18,6 +18,8 @@ pub mod companions;
 pub mod config;
 /// Diagnostic noise filtering for LSP server output.
 pub mod filter;
+/// Health model: typed findings shared by `catenary doctor` and the TUI.
+pub mod health;
 /// IPC server for host CLI hook integration (diagnostics and root sync).
 pub mod hook;
 /// Multi-sink tracing dispatcher for Catenary telemetry.
