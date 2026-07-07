@@ -577,17 +577,32 @@ impl crate::state_snapshot::SessionBoard for SessionBoardImpl {
 #[cfg(unix)]
 struct RootBoardImpl {
     tracker: RootTracker,
+    /// The ephemeral idle clocks, so the board can surface each activity-mounted
+    /// root's idle-remaining figure alongside its class.
+    ephemeral_mounts: EphemeralMounts,
 }
 
 #[cfg(unix)]
 impl crate::state_snapshot::RootBoard for RootBoardImpl {
     fn roots(&self) -> Vec<crate::state_snapshot::RootEntry> {
+        let now = Instant::now();
         self.tracker
             .list_roots()
             .into_iter()
-            .map(|(path, sources)| crate::state_snapshot::RootEntry {
-                path: path.display().to_string(),
-                ephemeral: root_is_ephemeral(&sources),
+            .map(|(path, sources)| {
+                // The full contributor classes (no longer collapsed to the
+                // `ephemeral` bool) plus the idle-remaining figure for an
+                // activity-mounted root — the same view `tool/roots-ls` reports.
+                let idle_remaining_secs = self
+                    .ephemeral_mounts
+                    .idle_remaining(&path, now, EPHEMERAL_ROOT_IDLE_TIMEOUT)
+                    .map(|d| d.as_secs());
+                crate::state_snapshot::RootEntry {
+                    path: path.display().to_string(),
+                    ephemeral: root_is_ephemeral(&sources),
+                    sources,
+                    idle_remaining_secs,
+                }
             })
             .collect()
     }
@@ -1312,6 +1327,18 @@ impl EphemeralMounts {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(root);
+    }
+
+    /// Seconds until the root at `path` expires on idle, given `now` and the
+    /// idle `timeout`. `None` when the root carries no idle clock (not an
+    /// activity-mounted ephemeral root). Saturating, so an already-past deadline
+    /// reads `0` rather than underflowing.
+    fn idle_remaining(&self, path: &Path, now: Instant, timeout: Duration) -> Option<Duration> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(path)
+            .map(|last| timeout.saturating_sub(now.saturating_duration_since(*last)))
     }
 
     /// Returns the roots whose last activity is at least `idle` before `now`.
@@ -2285,17 +2312,21 @@ impl SessionManager {
         self.root_tracker = Some(root_tracker.clone());
 
         let sessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        // Shared with the root board so `state.json` can surface each ephemeral
+        // root's idle-remaining figure; the hook context holds the same handle.
+        let ephemeral_mounts = EphemeralMounts::new();
         // Wire the live session board + root board onto the daemon snapshot so
         // `state.json` carries the rich session board (observability ticket 05)
-        // and the daemon-level tracked-root board with pinned/ephemeral classes
-        // (ephemeral-roots ticket 02). The writer pulls both at each flush;
-        // `None` outside daemon mode.
+        // and the daemon-level tracked-root board with full contributor classes
+        // and ephemeral idle-remaining (ephemeral-roots ticket 02 / tui-rework).
+        // The writer pulls both at each flush; `None` outside daemon mode.
         if let Some(snapshot) = &session.snapshot {
             snapshot.set_session_board(Arc::new(SessionBoardImpl {
                 sessions: sessions.clone(),
             }));
             snapshot.set_root_board(Arc::new(RootBoardImpl {
                 tracker: root_tracker.clone(),
+                ephemeral_mounts: ephemeral_mounts.clone(),
             }));
         }
 
@@ -2337,7 +2368,7 @@ impl SessionManager {
             editing_guardrail: Arc::new(EditingGuardrail::new()),
             handoff: KeyedHandoff::new(),
             worktree_watcher,
-            ephemeral_mounts: EphemeralMounts::new(),
+            ephemeral_mounts,
             first_sightings: FirstSightings::new(),
             worktree_registry,
             worktree_mounts: WorktreeMounts::new(),
@@ -10479,6 +10510,93 @@ mod tests {
             mounts
                 .expired(even_later, Duration::from_secs(1))
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn ephemeral_mounts_idle_remaining_counts_down() {
+        let mounts = EphemeralMounts::new();
+        let root = PathBuf::from("/proj/eph");
+        let t0 = Instant::now();
+        mounts.touch(&root, t0);
+
+        // Full band remaining at t0; elapsed time subtracts; a past deadline
+        // saturates to zero rather than underflowing. (Non-whole-minute second
+        // counts sidestep the readability lint while keeping the arithmetic
+        // obvious.)
+        assert_eq!(
+            mounts.idle_remaining(&root, t0, Duration::from_secs(90)),
+            Some(Duration::from_secs(90)),
+        );
+        assert_eq!(
+            mounts.idle_remaining(&root, t0 + Duration::from_secs(40), Duration::from_secs(90)),
+            Some(Duration::from_secs(50)),
+        );
+        assert_eq!(
+            mounts.idle_remaining(
+                &root,
+                t0 + Duration::from_secs(500),
+                Duration::from_secs(90)
+            ),
+            Some(Duration::ZERO),
+        );
+        // An untracked root carries no clock.
+        assert_eq!(
+            mounts.idle_remaining(Path::new("/proj/other"), t0, Duration::from_secs(90)),
+            None,
+        );
+    }
+
+    #[test]
+    fn root_board_surfaces_sources_and_idle_remaining() {
+        use crate::state_snapshot::RootBoard;
+
+        let tracker = RootTracker::new();
+        let mounts = EphemeralMounts::new();
+
+        let pinned = PathBuf::from("/p/Catenary");
+        let ephemeral = PathBuf::from("/p/Scratch");
+        tracker.add_roots("hook", std::slice::from_ref(&pinned));
+        tracker.add_roots("mcp:3", std::slice::from_ref(&pinned));
+        tracker.add_roots(
+            &ephemeral_contributor(&ephemeral),
+            std::slice::from_ref(&ephemeral),
+        );
+        // Only the ephemeral root carries an idle clock.
+        mounts.touch(&ephemeral, Instant::now());
+
+        let board = RootBoardImpl {
+            tracker,
+            ephemeral_mounts: mounts,
+        };
+        // `list_roots` sorts by path: Catenary before Scratch.
+        let roots = board.roots();
+        assert_eq!(roots.len(), 2);
+
+        let cat = &roots[0];
+        assert_eq!(cat.path, "/p/Catenary");
+        assert!(!cat.ephemeral, "pinned root");
+        assert_eq!(
+            cat.sources,
+            vec!["hook".to_string(), "mcp:3".to_string()],
+            "the full contributor classes, not just the ephemeral bool",
+        );
+        assert!(
+            cat.idle_remaining_secs.is_none(),
+            "a pinned root has no idle clock",
+        );
+
+        let scratch = &roots[1];
+        assert_eq!(scratch.path, "/p/Scratch");
+        assert!(scratch.ephemeral, "ephemeral root");
+        assert_eq!(scratch.sources, vec![ephemeral_contributor(&ephemeral)]);
+        let remaining = scratch
+            .idle_remaining_secs
+            .expect("an ephemeral root carries an idle-remaining figure");
+        assert!(
+            remaining <= EPHEMERAL_ROOT_IDLE_TIMEOUT.as_secs()
+                && remaining + 5 >= EPHEMERAL_ROOT_IDLE_TIMEOUT.as_secs(),
+            "idle-remaining sits just under the full band: {remaining}",
         );
     }
 

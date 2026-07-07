@@ -41,7 +41,13 @@ use crate::lsp::{InstanceKey, ServerLifecycle};
 
 /// Snapshot schema version. A stale reader skips a too-new major; this is a
 /// forward-compat tag, not a migration anchor — nothing is ever read back.
-const SCHEMA: u32 = 1;
+///
+/// - `1` — the original server/session/root board.
+/// - `2` — server entries carry `respawns`/`last_died_at` (crash-loop
+///   visibility) and `degraded_since`/`degraded_reason` (decision-027 coverage
+///   degradation); root entries carry the full contributor `sources` and the
+///   ephemeral `idle_remaining_secs` (tui-rework snapshot enrichment).
+const SCHEMA: u32 = 2;
 
 /// Default coalescing window for non-urgent flushes.
 ///
@@ -164,6 +170,25 @@ pub struct ServerEntry {
     /// bounded window, then dropped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub died_at: Option<String>,
+    /// How many times this scope id has been re-registered (spawned again).
+    /// Carried through re-registration rather than reset, so a crash-looping
+    /// server renders as a climbing count instead of a healthy young one.
+    pub respawns: u32,
+    /// The death timestamp carried forward from the entry's previous life
+    /// (ISO 8601), preserved across respawn so a crash-loop's last death stays
+    /// visible even after the entry returns to `initializing`. `None` for a
+    /// server that has never died before its current life.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_died_at: Option<String>,
+    /// When the diagnostics path last degraded this server's coverage
+    /// (decision 027) — ISO 8601, stamped on first degradation and cleared on
+    /// recovery. `None` while the server is covering normally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded_since: Option<String>,
+    /// Why the server's coverage is degraded, paired with [`Self::degraded_since`]
+    /// and cleared together on recovery. `None` while covering normally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
 }
 
 /// Host CLI client identity for a session board entry.
@@ -275,6 +300,16 @@ pub struct RootEntry {
     /// will expire on idle; `false` for a pinned root (`hook` / `mcp:*` /
     /// `worktree:*`).
     pub ephemeral: bool,
+    /// The contributor sources holding this root (`hook` / `mcp:*` /
+    /// `worktree:*` / `ephemeral:*`), sorted — the full class list `tool/roots-ls`
+    /// reports, no longer collapsed to the [`Self::ephemeral`] bool alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+    /// Seconds until an ephemeral (activity-mounted) root expires on idle, when
+    /// an idle clock is tracked for it. `None` for a pinned root or a root with
+    /// no ephemeral mount.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_remaining_secs: Option<u64>,
 }
 
 /// Source of the live root board, pulled at each snapshot flush.
@@ -436,10 +471,21 @@ struct SnapshotState {
 }
 
 impl SnapshotState {
-    /// Registers a freshly spawned server, resetting any prior entry at the
-    /// same scope id (a respawn clears `died_at`, progress, and messages).
+    /// Registers a freshly spawned server, clearing the prior entry's live
+    /// fields (`died_at`, progress, messages, degradation) at the same scope id.
+    ///
+    /// A re-registration is a **respawn**: the crash history is carried forward
+    /// rather than reset — the counter climbs and the prior life's death
+    /// timestamp becomes `last_died_at`, so a crash-looping server no longer
+    /// rebirths as a healthy young one (the crash-loop blindspot).
     fn register_server(&mut self, key: &InstanceKey, started_at: &str) {
         let id = server_id(key);
+        let (respawns, last_died_at) = self.servers.get(&id).map_or((0, None), |prev| {
+            (
+                prev.respawns.saturating_add(1),
+                prev.died_at.clone().or_else(|| prev.last_died_at.clone()),
+            )
+        });
         let entry = ServerEntry {
             id: id.clone(),
             language: key.language_id.clone(),
@@ -456,8 +502,47 @@ impl SnapshotState {
             progress: None,
             last_message: None,
             died_at: None,
+            respawns,
+            last_died_at,
+            degraded_since: None,
+            degraded_reason: None,
         };
         self.servers.insert(id, entry);
+    }
+
+    /// Removes a server's board entry by scope id — a per-root teardown reaped
+    /// the instance, so the board must stop showing it (bug 72). Returns whether
+    /// an entry was present.
+    fn remove_server(&mut self, key: &InstanceKey) -> bool {
+        self.servers.remove(&server_id(key)).is_some()
+    }
+
+    /// Marks a server's coverage degraded (decision 027). `degraded_since` is
+    /// stamped once (idempotent — a repeat does not move it) and `reason`
+    /// refreshes. Returns whether a matching entry existed.
+    fn mark_degraded(&mut self, id: &str, reason: &str) -> bool {
+        if let Some(entry) = self.servers.get_mut(id) {
+            if entry.degraded_since.is_none() {
+                entry.degraded_since = Some(now_iso());
+            }
+            entry.degraded_reason = Some(reason.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clears a server's degradation state on recovery. Returns whether a change
+    /// was made (an entry existed and carried degradation state).
+    fn clear_degraded(&mut self, id: &str) -> bool {
+        if let Some(entry) = self.servers.get_mut(id)
+            && (entry.degraded_since.is_some() || entry.degraded_reason.is_some())
+        {
+            entry.degraded_since = None;
+            entry.degraded_reason = None;
+            return true;
+        }
+        false
     }
 
     /// Returns the entry for `key`, creating a fresh `initializing` one if a
@@ -482,6 +567,10 @@ impl SnapshotState {
                 progress: None,
                 last_message: None,
                 died_at: None,
+                respawns: 0,
+                last_died_at: None,
+                degraded_since: None,
+                degraded_reason: None,
             }
         })
     }
@@ -803,6 +892,49 @@ impl SnapshotWriter {
         self.inner.notify.notify_one();
     }
 
+    /// Removes a server's board entry on per-root teardown (worktree reap,
+    /// `SubagentStop` reap, idle expiry — bug 72).
+    ///
+    /// A reaped per-root instance holds no process, so the board must not keep
+    /// rendering it healthy. Flushes promptly (urgent), like a lifecycle change:
+    /// the maintainer watches the board for the server/RAM footprint, and a
+    /// stale ghost misreports exactly that.
+    pub fn remove_server(&self, key: &InstanceKey) {
+        {
+            let mut state = self.inner.lock_state();
+            if state.remove_server(key) {
+                state.dirty = true;
+                state.urgent = true;
+            }
+        }
+        self.inner.notify.notify_one();
+    }
+
+    /// Marks a server's coverage degraded (decision 027), stamping
+    /// `degraded_since` on first degradation and refreshing the reason
+    /// (coalesced flush). No-op when no entry matches `id`.
+    pub fn mark_degraded(&self, id: &str, reason: &str) {
+        {
+            let mut state = self.inner.lock_state();
+            if state.mark_degraded(id, reason) {
+                state.dirty = true;
+            }
+        }
+        self.inner.notify.notify_one();
+    }
+
+    /// Clears a server's degradation state on recovery (coalesced flush).
+    /// No-op when the entry is absent or was not degraded.
+    pub fn clear_degraded(&self, id: &str) {
+        {
+            let mut state = self.inner.lock_state();
+            if state.clear_degraded(id) {
+                state.dirty = true;
+            }
+        }
+        self.inner.notify.notify_one();
+    }
+
     /// Applies a lifecycle transition, flushing promptly when the variant
     /// changes.
     pub fn update_state(&self, key: &InstanceKey, lifecycle: &ServerLifecycle) {
@@ -1066,7 +1198,7 @@ mod tests {
         assert_eq!(server["state"], "probing");
         assert!(server["state_since"].is_string());
         assert_eq!(server["id"], "rust-analyzer@/p");
-        assert_eq!(json["schema"], 1);
+        assert_eq!(json["schema"], 2);
         assert_eq!(json["daemon"]["pid"], 4242);
         assert!(json["daemon"]["generated_at"].is_string());
     }
@@ -1131,6 +1263,10 @@ mod tests {
                     last_message: None,
                     // Strictly increasing so the reaper's ordering is deterministic.
                     died_at: Some(format!("2026-06-08T13:00:{i:02}Z")),
+                    respawns: 0,
+                    last_died_at: None,
+                    degraded_since: None,
+                    degraded_reason: None,
                 },
             );
         }
@@ -1185,19 +1321,114 @@ mod tests {
     }
 
     #[test]
-    fn respawn_clears_died_at() {
+    fn respawn_increments_counter_and_preserves_last_died_at() {
         let mut state = fresh_state();
         let key = root_key("ra", "/p");
         state.register_server(&key, "t0");
+        assert_eq!(state.servers[&server_id(&key)].respawns, 0);
         state.update_state(&key, &ServerLifecycle::Dead);
-        assert!(state.servers[&server_id(&key)].died_at.is_some());
+        let first_death = state.servers[&server_id(&key)]
+            .died_at
+            .clone()
+            .expect("died_at stamped");
 
-        // A respawn at the same scope id resets the entry.
+        // A respawn at the same scope id revives the live fields (fresh
+        // `initializing`, cleared `died_at`) but carries the crash history: the
+        // counter climbs and the prior death becomes `last_died_at`. A
+        // crash-loop is now legible in the raw snapshot instead of rendering as
+        // a healthy young server.
         state.register_server(&key, "t1");
         let entry = &state.servers[&server_id(&key)];
-        assert!(entry.died_at.is_none());
+        assert!(entry.died_at.is_none(), "live fields reset on respawn");
         assert_eq!(entry.state, "initializing");
         assert_eq!(entry.started_at, "t1");
+        assert_eq!(entry.respawns, 1, "respawn increments the counter");
+        assert_eq!(
+            entry.last_died_at.as_ref(),
+            Some(&first_death),
+            "the prior life's death is preserved"
+        );
+
+        // A second death + respawn keeps climbing and tracks the latest death.
+        state.update_state(&key, &ServerLifecycle::Dead);
+        let second_death = state.servers[&server_id(&key)]
+            .died_at
+            .clone()
+            .expect("died_at stamped again");
+        state.register_server(&key, "t2");
+        let entry = &state.servers[&server_id(&key)];
+        assert_eq!(entry.respawns, 2);
+        assert_eq!(entry.last_died_at.as_ref(), Some(&second_death));
+    }
+
+    #[test]
+    fn remove_server_drops_entry() {
+        let mut state = fresh_state();
+        let key = root_key("ra", "/p");
+        state.register_server(&key, "t0");
+        state.update_state(&key, &ServerLifecycle::Healthy);
+        assert!(state.servers.contains_key(&server_id(&key)));
+
+        // A per-root teardown removes the entry outright (bug 72): a reaped
+        // instance leaves no healthy ghost on the board.
+        assert!(state.remove_server(&key), "entry was present");
+        assert!(!state.servers.contains_key(&server_id(&key)));
+        // Idempotent: a second removal reports nothing to remove.
+        assert!(!state.remove_server(&key));
+    }
+
+    #[test]
+    fn degradation_set_and_cleared_round_trips() {
+        let mut state = fresh_state();
+        let key = root_key("rust-analyzer", "/p");
+        state.register_server(&key, "t0");
+        let id = server_id(&key);
+        let entry = &state.servers[&id];
+        assert!(entry.degraded_since.is_none());
+
+        // Decision 027: the diagnostics path degrades the server's coverage.
+        assert!(state.mark_degraded(&id, "unavailable during diagnostics"));
+        let stamped = state.servers[&id]
+            .degraded_since
+            .clone()
+            .expect("degraded_since stamped");
+        assert_eq!(
+            state.servers[&id].degraded_reason.as_deref(),
+            Some("unavailable during diagnostics")
+        );
+
+        // Marking again is idempotent for the timestamp (does not move it).
+        assert!(state.mark_degraded(&id, "still unavailable"));
+        assert_eq!(state.servers[&id].degraded_since.as_ref(), Some(&stamped));
+        assert_eq!(
+            state.servers[&id].degraded_reason.as_deref(),
+            Some("still unavailable")
+        );
+
+        // Recovery clears both fields.
+        assert!(state.clear_degraded(&id));
+        assert!(state.servers[&id].degraded_since.is_none());
+        assert!(state.servers[&id].degraded_reason.is_none());
+        // Clearing an already-clean entry is a no-op.
+        assert!(!state.clear_degraded(&id));
+        // Marking an unknown id finds no entry.
+        assert!(!state.mark_degraded("nope@/p", "x"));
+    }
+
+    #[test]
+    fn respawn_clears_degradation() {
+        // A respawn produces a fresh server: any prior degradation is stale and
+        // must not carry over (the next diagnostics run re-evaluates coverage).
+        let mut state = fresh_state();
+        let key = root_key("ra", "/p");
+        state.register_server(&key, "t0");
+        let id = server_id(&key);
+        state.mark_degraded(&id, "unavailable during diagnostics");
+        state.update_state(&key, &ServerLifecycle::Dead);
+        state.register_server(&key, "t1");
+        let entry = &state.servers[&id];
+        assert!(entry.degraded_since.is_none());
+        assert!(entry.degraded_reason.is_none());
     }
 
     // ── Activity ring (ticket 08) ──────────────────────────────────────
@@ -1719,10 +1950,14 @@ mod tests {
             RootEntry {
                 path: "/p/Catenary".to_string(),
                 ephemeral: false,
+                sources: vec!["hook".to_string(), "mcp:3".to_string()],
+                idle_remaining_secs: None,
             },
             RootEntry {
                 path: "/p/Lattice".to_string(),
                 ephemeral: true,
+                sources: vec!["ephemeral:/p/Lattice".to_string()],
+                idle_remaining_secs: Some(312),
             },
         ];
         let json = state.to_json(std::slice::from_ref(&session), &roots);
@@ -1748,12 +1983,17 @@ mod tests {
         assert_eq!(snapshot.sessions[0].status, SessionStatus::Editing);
 
         // The daemon-level root board round-trips, sorted by path, with the
-        // pinned/ephemeral class preserved.
+        // pinned/ephemeral class, the full contributor sources, and the
+        // ephemeral idle-remaining figure preserved.
         assert_eq!(snapshot.roots.len(), 2);
         assert_eq!(snapshot.roots[0].path, "/p/Catenary");
         assert!(!snapshot.roots[0].ephemeral, "pinned root");
+        assert_eq!(snapshot.roots[0].sources, vec!["hook", "mcp:3"]);
+        assert!(snapshot.roots[0].idle_remaining_secs.is_none());
         assert_eq!(snapshot.roots[1].path, "/p/Lattice");
         assert!(snapshot.roots[1].ephemeral, "ephemeral root");
+        assert_eq!(snapshot.roots[1].sources, vec!["ephemeral:/p/Lattice"]);
+        assert_eq!(snapshot.roots[1].idle_remaining_secs, Some(312));
 
         assert_eq!(snapshot.alerts.len(), 1);
         assert_eq!(snapshot.alerts[0].level, "error");

@@ -284,6 +284,21 @@ upgrading.
 
 ### Changed
 
+- **The session board tells the truth: respawn history, teardown removal,
+  degradation state, contributor classes.** Four `state.json` enrichments
+  (schema 2, additive — old readers unaffected) that make the snapshot fit
+  to back a health dashboard. A respawn no longer rebirths the server entry:
+  a crash-looping server now shows its climbing `respawns` count and
+  `last_died_at` instead of posing as a healthy young process. A per-root
+  reap (worktree teardown, idle expiry, session end) removes that root's
+  server entries from the board — previously they persisted as healthy
+  ghosts with frozen state after the servers were verifiably gone. When the
+  diagnostics path degrades a server's files to uncovered (decision 027),
+  the entry records `degraded_since` and the reason, cleared on recovery —
+  that state previously lived only in the receipt banner. And root entries
+  carry their full contributor classes (`hook`/`mcp:*`/`worktree:*`/
+  `ephemeral:*`) plus the ephemeral idle countdown, instead of one
+  collapsed boolean.
 - **Root management renamed to what it does: `catenary pin` / `catenary
   unpin`.** Coverage became automatic (activity automount, worktree mounts,
   MCP roots), so `roots add` never granted coverage — it pinned: stop idle

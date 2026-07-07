@@ -307,6 +307,12 @@ impl DiagnosticsServer {
         // ── Phase 2c: cross-feeder aggregation (ticket 02) ─────────
         let file_results = self.aggregate_feeds(feeds);
 
+        // Mirror decision-027 coverage degradation onto the server board: a
+        // server that owed a file a result and produced none has degraded, one
+        // that produced has recovered. Today this state lives only in the
+        // receipt banner; record it where the health surface reads it too.
+        self.record_diag_degradation(&canonical_paths, &file_results, &path_servers);
+
         // ── Phase 3: classify and format ─────────────────────────
         let outcome = self.format_output(
             &canonical_paths,
@@ -1435,6 +1441,54 @@ impl DiagnosticsServer {
             path.parent()
                 .map_or_else(|| PathBuf::from("/"), PathBuf::from)
         })
+    }
+
+    /// Records decision-027 coverage degradation on the server board.
+    ///
+    /// Keyed exactly as the receipt banner ([`prepend_unavailable_banner`]): a
+    /// per-root instance is *degraded* this run iff it was assigned a file that
+    /// produced no result (absent from `file_results` — it died mid-run or
+    /// failed to start), and *recovered* iff it produced a result and degraded
+    /// nothing. The degraded ids gain `degraded_since`/`degraded_reason`; the
+    /// recovered ids are cleared — so the state that until now lived only in the
+    /// banner also rides the snapshot the health surface reads. No-op without a
+    /// wired snapshot (doctor / tests).
+    fn record_diag_degradation(
+        &self,
+        canonical_paths: &[PathBuf],
+        file_results: &BTreeMap<String, (String, Vec<DiagEntry>)>,
+        path_servers: &BTreeMap<String, BTreeSet<String>>,
+    ) {
+        let Some(writer) = self.client_manager.snapshot() else {
+            return;
+        };
+        // Per-root instance ids the run degraded vs. verified. A missing
+        // `file_results` entry is the `FileOutcome::NoResults` producer.
+        let mut degraded: BTreeSet<String> = BTreeSet::new();
+        let mut recovered: BTreeSet<String> = BTreeSet::new();
+        for cp in canonical_paths {
+            let key = cp.to_string_lossy().to_string();
+            let Some(servers) = path_servers.get(&key) else {
+                continue;
+            };
+            let root = self.resolve_root_or_parent(cp);
+            let target = if file_results.contains_key(&key) {
+                &mut recovered
+            } else {
+                &mut degraded
+            };
+            for server in servers {
+                target.insert(format!("{server}@{}", root.display()));
+            }
+        }
+        for id in &degraded {
+            writer.mark_degraded(id, "unavailable during diagnostics");
+        }
+        // A server that degraded any file stays degraded; clear only the ones
+        // with no degraded file this run.
+        for id in recovered.difference(&degraded) {
+            writer.clear_degraded(id);
+        }
     }
 }
 

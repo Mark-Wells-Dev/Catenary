@@ -266,6 +266,16 @@ impl LspClientManager {
         self.snapshot = Some(writer);
     }
 
+    /// Returns the `state.json` snapshot writer, when wired.
+    ///
+    /// Lets the diagnostics path record decision-027 coverage degradation on
+    /// the server board (`degraded_since`/`degraded_reason`). `None` in doctor
+    /// and test contexts where no snapshot is mirrored.
+    #[must_use]
+    pub const fn snapshot(&self) -> Option<&Arc<crate::state_snapshot::SnapshotWriter>> {
+        self.snapshot.as_ref()
+    }
+
     /// Returns a reference to the configuration.
     pub fn config(&self) -> &Config {
         &self.config
@@ -2135,6 +2145,13 @@ impl LspClientManager {
                     "Failed to shutdown LSP server instance {key}: {e}",
                 );
             }
+            drop(client);
+            drop(client_mutex);
+            // The instance is gone — drop its board entry so the snapshot does
+            // not keep a stale ghost (bug 72). See `shutdown_root_instances`.
+            if let Some(writer) = &self.snapshot {
+                writer.remove_server(key);
+            }
         }
     }
 
@@ -2168,6 +2185,16 @@ impl LspClientManager {
                         scope_root = sr.as_str(),
                         "Failed to shutdown per-root instance {key}: {e}",
                     );
+                }
+                drop(client);
+                drop(client_mutex);
+                // Drop the board entry: the instance is gone, so the snapshot
+                // must not keep rendering it healthy (bug 72). Ordered after the
+                // client drops so the reader loop's `on_shutdown` (which cannot
+                // upgrade its `Weak` once the last `LspServer` ref is gone)
+                // never re-creates a ghost behind us.
+                if let Some(writer) = &self.snapshot {
+                    writer.remove_server(&key);
                 }
             }
         }
@@ -3542,6 +3569,56 @@ mod tests {
             remaining_key.scope,
             Scope::Root(PathBuf::from("/tmp")),
             "/tmp instance should remain"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_root_instances_drops_snapshot_entry() -> Result<()> {
+        // Bug 72: a per-root teardown must drop the server's board entry, not
+        // leave it as a healthy ghost with `state_since` frozen at spawn.
+        let mut manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = crate::state_snapshot::SnapshotWriter::with_coalesce(
+            &tokio::runtime::Handle::current(),
+            dir.path(),
+            crate::state_snapshot::DaemonInfo {
+                instance_id: "daemon:test".to_string(),
+                pid: 1,
+                version: "test".to_string(),
+                started_at: "t0".to_string(),
+            },
+            Duration::from_millis(10),
+        );
+        manager.set_snapshot(writer.clone());
+
+        // Two root-scoped instances; each registers a board entry on spawn.
+        let _ = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        let server_name = format!("mockls-{MOCK_LANG_A}");
+        let _ = manager
+            .spawn(&server_name, MOCK_LANG_A, Path::new("/var"))
+            .await?;
+
+        // Tear down only /var — the misc-150/151 per-root reap chokepoint.
+        manager.shutdown_root_instances(Path::new("/var")).await;
+        writer.flush_now();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(writer.path()).expect("read snapshot"))
+                .expect("parse snapshot");
+        let servers = json["servers"].as_array().expect("servers array");
+        assert!(
+            servers.iter().all(|s| s["scope_root"] != "/var"),
+            "the reaped /var instance must leave no board entry: {servers:?}"
+        );
+        assert!(
+            servers.iter().any(|s| s["scope_root"] == "/tmp"),
+            "the surviving /tmp instance stays on the board: {servers:?}"
         );
 
         Ok(())
