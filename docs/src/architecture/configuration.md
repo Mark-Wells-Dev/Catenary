@@ -101,7 +101,7 @@ earlier model where project config could contain any section.
 Why each remaining section is excluded:
 
 - **`[notifications]`, `[icons]`, `[tools]`** — these are
-  user preferences, not project-specific. A notification threshold or
+  user preferences, not project-specific. A desktop-notification toggle or
   icon preset shouldn't vary per-root.
 
 ### `[commands]` in project config

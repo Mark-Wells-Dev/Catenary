@@ -65,18 +65,21 @@ others.
   it each run. The agent sees diagnostics in the shell tool output. Diagnostic
   events are also emitted to the JSONL telemetry firehose.
 - **Logging:** `LoggingServer` is a `tracing_subscriber::Layer` that subscribes
-  to every tracing event and dispatches structured events to two sinks: the
-  notification queue (user-facing `systemMessage`) and the per-root-sharded JSONL
-  telemetry firehose (`src/logging/jsonl_sink.rs`). See `src/logging/mod.rs` and
-  `docs/src/tracing-conventions`.
+  to every tracing event and dispatches structured events to its sinks: the
+  per-root-sharded JSONL telemetry firehose (`src/logging/jsonl_sink.rs`, carries
+  everything), the desktop-notification sink (`src/notify.rs`, error severity —
+  the urgent interrupt), and the daemon `state.json` snapshot (the TUI health
+  surface). The user-facing `systemMessage` notification queue retired in the TUI
+  rework. See `src/logging/mod.rs` and `docs/src/tracing-conventions`.
 
 ### Key source files
 
 - `src/paths.rs` — XDG base-dir resolvers (durable `state_dir` / ephemeral
   `runtime_dir` / regenerable `cache_dir`) and the firehose shard-key encoding.
 - `src/logging/mod.rs` — `LoggingServer`: multi-sink tracing Layer, the sole
-  telemetry port/adapter. Dispatches to the notification queue and the JSONL
-  firehose (`src/logging/jsonl_sink.rs`) sinks.
+  telemetry port/adapter. Dispatches to the JSONL firehose
+  (`src/logging/jsonl_sink.rs`), the desktop-notification sink, and the daemon
+  snapshot writer.
 - `src/router.rs` — the daemon: `SessionManager`/session lifecycle, the
   `RootTracker`, and hook dispatch. Per-session state lives in
   `src/bridge/session.rs`.
@@ -88,7 +91,7 @@ others.
 - **Safety:** `unsafe` code is strictly forbidden (`forbid(unsafe_code)`).
 - **Error Handling:** Use `anyhow` for application logic and `thiserror` for library errors.
 - **Strict Denials:** Do NOT use `unwrap()`, `panic!()`, `todo!()`, `unimplemented!()`, `dbg!()`, `println!()`, or `eprintln!()`. Use proper error handling and the `tracing` crate for logging. `expect()` is denied in production code but allowed in `#[cfg(test)]` modules — prefer `expect("reason")` over `anyhow` workarounds in tests.
-- **Tracing:** `warn!()` and `error!()` events reach the user-notification queue by default. Only use these levels for user-relevant, actionable conditions. Internal diagnostics belong at `info!()` or `debug!()`. See `docs/src/tracing-conventions` for severity guidelines, reserved structured fields, and the `source` taxonomy.
+- **Tracing:** `error!()` fires an OS desktop notification (the urgent interrupt) and surfaces as a TUI health finding; `warn!()` surfaces as a TUI health finding (no interrupt). Both also land in the firehose, which carries everything. Only use these levels for user-relevant, actionable conditions — an `error!()` must earn its interrupt. Internal diagnostics belong at `info!()` or `debug!()`. The store-and-forward `systemMessage` notification queue retired in the TUI rework. See `docs/src/tracing-conventions` for severity guidelines, reserved structured fields, and the `source` taxonomy.
 - **Imports:** No wildcard imports (`use crate::*`).
 - **Formatting:** Code must be formatted with `rustfmt`.
 - **Linting:** Must pass `cargo clippy` with `pedantic`, `nursery`, and `cargo` groups enabled.

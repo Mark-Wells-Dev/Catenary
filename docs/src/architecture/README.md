@@ -51,11 +51,11 @@ all protocol logging:
   dispatches hook requests, returns responses.
 
 **`LoggingServer`** is the telemetry port. It is a `tracing` Layer
-that dispatches every event to its sinks: the notification queue (for
-user-facing `systemMessage` delivery) and the append-only JSONL telemetry
-firehose (the full audit trail, read by `catenary query`). Warn/error
+that dispatches every event to its sinks: the append-only JSONL telemetry
+firehose (the full audit trail, read by `catenary query`) and the
+desktop-notification sink (error severity — the urgent interrupt). Warn/error
 events additionally feed the alert ring of the daemon-owned `state.json`
-snapshot. Every protocol message flows through it.
+snapshot (the TUI health surface). Every protocol message flows through it.
 
 Application servers (`GrepServer`, `GlobServer`, `DiagnosticsServer`)
 are the transformation layer. They receive application-level parameters
@@ -90,7 +90,8 @@ Host CLI ◄──IPC──► HookServer ──► HookRouter (editing enforcem
   (hooks)                          command filtering, file tracking)
 
 LoggingServer (tracing Layer) ─── dispatches all events to sinks:
-  ├── notification queue     (user-facing systemMessage)
+  ├── desktop notifications  (error severity — the urgent interrupt)
+  ├── state.json snapshot    (warn/error → TUI health surface)
   └── JSONL firehose         (append-only audit trail, read by catenary query)
 ```
 

@@ -543,24 +543,15 @@
     },
     "NotificationConfig": {
       "additionalProperties": false,
-      "description": "Notification delivery configuration.\n\nControls which tracing events are promoted to user-facing notifications via `systemMessage`. Events below the threshold are silently dropped by the notification queue sink.\n\n# Examples\n\n```toml [notifications] threshold = \"warn\" desktop = true ```",
+      "description": "Notification delivery configuration.\n\nThe only knob is [`desktop`](Self::desktop): OS-level desktop notifications for **error**-severity events, the urgent interrupt. The former `threshold` key — the floor of the retired user-notification queue (tui-rework 04) — is gone: warns now persist on the TUI health surface and everything is queryable in the firehose, neither of which is severity-tunable. A leftover `threshold` is not a hard error (serde is lenient here) but is flagged by the unknown-key health finding via the closed schema.\n\n# Examples\n\n```toml [notifications] desktop = true ```",
       "properties": {
         "desktop": {
           "default": null,
-          "description": "Whether OS-level desktop notifications are enabled for error events. Defaults to `true`. Set to `false` to suppress desktop notifications while keeping `systemMessage` delivery. The `CATENARY_NOTIFY=0` environment variable overrides this to `false`.",
+          "description": "Whether OS-level desktop notifications are enabled for error events. Defaults to `true`. Set to `false` to suppress desktop notifications. The `CATENARY_NOTIFY=0` environment variable overrides this to `false`.",
           "type": [
             "boolean",
             "null"
           ]
-        },
-        "threshold": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/SeverityConfig"
-            }
-          ],
-          "default": "warn",
-          "description": "Minimum severity for notification delivery."
         }
       },
       "type": "object"
@@ -790,39 +781,6 @@
         }
       },
       "type": "object"
-    },
-    "SeverityConfig": {
-      "description": "Severity level for notification threshold configuration.\n\nDeserialized from lowercase TOML strings (`\"debug\"`, `\"info\"`, `\"warn\"`, `\"error\"`). Defaults to `Warn`.",
-      "oneOf": [
-        {
-          "description": "Include debug-level events (most verbose).",
-          "enum": [
-            "debug"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Include info-level and above.",
-          "enum": [
-            "info"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Include warn-level and above (default).",
-          "enum": [
-            "warn"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Only error-level events.",
-          "enum": [
-            "error"
-          ],
-          "type": "string"
-        }
-      ]
     },
     "StringOrVec": {
       "anyOf": [

@@ -40,56 +40,28 @@ pub use weights::{BASELINE_WEIGHT, DiagnosticWeights};
 
 /// Notification delivery configuration.
 ///
-/// Controls which tracing events are promoted to user-facing notifications
-/// via `systemMessage`. Events below the threshold are silently dropped by
-/// the notification queue sink.
+/// The only knob is [`desktop`](Self::desktop): OS-level desktop notifications
+/// for **error**-severity events, the urgent interrupt. The former `threshold`
+/// key — the floor of the retired user-notification queue (tui-rework 04) — is
+/// gone: warns now persist on the TUI health surface and everything is queryable
+/// in the firehose, neither of which is severity-tunable. A leftover `threshold`
+/// is not a hard error (serde is lenient here) but is flagged by the unknown-key
+/// health finding via the closed schema.
 ///
 /// # Examples
 ///
 /// ```toml
 /// [notifications]
-/// threshold = "warn"
 /// desktop = true
 /// ```
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
+#[schemars(deny_unknown_fields)]
 pub struct NotificationConfig {
-    /// Minimum severity for notification delivery.
-    pub threshold: SeverityConfig,
     /// Whether OS-level desktop notifications are enabled for error events.
-    /// Defaults to `true`. Set to `false` to suppress desktop notifications
-    /// while keeping `systemMessage` delivery. The `CATENARY_NOTIFY=0`
-    /// environment variable overrides this to `false`.
+    /// Defaults to `true`. Set to `false` to suppress desktop notifications.
+    /// The `CATENARY_NOTIFY=0` environment variable overrides this to `false`.
     pub desktop: Option<bool>,
-}
-
-/// Severity level for notification threshold configuration.
-///
-/// Deserialized from lowercase TOML strings (`"debug"`, `"info"`, `"warn"`,
-/// `"error"`). Defaults to `Warn`.
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum SeverityConfig {
-    /// Include debug-level events (most verbose).
-    Debug,
-    /// Include info-level and above.
-    Info,
-    /// Include warn-level and above (default).
-    #[default]
-    Warn,
-    /// Only error-level events.
-    Error,
-}
-
-impl From<SeverityConfig> for crate::logging::Severity {
-    fn from(sc: SeverityConfig) -> Self {
-        match sc {
-            SeverityConfig::Debug => Self::Debug,
-            SeverityConfig::Info => Self::Info,
-            SeverityConfig::Warn => Self::Warn,
-            SeverityConfig::Error => Self::Error,
-        }
-    }
 }
 
 /// Workspace-root configuration (`[roots]`).
@@ -1461,9 +1433,13 @@ command = "rust-analyzer"
 
         let config = Config::load_from_sources(&[config_path])?;
         assert!(config.notifications.is_none());
-        assert_eq!(
-            config.notifications.unwrap_or_default().threshold,
-            SeverityConfig::Warn,
+        // The lone knob, `desktop`, defaults to enabled at the consumption site.
+        assert!(
+            config
+                .notifications
+                .unwrap_or_default()
+                .desktop
+                .unwrap_or(true)
         );
 
         Ok(())
@@ -1514,37 +1490,26 @@ command = "rust-analyzer"
     }
 
     #[test]
-    fn notification_config_parses_all_levels() -> anyhow::Result<()> {
-        let dir = tempdir()?;
-        for (toml_val, expected) in [
-            ("debug", SeverityConfig::Debug),
-            ("info", SeverityConfig::Info),
-            ("warn", SeverityConfig::Warn),
-            ("error", SeverityConfig::Error),
-        ] {
-            let path = dir.path().join(format!("{toml_val}.toml"));
-            fs::write(
-                &path,
-                format!("[notifications]\nthreshold = \"{toml_val}\"\n"),
-            )?;
-            let config = Config::load_from_sources(&[path])?;
-            assert_eq!(
-                config.notifications.expect("should be Some").threshold,
-                expected,
-            );
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn notification_config_rejects_unknown_key() {
+    fn notification_threshold_key_retired_is_lenient_and_flagged() {
+        // The retired `threshold` key (tui-rework 04) no longer hard-errors at
+        // load — serde is lenient here so an upgraded config never crashes the
+        // daemon — but the closed schema flags it via the unknown-key finding.
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        fs::write(&path, "[notifications]\nfoo = \"bar\"\n").expect("write");
+        fs::write(&path, "[notifications]\nthreshold = \"warn\"\n").expect("write");
 
-        let result = Config::load_from_sources(&[path]);
-        assert!(result.is_err());
+        // Lenient load: the retired key is ignored, not an error.
+        let config = Config::load_from_sources(std::slice::from_ref(&path)).expect("lenient load");
+        assert!(config.notifications.is_some());
+
+        // The schema-based unknown-key walk flags it (retire-through-finding).
+        let raw: toml::Value =
+            toml::from_str(&fs::read_to_string(&path).expect("read")).expect("parse");
+        let unknowns = crate::config::schema::unknown_user_config_keys(&raw);
+        assert!(
+            unknowns.iter().any(|u| u.key == "threshold"),
+            "retired threshold key must be flagged as unknown, got: {unknowns:?}",
+        );
     }
 
     #[test]
@@ -1552,15 +1517,15 @@ command = "rust-analyzer"
         let dir = tempdir()?;
 
         let user = dir.path().join("user.toml");
-        fs::write(&user, "[notifications]\nthreshold = \"warn\"\n")?;
+        fs::write(&user, "[notifications]\ndesktop = true\n")?;
 
         let project = dir.path().join("project.toml");
-        fs::write(&project, "[notifications]\nthreshold = \"info\"\n")?;
+        fs::write(&project, "[notifications]\ndesktop = false\n")?;
 
         let config = Config::load_from_sources(&[user, project])?;
         assert_eq!(
-            config.notifications.expect("should be Some").threshold,
-            SeverityConfig::Info,
+            config.notifications.expect("should be Some").desktop,
+            Some(false),
         );
 
         Ok(())
@@ -1571,7 +1536,7 @@ command = "rust-analyzer"
         let dir = tempdir()?;
 
         let user = dir.path().join("user.toml");
-        fs::write(&user, "[notifications]\nthreshold = \"error\"\n")?;
+        fs::write(&user, "[notifications]\ndesktop = false\n")?;
 
         let project = dir.path().join("project.toml");
         fs::write(&project, "")?;
@@ -1579,8 +1544,8 @@ command = "rust-analyzer"
         let config = Config::load_from_sources(&[user, project])?;
         // Project omits [notifications] entirely — user's value is preserved.
         assert_eq!(
-            config.notifications.unwrap_or_default().threshold,
-            SeverityConfig::Error,
+            config.notifications.expect("should be Some").desktop,
+            Some(false),
         );
 
         Ok(())
@@ -1590,7 +1555,7 @@ command = "rust-analyzer"
     fn notification_config_desktop_defaults_to_none() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("config.toml");
-        fs::write(&path, "[notifications]\nthreshold = \"warn\"\n")?;
+        fs::write(&path, "[notifications]\n")?;
 
         let config = Config::load_from_sources(&[path])?;
         let notif = config.notifications.expect("should be Some");
@@ -1615,16 +1580,6 @@ command = "rust-analyzer"
         assert_eq!(notif.desktop, Some(false));
 
         Ok(())
-    }
-
-    #[test]
-    fn severity_config_converts_to_logging_severity() {
-        use crate::logging::Severity;
-
-        assert_eq!(Severity::from(SeverityConfig::Debug), Severity::Debug);
-        assert_eq!(Severity::from(SeverityConfig::Info), Severity::Info);
-        assert_eq!(Severity::from(SeverityConfig::Warn), Severity::Warn);
-        assert_eq!(Severity::from(SeverityConfig::Error), Severity::Error);
     }
 
     #[test]

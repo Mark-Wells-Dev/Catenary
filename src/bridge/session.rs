@@ -23,11 +23,11 @@ use super::file_tools::GlobServer;
 use super::filesystem_manager::{FilesystemManager, Root};
 use super::grep_server::GrepServer;
 use super::handler::expand_tilde;
+use super::parent_context::ParentContextQueue;
 use super::path_security::PathValidator;
 use crate::config::Config;
 use crate::logging::LoggingServer;
 use crate::logging::jsonl_sink::JsonlSink;
-use crate::logging::notification_router::NotificationRouter;
 use crate::lsp::LspClientManager;
 use crate::lsp::glob::LspGlob;
 use crate::symbol_index::SymbolIndex;
@@ -521,9 +521,10 @@ pub struct Session {
     pub logging: LoggingServer,
     /// Per-session notification router.
     ///
-    /// Routes notifications to per-session queues based on `session_id`
-    /// from the tracing span hierarchy. Drained at stationary hook points.
-    pub notification_router: Arc<NotificationRouter>,
+    /// Parent-agent `additionalContext` side channel (misc 151): the
+    /// dirty-worktree "kept" notice queues here keyed by the parent's
+    /// `session_id` and drains into the parent's next eligible hook response.
+    pub parent_context: Arc<ParentContextQueue>,
     /// Symbol index populated from `documentSymbol` responses (shared with grep).
     pub symbol_index: Option<Arc<std::sync::Mutex<SymbolIndex>>>,
     /// Catenary instance ID (unique per process invocation).
@@ -563,9 +564,9 @@ impl Session {
     /// draining any bootstrap-buffered events. After this call, all
     /// `tracing` events flow through the logging pipeline.
     ///
-    /// The `notification_router` is registered as a tracing sink. It
-    /// routes notifications to per-session queues based on `session_id`
-    /// from the tracing span hierarchy.
+    /// The shared `parent_context` queue (misc 151) is stored, not registered
+    /// as a sink — it carries daemon-pushed `additionalContext` for the parent
+    /// agent, not tracing events.
     #[must_use]
     #[allow(
         clippy::too_many_arguments,
@@ -578,7 +579,7 @@ impl Session {
         logging: LoggingServer,
         instance_id: Arc<str>,
         runtime: Handle,
-        notification_router: Arc<NotificationRouter>,
+        parent_context: Arc<ParentContextQueue>,
         snapshot: Option<Arc<crate::state_snapshot::SnapshotWriter>>,
     ) -> Self {
         let config = Arc::new(config);
@@ -599,12 +600,11 @@ impl Session {
         let desktop_sink = crate::notify::DesktopNotificationSink::with_enabled(desktop_enabled);
 
         // Activate — drains bootstrap buffer, enables direct dispatch. The
-        // snapshot writer (daemon mode) joins as an alert-ring sink.
-        let mut sinks: Vec<Arc<dyn crate::logging::Sink>> = vec![
-            notification_router.clone(),
-            jsonl_sink.clone(),
-            desktop_sink,
-        ];
+        // snapshot writer (daemon mode) joins as an alert-ring sink. The
+        // user-facing notification queue retired (tui-rework 04): warns now
+        // persist on the TUI health surface, errors ride the desktop sink, and
+        // everything stays queryable in the JSONL firehose.
+        let mut sinks: Vec<Arc<dyn crate::logging::Sink>> = vec![jsonl_sink.clone(), desktop_sink];
         if let Some(writer) = &snapshot {
             sinks.push(writer.clone());
         }
@@ -685,7 +685,7 @@ impl Session {
             fs_manager,
             path_validator,
             logging,
-            notification_router,
+            parent_context,
             symbol_index,
             instance_id,
             runtime,
@@ -704,9 +704,10 @@ impl Session {
     /// Creates fresh per-session state: editing manager and editing
     /// guardrail.
     ///
-    /// The shared [`NotificationRouter`] handles per-session routing via
-    /// the `session_id` tracing span — no per-session sink registration
-    /// is needed.
+    /// The shared [`ParentContextQueue`] is cloned from the primary so a
+    /// dirty-worktree notice pushed against this session's `session_id`
+    /// (from the daemon's `SubagentStop` handler) is visible to its own
+    /// hook dispatch.
     #[must_use]
     pub fn new_for_daemon(
         primary: &Self,
@@ -754,7 +755,7 @@ impl Session {
             fs_manager: primary.fs_manager.clone(),
             path_validator: primary.path_validator.clone(),
             logging: primary.logging.clone(),
-            notification_router: primary.notification_router.clone(),
+            parent_context: primary.parent_context.clone(),
             symbol_index: primary.symbol_index.clone(),
             instance_id: session_id,
             runtime: primary.runtime.clone(),
@@ -1520,15 +1521,13 @@ mod tests {
     /// real served/unserved split.
     fn session_with_root(handle: &Handle, root: PathBuf) -> Session {
         let instance_id: Arc<str> = "test-session".into();
-        let notification_router = Arc::new(NotificationRouter::new(crate::logging::Severity::Warn));
-        notification_router.register_session(&instance_id);
         Session::new(
             Config::default_with_classification(),
             vec![root],
             LoggingServer::new(),
             instance_id,
             handle.clone(),
-            notification_router,
+            super::super::parent_context::ParentContextQueue::new(),
             None,
         )
     }

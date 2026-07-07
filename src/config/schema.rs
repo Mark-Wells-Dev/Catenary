@@ -731,7 +731,7 @@ mod tests {
         let found = unknown_keys(
             "log_retention_days = 14\n\n\
              [icons]\npreset = \"unicode\"\n\n\
-             [notifications]\nthreshold = \"error\"\n\n\
+             [notifications]\ndesktop = true\n\n\
              [tools]\ndiagnostics_severity = \"warning\"\n\n\
              [tools.glob]\noutline_suppress = [\"**/*.min.js\"]\n\n\
              [lsp.server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\

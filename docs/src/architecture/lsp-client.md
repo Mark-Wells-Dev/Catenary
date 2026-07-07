@@ -280,10 +280,10 @@ that transitions to either `Healthy` or `Failed`.
 tokens increment the count; each end decrements it. When the count
 reaches zero, the server returns to `Healthy`.
 
-Terminal state notifications flow through `LoggingServer` to
-`NotificationQueueSink` to `systemMessage`, so the user sees "Language
-server unavailable: rust (rust-analyzer)" without the agent having to
-report it.
+A terminal-state transition emits a `warn!()` through `LoggingServer`: it
+surfaces as a health finding on the TUI dashboard (a routed-but-broken server —
+"Language server unavailable: rust (rust-analyzer)") and lands in the firehose,
+without the agent having to report it.
 
 ## Capability model
 

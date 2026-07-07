@@ -8,10 +8,11 @@
 )]
 //! Cross-cutting integration tests for `LoggingServer`.
 //!
-//! Tests in this file exercise multi-sink dispatch, notification queue
-//! threshold/dedup, and protocol message round-trip through the full
-//! tracing Layer pipeline — scenarios that span multiple tickets and
-//! don't fit naturally inside a single module's test suite.
+//! Tests in this file exercise multi-sink dispatch and protocol message
+//! round-trip through the full tracing Layer pipeline — scenarios that span
+//! multiple tickets and don't fit naturally inside a single module's test
+//! suite. (The user-notification queue retired in tui-rework 04, so its
+//! threshold/dedup tests are gone with it.)
 //!
 //! The firehose half is captured by an in-memory `MessageRecorder` (the
 //! observability rewrite retired the `messages` DB sink); the JSONL write
@@ -27,27 +28,25 @@ use catenary_mcp::source::Source;
 use tempfile::tempdir;
 use tracing_subscriber::layer::SubscriberExt;
 
-use catenary_mcp::logging::notification_queue::NotificationQueueSink;
+use catenary_mcp::logging::LoggingServer;
 use catenary_mcp::logging::test_support::{
     MessageRecorder, MsgRow, message_count, query_all_messages,
 };
-use catenary_mcp::logging::{LoggingServer, Severity};
 
 const MOCK_LANG_A: &str = "yX4Za";
 
 // ── Multi-sink dispatch ────────────────────────────────────────────────
 
-/// Verify that both sinks (notification queue, message recorder) receive
-/// their respective events through a single `LoggingServer` Layer.
+/// Verify that events route through a single `LoggingServer` Layer to the
+/// message recorder with the correct `type` classification.
 #[test]
 fn multi_sink_dispatch_routes_correctly() {
     let recorder = MessageRecorder::new();
-    let notifications = NotificationQueueSink::new(Severity::Warn);
 
     let server = LoggingServer::new();
     let subscriber = tracing_subscriber::registry().with(server.clone());
     tracing::subscriber::with_default(subscriber, || {
-        server.activate(vec![notifications.clone(), recorder.clone()]);
+        server.activate(vec![recorder.clone()]);
 
         // Protocol event (kind="lsp") → recorder with type "lsp".
         tracing::info!(
@@ -58,10 +57,10 @@ fn multi_sink_dispatch_routes_correctly() {
             "outgoing"
         );
 
-        // Warn event without kind → recorder with type "internal" + notification queue.
+        // Warn event without kind → recorder with type "internal".
         tracing::warn!(source = Source::LspLifecycle.as_str(), "server crashed");
 
-        // Debug event without kind → recorder with type "internal" only (below notification threshold).
+        // Debug event without kind → recorder with type "internal".
         tracing::debug!("verbose trace");
     });
 
@@ -77,58 +76,6 @@ fn multi_sink_dispatch_routes_correctly() {
     // Internal events are type "internal".
     assert_eq!(msgs[1].r#type, "internal");
     assert_eq!(msgs[2].r#type, "internal");
-
-    // Notification queue: 1 warn event.
-    let drained = notifications.drain();
-    assert_eq!(drained.len(), 1);
-    assert_eq!(drained[0].message, "server crashed");
-}
-
-/// Verify that notification queue threshold filtering works end-to-end
-/// through the tracing Layer.
-#[test]
-fn notification_threshold_filters_through_layer() {
-    let notifications = NotificationQueueSink::new(Severity::Warn);
-    let server = LoggingServer::new();
-
-    let subscriber = tracing_subscriber::registry().with(server.clone());
-    tracing::subscriber::with_default(subscriber, || {
-        server.activate(vec![notifications.clone()]);
-
-        tracing::debug!("below threshold");
-        tracing::info!("below threshold");
-        tracing::warn!(server = "a", "at threshold");
-        tracing::error!(server = "b", "above threshold");
-    });
-
-    let drained = notifications.drain();
-    assert_eq!(drained.len(), 2, "only warn + error should enqueue");
-    assert_eq!(drained[0].severity, Severity::Warn);
-    assert_eq!(drained[1].severity, Severity::Error);
-}
-
-/// Verify dedup works through the Layer — identical messages dedup,
-/// different servers do not.
-#[test]
-fn notification_dedup_through_layer() {
-    let notifications = NotificationQueueSink::new(Severity::Warn);
-    let server = LoggingServer::new();
-
-    let subscriber = tracing_subscriber::registry().with(server.clone());
-    tracing::subscriber::with_default(subscriber, || {
-        server.activate(vec![notifications.clone()]);
-
-        tracing::warn!(server = "ra", "server offline");
-        tracing::warn!(server = "ra", "server offline"); // dedup
-        tracing::warn!(server = "pylsp", "server offline"); // different server
-    });
-
-    let drained = notifications.drain();
-    assert_eq!(
-        drained.len(),
-        2,
-        "identical message with same server should dedup"
-    );
 }
 
 // ── Protocol message round-trip ────────────────────────────────────────
@@ -299,7 +246,6 @@ fn unified_sink_type_column_correct() {
 #[test]
 fn bootstrap_buffer_drains_to_all_sinks() {
     let recorder = MessageRecorder::new();
-    let notifications = NotificationQueueSink::new(Severity::Warn);
     let server = LoggingServer::new();
 
     let subscriber = tracing_subscriber::registry().with(server.clone());
@@ -314,16 +260,12 @@ fn bootstrap_buffer_drains_to_all_sinks() {
         assert_eq!(server.buffered_len(), 2);
 
         // Activate: buffer drains to sinks.
-        server.activate(vec![notifications.clone(), recorder.clone()]);
+        server.activate(vec![recorder.clone()]);
         assert_eq!(server.buffered_len(), 0);
     });
 
     // Recorder got both events.
     assert_eq!(message_count(&recorder), 2);
-
-    // Notification queue got both (both are warn, distinct keys).
-    let drained = notifications.drain();
-    assert_eq!(drained.len(), 2);
 }
 
 /// Verify that LSP server stderr output is captured as attributed tracing

@@ -19,6 +19,8 @@ mod handler;
 mod hook_router;
 /// Standalone-linter diagnostic feeder (blessed + SARIF adapters).
 mod linter;
+/// Per-session `additionalContext` queue for the parent agent (misc 151).
+pub mod parent_context;
 /// Path validation for LSP-aware operations and config file protection.
 pub mod path_security;
 /// Shared container for tool servers and cross-tool infrastructure.
@@ -45,6 +47,7 @@ pub use grep_server::{
 pub use handler::expand_tilde;
 pub use hook_router::HookRouter;
 pub use hook_router::is_edit_tool;
+pub use parent_context::ParentContextQueue;
 pub use path_security::PathValidator;
 
 /// Partial-result annotation emitted by `grep` and `glob` when a searched

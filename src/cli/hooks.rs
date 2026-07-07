@@ -467,9 +467,10 @@ fn truncate_host_strings(value: &mut serde_json::Value, max_chars: usize) {
 /// are delivered.
 ///
 /// Also validates the configuration at session start. If the config is
-/// invalid, surfaces a `systemMessage` directing the user to
-/// `catenary doctor`, combined with any background notifications from the
-/// notification queue drain.
+/// invalid, surfaces a fresh `systemMessage` directing the user to
+/// `catenary doctor` — a synchronous, error-severity notice on the right
+/// surface (the notification queue retired in tui-rework 04; this direct check
+/// is not queue-fed, so it never delivers stale).
 pub fn run_session_start(format: HostFormat) {
     use crate::hook::response::SystemMessageBuilder;
     use crate::logging::Severity;
@@ -531,28 +532,11 @@ pub fn run_session_start(format: HostFormat) {
     }
     request["host_payload"] = prepare_host_payload(&hook_json);
 
-    let lines = ipc_exchange(stream, &request);
-
-    if let Some(line) = lines.first()
-        && let Ok(envelope) = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
-    {
-        if let Some(crate::hook::HookResult::Cleared(count)) = &envelope.result {
-            builder.push_direct(
-                Severity::Info,
-                &format!("Catenary: cleared {count} stale editing state entries"),
-            );
-        }
-        if let Some(bg) = envelope.system_message {
-            // Server-side background drain content: each line is a
-            // pre-rendered notification. Add them as background lines.
-            for bg_line in bg.lines() {
-                // Skip the header — the builder adds its own.
-                if !bg_line.starts_with("───") {
-                    builder.push_background(bg_line.to_string());
-                }
-            }
-        }
-    }
+    // Fire the clear-editing request for its daemon-side effect (resetting stale
+    // editing state). The response carries nothing the user needs: the Cleared
+    // count was routine info and the notification-drain leg retired (tui-rework
+    // 04), so the response is ignored.
+    let _ = ipc_exchange(stream, &request);
 
     let ctx = with_orphan_line(session_start_context(announce, format));
     emit_session_start(builder, ctx.as_deref());
@@ -957,14 +941,20 @@ fn emit_session_start(
     }
 }
 
-/// Format a `systemMessage` for hook responses.
-fn format_system_message(msg: &str, format: HostFormat) -> String {
+/// Format a parent-agent `additionalContext` payload as a hook response for the
+/// given hook event (misc 151, D-1).
+///
+/// `additionalContext` is Claude Code's agent-context channel. Other hosts have
+/// no equivalent field, and the dirty-worktree notice that populates the queue
+/// only originates from Claude Code's `Worktree`/`Subagent` flow, so this emits
+/// an empty response (allow, nothing added) for non-Claude hosts.
+fn format_additional_context(context: &str, hook_event_name: &str, format: HostFormat) -> String {
     match format {
-        // OpenCode reads `decision.systemMessage` (`catenary.js`) — same
-        // `{systemMessage}` shape as the other hosts.
-        HostFormat::Claude | HostFormat::Antigravity | HostFormat::OpenCode => {
-            serde_json::json!({ "systemMessage": msg }).to_string()
-        }
+        HostFormat::Claude => serde_json::json!({
+            "hookSpecificOutput": announcement_hook_specific_output(hook_event_name, context),
+        })
+        .to_string(),
+        HostFormat::Antigravity | HostFormat::OpenCode => String::new(),
     }
 }
 
@@ -1011,11 +1001,11 @@ pub fn run_post_agent(format: HostFormat) {
         && let Ok(envelope) = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
     {
         if let Some(crate::hook::HookResult::Block(reason)) = &envelope.result {
-            // Blocking: notifications stay queued (server didn't drain).
             print!("{}", format_stop_block(reason, format));
-        } else if let Some(sys_msg) = &envelope.system_message {
-            // Allowing with background notifications.
-            print!("{}", format_system_message(sys_msg, format));
+        } else if let Some(ctx) = &envelope.additional_context {
+            // Allowing with a drained parent-agent notice (misc 151): deliver it
+            // as this Stop response's `additionalContext`.
+            print!("{}", format_additional_context(ctx, "Stop", format));
         }
     }
 }
@@ -1177,9 +1167,16 @@ fn enforce_editing_state(
 
     if let Some(line) = lines.first()
         && let Ok(envelope) = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
-        && let Some(crate::hook::HookResult::Deny(reason)) = &envelope.result
     {
-        print!("{}", format_deny(reason, format));
+        if let Some(crate::hook::HookResult::Deny(reason)) = &envelope.result {
+            print!("{}", format_deny(reason, format));
+        } else if let Some(ctx) = &envelope.additional_context {
+            // An allowed PreToolUse carrying a drained parent-agent notice
+            // (misc 151): deliver it as this call's `additionalContext`. The
+            // daemon only drains for the parent (empty agent_id), so a subagent's
+            // own PreToolUse never lands here.
+            print!("{}", format_additional_context(ctx, "PreToolUse", format));
+        }
     }
 }
 
@@ -1505,16 +1502,32 @@ mod tests {
     use anyhow::{Context, Result};
 
     #[test]
-    fn test_format_system_message_claude() -> Result<()> {
-        let output =
-            format_system_message("─── background ───\n[warn] ra offline", HostFormat::Claude);
+    fn additional_context_claude_shape() -> Result<()> {
+        // The parent-agent notice rides `hookSpecificOutput.additionalContext`
+        // for the given hook event (misc 151).
+        let output = format_additional_context(
+            "subagent `a` left a dirty worktree",
+            "PreToolUse",
+            HostFormat::Claude,
+        );
         let parsed: serde_json::Value =
             serde_json::from_str(&output).context("should produce valid JSON")?;
         assert_eq!(
-            parsed["systemMessage"].as_str(),
-            Some("─── background ───\n[warn] ra offline"),
+            parsed["hookSpecificOutput"]["hookEventName"].as_str(),
+            Some("PreToolUse"),
+        );
+        assert_eq!(
+            parsed["hookSpecificOutput"]["additionalContext"].as_str(),
+            Some("subagent `a` left a dirty worktree"),
         );
         Ok(())
+    }
+
+    #[test]
+    fn additional_context_non_claude_is_empty() {
+        // Other hosts have no `additionalContext` field; nothing is emitted.
+        assert!(format_additional_context("x", "Stop", HostFormat::Antigravity).is_empty());
+        assert!(format_additional_context("x", "Stop", HostFormat::OpenCode).is_empty());
     }
 
     // ── extract_shell_command tests ─────────────────────────────────
@@ -2075,15 +2088,6 @@ mod tests {
             serde_json::from_str(&output).context("should produce valid JSON")?;
         assert_eq!(parsed["decision"], "continue");
         assert_eq!(parsed["reason"], "files still in editing state");
-        Ok(())
-    }
-
-    #[test]
-    fn antigravity_system_message_format() -> Result<()> {
-        let output = format_system_message("config error", HostFormat::Antigravity);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).context("should produce valid JSON")?;
-        assert_eq!(parsed["systemMessage"].as_str(), Some("config error"));
         Ok(())
     }
 

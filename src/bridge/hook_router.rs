@@ -14,7 +14,6 @@ use tracing::debug;
 use crate::source::Source;
 
 use super::session::Session;
-use crate::hook::response::SystemMessageBuilder;
 use crate::hook::{HookRequest, HookResult};
 
 // ── Tool classification helpers ─────────────────────────────────────────
@@ -87,12 +86,18 @@ fn is_allowed_during_editing(tool_name: &str) -> bool {
 }
 
 /// Result of hook dispatch: the handler's result plus an optional
-/// `systemMessage` from the notification queue drain.
+/// `additionalContext` payload for the parent agent (misc 151).
+///
+/// The user-facing `systemMessage` notification queue retired (tui-rework 04);
+/// what rides the hook response now is the parent-agent leg — the dirty-worktree
+/// notice drained from the [`ParentContextQueue`](super::parent_context::ParentContextQueue)
+/// on the parent's next eligible response.
 pub struct DispatchResult {
     /// Handler result (`None` = allow / no actionable data).
     pub result: Option<HookResult>,
-    /// Composed `systemMessage` content (direct + background drain).
-    pub system_message: Option<String>,
+    /// Drained `additionalContext` for the parent agent, delivered when the
+    /// response allows. `None` = no `additionalContext` field in host output.
+    pub additional_context: Option<String>,
 }
 
 // ── HookRouter ──────────────────────────────────────────────────────────
@@ -127,9 +132,12 @@ impl HookRouter {
 
     /// Dispatches a parsed hook request to the appropriate handler.
     ///
-    /// Returns a [`DispatchResult`] with the handler's result and an optional
-    /// `systemMessage` from the notification queue drain. The queue is drained
-    /// only at stationary points (`SessionStart`, `Stop`/`AfterAgent` when allowing).
+    /// Returns a [`DispatchResult`] with the handler's result and, when the
+    /// response allows, any `additionalContext` drained from the parent-agent
+    /// [`ParentContextQueue`](super::parent_context::ParentContextQueue). The
+    /// queue is drained only for the *parent* (empty `agent_id`) on its eligible
+    /// hook exchanges — `PreToolUse` and `Stop`/`AfterAgent` — so a subagent's
+    /// own hook traffic never absorbs a notice meant for its spawner (misc 151).
     #[allow(clippy::too_many_lines, reason = "match arms are sequential and flat")]
     pub(crate) fn dispatch(&self, request: HookRequest) -> DispatchResult {
         match request {
@@ -173,9 +181,17 @@ impl HookRouter {
                         );
                     }
                 }
+                // Deliver any pending parent-agent context on an allowed
+                // PreToolUse — the parent's most frequent eligible response
+                // (misc 151). A denied call carries nothing.
+                let additional_context = if result.is_none() {
+                    self.drain_parent_context(&agent_id)
+                } else {
+                    None
+                };
                 DispatchResult {
                     result,
-                    system_message: None,
+                    additional_context,
                 }
             }
             HookRequest::PreToolStartEditing {
@@ -190,7 +206,7 @@ impl HookRouter {
                 self.session.touch_snapshot();
                 DispatchResult {
                     result: None,
-                    system_message: None,
+                    additional_context: None,
                 }
             }
             HookRequest::PreToolDoneEditingPrepare { .. } => {
@@ -199,14 +215,14 @@ impl HookRouter {
                 // per-session HookServer path.
                 DispatchResult {
                     result: None,
-                    system_message: None,
+                    additional_context: None,
                 }
             }
             HookRequest::DoneEditingRun => {
                 // Handled at the daemon level (router.rs), not here.
                 DispatchResult {
                     result: None,
-                    system_message: None,
+                    additional_context: None,
                 }
             }
             HookRequest::PostAgent {
@@ -219,15 +235,17 @@ impl HookRouter {
                 // Editing state may have cleared (status → idle) — refresh the
                 // board (ticket 05).
                 self.session.touch_snapshot();
-                // Drain at stationary point: only when allowing the stop.
-                let system_message = if matches!(result, Some(HookResult::Block(_))) {
+                // Deliver any pending parent-agent context on an allowed Stop —
+                // the second eligible delivery point (misc 151). A blocked stop
+                // (editing gate / lingering-worktree nag) carries nothing.
+                let additional_context = if matches!(result, Some(HookResult::Block(_))) {
                     None
                 } else {
-                    self.drain_notifications()
+                    self.drain_parent_context(&agent_id)
                 };
                 DispatchResult {
                     result,
-                    system_message,
+                    additional_context,
                 }
             }
             HookRequest::SessionStart { session_id: _ } => {
@@ -235,11 +253,9 @@ impl HookRouter {
                 // Stale editing state may have cleared (status → idle) —
                 // refresh the board (ticket 05).
                 self.session.touch_snapshot();
-                // Drain at stationary point: session start.
-                let system_message = self.drain_notifications();
                 DispatchResult {
                     result,
-                    system_message,
+                    additional_context: None,
                 }
             }
             HookRequest::SessionEnd { session_id: _ } => {
@@ -247,28 +263,31 @@ impl HookRouter {
                 // daemon's handle_hook_dispatch (root tracker removal).
                 DispatchResult {
                     result: None,
-                    system_message: None,
+                    additional_context: None,
                 }
             }
         }
     }
 
-    /// Drain the notification queue into a `systemMessage` string.
+    /// Drain the parent-agent [`ParentContextQueue`](super::parent_context::ParentContextQueue)
+    /// into an `additionalContext` string (misc 151, D-1).
     ///
-    /// Drains from the shared [`crate::logging::notification_router::NotificationRouter`]
-    /// using this session's `session_id`.
-    ///
-    /// Returns `None` if the queue is empty.
-    fn drain_notifications(&self) -> Option<String> {
-        let mut builder = SystemMessageBuilder::new();
-        for notification in &self
-            .session
-            .notification_router
-            .drain(&self.session.instance_id)
-        {
-            builder.push_background(notification.format());
+    /// Only the **parent** (empty `agent_id` — the top-level agent) drains: a
+    /// sibling subagent's hook traffic shares the `session_id` but must not
+    /// absorb a notice meant for the spawner. Multiple queued lines join with
+    /// newlines.
+    /// Returns `None` when the queue is empty (the common case) or when a
+    /// subagent is calling.
+    fn drain_parent_context(&self, agent_id: &str) -> Option<String> {
+        if !agent_id.is_empty() {
+            return None;
         }
-        builder.finish()
+        let lines = self.session.parent_context.drain(&self.session.instance_id);
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
+        }
     }
 
     // ── Hook handlers ───────────────────────────────────────────────────
@@ -1187,19 +1206,14 @@ mod tests {
         let handle = runtime.handle().clone();
 
         let instance_id: Arc<str> = "test-session".into();
-        let notification_router = Arc::new(
-            crate::logging::notification_router::NotificationRouter::new(
-                crate::logging::Severity::Warn,
-            ),
-        );
-        notification_router.register_session(&instance_id);
+        let parent_context = crate::bridge::parent_context::ParentContextQueue::new();
         let session = Arc::new(Session::new(
             config,
             vec![],
             logging,
             instance_id.clone(),
             handle,
-            notification_router,
+            parent_context,
             None,
         ));
 
@@ -1716,19 +1730,14 @@ mod tests {
         let handle = runtime.handle().clone();
 
         let instance_id: Arc<str> = "test-session".into();
-        let notification_router = Arc::new(
-            crate::logging::notification_router::NotificationRouter::new(
-                crate::logging::Severity::Warn,
-            ),
-        );
-        notification_router.register_session(&instance_id);
+        let parent_context = crate::bridge::parent_context::ParentContextQueue::new();
         let session = Arc::new(Session::new(
             config,
             vec![],
             logging,
             instance_id.clone(),
             handle,
-            notification_router,
+            parent_context,
             None,
         ));
         let router = HookRouter::new(session, instance_id, "test".to_string());
@@ -1760,19 +1769,14 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create workspace dir");
 
         let instance_id: Arc<str> = "test-session".into();
-        let notification_router = Arc::new(
-            crate::logging::notification_router::NotificationRouter::new(
-                crate::logging::Severity::Warn,
-            ),
-        );
-        notification_router.register_session(&instance_id);
+        let parent_context = crate::bridge::parent_context::ParentContextQueue::new();
         let session = Arc::new(Session::new(
             config,
             vec![root.clone()],
             logging,
             instance_id.clone(),
             handle,
-            notification_router,
+            parent_context,
             None,
         ));
 
@@ -1806,19 +1810,14 @@ mod tests {
         let handle = runtime.handle().clone();
 
         let instance_id: Arc<str> = "test-session".into();
-        let notification_router = Arc::new(
-            crate::logging::notification_router::NotificationRouter::new(
-                crate::logging::Severity::Warn,
-            ),
-        );
-        notification_router.register_session(&instance_id);
+        let parent_context = crate::bridge::parent_context::ParentContextQueue::new();
         let session = Arc::new(Session::new(
             config,
             vec![root.clone()],
             logging,
             instance_id.clone(),
             handle,
-            notification_router,
+            parent_context,
             None,
         ));
 
@@ -1859,12 +1858,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create workspace dir");
 
         let instance_id: Arc<str> = "test-session".into();
-        let notification_router = Arc::new(
-            crate::logging::notification_router::NotificationRouter::new(
-                crate::logging::Severity::Warn,
-            ),
-        );
-        notification_router.register_session(&instance_id);
+        let parent_context = crate::bridge::parent_context::ParentContextQueue::new();
         // The primary session owns the shared resources (fs_manager carries
         // the workspace root); the per-session daemon session carries the
         // guardrail under test.
@@ -1874,7 +1868,7 @@ mod tests {
             logging,
             instance_id.clone(),
             handle,
-            notification_router,
+            parent_context,
             None,
         );
         let guardrail = Arc::new(crate::bridge::editing_guardrail::EditingGuardrail::new());
@@ -1911,68 +1905,95 @@ mod tests {
         }
     }
 
-    // ── Dispatch-level drain tests ─────────────────────────────────────
+    // ── Parent-context delivery tests (misc 151) ──────────────────────
 
     #[test]
-    fn dispatch_session_start_drains_notifications() {
+    fn pre_tool_allow_delivers_parent_context() {
         let router = test_router();
-        // Populate the notification queue.
-        crate::logging::Sink::handle(
-            router.session.notification_router.as_ref(),
-            &make_notify_event("server offline", "ra"),
-        );
-        assert_eq!(
-            router.session.notification_router.queue_len("test-session"),
-            1
+        router.session.parent_context.queue(
+            "test-session",
+            "subagent `a` left a dirty worktree".to_string(),
         );
 
-        let result = router.dispatch(crate::hook::HookRequest::SessionStart { session_id: None });
-        assert!(
-            result.system_message.is_some(),
-            "session start should drain notifications"
+        // An allowed PreToolUse by the parent (empty agent_id) drains it.
+        let result = router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Read".to_string(),
+            file_path: None,
+            command: None,
+            agent_id: String::new(),
+            session_id: None,
+            writes: Vec::new(),
+        });
+        assert!(result.result.is_none(), "read allowed");
+        assert_eq!(
+            result.additional_context.as_deref(),
+            Some("subagent `a` left a dirty worktree"),
         );
-        assert!(router.session.notification_router.queue_len("test-session") == 0);
+        // Drained — not redelivered on the next call.
+        assert_eq!(router.session.parent_context.queue_len("test-session"), 0);
     }
 
     #[test]
-    fn dispatch_stop_allow_drains_notifications() {
+    fn subagent_pre_tool_does_not_absorb_parent_context() {
         let router = test_router();
-        crate::logging::Sink::handle(
-            router.session.notification_router.as_ref(),
-            &make_notify_event("server offline", "ra"),
-        );
+        router
+            .session
+            .parent_context
+            .queue("test-session", "parent notice".to_string());
 
-        // Not editing → allow → should drain.
+        // A subagent (non-empty agent_id) must not drain the parent's notice.
+        let result = router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Read".to_string(),
+            file_path: None,
+            command: None,
+            agent_id: "sub-agent".to_string(),
+            session_id: None,
+            writes: Vec::new(),
+        });
+        assert!(result.additional_context.is_none());
+        assert_eq!(
+            router.session.parent_context.queue_len("test-session"),
+            1,
+            "notice preserved for the parent"
+        );
+    }
+
+    #[test]
+    fn stop_allow_delivers_parent_context() {
+        let router = test_router();
+        router
+            .session
+            .parent_context
+            .queue("test-session", "dirty worktree kept".to_string());
+
+        // Not editing → allow → drain on Stop.
         let result = router.dispatch(crate::hook::HookRequest::PostAgent {
             agent_id: String::new(),
             session_id: None,
             stop_hook_active: false,
         });
         assert!(result.result.is_none(), "should allow");
-        assert!(
-            result.system_message.is_some(),
-            "allow should drain notifications"
+        assert_eq!(
+            result.additional_context.as_deref(),
+            Some("dirty worktree kept"),
         );
-        assert!(router.session.notification_router.queue_len("test-session") == 0);
     }
 
     #[test]
-    fn dispatch_stop_block_preserves_notifications() {
+    fn stop_block_preserves_parent_context() {
         let router = test_router();
-        // Enter editing mode so stop blocks.
         let _ = router.session.editing.start_editing(None, "");
-
-        // Add a file so editing mode has pending work.
         router
             .session
             .editing
             .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
+        router
+            .session
+            .parent_context
+            .queue("test-session", "dirty worktree kept".to_string());
 
-        crate::logging::Sink::handle(
-            router.session.notification_router.as_ref(),
-            &make_notify_event("server offline", "ra"),
-        );
-
+        // The editing gate blocks the stop → no delivery, context preserved for
+        // the next allowed response (the once-clean-turn rule, misc 151).
         let result = router.dispatch(crate::hook::HookRequest::PostAgent {
             agent_id: String::new(),
             session_id: None,
@@ -1982,22 +2003,20 @@ mod tests {
             matches!(result.result, Some(HookResult::Block(_))),
             "should block"
         );
-        assert!(result.system_message.is_none(), "block should not drain");
+        assert!(
+            result.additional_context.is_none(),
+            "block delivers nothing"
+        );
         assert_eq!(
-            router.session.notification_router.queue_len("test-session"),
+            router.session.parent_context.queue_len("test-session"),
             1,
-            "queue should be preserved"
+            "context preserved for the next allowed response"
         );
     }
 
     #[test]
-    fn dispatch_pre_tool_does_not_drain() {
+    fn empty_parent_context_yields_no_additional_context() {
         let router = test_router();
-        crate::logging::Sink::handle(
-            router.session.notification_router.as_ref(),
-            &make_notify_event("server offline", "ra"),
-        );
-
         let result = router.dispatch(crate::hook::HookRequest::PreTool {
             tool_name: "Read".to_string(),
             file_path: None,
@@ -2006,143 +2025,7 @@ mod tests {
             session_id: None,
             writes: Vec::new(),
         });
-        assert!(result.system_message.is_none(), "pre-tool should not drain");
-        assert_eq!(
-            router.session.notification_router.queue_len("test-session"),
-            1
-        );
-    }
-
-    #[test]
-    fn dispatch_stop_block_then_allow_drains_accumulated() {
-        let router = test_router();
-        // Enter editing mode with a file so stop blocks.
-        let _ = router.session.editing.start_editing(None, "");
-        router
-            .session
-            .editing
-            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
-
-        // Enqueue a notification before the first stop.
-        crate::logging::Sink::handle(
-            router.session.notification_router.as_ref(),
-            &make_notify_event("server offline", "ra"),
-        );
-
-        // First stop: block (editing active) — queue preserved.
-        let result = router.dispatch(crate::hook::HookRequest::PostAgent {
-            agent_id: String::new(),
-            session_id: None,
-            stop_hook_active: false,
-        });
-        assert!(matches!(result.result, Some(HookResult::Block(_))));
-        assert!(result.system_message.is_none());
-        assert_eq!(
-            router.session.notification_router.queue_len("test-session"),
-            1
-        );
-
-        // Enqueue another notification between block and retry.
-        crate::logging::Sink::handle(
-            router.session.notification_router.as_ref(),
-            &make_notify_event("config error", "pylsp"),
-        );
-        assert_eq!(
-            router.session.notification_router.queue_len("test-session"),
-            2
-        );
-
-        // Second stop: retry (stop_hook_active) — force-clears editing, allows, drains.
-        let result = router.dispatch(crate::hook::HookRequest::PostAgent {
-            agent_id: String::new(),
-            session_id: None,
-            stop_hook_active: true,
-        });
-        assert!(result.result.is_none(), "retry should allow");
-        let msg = result
-            .system_message
-            .expect("retry-allow should drain accumulated notifications");
-        assert!(
-            msg.contains("server offline"),
-            "drain should include first-cycle notification"
-        );
-        assert!(
-            msg.contains("config error"),
-            "drain should include second-cycle notification"
-        );
-        assert!(router.session.notification_router.queue_len("test-session") == 0);
-    }
-
-    #[test]
-    fn dispatch_stop_dedup_persists_across_blocked_cycle() {
-        let router = test_router();
-        let _ = router.session.editing.start_editing(None, "");
-        router
-            .session
-            .editing
-            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
-
-        // Enqueue a notification.
-        crate::logging::Sink::handle(
-            router.session.notification_router.as_ref(),
-            &make_notify_event("server offline", "ra"),
-        );
-
-        // Block — queue preserved.
-        let result = router.dispatch(crate::hook::HookRequest::PostAgent {
-            agent_id: String::new(),
-            session_id: None,
-            stop_hook_active: false,
-        });
-        assert!(matches!(result.result, Some(HookResult::Block(_))));
-
-        // Same notification again — dedup should reject.
-        crate::logging::Sink::handle(
-            router.session.notification_router.as_ref(),
-            &make_notify_event("server offline", "ra"),
-        );
-        assert_eq!(
-            router.session.notification_router.queue_len("test-session"),
-            1,
-            "dedup should reject duplicate across blocked cycle"
-        );
-
-        // Retry-allow: drain should contain exactly one notification.
-        let result = router.dispatch(crate::hook::HookRequest::PostAgent {
-            agent_id: String::new(),
-            session_id: None,
-            stop_hook_active: true,
-        });
-        let msg = result.system_message.expect("should drain");
-        // Background header + 1 notification = 2 lines.
-        assert_eq!(
-            msg.lines().count(),
-            2,
-            "expected header + 1 notification, got: {msg}"
-        );
-    }
-
-    /// Shorthand for constructing a notification-level `LogEvent`.
-    ///
-    /// Includes `session_id = "test-session"` so the `NotificationRouter`
-    /// routes the event to the test session's queue.
-    fn make_notify_event(message: &str, server: &str) -> crate::logging::LogEvent<'static> {
-        crate::logging::LogEvent {
-            severity: crate::logging::Severity::Warn,
-            target: "test",
-            message: message.to_string(),
-            kind: None,
-            method: None,
-            server: Some(server.to_string()),
-            client: None,
-            parent_id: None,
-            source: None,
-            language: None,
-            payload: None,
-            scope_root: None,
-            session_id: Some("test-session".to_string()),
-            fields: serde_json::Map::new(),
-        }
+        assert!(result.additional_context.is_none());
     }
 
     // ── PreToolUse file tracking tests ──────────────────────────────

@@ -3,50 +3,33 @@
 
 //! Response builder for `systemMessage` content.
 //!
-//! [`SystemMessageBuilder`] composes two content surfaces into a single
-//! string for the host CLI's `systemMessage` field:
+//! [`SystemMessageBuilder`] collects the **direct** `systemMessage` lines a hook
+//! handler builds synchronously — today only the `SessionStart` config-validation
+//! error ("Catenary configuration error … run `catenary doctor`"), a fresh,
+//! error-severity notice the conversation is genuinely the right surface for.
 //!
-//! - **Direct** — lines built synchronously by the current hook handler
-//!   (e.g., config validation warnings at `SessionStart`).
-//! - **Background** — lines drained from the notification queue,
-//!   accumulated since the last drain point.
-//!
-//! Visual separation: direct lines come first (they describe what the user
-//! just triggered), followed by a header and background lines ("oh by the
-//! way, these accumulated").
+//! The **background** surface it used to carry — the notification-queue drain —
+//! retired with the queue (tui-rework 04): warns now persist on the TUI health
+//! surface and the dirty-worktree parent notice rides `additionalContext`, not
+//! `systemMessage`. So this is now a thin `[severity] message` line formatter.
 
 use crate::logging::Severity;
 
-/// Background section header: 3 em-dashes, space, "background", space, 3 em-dashes.
-const BACKGROUND_HEADER: &str = "─── background ───";
-
-/// Builder for `systemMessage` content delivered through hook responses.
+/// Builder for direct `systemMessage` content delivered through hook responses.
 ///
-/// Combines direct (synchronous handler messages) and background (notification
-/// queue drain) surfaces into a single string. The builder is used on the
-/// server side for queue draining and on the CLI side for final composition.
-///
-/// # Composition rules
-///
-/// | Direct | Background | Output |
-/// |--------|------------|--------|
-/// | empty  | empty      | `None` — field omitted |
-/// | present| empty      | Direct lines joined by `\n` |
-/// | empty  | present    | Header + background lines |
-/// | present| present    | Direct lines + separator + header + background lines |
+/// Each line renders as `[severity] message`; [`finish`](Self::finish) joins them
+/// with newlines, or returns `None` when empty so no `systemMessage` field is
+/// emitted.
+#[derive(Default)]
 pub struct SystemMessageBuilder {
     direct: Vec<String>,
-    background: Vec<String>,
 }
 
 impl SystemMessageBuilder {
     /// Create an empty builder.
     #[must_use]
     pub const fn new() -> Self {
-        Self {
-            direct: Vec::new(),
-            background: Vec::new(),
-        }
+        Self { direct: Vec::new() }
     }
 
     /// Append a line built synchronously by this handler.
@@ -56,47 +39,17 @@ impl SystemMessageBuilder {
         self.direct.push(format!("[{}] {message}", severity.tag()));
     }
 
-    /// Add a pre-rendered background line.
-    ///
-    /// Used on the CLI side to reconstitute background content received
-    /// from the server's IPC response.
-    pub fn push_background(&mut self, line: String) {
-        self.background.push(line);
-    }
-
     /// Finalize into the `systemMessage` content string.
     ///
-    /// Returns `None` if both surfaces are empty — no `systemMessage`
-    /// field should be emitted.
+    /// Returns `None` when no lines were pushed — no `systemMessage` field
+    /// should be emitted.
     #[must_use]
     pub fn finish(self) -> Option<String> {
-        let has_direct = !self.direct.is_empty();
-        let has_background = !self.background.is_empty();
-
-        match (has_direct, has_background) {
-            (false, false) => None,
-            (true, false) => Some(self.direct.join("\n")),
-            (false, true) => {
-                let mut out = String::from(BACKGROUND_HEADER);
-                out.push('\n');
-                out.push_str(&self.background.join("\n"));
-                Some(out)
-            }
-            (true, true) => {
-                let mut out = self.direct.join("\n");
-                out.push_str("\n\n");
-                out.push_str(BACKGROUND_HEADER);
-                out.push('\n');
-                out.push_str(&self.background.join("\n"));
-                Some(out)
-            }
+        if self.direct.is_empty() {
+            None
+        } else {
+            Some(self.direct.join("\n"))
         }
-    }
-}
-
-impl Default for SystemMessageBuilder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -108,8 +61,6 @@ impl Default for SystemMessageBuilder {
 mod tests {
     use super::*;
 
-    // ── Composition unit tests ─────────────────────────────────────────
-
     #[test]
     fn empty_builder_returns_none() {
         let builder = SystemMessageBuilder::new();
@@ -117,11 +68,13 @@ mod tests {
     }
 
     #[test]
-    fn direct_only_no_header() {
+    fn direct_line_rendered_with_severity_tag() {
         let mut builder = SystemMessageBuilder::new();
-        builder.push_direct(Severity::Warn, "config: invalid TOML");
-        let result = builder.finish();
-        assert_eq!(result.as_deref(), Some("[warn] config: invalid TOML"));
+        builder.push_direct(Severity::Error, "config: invalid TOML");
+        assert_eq!(
+            builder.finish().as_deref(),
+            Some("[err] config: invalid TOML")
+        );
     }
 
     #[test]
@@ -133,32 +86,5 @@ mod tests {
         assert!(result.starts_with("[err]"));
         assert!(result.contains('\n'));
         assert!(result.contains("[warn]"));
-        assert!(!result.contains("background"));
-    }
-
-    #[test]
-    fn background_only_has_header() {
-        let mut builder = SystemMessageBuilder::new();
-        builder.push_background("[warn] rust-analyzer offline".into());
-        let result = builder.finish().expect("should have content");
-        assert!(result.starts_with("─── background ───\n"));
-        assert!(result.contains("[warn] rust-analyzer offline"));
-    }
-
-    #[test]
-    fn direct_and_background_separated() {
-        let mut builder = SystemMessageBuilder::new();
-        builder.push_direct(Severity::Error, "config error");
-        builder.push_background("[warn] server crashed".into());
-        let result = builder.finish().expect("should have content");
-        let parts: Vec<&str> = result.split("\n\n").collect();
-        assert_eq!(
-            parts.len(),
-            2,
-            "expected separator between direct and background"
-        );
-        assert!(parts[0].starts_with("[err]"));
-        assert!(parts[1].starts_with("─── background ───"));
-        assert!(parts[1].contains("[warn] server crashed"));
     }
 }

@@ -246,22 +246,23 @@ pub enum HookResult {
     Cleared(usize),
 }
 
-/// IPC response envelope carrying both the handler result and an optional
-/// `systemMessage` for the user.
+/// IPC response envelope carrying the handler result and an optional
+/// `additionalContext` payload for the parent agent (misc 151).
 ///
-/// The notification queue is drained at stationary hook points (`SessionStart`,
-/// `Stop`/`AfterAgent` when allowing) and delivered as `system_message`. The CLI
-/// hook process embeds this string in the host-specific `systemMessage` JSON
-/// field.
+/// The user-facing `systemMessage` notification queue retired (tui-rework 04).
+/// What rides the response now is the parent-agent leg: the dirty-worktree
+/// notice drained from the parent [`ParentContextQueue`](crate::bridge::ParentContextQueue)
+/// on the parent's next eligible response (`PreToolUse` / `Stop` when allowing).
+/// The CLI hook process emits it as `hookSpecificOutput.additionalContext`.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, PartialEq, Eq)]
 pub struct HookResponseEnvelope {
     /// Handler result (`None` = allow / no actionable data).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<HookResult>,
-    /// Composed `systemMessage` content from direct messages and background
-    /// notification drain. `None` = no `systemMessage` field in host output.
+    /// Drained parent-agent `additionalContext`. `None` = no `additionalContext`
+    /// field in host output.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system_message: Option<String>,
+    pub additional_context: Option<String>,
 }
 
 // ── HookServer ──────────────────────────────────────────────────────────
@@ -414,9 +415,9 @@ impl HookServer {
 
         let envelope = HookResponseEnvelope {
             result: result.result,
-            system_message: result.system_message,
+            additional_context: result.additional_context,
         };
-        let response = if envelope.result.is_some() || envelope.system_message.is_some() {
+        let response = if envelope.result.is_some() || envelope.additional_context.is_some() {
             serde_json::to_string(&envelope)?
         } else {
             String::new()
@@ -805,7 +806,7 @@ mod tests {
     fn envelope_result_only() {
         let env = HookResponseEnvelope {
             result: Some(HookResult::Deny("call editing start first".into())),
-            system_message: None,
+            additional_context: None,
         };
         let json = serde_json::to_string(&env).expect("serialize");
         let parsed: HookResponseEnvelope = serde_json::from_str(&json).expect("deserialize");
@@ -813,24 +814,24 @@ mod tests {
             parsed.result,
             Some(HookResult::Deny("call editing start first".into()))
         );
-        assert!(parsed.system_message.is_none());
-        // system_message should be absent from JSON (skip_serializing_if)
+        assert!(parsed.additional_context.is_none());
+        // additional_context should be absent from JSON (skip_serializing_if)
         let raw: serde_json::Value = serde_json::from_str(&json).expect("parse");
-        assert!(raw.get("system_message").is_none());
+        assert!(raw.get("additional_context").is_none());
     }
 
     #[test]
-    fn envelope_system_message_only() {
+    fn envelope_additional_context_only() {
         let env = HookResponseEnvelope {
             result: None,
-            system_message: Some("[warn] server offline".into()),
+            additional_context: Some("subagent `a` left a dirty worktree".into()),
         };
         let json = serde_json::to_string(&env).expect("serialize");
         let parsed: HookResponseEnvelope = serde_json::from_str(&json).expect("deserialize");
         assert!(parsed.result.is_none());
         assert_eq!(
-            parsed.system_message.as_deref(),
-            Some("[warn] server offline")
+            parsed.additional_context.as_deref(),
+            Some("subagent `a` left a dirty worktree")
         );
         let raw: serde_json::Value = serde_json::from_str(&json).expect("parse");
         assert!(raw.get("result").is_none());
@@ -840,16 +841,16 @@ mod tests {
     fn envelope_both_fields() {
         let env = HookResponseEnvelope {
             result: Some(HookResult::Cleared(2)),
-            system_message: Some("─── background ───\n[warn] offline".into()),
+            additional_context: Some("dirty worktree kept".into()),
         };
         let json = serde_json::to_string(&env).expect("serialize");
         let parsed: HookResponseEnvelope = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.result, Some(HookResult::Cleared(2)));
         assert!(
             parsed
-                .system_message
+                .additional_context
                 .as_ref()
-                .is_some_and(|m| m.contains("offline"))
+                .is_some_and(|m| m.contains("dirty worktree"))
         );
     }
 
@@ -857,7 +858,7 @@ mod tests {
     fn envelope_empty_is_default() {
         let env = HookResponseEnvelope::default();
         assert!(env.result.is_none());
-        assert!(env.system_message.is_none());
+        assert!(env.additional_context.is_none());
         let json = serde_json::to_string(&env).expect("serialize");
         assert_eq!(json, "{}");
     }
@@ -865,33 +866,19 @@ mod tests {
     // ── Per-host response shape tests ──────────────────────────────────
 
     #[test]
-    fn claude_code_response_shape() {
-        // Stop hook allow with background drain.
+    fn envelope_carries_parent_additional_context() {
+        // Stop/PreTool hook allow with a drained parent-agent notice (misc 151):
+        // the CLI reads `additional_context` and emits it as
+        // `hookSpecificOutput.additionalContext`.
         let env = HookResponseEnvelope {
             result: None,
-            system_message: Some("─── background ───\n[warn] ra offline".into()),
-        };
-        let json = serde_json::to_string(&env).expect("serialize");
-        // Claude Code reads systemMessage from the hook response.
-        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
-        assert_eq!(
-            parsed["system_message"].as_str(),
-            Some("─── background ───\n[warn] ra offline"),
-        );
-    }
-
-    #[test]
-    fn response_envelope_allow_with_background_drain() {
-        // Stop/AfterAgent hook allow with background drain.
-        let env = HookResponseEnvelope {
-            result: None,
-            system_message: Some("─── background ───\n[err] pylsp crashed".into()),
+            additional_context: Some("subagent `a` left a dirty worktree".into()),
         };
         let json = serde_json::to_string(&env).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
         assert_eq!(
-            parsed["system_message"].as_str(),
-            Some("─── background ───\n[err] pylsp crashed"),
+            parsed["additional_context"].as_str(),
+            Some("subagent `a` left a dirty worktree"),
         );
     }
 
@@ -899,7 +886,7 @@ mod tests {
 
     #[test]
     fn hook_allow_emits_at_debug() {
-        // Empty envelope = allow (no result, no system_message)
+        // Empty envelope = allow (no result, no additional_context)
         let env = HookResponseEnvelope::default();
         let level = HookServer::hook_outcome_level("pre-tool/editing-state", &env);
         assert_eq!(level, tracing::Level::DEBUG);
@@ -909,7 +896,7 @@ mod tests {
     fn hook_block_emits_at_info() {
         let env = HookResponseEnvelope {
             result: Some(HookResult::Deny("call editing start first".into())),
-            system_message: None,
+            additional_context: None,
         };
         let level = HookServer::hook_outcome_level("pre-tool/editing-state", &env);
         assert_eq!(level, tracing::Level::INFO);
@@ -921,7 +908,7 @@ mod tests {
         // result).
         let env = HookResponseEnvelope {
             result: None,
-            system_message: None,
+            additional_context: None,
         };
         let level = HookServer::hook_outcome_level("session-start/clear-editing", &env);
         assert_eq!(level, tracing::Level::DEBUG);
@@ -1006,8 +993,8 @@ mod tests {
 
     /// Create a `HookServer` backed by an in-memory session.
     ///
-    /// The `Session` has no LSP servers but a functional notification
-    /// router and config version counter — enough to exercise the IPC
+    /// The `Session` has no LSP servers but a functional parent-context
+    /// queue and config version counter — enough to exercise the IPC
     /// dispatch and root sync paths.
     fn test_hook_server() -> TestHookServer {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1015,12 +1002,7 @@ mod tests {
         let logging = crate::logging::LoggingServer::new();
         let handle = tokio::runtime::Handle::current();
         let instance_id: Arc<str> = "test-session".into();
-        let notification_router = Arc::new(
-            crate::logging::notification_router::NotificationRouter::new(
-                crate::logging::Severity::Warn,
-            ),
-        );
-        notification_router.register_session(&instance_id);
+        let parent_context = crate::bridge::ParentContextQueue::new();
 
         let session = Arc::new(Session::new(
             config,
@@ -1028,7 +1010,7 @@ mod tests {
             logging,
             instance_id.clone(),
             handle,
-            notification_router,
+            parent_context,
             None,
         ));
         let server = HookServer::new(session, instance_id, "test".to_string());

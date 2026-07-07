@@ -135,16 +135,24 @@ diagnostics_severity = "error"    # default
 
 See [Configuration → Diagnostics](configuration.md#diagnostics).
 
-### Notification threshold
+### Notifications: `threshold` removed
+
+The store-and-forward `systemMessage` notification queue retired, and with it
+its severity floor. The `[notifications]` table now has one knob:
 
 ```toml
 [notifications]
-threshold = "warn"    # default
+desktop = true    # default — OS notifications for error-severity events
 ```
 
-- **`threshold`** (default `"warn"`) — minimum severity promoted to user-facing
-  notifications via the host's `systemMessage`. One of `"debug"`, `"info"`,
-  `"warn"`, `"error"`.
+- **`threshold`** — **removed.** Warns now persist on the TUI health dashboard
+  (a warn *is* a health finding) and everything is queryable via `catenary
+  query`; neither is severity-tunable. A leftover `threshold` does not break
+  startup — it is ignored — but `catenary doctor` flags it as an unknown key,
+  so delete it.
+- **`desktop`** (default `true`) — fire OS-level desktop notifications for
+  error-severity events (the urgent interrupt). `CATENARY_NOTIFY=0` also
+  suppresses.
 
 See [Configuration → Notifications](configuration.md#notifications) and
 [Notifications](notifications.md).

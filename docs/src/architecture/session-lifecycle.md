@@ -20,8 +20,8 @@ daemon. Daemon startup, in order:
 2. **`LoggingServer` activation.** Constructed earlier in buffering mode
    (early `tracing` events are captured in a bounded 4096-event buffer);
    once the sinks exist, `activate()` drains the buffer and switches to
-   direct dispatch. The sinks are the notification queue and the JSONL
-   firehose.
+   direct dispatch. The sinks are the JSONL firehose, the desktop-notification
+   sink, and the daemon `state.json` snapshot.
 
 3. **Config loading.** `Config::load()` reads sources in order: embedded
    default language definitions, user config

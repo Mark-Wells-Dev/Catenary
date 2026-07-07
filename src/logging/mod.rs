@@ -5,7 +5,8 @@
 //!
 //! [`LoggingServer`] is a [`tracing_subscriber::Layer`] that subscribes to every
 //! tracing event in the process and dispatches structured events to registered
-//! sinks (notification queue, JSONL firehose). It supports
+//! sinks (the JSONL firehose, the desktop-notification sink, the daemon snapshot
+//! writer). It supports
 //! two-phase construction: the Layer is installed at binary entry in a buffering
 //! state, and [`LoggingServer::activate`] transitions to active once sinks are
 //! ready, draining any buffered events through the new sinks.
@@ -21,8 +22,6 @@
 //! Layer impl. Concrete sinks are added in subsequent tickets.
 
 pub mod jsonl_sink;
-pub mod notification_queue;
-pub mod notification_router;
 pub mod reaper;
 
 use std::collections::VecDeque;
@@ -30,8 +29,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use chrono::DateTime;
-use chrono::Utc;
 use tracing::Subscriber;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
@@ -39,17 +36,19 @@ use tracing_subscriber::registry::LookupSpan;
 /// Severity of a logging event.
 ///
 /// Mapped from [`tracing::Level`]. `TRACE` collapses into [`Severity::Debug`]
-/// because the trace DB and notification queue don't distinguish the two.
+/// because the firehose does not distinguish the two.
 /// Ordered so comparisons like `event.severity >= threshold` work directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Severity {
-    /// Verbose diagnostic — below default notification threshold.
+    /// Verbose diagnostic — firehose only.
     Debug,
-    /// Informational — below default notification threshold.
+    /// Informational — firehose only.
     Info,
-    /// Warning — reaches default notification threshold.
+    /// Warning — firehose plus the TUI health surface (a warn is a health
+    /// finding: stale hooks, version skew, 027 degradation).
     Warn,
-    /// Error — reaches default notification threshold.
+    /// Error — firehose, the TUI health surface, and the desktop-notification
+    /// sink (the urgent interrupt).
     Error,
 }
 
@@ -155,29 +154,10 @@ pub struct LogEvent<'a> {
     /// Session ID from the tracing span hierarchy.
     ///
     /// Extracted from the nearest ancestor span with a `session_id` field.
-    /// Used by [`notification_router::NotificationRouter`] to route
-    /// notifications to per-session queues.
+    /// Carried into the firehose for `catenary query --session <id>` scoping.
     pub session_id: Option<String>,
     /// All non-reserved structured fields.
     pub fields: serde_json::Map<String, serde_json::Value>,
-}
-
-impl LogEvent<'_> {
-    /// Whether this event was forwarded verbatim from an LSP server's
-    /// `window/logMessage` or `window/showMessage` notification.
-    ///
-    /// Server-forwarded window messages are tagged `source = "lsp.logging"`
-    /// (see [`Source::LspLogging`](crate::source::Source::LspLogging)) at the
-    /// forwarding site. They are firehose-only: the notification queue is
-    /// reserved for Catenary's own user-actionable events, so the notification
-    /// sinks exclude these regardless of mapped severity — a server's
-    /// `showMessage` type 1 maps to error but is still just that server's own
-    /// chatter about itself. They remain fully queryable in the JSONL firehose
-    /// and visible on the TUI. See `CatenaryInternal` misc 125.
-    #[must_use]
-    pub fn is_server_forwarded(&self) -> bool {
-        self.source.as_deref() == Some(crate::source::Source::LspLogging.as_str())
-    }
 }
 
 /// Owned counterpart of [`LogEvent`] for buffered replay.
@@ -231,85 +211,6 @@ impl OwnedEvent {
 pub trait Sink: Send + Sync {
     /// Handle one logging event.
     fn handle(&self, event: &LogEvent<'_>);
-}
-
-/// Queued user-facing notification.
-///
-/// Produced by the notification queue sink (ticket 01) and drained at
-/// stationary hook points (ticket 06) into the host CLI's `systemMessage`.
-#[derive(Debug, Clone)]
-pub struct Notification {
-    /// Severity level.
-    pub severity: Severity,
-    /// Human-readable message body (without the `[severity]` prefix).
-    pub message: String,
-    /// When the notification was recorded.
-    pub timestamp: DateTime<Utc>,
-}
-
-impl Notification {
-    /// Format the notification as `[severity] message`.
-    #[must_use]
-    pub fn format(&self) -> String {
-        format!("[{}] {}", self.severity.tag(), self.message)
-    }
-}
-
-/// Dedup key for the notification queue.
-///
-/// Two notifications with equal keys collapse into a single queue entry.
-/// Combines identity-relevant structured fields with a normalized form of
-/// the message body that strips volatile numeric suffixes.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct NotificationKey {
-    /// `source` field.
-    pub source: Option<String>,
-    /// `server` field.
-    pub server: Option<String>,
-    /// `language` field.
-    pub language: Option<String>,
-    /// Lowercase, digits-stripped, whitespace-collapsed message body.
-    pub stem: String,
-}
-
-impl NotificationKey {
-    /// Build a dedup key from an event.
-    #[must_use]
-    pub fn from_event(event: &LogEvent<'_>) -> Self {
-        Self {
-            source: event.source.clone(),
-            server: event.server.clone(),
-            language: event.language.clone(),
-            stem: normalize_stem(&event.message),
-        }
-    }
-}
-
-/// Normalize a message for dedup: lowercase, strip ASCII digits, collapse
-/// consecutive whitespace into single spaces, and trim.
-fn normalize_stem(message: &str) -> String {
-    let mut out = String::with_capacity(message.len());
-    let mut prev_space = true;
-    for c in message.chars() {
-        if c.is_ascii_digit() {
-            continue;
-        }
-        if c.is_whitespace() {
-            if !prev_space {
-                out.push(' ');
-                prev_space = true;
-            }
-        } else {
-            for lc in c.to_lowercase() {
-                out.push(lc);
-            }
-            prev_space = false;
-        }
-    }
-    if out.ends_with(' ') {
-        out.pop();
-    }
-    out
 }
 
 /// Default buffer capacity for bootstrap events before activation.
@@ -998,11 +899,8 @@ pub mod test_support {
 mod tests {
     use super::LogEvent;
     use super::LoggingServer;
-    use super::Notification;
-    use super::NotificationKey;
     use super::Severity;
     use super::Sink;
-    use super::normalize_stem;
     use std::sync::Arc;
     use std::sync::Mutex;
     use tracing_subscriber::layer::SubscriberExt;
@@ -1057,25 +955,6 @@ mod tests {
         }
     }
 
-    fn make_event(message: &str, source: Option<&str>, server: Option<&str>) -> LogEvent<'static> {
-        LogEvent {
-            severity: Severity::Warn,
-            target: "test",
-            message: message.to_string(),
-            kind: None,
-            method: None,
-            server: server.map(str::to_string),
-            client: None,
-            parent_id: None,
-            source: source.map(str::to_string),
-            language: None,
-            payload: None,
-            scope_root: None,
-            session_id: None,
-            fields: serde_json::Map::new(),
-        }
-    }
-
     fn with_subscriber<F: FnOnce()>(server: LoggingServer, f: F) {
         let subscriber = tracing_subscriber::registry().with(server);
         tracing::subscriber::with_default(subscriber, f);
@@ -1103,55 +982,6 @@ mod tests {
         assert_eq!(Severity::Info.tag(), "info");
         assert_eq!(Severity::Warn.tag(), "warn");
         assert_eq!(Severity::Error.tag(), "err");
-    }
-
-    #[test]
-    fn notification_format() {
-        let n = Notification {
-            severity: Severity::Warn,
-            message: "rust-analyzer offline".into(),
-            timestamp: chrono::Utc::now(),
-        };
-        assert_eq!(n.format(), "[warn] rust-analyzer offline");
-    }
-
-    #[test]
-    fn normalize_stem_strips_digits_and_collapses_whitespace() {
-        assert_eq!(
-            normalize_stem("Fetch Failed 42 times"),
-            "fetch failed times"
-        );
-        assert_eq!(normalize_stem("  HI    there  "), "hi there");
-        assert_eq!(normalize_stem("123"), "");
-        assert_eq!(normalize_stem(""), "");
-    }
-
-    #[test]
-    fn notification_key_dedups_numeric_variance() {
-        let e1 = make_event(
-            "rust-analyzer crashed 3 times",
-            Some("lsp.lifecycle"),
-            Some("rust-analyzer"),
-        );
-        let e2 = make_event(
-            "rust-analyzer crashed 5 times",
-            Some("lsp.lifecycle"),
-            Some("rust-analyzer"),
-        );
-        assert_eq!(
-            NotificationKey::from_event(&e1),
-            NotificationKey::from_event(&e2)
-        );
-    }
-
-    #[test]
-    fn notification_key_different_server_not_deduped() {
-        let e1 = make_event("server crashed", None, Some("rust-analyzer"));
-        let e2 = make_event("server crashed", None, Some("pylsp"));
-        assert_ne!(
-            NotificationKey::from_event(&e1),
-            NotificationKey::from_event(&e2)
-        );
     }
 
     #[test]
@@ -1252,19 +1082,14 @@ mod tests {
     }
 
     #[test]
-    fn server_forwarded_reaches_firehose_not_queue() {
-        use super::notification_queue::NotificationQueueSink;
-
+    fn firehose_receives_server_forwarded_and_catenary_events() {
+        // The notification queue retired (tui-rework 04); the firehose is the
+        // single sink that sees every event — server chatter and Catenary's own.
         let server = LoggingServer::new();
-        // Firehose stand-in: an unfiltered sink that records every event.
         let firehose = Arc::new(RecorderSink::default());
-        // The user-notification queue at its default `warn` threshold.
-        let queue = NotificationQueueSink::new(Severity::Warn);
 
-        let firehose_sink: Arc<dyn Sink> = firehose.clone();
-        let queue_sink: Arc<dyn Sink> = queue.clone();
         with_subscriber(server.clone(), || {
-            server.activate(vec![firehose_sink, queue_sink]);
+            server.activate(vec![firehose.clone()]);
 
             // A server's `window/showMessage` type 1 (Error) — forwarded
             // verbatim and tagged `lsp.logging` at the forwarding site.
@@ -1287,13 +1112,6 @@ mod tests {
         // The firehose receives both events, server chatter included.
         let recorded = firehose.snapshot();
         assert_eq!(recorded.len(), 2, "firehose must see every event");
-
-        // The queue holds only the Catenary-origin warning — the type-1
-        // showMessage was excluded by origin regardless of its error severity.
-        let drained = queue.drain();
-        assert_eq!(drained.len(), 1, "queue must hold only Catenary events");
-        assert_eq!(drained[0].message, "rust-analyzer offline");
-        assert_eq!(drained[0].severity, Severity::Warn);
     }
 
     #[test]

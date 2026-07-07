@@ -2873,13 +2873,9 @@ async fn handle_hook_connection(
 /// Looks up or creates a per-session [`Session`] + [`HookRouter`] pair.
 ///
 /// Each `session_id` gets its own `Session` (via
-/// [`Session::new_for_daemon`]) with independent editing state and
-/// notification queue. The `HookRouter` wraps the per-session `Session`
-/// with its own turn counter and debounce state.
-///
-/// Registers the session with the shared [`crate::logging::notification_router::NotificationRouter`]
-/// so `warn!()` / `error!()` events carrying this `session_id` in
-/// their span context route to this session's notification queue.
+/// [`Session::new_for_daemon`]) with independent editing state, sharing the
+/// primary's parent-context queue. The `HookRouter` wraps the per-session
+/// `Session` with its own turn counter and debounce state.
 ///
 /// Populates the session's board metadata on first creation; the daemon
 /// snapshot (`state.json`) surfaces it to the TUI dashboard.
@@ -2910,10 +2906,6 @@ fn get_or_create_router(
                 session_id_arc,
                 Some(ctx.editing_guardrail.clone()),
             ));
-
-            // Register session with the notification router so
-            // events carrying this session_id route to its queue.
-            session.notification_router.register_session(session_id);
 
             // Board metadata from this session's own hook payload (ticket 05):
             // the `format` field is the host label (client_name), the connect
@@ -3355,6 +3347,7 @@ fn load_meta_from_sidecar(worktree: &Path) -> Option<crate::worktree_create::Wor
 #[cfg(unix)]
 fn dispose_worktree_in_background(
     registry: &WorktreeRegistry,
+    parent_context: &crate::bridge::ParentContextQueue,
     session_id: &str,
     agent_id: &str,
     worktree: &Path,
@@ -3371,21 +3364,27 @@ fn dispose_worktree_in_background(
         crate::worktree_dispose::Disposition::Disposed
         | crate::worktree_dispose::Disposition::Remnant => registry.forget(worktree),
         crate::worktree_dispose::Disposition::KeptDirty { .. } if !host_initiated => {
-            surface_dirty_kept(session_id, agent_id, worktree);
+            surface_dirty_kept(parent_context, session_id, agent_id, worktree);
         }
         _ => {}
     }
 }
 
-/// Surface a dirty worktree kept at `SubagentStop` to the *parent* (misc 151, D-1).
+/// Surface a dirty worktree kept at `SubagentStop` to the *parent agent* (misc
+/// 151, D-1).
 ///
-/// Two legs from one queue event. The user leg is the notification queue's
-/// `systemMessage` — routed to the parent session by the `session_id` field (the
-/// deliberate user-relevant lifecycle exception, so `warn!`). The agent leg
-/// (`additionalContext` on the parent's next hook response) is stubbed pending
-/// the hooks-doc delivery-point wiring ([`queue_parent_additional_context`]).
+/// The retired notification queue's user `systemMessage` leg is gone (tui-rework
+/// 04): the notice's actionable audience is the parent agent, delivered as
+/// `additionalContext` ([`queue_parent_additional_context`]). The `warn!` stays
+/// as the firehose/log record of the event (queryable via `catenary query`), no
+/// longer a user notification.
 #[cfg(unix)]
-fn surface_dirty_kept(session_id: &str, agent_id: &str, worktree: &Path) {
+fn surface_dirty_kept(
+    parent_context: &crate::bridge::ParentContextQueue,
+    session_id: &str,
+    agent_id: &str,
+    worktree: &Path,
+) {
     let message = format!(
         "subagent `{agent_id}` left a dirty worktree at `{}` (kept; land its work \
          or `catenary worktree rm` it)",
@@ -3396,29 +3395,26 @@ fn surface_dirty_kept(session_id: &str, agent_id: &str, worktree: &Path) {
         session_id = %session_id,
         "{message}",
     );
-    queue_parent_additional_context(session_id, agent_id, worktree);
+    queue_parent_additional_context(parent_context, session_id, message);
 }
 
-/// STUB (misc 151, D-1 agent leg): deliver the dirty-kept notice to the *parent
-/// agent* as `additionalContext` on its next hook response.
+/// Deliver the dirty-kept notice to the *parent agent* as `additionalContext`
+/// on its next eligible hook response (misc 151, D-1 — the cashed-in stub).
 ///
-/// Verified against the Claude Code hooks docs: the `SubagentStop` response is
-/// delivered to the *stopping subagent*, not the parent, so the agent leg must
-/// ride a later *parent* hook response. `additionalContext` is a documented
-/// output field of the parent's `PreToolUse`/`UserPromptSubmit` responses, so the
-/// delivery point exists — but wiring it needs a per-session additionalContext
-/// queue the hook-response path drains, which is deferred per the misc-151
-/// priority order. The user leg (systemMessage) is fully wired; this records the
-/// intent so the agent leg is a named, findable stub rather than a silent gap.
+/// The `SubagentStop` response goes to the *stopping subagent*, not the parent,
+/// so the notice is queued against the parent's `session_id` in the shared
+/// [`ParentContextQueue`](crate::bridge::ParentContextQueue). The parent's own
+/// hook dispatch drains it on its next allowed `PreToolUse` / `Stop` (see
+/// [`HookRouter::drain_parent_context`](crate::bridge::HookRouter)), where the
+/// CLI emits it as `hookSpecificOutput.additionalContext`. Session-scoped,
+/// dropped on session end.
 #[cfg(unix)]
-fn queue_parent_additional_context(session_id: &str, agent_id: &str, worktree: &Path) {
-    debug!(
-        source = Source::DaemonDispatch.as_str(),
-        session_id = %session_id,
-        agent_id = agent_id,
-        worktree = %worktree.display(),
-        "dirty-kept agent-context leg stubbed (additionalContext delivery deferred, misc 151)",
-    );
+fn queue_parent_additional_context(
+    parent_context: &crate::bridge::ParentContextQueue,
+    session_id: &str,
+    message: String,
+) {
+    parent_context.queue(session_id, message);
 }
 
 /// The `id`s of background subagents reported **running** in a stop payload's
@@ -3841,7 +3837,7 @@ async fn handle_hook_dispatch(
     //
     // Fires when the host CLI sends a SessionEnd hook (exit, /clear,
     // resume, logout). Cleans up session-scoped state: editing
-    // guardrail, notification router, session registry, and roots.
+    // guardrail, parent-context queue, session registry, and roots.
     //
     // Short-circuits before get_or_create_router to avoid creating
     // a new session just to immediately clean it up.
@@ -3852,9 +3848,9 @@ async fn handle_hook_dispatch(
         // disconnect already ran).
         ctx.editing_guardrail.release_all(&session_id);
 
-        // Remove session from notification router (idempotent if
-        // MCP disconnect already ran).
-        ctx.primary.notification_router.remove_session(&session_id);
+        // Drop any undelivered parent-agent context for this session
+        // (misc 151 — session-scoped, dropped on session end).
+        ctx.primary.parent_context.remove_session(&session_id);
 
         // Remove the session from the registry.
         ctx.sessions
@@ -4180,10 +4176,11 @@ async fn handle_hook_dispatch(
             // The guard is unchanged — never a path outside our scheme or without
             // a sidecar. (Dormant for git, whose worktrees the host removes itself.)
             let registry = ctx.worktree_registry.clone();
+            let parent_context = ctx.primary.parent_context.clone();
             let sid = session_id.clone();
             let wt = canonical.clone();
             tokio::task::spawn_blocking(move || {
-                dispose_worktree_in_background(&registry, &sid, "", &wt, true);
+                dispose_worktree_in_background(&registry, &parent_context, &sid, "", &wt, true);
             });
         }
 
@@ -5132,11 +5129,11 @@ async fn handle_hook_dispatch(
     // payload's `background_tasks`, and not yet nagged (once per worktree). A
     // doorbell, not a wall — the `stop_hook_active` retry passes. Fires only on a
     // clean turn: not already blocking on the editing gate, and no pending
-    // notifications to drain first (delivering those keeps `result` an allow this
-    // turn; the nag takes the next clean stop). Scoped to the **top-level Stop**
-    // (`hook_event_name == "Stop"`) so a leaf subagent's SubagentStop is never
-    // held for a sibling's lingering worktree; the mid-tier-parent SubagentStop
-    // case is a deferred refinement.
+    // parent-agent context to deliver first (delivering that keeps `result` an
+    // allow this turn; the nag takes the next clean stop). Scoped to the
+    // **top-level Stop** (`hook_event_name == "Stop"`) so a leaf subagent's
+    // SubagentStop is never held for a sibling's lingering worktree; the
+    // mid-tier-parent SubagentStop case is a deferred refinement.
     if method == "post-agent/require-release"
         && raw
             .get("host_payload")
@@ -5148,7 +5145,7 @@ async fn handle_hook_dispatch(
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
         && result.result.is_none()
-        && result.system_message.is_none()
+        && result.additional_context.is_none()
         && let Some(nag) = lingering_worktree_nag(&ctx, &session_id, &raw)
     {
         result.result = Some(crate::hook::HookResult::Block(nag));
@@ -5212,11 +5209,12 @@ async fn handle_hook_dispatch(
             // whether or not the root was still mounted (an idle-reaped worktree
             // still disposes).
             let registry = ctx.worktree_registry.clone();
+            let parent_context = ctx.primary.parent_context.clone();
             let sid = session_id.clone();
             let aid = agent_id.to_string();
             let wt = worktree.clone();
             tokio::task::spawn_blocking(move || {
-                dispose_worktree_in_background(&registry, &sid, &aid, &wt, false);
+                dispose_worktree_in_background(&registry, &parent_context, &sid, &aid, &wt, false);
             });
         }
     }
@@ -5249,10 +5247,10 @@ async fn handle_hook_dispatch(
 
     let envelope = HookResponseEnvelope {
         result: result.result,
-        system_message: result.system_message,
+        additional_context: result.additional_context,
     };
 
-    let response = if envelope.result.is_some() || envelope.system_message.is_some() {
+    let response = if envelope.result.is_some() || envelope.additional_context.is_some() {
         serde_json::to_string(&envelope)?
     } else {
         String::new()
@@ -6604,18 +6602,14 @@ mod tests {
         let logging = LoggingServer::new();
         let runtime = tokio::runtime::Handle::current();
         let instance_id: Arc<str> = "daemon".into();
-        let notification_router = Arc::new(
-            crate::logging::notification_router::NotificationRouter::new(
-                crate::logging::Severity::Warn,
-            ),
-        );
+        let parent_context = crate::bridge::ParentContextQueue::new();
         let session = Arc::new(crate::bridge::session::Session::new(
             crate::config::Config::default_with_classification(),
             roots,
             logging.clone(),
             instance_id,
             runtime,
-            notification_router,
+            parent_context,
             None,
         ));
 
@@ -6655,18 +6649,14 @@ mod tests {
         use crate::state_snapshot::{SessionBoard, SessionStatus};
 
         let instance_id: Arc<str> = "sess-1".into();
-        let notification_router = Arc::new(
-            crate::logging::notification_router::NotificationRouter::new(
-                crate::logging::Severity::Warn,
-            ),
-        );
+        let parent_context = crate::bridge::ParentContextQueue::new();
         let session = Arc::new(crate::bridge::session::Session::new(
             crate::config::Config::default(),
             vec![],
             LoggingServer::new(),
             instance_id.clone(),
             tokio::runtime::Handle::current(),
-            notification_router,
+            parent_context,
             None,
         ));
         let router = Arc::new(HookRouter::new(

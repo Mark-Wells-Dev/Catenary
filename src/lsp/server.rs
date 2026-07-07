@@ -549,11 +549,11 @@ impl LspServer {
 
     /// Sets the lifecycle state and wakes waiters.
     ///
-    /// Emits a `debug!()` event on every transition so the DB sink can
-    /// update the `language_servers` table. On first transition to a
-    /// terminal state (`Dead` or `Failed`), additionally emits a
-    /// `warn!()` notification that flows through `LoggingServer` →
-    /// `NotificationQueueSink` → `systemMessage`.
+    /// Emits a `debug!()` event on every transition so the firehose and the
+    /// daemon snapshot track server state. On first transition to a terminal
+    /// state (`Dead` or `Failed`), additionally emits a `warn!()` — surfaced as
+    /// a health finding on the TUI and recorded in the firehose (the
+    /// user-notification queue retired in tui-rework 04).
     pub(crate) fn set_lifecycle(&self, state: ServerLifecycle) {
         let is_terminal = state.is_terminal();
         // Keep a copy for persistence; `state` itself moves into the lock.

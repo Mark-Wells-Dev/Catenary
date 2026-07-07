@@ -2,45 +2,58 @@
 
 Catenary uses the `tracing` crate for all logging and telemetry.
 `LoggingServer` subscribes to every `tracing` event and dispatches to
-two sinks: a message DB (protocol messages and internal traces, with
-TUI broadcast) and a user-notification queue.
+its sinks: the per-root-sharded **JSONL firehose** (`catenary query`,
+everything), the **desktop-notification sink** (error severity, the urgent
+interrupt), and — in the daemon — the **state.json snapshot writer** (the
+TUI health surface). The store-and-forward `systemMessage` notification queue
+retired in the TUI rework: warns no longer interrupt a transcript, they
+persist as health findings on the dashboard.
 
 ## Severity guidelines
 
-Events at `warn` and `error` reach the user-notification queue by
-default (configurable via `[notifications] threshold`). Choose severity
-by asking:
+Severity chooses the delivery channel:
 
-| User cares? | Actionable? | Frequent? | Severity |
+- **`error!()`** — reaches the desktop-notification sink (the OS-level urgent
+  interrupt, deduped per daemon lifetime, suppressible via
+  `[notifications] desktop = false` or `CATENARY_NOTIFY=0`) **and** the TUI
+  health surface **and** the firehose.
+- **`warn!()`** — reaches the TUI health surface (a warn *is* a health finding
+  — stale hooks, version skew, 027 degradation) **and** the firehose. It no
+  longer interrupts.
+- **`info!()` / `debug!()`** — the firehose only.
+
+Choose severity by asking:
+
+| User cares? | Actionable? | Interrupt-worthy? | Severity |
 |---|---|---|---|
 | No | — | — | `debug!()` |
 | Yes | No | — | `info!()` |
-| Yes | Yes | Very | `warn!()` / `error!()` + verify dedup fields |
-| Yes | Yes | Rare | `warn!()` / `error!()` |
+| Yes | Yes | Yes (systemic failure) | `error!()` |
+| Yes | Yes | No (recoverable / a health finding) | `warn!()` |
 
 Use `error!()` only for conditions that indicate a systemic failure
-(e.g., root resolution failed, critical I/O error). Use `warn!()` for
+(e.g., root resolution failed, critical I/O error) — an error fires a desktop
+notification, so it must earn the interrupt. Use `warn!()` for
 degradation that the user should know about but that Catenary can
-recover from (e.g., server died, roots/list failed).
+recover from (e.g., server died, roots/list failed); it surfaces durably on
+the dashboard rather than interrupting.
 
 ### Server-forwarded events are firehose-only
 
 Events forwarded verbatim from an LSP server's `window/logMessage` or
-`window/showMessage` (tagged `source = lsp.logging` at the forwarding
-site) **never** reach the notification queue, regardless of their mapped
-severity. A server's `showMessage` type 1 maps to `error`, but it is
-still just that server's own chatter about itself — and the maintainer
-ruled (CatenaryInternal misc 125) that the notification queue is reserved
-for Catenary's **own** user-actionable events. Server chatter stays fully
-queryable in the JSONL firehose and visible on the TUI; a genuinely
-broken server already surfaces where it matters (the `unavailable:`
-banner on the diagnostics receipt). The `[notifications] threshold` gate
-applies only to Catenary's own events.
+`window/showMessage` are tagged `source = lsp.logging` at the forwarding
+site. A server's `showMessage` type 1 maps to `error`, but it is still just
+that server's own chatter about itself — not Catenary's own user-actionable
+event — so the maintainer ruled (CatenaryInternal misc 125) it is
+firehose-only and belongs on the TUI's secondary Activity/Alerts surface, never
+the desktop interrupt. It stays fully queryable in the JSONL firehose; a
+genuinely broken server surfaces where it matters (a routed-but-broken server
+is a health finding).
 
 ## Reserved structured fields
 
 ```
-kind       — "lsp" | "mcp" | "hook" — routes to protocol DB sink
+kind       — "lsp" | "mcp" | "hook" — marks a protocol event in the firehose
 method     — Protocol method name (LSP/MCP method)
 server     — LSP server name ("rust-analyzer", "pylsp", ...)
 client     — Client identifier ("claude-code", "antigravity")
@@ -51,9 +64,10 @@ language   — Language id ("rust", "python", ...)
 payload    — Raw protocol JSON string (for kind = lsp|mcp|hook)
 ```
 
-Notification dedup key: `(source, server, language, message_stem)`.
-Events at `warn`/`error` level should include these fields where
-applicable so notifications with the same identity collapse.
+`warn!()`/`error!()` events should carry `source`, `server`, and `language`
+where applicable: they key the firehose query surface (`catenary query`) and
+the health finding an event maps to, so an event with a stable identity groups
+cleanly instead of scrolling by as noise.
 
 ## Source taxonomy
 
@@ -96,7 +110,7 @@ convenience constants are derived from it for use in `tracing` macros.
 | `logging.bootstrap` | Logging infrastructure startup sequencing | `LoggingBootstrap` |
 | `lsp.dispatch` | LSP message routing, method dispatch, capability checks | `LspDispatch` |
 | `lsp.lifecycle` | Server spawn, init, crash, recovery, shutdown | `LspLifecycle` |
-| `lsp.logging` | Server `window/logMessage` / `window/showMessage` telemetry (firehose-only, never promoted to the notification queue) | `LspLogging` |
+| `lsp.logging` | Server `window/logMessage` / `window/showMessage` telemetry (firehose-only, never a desktop interrupt) | `LspLogging` |
 | `lsp.stderr` | Raw server process stderr output | `LspStderr` |
 | `mcp.dispatch` | MCP message dispatch and roots handling | `McpDispatch` |
 
@@ -108,6 +122,5 @@ enum in `src/source.rs`.
 
 Protocol boundary components (`McpServer`, `Connection`/`LspServer`,
 `HookServer`) emit structured `tracing::info!()` events with `kind`,
-`method`, `request_id`, `parent_id`, and `payload` fields. These are
-routed to the message DB sink by the `kind` field and do not reach
-the notification queue.
+`method`, `request_id`, `parent_id`, and `payload` fields. At `info`
+severity they land in the firehose only — never a desktop interrupt.

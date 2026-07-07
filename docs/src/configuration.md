@@ -828,19 +828,21 @@ free, every session.
 
 ## Notifications
 
-The `[notifications]` table controls which tracing events are promoted
-to user-facing notifications via the host CLI's `systemMessage`. See
-[Notifications](notifications.md) for details on delivery timing, dedup,
-and overflow.
+The `[notifications]` table has a single knob: `desktop`, which controls
+whether **error**-severity events fire an OS-level desktop notification — the
+urgent interrupt. Warns persist on the TUI health dashboard and everything is
+queryable via `catenary query`, so there is no severity `threshold` to set (the
+former `threshold` key retired with the notification queue). See
+[Notifications](notifications.md) for the full channel model.
 
 ```toml
 [notifications]
-threshold = "warn"    # default
+desktop = true    # default
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `threshold` | `"warn"` | Minimum severity for notification delivery. One of `"debug"`, `"info"`, `"warn"`, `"error"`. |
+| `desktop` | `true` | Fire OS-level desktop notifications for error-severity events. Set `false` to suppress; `CATENARY_NOTIFY=0` overrides to suppressed. |
 
 ## Diagnostics
 

@@ -145,14 +145,13 @@ const TEMPLATE: &str = r#"#:schema https://twowells.github.io/catenary/schemas/c
 
 # ── Notifications ────────────────────────────────────────────────
 #
-# Controls which events are promoted to user-facing notifications
-# via systemMessage. Options: "debug", "info", "warn", "error".
-#
-# desktop: OS-level desktop notifications for error events.
-# Set to false to suppress. CATENARY_NOTIFY=0 env var also suppresses.
+# desktop: OS-level desktop notifications for error-severity events —
+# the urgent interrupt. Warns persist on the TUI health dashboard and
+# everything is queryable via `catenary query`, so there is no severity
+# threshold to set.
+# Set desktop to false to suppress. CATENARY_NOTIFY=0 env var also suppresses.
 
 # [notifications]
-# threshold = "warn"
 # desktop = true
 
 # ── Server environment ────────────────────────────────────────────

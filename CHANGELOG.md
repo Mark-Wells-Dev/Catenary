@@ -318,6 +318,21 @@ upgrading.
 
 ### Changed
 
+- **The notification queue retires: three channels, each doing what it's
+  for.** The store-and-forward `systemMessage` queue — which could deliver
+  a warning minutes after its problem was already fixed — is gone. In its
+  place: **errors** fire an OS desktop notification (the urgent interrupt,
+  unchanged) and surface as health findings; **warnings** persist as TUI
+  health findings until fixed, with no interrupt; **everything** lands in
+  the firehose for `catenary query`. The one queue-fed message whose real
+  audience was the *agent* — "your subagent left a dirty worktree" — now
+  reaches the spawning parent directly via hook-response
+  `additionalContext` on its next tool use or stop (session-scoped,
+  top-level-parent only), instead of telling the user about work only the
+  agent can land. The `[notification] threshold` key retires with the
+  queue (a leftover key is flagged by the unknown-key finding, not a
+  startup failure), and the tracing conventions are re-trued: an
+  `error!()` must earn its interrupt.
 - **The TUI is the health dashboard: a master-detail grid replaces the
   four-board monitor.** Bare `catenary` now opens a 2×2 grid built to
   answer *"is it working?"*: a root-grouped server tree (one collapsed

@@ -1,89 +1,71 @@
 # Notifications
 
-Catenary routes user-facing notifications through the host CLI's
-`systemMessage` field. This keeps operational information (server
-crashes, config errors, degradation notices) visible to **you** without
-polluting the agent's tool results.
+Catenary tells you when something needs attention through three channels,
+split by urgency. The store-and-forward `systemMessage` notification queue —
+which accumulated warns and drained them into a hook response one turn later —
+retired in the TUI rework: it structurally delivered stale truths (a warn could
+arrive minutes after the problem was already resolved), and a state-based
+health surface cannot (a fixed problem simply isn't there).
 
-## How it works
+## The channels
 
-Every `tracing::warn!()` and `tracing::error!()` call in Catenary is a
-potential notification. `LoggingServer` — Catenary's central tracing
-subscriber — dispatches these events to a notification queue that
-accumulates entries between drain points.
+Every `tracing::warn!()` and `tracing::error!()` in Catenary carries an
+operational signal. `LoggingServer` — Catenary's central tracing subscriber —
+dispatches each event by severity:
+
+| Severity | Desktop notification | TUI health surface | Firehose |
+|----------|:---:|:---:|:---:|
+| `error!()` | ✓ (urgent interrupt) | ✓ (a finding) | ✓ |
+| `warn!()` | — | ✓ (a finding) | ✓ |
+| `info!()` / `debug!()` | — | — | ✓ |
+
+- **Desktop notifications** (`src/notify.rs`, `DesktopNotificationSink`) fire an
+  OS-level notification for **error**-severity events only — the urgent
+  interrupt, the daemon speaking for itself with no host conversation required.
+  Deduped per daemon lifetime. Suppress with `[notifications] desktop = false`
+  or the `CATENARY_NOTIFY=0` environment variable.
+- **The TUI health surface** carries everything user-actionable, warns
+  included: a warn *is* a health finding (stale hooks, version skew, coverage
+  degradation). Findings persist on the dashboard's problems pane until the
+  problem is fixed, rather than scrolling by in a transcript. `catenary doctor`
+  renders the same findings one-shot.
+- **The firehose** (`src/logging/jsonl_sink.rs`) records every event, queryable
+  after the fact with `catenary query`.
 
 Server-forwarded LSP window messages (`window/logMessage` and
-`window/showMessage`, tagged `source = lsp.logging`) are the one
-exception: they are **firehose-only** and never enqueue, regardless of
-severity. The queue is reserved for Catenary's own user-actionable
-events, so a language server's own chatter — including a `showMessage`
-type 1 that maps to `error` — stays queryable in the firehose and
-visible on the TUI instead of interrupting you. (See CatenaryInternal
-misc 125: such messages are typically transient, per-server hiccups, and
-a genuinely broken server already shows up on the diagnostics receipt's
-`unavailable:` banner.)
+`window/showMessage`, tagged `source = lsp.logging`) are firehose-only and never
+a desktop interrupt, regardless of severity — a language server's own chatter,
+including a `showMessage` type 1 that maps to `error`, is not Catenary's own
+user-actionable event. It surfaces on the TUI's secondary Activity/Alerts
+surface (see CatenaryInternal misc 125).
 
-Notifications are delivered at **stationary points** — moments when
-the host CLI naturally pauses to display system information:
+## The parent-agent context leg
 
-| Hook | Drains? | Why |
-|------|---------|-----|
-| `SessionStart` | Yes | Fresh session — show startup warnings and anything from the previous cycle |
-| `Stop` / `AfterAgent` (allow) | Yes | Agent is done — safe to surface accumulated notices |
-| `Stop` / `AfterAgent` (block) | No | Agent must fix something first — preserve queue for next allow |
-| `PreToolUse` | No | Mid-flight — don't interrupt |
+One notice keeps an agent-facing delivery: when a subagent stops leaving a
+dirty worktree, Catenary keeps the worktree (never auto-deleting unlanded work)
+and the actionable audience is the **parent agent** that spawned it. That
+notice rides Claude Code's `hookSpecificOutput.additionalContext` on the
+parent's next eligible hook response (`PreToolUse` or `Stop` when allowing),
+delivered from a per-session queue that is dropped on session end. It is not a
+user notification — the user leg retired with the queue (misc 151).
 
 ## Configuration
 
-The `[notifications]` section controls which events reach the queue:
+The `[notifications]` section has a single knob:
 
 ```toml
 [notifications]
-threshold = "warn"    # default
+desktop = true    # default — OS notifications for error-severity events
 ```
 
-| Value | Effect |
-|-------|--------|
-| `"debug"` | Everything (very verbose) |
-| `"info"` | Informational and above |
-| `"warn"` | Warnings and errors (default) |
-| `"error"` | Errors only |
+There is no severity `threshold`: it was the floor of the retired queue. Warns
+are not severity-tunable — they persist on the dashboard, always. A leftover
+`threshold` key does not break startup (it is ignored) but is flagged by the
+unknown-key health finding, so `catenary doctor` and your editor point it out.
 
-## Dedup
+## Doctor and the TUI: one model, two renderers
 
-Notifications are deduplicated within a session. Two events with the
-same identity key — `(source, server, language, message_stem)` — produce
-only one queue entry. The message stem is normalized: lowercased, digits
-stripped, whitespace collapsed. This means "server crashed 3 times" and
-"server crashed 5 times" collapse into a single notification.
-
-Dedup persists across drains. Once a notification has been shown, the
-same event won't appear again in the same session.
-
-## Overflow
-
-The queue holds up to 100 notifications. When full, the oldest entry is
-evicted and a sentinel is appended on drain:
-
-```
-[info] 3 notifications dropped
-```
-
-## Output format
-
-Notifications appear in the `systemMessage` field of hook responses.
-Two content surfaces are composed:
-
-- **Direct** — synchronous handler messages (e.g., config validation
-  warnings at session start).
-- **Background** — accumulated notifications from the queue.
-
-When both are present, they are separated by a visual header:
-
-```
-[err] config: removed `inherit` field — run `catenary doctor`
-
---- background ---
-[warn] rust-analyzer offline
-[warn] pylsp crashed during previous teardown
-```
+`catenary doctor` is the standalone one-shot renderer of the health model —
+scriptable, greppable, and **daemon-down capable** (it feeds the model with its
+own `initialize` probes); the TUI is its live twin, rendering the same findings
+continuously from the daemon's `state.json`.

@@ -1236,16 +1236,10 @@ fn run_daemon_main() -> Result<()> {
         let reap_policy = config.reap_policy();
         let retention_days = config.log_retention_days;
 
-        let threshold: catenary_mcp::logging::Severity = config
-            .notifications
-            .as_ref()
-            .map_or_else(catenary_mcp::config::SeverityConfig::default, |n| {
-                n.threshold
-            })
-            .into();
-        let notification_router = Arc::new(
-            catenary_mcp::logging::notification_router::NotificationRouter::new(threshold),
-        );
+        // Parent-agent additionalContext side channel (misc 151): the
+        // dirty-worktree "kept" notice queues here for delivery on the parent's
+        // next hook response. Shared by every per-session `Session`.
+        let parent_context = catenary_mcp::bridge::ParentContextQueue::new();
 
         // Daemon-owned live-state snapshot. Mirrors server lifecycle/progress
         // and the alert ring to runtime_dir()/catenary/state.json — the
@@ -1267,7 +1261,7 @@ fn run_daemon_main() -> Result<()> {
             logging.clone(),
             instance_id.clone(),
             rt.handle().clone(),
-            notification_router,
+            parent_context,
             Some(snapshot),
         ));
 

@@ -256,10 +256,10 @@ symbol in a file named `PKGBUILD`:
 ## Dispatch errors
 
 LSP-side errors during dispatch never reach the agent. All errors are
-routed through `warn!()` via tracing, which `LoggingServer` delivers
-to the user notification queue. The agent sees empty results or
-whatever partial results were available from other servers in the
-chain.
+routed through `warn!()` via tracing, which `LoggingServer` surfaces as a
+health finding on the TUI dashboard and records in the firehose. The agent
+sees empty results or whatever partial results were available from other
+servers in the chain.
 
 This separation is deliberate: the agent cannot act on "rust-analyzer
 returned error code -32602." The user can — they can check their
@@ -300,9 +300,10 @@ responsible for readiness via `wait_ready_for_path` or
 `wait_ready_all` before invoking.
 
 An empty result triggers a `warn!()` (unless the language has no
-configured servers). Deduplication is handled by
-`NotificationQueueSink` — the same "no server supports X" warning
-won't spam the user across repeated tool calls.
+configured servers) — surfaced as a health finding on the TUI dashboard and
+recorded in the firehose. The health surface is state-based, so the same "no
+server supports X" condition shows as one finding, not a stream, across
+repeated tool calls.
 
 A separate `diagnostic_servers` method wraps `get_servers` with the
 diagnostics capability check and the additional config-level

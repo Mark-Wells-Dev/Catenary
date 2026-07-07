@@ -14,8 +14,9 @@ observability stack.
 | Audience | Channel | What goes here |
 |---|---|---|
 | Agent | Tool result content | Data + caller-input errors the agent can fix |
-| User (real-time) | Host CLI `systemMessage` | Degradation notices, server status, anything user-actionable |
-| User (investigating) | Logs, TUI | Full audit trail |
+| User (urgent) | Desktop notification | Error-severity events — the interrupt |
+| User (dashboard) | TUI health surface | Warns + errors as durable findings |
+| User (investigating) | Firehose (`catenary query`) | Full audit trail |
 
 Why the separation matters: agent context is expensive (tokens), and
 Catenary's internal problems — server crashes, config errors, routing
@@ -25,9 +26,12 @@ channels exist for everything else.
 
 The agent sees only data it asked for (hover results, diagnostics,
 grep matches) and errors it can fix (file not found, ambiguous path).
-The user sees operational status in real time through `systemMessage`.
-The full protocol trace is always available through the TUI and
-database for debugging.
+The user sees the urgent interrupt (errors) as a desktop notification, and
+everything user-actionable — warns included — as a durable finding on the TUI
+health dashboard. The full protocol trace is always available through the
+firehose for debugging. The former store-and-forward `systemMessage`
+notification queue retired in the TUI rework (it delivered stale truths; a
+state-based health surface cannot).
 
 ## `LoggingServer` — the sole telemetry port
 
@@ -60,9 +64,11 @@ sinks like any other.
 
 Post-activation, the sinks receive every tracing event:
 
-- **Notification queue** — severity-filtered (default `warn`),
-  deduplicated. Accumulates user-facing notifications between drain
-  points. See [notification lifecycle](#notification-lifecycle) below.
+- **Desktop notification sink** — fires an OS-level notification for
+  **error**-severity events only, the urgent interrupt. Deduped per daemon
+  lifetime; suppressed by `[notifications] desktop = false` or
+  `CATENARY_NOTIFY=0`. See [notification channels](#notification-channels)
+  below.
 
 - **JSONL firehose** — appends every event as one JSON line to a
   sharded, append-only log under `cache_dir` (see
@@ -105,62 +111,45 @@ IDs are in-process monotonic values, not database ROWIDs. This avoids
 round-trip latency and lets correlation work even before the database
 write completes.
 
-## Notification lifecycle
+## Notification channels
 
-Notifications are user-facing messages delivered through the host CLI's
-`systemMessage` field. They exist because Catenary bugs and server
-problems should not consume agent context — but the user should still
-know about them.
+Catenary tells the user about operational problems without spending agent
+context. Severity picks the channel:
 
-### From tracing call to queue
+- **`error!()`** fires a **desktop notification** (the urgent interrupt), lands
+  as a **TUI health finding**, and is recorded in the firehose.
+- **`warn!()`** lands as a **TUI health finding** (no interrupt) and is
+  recorded in the firehose. A warn *is* a health finding — stale hooks, version
+  skew, coverage degradation.
+- **`info!()` / `debug!()`** go to the firehose only.
 
-1. Any `warn!()` or `error!()` call in the codebase becomes a potential
-   notification.
-2. `NotificationQueueSink` filters by severity threshold (configurable
-   via `[notifications] threshold`, default `warn`). Events below
-   threshold are silently dropped.
-3. The event's `NotificationKey` — `(source, server, language,
-   message_stem)` — is checked against the session-scoped `seen` set.
-   Duplicates are dropped. The message stem is normalized: lowercased,
-   digits stripped, whitespace collapsed. This means "server crashed 3
-   times" and "server crashed 5 times" collapse into a single entry.
-4. The notification is pushed onto a bounded queue (cap: 100). On
-   overflow, the oldest entry is evicted.
+The desktop sink dedups per daemon lifetime, so a repeated error fires once.
+Findings persist on the dashboard's problems pane until the problem is fixed —
+a state-based surface, not store-and-forward, so a resolved problem simply
+vanishes rather than delivering stale.
 
-### Drain at stationary points
+### The retired queue
 
-Notifications are not delivered immediately. They are drained at
-**stationary points** — moments when the agent is not mid-tool-call
-and the host CLI can display a message:
+Earlier builds accumulated warns in a per-session `systemMessage` queue and
+drained them into the next `SessionStart` / `Stop` hook response. That queue
+retired in the TUI rework: with no drain-time revalidation it structurally
+delivered expired truths (a warn arriving after the problem was already
+resolved), which the TUI's durable, state-based problems pane cannot. The
+`[notifications] threshold` key that set its floor retired with it.
 
-| Hook | Drains? | Why |
-|------|---------|-----|
-| `SessionStart` | Yes | Fresh session — show startup warnings |
-| `Stop` / `AfterAgent` (allow) | Yes | Agent is done — safe to surface notices |
-| `Stop` / `AfterAgent` (block) | No | Agent must fix something — preserve queue |
-| `PreToolUse` | No | Mid-flight — don't interrupt |
+### The parent-agent context leg
 
-Why drain at stationary points: host CLIs may not display
-`systemMessage` during tool execution. Delivering at stationary points
-ensures visibility.
+One hook-borne notice survives, and it is agent-facing, not user-facing: when a
+subagent stops leaving a dirty worktree, the notice rides Claude Code's
+`hookSpecificOutput.additionalContext` on the **parent** agent's next allowed
+`PreToolUse` / `Stop` response (a per-session queue in `parent_context.rs`,
+dropped on session end). The parent is the actionable audience — it can land
+the work or remove the worktree.
 
-### Output composition
-
-`SystemMessageBuilder` composes two content surfaces into the
-`systemMessage` string:
-
-- **Direct** — synchronous handler messages (e.g., config validation
-  warnings at session start). Rendered first.
-- **Background** — accumulated notifications from the queue drain.
-  Rendered after a visual header (`─── background ───`).
-
-When both are present, they are separated by a blank line and the
-header. When only one is present, the other is omitted. When neither
-has content, no `systemMessage` field is emitted.
-
-Sink panics (isolated by `catch_unwind` in the Layer) are surfaced as
-`[err] sink panic: <message>` in the background section, so the user
-sees them exactly once through the same channel.
+The `SystemMessageBuilder` survives too, trimmed to a thin `[severity] message`
+formatter for the one remaining direct `systemMessage`: the `SessionStart`
+config-validation error ("run `catenary doctor`"), a fresh synchronous check,
+not a queued drain.
 
 For full configuration details, see the
 [Notifications](../notifications.md) page.
@@ -457,24 +446,23 @@ For keybindings and usage, see the
 severity guidelines, reserved field names, and source taxonomy that
 all code must follow. Key rules:
 
-- `warn!()` and `error!()` reach the notification queue by default.
-  Only use these for user-relevant, actionable conditions. The one
-  exception is server-forwarded window messages (`source = lsp.logging`,
-  from `window/logMessage` / `window/showMessage`): those are
-  firehose-only and never enqueue, regardless of severity — the queue is
-  reserved for Catenary's own events (misc 125).
-- The `kind` field (`"lsp"`, `"mcp"`, `"hook"`) routes protocol events
-  to the message DB. Internal events (no `kind` field) also go to the
-  message DB with `type = "internal"`.
-- Notification dedup fields (`source`, `server`, `language`) should be
-  included on `warn!()` / `error!()` events so notifications with the
-  same identity collapse.
+- `error!()` fires a desktop notification (the urgent interrupt) and a TUI
+  health finding; `warn!()` fires a TUI health finding (no interrupt). Both
+  land in the firehose. Only use these for user-relevant, actionable
+  conditions. The one exception is server-forwarded window messages
+  (`source = lsp.logging`, from `window/logMessage` / `window/showMessage`):
+  those are firehose-only and never a desktop interrupt (misc 125).
+- The `kind` field (`"lsp"`, `"mcp"`, `"hook"`) marks protocol events in the
+  firehose. Internal events (no `kind` field) carry `type = "internal"`.
+- The `source`, `server`, and `language` fields should be included on
+  `warn!()` / `error!()` events so the firehose query surface and the health
+  finding key cleanly on identity.
 
 ## Related pages
 
 - [Session Lifecycle](session-lifecycle.md) — when `LoggingServer` is
   constructed and activated, when hooks bind to the IPC socket.
-- [Configuration Model](configuration.md) — `[notifications]` threshold
+- [Configuration Model](configuration.md) — `[notifications]`
   configuration.
 - [Document Lifecycle & File Watching](documents.md) — editing mode
   enforcement and the `catenary diagnostics` pipeline.
