@@ -77,6 +77,13 @@ bytes = "1.10"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5.54", features = ["derive"] }
 toml = "0.9.11"
+# `toml_edit` powers the guided-mutation writer (tui-rework 05): format-preserving
+# surgical edits to config files so a hand-formatted config keeps its comments and
+# layout outside the one key a fix-it changes. The `spec-1.1.0` generation
+# (0.25.x) shares every transitive crate with `toml` 0.9 (toml_datetime /
+# toml_parser / toml_writer / serde_spanned / winnow 0.7), so it adds no new
+# version to the graph. MIT OR Apache-2.0 — deny.toml-clean.
+toml_edit = "0.25"
 crossterm = "0.28"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_28"] }
 dirs = "6.0.0"

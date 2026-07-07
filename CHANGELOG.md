@@ -62,6 +62,21 @@ upgrading.
 
 ### Added
 
+- **Guided mutations: the dashboard's fix-its become executable.** On a
+  broken-server problem row or a cursored server, `a` opens a consent
+  overlay showing exactly what will be written — key, value, target file —
+  before anything happens; Enter applies, Esc declines, no write is ever
+  silent. v1 actions: set a server's binary path, enable/disable a server,
+  and apply the config-namespace migration renames. Writes are surgical
+  (`toml_edit` — a hand-formatted config with comments survives byte-
+  identical outside the edited key) and **layer-routed structurally**:
+  project-scoped keys may target a root's `.catenary.toml`, everything
+  else targets user `config.toml`, and enforcement keys can never yield a
+  project write — the TUI cannot author config the engine ignores.
+  Applied changes surface an honest `pending daemon restart` marker in
+  the problems pane until a restarted daemon's identity confirms the new
+  config is live; provenance re-reads the file just written, never
+  assumes.
 - **Language-server conformance: every shipped server definition is now a
   testable claim.** A conformance harness drives the real Catenary
   lifecycle — spawn through the shipped defaults with live

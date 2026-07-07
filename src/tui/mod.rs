@@ -15,6 +15,7 @@
 //! probes an LSP (structurally unwedgeable stays a feature — DESIGN). The bridge
 //! to `catenary query` is a yankable scope id (OSC 52).
 
+pub mod action;
 pub mod app;
 pub mod data;
 pub mod findings;
@@ -167,9 +168,16 @@ struct PanelRects {
 
 /// Handle a key event.
 fn handle_key(app: &mut App<'_>, code: KeyCode) {
+    // A guided-mutation consent overlay is modal: it captures every key until
+    // the user confirms or declines. Value edits (a binary path) take chars.
+    if app.pending_action.is_some() {
+        handle_action_key(app, code);
+        return;
+    }
     match code {
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('?') => app.toggle_keybinds(),
+        KeyCode::Char('a') => app.begin_action(),
         KeyCode::Tab => app.cycle_focus(),
         KeyCode::BackTab => app.cycle_focus_back(),
         KeyCode::Char('j') | KeyCode::Down => app.cursor_down(1),
@@ -191,6 +199,18 @@ fn handle_key(app: &mut App<'_>, code: KeyCode) {
                 osc52_copy(&text);
             }
         }
+        _ => {}
+    }
+}
+
+/// Handle a key while the guided-mutation consent overlay is open.
+fn handle_action_key(app: &mut App<'_>, code: KeyCode) {
+    match code {
+        KeyCode::Enter => app.confirm_action(),
+        KeyCode::Esc => app.cancel_action(),
+        KeyCode::Tab | KeyCode::BackTab => app.action_cycle_layer(),
+        KeyCode::Backspace => app.action_backspace(),
+        KeyCode::Char(c) => app.action_push_char(c),
         _ => {}
     }
 }
@@ -248,6 +268,10 @@ fn handle_mouse(
     row: u16,
     rects: &PanelRects,
 ) {
+    // The consent overlay is keyboard-only; ignore clicks behind it.
+    if app.pending_action.is_some() {
+        return;
+    }
     let pos = Rect {
         x: column,
         y: row,
@@ -580,6 +604,7 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
 
     if area.width < NARROW_THRESHOLD {
         render_narrow(app, grid, buf, theme, icons, &detail_lines, rects);
+        draw_action_overlay(app, area, buf, theme);
         return;
     }
 
@@ -589,7 +614,12 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
 
     let root_entries = tree_entries(&app.root_rows, tl.width, theme, icons);
     let session_entries = tree_entries(&app.session_rows, bl.width, theme, icons);
-    let problem_entries = render::problem_entries(&app.problem_rows, br.width as usize, theme);
+    let mut problem_entries = render::problem_entries(&app.problem_rows, br.width as usize, theme);
+    problem_entries.extend(render::pending_restart_entries(
+        &app.pending_restarts,
+        br.width as usize,
+        theme,
+    ));
 
     render_list(
         " Roots & Servers",
@@ -631,6 +661,62 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
     rects.detail = tr;
     rects.session = bl;
     rects.problems = br;
+
+    draw_action_overlay(app, area, buf, theme);
+}
+
+/// Draw the guided-mutation consent overlay centered over the grid, when open.
+fn draw_action_overlay(app: &App<'_>, area: Rect, buf: &mut Buffer, theme: &Theme) {
+    if let Some(state) = &app.pending_action {
+        let lines = render::action_overlay_lines(state, theme);
+        draw_overlay(&lines, area, buf, theme);
+    }
+}
+
+/// Draw a bordered, background-cleared box of `lines` centered in `area`.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "overlay dimensions are bounded by the terminal size"
+)]
+fn draw_overlay(lines: &[Line<'static>], area: Rect, buf: &mut Buffer, theme: &Theme) {
+    let content_w = lines
+        .iter()
+        .map(|l| format::spans_width(&l.spans))
+        .max()
+        .unwrap_or(0);
+    let max_inner = area.width.saturating_sub(4) as usize;
+    let inner_w = content_w.clamp(28, max_inner.max(1)) as u16;
+    let box_w = inner_w + 2;
+    let box_h = lines.len() as u16 + 2;
+    if box_w > area.width || box_h > area.height {
+        return;
+    }
+    let x = area.x + (area.width - box_w) / 2;
+    let y = area.y + (area.height - box_h) / 2;
+
+    // Clear the box interior so the panes behind it do not bleed through.
+    for yy in y..y + box_h {
+        for xx in x..x + box_w {
+            set(buf, xx, yy, " ", theme.text);
+        }
+    }
+    // Border.
+    for xx in x..x + box_w {
+        set(buf, xx, y, "─", theme.accent);
+        set(buf, xx, y + box_h - 1, "─", theme.accent);
+    }
+    for yy in y..y + box_h {
+        set(buf, x, yy, "│", theme.accent);
+        set(buf, x + box_w - 1, yy, "│", theme.accent);
+    }
+    set(buf, x, y, "┌", theme.accent);
+    set(buf, x + box_w - 1, y, "┐", theme.accent);
+    set(buf, x, y + box_h - 1, "└", theme.accent);
+    set(buf, x + box_w - 1, y + box_h - 1, "┘", theme.accent);
+
+    for (i, line) in lines.iter().enumerate() {
+        buf.set_line(x + 1, y + 1 + i as u16, line, inner_w);
+    }
 }
 
 /// Narrow degradation: stack the four panes full-width.
@@ -658,7 +744,12 @@ fn render_narrow(
 
     let root_entries = tree_entries(&app.root_rows, tl.width, theme, icons);
     let session_entries = tree_entries(&app.session_rows, bl.width, theme, icons);
-    let problem_entries = render::problem_entries(&app.problem_rows, br.width as usize, theme);
+    let mut problem_entries = render::problem_entries(&app.problem_rows, br.width as usize, theme);
+    problem_entries.extend(render::pending_restart_entries(
+        &app.pending_restarts,
+        br.width as usize,
+        theme,
+    ));
 
     render_list(
         " Roots & Servers",

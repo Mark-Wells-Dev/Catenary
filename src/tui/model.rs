@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::health::Severity;
+use crate::health::{FindingCode, Severity};
 use crate::state_snapshot::{ServerEntry, SessionEntry, Snapshot, Subagent};
 
 use super::findings::{OwnedFinding, Owner};
@@ -267,6 +267,9 @@ pub fn verdict(findings: &[OwnedFinding]) -> Verdict {
 /// it is a suggestion (the collapsed tail).
 #[derive(Debug, Clone)]
 pub struct ProblemRow {
+    /// The finding's stable class — drives which guided mutation (if any) the
+    /// action key offers for this row.
+    pub code: FindingCode,
     /// Severity tier.
     pub severity: Severity,
     /// One-line message.
@@ -310,6 +313,7 @@ pub fn build_problems(findings: &[OwnedFinding]) -> Vec<ProblemRow> {
 
 fn to_problem_row(f: &OwnedFinding, is_suggestion: bool) -> ProblemRow {
     ProblemRow {
+        code: f.finding.code,
         severity: f.finding.severity,
         message: f.finding.message.clone(),
         fix_it: f.finding.fix_it.clone(),

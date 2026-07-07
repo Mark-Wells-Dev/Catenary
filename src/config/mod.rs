@@ -6,6 +6,7 @@
 mod language;
 mod linter;
 pub(crate) mod merge;
+pub mod mutate;
 mod parse;
 pub mod schema;
 mod server;
@@ -29,6 +30,7 @@ pub use commands::{
 };
 pub use language::{DispatchMethod, LanguageConfig, ServerBinding};
 pub use linter::LinterConfig;
+pub use mutate::{BindingSpec, ConfigLayer, Mutation, section_is_project_scoped};
 pub use parse::{
     DEFAULT_LINTERS, DEFAULT_SERVERS, MIGRATION_GUIDANCE_POINTER, ProjectConfig, SERVER_DEF_KEYS,
     config_sources, default_server_names, load_project_config,

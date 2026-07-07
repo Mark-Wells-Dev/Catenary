@@ -14,9 +14,11 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::config::Config;
+use crate::config::{Config, Mutation};
+use crate::health::{FindingCode, servers::binary_exists};
 use crate::state_snapshot::Snapshot;
 
+use super::action::{ActionState, PendingRestart, binding_specs, find_migration_source};
 use super::data::DataSource;
 use super::findings::{self, OwnedFinding, Owner};
 use super::icons::IconSet;
@@ -112,6 +114,13 @@ pub struct App<'a> {
     /// Quit flag.
     pub quit: bool,
 
+    /// The open guided-mutation consent overlay, if any (tui-rework 05).
+    pub pending_action: Option<ActionState>,
+    /// Applied mutations awaiting a daemon restart to take effect. They stay
+    /// marked until the snapshot shows the daemon has come back under a new
+    /// identity.
+    pub pending_restarts: Vec<PendingRestart>,
+
     /// Cached filesystem-detected languages, keyed by the root-path set.
     lang_cache: HashSet<String>,
     lang_cache_key: Vec<String>,
@@ -178,6 +187,8 @@ impl<'a> App<'a> {
             problems_only: false,
             keybinds_expanded: false,
             quit: false,
+            pending_action: None,
+            pending_restarts: Vec::new(),
             lang_cache: HashSet::new(),
             lang_cache_key: Vec::new(),
             last_generated_at: String::new(),
@@ -221,6 +232,10 @@ impl<'a> App<'a> {
         if let Ok(snap) = self.data.load() {
             self.snapshot = snap;
         }
+        // Clear any pending-restart marker whose daemon has come back on the new
+        // config (a fresh instance id / start time in the snapshot).
+        self.pending_restarts
+            .retain(|p| !p.cleared_by(&self.snapshot));
         let changed = self.snapshot.daemon.generated_at != self.last_generated_at;
         if changed {
             if self.env_findings {
@@ -614,6 +629,168 @@ impl<'a> App<'a> {
         self.keybinds_expanded = !self.keybinds_expanded;
     }
 
+    // ── Guided mutations (tui-rework 05) ─────────────────────────────
+
+    /// The guided mutation the action key offers for the current context, if
+    /// any: a problem row's fix, or the cursored server's config.
+    #[must_use]
+    pub fn available_mutation(&self) -> Option<Mutation> {
+        match self.focus {
+            Pane::Problems => {
+                let row = self.problem_rows.get(self.problem_cursor.index)?;
+                self.mutation_for_problem(row)
+            }
+            Pane::RootTree | Pane::Detail => match self.detail_entity()? {
+                EntityKey::Server { name, .. } => self.mutation_for_server(&name),
+                _ => None,
+            },
+            Pane::SessionTree => None,
+        }
+    }
+
+    /// The mutation that executes a problem row's fix-it, if it has one.
+    fn mutation_for_problem(&self, row: &ProblemRow) -> Option<Mutation> {
+        match row.code {
+            FindingCode::ConfigLegacyNamespace => {
+                find_migration_source().map(|source| Mutation::MigrateNamespace { source })
+            }
+            FindingCode::ServerRoutedBroken => match &row.owner {
+                Owner::Server(name) => self.set_command_mutation(name),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The mutation the detail pane offers for a cursored server: set its binary
+    /// path when the binary is missing, else toggle its diagnostics.
+    fn mutation_for_server(&self, name: &str) -> Option<Mutation> {
+        let def = self.config.as_ref()?.server.get(name)?;
+        if binary_exists(&def.command) {
+            self.toggle_server_mutation(name)
+        } else {
+            self.set_command_mutation(name)
+        }
+    }
+
+    /// A "set the binary path" mutation seeded with the server's current command.
+    fn set_command_mutation(&self, name: &str) -> Option<Mutation> {
+        let command = self.config.as_ref()?.server.get(name)?.command.clone();
+        Some(Mutation::SetServerCommand {
+            server: name.to_string(),
+            command,
+        })
+    }
+
+    /// An enable/disable mutation flipping the server's `diagnostics` in the
+    /// first language that binds it, carrying the full binding list so siblings
+    /// survive.
+    fn toggle_server_mutation(&self, name: &str) -> Option<Mutation> {
+        let cfg = self.config.as_ref()?;
+        let (language, lang) = cfg
+            .language
+            .iter()
+            .find(|(_, lc)| lc.servers().iter().any(|b| b.name == name))?;
+        let enabled = lang
+            .servers()
+            .iter()
+            .find(|b| b.name == name)
+            .is_none_or(|b| b.diagnostics);
+        Some(Mutation::SetServerEnabled {
+            language: language.clone(),
+            server: name.to_string(),
+            enabled: !enabled,
+            bindings: binding_specs(lang),
+        })
+    }
+
+    /// Open the consent overlay for the current context's mutation, if any.
+    pub fn begin_action(&mut self) {
+        let Some(mutation) = self.available_mutation() else {
+            return;
+        };
+        let candidates = mutation.candidate_layers(Some(&self.project_root));
+        let value = match &mutation {
+            Mutation::SetServerCommand { command, .. } => Some(command.clone()),
+            _ => None,
+        };
+        self.pending_action = Some(ActionState::new(mutation, candidates, 0, value));
+    }
+
+    /// Cancel the open consent overlay without writing (escape-equivalent).
+    pub fn cancel_action(&mut self) {
+        self.pending_action = None;
+    }
+
+    /// Cycle the target layer in the open overlay.
+    pub const fn action_cycle_layer(&mut self) {
+        if let Some(a) = self.pending_action.as_mut() {
+            a.cycle_layer();
+        }
+    }
+
+    /// Type a character into the overlay's editable value.
+    pub fn action_push_char(&mut self, c: char) {
+        if let Some(a) = self.pending_action.as_mut() {
+            a.push_char(c);
+        }
+    }
+
+    /// Delete the last character of the overlay's editable value.
+    pub fn action_backspace(&mut self) {
+        if let Some(a) = self.pending_action.as_mut() {
+            a.backspace();
+        }
+    }
+
+    /// Apply the pending mutation to its chosen layer, mark it pending-restart,
+    /// and re-read the config so the detail pane's provenance reflects the file
+    /// just written. On failure the overlay stays open carrying the error.
+    pub fn confirm_action(&mut self) {
+        let Some(state) = self.pending_action.as_mut() else {
+            return;
+        };
+        let Some(layer) = state.current_layer().cloned() else {
+            state.error = Some("no writable config layer".to_string());
+            return;
+        };
+        let mutation = state.effective_mutation();
+        let path = match layer.resolve_path() {
+            Ok(p) => p,
+            Err(e) => {
+                state.error = Some(format!("{e:#}"));
+                return;
+            }
+        };
+        if let Err(e) = mutation.apply(&path) {
+            state.error = Some(format!("{e:#}"));
+            return;
+        }
+        let summary = format!(
+            "{} = {} @ {}",
+            mutation.key_label(),
+            mutation.value_label(),
+            layer.label()
+        );
+        self.pending_action = None;
+        self.pending_restarts
+            .push(PendingRestart::new(summary, &self.snapshot));
+        self.refresh_config();
+    }
+
+    /// Re-read the config from disk (in production) and recompute findings + rows
+    /// so provenance and findings reflect the file just written.
+    fn refresh_config(&mut self) {
+        if self.env_findings {
+            let (config, config_error) = load_config();
+            self.config = config;
+            self.config_error = config_error;
+        }
+        self.recompute_findings();
+        self.needs_rebuild = true;
+        self.rebuild_rows();
+    }
+
     /// Yank text for the focused row (a scope id → the `catenary query` bridge).
     #[must_use]
     pub fn selected_yank_text(&self) -> Option<String> {
@@ -801,5 +978,80 @@ mod tests {
         // Healthy fleet: no findings → problems-only empties the root tree.
         app.toggle_problems_only();
         assert!(app.root_rows.is_empty(), "no broken roots to show");
+    }
+
+    #[test]
+    fn cursored_server_with_missing_binary_offers_set_command() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+        let mut snap = snap_with_servers(1);
+        snap.servers[0].state = "failed".to_string();
+        let mut app = app_with(&theme, &icons, snap, config_with_server("srv0", "rust"));
+        app.expanded_roots.insert("/p/root0".to_string());
+        app.rebuild_rows();
+        let idx = app
+            .root_rows
+            .iter()
+            .position(|r| matches!(r, Row::Server(s) if s.server == "srv0"))
+            .expect("server row present");
+        app.root_cursor.index = idx;
+        app.set_focus(Pane::RootTree);
+        // `srv0` isn't on `$PATH`, so the action is "set the binary path".
+        assert!(
+            matches!(
+                app.available_mutation(),
+                Some(crate::config::Mutation::SetServerCommand { server, .. }) if server == "srv0"
+            ),
+            "a missing-binary server offers a set-command mutation",
+        );
+    }
+
+    #[test]
+    fn confirm_action_applies_write_and_records_pending_restart() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+        let mut app = app_with(&theme, &icons, snap_with_servers(1), Config::default());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[server.foo]\ncommand = \"foo\"\n").expect("write fixture");
+        let mutation = crate::config::Mutation::MigrateNamespace {
+            source: path.clone(),
+        };
+        let candidates = mutation.candidate_layers(None);
+        app.pending_action = Some(ActionState::new(mutation, candidates, 0, None));
+
+        app.confirm_action();
+
+        assert!(
+            app.pending_action.is_none(),
+            "overlay closes on a clean write"
+        );
+        assert_eq!(
+            app.pending_restarts.len(),
+            1,
+            "the applied change is marked pending a daemon restart",
+        );
+        let out = std::fs::read_to_string(&path).expect("read back");
+        assert!(out.contains("[lsp.server.foo]"), "migration applied: {out}");
+    }
+
+    #[test]
+    fn pending_restart_clears_when_daemon_identity_changes() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+        let mut app = app_with(&theme, &icons, snap_with_servers(1), Config::default());
+        app.pending_restarts
+            .push(PendingRestart::new("x".to_string(), &app.snapshot));
+        // Swap the data source to a snapshot with a different daemon identity —
+        // the daemon has restarted on the new config, so the marker clears.
+        let mut restarted = snap_with_servers(1);
+        restarted.daemon.instance_id = "daemon:new".to_string();
+        restarted.daemon.started_at = "2026-07-07T13:00:00Z".to_string();
+        app.data = Box::new(MockDataSource::new(restarted));
+        app.reload();
+        assert!(
+            app.pending_restarts.is_empty(),
+            "the marker clears once the daemon returns under a new identity",
+        );
     }
 }

@@ -12,10 +12,11 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::config::Config;
+use crate::config::{Config, ConfigLayer};
 use crate::health::Severity;
 use crate::state_snapshot::{ServerEntry, SessionEntry, SessionStatus, Snapshot};
 
+use super::action::{ActionState, PendingRestart};
 use super::findings::{OwnedFinding, Owner};
 use super::format::{elapsed_short, seconds_since, truncate_to_width};
 use super::icons::{IconSet, basename};
@@ -372,6 +373,85 @@ pub fn problem_entries(
     out
 }
 
+/// Render the pending-restart markers appended to the problems pane.
+///
+/// An applied mutation is written but not yet live (config changes need a daemon
+/// restart), so each stays listed here — marked, never silently gone — until the
+/// daemon comes back on the new config.
+#[must_use]
+pub fn pending_restart_entries(
+    pending: &[PendingRestart],
+    width: usize,
+    theme: &Theme,
+) -> Vec<Vec<Line<'static>>> {
+    if pending.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<Vec<Line<'static>>> = vec![vec![Line::from(vec![Span::styled(
+        format!("  ⟳ {} pending daemon restart", pending.len()),
+        theme.warning,
+    )])]];
+    for p in pending {
+        out.push(vec![Line::from(vec![Span::styled(
+            format!(
+                "    {}",
+                truncate_to_width(&p.summary, width.saturating_sub(4))
+            ),
+            theme.muted,
+        )])]);
+    }
+    out
+}
+
+/// Render the guided-mutation consent overlay: what will be written (key, value,
+/// target file), the layer choice when both apply, and the confirm/cancel hint.
+///
+/// The overlay shows exactly what a confirm writes — no silent mutation ever.
+#[must_use]
+pub fn action_overlay_lines(state: &ActionState, theme: &Theme) -> Vec<Line<'static>> {
+    let m = state.mutation();
+    let mut lines = vec![
+        Line::from(vec![Span::styled(
+            "  Apply this change?".to_string(),
+            theme.title,
+        )]),
+        Line::from(""),
+        kv("key", m.key_label(), theme),
+        kv("value", state.preview_value(), theme),
+    ];
+    let target = state
+        .current_layer()
+        .map_or_else(|| "—".to_string(), ConfigLayer::label);
+    lines.push(kv("target", target, theme));
+    if state.candidate_count() > 1 {
+        lines.push(Line::from(vec![Span::styled(
+            "  Tab: switch user / project layer".to_string(),
+            theme.muted,
+        )]));
+    }
+    if state.takes_value() {
+        lines.push(Line::from(vec![Span::styled(
+            "  type to edit · Backspace deletes".to_string(),
+            theme.muted,
+        )]));
+    }
+    if let Some(err) = &state.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            format!("  ✗ {err}"),
+            theme.error,
+        )]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  Enter".to_string(), theme.hint_key),
+        Span::styled(" apply   ".to_string(), theme.hint_label),
+        Span::styled("Esc".to_string(), theme.hint_key),
+        Span::styled(" cancel".to_string(), theme.hint_label),
+    ]));
+    lines
+}
+
 // ── Header / footer strips ───────────────────────────────────────────
 
 /// The one-line verdict span sequence (`● working` / `✗ N problems`), with a
@@ -461,6 +541,7 @@ pub fn footer_line(theme: &Theme) -> Line<'static> {
         ("Tab", "panes"),
         ("j/k", "move"),
         ("Enter", "expand/focus"),
+        ("a", "fix-it"),
         ("p", "problems-only"),
         ("d", "dormant"),
         ("y", "yank"),
