@@ -684,10 +684,10 @@ mod tests {
     /// A typo inside a known table is named with the table's header path.
     #[test]
     fn unknown_keys_flags_typo_in_known_table() {
-        let found = unknown_keys("[tui]\ntypo_key = 1\n");
+        let found = unknown_keys("[icons]\ntypo_key = 1\n");
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].key, "typo_key");
-        assert_eq!(found[0].location, "tui");
+        assert_eq!(found[0].location, "icons");
     }
 
     /// The server pass-through subtrees stay open — `initialization_options`,
@@ -730,7 +730,7 @@ mod tests {
     fn unknown_keys_empty_for_fully_known_config() {
         let found = unknown_keys(
             "log_retention_days = 14\n\n\
-             [tui]\nauto_add_sessions = false\n\n\
+             [icons]\npreset = \"unicode\"\n\n\
              [notifications]\nthreshold = \"error\"\n\n\
              [tools]\ndiagnostics_severity = \"warning\"\n\n\
              [tools.glob]\noutline_suppress = [\"**/*.min.js\"]\n\n\

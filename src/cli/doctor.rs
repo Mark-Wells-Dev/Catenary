@@ -28,8 +28,12 @@ const STDERR_MAX_LINES: usize = 50;
 /// only under `--diff` — its stale-content diff.
 fn render_finding(out: &mut Output, finding: &Finding, show_diff: bool) {
     let body = match finding.severity {
+        Severity::Fatal => out
+            .colors
+            .bold(&out.colors.red(&format!("✗  {}", finding.message))),
         Severity::Error => out.colors.red(&format!("✗  {}", finding.message)),
         Severity::Warning => out.colors.yellow(&format!("⚠  {}", finding.message)),
+        Severity::Suggestion => out.colors.cyan(&format!("○  {}", finding.message)),
         Severity::Ok => out.colors.green(&format!("✓  {}", finding.message)),
         Severity::Info => out.colors.dim(&finding.message),
     };

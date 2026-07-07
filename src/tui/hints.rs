@@ -15,7 +15,10 @@ use super::theme::Theme;
 /// All keybindings (flat list, no modal sections).
 const KEYBINDS: &[(&str, &str)] = &[
     ("j/k", "navigate"),
-    ("Tab", "next board"),
+    ("Tab", "cycle panes"),
+    ("Enter", "expand / focus"),
+    ("p", "problems only"),
+    ("d", "dormant toggle"),
     ("y", "yank scope id"),
     ("PgUp/Dn", "scroll"),
     ("Home/End", "jump"),
@@ -95,7 +98,7 @@ mod tests {
 
         assert!(content.contains("quit"), "should show quit: {content}");
         assert!(
-            content.contains("next board"),
+            content.contains("cycle panes"),
             "should show Tab hint: {content}"
         );
         assert!(
@@ -105,6 +108,10 @@ mod tests {
         assert!(
             content.contains("navigate"),
             "should show navigate: {content}"
+        );
+        assert!(
+            content.contains("problems only"),
+            "should show problems-only: {content}"
         );
         assert!(content.contains("yank"), "should show yank: {content}");
         assert!(content.contains("scroll"), "should show scroll: {content}");
@@ -156,13 +163,13 @@ mod tests {
             "should show first keybind: {content}"
         );
         assert!(
-            content.contains("yank"),
-            "should show third keybind: {content}"
+            content.contains("cycle panes"),
+            "should show second keybind: {content}"
         );
-        // Fourth keybind (scroll) shouldn't fit.
+        // Later keybinds (yank) shouldn't fit in 3 rows.
         assert!(
-            !content.contains("scroll"),
-            "should not show scroll in 3 rows: {content}"
+            !content.contains("yank"),
+            "should not show yank in 3 rows: {content}"
         );
     }
 }

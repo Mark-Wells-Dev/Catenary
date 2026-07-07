@@ -157,10 +157,18 @@ pub fn classify_server(
 
 /// One finding per configured server, sorted by name.
 ///
-/// The severity is the routed-vs-dormant derivation made concrete: a ready
-/// server is [`Severity::Ok`]; a **routed** server that failed its probe is an
-/// [`Severity::Error`]; a **dormant** server that failed is [`Severity::Info`]
-/// inventory — never an error, however broken its binary.
+/// The severity is the routed-vs-dormant derivation crossed with the **intent**
+/// axis (severity ladder, ratified 2026-07-07):
+///
+/// - a ready server is [`Severity::Ok`];
+/// - a **routed** server that failed its probe *with intent evidence*
+///   (explicitly configured, or its binary is installed) is a
+///   [`Severity::Fatal`] — you chose it and it isn't working;
+/// - a **routed** default binding whose binary is simply absent, with no
+///   explicit config, is a [`Severity::Suggestion`] — an unchosen gap ("you
+///   have these files; install this server");
+/// - a **dormant** server that failed is [`Severity::Info`] inventory — never
+///   a problem, however broken its binary.
 #[must_use]
 pub fn server_findings(config: &Config, feed: &dyn HealthFeed) -> Vec<Finding> {
     let mut names: Vec<&String> = config.server.keys().collect();
@@ -190,6 +198,24 @@ pub fn server_findings(config: &Config, feed: &dyn HealthFeed) -> Vec<Finding> {
         .collect()
 }
 
+/// Whether a broken routed server carries **intent** — the axis that splits a
+/// [`Severity::Fatal`] (you chose it) from a [`Severity::Suggestion`] (an
+/// unchosen default gap).
+///
+/// Two evidences, either sufficient:
+/// - **installation** — the binary is present (any status other than
+///   [`ServerStatus::BinaryNotFound`] means the process spawned or tried to);
+/// - **explicit config** — a user or project layer named the server, i.e. it
+///   is not a pure embedded default. Mirrors the model's existing provenance
+///   stance ([`crate::config::default_server_names`]): a user def reusing a
+///   default name adopts the default's exemption.
+fn server_intent(name: &str, status: &ServerStatus) -> bool {
+    if !matches!(status, ServerStatus::BinaryNotFound(_)) {
+        return true;
+    }
+    !crate::config::default_server_names().contains(name)
+}
+
 /// Build the `file_patterns: [...]` suffix for a ready server's message.
 fn ready_suffix(config: &Config, server: &str) -> String {
     let patterns = config
@@ -211,23 +237,45 @@ fn ready_suffix(config: &Config, server: &str) -> String {
     }
 }
 
-/// Build the finding for a server that failed its probe, split by class.
+/// Build the finding for a server that failed its probe, split by class and —
+/// for a routed break — by intent ([`server_intent`]).
 fn broken_finding(name: &str, class: ServerClass, status: &ServerStatus) -> Finding {
     let detail = status.detail();
     match class {
-        ServerClass::Routed => {
+        ServerClass::Routed if server_intent(name, status) => {
+            // Fatal — an intent-broken server you chose or installed.
             let finding = Finding::new(
                 FindingCode::ServerRoutedBroken,
-                Severity::Error,
+                Severity::Fatal,
                 format!("{name}: {detail}"),
             );
             match status {
-                ServerStatus::BinaryNotFound(cmd) => finding
-                    .with_fix_it(format!("Install `{cmd}` and ensure it is on your `$PATH`.")),
+                ServerStatus::BinaryNotFound(cmd) => finding.with_fix_it(format!(
+                    "`{cmd}` is configured but wasn't found on your `$PATH`. \
+                     Install it or correct the path."
+                )),
                 _ => finding.with_fix_it(format!(
                     "Run `catenary doctor {name}` for the full spawn/initialize transcript."
                 )),
             }
+        }
+        ServerClass::Routed => {
+            // Suggestion — a live language with a default binding but no binary
+            // and no explicit config. Name the binary; never fabricate an
+            // install command (pinned recipes are a later ticket).
+            let binary = match status {
+                ServerStatus::BinaryNotFound(cmd) => cmd.as_str(),
+                _ => name,
+            };
+            Finding::new(
+                FindingCode::ServerInstallSuggestion,
+                Severity::Suggestion,
+                format!("{name}: not installed"),
+            )
+            .with_fix_it(format!(
+                "Install `{binary}` to enable {name} coverage. \
+                 Catenary never runs installs for you."
+            ))
         }
         ServerClass::Dormant => Finding::new(
             FindingCode::ServerDormant,
@@ -435,7 +483,29 @@ mod tests {
     }
 
     #[test]
-    fn routed_missing_binary_is_error() {
+    fn routed_missing_binary_of_configured_server_is_fatal() {
+        // A user-named server (not an embedded default) with a missing binary
+        // is intent-broken: you explicitly configured it, so a PATH break
+        // eating it ranks with a crash — Fatal.
+        let config = routed_config("mylang", "my-custom-ls");
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            "my-custom-ls".to_string(),
+            ServerStatus::BinaryNotFound("my-custom-ls".to_string()),
+        );
+        let active: HashSet<String> = std::iter::once("mylang".to_string()).collect();
+        let feed = ProbeFeed::new(statuses, active, None);
+        let findings = server_findings(&config, &feed);
+        let finding = findings.first().expect("one server finding");
+        assert_eq!(finding.code, FindingCode::ServerRoutedBroken);
+        assert_eq!(finding.severity, Severity::Fatal);
+        assert!(finding.fix_it.is_some(), "a fatal break carries fix-it");
+    }
+
+    #[test]
+    fn routed_missing_binary_of_default_is_suggestion() {
+        // A shipped default binding (rust-analyzer) with no binary and no
+        // explicit config is an unchosen gap — a Suggestion, never a problem.
         let config = routed_config("rust", "rust-analyzer");
         let mut statuses = HashMap::new();
         statuses.insert(
@@ -446,9 +516,42 @@ mod tests {
         let feed = ProbeFeed::new(statuses, active, None);
         let findings = server_findings(&config, &feed);
         let finding = findings.first().expect("one server finding");
+        assert_eq!(finding.code, FindingCode::ServerInstallSuggestion);
+        assert_eq!(finding.severity, Severity::Suggestion);
+        assert!(
+            !finding.severity.is_problem(),
+            "a suggestion is not a problem"
+        );
+        let fix_it = finding
+            .fix_it
+            .as_deref()
+            .expect("suggestion names a binary");
+        assert!(
+            fix_it.contains("rust-analyzer"),
+            "names the binary: {fix_it}"
+        );
+        assert!(
+            !fix_it.contains("cargo") && !fix_it.contains("npm") && !fix_it.contains("curl"),
+            "never fabricates an install command: {fix_it}",
+        );
+    }
+
+    #[test]
+    fn routed_installed_but_init_failed_is_fatal() {
+        // A default-named server whose binary IS present but init failed carries
+        // intent via installation — Fatal, not a suggestion.
+        let config = routed_config("rust", "rust-analyzer");
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            "rust-analyzer".to_string(),
+            ServerStatus::InitializeFailed("boom".to_string()),
+        );
+        let active: HashSet<String> = std::iter::once("rust".to_string()).collect();
+        let feed = ProbeFeed::new(statuses, active, None);
+        let findings = server_findings(&config, &feed);
+        let finding = findings.first().expect("one server finding");
         assert_eq!(finding.code, FindingCode::ServerRoutedBroken);
-        assert_eq!(finding.severity, Severity::Error);
-        assert!(finding.fix_it.is_some(), "a routed break carries fix-it");
+        assert_eq!(finding.severity, Severity::Fatal);
     }
 
     #[test]

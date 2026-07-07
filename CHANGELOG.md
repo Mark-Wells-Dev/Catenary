@@ -284,6 +284,31 @@ upgrading.
 
 ### Changed
 
+- **The TUI is the health dashboard: a master-detail grid replaces the
+  four-board monitor.** Bare `catenary` now opens a 2×2 grid built to
+  answer *"is it working?"*: a root-grouped server tree (one collapsed
+  line per healthy root; contributor classes, idle countdowns, respawn
+  history, dormant inventory behind a toggle), a client-grouped session
+  tree (install-health findings inline at the client, live subagents as
+  sub-rows, honest `last seen Nm` when a host's hooks can't say more), a
+  contextual detail pane (a server shows its effective config by layer
+  with provenance; a root its routing table; a session its recent
+  actions), and a **problems pane** — every Fatal/Error/Warning finding
+  with its fix-it, selecting one focuses the board on its owner. The
+  header carries the verdict, version skew, and snapshot staleness;
+  suggestions ride as a collapsed tail that never displaces a problem
+  and never dents a green verdict. Keyboard-first with equal mouse
+  support, a problems-only filter, and the same unwedgeable
+  `state.json` watch+poll underneath — the TUI still never probes and
+  never opens the firehose. The severity ladder behind it gains
+  **Fatal** (a routed server you configured or installed that isn't
+  running — a missing binary counts when the server is explicitly
+  configured) and **Suggestion** (a live language with a known default
+  server and nothing installed — named, never shouted, and never an
+  unpinned install command); `catenary doctor` renders the same tiers.
+  The dead SQLite-era `[tui]` config keys are retired (they now surface
+  through the unknown-key finding), and the session snapshot carries
+  live subagents per session.
 - **One health model: doctor's checks extracted into a typed findings
   library, and dormant servers stop presenting as errors.** Every check
   `catenary doctor` performs now resolves in `src/health/` into typed

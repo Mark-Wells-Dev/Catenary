@@ -141,12 +141,6 @@ pub struct Config {
     /// through to the earlier config layer.
     pub icons: Option<IconConfig>,
 
-    /// TUI configuration.
-    ///
-    /// `None` when no source specified `[tui]`. Absent sections fall
-    /// through to the earlier config layer.
-    pub tui: Option<TuiConfig>,
-
     /// Per-tool configuration (budgets, maps options, etc.).
     ///
     /// `None` when no source specified `[tools]`. Absent sections fall
@@ -261,49 +255,6 @@ pub struct IconConfig {
     pub spinner_cycle: Option<Vec<String>>,
     /// Spinner done frame (shown on progress end).
     pub spinner_done: Option<String>,
-}
-
-/// TUI configuration options.
-///
-/// Controls the interactive monitor's layout and behavior.
-#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
-#[serde(default)]
-#[schemars(deny_unknown_fields)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "config struct — each field is an independent toggle"
-)]
-pub struct TuiConfig {
-    /// Automatically add new sessions to the grid (default: true).
-    pub auto_add_sessions: bool,
-
-    /// Preferred width of the Sessions tree as a fraction of the terminal
-    /// (default: 0.25).
-    pub sessions_width: f64,
-
-    /// Whether mouse hover changes focus (default: false).
-    pub focus_follows_mouse: bool,
-
-    /// Capture full tool output in `ToolResult` events for TUI detail
-    /// expansion (default: false). Increases database size.
-    pub capture_tool_output: bool,
-
-    /// Keep panels open after a session dies instead of closing them
-    /// (default: false). Dead panels show the session ID with dimmed
-    /// styling. When false, panels are closed on the next liveness check.
-    pub keep_dead_panels: bool,
-}
-
-impl Default for TuiConfig {
-    fn default() -> Self {
-        Self {
-            auto_add_sessions: true,
-            sessions_width: 0.25,
-            focus_follows_mouse: false,
-            capture_tool_output: false,
-            keep_dead_panels: false,
-        }
-    }
 }
 
 /// Default dirty-severity threshold for `catenary diagnostics`.
@@ -470,7 +421,6 @@ impl Default for Config {
             server: HashMap::new(),
             notifications: None,
             icons: None,
-            tui: None,
             tools: None,
             resolved_commands: None,
             observability: None,

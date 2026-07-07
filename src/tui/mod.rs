@@ -1,21 +1,28 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Interactive `state.json` dashboard.
+//! The interactive health/config dashboard — a 2×2 master-detail grid over the
+//! daemon's `state.json` snapshot and the health model's findings.
 //!
-//! The TUI renders four boards from the daemon-owned snapshot — server health
-//! (upper-left), sessions (lower-left), the activity ring of milestones
-//! (upper-right), and the alerts ring (lower-right) — with a collapsible
-//! keybinds panel. It is a **pure file reader**: it file-watches the
-//! snapshot and re-loads on change. It never opens the firehose (JSONL) or a
-//! database, which makes it structurally unwedgeable (observability ticket 06).
-//! The bridge to `catenary query` is a yankable scope id (OSC 52).
+//! Four panes share a grid: the **root/server tree** (top-left), the
+//! **client/session tree** (bottom-left), the **contextual detail pane**
+//! (top-right), and the **problems pane** (bottom-right, the durable
+//! notification surface). A header strip carries the verdict, daemon identity,
+//! version/skew, and snapshot staleness; a footer carries the keybinding hint.
+//!
+//! It is a **pure file reader**: it file-watches the snapshot and re-loads on
+//! change, reads config files for findings, and **never** opens the firehose or
+//! probes an LSP (structurally unwedgeable stays a feature — DESIGN). The bridge
+//! to `catenary query` is a yankable scope id (OSC 52).
 
 pub mod app;
 pub mod data;
+pub mod findings;
 pub mod format;
 pub mod hints;
 pub mod icons;
+pub mod model;
+pub mod render;
 pub mod scrollbar;
 pub mod theme;
 
@@ -39,49 +46,31 @@ use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Widget};
-use tracing::info;
+use ratatui::text::Line;
 use unicode_width::UnicodeWidthStr;
 
 use crate::config::IconConfig;
 
-use self::app::{Board, Focus};
+use self::app::Cursor;
 use self::data::StateJsonDataSource;
 use self::hints::{KEYBINDS_EXPANDED_HEIGHT, render_keybinds_content};
 use self::icons::IconSet;
+use self::model::Pane;
 use self::scrollbar::{OverflowCounts, render_overflow_counts};
 use self::theme::Theme;
 
-/// Tick interval for the event loop. The snapshot is re-loaded each tick (a
-/// small file read), so changes surface within this bound even without the
-/// watcher.
+/// Tick interval: the snapshot is re-read each tick (a small file read).
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Minimum left-column width percentage.
-const MIN_SIDEBAR_PCT: u16 = 10;
-/// Maximum left-column width percentage.
-const MAX_SIDEBAR_PCT: u16 = 90;
-/// Terminal width below which the layout degrades to three stacked full-width
-/// boards (the right alerts pane folds under the left column).
-const NARROW_THRESHOLD: u16 = 60;
+/// Terminal width below which the grid degrades to stacked full-width panes.
+const NARROW_THRESHOLD: u16 = 80;
 
-/// Rendered lines per server board entry.
-const SERVER_LPE: usize = format::SERVER_ENTRY_LINES;
-/// Rendered lines per session board entry.
-const SESSION_LPE: usize = format::SESSION_ENTRY_LINES;
-/// Rendered lines per activity (milestone) entry.
-const ACTIVITY_LPE: usize = 1;
-/// Rendered lines per alert entry.
-const ALERT_LPE: usize = 1;
+/// Left-column width as a percentage of the grid (the trees).
+const LEFT_PCT: u16 = 46;
 
-/// Start a file watcher on the snapshot's parent directory.
-///
-/// Watches the parent (non-recursive) because `state.json` is replaced by an
-/// atomic temp + rename, and may not exist when the TUI starts. Events are
-/// filtered to the `state.json` filename and coalesced into a `()` signal.
+/// Start a file watcher on the snapshot's parent directory (atomic-rename safe).
 fn start_state_watcher(
     snapshot_path: &Path,
 ) -> Result<(notify::RecommendedWatcher, mpsc::Receiver<()>)> {
@@ -103,8 +92,6 @@ fn start_state_watcher(
     let watch_dir = snapshot_path
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    // The parent may not exist yet (daemon never started); create it so the
-    // watch can attach and fire when the daemon first writes.
     if !watch_dir.exists() {
         let _ = std::fs::create_dir_all(&watch_dir);
     }
@@ -121,33 +108,34 @@ fn start_state_watcher(
 pub fn run(icon_config: IconConfig) -> Result<()> {
     let data = StateJsonDataSource::new();
     let snapshot_path = data.path().to_path_buf();
+    let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let watcher = match start_state_watcher(&snapshot_path) {
         Ok((watcher, rx)) => Some((watcher, rx)),
         Err(e) => {
-            info!("state.json watcher unavailable, falling back to polling: {e}");
+            tracing::info!("state.json watcher unavailable, polling instead: {e}");
             None
         }
     };
-    // Hold `_watcher` to keep it alive; extract `rx` for the event loop.
     let (_watcher, watch_rx) = match watcher {
         Some((w, rx)) => (Some(w), Some(rx)),
         None => (None, None),
     };
 
-    run_with_data_and_watcher(icon_config, Box::new(data), watch_rx.as_ref())
+    run_with_data_and_watcher(icon_config, project_root, Box::new(data), watch_rx.as_ref())
 }
 
 /// Run the dashboard with an explicit data source and optional change signal.
 fn run_with_data_and_watcher(
     icon_config: IconConfig,
+    project_root: PathBuf,
     data: Box<dyn DataSource>,
     watch_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<()> {
     let theme = Theme::new();
     let icons = IconSet::from_config(icon_config);
 
-    let mut app = App::new(&theme, &icons, data)?;
+    let mut app = App::new(&theme, &icons, project_root, data)?;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -168,22 +156,13 @@ fn run_with_data_and_watcher(
     result
 }
 
-/// Stored panel rectangles for mouse dispatch.
+/// Stored pane rectangles for mouse dispatch (inner content areas).
 #[derive(Default)]
-struct PanelLayout {
-    servers: Rect,
-    servers_inner: Rect,
-    sessions: Rect,
-    sessions_inner: Rect,
-    activity: Rect,
-    activity_inner: Rect,
-    alerts: Rect,
-    alerts_inner: Rect,
-    keybinds: Rect,
-    /// Column of the vertical divider (0 when there is none, e.g. narrow mode).
-    divider_col: u16,
-    /// Total terminal width, for percentage computation during a divider drag.
-    total_width: u16,
+struct PanelRects {
+    root: Rect,
+    session: Rect,
+    detail: Rect,
+    problems: Rect,
 }
 
 /// Handle a key event.
@@ -199,6 +178,14 @@ fn handle_key(app: &mut App<'_>, code: KeyCode) {
         KeyCode::PageUp => app.page_up(),
         KeyCode::Char('g') | KeyCode::Home => app.jump_home(),
         KeyCode::Char('G') | KeyCode::End => app.jump_end(),
+        KeyCode::Enter => app.activate(),
+        KeyCode::Char('p') => app.toggle_problems_only(),
+        KeyCode::Char('d') => {
+            // 'd' expands the dormant tail when the root tree is focused.
+            app.set_focus(Pane::RootTree);
+            app.jump_end();
+            app.activate();
+        }
         KeyCode::Char('y') => {
             if let Some(text) = app.selected_yank_text() {
                 osc52_copy(&text);
@@ -220,7 +207,7 @@ fn osc52_copy(text: &str) {
 /// Minimal base64 encoder (RFC 4648).
 #[allow(
     clippy::cast_possible_truncation,
-    reason = "base64 index is always 0..63, safe for usize; byte-to-char is ASCII"
+    reason = "base64 index is always 0..63; byte-to-char is ASCII"
 )]
 fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -234,37 +221,22 @@ fn base64_encode(input: &[u8]) -> String {
 
         out.push(ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
         out.push(ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((triple >> 6) & 0x3F) as usize] as char
         } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[(triple & 0x3F) as usize] as char);
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(triple & 0x3F) as usize] as char
         } else {
-            out.push('=');
-        }
+            '='
+        });
     }
     out
 }
 
-/// Map a terminal row inside a board's content area to an entry index.
-fn entry_at(
-    inner: Rect,
-    row: u16,
-    scroll: usize,
-    lines_per_entry: usize,
-    len: usize,
-) -> Option<usize> {
-    if row < inner.y || row >= inner.y + inner.height || lines_per_entry == 0 {
-        return None;
-    }
-    let rel = (row - inner.y) as usize;
-    let entry = scroll + rel / lines_per_entry;
-    (entry < len).then_some(entry)
-}
-
-/// Handle a mouse event.
+/// Handle a mouse event: click focuses a pane and moves its cursor; scroll
+/// moves the cursor of the pane under the pointer.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "terminal coordinates are always small"
@@ -274,133 +246,249 @@ fn handle_mouse(
     kind: MouseEventKind,
     column: u16,
     row: u16,
-    layout: &PanelLayout,
+    rects: &PanelRects,
 ) {
-    // ── Divider drag (wide layout only) ────────────────────────
-    if matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
-        app.dragging_divider = layout.divider_col > 0 && column.abs_diff(layout.divider_col) <= 1;
-        if app.dragging_divider {
-            return;
-        }
-    }
-    if matches!(kind, MouseEventKind::Up(MouseButton::Left)) {
-        app.dragging_divider = false;
-    }
-    if app.dragging_divider {
-        if kind == MouseEventKind::Drag(MouseButton::Left) && layout.total_width > 0 {
-            let raw = (u32::from(column) * 100 / u32::from(layout.total_width)) as u16;
-            app.sidebar_pct = raw.clamp(MIN_SIDEBAR_PCT, MAX_SIDEBAR_PCT);
-        }
-        return;
-    }
-
-    let pos = (column, row);
-    let target = if layout.servers.contains(pos.into()) {
-        Some(Focus::Servers)
-    } else if layout.sessions.contains(pos.into()) {
-        Some(Focus::Sessions)
-    } else if layout.activity.contains(pos.into()) {
-        Some(Focus::Activity)
-    } else if layout.alerts.contains(pos.into()) {
-        Some(Focus::Alerts)
+    let pos = Rect {
+        x: column,
+        y: row,
+        width: 1,
+        height: 1,
+    };
+    let target = if rects.root.intersects(pos) {
+        Some(Pane::RootTree)
+    } else if rects.session.intersects(pos) {
+        Some(Pane::SessionTree)
+    } else if rects.detail.intersects(pos) {
+        Some(Pane::Detail)
+    } else if rects.problems.intersects(pos) {
+        Some(Pane::Problems)
     } else {
         None
     };
+    let Some(pane) = target else { return };
 
     match kind {
         MouseEventKind::ScrollUp => {
-            if let Some(focus) = target {
-                app.focus = focus;
-                app.cursor_up(3);
-            }
+            app.set_focus(pane);
+            app.cursor_up(3);
         }
         MouseEventKind::ScrollDown => {
-            if let Some(focus) = target {
-                app.focus = focus;
-                app.cursor_down(3);
-            }
+            app.set_focus(pane);
+            app.cursor_down(3);
         }
-        MouseEventKind::Down(MouseButton::Left) => match target {
-            Some(Focus::Servers) => {
-                app.focus = Focus::Servers;
-                if let Some(i) = entry_at(
-                    layout.servers_inner,
-                    row,
-                    app.servers.scroll,
-                    SERVER_LPE,
-                    app.snapshot.servers.len(),
-                ) {
-                    app.servers.cursor = i;
-                }
-            }
-            Some(Focus::Sessions) => {
-                app.focus = Focus::Sessions;
-                if let Some(i) = entry_at(
-                    layout.sessions_inner,
-                    row,
-                    app.sessions.scroll,
-                    SESSION_LPE,
-                    app.snapshot.sessions.len(),
-                ) {
-                    app.sessions.cursor = i;
-                }
-            }
-            Some(Focus::Activity) => {
-                app.focus = Focus::Activity;
-                if let Some(i) = entry_at(
-                    layout.activity_inner,
-                    row,
-                    app.activity.scroll,
-                    ACTIVITY_LPE,
-                    app.snapshot.activity.len(),
-                ) {
-                    app.activity.cursor = i;
-                }
-            }
-            Some(Focus::Alerts) => {
-                app.focus = Focus::Alerts;
-                if let Some(i) = entry_at(
-                    layout.alerts_inner,
-                    row,
-                    app.alerts.scroll,
-                    ALERT_LPE,
-                    app.snapshot.alerts.len(),
-                ) {
-                    app.alerts.cursor = i;
-                }
-            }
-            None => {
-                if layout.keybinds.contains(pos.into()) {
-                    app.keybinds_expanded = true;
-                }
-            }
-        },
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.set_focus(pane);
+            // Move the cursor to the clicked row, then activate (expand/focus).
+            move_cursor_to_click(app, pane, row, rects);
+            app.activate();
+        }
         _ => {}
     }
 }
 
-/// Build a `Block` frame for a panel, styling the border based on focus.
-fn panel_block<'a>(title: &'a str, focused: bool, theme: &'a Theme, borders: Borders) -> Block<'a> {
-    let border_style = if focused {
-        theme.border_focused
-    } else {
-        theme.border_unfocused
+/// Move the focused pane's cursor to the row under a click (best-effort, single
+/// line per entry for the trees).
+fn move_cursor_to_click(app: &mut App<'_>, pane: Pane, row: u16, rects: &PanelRects) {
+    let (inner, cursor, len) = match pane {
+        Pane::RootTree => (rects.root, &mut app.root_cursor, app.root_rows.len()),
+        Pane::SessionTree => (
+            rects.session,
+            &mut app.session_cursor,
+            app.session_rows.len(),
+        ),
+        Pane::Problems => (
+            rects.problems,
+            &mut app.problem_cursor,
+            app.problem_rows.len(),
+        ),
+        Pane::Detail => return,
     };
-    let title_style = if focused { theme.title } else { theme.muted };
-    Block::default()
-        .borders(borders)
-        .border_style(border_style)
-        .title(Span::styled(title, title_style))
+    // Body starts one row below the title.
+    if row <= inner.y {
+        return;
+    }
+    let rel = (row - inner.y - 1) as usize;
+    let target = cursor.scroll + rel;
+    if target < len {
+        cursor.index = target;
+        cursor.settle(len);
+    }
 }
 
-/// Inner content rect for a panel with the given borders.
-fn inner_of(rect: Rect, borders: Borders) -> Rect {
-    Block::default().borders(borders).inner(rect)
+/// Draw the shared grid borders (outer box + interior cross) and return the four
+/// inner content rects. Titles render inside each body, not on the border.
+fn draw_grid_borders(
+    area: Rect,
+    split_x: u16,
+    split_y: u16,
+    buf: &mut Buffer,
+    style: Style,
+) -> [Rect; 4] {
+    let x0 = area.x;
+    let y0 = area.y;
+    let x1 = area.x + area.width - 1;
+    let y1 = area.y + area.height - 1;
+
+    // Edges.
+    for x in x0..=x1 {
+        set(buf, x, y0, "─", style);
+        set(buf, x, y1, "─", style);
+    }
+    for y in y0..=y1 {
+        set(buf, x0, y, "│", style);
+        set(buf, x1, y, "│", style);
+    }
+    // Interior lines.
+    for y in (y0 + 1)..y1 {
+        set(buf, split_x, y, "│", style);
+    }
+    for x in (x0 + 1)..x1 {
+        set(buf, x, split_y, "─", style);
+    }
+    // Junctions.
+    set(buf, x0, y0, "┌", style);
+    set(buf, x1, y0, "┐", style);
+    set(buf, x0, y1, "└", style);
+    set(buf, x1, y1, "┘", style);
+    set(buf, split_x, y0, "┬", style);
+    set(buf, split_x, y1, "┴", style);
+    set(buf, x0, split_y, "├", style);
+    set(buf, x1, split_y, "┤", style);
+    set(buf, split_x, split_y, "┼", style);
+
+    let left_w = split_x.saturating_sub(x0 + 1);
+    let right_w = x1.saturating_sub(split_x + 1);
+    let top_h = split_y.saturating_sub(y0 + 1);
+    let bot_h = y1.saturating_sub(split_y + 1);
+    [
+        Rect::new(x0 + 1, y0 + 1, left_w, top_h),            // TL
+        Rect::new(split_x + 1, y0 + 1, right_w, top_h),      // TR
+        Rect::new(x0 + 1, split_y + 1, left_w, bot_h),       // BL
+        Rect::new(split_x + 1, split_y + 1, right_w, bot_h), // BR
+    ]
 }
 
-/// Re-style a line for the selection highlight, padding to `width` so the whole
-/// row (including a 2-line entry's sub-line) is highlighted.
+/// Set a single cell to a string symbol with a style.
+fn set(buf: &mut Buffer, x: u16, y: u16, s: &str, style: Style) {
+    if x < buf.area.right() && y < buf.area.bottom() {
+        buf.set_string(x, y, s, style);
+    }
+}
+
+/// Render one list pane: a title line, then scrollable entries with a
+/// cursor-highlighted (glyph + color) selected entry.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    reason = "a list pane needs title, focus, entries, cursor, rect, and styling"
+)]
+fn render_list(
+    title: &str,
+    focused: bool,
+    entries: &[Vec<Line<'static>>],
+    cursor: &mut Cursor,
+    inner: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+) {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    // Title line inside the body.
+    let title_style = if focused { theme.accent } else { theme.title };
+    buf.set_string(inner.x, inner.y, truncate(title, inner.width), title_style);
+
+    let list_y = inner.y + 1;
+    let list_h = inner.height.saturating_sub(1);
+    if list_h == 0 {
+        return;
+    }
+
+    let heights: Vec<u16> = entries.iter().map(|e| e.len() as u16).collect();
+    // Keep the cursor entry in view.
+    if cursor.index < cursor.scroll {
+        cursor.scroll = cursor.index;
+    }
+    while cursor.scroll < cursor.index {
+        let used: u16 = heights
+            .get(cursor.scroll..=cursor.index)
+            .map_or(0, |s| s.iter().sum());
+        if used <= list_h {
+            break;
+        }
+        cursor.scroll += 1;
+    }
+
+    let mut y = list_y;
+    let end_y = list_y + list_h;
+    let mut drawn = 0usize;
+    for (i, entry) in entries.iter().enumerate().skip(cursor.scroll) {
+        if y >= end_y {
+            break;
+        }
+        let selected = focused && i == cursor.index;
+        for (li, line) in entry.iter().enumerate() {
+            if y >= end_y {
+                break;
+            }
+            if selected {
+                let hl = highlight_line(line, inner.width as usize, theme.selection);
+                buf.set_line(inner.x, y, &hl, inner.width);
+                if li == 0 {
+                    buf.set_string(inner.x, y, "▸", theme.selection);
+                }
+            } else {
+                buf.set_line(inner.x, y, line, inner.width);
+            }
+            y += 1;
+        }
+        drawn += 1;
+    }
+    cursor.visible = drawn.max(1);
+
+    let counts = OverflowCounts {
+        above: cursor.scroll,
+        below: entries.len().saturating_sub(cursor.scroll + drawn),
+    };
+    render_overflow_counts(
+        &counts,
+        Rect::new(inner.x, list_y, inner.width, list_h),
+        buf,
+        theme.muted,
+    );
+}
+
+/// Render a non-interactive detail pane: a title then wrapped content lines.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "detail line counts are small"
+)]
+fn render_detail(
+    title: &str,
+    focused: bool,
+    lines: &[Line<'static>],
+    inner: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+) {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let title_style = if focused { theme.accent } else { theme.title };
+    buf.set_string(inner.x, inner.y, truncate(title, inner.width), title_style);
+    let end_y = inner.y + inner.height;
+    for (i, line) in lines.iter().enumerate() {
+        let y = inner.y + 1 + i as u16;
+        if y >= end_y {
+            break;
+        }
+        buf.set_line(inner.x, y, line, inner.width);
+    }
+}
+
+/// Re-style a line for the selection highlight, padding to `width`.
 fn highlight_line(line: &Line<'static>, width: usize, style: Style) -> Line<'static> {
+    use ratatui::text::Span;
     let mut spans: Vec<Span<'static>> = line
         .spans
         .iter()
@@ -413,553 +501,218 @@ fn highlight_line(line: &Line<'static>, width: usize, style: Style) -> Line<'sta
     Line::from(spans)
 }
 
-/// Render a board (entries are line-groups) into `rect`, with cursor highlight,
-/// scroll, and overflow indicators.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a board render needs frame, content, scroll state, and styling"
-)]
-fn render_board_into(
-    title: &str,
-    focused: bool,
-    entries: &[Vec<Line<'static>>],
-    lines_per_entry: usize,
-    board: &mut Board,
-    rect: Rect,
-    inner: Rect,
-    buf: &mut Buffer,
-    theme: &Theme,
-    borders: Borders,
-) {
-    panel_block(title, focused, theme, borders).render(rect, buf);
-
-    let total = entries.len();
-    let visible = (inner.height as usize) / lines_per_entry.max(1);
-    board.visible = visible;
-    board.settle(total);
-
-    let mut y = inner.y;
-    let end_y = inner.y + inner.height;
-    'outer: for (i, lines) in entries.iter().enumerate().skip(board.scroll).take(visible) {
-        let selected = focused && i == board.cursor;
-        for line in lines {
-            if y >= end_y {
-                break 'outer;
-            }
-            if selected {
-                let hl = highlight_line(line, inner.width as usize, theme.selection);
-                buf.set_line(inner.x, y, &hl, inner.width);
-            } else {
-                buf.set_line(inner.x, y, line, inner.width);
-            }
-            y += 1;
-        }
-    }
-
-    let counts = OverflowCounts {
-        above: board.scroll,
-        below: total.saturating_sub(board.scroll + visible),
-    };
-    render_overflow_counts(&counts, inner, buf, theme.muted);
+/// Truncate a title to `width` columns.
+fn truncate(s: &str, width: u16) -> String {
+    format::truncate_to_width(s, width as usize)
 }
 
-/// Render a horizontal separator row carrying a panel title.
-///
-/// `left_cap` anchors a `├` at the left border (full-box / left-column
-/// separators); when false the left end stays `─` so the vertical divider draws
-/// the junction instead (the right column's separator). `right_cap` adds a `┤`
-/// at the right edge (full-box, narrow mode); in the wide left column the right
-/// end abuts the divider, which draws that junction.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::too_many_arguments,
-    clippy::fn_params_excessive_bools,
-    reason = "terminal coordinates are always small; a titled separator needs position, content, style, and the two cap flags"
-)]
-fn render_separator(
-    y: u16,
-    x: u16,
-    width: u16,
-    title: &str,
-    theme: &Theme,
-    buf: &mut Buffer,
-    left_cap: bool,
-    right_cap: bool,
-) {
-    if width == 0 {
-        return;
-    }
-    let style = theme.border_unfocused;
-    for col in x..(x + width) {
-        buf.set_string(col, y, "─", style);
-    }
-    if left_cap {
-        buf.set_string(x, y, "├", style);
-    }
-    if right_cap {
-        buf.set_string(x + width - 1, y, "┤", style);
-    }
-    if !title.is_empty() && width > 4 {
-        let max = (width - 4) as usize;
-        let truncated: String = title.chars().take(max).collect();
-        buf.set_string(x + 2, y, &truncated, theme.muted);
-    }
-}
-
-/// Render the vertical divider column, using intersection glyphs where the
-/// left-column separators (`┤`) and the right-column separator (`├`) meet it.
-fn render_divider_col(
-    col: u16,
-    top: u16,
-    bottom: u16,
-    left_seps: &[u16],
-    right_seps: &[u16],
-    style: Style,
-    buf: &mut Buffer,
-) {
-    for y in top..=bottom {
-        let left = left_seps.contains(&y);
-        let right = right_seps.contains(&y);
-        let ch = if y == top {
-            "┬"
-        } else if y == bottom {
-            "┴"
-        } else if left && right {
-            "┼"
-        } else if left {
-            "┤"
-        } else if right {
-            "├"
-        } else {
-            "│"
-        };
-        buf.set_string(col, y, ch, style);
-    }
-}
-
-/// The daemon status line shown in the alerts panel title.
-fn daemon_status(snapshot: &crate::state_snapshot::Snapshot) -> String {
-    if snapshot.daemon.generated_at.is_empty() {
-        return " Alerts ".to_string();
-    }
-    let age = format::elapsed_short(&snapshot.daemon.generated_at);
-    let version = if snapshot.daemon.version.is_empty() {
-        "catenary"
-    } else {
-        &snapshot.daemon.version
-    };
-    if age.is_empty() {
-        format!(" Alerts — {version} ")
-    } else {
-        format!(" Alerts — {version} · updated {age} ago ")
-    }
-}
-
-/// Build per-entry line groups for the server board.
-fn build_server_entries(
-    app: &App<'_>,
+/// Build the entry line-groups for a tree pane (one line per row).
+fn tree_entries(
+    rows: &[model::Row],
     width: u16,
     theme: &Theme,
     icons: &IconSet,
 ) -> Vec<Vec<Line<'static>>> {
-    app.snapshot
-        .servers
-        .iter()
-        .map(|s| format::server_entry_lines(s, width as usize, theme, icons))
+    rows.iter()
+        .map(|r| vec![render::tree_line(r, width as usize, theme, icons)])
         .collect()
 }
 
-/// Build per-entry line groups for the session board.
-fn build_session_entries(
-    app: &App<'_>,
-    width: u16,
-    theme: &Theme,
-    icons: &IconSet,
-) -> Vec<Vec<Line<'static>>> {
-    app.snapshot
-        .sessions
-        .iter()
-        .map(|s| format::session_entry_lines(s, width as usize, theme, icons))
-        .collect()
-}
-
-/// Build per-entry line groups for the alerts ring (one line per alert).
-fn build_alert_entries(
-    app: &App<'_>,
-    width: u16,
-    theme: &Theme,
-    icons: &IconSet,
-) -> Vec<Vec<Line<'static>>> {
-    app.snapshot
-        .alerts
-        .iter()
-        .map(|a| vec![format::alert_line(a, width as usize, theme, icons)])
-        .collect()
-}
-
-/// Build per-entry line groups for the activity ring (one line per milestone).
-fn build_activity_entries(
-    app: &App<'_>,
-    width: u16,
-    theme: &Theme,
-    icons: &IconSet,
-) -> Vec<Vec<Line<'static>>> {
-    app.snapshot
-        .activity
-        .iter()
-        .map(|m| vec![format::milestone_line(m, width as usize, theme, icons)])
-        .collect()
-}
-
-/// Render a single dashboard frame. Shared by the event loop and tests so both
-/// exercise the same render path.
+/// Render one full frame.
 #[allow(
     clippy::too_many_lines,
     clippy::cast_possible_truncation,
-    reason = "one draw function covers the waiting state plus the wide and narrow layouts"
+    reason = "one draw covers header, grid, four panes, and footer; terminal coords are small"
 )]
-fn render_dashboard(f: &mut Frame<'_>, app: &mut App<'_>, layout: &mut PanelLayout) {
+fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
     let area = f.area();
-    *layout = PanelLayout::default();
-
-    // ── Too small / waiting states ─────────────────────────────
-    if area.width < 16 || area.height < 4 {
-        return;
-    }
-    if !app.daemon_present() {
-        let msg = "Waiting for daemon\u{2026}";
-        let w = UnicodeWidthStr::width(msg) as u16;
-        let x = area.x + area.width.saturating_sub(w) / 2;
-        let y = area.y + area.height / 2;
-        f.buffer_mut().set_string(x, y, msg, app.theme.muted);
+    *rects = PanelRects::default();
+    if area.width < 24 || area.height < 8 {
         return;
     }
 
     let theme = app.theme;
     let icons = app.icons;
-    let focus = app.focus;
+    let buf = f.buffer_mut();
 
-    if area.width < NARROW_THRESHOLD {
-        // ── Narrow: four stacked full-width boards ─────────────
-        let v = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Fill(1),
-                Constraint::Length(1),
-                Constraint::Fill(1),
-                Constraint::Length(1),
-                Constraint::Fill(1),
-                Constraint::Length(1),
-                Constraint::Fill(1),
-            ])
-            .split(area);
-        let servers_rect = v[0];
-        let sep_a = v[1];
-        let sessions_rect = v[2];
-        let sep_b = v[3];
-        let activity_rect = v[4];
-        let sep_c = v[5];
-        let alerts_rect = v[6];
+    // Header strip (row 0) + footer (last row); grid between.
+    let header = render::header_line(&app.snapshot, app.verdict, theme);
+    buf.set_line(area.x, area.y, &header, area.width);
 
-        let sb = Borders::TOP | Borders::LEFT | Borders::RIGHT;
-        let mb = Borders::LEFT | Borders::RIGHT;
-        let ab = Borders::LEFT | Borders::RIGHT | Borders::BOTTOM;
-        let servers_inner = inner_of(servers_rect, sb);
-        let sessions_inner = inner_of(sessions_rect, mb);
-        let activity_inner = inner_of(activity_rect, mb);
-        let alerts_inner = inner_of(alerts_rect, ab);
+    let footer_y = area.y + area.height - 1;
+    if app.keybinds_expanded {
+        // Expanded keybind panel occupies the lines just above the footer.
+        let kb_h = KEYBINDS_EXPANDED_HEIGHT.min(area.height.saturating_sub(2));
+        render_keybinds_content(
+            Rect::new(area.x, footer_y.saturating_sub(kb_h), area.width, kb_h),
+            buf,
+            theme,
+        );
+    }
+    let footer = render::footer_line(theme);
+    buf.set_line(area.x, footer_y, &footer, area.width);
 
-        let server_entries = build_server_entries(app, servers_inner.width, theme, icons);
-        let session_entries = build_session_entries(app, sessions_inner.width, theme, icons);
-        let activity_entries = build_activity_entries(app, activity_inner.width, theme, icons);
-        let alert_entries = build_alert_entries(app, alerts_inner.width, theme, icons);
-
-        render_board_into(
-            " Servers ",
-            focus == Focus::Servers,
-            &server_entries,
-            SERVER_LPE,
-            &mut app.servers,
-            servers_rect,
-            servers_inner,
-            f.buffer_mut(),
-            theme,
-            sb,
-        );
-        render_separator(
-            sep_a.y,
-            sep_a.x,
-            sep_a.width,
-            " Sessions ",
-            theme,
-            f.buffer_mut(),
-            true,
-            true,
-        );
-        render_board_into(
-            "",
-            focus == Focus::Sessions,
-            &session_entries,
-            SESSION_LPE,
-            &mut app.sessions,
-            sessions_rect,
-            sessions_inner,
-            f.buffer_mut(),
-            theme,
-            mb,
-        );
-        render_separator(
-            sep_b.y,
-            sep_b.x,
-            sep_b.width,
-            " Activity ",
-            theme,
-            f.buffer_mut(),
-            true,
-            true,
-        );
-        render_board_into(
-            "",
-            focus == Focus::Activity,
-            &activity_entries,
-            ACTIVITY_LPE,
-            &mut app.activity,
-            activity_rect,
-            activity_inner,
-            f.buffer_mut(),
-            theme,
-            mb,
-        );
-        render_separator(
-            sep_c.y,
-            sep_c.x,
-            sep_c.width,
-            " Alerts ",
-            theme,
-            f.buffer_mut(),
-            true,
-            true,
-        );
-        render_board_into(
-            "",
-            focus == Focus::Alerts,
-            &alert_entries,
-            ALERT_LPE,
-            &mut app.alerts,
-            alerts_rect,
-            alerts_inner,
-            f.buffer_mut(),
-            theme,
-            ab,
-        );
-
-        layout.servers = servers_rect;
-        layout.servers_inner = servers_inner;
-        layout.sessions = sessions_rect;
-        layout.sessions_inner = sessions_inner;
-        layout.activity = activity_rect;
-        layout.activity_inner = activity_inner;
-        layout.alerts = alerts_rect;
-        layout.alerts_inner = alerts_inner;
+    if !app.daemon_present() {
+        let msg = "Waiting for daemon…";
+        let w = UnicodeWidthStr::width(msg) as u16;
+        let x = area.x + area.width.saturating_sub(w) / 2;
+        let y = area.y + area.height / 2;
+        buf.set_string(x, y, msg, theme.muted);
         return;
     }
 
-    // ── Wide: left column (servers/sessions/keybinds) + right
-    //    column (activity over alerts) ─────────────────────────
-    let h = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(app.sidebar_pct),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ])
-        .split(area);
-    let left = h[0];
-    let divider = h[1];
-    let right = h[2];
-
-    let kb_height = if app.keybinds_expanded {
-        KEYBINDS_EXPANDED_HEIGHT + 1
-    } else {
-        1
-    };
-    let v = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Fill(1),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-            Constraint::Length(1),
-            Constraint::Length(kb_height),
-        ])
-        .split(left);
-    let servers_rect = v[0];
-    let sep1 = v[1];
-    let sessions_rect = v[2];
-    let sep2 = v[3];
-    let keybinds_rect = v[4];
-
-    // Right column: activity (top) over alerts (bottom).
-    let rv = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Fill(1),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ])
-        .split(right);
-    let activity_rect = rv[0];
-    let sep_r = rv[1];
-    let alerts_rect = rv[2];
-
-    let sb = Borders::TOP | Borders::LEFT;
-    let mb = Borders::LEFT;
-    let atb = Borders::TOP | Borders::RIGHT;
-    let alb = Borders::RIGHT | Borders::BOTTOM;
-    let servers_inner = inner_of(servers_rect, sb);
-    let sessions_inner = inner_of(sessions_rect, mb);
-    let activity_inner = inner_of(activity_rect, atb);
-    let alerts_inner = inner_of(alerts_rect, alb);
-
-    let server_entries = build_server_entries(app, servers_inner.width, theme, icons);
-    let session_entries = build_session_entries(app, sessions_inner.width, theme, icons);
-    let activity_entries = build_activity_entries(app, activity_inner.width, theme, icons);
-    let alert_entries = build_alert_entries(app, alerts_inner.width, theme, icons);
-    let alerts_title = daemon_status(&app.snapshot);
-
-    render_board_into(
-        " Servers ",
-        focus == Focus::Servers,
-        &server_entries,
-        SERVER_LPE,
-        &mut app.servers,
-        servers_rect,
-        servers_inner,
-        f.buffer_mut(),
-        theme,
-        sb,
-    );
-    render_separator(
-        sep1.y,
-        sep1.x,
-        sep1.width,
-        " Sessions ",
-        theme,
-        f.buffer_mut(),
-        true,
-        false,
-    );
-    render_board_into(
-        "",
-        focus == Focus::Sessions,
-        &session_entries,
-        SESSION_LPE,
-        &mut app.sessions,
-        sessions_rect,
-        sessions_inner,
-        f.buffer_mut(),
-        theme,
-        mb,
+    let grid = Rect::new(
+        area.x,
+        area.y + 1,
+        area.width,
+        area.height.saturating_sub(2),
     );
 
-    // Keybinds separator + (collapsible) content.
-    let kb_title = if app.keybinds_expanded {
-        " Keybinds  ? "
-    } else {
-        " Keybinds  ? to expand "
-    };
-    render_separator(
-        sep2.y,
-        sep2.x,
-        sep2.width,
-        kb_title,
+    // Precompute detail lines + tree entries before mutating cursors.
+    let detail_entity = app.detail_entity();
+    let detail_lines = render::detail_lines(
+        detail_entity.as_ref(),
+        &app.snapshot,
+        app.config.as_ref(),
+        &app.findings,
         theme,
-        f.buffer_mut(),
-        true,
-        false,
     );
-    let kb_block = panel_block("", false, theme, Borders::BOTTOM | Borders::LEFT);
-    let kb_inner = kb_block.inner(keybinds_rect);
-    kb_block.render(keybinds_rect, f.buffer_mut());
-    if app.keybinds_expanded {
-        render_keybinds_content(kb_inner, f.buffer_mut(), theme);
+
+    if area.width < NARROW_THRESHOLD {
+        render_narrow(app, grid, buf, theme, icons, &detail_lines, rects);
+        return;
     }
 
-    // Right column: activity board (top), then the alerts board (bottom) with
-    // the daemon-status line carried on the separator between them.
-    render_board_into(
-        " Activity ",
-        focus == Focus::Activity,
-        &activity_entries,
-        ACTIVITY_LPE,
-        &mut app.activity,
-        activity_rect,
-        activity_inner,
-        f.buffer_mut(),
+    let split_x = grid.x + grid.width * LEFT_PCT / 100;
+    let split_y = grid.y + grid.height / 2;
+    let [tl, tr, bl, br] = draw_grid_borders(grid, split_x, split_y, buf, theme.border_unfocused);
+
+    let root_entries = tree_entries(&app.root_rows, tl.width, theme, icons);
+    let session_entries = tree_entries(&app.session_rows, bl.width, theme, icons);
+    let problem_entries = render::problem_entries(&app.problem_rows, br.width as usize, theme);
+
+    render_list(
+        " Roots & Servers",
+        app.focus == Pane::RootTree,
+        &root_entries,
+        &mut app.root_cursor,
+        tl,
+        buf,
         theme,
-        atb,
     );
-    render_separator(
-        sep_r.y,
-        sep_r.x,
-        sep_r.width,
-        &alerts_title,
+    render_detail(
+        " Detail",
+        app.focus == Pane::Detail,
+        &detail_lines,
+        tr,
+        buf,
         theme,
-        f.buffer_mut(),
-        false,
-        true,
     );
-    render_board_into(
-        "",
-        focus == Focus::Alerts,
-        &alert_entries,
-        ALERT_LPE,
-        &mut app.alerts,
-        alerts_rect,
-        alerts_inner,
-        f.buffer_mut(),
+    render_list(
+        " Clients & Sessions",
+        app.focus == Pane::SessionTree,
+        &session_entries,
+        &mut app.session_cursor,
+        bl,
+        buf,
         theme,
-        alb,
+    );
+    render_list(
+        " Problems",
+        app.focus == Pane::Problems,
+        &problem_entries,
+        &mut app.problem_cursor,
+        br,
+        buf,
+        theme,
     );
 
-    render_divider_col(
-        divider.x,
-        divider.y,
-        divider.y + divider.height.saturating_sub(1),
-        &[sep1.y, sep2.y],
-        &[sep_r.y],
-        theme.border_unfocused,
-        f.buffer_mut(),
-    );
-
-    layout.servers = servers_rect;
-    layout.servers_inner = servers_inner;
-    layout.sessions = sessions_rect;
-    layout.sessions_inner = sessions_inner;
-    layout.activity = activity_rect;
-    layout.activity_inner = activity_inner;
-    layout.alerts = alerts_rect;
-    layout.alerts_inner = alerts_inner;
-    layout.keybinds = Rect {
-        y: sep2.y,
-        height: sep2.height + keybinds_rect.height,
-        ..keybinds_rect
-    };
-    layout.divider_col = divider.x;
-    layout.total_width = area.width;
+    rects.root = tl;
+    rects.detail = tr;
+    rects.session = bl;
+    rects.problems = br;
 }
 
-/// Main event loop: re-load the snapshot, render the boards, handle input.
+/// Narrow degradation: stack the four panes full-width.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "narrow stacking needs the full render context"
+)]
+fn render_narrow(
+    app: &mut App<'_>,
+    grid: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    icons: &IconSet,
+    detail_lines: &[Line<'static>],
+    rects: &mut PanelRects,
+) {
+    let h = grid.height / 4;
+    if h == 0 {
+        return;
+    }
+    let tl = Rect::new(grid.x, grid.y, grid.width, h);
+    let bl = Rect::new(grid.x, grid.y + h, grid.width, h);
+    let tr = Rect::new(grid.x, grid.y + 2 * h, grid.width, h);
+    let br = Rect::new(grid.x, grid.y + 3 * h, grid.width, grid.height - 3 * h);
+
+    let root_entries = tree_entries(&app.root_rows, tl.width, theme, icons);
+    let session_entries = tree_entries(&app.session_rows, bl.width, theme, icons);
+    let problem_entries = render::problem_entries(&app.problem_rows, br.width as usize, theme);
+
+    render_list(
+        " Roots & Servers",
+        app.focus == Pane::RootTree,
+        &root_entries,
+        &mut app.root_cursor,
+        tl,
+        buf,
+        theme,
+    );
+    render_list(
+        " Clients & Sessions",
+        app.focus == Pane::SessionTree,
+        &session_entries,
+        &mut app.session_cursor,
+        bl,
+        buf,
+        theme,
+    );
+    render_detail(
+        " Detail",
+        app.focus == Pane::Detail,
+        detail_lines,
+        tr,
+        buf,
+        theme,
+    );
+    render_list(
+        " Problems",
+        app.focus == Pane::Problems,
+        &problem_entries,
+        &mut app.problem_cursor,
+        br,
+        buf,
+        theme,
+    );
+
+    rects.root = tl;
+    rects.session = bl;
+    rects.detail = tr;
+    rects.problems = br;
+}
+
+/// Main event loop: re-load the snapshot, render, handle input.
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App<'_>,
     watch_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<()> {
     let mut last_tick = Instant::now();
-    let mut layout = PanelLayout::default();
+    let mut rects = PanelRects::default();
 
     loop {
-        terminal.draw(|f| render_dashboard(f, app, &mut layout))?;
+        terminal.draw(|f| render_frame(f, app, &mut rects))?;
 
         if app.quit {
             return Ok(());
@@ -971,9 +724,11 @@ fn run_loop(
 
         if event::poll(timeout)? {
             match event::read()? {
-                Event::Key(key) => handle_key(app, key.code),
+                Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
+                    handle_key(app, key.code);
+                }
                 Event::Mouse(mouse) => {
-                    handle_mouse(app, mouse.kind, mouse.column, mouse.row, &layout);
+                    handle_mouse(app, mouse.kind, mouse.column, mouse.row, &rects);
                 }
                 _ => {}
             }
@@ -997,93 +752,127 @@ fn run_loop(
 mod tests {
     use super::*;
     use crate::state_snapshot::{
-        Alert, ClientInfo, DaemonSnapshot, LastAction, Milestone, MilestoneKind, Progress,
-        ServerEntry, SessionEntry, SessionStatus, Snapshot,
+        ClientInfo, DaemonSnapshot, LastMessage, ServerEntry, SessionEntry, Snapshot, Subagent,
     };
     use crate::tui::data::MockDataSource;
-    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn fixture() -> Snapshot {
-        Snapshot {
-            schema: 1,
+    /// A fleet: 20+ servers across several roots, sessions on different hosts,
+    /// all healthy except one broken server.
+    fn fleet_fixture(one_broken: bool) -> Snapshot {
+        let mut snap = Snapshot {
             daemon: DaemonSnapshot {
                 instance_id: "daemon:test".to_string(),
                 pid: 4242,
-                version: "2.0.0".to_string(),
-                started_at: "2026-06-08T12:00:00Z".to_string(),
-                generated_at: chrono::Utc::now()
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                version: env!("CATENARY_VERSION").to_string(),
+                started_at: "2026-07-07T12:00:00Z".to_string(),
+                generated_at: crate::state_snapshot::now_iso(),
             },
-            servers: vec![
-                ServerEntry {
-                    id: "rust-analyzer@/p/Catenary".to_string(),
-                    server: "rust-analyzer".to_string(),
-                    scope_root: "/p/Catenary".to_string(),
-                    state: "probing".to_string(),
-                    // 5m05s ago → growing time-in-state.
-                    state_since: (chrono::Utc::now() - chrono::Duration::seconds(305))
-                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                    progress: Some(Progress {
-                        title: "Indexing".to_string(),
-                        message: None,
-                        pct: Some(62),
-                    }),
-                    ..ServerEntry::default()
-                },
-                ServerEntry {
-                    id: "pyright@/p/Other".to_string(),
-                    server: "pyright".to_string(),
+            ..Snapshot::default()
+        };
+        // 3 roots × 7 servers = 21 healthy instances.
+        for r in 0..3 {
+            for s in 0..7 {
+                snap.servers.push(ServerEntry {
+                    id: format!("srv{s}@/p/root{r}"),
+                    language: format!("lang{s}"),
+                    server: format!("srv{s}"),
+                    scope_root: format!("/p/root{r}"),
                     state: "healthy".to_string(),
-                    state_since: chrono::Utc::now().to_rfc3339(),
+                    state_since: crate::state_snapshot::now_iso(),
                     ..ServerEntry::default()
-                },
-            ],
-            sessions: vec![SessionEntry {
-                id: "mcp:7f3a".to_string(),
+                });
+            }
+        }
+        if one_broken {
+            snap.servers.push(ServerEntry {
+                id: "julia-ls@/p/root0".to_string(),
+                language: "julia".to_string(),
+                server: "julia-ls".to_string(),
+                scope_root: "/p/root0".to_string(),
+                state: "failed".to_string(),
+                state_since: crate::state_snapshot::now_iso(),
+                last_message: Some(LastMessage {
+                    level: "error".to_string(),
+                    text: "initialize failed".to_string(),
+                    at: crate::state_snapshot::now_iso(),
+                }),
+                ..ServerEntry::default()
+            });
+        }
+        snap.sessions = vec![
+            SessionEntry {
+                id: "claude-abc".to_string(),
                 client: ClientInfo {
                     name: "claude".to_string(),
                     version: None,
                 },
-                status: SessionStatus::Editing,
-                last_seen: chrono::Utc::now().to_rfc3339(),
-                last_action: Some(LastAction {
-                    summary: "edited src/db.rs".to_string(),
-                    at: chrono::Utc::now().to_rfc3339(),
-                }),
-                roots: vec!["/p/Catenary".to_string()],
+                last_seen: crate::state_snapshot::now_iso(),
+                subagents: vec![Subagent {
+                    id: "agent-1".to_string(),
+                    started_at: crate::state_snapshot::now_iso(),
+                }],
                 ..SessionEntry::default()
-            }],
-            roots: Vec::new(),
-            alerts: vec![Alert {
-                at: "2026-06-08T14:32:00.000Z".to_string(),
-                level: "error".to_string(),
-                source: Some("lsp".to_string()),
-                text: "rust-analyzer exited (code 101)".to_string(),
-                scope: Some("rust-analyzer@/p/Catenary".to_string()),
-            }],
-            activity: vec![Milestone {
-                at: "2026-06-08T14:31:00.000Z".to_string(),
-                kind: MilestoneKind::Diagnostics,
-                summary: "3 errors, 12 warnings · 4 files".to_string(),
-                scope: Some("mcp:7f3a".to_string()),
-            }],
+            },
+            SessionEntry {
+                id: "antigravity-xyz".to_string(),
+                client: ClientInfo {
+                    name: "antigravity".to_string(),
+                    version: None,
+                },
+                last_seen: crate::state_snapshot::now_iso(),
+                ..SessionEntry::default()
+            },
+        ];
+        snap
+    }
+
+    /// The config the fleet fixture routes against: empty for the healthy
+    /// fleet, `julia-ls → julia` for the broken variant (so the failed instance
+    /// surfaces as an intent-broken `Fatal`).
+    fn fleet_config(one_broken: bool) -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        if one_broken {
+            use crate::config::{LanguageConfig, ServerBinding, ServerDef};
+            config.server.insert(
+                "julia-ls".to_string(),
+                ServerDef {
+                    command: "julia-ls".to_string(),
+                    ..ServerDef::default()
+                },
+            );
+            config.language.insert(
+                "julia".to_string(),
+                LanguageConfig {
+                    servers: Some(vec![ServerBinding::new("julia-ls")]),
+                    ..Default::default()
+                },
+            );
         }
+        config
     }
 
-    fn app_for<'a>(theme: &'a Theme, icons: &'a IconSet, snap: Snapshot) -> App<'a> {
-        App::new(theme, icons, Box::new(MockDataSource::new(snap))).expect("app")
-    }
-
-    fn render_to_string(snap: Snapshot, width: u16, height: u16) -> String {
+    fn render_to_string(
+        snap: Snapshot,
+        config: crate::config::Config,
+        width: u16,
+        height: u16,
+    ) -> String {
         let theme = Theme::new();
         let icons = IconSet::from_config(IconConfig::default());
-        let mut app = app_for(&theme, &icons, snap);
+        let mut app = App::with_injected_config(
+            &theme,
+            &icons,
+            PathBuf::from("/nonexistent"),
+            config,
+            Box::new(MockDataSource::new(snap)),
+        )
+        .expect("app");
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        let mut layout = PanelLayout::default();
+        let mut rects = PanelRects::default();
         terminal
-            .draw(|f| render_dashboard(f, &mut app, &mut layout))
+            .draw(|f| render_frame(f, &mut app, &mut rects))
             .expect("draw");
         buffer_to_string(terminal.backend().buffer())
     }
@@ -1100,60 +889,85 @@ mod tests {
     }
 
     #[test]
-    fn renders_all_four_boards_from_fixture() {
-        let out = render_to_string(fixture(), 100, 24);
-        assert!(out.contains("Servers"), "server board title: {out}");
-        assert!(out.contains("rust-analyzer"), "server row: {out}");
-        assert!(out.contains("pyright"), "second server: {out}");
-        assert!(out.contains("Sessions"), "session board title");
-        assert!(out.contains("claude"), "session client");
-        assert!(out.contains("edited src/db.rs"), "session last action");
-        assert!(out.contains("Activity"), "activity board title: {out}");
+    fn healthy_fleet_renders_quiet_verdict() {
+        let out = render_to_string(fleet_fixture(false), fleet_config(false), 100, 30);
+        assert!(out.contains("working"), "green verdict when healthy: {out}");
+        assert!(out.contains("Roots & Servers"), "root tree title");
+        assert!(out.contains("Problems"), "problems pane title");
+    }
+
+    #[test]
+    fn healthy_fleet_collapses_roots_to_one_line_each() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let app = App::with_injected_config(
+            &theme,
+            &icons,
+            PathBuf::from("/nonexistent"),
+            fleet_config(false),
+            Box::new(MockDataSource::new(fleet_fixture(false))),
+        )
+        .expect("app");
+        // 21 servers over 3 roots → 3 collapsed root lines (density law).
+        assert_eq!(app.root_rows.len(), 3);
+    }
+
+    #[test]
+    fn broken_server_surfaces_in_problems_and_focuses() {
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = App::with_injected_config(
+            &theme,
+            &icons,
+            PathBuf::from("/nonexistent"),
+            fleet_config(true),
+            Box::new(MockDataSource::new(fleet_fixture(true))),
+        )
+        .expect("app");
+        // julia-ls failed → a problem with a fix-it.
         assert!(
-            out.contains("3 errors, 12 warnings"),
-            "milestone summary: {out}"
+            app.problem_rows
+                .iter()
+                .any(|p| p.message.contains("julia-ls")),
+            "broken server is in the problems pane",
         );
-        assert!(out.contains("Alerts"), "alerts title");
-        assert!(out.contains("rust-analyzer exited"), "alert text");
+        assert!(!app.verdict.is_working(), "verdict is not working");
+        // Selecting it focuses the root tree on the owning server.
+        app.set_focus(Pane::Problems);
+        app.jump_home();
+        app.activate();
+        assert_eq!(
+            app.focus,
+            Pane::RootTree,
+            "selection jumps to the root tree"
+        );
+        let idx = app.root_cursor.index;
+        assert!(
+            matches!(&app.root_rows[idx], model::Row::Server(s) if s.server == "julia-ls"),
+            "cursor lands on the owning server",
+        );
     }
 
     #[test]
-    fn stuck_probing_shows_growing_time_in_state() {
-        let out = render_to_string(fixture(), 100, 24);
-        // The probing server's state_since is 5m05s in the past.
-        assert!(out.contains("5m05s"), "time-in-state visible: {out}");
-        assert!(out.contains("probing"), "probing state shown");
+    fn problems_pane_budget_fits_in_80x24() {
+        // Verdict + a handful of problems must fit in 80×24 unscrolled.
+        let out = render_to_string(fleet_fixture(true), fleet_config(true), 80, 24);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines.len() <= 24, "fits the height: {}", lines.len());
+        assert!(out.contains("julia-ls"), "the problem is visible: {out}");
     }
 
     #[test]
-    fn narrow_layout_still_renders_all_boards() {
-        let out = render_to_string(fixture(), 50, 32);
-        assert!(out.contains("Servers"), "{out}");
-        assert!(out.contains("Sessions"), "{out}");
-        assert!(out.contains("Activity"), "{out}");
-        assert!(out.contains("Alerts"), "{out}");
-        assert!(out.contains("rust-analyzer"), "{out}");
+    fn narrow_layout_stacks_panes() {
+        let out = render_to_string(fleet_fixture(true), fleet_config(true), 60, 40);
+        assert!(out.contains("Roots & Servers"), "{out}");
+        assert!(out.contains("Problems"), "{out}");
     }
 
     #[test]
     fn waiting_state_when_no_daemon() {
-        let out = render_to_string(Snapshot::default(), 80, 12);
+        let out = render_to_string(Snapshot::default(), fleet_config(false), 100, 24);
         assert!(out.contains("Waiting for daemon"), "{out}");
-    }
-
-    #[test]
-    fn key_navigation_moves_focus_and_cursor() {
-        let theme = Theme::new();
-        let icons = IconSet::from_config(IconConfig::default());
-        let mut app = app_for(&theme, &icons, fixture());
-        app.servers.visible = 10;
-        assert_eq!(app.focus, Focus::Servers);
-        handle_key(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.servers.cursor, 1);
-        handle_key(&mut app, KeyCode::Tab);
-        assert_eq!(app.focus, Focus::Sessions);
-        // 'y' on a session yanks without panicking.
-        handle_key(&mut app, KeyCode::Char('y'));
     }
 
     #[test]
@@ -1161,13 +975,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state.json");
         let (_watcher, rx) = start_state_watcher(&path).expect("watcher");
-
-        // Atomic write: temp + rename, as the daemon does.
         let tmp = dir.path().join("state.json.tmp");
         std::fs::write(&tmp, "{}").expect("write tmp");
         std::fs::rename(&tmp, &path).expect("rename");
-
         let got = rx.recv_timeout(Duration::from_secs(5));
-        assert!(got.is_ok(), "watcher should signal on rename to state.json");
+        assert!(got.is_ok(), "watcher signals on rename to state.json");
     }
 }

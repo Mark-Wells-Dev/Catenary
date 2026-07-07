@@ -539,6 +539,9 @@ fn extract_session_roots(raw: &serde_json::Value) -> Vec<String> {
 #[cfg(unix)]
 struct SessionBoardImpl {
     sessions: Arc<std::sync::Mutex<HashMap<String, SessionEntry>>>,
+    /// Live subagents by parent session, pulled at each flush so a session's
+    /// board entry carries its running subagent sub-rows (tui-rework 03).
+    subagents: SubagentRegistry,
 }
 
 #[cfg(unix)]
@@ -566,8 +569,91 @@ impl crate::state_snapshot::SessionBoard for SessionBoardImpl {
                 roots: entry.meta.roots.clone(),
                 status: entry.router.session.status(),
                 last_action: entry.router.session.last_action(),
+                subagents: self.subagents.for_session(id),
             })
             .collect()
+    }
+}
+
+/// Daemon-side live-subagent registry: parent `session_id` → its running
+/// subagents.
+///
+/// Populated at `SubagentStart` and pruned at `SubagentStop` / `SessionEnd`;
+/// the session board pulls it at each snapshot flush. Independent of the
+/// session-entry lifecycle (a subagent can be recorded whether or not the
+/// parent has a live entry yet), mirroring the `worktree_mounts` /
+/// `ephemeral_mounts` side registries. Only hosts that feed subagent identity
+/// (Claude Code) ever populate it — capability-aware, no fabrication.
+#[cfg(unix)]
+#[derive(Clone, Default)]
+struct SubagentRegistry {
+    inner: Arc<std::sync::Mutex<HashMap<String, Vec<crate::state_snapshot::Subagent>>>>,
+}
+
+#[cfg(unix)]
+impl SubagentRegistry {
+    /// A fresh, empty registry.
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a subagent under its parent session (idempotent per agent id).
+    /// A blank agent id (path-keyed `--worktree` session) records nothing.
+    fn start(&self, session_id: &str, agent_id: &str, started_at: String) {
+        if agent_id.is_empty() {
+            return;
+        }
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let list = map.entry(session_id.to_string()).or_default();
+        if list.iter().all(|s| s.id != agent_id) {
+            list.push(crate::state_snapshot::Subagent {
+                id: agent_id.to_string(),
+                started_at,
+            });
+        }
+        drop(map);
+    }
+
+    /// Remove a subagent at stop; drops the session bucket when it empties.
+    fn stop(&self, session_id: &str, agent_id: &str) {
+        if agent_id.is_empty() {
+            return;
+        }
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(list) = map.get_mut(session_id) {
+            list.retain(|s| s.id != agent_id);
+            if list.is_empty() {
+                map.remove(session_id);
+            }
+        }
+    }
+
+    /// Drop every subagent under a session (its `SessionEnd` sweep).
+    fn clear_session(&self, session_id: &str) {
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.remove(session_id);
+    }
+
+    /// The live subagents under `session_id`, sorted by start time.
+    fn for_session(&self, session_id: &str) -> Vec<crate::state_snapshot::Subagent> {
+        let mut list = {
+            let map = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.get(session_id).cloned().unwrap_or_default()
+        };
+        list.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+        list
     }
 }
 
@@ -723,6 +809,10 @@ struct HookDispatchContext {
     /// the ephemeral clocks; the worktree idle reaper reads it to unmount a quiet
     /// worktree root, and a blocked root is exempt from that expiry.
     worktree_mounts: WorktreeMounts,
+    /// Live subagents by parent session (tui-rework 03). Recorded at
+    /// `SubagentStart`, pruned at `SubagentStop` / `SessionEnd`; shared with the
+    /// session board so `state.json` carries subagent sub-rows.
+    subagents: SubagentRegistry,
 }
 
 /// A staged hook→CLI handoff, deposited under a [`HandoffKey`] by the
@@ -2315,6 +2405,9 @@ impl SessionManager {
         // Shared with the root board so `state.json` can surface each ephemeral
         // root's idle-remaining figure; the hook context holds the same handle.
         let ephemeral_mounts = EphemeralMounts::new();
+        // Shared with the session board so `state.json` carries each session's
+        // live subagents; the hook context records/prunes into the same handle.
+        let subagents = SubagentRegistry::new();
         // Wire the live session board + root board onto the daemon snapshot so
         // `state.json` carries the rich session board (observability ticket 05)
         // and the daemon-level tracked-root board with full contributor classes
@@ -2323,6 +2416,7 @@ impl SessionManager {
         if let Some(snapshot) = &session.snapshot {
             snapshot.set_session_board(Arc::new(SessionBoardImpl {
                 sessions: sessions.clone(),
+                subagents: subagents.clone(),
             }));
             snapshot.set_root_board(Arc::new(RootBoardImpl {
                 tracker: root_tracker.clone(),
@@ -2372,6 +2466,7 @@ impl SessionManager {
             first_sightings: FirstSightings::new(),
             worktree_registry,
             worktree_mounts: WorktreeMounts::new(),
+            subagents,
         });
         self
     }
@@ -3795,6 +3890,8 @@ async fn handle_hook_dispatch(
             }
             // Drop this session's worktree idle clocks too (misc 150).
             ctx.worktree_mounts.remove_prefix(&prefix);
+            // Drop this session's subagent board entries too (tui-rework 03).
+            ctx.subagents.clear_session(&session_id);
             if removed > 0 {
                 info!(
                     source = Source::DaemonDispatch.as_str(),
@@ -3933,6 +4030,14 @@ async fn handle_hook_dispatch(
     // concern (RootTracker), with no per-session editing/notification state.
     if method == "subagent-start/mount-worktree" {
         let scope_id = uuid::Uuid::new_v4().to_string();
+
+        // Record the subagent under its parent session for the board, whether or
+        // not a worktree is mounted below (a subagent with no worktree still runs
+        // under the session). Blank agent id (`--worktree`/foreign) records nothing.
+        if let Some(agent_id) = raw.get("agent_id").and_then(|v| v.as_str()) {
+            ctx.subagents
+                .start(&session_id, agent_id, crate::state_snapshot::now_iso());
+        }
 
         if let Some(ref tracker) = ctx.root_tracker
             && let Some(cwd) = raw.get("cwd").and_then(|v| v.as_str())
@@ -5073,6 +5178,9 @@ async fn handle_hook_dispatch(
         && !matches!(&result.result, Some(crate::hook::HookResult::Block(_)))
     {
         let agent_id = raw.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        // Drop the subagent from the board — it has stopped (the stop is allowed;
+        // a blocked stop, gated out above, means it is still running).
+        ctx.subagents.stop(&session_id, agent_id);
         let cwd = hp.get("cwd").and_then(|v| v.as_str());
         if let Some((contributor, worktree)) =
             resolve_stop_reap_target(&ctx, tracker, &session_id, agent_id, cwd)
@@ -6516,6 +6624,32 @@ mod tests {
             .with_session(session)
     }
 
+    #[test]
+    fn subagent_registry_start_stop_and_clear() {
+        let reg = SubagentRegistry::new();
+        reg.start("sess-1", "agent-a", "2026-06-08T13:10:00.000Z".to_string());
+        reg.start("sess-1", "agent-b", "2026-06-08T13:11:00.000Z".to_string());
+        // Idempotent per agent id — a duplicate start is ignored.
+        reg.start("sess-1", "agent-a", "2026-06-08T13:12:00.000Z".to_string());
+        // A blank agent id (path-keyed session) records nothing.
+        reg.start("sess-1", "", "2026-06-08T13:13:00.000Z".to_string());
+
+        let live = reg.for_session("sess-1");
+        assert_eq!(live.len(), 2, "two distinct subagents, start-time sorted");
+        assert_eq!(live[0].id, "agent-a");
+        assert_eq!(live[1].id, "agent-b");
+        assert!(reg.for_session("other").is_empty(), "no cross-session leak");
+
+        reg.stop("sess-1", "agent-a");
+        assert_eq!(reg.for_session("sess-1"), vec![live[1].clone()]);
+
+        reg.clear_session("sess-1");
+        assert!(
+            reg.for_session("sess-1").is_empty(),
+            "session sweep drops all"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn session_board_builds_rich_entries() {
         use crate::state_snapshot::{SessionBoard, SessionStatus};
@@ -6553,7 +6687,10 @@ mod tests {
                 },
             },
         );
-        let board = SessionBoardImpl { sessions };
+        let board = SessionBoardImpl {
+            sessions,
+            subagents: SubagentRegistry::new(),
+        };
 
         // Idle to start: no editing accumulator, no last_action. Client name
         // from the payload `format`; version unknown (omitted).
@@ -6719,6 +6856,7 @@ mod tests {
             (
                 SessionBoardImpl {
                     sessions: ctx.sessions.clone(),
+                    subagents: ctx.subagents.clone(),
                 },
                 session,
             )

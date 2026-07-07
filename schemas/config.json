@@ -860,39 +860,6 @@
         }
       },
       "type": "object"
-    },
-    "TuiConfig": {
-      "additionalProperties": false,
-      "description": "TUI configuration options.\n\nControls the interactive monitor's layout and behavior.",
-      "properties": {
-        "auto_add_sessions": {
-          "default": true,
-          "description": "Automatically add new sessions to the grid (default: true).",
-          "type": "boolean"
-        },
-        "capture_tool_output": {
-          "default": false,
-          "description": "Capture full tool output in `ToolResult` events for TUI detail expansion (default: false). Increases database size.",
-          "type": "boolean"
-        },
-        "focus_follows_mouse": {
-          "default": false,
-          "description": "Whether mouse hover changes focus (default: false).",
-          "type": "boolean"
-        },
-        "keep_dead_panels": {
-          "default": false,
-          "description": "Keep panels open after a session dies instead of closing them (default: false). Dead panels show the session ID with dimmed styling. When false, panels are closed on the next liveness check.",
-          "type": "boolean"
-        },
-        "sessions_width": {
-          "default": 0.25,
-          "description": "Preferred width of the Sessions tree as a fraction of the terminal (default: 0.25).",
-          "format": "double",
-          "type": "number"
-        }
-      },
-      "type": "object"
     }
   },
   "description": "Schema for the Catenary user config (~/.config/catenary/config.toml). Generated from the serde config structs (misc 133).",
@@ -983,17 +950,6 @@
       "anyOf": [
         {
           "$ref": "#/definitions/ToolsConfig"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null
-    },
-    "tui": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/TuiConfig"
         },
         {
           "type": "null"

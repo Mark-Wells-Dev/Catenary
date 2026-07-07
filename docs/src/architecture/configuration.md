@@ -52,7 +52,7 @@ per-field basis:
 
 2. **User config** (`~/.config/catenary/config.toml`) — full config.
    Adds server bindings, server definitions, and all other sections
-   (`[commands]`, `[notifications]`, `[icons]`, `[tui]`, `[tools]`).
+   (`[commands]`, `[notifications]`, `[icons]`, `[tools]`).
 
 3. **Project config** (`.catenary.toml` per workspace root) — scoped
    to `[lsp.language.*]`, `[lsp.server.*]`, and `[commands]`. Discovered at
@@ -100,7 +100,7 @@ earlier model where project config could contain any section.
 
 Why each remaining section is excluded:
 
-- **`[notifications]`, `[icons]`, `[tui]`, `[tools]`** — these are
+- **`[notifications]`, `[icons]`, `[tools]`** — these are
   user preferences, not project-specific. A notification threshold or
   icon preset shouldn't vary per-root.
 

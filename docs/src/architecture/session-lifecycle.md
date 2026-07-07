@@ -206,11 +206,11 @@ the daemon-owned `state.json` snapshot under `runtime_dir` and reloads on
 change — it never connects to the daemon, the firehose, or a database, so
 it cannot affect (or wedge) a running session.
 
-The snapshot holds live state only, so the dashboard renders boards
-rather than a message stream: a **Servers** board and a **Sessions**
-board on the left (with a collapsible **Keybinds** panel), and
-**Activity** and **Alerts** boards on the right. On narrow terminals the
-four boards stack full-width.
+The snapshot holds live state only, so the dashboard renders a
+health/config surface rather than a message stream: a 2×2 master-detail
+grid with the root/server tree and client/session tree on the left, a
+contextual detail pane top-right, and the problems pane bottom-right. On
+narrow terminals the four panes stack full-width.
 
 For full protocol and trace history — request/response pairing, the LSP
 traffic behind a single command — query the firehose with `catenary

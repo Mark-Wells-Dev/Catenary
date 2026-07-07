@@ -31,19 +31,41 @@ pub mod install_checks;
 pub mod servers;
 pub mod skew;
 
-/// Severity of a health finding — the `:checkhealth` OK/WARN/ERROR ladder,
-/// split so a renderer can distinguish a healthy state from silent inventory.
+/// Severity of a health finding — the `:checkhealth` ladder.
 ///
-/// Only [`Severity::Error`] and [`Severity::Warning`] are *problems*
-/// ([`Finding::is_problem`]) — the two levels a health verdict counts.
-/// [`Severity::Ok`] marks a confirmed-healthy state and [`Severity::Info`]
-/// marks non-actionable inventory or notes; neither ever shouts.
+/// Ratified 2026-07-07 into five tiers so a renderer can distinguish an
+/// intent-broken failure from a broken fact, an unchosen gap from silent
+/// inventory. The ladder, most severe first:
+///
+/// - [`Severity::Fatal`] — *intent-broken*: a routed server the user
+///   configured or installed that isn't functioning (a missing binary counts
+///   when the server is explicitly configured — a PATH break eating a chosen
+///   server ranks with a crash).
+/// - [`Severity::Error`] — *broken facts*, intent-independent: config
+///   validation failures, unresolvable server refs, unreadable hook
+///   registrations.
+/// - [`Severity::Warning`] — *impaired or stale*: 027 coverage degradation,
+///   respawn-looping-but-up, stale hooks, version skew.
+/// - [`Severity::Suggestion`] — *unchosen gaps*: a live workspace language
+///   with a shipped default binding but no binary and no explicit config.
+///   Never a problem, never in the verdict count — an honest green may still
+///   carry suggestions.
+/// - [`Severity::Ok`] — a confirmed-healthy state; never shouts.
+/// - [`Severity::Info`] — non-actionable inventory or a note (dormant server);
+///   never shouts.
+///
+/// [`Severity::Fatal`], [`Severity::Error`], and [`Severity::Warning`] are the
+/// *problems* ([`Finding::is_problem`]) a health verdict counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
-    /// A user-actionable failure (routed-but-broken server, config error).
+    /// An intent-broken failure — a configured/installed routed server down.
+    Fatal,
+    /// A user-actionable failure of fact (config error, unresolvable ref).
     Error,
     /// A user-actionable warning (unknown key, stale hooks, version skew).
     Warning,
+    /// An unchosen gap — a live language wanting a not-yet-installed server.
+    Suggestion,
     /// A confirmed-healthy state (server ready, hooks match, up to date).
     Ok,
     /// Non-actionable inventory or a note (dormant server, disable toggle).
@@ -52,10 +74,41 @@ pub enum Severity {
 
 impl Severity {
     /// Whether this severity denotes a user-actionable *problem*
-    /// ([`Severity::Error`] or [`Severity::Warning`]).
+    /// ([`Severity::Fatal`], [`Severity::Error`], or [`Severity::Warning`]) —
+    /// the tiers the verdict counts. [`Severity::Suggestion`] is deliberately
+    /// excluded: a suggestion never displaces a problem or dents the verdict.
     #[must_use]
     pub const fn is_problem(self) -> bool {
-        matches!(self, Self::Error | Self::Warning)
+        matches!(self, Self::Fatal | Self::Error | Self::Warning)
+    }
+
+    /// A stable sort rank (0 = most severe), so a renderer can order the
+    /// problems pane Fatal → Error → Warning → Suggestion without matching on
+    /// each variant. Ok/Info share the tail (they are never in the pane).
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Fatal => 0,
+            Self::Error => 1,
+            Self::Warning => 2,
+            Self::Suggestion => 3,
+            Self::Ok => 4,
+            Self::Info => 5,
+        }
+    }
+
+    /// The severity's label word (`Fatal` / `Error` / `Warning` / `Suggestion`
+    /// / `Ok` / `Info`) — the problems-pane and doctor prefix.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Fatal => "Fatal",
+            Self::Error => "Error",
+            Self::Warning => "Warning",
+            Self::Suggestion => "Suggestion",
+            Self::Ok => "Ok",
+            Self::Info => "Info",
+        }
     }
 }
 
@@ -97,8 +150,12 @@ pub enum FindingCode {
     ProjectUnresolvedServerRef,
     /// Project `[commands]` enforcement keys ignored at project scope.
     ProjectIgnoredEnforcement,
-    /// A routed server that failed its probe (missing binary, init failure).
+    /// A routed server that failed its probe (missing binary, init failure)
+    /// with intent evidence — configured or installed. A [`Severity::Fatal`].
     ServerRoutedBroken,
+    /// A live workspace language with a shipped default binding but no binary
+    /// and no explicit config — an unchosen gap ([`Severity::Suggestion`]).
+    ServerInstallSuggestion,
     /// A configured server nothing routes to — dormant inventory.
     ServerDormant,
     /// A server that probed ready.
@@ -150,6 +207,7 @@ impl FindingCode {
             Self::ProjectUnresolvedServerRef => "project-unresolved-server-ref",
             Self::ProjectIgnoredEnforcement => "project-ignored-enforcement",
             Self::ServerRoutedBroken => "server-routed-broken",
+            Self::ServerInstallSuggestion => "server-install-suggestion",
             Self::ServerDormant => "server-dormant",
             Self::ServerReady => "server-ready",
             Self::VersionSkew => "version-skew",

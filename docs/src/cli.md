@@ -6,13 +6,20 @@ Running `catenary` in an interactive terminal launches the TUI dashboard.
 When stdin and stdout are pipes (launched by an MCP client), it serves
 MCP instead — no flags needed.
 
-The dashboard is the primary way to observe Catenary at a glance. It
-reads a daemon-owned `state.json` snapshot and renders four live boards:
-the LSP servers and their health, the connected sessions, recent
-activity, and recent alerts. It is a pure file reader — it never connects
-to the daemon or opens the firehose. Full protocol and trace history
-streams to an append-only JSONL telemetry firehose, which `catenary
-query` reads after the fact.
+The dashboard is the primary way to answer *"is it working?"* at a
+glance. It reads a daemon-owned `state.json` snapshot plus the health
+model's findings and renders a **2×2 master-detail grid**: the
+root/server tree (top-left, grouped by root, healthy fleets collapsed to
+one line each), the client/session tree (bottom-left, grouped by client
+with capability-aware session status), a contextual detail pane
+(top-right, effective config / routing / session actions for the
+cursored node), and the **problems pane** (bottom-right — the durable
+notification surface, every finding with its fix-it). A header strip
+carries the one-line verdict, daemon identity, version + skew, and
+snapshot staleness. It is a pure file reader — it never connects to the
+daemon, probes an LSP, or opens the firehose. Full protocol and trace
+history streams to an append-only JSONL telemetry firehose, which
+`catenary query` reads after the fact.
 
 ```bash
 catenary  # launch dashboard
@@ -20,20 +27,22 @@ catenary  # launch dashboard
 
 ### Keybindings
 
-The dashboard renders four boards — **Servers** and **Sessions** on the
-left (with a collapsible **Keybinds** panel) and **Activity** and
-**Alerts** on the right. Navigation is keyboard-first:
+Navigation is keyboard-first; mouse click is an equal path (click a pane
+to focus it, click a row to select/expand, click a problem to jump to
+its owner):
 
 | Key | Action |
 |-----|--------|
 | `j` / `Down` | Move down one entry |
 | `k` / `Up` | Move up one entry |
-| `Tab` | Focus the next board |
-| `Shift+Tab` | Focus the previous board |
+| `Tab` | Focus the next pane |
+| `Shift+Tab` | Focus the previous pane |
+| `Enter` | Expand/collapse a node, or focus a problem's owner |
+| `p` | Problems-only — collapse both trees to broken things |
+| `d` | Toggle the dormant-server inventory |
 | `g` / `Home` | Jump to the first entry |
 | `G` / `End` | Jump to the last entry |
-| `PageDown` | Page down |
-| `PageUp` | Page up |
+| `PageDown` / `PageUp` | Page down / up |
 | `y` | Yank the selected entry (scope id / text) via OSC 52 |
 | `?` | Toggle the keybinds help panel |
 | `q` | Quit |

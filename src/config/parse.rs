@@ -17,7 +17,7 @@ use crate::logging::reaper::ReapPolicy;
 use super::commands::{self, CommandsConfig};
 use super::{
     Config, IconConfig, LanguageConfig, LinterConfig, NotificationConfig, RootsConfig,
-    ServerBinding, ServerDef, ToolsConfig, TuiConfig, default_log_retention_days,
+    ServerBinding, ServerDef, ToolsConfig, default_log_retention_days,
 };
 
 /// Embedded default classification config (lowest-priority layer).
@@ -67,9 +67,6 @@ pub(super) struct RawConfig {
 
     #[serde(default)]
     icons: Option<IconConfig>,
-
-    #[serde(default)]
-    tui: Option<TuiConfig>,
 
     #[serde(default)]
     tools: Option<ToolsConfig>,
@@ -506,7 +503,7 @@ fn parse_linter_defaults(contents: &str) -> Result<HashMap<String, LinterConfig>
 /// **Maps** (`lsp.language`, `lsp.server`, `linter.rule`): key-level merge.
 /// Later source wins per-key; keys absent from the later source are preserved.
 ///
-/// **Structured sections** (`notifications`, `icons`, `tui`, `tools`,
+/// **Structured sections** (`notifications`, `icons`, `tools`,
 /// `observability`, `roots`): `Option<T>` on `Config`. `None` means the source
 /// did not mention the section; `Some` means it was present (even if all values
 /// match defaults). Merge only overwrites when the later source is `Some`, so an
@@ -535,9 +532,6 @@ fn merge(config: &mut Config, other: RawConfig) {
     }
     if other.icons.is_some() {
         config.icons = other.icons;
-    }
-    if other.tui.is_some() {
-        config.tui = other.tui;
     }
     if other.tools.is_some() {
         config.tools = other.tools;

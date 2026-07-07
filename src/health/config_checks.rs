@@ -637,12 +637,12 @@ mod tests {
     fn unknown_key_findings_name_nested_typo() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = tmp.path().join("config.toml");
-        fs::write(&cfg, "[tui]\ntypo_key = 1\n").expect("write config");
+        fs::write(&cfg, "[icons]\ntypo_key = 1\n").expect("write config");
 
         let findings = unknown_key_findings(&[cfg]);
         let finding = findings.first().expect("one finding");
         assert!(
-            finding.message.contains("`typo_key` (in [tui])"),
+            finding.message.contains("`typo_key` (in [icons])"),
             "got: {}",
             finding.message,
         );
@@ -654,7 +654,7 @@ mod tests {
         let cfg = tmp.path().join("config.toml");
         fs::write(
             &cfg,
-            "[tui]\nauto_add_sessions = false\n\n\
+            "[icons]\npreset = \"unicode\"\n\n\
              [lsp.server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
              [lsp.server.rust-analyzer.initialization_options]\ncheck = { command = \"clippy\" }\n\n\
              [lsp.server.rust-analyzer.settings]\nanything = true\n",

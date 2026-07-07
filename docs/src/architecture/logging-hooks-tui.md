@@ -392,37 +392,54 @@ Three boundary components own logging: `McpServer` (MCP), `LspClient`
 the protocol messages that went in and came out are linked by
 `parent_id` in the firehose records.
 
-### Boards
+### Panes
 
 The dashboard is a snapshot renderer: it shows the daemon's current state
 directly, with no message-stream reconstruction (no request/response
-pairing or scope collapse — that view is `catenary query`'s job). It
-renders four boards built from `state.json`:
+pairing or scope collapse — that view is `catenary query`'s job). It is a
+health/config surface, not a stream monitor, and answers a single binary
+question: *is it working?* Its inputs are `state.json` and the health
+model's findings; it never probes an LSP or opens the firehose. Four
+panes share a 2×2 master-detail grid:
 
-- **Servers** — every LSP server the daemon manages, with lifecycle
-  state, time in state, `$/progress`, and the last `window/logMessage`.
-- **Sessions** — connected agents, each with its client, workspace
-  roots, and current status (editing / diagnostics / idle).
-- **Activity** — a curated ring of recent milestones (newest first).
-- **Alerts** — a ring of recent `warn!()` / `error!()` events (newest
-  first).
+- **Root/server tree** (top-left) — grouped by root (the lifecycle/RAM
+  unit), collapsible; root lines carry the schema-2 contributor labels
+  and ephemeral idle countdowns, with per-root server rows
+  (lifecycle / time-in-state / respawns / last-death) and dormant
+  inventory behind a toggle. A healthy fleet collapses to one line per
+  root — nothing green shouts.
+- **Client/session tree** (bottom-left) — grouped by client, with
+  install-health findings inline at the client node and live sessions
+  underneath. Session status is capability-aware: each host renders only
+  what its events feed (Claude Code adds subagent sub-rows; a host with
+  no stop coverage degrades to an honest `last seen Nm` — no fabricated
+  statuses).
+- **Detail pane** (top-right) — the contextual view of the cursored
+  node: a server's effective config by layer with provenance, a root's
+  routing table, or a session's recent actions + live subagents.
+- **Problems pane** (bottom-right) — the durable notification surface:
+  every finding sorted `Fatal`/`Error`/`Warning` with its fix-it line,
+  suggestions as a collapsed tail that never displaces a problem.
+  Selecting a problem focuses the board on its owner. An empty pane is
+  the working verdict.
+
+Findings render twice — inline at their owning tree node and in the
+problems pane — from one health model, so the two views can never
+disagree. A header strip carries the one-line verdict, daemon identity,
+version + skew, and snapshot staleness.
 
 ### Layout
 
-The dashboard places a sidebar on the left and detail boards on the
-right (the default wide layout):
-
-- **Left column** — the Servers board (top) and Sessions board (middle),
-  with a **Keybinds** help panel (bottom), collapsed by default to a
-  single "Keybinds — `?` to expand" line.
-- **Right column** — the Activity board (top) and Alerts board (bottom),
-  with the daemon status line on the divider.
-
-On narrow terminals the columns collapse and the four boards stack
-full-width. Navigation is keyboard-first: `j`/`k` to move, `Tab` to cycle
-boards, `g`/`G` and `PageUp`/`PageDown` to jump, `y` to yank the selected
-entry via OSC 52, `?` for the keybinds panel, `q` to quit. All colors use
-the terminal's ANSI palette, so the TUI inherits the user's theme.
+Shared borders divide the grid; each pane's title renders inside its
+body, not on the border. On narrow terminals the grid degrades to four
+full-width stacked panes. Navigation is keyboard-first with mouse click
+as an equal path: `j`/`k` to move, `Tab` to cycle panes, `Enter` to
+expand a node or focus a problem's owner, `p` for problems-only, `d` to
+toggle dormant inventory, `g`/`G` and `PageUp`/`PageDown` to jump, `y` to
+yank the selected entry via OSC 52, `?` for the keybinds panel, `q` to
+quit. All colors use the terminal's ANSI palette, so the TUI inherits the
+user's theme; every severity also carries a glyph so it reads on a
+monochrome terminal.
 
 This snapshot dashboard replaced an earlier message-stream TUI: with a
 shared daemon and many concurrent sessions, reconstructing every

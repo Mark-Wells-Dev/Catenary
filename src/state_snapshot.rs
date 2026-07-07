@@ -46,7 +46,9 @@ use crate::lsp::{InstanceKey, ServerLifecycle};
 /// - `2` — server entries carry `respawns`/`last_died_at` (crash-loop
 ///   visibility) and `degraded_since`/`degraded_reason` (decision-027 coverage
 ///   degradation); root entries carry the full contributor `sources` and the
-///   ephemeral `idle_remaining_secs` (tui-rework snapshot enrichment).
+///   ephemeral `idle_remaining_secs`; session entries carry their live
+///   `subagents` (tui-rework snapshot enrichment). Every schema-2 addition is
+///   serde-additive — an older reader defaults each new field.
 const SCHEMA: u32 = 2;
 
 /// Default coalescing window for non-urgent flushes.
@@ -231,6 +233,21 @@ pub struct LastAction {
     pub at: String,
 }
 
+/// A live subagent running under a parent session.
+///
+/// Populated only for hosts that feed subagent identity (Claude Code's
+/// `Subagent*` events); Antigravity and OpenCode send none, so their sessions
+/// carry an empty list. Additive to schema 2 — a reader predating this field
+/// simply defaults it (`#[serde(default)]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Subagent {
+    /// The subagent's host-supplied agent id — yankable, the sub-row label.
+    pub id: String,
+    /// When the subagent started (ISO 8601).
+    pub started_at: String,
+}
+
 /// A connected session's board entry — the rich session board (ticket 05).
 ///
 /// The board lists the sessions currently in the daemon's registry. There is
@@ -271,6 +288,12 @@ pub struct SessionEntry {
     /// The most recent attributable action, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_action: Option<LastAction>,
+    /// Live subagents running under this session (Claude Code `Subagent*`
+    /// flow), started-time sorted. Empty for hosts that feed no subagent
+    /// identity — the board renders subagent sub-rows only where they exist
+    /// (capability-aware, no fabrication).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagents: Vec<Subagent>,
 }
 
 /// Source of the live session board, pulled at each snapshot flush.
@@ -1779,6 +1802,7 @@ mod tests {
             roots: roots.into_iter().map(String::from).collect(),
             status,
             last_action: None,
+            subagents: Vec::new(),
         }
     }
 
@@ -1794,6 +1818,11 @@ mod tests {
         assert_eq!(json["id"], "s1");
         assert_eq!(json["status"], "editing");
         assert_eq!(json["client"]["name"], "claude");
+        // No subagents → the field is omitted (skip_serializing_if empty).
+        assert!(
+            json.get("subagents").is_none(),
+            "empty subagents omitted for hosts that feed no subagent identity",
+        );
         // `last_seen` (recency) serializes as an ISO string, distinct from
         // `last_action.at` (last meaningful action) — ticket 05a.
         assert_eq!(json["last_seen"], "2026-06-08T13:12:00.000Z");
@@ -1808,6 +1837,40 @@ mod tests {
         assert_eq!(json["roots"][0], "/p/Catenary");
         assert_eq!(json["last_action"]["summary"], "edited src/db.rs");
         assert_eq!(json["last_action"]["at"], "2026-06-08T13:11:00.000Z");
+    }
+
+    #[test]
+    fn session_subagents_round_trip() {
+        let mut entry = session_entry("s1", SessionStatus::Idle, vec!["/p/Catenary"]);
+        entry.subagents = vec![
+            Subagent {
+                id: "agent-a".to_string(),
+                started_at: "2026-06-08T13:10:00.000Z".to_string(),
+            },
+            Subagent {
+                id: "agent-b".to_string(),
+                started_at: "2026-06-08T13:11:00.000Z".to_string(),
+            },
+        ];
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let back: SessionEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            back.subagents.len(),
+            2,
+            "both subagents survive the round-trip"
+        );
+        assert_eq!(back.subagents[0].id, "agent-a");
+        assert_eq!(back.subagents[1].started_at, "2026-06-08T13:11:00.000Z");
+    }
+
+    #[test]
+    fn session_without_subagents_field_defaults_empty() {
+        // Schema-2 additive guarantee: a snapshot written before this field
+        // still parses, defaulting `subagents` to empty.
+        let entry: SessionEntry =
+            serde_json::from_str(r#"{"id":"s1","started_at":"t","last_seen":"t","status":"idle"}"#)
+                .expect("legacy session entry parses");
+        assert!(entry.subagents.is_empty(), "missing field defaults empty");
     }
 
     #[tokio::test]
