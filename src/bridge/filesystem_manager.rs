@@ -1338,6 +1338,24 @@ fn observe_metadata_with(
     None
 }
 
+// ─── content-byte instrumentation (bug 78 pathology tier / misc 159) ──
+//
+// A test-only tally of file content bytes read by [`scan_file`], so the
+// bug-78 pathology tier can assert `--count` reads **zero** content bytes
+// (the free win) as a work-based fact rather than a wall-clock guess.
+#[cfg(test)]
+static SCAN_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Content bytes read by [`scan_file`] since the last [`scan_bytes_reset`].
+#[cfg(test)]
+pub(crate) fn scan_bytes() -> usize {
+    SCAN_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Zeroes the content-byte tally before a measured run.
+#[cfg(test)]
+pub(crate) fn scan_bytes_reset() {
+    SCAN_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Intermediate result from a single-pass file scan.
 struct ScanResult {
     lines: usize,
@@ -1384,6 +1402,8 @@ fn scan_file(path: &Path) -> Option<ScanResult> {
                 shebang_interpreter,
             });
         }
+        #[cfg(test)]
+        SCAN_BYTES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
 
         // BOM detection precedes the NUL verdict: a UTF-16 BOM file is text even
         // though it is NUL-dense. Shebang extraction shares this first-chunk pass.

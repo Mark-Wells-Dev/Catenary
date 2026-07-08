@@ -46,6 +46,14 @@ pub struct ResolvedGlob {
     glob: LspGlob,
     match_full_path: bool,
     override_root: Option<PathBuf>,
+    /// The deepest a matching path can lie below [`override_root`], used to
+    /// bound the expansion walk. `Some(n)` when every pattern segment after the
+    /// metachar-free base is a single-component glob (`literal_separator(true)`
+    /// means `*`/`?`/`[]` never cross `/`, so each such segment consumes exactly
+    /// one path component); `None` when a `**` segment makes the depth unbounded.
+    /// Only meaningful for absolute patterns (an `override_root` walk); relative
+    /// patterns carry no base and never walk.
+    max_depth: Option<usize>,
 }
 
 impl ResolvedGlob {
@@ -60,16 +68,19 @@ impl ResolvedGlob {
 
         if Path::new(&expanded).is_absolute() {
             let base = Self::base_dir(&expanded);
+            let max_depth = Self::match_depth(&expanded, &base);
             Ok(Self {
                 glob,
                 match_full_path: true,
                 override_root: Some(base),
+                max_depth,
             })
         } else {
             Ok(Self {
                 glob,
                 match_full_path: false,
                 override_root: None,
+                max_depth: None,
             })
         }
     }
@@ -126,6 +137,33 @@ impl ResolvedGlob {
         }
     }
 
+    /// The deepest a match can lie below `base`, or `None` if a `**` segment
+    /// makes it unbounded.
+    ///
+    /// `base` is the pattern's metachar-free prefix ([`base_dir`](Self::base_dir)),
+    /// so the segments *after* it are the glob part. Each glob segment matches
+    /// exactly one path component — `LspGlob` compiles with
+    /// `literal_separator(true)`, so `*`/`?`/`[…]` never cross `/` — **except**
+    /// `**`, which crosses segment boundaries and lifts the bound. The count of
+    /// post-base segments is therefore the maximum depth below `base` at which a
+    /// path can match; a `**` anywhere in the remainder returns `None`
+    /// (unbounded). This bounds the expansion walk (misc 159): a single-star
+    /// pattern like `/base/t*` need only enumerate `base`'s direct children
+    /// rather than descend every sibling subtree.
+    fn match_depth(pattern: &str, base: &Path) -> Option<usize> {
+        let total = Path::new(pattern).components().count();
+        let base_len = base.components().count();
+        // Segments the glob part contributes below `base`.
+        let remainder = total.saturating_sub(base_len);
+        // A `**` component (or an embedded `**`) crosses `/`, so depth is
+        // unbounded. Inspect only the post-base components.
+        let unbounded = Path::new(pattern)
+            .components()
+            .skip(base_len)
+            .any(|c| c.as_os_str().to_string_lossy().contains("**"));
+        if unbounded { None } else { Some(remainder) }
+    }
+
     /// Expands this glob into the concrete paths it matches on disk.
     ///
     /// Walks the pattern's non-glob base directory with the gitignore-aware
@@ -155,6 +193,13 @@ impl ResolvedGlob {
     /// Like [`expand`](Self::expand), but quits the base-directory walk the
     /// instant `cancel` fires (misc 140 phase 2).
     ///
+    /// The walk is bounded to [`max_depth`](Self::max_depth) — the deepest a
+    /// match can lie below the base (misc 159), so a single-star pattern like
+    /// `/base/t*` enumerates only `base`'s direct children instead of descending
+    /// every sibling's subtree (the bug-78 runaway: an unbounded walk made a
+    /// hanging `t*` and an instant `d*` pay the *same* full base walk). A `**`
+    /// pattern is unbounded and keeps the full recursive walk it needs.
+    ///
     /// The walk is checked per entry so a massive base directory — the residual
     /// phase-1 named — stops mid-walk once the router's disconnect `select!`
     /// fires the token (the walk runs off the runtime thread via
@@ -170,13 +215,24 @@ impl ResolvedGlob {
         let Some(base) = self.override_root.as_deref() else {
             return Vec::new();
         };
-        let mut matches: Vec<PathBuf> = Vec::new();
-        for entry in WalkBuilder::new(base)
+        let mut builder = WalkBuilder::new(base);
+        builder
             .git_ignore(!include_gitignored)
-            .hidden(!include_hidden)
-            .build()
-            .flatten()
-        {
+            .hidden(!include_hidden);
+        // Bound the walk to the deepest a match can lie (misc 159): a
+        // single-star pattern (`/base/t*`) matches only `base`'s direct
+        // children, so descending every sibling subtree is pure waste — the
+        // runaway's contradiction 1 (the base walk was identical for a hanging
+        // `t*` and an instant `d*`). A `**` pattern has `max_depth == None` and
+        // keeps the full recursive walk it needs.
+        if let Some(depth) = self.max_depth {
+            builder.max_depth(Some(depth));
+        }
+        let mut matches: Vec<PathBuf> = Vec::new();
+        for entry in builder.build().flatten() {
+            #[cfg(test)]
+            crate::bridge::file_tools::probe::EXPAND_ENTRIES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if cancel.is_cancelled() {
                 return Vec::new();
             }
@@ -1391,6 +1447,39 @@ mod tests {
         assert!(
             !matches.contains(&root.join("sub/nested.rs")),
             "single star stays within one segment: {matches:?}"
+        );
+    }
+
+    /// Bounding the expansion walk to the pattern's depth (misc 159) must not
+    /// truncate a legitimate deeper match: a two-segment single-star pattern
+    /// (`.../mid*/leaf*.rs`) matches at depth 2 below the base, so the walk is
+    /// bounded to depth 2 — deep enough to find `midX/leafY.rs`, but not so deep
+    /// it descends a matched intermediate dir's own subtree.
+    #[test]
+    fn expand_multi_segment_single_star_reaches_its_depth() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("mid1/deeper")).expect("mkdir");
+        std::fs::write(root.join("mid1/leafA.rs"), "x").expect("write");
+        std::fs::write(root.join("mid1/deeper/tooDeep.rs"), "x").expect("write");
+        std::fs::create_dir_all(root.join("mid2")).expect("mkdir");
+        std::fs::write(root.join("mid2/leafB.rs"), "x").expect("write");
+
+        let pattern = format!("{}/mid*/leaf*.rs", root.display());
+        let glob = ResolvedGlob::new(&pattern).expect("compile glob");
+        let matches = glob.expand(false, false);
+
+        assert!(
+            matches.contains(&root.join("mid1/leafA.rs")),
+            "depth-2 match found: {matches:?}"
+        );
+        assert!(
+            matches.contains(&root.join("mid2/leafB.rs")),
+            "depth-2 match in a second matched mid dir found: {matches:?}"
+        );
+        assert!(
+            !matches.contains(&root.join("mid1/deeper/tooDeep.rs")),
+            "a single-star pattern never matches past its depth: {matches:?}"
         );
     }
 

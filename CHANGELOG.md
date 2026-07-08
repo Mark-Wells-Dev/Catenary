@@ -857,6 +857,18 @@ upgrading.
 
 ### Fixed
 
+- **`catenary glob` expansion is bounded by pattern depth, and `--count`
+  reads zero file content.** A multi-directory single-star pattern
+  (`~/.claude/t*`) walked the entire base subtree during expansion — a
+  hanging pattern and an instant one paid the same full walk — and the
+  count path then read every resolved directory's children end-to-end for
+  line counts it threw away, hanging glob on large sibling directories.
+  Expansion now bounds its walk to the deepest a match can lie (`**`
+  keeps the unbounded recursive walk it needs), and counting enumerates
+  directories content-free with the same visibility, gitignore, and
+  exclude filters as the listing. A pathology test tier pins the fix as
+  operation counts — depth-bounded walk, zero content bytes,
+  exactly-complete results — never wall clocks.
 - **Project `.catenary.toml` language bindings now reach server dispatch.**
   A project-layer `[lsp.language.*]` binding drove file classification but
   never which server spawned or answered — silently masked whenever the

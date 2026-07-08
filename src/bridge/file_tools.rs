@@ -39,6 +39,51 @@ use super::session::{ArgResolution, ResolvedGlob, expand_search_paths_grouped_ca
 use crate::lsp::{LspClientManager, WalkBreadth};
 use crate::symbol_index::{Symbol, SymbolIndex};
 
+/// Test-only per-stage operation counters for the glob expansion path.
+///
+/// The bug-78 pathology tier (misc 159) asserts on **operation counts, not wall
+/// clocks** (the bug-59 ruling): expansion walks ≤ c·N entries and issues ≤ c·N
+/// stats regardless of how many siblings match, and `--count` reads zero file
+/// content bytes. These counters make those work-based facts directly
+/// observable. Content bytes are tallied in `filesystem_manager::scan_file`
+/// ([`crate::bridge::filesystem_manager::scan_bytes`]).
+#[cfg(test)]
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "sibling module session.rs reads these counters through the private mod"
+)]
+pub(crate) mod probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Entries visited by the expansion walk (`ResolvedGlob::expand_cancellable`).
+    pub(crate) static EXPAND_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+    /// Entries visited by a per-resolved-directory enumeration
+    /// (`collect_dir_entries` / `count_dir_entries`).
+    pub(crate) static COLLECT_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+    /// Calls to `file_info` — each reads a file's content for its line count.
+    pub(crate) static FILE_INFO_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Zeroes every counter (and the content-byte tally) before a measured run.
+    pub(crate) fn reset() {
+        EXPAND_ENTRIES.store(0, Ordering::Relaxed);
+        COLLECT_ENTRIES.store(0, Ordering::Relaxed);
+        FILE_INFO_CALLS.store(0, Ordering::Relaxed);
+        crate::bridge::filesystem_manager::scan_bytes_reset();
+    }
+    /// Entries visited by the expansion walk since the last [`reset`].
+    pub(crate) fn expand_entries() -> usize {
+        EXPAND_ENTRIES.load(Ordering::Relaxed)
+    }
+    /// Per-resolved-directory entries visited since the last [`reset`].
+    pub(crate) fn collect_entries() -> usize {
+        COLLECT_ENTRIES.load(Ordering::Relaxed)
+    }
+    /// `file_info` calls since the last [`reset`].
+    pub(crate) fn file_info_calls() -> usize {
+        FILE_INFO_CALLS.load(Ordering::Relaxed)
+    }
+}
+
 /// Input for the `glob` tool.
 #[derive(Debug, Deserialize)]
 pub struct GlobInput {
@@ -627,6 +672,8 @@ impl GlobServer {
         path: &Path,
         metadata: Option<&std::fs::Metadata>,
     ) -> (Option<usize>, Option<String>) {
+        #[cfg(test)]
+        probe::FILE_INFO_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         metadata.map_or((None, None), |m| {
             fs_manager.line_count(path, m).map_or_else(
                 || (None, Some(format_file_size(m.len()))),
@@ -685,6 +732,8 @@ impl GlobServer {
         let mut entries = Vec::new();
 
         for entry in walker.flatten() {
+            #[cfg(test)]
+            probe::COLLECT_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if cancel.is_cancelled() {
                 break;
             }
@@ -775,6 +824,59 @@ impl GlobServer {
         Ok(entries)
     }
 
+    /// Counts the immediate children of a directory `--count` would list —
+    /// the content-free twin of [`Self::collect_dir_entries`] (misc 159).
+    ///
+    /// Applies the identical visibility (hidden), gitignore, and `exclude`
+    /// filters as [`Self::collect_dir_entries`], so the tally equals that
+    /// function's `.len()` exactly — but it never builds a `GlobEntry` and,
+    /// crucially, never calls [`Self::file_info`]. `file_info` reads each text
+    /// file end-to-end for its line count (`FilesystemManager::line_count` →
+    /// `scan_file`); a count throws that away. Under `--count` those reads were
+    /// pure waste, and for a resolved directory of many files they were the
+    /// runaway's dominant cost (bug 78: a single-star pattern that resolves a
+    /// large directory paid N full-file reads). This reads **zero** file
+    /// content bytes.
+    ///
+    /// The walk is `max_depth(1)` and `cancel` is checked per entry, exactly as
+    /// [`Self::collect_dir_entries`], so a wide directory stays bounded and a
+    /// disconnected client stops it promptly.
+    fn count_dir_entries(
+        canonical: &Path,
+        include_gitignored: bool,
+        include_hidden: bool,
+        exclude: Option<&ResolvedGlob>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> usize {
+        let walker = WalkBuilder::new(canonical)
+            .max_depth(Some(1))
+            .git_ignore(!include_gitignored)
+            .hidden(!include_hidden)
+            .build();
+
+        let mut count = 0usize;
+        for entry in walker.flatten() {
+            #[cfg(test)]
+            probe::COLLECT_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if cancel.is_cancelled() {
+                break;
+            }
+            let entry_path = entry.into_path();
+            if entry_path.as_path() == canonical {
+                continue;
+            }
+            // Same entry-level exclude filter `collect_dir_entries` applies, so
+            // the count and the listing agree under an exclude (bug 73).
+            if let Some(rg) = exclude
+                && rg.is_match(&entry_path, canonical)
+            {
+                continue;
+            }
+            count += 1;
+        }
+        count
+    }
+
     /// Runs [`Self::collect_dir_entries`] on a blocking thread (misc 140 phase 2).
     ///
     /// The one-level directory enumeration is synchronous; left on an async
@@ -818,9 +920,11 @@ impl GlobServer {
     /// so a symlink-to-dir (which `is_dir()` follows) contributes its listed
     /// entry count, exactly as the listing renders it, rather than counting as a
     /// single file/symlink (WS31-review D1/T1). Each directory contributes the
-    /// same filtered set [`Self::handle_glob_dir`] renders; each remaining
-    /// resolved file or symlink-to-file counts once. LSP enrichment is skipped —
-    /// a count is pure filesystem.
+    /// same filtered set [`Self::handle_glob_dir`] renders — tallied by the
+    /// content-free [`Self::count_dir_entries`], which applies the identical
+    /// filters but reads no file content (misc 159); each remaining resolved
+    /// file or symlink-to-file counts once. LSP enrichment is skipped — a count
+    /// is pure filesystem, and reads **zero** file content bytes.
     ///
     /// A free helper over [`FilesystemManager`] (not `&self`) so
     /// [`Self::count_paths_off_thread`] can run it in a `spawn_blocking` task —
@@ -857,15 +961,17 @@ impl GlobServer {
                 let canonical = path
                     .canonicalize()
                     .map_err(|e| anyhow!("Path does not exist: {}: {e}", path.display()))?;
-                total += Self::collect_dir_entries(
-                    fs_manager,
+                // Content-free count: mirrors the listing's filtered set exactly
+                // but never reads a file's content for a line count it would
+                // discard (misc 159 — the free win and the runaway's dominant
+                // cost). `fs_manager` is no longer needed here.
+                total += Self::count_dir_entries(
                     &canonical,
                     include_gitignored,
                     include_hidden,
                     exclude,
                     cancel,
-                )?
-                .len();
+                );
             } else if path.is_file() || path.is_symlink() {
                 total += 1;
             }
@@ -2456,6 +2562,195 @@ mod tests {
             cancelled.is_empty(),
             "a fired token quits the off-thread directory walk (got {} entries)",
             cancelled.len(),
+        );
+    }
+
+    // ─── expansion pathology tier (bug 78 / misc 159) ──────────────────
+    //
+    // A synthetic fixture of `k` sibling directories × `n` descendants,
+    // asserting **operation counts, never wall clocks** (the bug-59 ruling —
+    // time-based guards flake under contention, work-based guards don't). The
+    // three contradictions the runaway's root cause had to explain map onto
+    // these three tests: the base walk is not the cost (bounded expansion), the
+    // count reads no content (zero bytes), and the returned set is complete.
+
+    /// Builds the discriminating fixture: a base dir with `k` sibling
+    /// directories, one of them (`big/`) carrying `n` flat text-file children,
+    /// the others near-empty. Returns `(base, big)`, both canonicalized. This is
+    /// the synthetic `~/.claude` analog — no dependence on any real state dir.
+    #[allow(clippy::expect_used, reason = "test fixture construction")]
+    fn pathology_fixture(k: usize, n: usize) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize base");
+        // The one big sibling — `big/` — with `n` flat children.
+        let big = base.join("big");
+        std::fs::create_dir(&big).expect("mkdir big");
+        for i in 0..n {
+            std::fs::write(big.join(format!("f{i}.txt")), "line\n").expect("write child");
+        }
+        // `k - 1` near-empty siblings sharing the leading letter `b` so a
+        // single-star `b*` resolves all of them at once (the multi-dir match the
+        // runaway needed).
+        for s in 0..k.saturating_sub(1) {
+            let sib = base.join(format!("bit{s}"));
+            std::fs::create_dir(&sib).expect("mkdir sibling");
+            std::fs::write(sib.join("only.txt"), "x\n").expect("write sibling child");
+        }
+        (tmp, base, big)
+    }
+
+    /// Contradiction 1 — cost must track which dirs resolve, not the base walk.
+    ///
+    /// A single-star pattern (`/base/b*`) can only match `base`'s direct
+    /// children, so the expansion walk must not descend into any sibling's
+    /// subtree. With one sibling carrying `n` descendants, the pre-fix walk
+    /// visited the whole tree (`> n` entries); the fix bounds it to the base's
+    /// direct children. The assertion is independent of `n`: the same pattern
+    /// against a 10× larger `big/` must walk the same handful of entries.
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn pathology_expansion_walk_bounded_by_pattern_depth() {
+        use tokio_util::sync::CancellationToken;
+
+        let k = 6;
+        let (_small_guard, small_base, _) = pathology_fixture(k, 100);
+        let (_big_guard, big_base, _) = pathology_fixture(k, 5000);
+        let server = test_glob_server();
+        let cancel = CancellationToken::new();
+
+        // Small fixture: single-star `b*` expansion.
+        probe::reset();
+        let _ = GlobServer::count_paths(
+            &server.fs_manager,
+            &[small_base.join("b*")],
+            false,
+            false,
+            None,
+            &cancel,
+        )
+        .expect("count small b*");
+        let small_expand = probe::expand_entries();
+
+        // Big fixture (50× the descendants): same single-star `b*`.
+        probe::reset();
+        let _ = GlobServer::count_paths(
+            &server.fs_manager,
+            &[big_base.join("b*")],
+            false,
+            false,
+            None,
+            &cancel,
+        )
+        .expect("count big b*");
+        let big_expand = probe::expand_entries();
+
+        // The expansion walk is bounded by the pattern's depth (base + its
+        // direct children), so it is the SAME for both fixtures — it does not
+        // scale with the size of the matched sibling's subtree. `k` siblings +
+        // `big/` + the base itself is `k + 1` entries; allow generous slack but
+        // stay far below the descendant count.
+        let bound = k + 2;
+        assert!(
+            small_expand <= bound,
+            "single-star expansion must walk ≤ {bound} entries, walked {small_expand}"
+        );
+        assert_eq!(
+            small_expand, big_expand,
+            "expansion walk must not grow with the matched subtree size \
+             (small={small_expand}, big={big_expand}) — it tracks pattern depth, \
+             not descendant count"
+        );
+    }
+
+    /// The free win (regardless of root cause) — `--count` reads ZERO file
+    /// content bytes, and issues zero line-count reads (`file_info`), even when
+    /// a single-star pattern resolves a directory of thousands of files.
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn pathology_count_reads_zero_content_bytes() {
+        use crate::bridge::filesystem_manager::scan_bytes;
+        use tokio_util::sync::CancellationToken;
+
+        let n = 3000;
+        let (_guard, base, _big) = pathology_fixture(3, n);
+        let server = test_glob_server();
+        let cancel = CancellationToken::new();
+
+        probe::reset();
+        let count = GlobServer::count_paths(
+            &server.fs_manager,
+            &[base.join("b*")],
+            false,
+            false,
+            None,
+            &cancel,
+        )
+        .expect("count b*");
+
+        assert!(
+            count >= n,
+            "sanity: the big directory's children are counted"
+        );
+        assert_eq!(
+            probe::file_info_calls(),
+            0,
+            "--count must never call file_info (line-count reads it throws away)"
+        );
+        assert_eq!(
+            scan_bytes(),
+            0,
+            "--count must read zero file content bytes (read {} bytes)",
+            scan_bytes()
+        );
+    }
+
+    /// The returned set is exactly complete (count == the constructed N), and
+    /// the total per-resolved-directory enumeration stays bounded by `c·N` — no
+    /// superlinear blowup from combining a big matched directory with tiny
+    /// siblings (the runaway's trigger).
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn pathology_count_complete_and_enumeration_bounded() {
+        use tokio_util::sync::CancellationToken;
+
+        let k = 5;
+        let n = 2000;
+        let (_guard, base, _big) = pathology_fixture(k, n);
+        let server = test_glob_server();
+        let cancel = CancellationToken::new();
+
+        // Constructed total the pattern `b*` resolves: `big/` (n children) plus
+        // `k - 1` siblings with one child each.
+        let constructed = n + (k - 1);
+
+        probe::reset();
+        let count = GlobServer::count_paths(
+            &server.fs_manager,
+            &[base.join("b*")],
+            false,
+            false,
+            None,
+            &cancel,
+        )
+        .expect("count b*");
+
+        assert_eq!(
+            count, constructed,
+            "the returned count must be exactly the constructed N \
+             (got {count}, expected {constructed}) — completeness, never partial"
+        );
+
+        // Total entries touched: the bounded expansion walk plus one depth-1
+        // enumeration per resolved directory. That sums to `O(N)` — every
+        // resolved directory's direct children counted once — with no
+        // superlinear interaction between the sibling count and the big
+        // directory's size.
+        let touched = probe::expand_entries() + probe::collect_entries();
+        let budget = 3 * constructed;
+        assert!(
+            touched <= budget,
+            "expansion + enumeration must touch ≤ {budget} entries for N={constructed}, \
+             touched {touched}"
         );
     }
 }
