@@ -32,24 +32,25 @@
 //!   `textDocument.diagnostic` client capability *and* gates the client-side pull
 //!   path, so RA's native pushes are the sole diagnostic channel — airtight even
 //!   if RA spontaneously advertises `diagnosticProvider`.
-//! - **gopls** — [`ServerProfile::forced_initialization_options`].
+//! - **gopls** — [`ServerProfile::forced_initialization_options`] +
+//!   [`ServerProfile::forbidden_initialization_options`].
 //!   `pullDiagnostics: false` — **forced off** (bug 87, conformance run 8): in
 //!   pull mode gopls stops pushing real diagnostics and publishes empty
 //!   placeholders, which the heard-empty-is-evidence rule (misc 153) treats as
 //!   authoritative — so the pull that would fetch the real results is suppressed
-//!   and dirty files read `[clean]`. Push mode on gopls's **default** debounce is
-//!   the honest configuration until the collection path can drive pull-mode
-//!   servers pull-first. `diagnosticsDelay` is deliberately NOT forced:
-//!   conformance run 9 proved `"0s"` decouples publishing from analysis — every
-//!   publish fired ~1 ms after its document event, empty, on the not-yet-checked
-//!   snapshot, and the completed type-check never got a publish of its own. The
-//!   debounce is not a blind window to zero out; it is the coupling between
-//!   analysis completion and the publish. This is a conformance setting, not a
-//!   `defaults/servers.toml` entry, because a user `[lsp.server.gopls]` replaces
-//!   the shipped default wholesale (no field merge — see `test_builtin_no_merge`),
-//!   which would silently drop it; and because it must win over a user who sets it
-//!   otherwise (a user's `pullDiagnostics: true` would reintroduce the bug-87
-//!   false-clean).
+//!   and dirty files read `[clean]`. `diagnosticsDelay` — **enforced absent**
+//!   (maintainer ruling after conformance run 9): `"0s"` decouples publishing
+//!   from analysis — every publish fired ~1 ms after its document event, empty,
+//!   on the not-yet-checked snapshot, and the completed type-check never got a
+//!   publish of its own. The debounce is not a blind window to zero out; it is
+//!   the coupling between analysis completion and the publish. A user reasoning
+//!   "zero the delay to minimize latency" would reintroduce exactly that, so the
+//!   key is stripped from whatever the config layers produce and gopls's own
+//!   default is the only value that can ever reach the server. These are
+//!   conformance settings, not `defaults/servers.toml` entries, because a user
+//!   `[lsp.server.gopls]` replaces the shipped default wholesale (no field merge —
+//!   see `test_builtin_no_merge`), which would silently drop them; and because
+//!   they must win over a user who sets them otherwise.
 
 use serde_json::{Value, json};
 
@@ -71,6 +72,10 @@ pub struct ServerProfile {
     /// user-supplied options at initialize time. `None` when the server has no
     /// forced options.
     forced_initialization_options: Option<Value>,
+    /// Top-level `initializationOptions` keys **enforced absent**: stripped after
+    /// the user/forced merge, so no config layer can deliver them and the
+    /// server's own built-in default is the only value that ever applies.
+    forbidden_initialization_options: &'static [&'static str],
 }
 
 impl ServerProfile {
@@ -115,15 +120,23 @@ impl ServerProfile {
     /// `user`-supplied options and **win on conflict**: they are applied after the
     /// user/project merge and are not overridable (existing [`deep_merge`]
     /// semantics — the forced options are the overlay). A user's *unrelated* keys
-    /// survive; a user value for a forced key is replaced. With no forced options
-    /// this is the identity on `user`.
+    /// survive; a user value for a forced key is replaced. Forbidden keys are then
+    /// stripped — enforced absent, whatever any layer supplied — so the server's
+    /// own default is the only value that can apply. With no forced and no
+    /// forbidden options this is the identity on `user`.
     #[must_use]
     pub fn effective_initialization_options(&self, user: Option<&Value>) -> Option<Value> {
-        match (self.forced_initialization_options.as_ref(), user) {
+        let mut merged = match (self.forced_initialization_options.as_ref(), user) {
             (Some(forced), Some(user)) => Some(deep_merge(user, forced)),
             (Some(forced), None) => Some(forced.clone()),
             (None, user) => user.cloned(),
+        };
+        if let Some(object) = merged.as_mut().and_then(Value::as_object_mut) {
+            for key in self.forbidden_initialization_options {
+                object.remove(*key);
+            }
         }
+        merged
     }
 }
 
@@ -136,18 +149,23 @@ fn profile(server_name: &str) -> ServerProfile {
         "rust-analyzer" => ServerProfile {
             suppress_pull_diagnostics: true,
             forced_initialization_options: None,
+            forbidden_initialization_options: &[],
         },
         "gopls" => ServerProfile {
             suppress_pull_diagnostics: false,
             // `pullDiagnostics` is forced FALSE (bug 87): gopls's pull mode
             // stops real pushes and publishes empty placeholders that the
             // heard-empty rule reads as authoritative — false `[clean]`.
-            // `diagnosticsDelay` stays at gopls's default: forcing "0s" made
-            // every publish fire instantly-and-empty on the unchecked snapshot
-            // (run 9) — the debounce couples publishing to completed analysis.
             forced_initialization_options: Some(json!({
                 "pullDiagnostics": false,
             })),
+            // `diagnosticsDelay` is enforced ABSENT (run 9 + maintainer
+            // ruling): at "0s" every publish fires instantly-and-empty on the
+            // unchecked snapshot — the debounce couples publishing to
+            // completed analysis, and "zero it to minimize latency" is the
+            // natural user reasoning that reintroduces the false-clean. Only
+            // gopls's own default may apply.
+            forbidden_initialization_options: &["diagnosticsDelay"],
         },
         _ => ServerProfile::default(),
     }
@@ -206,17 +224,16 @@ mod tests {
         // Pull is forced OFF (bug 87: pull mode stops real pushes and the empty
         // placeholder publishes read as authoritative heard-empty).
         assert_eq!(opts["pullDiagnostics"], json!(false));
-        // The debounce is NOT forced (run 9: "0s" published instantly-and-empty
-        // on the unchecked snapshot — the delay couples publish to analysis).
+        // The debounce key never ships (enforced absent — run 9 + ruling).
         assert!(opts.get("diagnosticsDelay").is_none());
     }
 
     #[test]
     fn gopls_conformance_wins_over_user_options() {
-        // A user tries the bug-87 footgun (`pullDiagnostics: true`) and also
-        // tunes the debounce — a configurable the profile must NOT own.
+        // A user tries the bug-87 footgun (`pullDiagnostics: true`) and the
+        // run-9 footgun ("zero the delay to minimize latency").
         let user = json!({
-            "diagnosticsDelay": "250ms",
+            "diagnosticsDelay": "0s",
             "pullDiagnostics": true,
             "buildFlags": ["-tags=integration"],
         });
@@ -228,9 +245,14 @@ mod tests {
             json!(false),
             "a user cannot reintroduce the bug-87 false-clean",
         );
-        // The user's non-conformance keys survive — including the debounce,
-        // which is theirs to tune (only forcing it to "0s" was the run-9 bug).
-        assert_eq!(opts["diagnosticsDelay"], json!("250ms"));
+        // The delay key is enforced ABSENT — stripped whatever the user set,
+        // so gopls's own default is the only value that can ever apply (run 9:
+        // "0s" decoupled publishing from analysis — instant empty publishes).
+        assert!(
+            opts.get("diagnosticsDelay").is_none(),
+            "a user cannot deliver diagnosticsDelay at all",
+        );
+        // The user's unrelated key survives.
         assert_eq!(opts["buildFlags"], json!(["-tags=integration"]));
     }
 
