@@ -335,6 +335,10 @@ jobs:
               # root-owned (first dispatch failed on it).
               gem install "${{ matrix.gem }}" --user-install \
                 --version "${{ matrix.version }}"
+              # ruby-lsp's launcher composes its bundle via `bundle`
+              # (run-8 stderr: "sh: 1: bundle: not found" → Errno::ENOENT
+              # death). Provision bundler into the same user gem dir.
+              gem install bundler --user-install
               userbin="$(ruby -e 'puts Gem.user_dir')/bin"
               echo "$userbin" >> "$GITHUB_PATH"
               # The runner's RubyGems derives Gem.user_dir from

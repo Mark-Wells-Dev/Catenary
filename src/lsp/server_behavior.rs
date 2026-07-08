@@ -32,14 +32,20 @@
 //!   `textDocument.diagnostic` client capability *and* gates the client-side pull
 //!   path, so RA's native pushes are the sole diagnostic channel — airtight even
 //!   if RA spontaneously advertises `diagnosticProvider`.
-//! - **gopls** — [`ServerProfile::forced_initialization_options`]. `pullDiagnostics:
-//!   true` (real LSP 3.17 pull, advertised since gopls v0.17; our pin v0.22.0 has
-//!   it) and `diagnosticsDelay: "0s"` (no debounce blind window — the debounce
-//!   coalesces human keystreams, but Catenary sends discrete batches). These are
+//! - **gopls** — [`ServerProfile::forced_initialization_options`].
+//!   `diagnosticsDelay: "0s"` (no debounce blind window — the debounce coalesces
+//!   human keystreams, but Catenary sends discrete batches) and `pullDiagnostics:
+//!   false` — **forced off** (bug 87, conformance run 8): in pull mode gopls stops
+//!   pushing real diagnostics and publishes empty placeholders, which the
+//!   heard-empty-is-evidence rule (misc 153) treats as authoritative — so the pull
+//!   that would fetch the real results is suppressed and dirty files read
+//!   `[clean]`. Push mode with a zeroed delay is the honest configuration until
+//!   the collection path can drive pull-mode servers pull-first. These are
 //!   conformance settings, not `defaults/servers.toml` entries, because a user
 //!   `[lsp.server.gopls]` replaces the shipped default wholesale (no field merge —
 //!   see `test_builtin_no_merge`), which would silently drop them; and because they
-//!   must win over a user who sets them otherwise.
+//!   must win over a user who sets them otherwise (a user's `pullDiagnostics:
+//!   true` would reintroduce the bug-87 false-clean).
 
 use serde_json::{Value, json};
 
@@ -129,8 +135,11 @@ fn profile(server_name: &str) -> ServerProfile {
         },
         "gopls" => ServerProfile {
             suppress_pull_diagnostics: false,
+            // `pullDiagnostics` is forced FALSE (bug 87): gopls's pull mode
+            // stops real pushes and publishes empty placeholders that the
+            // heard-empty rule reads as authoritative — false `[clean]`.
             forced_initialization_options: Some(json!({
-                "pullDiagnostics": true,
+                "pullDiagnostics": false,
                 "diagnosticsDelay": "0s",
             })),
         },
@@ -188,20 +197,31 @@ mod tests {
         let opts = ServerProfile::for_server("gopls")
             .effective_initialization_options(None)
             .expect("gopls forces initialization options");
-        assert_eq!(opts["pullDiagnostics"], json!(true));
+        // Pull is forced OFF (bug 87: pull mode stops real pushes and the empty
+        // placeholder publishes read as authoritative heard-empty).
+        assert_eq!(opts["pullDiagnostics"], json!(false));
         assert_eq!(opts["diagnosticsDelay"], json!("0s"));
     }
 
     #[test]
     fn gopls_conformance_wins_over_user_options() {
-        // A user tries to override a conformance lever and adds an unrelated key.
-        let user = json!({ "diagnosticsDelay": "250ms", "buildFlags": ["-tags=integration"] });
+        // A user tries to override BOTH conformance levers — including the
+        // bug-87 footgun (`pullDiagnostics: true`) — and adds an unrelated key.
+        let user = json!({
+            "diagnosticsDelay": "250ms",
+            "pullDiagnostics": true,
+            "buildFlags": ["-tags=integration"],
+        });
         let opts = ServerProfile::for_server("gopls")
             .effective_initialization_options(Some(&user))
             .expect("merged options");
-        // Conformance wins on the conflicting key — never overridable.
+        // Conformance wins on the conflicting keys — never overridable.
         assert_eq!(opts["diagnosticsDelay"], json!("0s"));
-        assert_eq!(opts["pullDiagnostics"], json!(true));
+        assert_eq!(
+            opts["pullDiagnostics"],
+            json!(false),
+            "a user cannot reintroduce the bug-87 false-clean",
+        );
         // The user's unrelated key survives.
         assert_eq!(opts["buildFlags"], json!(["-tags=integration"]));
     }

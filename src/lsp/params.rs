@@ -508,21 +508,27 @@ mod tests {
     #[test]
     fn initialize_forces_gopls_conformance_levers() {
         // gopls carries the forced conformance levers even when the user supplies
-        // no initializationOptions.
+        // no initializationOptions. Pull is forced OFF (bug 87: pull mode stops
+        // real pushes; the empty placeholder publishes read as heard-empty).
         let ours = initialize(7, &[("file:///ws", "ws")], "gopls", None);
         let opts = &ours["initializationOptions"];
-        assert_eq!(opts["pullDiagnostics"], json!(true));
+        assert_eq!(opts["pullDiagnostics"], json!(false));
         assert_eq!(opts["diagnosticsDelay"], json!("0s"));
     }
 
     #[test]
     fn initialize_gopls_conformance_wins_over_user_options() {
-        let user = json!({ "diagnosticsDelay": "100ms", "buildFlags": ["-tags=x"] });
+        let user = json!({
+            "diagnosticsDelay": "100ms",
+            "pullDiagnostics": true,
+            "buildFlags": ["-tags=x"],
+        });
         let ours = initialize(7, &[("file:///ws", "ws")], "gopls", Some(&user));
         let opts = &ours["initializationOptions"];
-        // Conformance wins on the conflicting key — never overridable by the user.
+        // Conformance wins on the conflicting keys — never overridable by the
+        // user (`pullDiagnostics: true` is the bug-87 footgun).
         assert_eq!(opts["diagnosticsDelay"], json!("0s"));
-        assert_eq!(opts["pullDiagnostics"], json!(true));
+        assert_eq!(opts["pullDiagnostics"], json!(false));
         // The user's unrelated key survives.
         assert_eq!(opts["buildFlags"], json!(["-tags=x"]));
     }
