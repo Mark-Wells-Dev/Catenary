@@ -1,23 +1,36 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Mark Wells <contact@markwells.dev>
-"""Emit the GitHub Actions conformance matrix from the install recipes.
+"""Emit the GitHub Actions conformance matrix from recipes AND provisioning.
 
 The `discover` job of `.github/workflows/conformance.yml` runs this to turn
-`defaults/recipes.toml` into one matrix entry per server the harness should
-install-and-conform. Each entry carries everything a matrix job needs to install
-the pinned artifact and select it in the harness:
+`defaults/recipes.toml` (user-grade install recipes) AND
+`defaults/ci-provision.toml` (CI-only provisioning: toolchain components, system
+packages, checksummed GitHub-release binaries, git-pinned source builds, gems)
+into one matrix entry per server the harness should install-and-conform.
 
-    { server, ecosystem, package, version, tier, hash, runtime_name, runtime_version }
+Each entry carries a `source` (`recipe` | `provision`) that the workflow branches
+on, plus the fields that source's install step needs:
 
-Scoping (a recipe-touching PR need not re-conform every server):
+    recipe:    { server, source, ecosystem, package, version, tier, hash,
+                 runtime_name, runtime_version }
+    provision: { server, source, kind, version, component, apt, repo, asset,
+                 sha256, bin, git, rev, url, gem, runtime_name, runtime_version }
 
-- `--base OLD_RECIPES` emits only the recipes whose parsed entry differs from
-  `OLD_RECIPES` (added or changed) — robust to a version/hash bump inside a
-  block, which a header-only diff would miss.
-- `--only NAME ...` restricts to the named recipes.
-- with neither, the full matrix is emitted (structural changes and
-  refresh-recipes PRs, where every pin can move).
+A provisioning stanza marked `pending` (a required pin that could not be resolved
+mechanically — never invented) is SKIPPED with a stderr note: it cannot be
+installed, so emitting it would create a guaranteed-red job that blocks blessing.
+
+Scoping (a recipe/provision-touching PR need not re-conform every server):
+
+- `--base-recipes OLD` / `--base-provision OLD` emit only the stanzas whose parsed
+  entry differs from the base (added or changed) — robust to a pin bump inside a
+  block, which a header-only diff would miss. Scoping is per-source: a
+  recipes-only edit passes an unchanged provisioning base, yielding zero provision
+  jobs (diff-scoping for recipe-only edits still works).
+- `--only NAME ...` restricts to the named servers across both sources.
+- with neither base, the full matrix is emitted (structural / refresh PRs, where
+  every pin can move).
 
 Output is a single JSON object `{"include": [...]}` on stdout, ready for
 `fromJson()`; a human-readable count goes to stderr.
@@ -31,55 +44,116 @@ import sys
 import tomllib
 from pathlib import Path
 
-DEFAULT_RECIPES = Path(__file__).resolve().parent.parent / "defaults" / "recipes.toml"
+DEFAULTS = Path(__file__).resolve().parent.parent / "defaults"
+DEFAULT_RECIPES = DEFAULTS / "recipes.toml"
+DEFAULT_PROVISION = DEFAULTS / "ci-provision.toml"
+
+
+def _load(path: Path, table: str) -> dict[str, dict]:
+    """Parse `path` and return its top-level `[<table>.*]` map (empty if absent)."""
+    return tomllib.loads(path.read_text()).get(table, {})
+
+
+def _scoped(entries: dict[str, dict], base: Path | None, table: str) -> set[str]:
+    """Names to include: changed-vs-base when a base is given, else all."""
+    if base is None:
+        return set(entries)
+    base_entries = _load(base, table)
+    return {n for n, e in entries.items() if base_entries.get(n) != e}
+
+
+def recipe_entry(name: str, recipe: dict) -> dict:
+    """One `source = recipe` matrix entry."""
+    runtime = recipe.get("runtime") or {}
+    return {
+        "server": name,
+        "source": "recipe",
+        "ecosystem": recipe.get("ecosystem", ""),
+        "package": recipe.get("package", ""),
+        "version": recipe.get("version", ""),
+        "tier": recipe.get("tier", ""),
+        "hash": recipe.get("hash", ""),
+        "runtime_name": runtime.get("name", ""),
+        "runtime_version": runtime.get("version", ""),
+    }
+
+
+def provision_entry(name: str, prov: dict) -> dict:
+    """One `source = provision` matrix entry (all kind-specific fields flattened)."""
+    runtime = prov.get("runtime") or {}
+    return {
+        "server": name,
+        "source": "provision",
+        "kind": prov.get("kind", ""),
+        "version": prov.get("version", ""),
+        "component": prov.get("component", ""),
+        "apt": prov.get("apt", ""),
+        "repo": prov.get("repo", ""),
+        "asset": prov.get("asset", ""),
+        "sha256": prov.get("sha256", ""),
+        "bin": prov.get("bin", ""),
+        "git": prov.get("git", ""),
+        "rev": prov.get("rev", ""),
+        "url": prov.get("url", ""),
+        "gem": prov.get("gem", ""),
+        "runtime_name": runtime.get("name", ""),
+        "runtime_version": runtime.get("version", ""),
+    }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Emit the conformance CI matrix.")
     parser.add_argument("--recipes", type=Path, default=DEFAULT_RECIPES)
+    parser.add_argument("--provision", type=Path, default=DEFAULT_PROVISION)
     parser.add_argument(
-        "--base",
+        "--base-recipes",
         type=Path,
         default=None,
         help="only include recipes changed vs this base recipes.toml",
     )
     parser.add_argument(
-        "--only", nargs="*", default=None, help="restrict to these recipe names"
+        "--base-provision",
+        type=Path,
+        default=None,
+        help="only include provisions changed vs this base ci-provision.toml",
+    )
+    parser.add_argument(
+        "--only", nargs="*", default=None, help="restrict to these server names"
     )
     args = parser.parse_args()
 
-    doc = tomllib.loads(args.recipes.read_text())
-    recipes: dict[str, dict] = doc.get("recipe", {})
+    recipes = _load(args.recipes, "recipe")
+    provisions = _load(args.provision, "provision")
 
-    if args.base is not None:
-        base = tomllib.loads(args.base.read_text()).get("recipe", {})
-        names = sorted(n for n, r in recipes.items() if base.get(n) != r)
-    elif args.only:
-        names = args.only
-    else:
-        names = sorted(recipes)
+    recipe_names = _scoped(recipes, args.base_recipes, "recipe")
+    provision_names = _scoped(provisions, args.base_provision, "provision")
+
+    if args.only:
+        only = set(args.only)
+        recipe_names &= only
+        provision_names &= only
+
     include = []
-    for name in names:
-        recipe = recipes.get(name)
-        if recipe is None:
-            print(f"warn: no [recipe.{name}] — skipped", file=sys.stderr)
+    for name in sorted(recipe_names):
+        include.append(recipe_entry(name, recipes[name]))
+    skipped_pending = []
+    for name in sorted(provision_names):
+        prov = provisions[name]
+        if prov.get("pending"):
+            skipped_pending.append(name)
             continue
-        runtime = recipe.get("runtime") or {}
-        include.append(
-            {
-                "server": name,
-                "ecosystem": recipe.get("ecosystem", ""),
-                "package": recipe.get("package", ""),
-                "version": recipe.get("version", ""),
-                "tier": recipe.get("tier", ""),
-                "hash": recipe.get("hash", ""),
-                "runtime_name": runtime.get("name", ""),
-                "runtime_version": runtime.get("version", ""),
-            }
-        )
+        include.append(provision_entry(name, prov))
 
     print(json.dumps({"include": include}))
-    print(f"conformance matrix: {len(include)} job(s)", file=sys.stderr)
+    recipe_jobs = sum(1 for e in include if e["source"] == "recipe")
+    provision_jobs = sum(1 for e in include if e["source"] == "provision")
+    print(
+        f"conformance matrix: {len(include)} job(s) "
+        f"({recipe_jobs} recipe, {provision_jobs} provision)",
+        file=sys.stderr,
+    )
+    for name in skipped_pending:
+        print(f"skip: provision `{name}` is pending an unresolved pin", file=sys.stderr)
     return 0
 
 

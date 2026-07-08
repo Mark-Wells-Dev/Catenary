@@ -1018,6 +1018,25 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
     }
 
     #[test]
+    fn blessed_manifest_entry_without_recipe_yields_no_offer() {
+        // A CI-provisioned server (rust-analyzer, clangd, lattice, …) blesses but
+        // is NOT a recipe — it lives only in ci-provision.toml (tui-rework 10).
+        // Offerability requires a recipe to construct a BlessedRecipe, so a
+        // manifest entry with no matching recipe is never offerable: the offer
+        // loop iterates recipes and never visits a manifest-only server.
+        let manifest = manifest("rust-analyzer", "1.85.0"); // blessed, no recipe
+        let recipes: std::collections::BTreeMap<String, InstallRecipe> =
+            std::collections::BTreeMap::new(); // rust-analyzer carries no recipe
+        let any_offerable = recipes
+            .iter()
+            .any(|(name, r)| BlessedRecipe::resolve(name, r, &manifest).is_some());
+        assert!(
+            !any_offerable,
+            "a blessed-manifest entry with no recipe must yield nothing offerable",
+        );
+    }
+
+    #[test]
     fn cargo_plan_argv_is_pinned_and_locked() {
         let r = recipe(
             Ecosystem::Cargo,

@@ -53,9 +53,9 @@ extensions = ["nim"]
 
 # ── JVM ─────────────────────────────────────────────────────────────
 
-# [lsp.language.java]  — no canonical default server (jdtls requires Eclipse runtime)
 [lsp.language.java]
 extensions = ["java"]
+servers = ["jdtls"]
 root_markers = ["pom.xml", "build.gradle", "build.gradle.kts"]
 
 [lsp.language.kotlin]
@@ -111,6 +111,7 @@ root_markers = ["pyrightconfig.json", "pyproject.toml", "setup.py"]
 extensions = ["rb"]
 filenames = ["Gemfile", "Rakefile"]
 shebangs = ["ruby", "irb"]
+servers = ["ruby-lsp"]
 root_markers = ["Gemfile"]
 
 [lsp.language.perl]

@@ -62,6 +62,20 @@ upgrading.
 
 ### Added
 
+- **Conformance CI now covers the servers people actually reach for.**
+  Install recipes only exist where a package ecosystem can carry a
+  verifiable pin — but "can we install it for you" and "does it work with
+  Catenary's shipped config" are different questions. A new CI-only
+  provisioning source answers the second one for toolchain- and
+  binary-distributed servers: rust-analyzer (rustup component), clangd
+  (system), lua-ls and marksman (pinned, sha256-verified release assets),
+  and lattice itself (pinned-rev `cargo --locked` build — Catenary's docs
+  stack dogfoods the server it recommends). Java (jdtls) and Ruby
+  (ruby-lsp) enter the shipped defaults with new conformance fixtures
+  alongside a new C fixture for clangd. Provisioned servers can be
+  blessed for config-compatibility but structurally cannot become
+  install offers: the provision and recipe key sets are disjoint by
+  parser assertion, and offerability still requires a recipe.
 - **The recipe registry can live outside the binary, behind a signature.**
   A new `[registry]` config table points Catenary at a published registry
   artifact (recipes + blessed-manifest); the loader resolves

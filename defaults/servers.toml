@@ -74,6 +74,17 @@ args = ["--stdio"]
 command = "vscode-eslint-language-server"
 args = ["--stdio"]
 
+# jdtls (Eclipse JDT Language Server) is the Java default (tui-rework 10). The
+# `jdtls` launcher manages its own workspace data dir, so no args. It requires a
+# JDK >= 17 runtime — recorded on the CI provisioning stanza
+# (defaults/ci-provision.toml), not here (servers.toml carries command/args only).
+[lsp.server.jdtls]
+command = "jdtls"
+
+# ruby-lsp serves Ruby over stdio by default (tui-rework 10).
+[lsp.server.ruby-lsp]
+command = "ruby-lsp"
+
 # ── {name}-ls ────────────────────────────────────────────────────
 
 [lsp.server.bash-ls]

@@ -22,6 +22,7 @@ on:
     branches: [main]
     paths:
       - "defaults/recipes.toml"
+      - "defaults/ci-provision.toml"
       - "defaults/servers.toml"
       - "defaults/languages.toml"
       - "tests/fixtures/conformance/**"
@@ -57,19 +58,28 @@ jobs:
           base="${{ github.event.pull_request.base.sha }}"
           scope_full=1
           # workflow_dispatch (no PR base) and structural changes run the full
-          # matrix; an ordinary recipe edit is diff-scoped to changed recipes.
+          # matrix; an ordinary recipe/provision edit is diff-scoped to the
+          # changed stanzas of whichever pin file(s) moved.
           if [ -n "$base" ]; then
             changed="$(git diff --name-only "$base" "${{ github.sha }}")"
             echo "changed files:"; echo "$changed"
-            if echo "$changed" | grep -qvE '^defaults/recipes\.toml$'; then
-              scope_full=1  # a non-recipes file changed → any server may be affected
+            # Only the two pin files are diff-scopeable; any other changed file
+            # (a fixture, the harness, servers/languages) may affect any server.
+            if echo "$changed" | grep -qvE '^defaults/(recipes|ci-provision)\.toml$'; then
+              scope_full=1
             else
-              scope_full=0  # only recipes.toml changed → scope to changed recipes
+              scope_full=0
             fi
           fi
           if [ "$scope_full" -eq 0 ]; then
+            # Diff-scope BOTH sources against their base. A file that did not
+            # change compares equal to its base → zero jobs from it, so a
+            # recipes-only edit still scopes to changed recipes (and vice versa).
             git show "$base:defaults/recipes.toml" > /tmp/base-recipes.toml
-            matrix="$(python3 tools/conformance_matrix.py --base /tmp/base-recipes.toml)"
+            git show "$base:defaults/ci-provision.toml" > /tmp/base-provision.toml
+            matrix="$(python3 tools/conformance_matrix.py \
+              --base-recipes /tmp/base-recipes.toml \
+              --base-provision /tmp/base-provision.toml)"
           else
             matrix="$(python3 tools/conformance_matrix.py)"
           fi
@@ -111,6 +121,7 @@ jobs:
           esac
 
       - name: Install pinned server (${{ matrix.ecosystem }} ${{ matrix.package }}@${{ matrix.version }})
+        if: matrix.source == 'recipe'
         run: |
           set -euo pipefail
           case "${{ matrix.ecosystem }}" in
@@ -148,6 +159,73 @@ jobs:
               echo "unknown ecosystem: ${{ matrix.ecosystem }}"; exit 1 ;;
           esac
 
+      # CI-only provisioning (tui-rework 10): obtain a server that no user-grade
+      # ecosystem recipe can carry. One branch per provisioning `kind`. Pending
+      # stanzas never reach here — conformance_matrix.py drops them (an
+      # unresolved pin can't be installed).
+      - name: Provision server (${{ matrix.kind }} ${{ matrix.server }})
+        if: matrix.source == 'provision'
+        run: |
+          set -euo pipefail
+          case "${{ matrix.kind }}" in
+            rustup-component)
+              # Rides the pinned toolchain; the component adds the binary.
+              rustup component add "${{ matrix.component }}"
+              ;;
+            system-apt)
+              sudo apt-get update && sudo apt-get install -y "${{ matrix.apt }}"
+              ;;
+            github-release-sha256)
+              # Fetch the pinned asset, verify OUR pinned sha256, then place its
+              # launcher on PATH under the shipped server command (= basename bin).
+              url="https://github.com/${{ matrix.repo }}/releases/download/${{ matrix.version }}/${{ matrix.asset }}"
+              curl -sSL "$url" -o asset.dl
+              actual="$(sha256sum asset.dl | cut -d' ' -f1)"
+              if [ "$actual" != "${{ matrix.sha256 }}" ]; then
+                echo "sha256 mismatch for ${{ matrix.asset }}"
+                echo "  expected ${{ matrix.sha256 }}"
+                echo "  actual   $actual"
+                exit 1
+              fi
+              dest="$HOME/.provision/${{ matrix.server }}"
+              mkdir -p "$dest"
+              case "${{ matrix.asset }}" in
+                *.tar.gz|*.tgz) tar -xzf asset.dl -C "$dest" ;;
+                *.zip)          unzip -q asset.dl -d "$dest" ;;
+                *)              cp asset.dl "$dest/${{ matrix.bin }}" ;;  # bare binary
+              esac
+              chmod +x "$dest/${{ matrix.bin }}"
+              bindir="$HOME/.local/bin"; mkdir -p "$bindir"
+              ln -sf "$dest/${{ matrix.bin }}" "$bindir/$(basename "${{ matrix.bin }}")"
+              echo "$bindir" >> "$GITHUB_PATH"
+              ;;
+            cargo-git-locked)
+              # Reproducible source build pinned to an exact commit.
+              cargo install --git "${{ matrix.git }}" --rev "${{ matrix.rev }}" --locked "${{ matrix.server }}"
+              ;;
+            tarball-sha256)
+              url="${{ matrix.url }}"
+              curl -sSL "$url" -o asset.dl
+              actual="$(sha256sum asset.dl | cut -d' ' -f1)"
+              if [ "$actual" != "${{ matrix.sha256 }}" ]; then
+                echo "sha256 mismatch for $url"; exit 1
+              fi
+              dest="$HOME/.provision/${{ matrix.server }}"
+              mkdir -p "$dest"
+              tar -xzf asset.dl -C "$dest"
+              bindir="$HOME/.local/bin"; mkdir -p "$bindir"
+              ln -sf "$dest/${{ matrix.bin }}" "$bindir/$(basename "${{ matrix.bin }}")"
+              echo "$bindir" >> "$GITHUB_PATH"
+              ;;
+            gem)
+              # RubyGems carries no npm-grade integrity — the exact-version pin
+              # plus RubyGems' index is the verification (recorded honestly).
+              gem install "${{ matrix.gem }}" --version "${{ matrix.version }}"
+              ;;
+            *)
+              echo "unknown provisioning kind: ${{ matrix.kind }}"; exit 1 ;;
+          esac
+
       - name: Run conformance harness (${{ matrix.server }})
         env:
           CATENARY_CONFORMANCE: ${{ matrix.server }}
@@ -159,9 +237,20 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p blessed
+          # Host-riding provisions (rustup component, apt) carry no pin version;
+          # capture the actually-conformed version from the binary so the
+          # candidate manifest is honest.
+          ver="${{ matrix.version }}"
+          if [ -z "$ver" ]; then
+            case "${{ matrix.server }}" in
+              rust-analyzer) ver="$(rustup run stable rust-analyzer --version 2>/dev/null | head -1 || true)" ;;
+              clangd)        ver="$(clangd --version 2>/dev/null | head -1 || true)" ;;
+              *)             ver="unknown" ;;
+            esac
+          fi
           cat > "blessed/${{ matrix.server }}.toml" <<EOF
           [blessed.${{ matrix.server }}]
-          version = "${{ matrix.version }}"
+          version = "$ver"
           platform = "linux-x86_64"
           date = "$(date -u +%Y-%m-%d)"
           tier = "verified-on-linux"

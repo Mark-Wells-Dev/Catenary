@@ -1,0 +1,6 @@
+# Conformance fixture (tui-rework 10) — the `.clangd` file is the C root marker
+# (defaults/languages.toml `[lsp.language.c].root_markers`) and gives clangd a
+# standalone compile line so it parses the translation unit without a
+# compile_commands.json.
+CompileFlags:
+  Add: [-std=c11, -Wall]

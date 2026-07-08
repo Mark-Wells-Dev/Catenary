@@ -71,11 +71,39 @@ use serde_json::json;
 /// burns it down and fails the blessing.
 const CONFORMANCE_WALL_BOUND: Duration = Duration::from_mins(3);
 
+/// The generously-raised wall bound for cold-start-heavy servers (jdtls: JVM
+/// spin-up + Eclipse workspace init).
+///
+/// It is raised, not tightened — still finite (catches the never-idle class) but
+/// far above any healthy cold start even under parallel-test CPU contention. Per
+/// the contention doctrine (tui-rework 07 landing gate): a generous bound is the
+/// sanctioned lever; a sleep, retry loop, or tight bound is not.
+const CONFORMANCE_WALL_BOUND_SLOW: Duration = Duration::from_mins(10);
+
 /// Grace for a clean bridge shutdown after stdin close.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// Env var the conformance CI matrix sets to select the one server a job runs.
 const CONFORMANCE_ENV: &str = "CATENARY_CONFORMANCE";
+
+/// A shipped-default routing override for a server that is defined in the shipped
+/// config but is NOT its language's default binding.
+///
+/// The motivating case is `marksman`: `lattice` is the shipped markdown default
+/// (decision 015), so a bare shipped-defaults spawn never routes to marksman.
+/// When a [`Case`] carries a binding, the harness writes a `.catenary.toml` into
+/// the isolated fixture root binding `language → server` — the exact one-line
+/// opt-in a user of that server writes (docs/src/lsp/markdown.md) — so the harness
+/// can reach it. The shipped server *definition* is unchanged (its command still
+/// comes from `defaults/servers.toml`); only routing is overridden, and only in
+/// the throwaway tempdir, so the shipped default every real root gets is untouched.
+#[derive(Clone, Copy)]
+struct CaseBinding {
+    /// The language whose `servers` list is overridden (e.g. `markdown`).
+    language: &'static str,
+    /// The server to route it to (e.g. `marksman`).
+    server: &'static str,
+}
 
 /// One conformance case: a shipped server, the fixture it runs against, and the
 /// binary whose presence gates a local run.
@@ -89,6 +117,12 @@ struct Case {
     /// The binary the shipped command launches — the first token of the
     /// `[lsp.server.<server>].command`. Its presence on `PATH` gates a local run.
     probe: &'static str,
+    /// A shipped-default routing override for a non-default server (see
+    /// [`CaseBinding`]); `None` routes purely through the shipped defaults.
+    binding: Option<CaseBinding>,
+    /// `true` for a cold-start-heavy server (jdtls): use
+    /// [`CONFORMANCE_WALL_BOUND_SLOW`] instead of [`CONFORMANCE_WALL_BOUND`].
+    slow_start: bool,
 }
 
 /// Every conformance case. The dogfooded fleet (marked) has a sentinel `#[test]`
@@ -100,6 +134,12 @@ struct Case {
 /// cannot reach. `vscode-html` is absent too: the HTML server publishes no
 /// diagnostics for a plain document, so it has no intentional-diagnostic to
 /// assert on. (All recorded in the tui-rework 07 report as real gaps.)
+///
+/// The tui-rework 10 tranche (rust-analyzer already present; clangd, jdtls,
+/// ruby-lsp, marksman added) covers "the servers everyone actually wants" plus
+/// the lattice dogfood, obtained in CI via `defaults/ci-provision.toml` rather
+/// than an install recipe. marksman carries a [`CaseBinding`] because `lattice`
+/// is the shipped markdown default (decision 015); jdtls is `slow_start`.
 const CASES: &[Case] = &[
     // ── dogfooded fleet (local sentinels) ──────────────────────────────
     Case {
@@ -107,36 +147,48 @@ const CASES: &[Case] = &[
         fixture: "rust",
         file: "src/main.rs",
         probe: "rustup",
+        binding: None,
+        slow_start: false,
     },
     Case {
         server: "taplo",
         fixture: "toml",
         file: "broken.toml",
         probe: "taplo",
+        binding: None,
+        slow_start: false,
     },
     Case {
         server: "lattice",
         fixture: "markdown",
         file: "broken.md",
         probe: "lattice",
+        binding: None,
+        slow_start: false,
     },
     Case {
         server: "yaml-ls",
         fixture: "yaml",
         file: "broken.yaml",
         probe: "yaml-language-server",
+        binding: None,
+        slow_start: false,
     },
     Case {
         server: "vscode-json",
         fixture: "json",
         file: "broken.json",
         probe: "vscode-json-language-server",
+        binding: None,
+        slow_start: false,
     },
     Case {
         server: "bash-ls",
         fixture: "shellscript",
         file: "broken.sh",
         probe: "bash-language-server",
+        binding: None,
+        slow_start: false,
     },
     // ── npm / cargo / pip / go tranche (CI matrix) ─────────────────────
     Case {
@@ -144,66 +196,126 @@ const CASES: &[Case] = &[
         fixture: "python",
         file: "broken.py",
         probe: "pyright-langserver",
+        binding: None,
+        slow_start: false,
     },
     Case {
         server: "typescript-ls",
         fixture: "typescript",
         file: "broken.ts",
         probe: "typescript-language-server",
+        binding: None,
+        slow_start: false,
     },
     Case {
         server: "vscode-css",
         fixture: "css",
         file: "broken.css",
         probe: "vscode-css-language-server",
+        binding: None,
+        slow_start: false,
     },
     Case {
         server: "intelephense",
         fixture: "php",
         file: "broken.php",
         probe: "intelephense",
+        binding: None,
+        slow_start: false,
     },
     Case {
         server: "svelte-ls",
         fixture: "svelte",
         file: "src/Broken.svelte",
         probe: "svelteserver",
+        binding: None,
+        slow_start: false,
     },
     Case {
         server: "elm-ls",
         fixture: "elm",
         file: "src/Main.elm",
         probe: "elm-language-server",
+        binding: None,
+        slow_start: false,
     },
     Case {
         server: "docker-ls",
         fixture: "dockerfile",
         file: "Dockerfile",
         probe: "docker-langserver",
+        binding: None,
+        slow_start: false,
     },
     Case {
         server: "sql-ls",
         fixture: "sql",
         file: "broken.sql",
         probe: "sql-language-server",
+        binding: None,
+        slow_start: false,
     },
     Case {
         server: "cmake-ls",
         fixture: "cmake",
         file: "CMakeLists.txt",
         probe: "cmake-language-server",
+        binding: None,
+        slow_start: false,
     },
     Case {
         server: "gopls",
         fixture: "go",
         file: "main.go",
         probe: "gopls",
+        binding: None,
+        slow_start: false,
     },
     Case {
         server: "lua-ls",
         fixture: "lua",
         file: "broken.lua",
         probe: "lua-language-server",
+        binding: None,
+        slow_start: false,
+    },
+    // ── tui-rework 10 coverage (CI matrix via ci-provision.toml) ───────
+    Case {
+        server: "clangd",
+        fixture: "c",
+        file: "broken.c",
+        probe: "clangd",
+        binding: None,
+        slow_start: false,
+    },
+    Case {
+        server: "marksman",
+        fixture: "markdown",
+        file: "broken.md",
+        probe: "marksman",
+        // lattice is the shipped markdown default (decision 015); route the
+        // fixture to marksman via the isolated-root opt-in without touching it.
+        binding: Some(CaseBinding {
+            language: "markdown",
+            server: "marksman",
+        }),
+        slow_start: false,
+    },
+    Case {
+        server: "jdtls",
+        fixture: "java",
+        file: "Broken.java",
+        probe: "jdtls",
+        binding: None,
+        slow_start: true,
+    },
+    Case {
+        server: "ruby-lsp",
+        fixture: "ruby",
+        file: "broken.rb",
+        probe: "ruby-lsp",
+        binding: None,
+        slow_start: false,
     },
 ];
 
@@ -346,6 +458,25 @@ fn run_conformance(case: &Case, require: bool) -> Result<()> {
         bail!("fixture `{}` missing at {}", case.fixture, src.display());
     }
     copy_dir(&src, root.path())?;
+
+    // A non-default server (e.g. marksman, where lattice is the shipped markdown
+    // default) needs a one-line routing opt-in — written into the isolated root
+    // only, so the shipped default every real root gets is untouched. This is the
+    // exact `.catenary.toml` a user of that server writes (docs/src/lsp/markdown.md).
+    if let Some(binding) = case.binding {
+        let config = format!(
+            "# Conformance routing override (tui-rework 10): `{server}` is defined in\n\
+             # the shipped config but is not `{language}`'s default binding. This is the\n\
+             # one-line opt-in a user writes; it lives only in this throwaway fixture\n\
+             # root, so the shipped default is untouched.\n\
+             [lsp.language.{language}]\nservers = [\"{server}\"]\n",
+            server = binding.server,
+            language = binding.language,
+        );
+        std::fs::write(root.path().join(".catenary.toml"), config)
+            .context("write conformance routing override")?;
+    }
+
     let file = root.path().join(case.file);
 
     let file_name = Path::new(case.file)
@@ -366,7 +497,12 @@ fn run_conformance(case: &Case, require: bool) -> Result<()> {
     // settle/pull gap (bug 74; the waitv2 finding-7 pull-diagnostics class),
     // and its known-deterministic casualties (`lattice`, `vscode-json`) are
     // `#[ignore]`d sentinels pointing at the bug, not absorbed.
-    let receipt = run_settle_diagnostics(&bridge, &file, CONFORMANCE_WALL_BOUND)
+    let wall = if case.slow_start {
+        CONFORMANCE_WALL_BOUND_SLOW
+    } else {
+        CONFORMANCE_WALL_BOUND
+    };
+    let receipt = run_settle_diagnostics(&bridge, &file, wall)
         .with_context(|| format!("conformance settle for `{}`", case.server))?;
 
     // The intentional diagnostic MUST have published: the fixture file is
@@ -457,6 +593,20 @@ fn conformance_lattice() -> Result<()> {
 #[test]
 fn conformance_vscode_json() -> Result<()> {
     sentinel("vscode-json")
+}
+
+// ── tui-rework 10 coverage sentinel (skip-if-binary-missing) ──────────
+//
+// clangd is a common, apt-provisioned server that publishes a hard parse error
+// (undeclared identifier) on didOpen, so it is a reliable cold-diagnose sentinel
+// where present. marksman, jdtls, and ruby-lsp are intentionally NOT sentinels:
+// they are exercised by the CI matrix via `CATENARY_CONFORMANCE` (marksman needs
+// its routing opt-in and jdtls a JVM cold start — neither belongs in the local
+// dogfood fleet), keeping `make check` green on hosts without them.
+
+#[test]
+fn conformance_clangd() -> Result<()> {
+    sentinel("clangd")
 }
 
 // ── CI-matrix entry point (exact-server selection) ────────────────────

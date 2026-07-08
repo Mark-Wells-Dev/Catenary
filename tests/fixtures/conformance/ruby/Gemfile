@@ -1,0 +1,4 @@
+# Conformance fixture (tui-rework 10) — the Gemfile is the Ruby root marker
+# (defaults/languages.toml `[lsp.language.ruby].root_markers`). It lists no gems,
+# so ruby-lsp roots here without a bundle install on the runner.
+source "https://rubygems.org"

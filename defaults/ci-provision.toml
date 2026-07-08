@@ -1,0 +1,149 @@
+# CI-INTERNAL server provisioning — NOT install recipes, NOT user-visible, NOT
+# offerable (tui-rework 10).
+#
+# This file answers a different question than `defaults/recipes.toml`. A recipe
+# records *can Catenary install this for a user* (a user-grade ecosystem pin an
+# install engine can execute — npm/cargo/pip/go, all offerable once blessed). A
+# provision stanza records *how a conformance CI matrix job OBTAINS a server that
+# no user-grade ecosystem recipe can carry* — a toolchain component, a system
+# package, a checksummed GitHub release binary, a git-pinned source build, a gem.
+#
+# The separation is the whole point: a provisioned server lives ONLY here, is
+# NEVER parsed into the install engine's recipe set, and so is STRUCTURALLY unable
+# to become an install offer (src/recipes.rs asserts `provision` and `recipe` key
+# sets are disjoint). Provisioned servers still DO enter the candidate
+# blessed-manifest — blessing means "conforms with the shipped default config",
+# which is exactly what these servers need on record — but blessing is not
+# offerability (offerability additionally requires a recipe, by construction:
+# src/install.rs `BlessedRecipe::resolve`).
+#
+# Each `[provision.<server>]` keys a canonical server name from
+# `defaults/servers.toml`. `tools/conformance_matrix.py` reads this file AND
+# recipes.toml to build the CI matrix; `.github/workflows/conformance.yml` gains
+# one install branch per `kind`.
+#
+# Fields:
+#   kind      how the job obtains the server (see kinds below).
+#   version   the exact pin, where the kind carries one (git tag / release tag /
+#             gem version). Omitted for kinds that ride a host (rustup, apt).
+#   runtime   (optional) an extra runtime dep, e.g.
+#             runtime = { name = "jdk", version = ">=17" } — declared LAST (a
+#             sub-table). The workflow provisions it before the harness runs.
+#   pending   true when a pin this kind requires could NOT be resolved
+#             mechanically from the authoring environment; NEVER invent one — the
+#             field is marked pending and the matrix job fails loudly until a
+#             maintainer fills it (same honesty rule the recipes' pip hashes
+#             follow).
+#   note      (optional) residual risk / what a pending pin still needs.
+#
+# Provision kinds:
+#   rustup-component      `rustup component add <component>` — the pin rides the
+#                         pinned toolchain (rust-toolchain.toml); no explicit
+#                         version, toolchain-verified.
+#   system-apt            the runner's apt package (`apt-get install <apt>`);
+#                         apt's signed repositories verify — no explicit hash.
+#   github-release-sha256 a pinned release `tag` + `asset` from `repo`, verified
+#                         against `sha256`, unpacked to a runner temp dir; `bin`
+#                         is the launcher path within the unpacked asset. The
+#                         placement problem that deferred this tier for USERS
+#                         (managed-dir territory, tui-rework 06) does not exist in
+#                         CI — download-verify was always the easy half.
+#   cargo-git-locked      `cargo install --git <git> --rev <rev> --locked` — a
+#                         reproducible source build pinned to an exact commit;
+#                         `--locked` + the git rev verify.
+#   tarball-sha256        a pinned `url` tarball verified against `sha256`,
+#                         unpacked (`bin` the launcher within) — for a release
+#                         hosted off GitHub (e.g. an Eclipse milestone build).
+#   gem                   `gem install <gem> --version <version>` — RubyGems
+#                         carries no npm-grade per-artifact integrity, so the
+#                         verification is the exact-version pin plus RubyGems'
+#                         own index; the tier is recorded honestly, not inflated.
+#
+# Versions resolved 2026-07-07 from each project's GitHub release/tag metadata
+# (mechanically, via `gh api`); sha256 values are the release asset `digest`
+# GitHub reports. A pin that could not be resolved from GitHub metadata (an
+# Eclipse-hosted tarball, a RubyGems checksum) is marked `pending`.
+
+# ── toolchain component ──────────────────────────────────────────────
+# rust-analyzer — arguably the #1 server for the actual audience, never before
+# conformed. Rides the pinned stable toolchain, so no version pin.
+
+[provision.rust-analyzer]
+kind = "rustup-component"
+component = "rust-analyzer"
+
+# ── system package ───────────────────────────────────────────────────
+# clangd — from the runner's apt (the ubuntu-latest LLVM packaging). Rides the
+# runner image, so no explicit version; apt's signed repos verify.
+
+[provision.clangd]
+kind = "system-apt"
+apt = "clangd"
+
+# ── checksummed GitHub releases ──────────────────────────────────────
+# lua-ls, marksman — pinned tag + pinned asset sha256, unpacked to a temp dir.
+
+[provision.lua-ls]
+kind = "github-release-sha256"
+repo = "LuaLS/lua-language-server"
+version = "3.18.2"
+asset = "lua-language-server-3.18.2-linux-x64.tar.gz"
+sha256 = "ca71415dd19f19e30aaa35a4915aefca9fdb5fec31b98331cc3d77f778d539c5"
+bin = "bin/lua-language-server"
+
+[provision.marksman]
+kind = "github-release-sha256"
+repo = "artempyanykh/marksman"
+version = "2026-02-08"
+asset = "marksman-linux-x64"
+sha256 = "be5098e8213219269c47fc0d916a66fa31ce0602ec967475c722260aabf26087"
+bin = "marksman"
+note = "the asset is a bare executable, not an archive; the job copies it to `bin` (basename must equal the shipped [lsp.server.marksman] command `marksman`) and puts it on PATH."
+
+# ── git-pinned source build (the lattice dogfood) ────────────────────
+# lattice — the maintainer's own markdown LSP, built from the Lattice repo at a
+# pinned rev with `--locked`. This is a contract pin (tui-rework 10 §4): the job
+# validates the shipped default config against the server CatenaryInternal is
+# authored in, and notices the day lattice starts advertising `diagnosticProvider`
+# (bug 74's upstream nit) instead of silently changing behavior.
+#
+# Lattice publishes to crates.io (`cargo install lattice`), but the pin below is
+# resolved fully from THIS environment: the repo is public, the rev is the exact
+# commit of the v0.4.0 tag (`gh api repos/TwoWells/Lattice/tags`), and it matches
+# the dogfood binary on the maintainer host (`lattice --version` → 0.4.0 b078c5a).
+# A git-rev build is therefore verifiable end-to-end here, where a crates.io
+# version could not be (no crates.io access from the authoring environment).
+
+[provision.lattice]
+kind = "cargo-git-locked"
+git = "https://github.com/TwoWells/Lattice"
+version = "0.4.0"
+tag = "v0.4.0"
+rev = "b078c5ae5d3cc5fd1477513f87251a194dd73c6c"
+
+# ── off-GitHub tarball (Eclipse milestone) ───────────────────────────
+# jdtls — Eclipse JDT Language Server. New to the shipped defaults this ticket
+# (runtime = jdk >= 17). jdtls cold-starts notoriously slowly; the harness gives
+# it a generously raised wall bound (never a tight bound, sleep, or retry loop —
+# contention doctrine). The release TARBALL lives on download.eclipse.org, not a
+# GitHub release asset, so its exact URL (milestone timestamp) and sha256 cannot
+# be resolved mechanically from GitHub metadata — pending, not invented.
+
+[provision.jdtls]
+kind = "tarball-sha256"
+version = "1.60.0"
+pending = true
+note = "url + sha256 pending: the jdt-language-server-1.60.0-<timestamp>.tar.gz milestone build is on download.eclipse.org (not a GitHub release asset), so neither the exact URL nor its sha256 is resolvable from GitHub metadata. The tag 1.60.0 is the latest eclipse-jdtls/eclipse.jdt.ls release."
+runtime = { name = "jdk", version = ">=17" }
+
+# ── gem ──────────────────────────────────────────────────────────────
+# ruby-lsp — new to the shipped defaults this ticket. Exact-version pin from the
+# ruby-lsp gem's GitHub release tag; RubyGems carries no npm-grade per-artifact
+# integrity, so the sha256 is honestly pending (RubyGems' compact-index checksum
+# is not resolvable from GitHub metadata).
+
+[provision.ruby-lsp]
+kind = "gem"
+gem = "ruby-lsp"
+version = "0.26.10"
+note = "the gem tier carries no per-artifact sha256 by design — RubyGems has no npm-grade integrity; verification is the exact-version pin plus RubyGems' index. Version is the latest stable Shopify/ruby-lsp gem tag (v0.26.10; 0.27.0 is prerelease)."

@@ -565,6 +565,8 @@ mod tests {
             "taplo",
             "lattice",
             "marksman",
+            "jdtls",
+            "ruby-lsp",
             "intelephense",
             "vscode-css",
             "vscode-html",

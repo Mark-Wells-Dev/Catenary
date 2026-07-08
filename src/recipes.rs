@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! CI-internal install recipes and the blessed-manifest (tui-rework 07).
+//! CI-internal install recipes, CI provisioning, and the blessed-manifest
+//! (tui-rework 07/10).
 //!
-//! Two disjoint data sets, both parsed here, both keyed by canonical server
-//! name (the `[lsp.server.*]` keys in `defaults/servers.toml`):
+//! Three disjoint data sets, all parsed here, all keyed by canonical server name
+//! (the `[lsp.server.*]` keys in `defaults/servers.toml`):
 //!
 //! - **Recipes** (`defaults/recipes.toml`) are *CI-internal install
 //!   instructions*: how a conformance matrix job installs a pinned language
@@ -18,6 +19,18 @@
 //!   blessed-manifest feeds any user surface (that surface ships later, in
 //!   tickets 03/06).
 //!
+//! - **Provisioning** (`defaults/ci-provision.toml`) records how a conformance
+//!   matrix job *obtains* a server that no user-grade ecosystem recipe can carry
+//!   — a toolchain component, a system package, a checksummed GitHub-release
+//!   binary, a git-pinned source build, a gem. A provision is **not** a recipe
+//!   and is structurally unable to become an install offer: it lives in its own
+//!   file, is parsed by this module alone, and its key set is asserted disjoint
+//!   from the recipe set ([`validate_provisioning`] plus the test module). A
+//!   provisioned server still enters the *blessed*-manifest (blessing = conforms
+//!   with the shipped default config), but blessing is not offerability —
+//!   offerability additionally requires a recipe by construction
+//!   (`crate::install::BlessedRecipe`).
+//!
 //! - **The blessed-manifest** (`defaults/blessed-manifest.toml`) is the
 //!   committed record of servers that have passed the CI conformance gate:
 //!   server → conformed version / platform / date. A server earns an entry only
@@ -25,10 +38,10 @@
 //!   is mechanized, not manual — see the tui-rework 06 design). It is the *only*
 //!   recipe-derived data a user surface is ever allowed to consult.
 //!
-//! Neither data set is consumed by the running daemon; both exist for the
+//! None of the three is consumed by the running daemon; they exist for the
 //! conformance harness (`tests/conformance_harness.rs`), the `refresh-recipes`
 //! maintenance target, and the conformance CI workflow. This module is the
-//! single parse/validate port for both.
+//! single parse/validate port for all three.
 
 use std::collections::BTreeMap;
 
@@ -37,6 +50,9 @@ use serde::{Deserialize, Serialize};
 
 /// Embedded default recipe drafts (`defaults/recipes.toml`).
 pub const DEFAULT_RECIPES: &str = include_str!("../defaults/recipes.toml");
+
+/// Embedded CI provisioning stanzas (`defaults/ci-provision.toml`).
+pub const DEFAULT_CI_PROVISION: &str = include_str!("../defaults/ci-provision.toml");
 
 /// Embedded committed blessed-manifest (`defaults/blessed-manifest.toml`).
 pub const DEFAULT_BLESSED_MANIFEST: &str = include_str!("../defaults/blessed-manifest.toml");
@@ -180,6 +196,17 @@ const fn default_true() -> bool {
     true
 }
 
+/// serde `skip_serializing_if` for a defaults-false bool (e.g.
+/// [`ProvisionStanza::pending`]) — omit it from TOML when unset. The `&bool`
+/// signature is dictated by serde's `skip_serializing_if` contract.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires an fn(&T) -> bool"
+)]
+const fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// Parse target for `defaults/recipes.toml`: a `[recipe.<name>]` table map.
 #[derive(Debug, Default, Deserialize)]
 struct RecipesDoc {
@@ -246,6 +273,228 @@ pub fn recipes_missing_hash(recipes: &BTreeMap<String, InstallRecipe>) -> Vec<St
     recipes
         .iter()
         .filter(|(_, r)| r.tier.carries_hash() && r.hash.is_none())
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+// ── CI provisioning (tui-rework 10) ──────────────────────────────────
+
+/// How a conformance CI matrix job obtains a server that no user-grade ecosystem
+/// recipe can carry.
+///
+/// Each variant names the mechanism `.github/workflows/conformance.yml` runs; the
+/// kebab-case token is the `kind` key in `defaults/ci-provision.toml`. Unlike
+/// [`Ecosystem`], these are deliberately CI-only — a provisioned server is never
+/// an install offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProvisionKind {
+    /// `rustup component add <component>` — the pin rides the pinned toolchain,
+    /// so no explicit version is carried.
+    RustupComponent,
+    /// The runner's apt package (`apt-get install <apt>`); apt's signed
+    /// repositories verify, so no explicit hash is carried.
+    SystemApt,
+    /// A pinned GitHub release `asset` from `repo`, verified against `sha256` and
+    /// unpacked; `bin` is the launcher path within the asset.
+    GithubReleaseSha256,
+    /// `cargo install --git <git> --rev <rev> --locked` — a reproducible source
+    /// build pinned to an exact commit.
+    CargoGitLocked,
+    /// A pinned `url` tarball verified against `sha256` and unpacked (for a
+    /// release hosted off GitHub, e.g. an Eclipse milestone build).
+    TarballSha256,
+    /// `gem install <gem> --version <version>` — the gem registry carries no
+    /// npm-grade per-artifact integrity, so verification is the exact-version pin
+    /// plus the registry index.
+    Gem,
+}
+
+impl ProvisionKind {
+    /// The kebab-case token used in TOML and matrix jobs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RustupComponent => "rustup-component",
+            Self::SystemApt => "system-apt",
+            Self::GithubReleaseSha256 => "github-release-sha256",
+            Self::CargoGitLocked => "cargo-git-locked",
+            Self::TarballSha256 => "tarball-sha256",
+            Self::Gem => "gem",
+        }
+    }
+}
+
+/// One CI provisioning stanza for a shipped server.
+///
+/// The kind-specific fields are all optional at the type level (one struct serves
+/// every kind); [`validate_provisioning`] enforces that the fields a given `kind`
+/// requires are present, unless the stanza is `pending`. `runtime` is declared
+/// last so a nested struct serializes as a trailing `[provision.<name>.runtime]`
+/// sub-table (same reason as [`InstallRecipe::runtime`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvisionStanza {
+    /// The provisioning mechanism.
+    pub kind: ProvisionKind,
+    /// The exact pin, where the kind carries one (git tag / release tag / gem
+    /// version). Absent for kinds that ride a host (`rustup-component`,
+    /// `system-apt`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// `rustup-component`: the component name (e.g. `rust-analyzer`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
+    /// `system-apt`: the apt package name (e.g. `clangd`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apt: Option<String>,
+    /// `github-release-sha256`: the `owner/name` repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// `github-release-sha256`: the release asset file name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<String>,
+    /// `github-release-sha256` / `tarball-sha256`: the pinned asset sha256 (hex).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// `github-release-sha256` / `tarball-sha256`: the launcher path within the
+    /// unpacked asset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bin: Option<String>,
+    /// `cargo-git-locked`: the git repository URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<String>,
+    /// `cargo-git-locked`: a human-readable tag for the pinned rev (documentation
+    /// only; `rev` is what `cargo install` pins on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// `cargo-git-locked`: the exact commit sha the build pins to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    /// `tarball-sha256`: the pinned tarball URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// `gem`: the gem name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gem: Option<String>,
+    /// `true` when a pin this kind requires could not be resolved mechanically
+    /// from the authoring environment. A pending stanza is exempt from the
+    /// required-field check (so it round-trips and ships) but its matrix job
+    /// fails loudly until a maintainer fills the pin — never invented.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pending: bool,
+    /// Free-text note stating residual risk or what a pending pin still needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// An additional runtime dependency (e.g. a JDK for jdtls), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<Runtime>,
+}
+
+/// Parse target for `defaults/ci-provision.toml`: a `[provision.<name>]` map.
+#[derive(Debug, Default, Deserialize)]
+struct ProvisionDoc {
+    #[serde(default)]
+    provision: BTreeMap<String, ProvisionStanza>,
+}
+
+/// Parse a `[provision.*]` TOML document into a map keyed by server name.
+///
+/// # Errors
+///
+/// Returns an error if the TOML is malformed or a stanza has no `kind`.
+pub fn parse_provisioning(contents: &str) -> Result<BTreeMap<String, ProvisionStanza>> {
+    let doc: ProvisionDoc =
+        toml::from_str(contents).context("Failed to parse provisioning TOML")?;
+    Ok(doc.provision)
+}
+
+/// Parse the embedded default provisioning stanzas.
+///
+/// # Errors
+///
+/// Returns an error if the embedded `defaults/ci-provision.toml` is malformed.
+pub fn default_provisioning() -> Result<BTreeMap<String, ProvisionStanza>> {
+    parse_provisioning(DEFAULT_CI_PROVISION)
+}
+
+/// Validate a provisioning set against a recipe set, returning one message per
+/// problem.
+///
+/// Enforces two CI-internal invariants: the kind-required pins are present (a
+/// `pending` stanza is exempt — it ships with the pin unresolved and fails its
+/// matrix job loudly instead), and — the structural boundary — the provisioning
+/// and recipe key sets are **disjoint**, so a provisioned server can never leak
+/// into the offerable recipe set.
+#[must_use]
+pub fn validate_provisioning(
+    provisions: &BTreeMap<String, ProvisionStanza>,
+    recipes: &BTreeMap<String, InstallRecipe>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (name, p) in provisions {
+        if recipes.contains_key(name) {
+            errors.push(format!(
+                "server `{name}` is BOTH provisioned and a recipe — the unofferability \
+                 boundary requires the provision and recipe key sets be disjoint"
+            ));
+        }
+        if p.pending {
+            continue; // a pending stanza may omit the pins it is pending on.
+        }
+        for field in missing_required_fields(p) {
+            errors.push(format!(
+                "provision `{name}` (kind `{}`) is missing required field `{field}`",
+                p.kind.as_str()
+            ));
+        }
+    }
+    errors
+}
+
+/// The kind-required fields absent on `p` (the `gem` tier carries no sha256 by
+/// design, so it is not required; a `pending` stanza is checked by the caller).
+fn missing_required_fields(p: &ProvisionStanza) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    let mut require = |present: bool, field: &'static str| {
+        if !present {
+            missing.push(field);
+        }
+    };
+    match p.kind {
+        ProvisionKind::RustupComponent => require(p.component.is_some(), "component"),
+        ProvisionKind::SystemApt => require(p.apt.is_some(), "apt"),
+        ProvisionKind::GithubReleaseSha256 => {
+            require(p.repo.is_some(), "repo");
+            require(p.asset.is_some(), "asset");
+            require(p.sha256.is_some(), "sha256");
+            require(p.bin.is_some(), "bin");
+        }
+        ProvisionKind::CargoGitLocked => {
+            require(p.git.is_some(), "git");
+            require(p.rev.is_some(), "rev");
+        }
+        ProvisionKind::TarballSha256 => {
+            require(p.url.is_some(), "url");
+            require(p.sha256.is_some(), "sha256");
+        }
+        ProvisionKind::Gem => {
+            require(p.gem.is_some(), "gem");
+            require(p.version.is_some(), "version");
+        }
+    }
+    missing
+}
+
+/// Names of provisioning stanzas marked `pending` (a required pin unresolved).
+///
+/// Reported, not errored — a pending stanza ships (so the mechanism and the rest
+/// of its pins are recorded) and its matrix job fails until the pin is filled by
+/// a maintainer, never invented.
+#[must_use]
+pub fn provisioning_pending(provisions: &BTreeMap<String, ProvisionStanza>) -> Vec<String> {
+    provisions
+        .iter()
+        .filter(|(_, p)| p.pending)
         .map(|(name, _)| name.clone())
         .collect()
 }
@@ -508,10 +757,159 @@ mod tests {
         }
     }
 
+    #[test]
+    fn default_provisioning_parses_and_validates() {
+        let provisions = default_provisioning().expect("default provisioning parses");
+        assert!(!provisions.is_empty(), "at least one provision ships");
+        let recipes = default_recipes().expect("default recipes parse");
+        let errors = validate_provisioning(&provisions, &recipes);
+        assert!(
+            errors.is_empty(),
+            "shipped provisioning must validate: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn provisioning_and_recipes_are_disjoint() {
+        // The unofferability boundary: a provisioned server lives ONLY in
+        // ci-provision.toml and can never appear in the offerable recipe set.
+        let provisions = default_provisioning().expect("provisioning parses");
+        let recipes = default_recipes().expect("recipes parse");
+        for name in provisions.keys() {
+            assert!(
+                !recipes.contains_key(name),
+                "server `{name}` is both provisioned and a recipe — the boundary is broken"
+            );
+        }
+    }
+
+    #[test]
+    fn every_provision_names_a_real_server() {
+        let provisions = default_provisioning().expect("provisioning parses");
+        let servers = default_server_names();
+        for name in provisions.keys() {
+            assert!(
+                servers.contains(name),
+                "provision `{name}` does not name a [lsp.server.*] in defaults/servers.toml"
+            );
+        }
+    }
+
+    #[test]
+    fn provisioning_covers_the_ticket_servers_and_kinds() {
+        // tui-rework 10's headline coverage: the servers everyone actually wants
+        // plus the lattice dogfood, spanning every provisioning kind.
+        let provisions = default_provisioning().expect("provisioning parses");
+        for server in [
+            "rust-analyzer",
+            "clangd",
+            "lua-ls",
+            "marksman",
+            "lattice",
+            "jdtls",
+            "ruby-lsp",
+        ] {
+            assert!(provisions.contains_key(server), "provision for `{server}`");
+        }
+        for kind in [
+            ProvisionKind::RustupComponent,
+            ProvisionKind::SystemApt,
+            ProvisionKind::GithubReleaseSha256,
+            ProvisionKind::CargoGitLocked,
+            ProvisionKind::TarballSha256,
+            ProvisionKind::Gem,
+        ] {
+            assert!(
+                provisions.values().any(|p| p.kind == kind),
+                "at least one `{}` provision ships",
+                kind.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn lattice_dogfood_is_a_pinned_rev_build() {
+        // The contract pin (tui-rework 10 §4): lattice built from the repo at an
+        // exact rev with --locked. The pin is fully resolvable from the authoring
+        // environment (public repo, rev = the v0.4.0 tag commit), so it is NOT
+        // pending.
+        let provisions = default_provisioning().expect("provisioning parses");
+        let lattice = &provisions["lattice"];
+        assert_eq!(lattice.kind, ProvisionKind::CargoGitLocked);
+        assert!(!lattice.pending, "the lattice rev is resolved, not pending");
+        assert!(
+            lattice.git.is_some() && lattice.rev.is_some(),
+            "git + rev pinned"
+        );
+    }
+
+    #[test]
+    fn provisioning_pending_is_exactly_the_unresolved_pins() {
+        // jdtls's Eclipse-hosted tarball URL + sha256 are not resolvable from
+        // GitHub metadata, so it ships pending; ruby-lsp's gem tier carries no
+        // sha256 BY DESIGN (not a missing pin), so it is not pending.
+        let provisions = default_provisioning().expect("provisioning parses");
+        let pending = provisioning_pending(&provisions);
+        assert!(pending.contains(&"jdtls".to_owned()), "jdtls is pending");
+        assert!(
+            !pending.contains(&"ruby-lsp".to_owned()),
+            "ruby-lsp is not pending — the gem tier carries no sha256 by design"
+        );
+    }
+
+    #[test]
+    fn provisioning_roundtrips_through_toml() {
+        let provisions = default_provisioning().expect("provisioning parses");
+        let serialized = toml::to_string(&ProvisionWrap {
+            provision: &provisions,
+        })
+        .expect("serialize");
+        let reparsed = parse_provisioning(&serialized).expect("reparse");
+        assert_eq!(
+            provisions, reparsed,
+            "provisioning round-trips through TOML"
+        );
+    }
+
+    #[test]
+    fn non_pending_provision_missing_a_required_field_fails_validation() {
+        // A github-release-sha256 stanza with no sha256, not marked pending, is a
+        // validation error — an unverified download would slip through otherwise.
+        let toml = "[provision.demo]\nkind = \"github-release-sha256\"\n\
+                    repo = \"o/r\"\nasset = \"a.tar.gz\"\nbin = \"bin/x\"\n";
+        let provisions = parse_provisioning(toml).expect("parses");
+        let errors = validate_provisioning(&provisions, &BTreeMap::new());
+        assert!(
+            errors.iter().any(|e| e.contains("sha256")),
+            "a missing sha256 must fail validation: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_server_in_both_provision_and_recipe_fails_validation() {
+        let provisions = parse_provisioning(
+            "[provision.taplo]\nkind = \"cargo-git-locked\"\n\
+             git = \"https://example/x\"\nrev = \"abc\"\n",
+        )
+        .expect("parses");
+        let recipes = default_recipes().expect("recipes parse"); // taplo is a recipe
+        let errors = validate_provisioning(&provisions, &recipes);
+        assert!(
+            errors.iter().any(|e| e.contains("disjoint")),
+            "a server that is both provisioned and a recipe must fail: {errors:?}"
+        );
+    }
+
     /// Borrowing serialize helper so the round-trip test can serialize without
     /// cloning the map into an owned [`RecipesDoc`] twice.
     #[derive(Serialize)]
     struct Wrap<'a> {
         recipe: &'a BTreeMap<String, InstallRecipe>,
+    }
+
+    /// Borrowing serialize helper for the provisioning round-trip test.
+    #[derive(Serialize)]
+    struct ProvisionWrap<'a> {
+        provision: &'a BTreeMap<String, ProvisionStanza>,
     }
 }
