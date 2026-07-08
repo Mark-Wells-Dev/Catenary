@@ -349,6 +349,13 @@ jobs:
               # cleared), so the lookup holds wherever XDG points.
               echo "GEM_PATH=$(ruby -e 'puts Gem.user_dir')" \
                 >> "$GITHUB_ENV"
+              # GEM_HOME too: ruby-lsp's composed bundle runs
+              # `bundle install` at boot, and without GEM_HOME bundler
+              # installs into the root-owned system gem dir (run-9 red:
+              # Bundler::PermissionError on /var/lib/gems, 4x retries
+              # per gem for ~50s, then server death).
+              echo "GEM_HOME=$(ruby -e 'puts Gem.user_dir')" \
+                >> "$GITHUB_ENV"
               ;;
             *)
               echo "unknown provisioning kind: ${{ matrix.kind }}"; exit 1 ;;

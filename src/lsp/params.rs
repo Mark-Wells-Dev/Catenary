@@ -507,13 +507,15 @@ mod tests {
 
     #[test]
     fn initialize_forces_gopls_conformance_levers() {
-        // gopls carries the forced conformance levers even when the user supplies
+        // gopls carries the forced conformance lever even when the user supplies
         // no initializationOptions. Pull is forced OFF (bug 87: pull mode stops
-        // real pushes; the empty placeholder publishes read as heard-empty).
+        // real pushes; the empty placeholder publishes read as heard-empty). The
+        // debounce is NOT forced (run 9: "0s" made gopls publish
+        // instantly-and-empty on the unchecked snapshot).
         let ours = initialize(7, &[("file:///ws", "ws")], "gopls", None);
         let opts = &ours["initializationOptions"];
         assert_eq!(opts["pullDiagnostics"], json!(false));
-        assert_eq!(opts["diagnosticsDelay"], json!("0s"));
+        assert!(opts.get("diagnosticsDelay").is_none());
     }
 
     #[test]
@@ -525,11 +527,12 @@ mod tests {
         });
         let ours = initialize(7, &[("file:///ws", "ws")], "gopls", Some(&user));
         let opts = &ours["initializationOptions"];
-        // Conformance wins on the conflicting keys — never overridable by the
-        // user (`pullDiagnostics: true` is the bug-87 footgun).
-        assert_eq!(opts["diagnosticsDelay"], json!("0s"));
+        // Conformance wins on its key — never overridable by the user
+        // (`pullDiagnostics: true` is the bug-87 footgun).
         assert_eq!(opts["pullDiagnostics"], json!(false));
-        // The user's unrelated key survives.
+        // The user's non-conformance keys survive — the debounce is theirs to
+        // tune (only forcing it to "0s" was the run-9 bug).
+        assert_eq!(opts["diagnosticsDelay"], json!("100ms"));
         assert_eq!(opts["buildFlags"], json!(["-tags=x"]));
     }
 

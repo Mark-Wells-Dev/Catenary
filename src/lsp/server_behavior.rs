@@ -33,19 +33,23 @@
 //!   path, so RA's native pushes are the sole diagnostic channel — airtight even
 //!   if RA spontaneously advertises `diagnosticProvider`.
 //! - **gopls** — [`ServerProfile::forced_initialization_options`].
-//!   `diagnosticsDelay: "0s"` (no debounce blind window — the debounce coalesces
-//!   human keystreams, but Catenary sends discrete batches) and `pullDiagnostics:
-//!   false` — **forced off** (bug 87, conformance run 8): in pull mode gopls stops
-//!   pushing real diagnostics and publishes empty placeholders, which the
-//!   heard-empty-is-evidence rule (misc 153) treats as authoritative — so the pull
-//!   that would fetch the real results is suppressed and dirty files read
-//!   `[clean]`. Push mode with a zeroed delay is the honest configuration until
-//!   the collection path can drive pull-mode servers pull-first. These are
-//!   conformance settings, not `defaults/servers.toml` entries, because a user
-//!   `[lsp.server.gopls]` replaces the shipped default wholesale (no field merge —
-//!   see `test_builtin_no_merge`), which would silently drop them; and because they
-//!   must win over a user who sets them otherwise (a user's `pullDiagnostics:
-//!   true` would reintroduce the bug-87 false-clean).
+//!   `pullDiagnostics: false` — **forced off** (bug 87, conformance run 8): in
+//!   pull mode gopls stops pushing real diagnostics and publishes empty
+//!   placeholders, which the heard-empty-is-evidence rule (misc 153) treats as
+//!   authoritative — so the pull that would fetch the real results is suppressed
+//!   and dirty files read `[clean]`. Push mode on gopls's **default** debounce is
+//!   the honest configuration until the collection path can drive pull-mode
+//!   servers pull-first. `diagnosticsDelay` is deliberately NOT forced:
+//!   conformance run 9 proved `"0s"` decouples publishing from analysis — every
+//!   publish fired ~1 ms after its document event, empty, on the not-yet-checked
+//!   snapshot, and the completed type-check never got a publish of its own. The
+//!   debounce is not a blind window to zero out; it is the coupling between
+//!   analysis completion and the publish. This is a conformance setting, not a
+//!   `defaults/servers.toml` entry, because a user `[lsp.server.gopls]` replaces
+//!   the shipped default wholesale (no field merge — see `test_builtin_no_merge`),
+//!   which would silently drop it; and because it must win over a user who sets it
+//!   otherwise (a user's `pullDiagnostics: true` would reintroduce the bug-87
+//!   false-clean).
 
 use serde_json::{Value, json};
 
@@ -138,9 +142,11 @@ fn profile(server_name: &str) -> ServerProfile {
             // `pullDiagnostics` is forced FALSE (bug 87): gopls's pull mode
             // stops real pushes and publishes empty placeholders that the
             // heard-empty rule reads as authoritative — false `[clean]`.
+            // `diagnosticsDelay` stays at gopls's default: forcing "0s" made
+            // every publish fire instantly-and-empty on the unchecked snapshot
+            // (run 9) — the debounce couples publishing to completed analysis.
             forced_initialization_options: Some(json!({
                 "pullDiagnostics": false,
-                "diagnosticsDelay": "0s",
             })),
         },
         _ => ServerProfile::default(),
@@ -193,20 +199,22 @@ mod tests {
     }
 
     #[test]
-    fn gopls_forces_both_levers_when_user_supplies_none() {
+    fn gopls_forces_pull_off_when_user_supplies_none() {
         let opts = ServerProfile::for_server("gopls")
             .effective_initialization_options(None)
             .expect("gopls forces initialization options");
         // Pull is forced OFF (bug 87: pull mode stops real pushes and the empty
         // placeholder publishes read as authoritative heard-empty).
         assert_eq!(opts["pullDiagnostics"], json!(false));
-        assert_eq!(opts["diagnosticsDelay"], json!("0s"));
+        // The debounce is NOT forced (run 9: "0s" published instantly-and-empty
+        // on the unchecked snapshot — the delay couples publish to analysis).
+        assert!(opts.get("diagnosticsDelay").is_none());
     }
 
     #[test]
     fn gopls_conformance_wins_over_user_options() {
-        // A user tries to override BOTH conformance levers — including the
-        // bug-87 footgun (`pullDiagnostics: true`) — and adds an unrelated key.
+        // A user tries the bug-87 footgun (`pullDiagnostics: true`) and also
+        // tunes the debounce — a configurable the profile must NOT own.
         let user = json!({
             "diagnosticsDelay": "250ms",
             "pullDiagnostics": true,
@@ -215,14 +223,14 @@ mod tests {
         let opts = ServerProfile::for_server("gopls")
             .effective_initialization_options(Some(&user))
             .expect("merged options");
-        // Conformance wins on the conflicting keys — never overridable.
-        assert_eq!(opts["diagnosticsDelay"], json!("0s"));
         assert_eq!(
             opts["pullDiagnostics"],
             json!(false),
             "a user cannot reintroduce the bug-87 false-clean",
         );
-        // The user's unrelated key survives.
+        // The user's non-conformance keys survive — including the debounce,
+        // which is theirs to tune (only forcing it to "0s" was the run-9 bug).
+        assert_eq!(opts["diagnosticsDelay"], json!("250ms"));
         assert_eq!(opts["buildFlags"], json!(["-tags=integration"]));
     }
 
