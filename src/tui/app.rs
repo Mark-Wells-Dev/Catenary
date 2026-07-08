@@ -140,9 +140,6 @@ pub struct App<'a> {
     /// The tarball fetcher the npm verified-install path fetches through.
     fetcher: Box<dyn TarballFetcher>,
 
-    /// Cached filesystem-detected languages, keyed by the root-path set.
-    lang_cache: HashSet<String>,
-    lang_cache_key: Vec<String>,
     /// The `generated_at` the findings were built from.
     last_generated_at: String,
     /// Set by a toggle/filter change to force a row rebuild next reload.
@@ -213,8 +210,6 @@ impl<'a> App<'a> {
             blessed: crate::recipes::default_blessed_manifest().unwrap_or_default(),
             runner: Box::new(ProcessRunner),
             fetcher: Box::new(UreqFetcher),
-            lang_cache: HashSet::new(),
-            lang_cache_key: Vec::new(),
             last_generated_at: String::new(),
             needs_rebuild: true,
             env_findings,
@@ -337,41 +332,17 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Active workspace languages: the cheap live-instance set unioned with a
-    /// cached filesystem detection (recomputed only when the root set changes).
-    fn active_languages(&mut self) -> HashSet<String> {
-        let mut key: Vec<String> = self.snapshot.roots.iter().map(|r| r.path.clone()).collect();
-        key.sort();
-        if key != self.lang_cache_key {
-            self.lang_cache = self.detect_fs_languages();
-            self.lang_cache_key = key;
-        }
-        let mut active = findings::live_languages(&self.snapshot);
-        active.extend(self.lang_cache.iter().cloned());
+    /// Active workspace languages: the **activity-gated** set from the snapshot's
+    /// language-activity ledger (tui-rework 09, item 5).
+    ///
+    /// A language is live only when tracked-session activity touched a file of
+    /// it — presence in a dormant fixture directory no session opened lights
+    /// nothing, so it can never raise a suggestion or Fatal. The daemon records
+    /// the ledger; the TUI never walks the filesystem for this.
+    fn active_languages(&self) -> HashSet<String> {
+        let (active, _) =
+            crate::health::servers::activity_inputs(&self.snapshot.activity_languages);
         active
-    }
-
-    /// Detect languages from files under the tracked roots (best-effort; empty
-    /// when config is absent or no root exists on disk).
-    fn detect_fs_languages(&self) -> HashSet<String> {
-        let Some(cfg) = &self.config else {
-            return HashSet::new();
-        };
-        let roots: Vec<PathBuf> = self
-            .snapshot
-            .roots
-            .iter()
-            .map(|r| PathBuf::from(&r.path))
-            .filter(|p| p.exists())
-            .collect();
-        if roots.is_empty() {
-            return HashSet::new();
-        }
-        let configured: HashSet<&str> = cfg.language.keys().map(String::as_str).collect();
-        let manager = crate::bridge::filesystem_manager::FilesystemManager::with_classification(
-            crate::bridge::filesystem_manager::ClassificationTables::from_config(cfg),
-        );
-        manager.detect_workspace_languages(&roots, &configured)
     }
 
     /// Rebuild the three pane row lists from the current snapshot + findings +

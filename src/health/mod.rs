@@ -21,10 +21,12 @@
 //!   phase (this module defines the trait; the consumer is out of scope here).
 //!
 //! Routed-vs-dormant derivation lives in the model
-//! ([`servers::is_routed`]): a server is *routed* iff a configured language
-//! binding targets it and that language is active in a tracked root (detected
-//! files, or — via a snapshot feed — a live per-root instance). Everything
-//! else configured is *dormant inventory*, never a warning.
+//! ([`servers::is_intent_routed`]): a server is *routed* iff a configured
+//! language binding targets it and that language is **activity-live** — a
+//! tracked session touched a file of it (tui-rework 09) — or the server is
+//! explicitly configured. Everything else configured is *dormant inventory*,
+//! never a warning; presence in a fixture directory no one opened lights
+//! nothing.
 
 pub mod config_checks;
 pub mod install_checks;
@@ -262,6 +264,10 @@ pub struct Finding {
     pub message: String,
     /// Optional fix-it guidance, rendered under the message.
     pub fix_it: Option<String>,
+    /// Optional routing provenance — which root and file(s) made this finding's
+    /// language activity-live — rendered under the fix-it line (tui-rework 09,
+    /// item 4). Carried as its own field, never folded into [`Self::message`].
+    pub provenance: Option<String>,
     /// Optional stale-content diff, rendered only under `--diff`.
     pub diff: Option<StaleDiff>,
 }
@@ -275,6 +281,7 @@ impl Finding {
             severity,
             message: message.into(),
             fix_it: None,
+            provenance: None,
             diff: None,
         }
     }
@@ -283,6 +290,13 @@ impl Finding {
     #[must_use]
     pub fn with_fix_it(mut self, fix_it: impl Into<String>) -> Self {
         self.fix_it = Some(fix_it.into());
+        self
+    }
+
+    /// Attach routing provenance, rendered under the fix-it line (chainable).
+    #[must_use]
+    pub fn with_provenance(mut self, provenance: impl Into<String>) -> Self {
+        self.provenance = Some(provenance.into());
         self
     }
 

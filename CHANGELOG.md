@@ -350,6 +350,21 @@ upgrading.
 
 ### Changed
 
+- **The dashboard reports what you work on, not what's lying around.**
+  Language suggestions (and the intent that turns an
+  installed-but-failing server into a Fatal) are now gated on tracked
+  session activity — a language counts as live only when a session has
+  actually touched a file of it, recorded from hook file-tracking into
+  the snapshot's new activity ledger. Presence alone (vendored samples,
+  test fixtures) no longer lights a language: those demote to quiet
+  inventory. Findings also carry their provenance — which root and
+  file(s) made the language live — rendered in the detail pane and
+  doctor, so "why is this server even being probed?" is answered on
+  sight. Layout polish from the first live review rides along: the
+  header strip dissolves (verdict counts onto the Problems panel title,
+  daemon pid/version/freshness into the footer), and the panes are
+  renamed `Servers (by root)`, `Sessions (by client)`, and the
+  focus-aware `Details (Servers)` / `Details (Sessions)`.
 - **A heard-empty publish is evidence; only never-heard probes.** The
   diagnostics push cache always kept the distinction between "the server
   published an empty set for this file" and "the server never published",
@@ -769,6 +784,11 @@ upgrading.
 
 ### Fixed
 
+- **The dashboard no longer cries "stale daemon" on every non-tag build.**
+  The snapshot recorded the bare crate semver while the binary reports the
+  git-describe build version, so the TUI/doctor version-skew finding fired
+  falsely on any build between tags. Both now read the same source as
+  `catenary version`, with a regression test holding them together.
 - **Two false-`[clean]` bugs the conformance harness caught in its first
   week.** A server that answers `textDocument/diagnostic` pulls without
   advertising the capability (lattice publishes once on workspace scan,

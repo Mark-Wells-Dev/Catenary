@@ -10,7 +10,7 @@
 //! asks the model for findings, and renders them. The finding *set* is the
 //! contract (pinned by the model's tests); the prose here may reflow freely.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -44,6 +44,13 @@ fn render_finding(out: &mut Output, finding: &Finding, show_diff: bool) {
             let styled = out.colors.dim(line);
             let _ = out.writeln(format_args!("     {styled}"));
         }
+    }
+
+    // Routing provenance under the fix-it line — "why is this being probed?"
+    // (tui-rework 09, item 4).
+    if let Some(provenance) = &finding.provenance {
+        let styled = out.colors.dim(provenance);
+        let _ = out.writeln(format_args!("     {styled}"));
     }
 
     if show_diff && let Some(diff) = &finding.diff {
@@ -82,9 +89,10 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
     // up top so a stale daemon is the first thing seen. Daemon down → no
     // finding.
     let daemon_version = read_daemon_version();
-    if let Some(finding) =
-        crate::health::skew::skew_finding(env!("CATENARY_VERSION"), daemon_version.as_deref())
-    {
+    if let Some(finding) = crate::health::skew::skew_finding(
+        crate::health::skew::BINARY_VERSION,
+        daemon_version.as_deref(),
+    ) {
         render_finding(out, &finding, show_diff);
         let _ = out.writeln(format_args!(""));
     }
@@ -163,7 +171,7 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
     // Gather the probe feed (concurrent one-shot probes), then render the
     // server findings the model derives from it — routed breaks are errors,
     // dormant breaks are inventory.
-    let feed = gather_probe_feed(&config, project_root, daemon_version).await;
+    let feed = gather_probe_feed(&config, daemon_version).await;
     let _ = out.writeln(format_args!("{}:", out.colors.bold("Servers")));
     let server_findings = crate::health::servers::server_findings(&config, &feed);
     render_findings(out, &server_findings, show_diff);
@@ -214,11 +222,17 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
 }
 
 /// Gather doctor's one-shot probe feed: concurrent `initialize` probes for every
-/// configured server, the languages detected in the workspace, and the observed
-/// daemon version.
+/// configured server, plus the **activity-live** languages and their provenance
+/// read from the daemon's `state.json` activity ledger, and the observed daemon
+/// version.
+///
+/// Gating on activity rather than presence is the doctor half of "one model, two
+/// renderers" (tui-rework 09, item 5): with the daemon down there is no activity
+/// ledger, so no language is live and a broken *default* server reads as quiet
+/// dormant inventory rather than a phantom Fatal — a dormant fixture directory
+/// no session touched never screams "install this".
 async fn gather_probe_feed(
     config: &crate::config::Config,
-    project_root: &Path,
     daemon_version: Option<String>,
 ) -> ProbeFeed {
     let mut join_set = tokio::task::JoinSet::new();
@@ -239,17 +253,12 @@ async fn gather_probe_feed(
         }
     }
 
-    let configured_keys: HashSet<&str> = config.language.keys().map(String::as_str).collect();
-    let roots = project_root
-        .canonicalize()
-        .map(|r| vec![r])
+    let activity = read_snapshot()
+        .map(|s| s.activity_languages)
         .unwrap_or_default();
-    let manager = crate::bridge::filesystem_manager::FilesystemManager::with_classification(
-        crate::bridge::filesystem_manager::ClassificationTables::from_config(config),
-    );
-    let active_languages = manager.detect_workspace_languages(&roots, &configured_keys);
+    let (active_languages, provenance) = crate::health::servers::activity_inputs(&activity);
 
-    ProbeFeed::new(statuses, active_languages, daemon_version)
+    ProbeFeed::new(statuses, active_languages, daemon_version).with_provenance(provenance)
 }
 
 /// Render the language→server routing table with each server's capabilities.
@@ -283,18 +292,26 @@ fn render_languages(out: &mut Output, config: &crate::config::Config, feed: &dyn
     }
 }
 
-/// Read the running daemon's version from the `state.json` snapshot, if present.
+/// Read + parse the running daemon's `state.json` snapshot, if present.
 ///
-/// Read-only: the snapshot is the same source the TUI's snapshot feed will use.
-/// A missing/unparseable snapshot or an empty version yields `None` (daemon down
-/// or unknown), so version skew simply does not fire.
-fn read_daemon_version() -> Option<String> {
+/// Read-only: the same source the TUI's snapshot feed uses. A missing or
+/// unparseable snapshot (daemon down) yields `None`, so doctor sees no daemon
+/// version and no activity ledger — version skew does not fire and no language
+/// is activity-live.
+fn read_snapshot() -> Option<crate::state_snapshot::Snapshot> {
     let path = crate::paths::runtime_dir()
         .join("catenary")
         .join("state.json");
     let contents = std::fs::read_to_string(path).ok()?;
-    let snapshot: crate::state_snapshot::Snapshot = serde_json::from_str(&contents).ok()?;
-    let version = snapshot.daemon.version;
+    serde_json::from_str(&contents).ok()
+}
+
+/// Read the running daemon's version from the `state.json` snapshot, if present.
+///
+/// A missing/unparseable snapshot or an empty version yields `None` (daemon down
+/// or unknown), so version skew simply does not fire.
+fn read_daemon_version() -> Option<String> {
+    let version = read_snapshot()?.daemon.version;
     (!version.is_empty()).then_some(version)
 }
 

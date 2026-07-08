@@ -1247,12 +1247,14 @@ fn run_daemon_main() -> Result<()> {
         let snapshot = catenary_mcp::state_snapshot::SnapshotWriter::new(
             rt.handle(),
             &catenary_mcp::paths::runtime_dir().join("catenary"),
-            catenary_mcp::state_snapshot::DaemonInfo {
-                instance_id: instance_id.to_string(),
-                pid: std::process::id(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                started_at: catenary_mcp::state_snapshot::now_iso(),
-            },
+            // `DaemonInfo::current` sources the recorded version from the same
+            // `CATENARY_VERSION` the skew check compares against, so a non-tag
+            // build is never falsely flagged stale (tui-rework 09, item 1).
+            catenary_mcp::state_snapshot::DaemonInfo::current(
+                instance_id.to_string(),
+                std::process::id(),
+                catenary_mcp::state_snapshot::now_iso(),
+            ),
         );
 
         let session = Arc::new(catenary_mcp::bridge::session::Session::new(

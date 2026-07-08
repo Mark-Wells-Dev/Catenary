@@ -25,7 +25,7 @@
 //! lossy `display_state` collapse, so a stuck `probing` server is visible
 //! (time-in-state = `now − state_since`).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -49,7 +49,13 @@ use crate::lsp::{InstanceKey, ServerLifecycle};
 ///   ephemeral `idle_remaining_secs`; session entries carry their live
 ///   `subagents` (tui-rework snapshot enrichment). Every schema-2 addition is
 ///   serde-additive — an older reader defaults each new field.
-const SCHEMA: u32 = 2;
+/// - `3` — the daemon records `activity_languages`: which configured languages
+///   tracked-session activity has touched, with the root and representative
+///   file(s) that made each live (tui-rework 09). The health model gates
+///   suggestion/Fatal findings on this activity ledger rather than presence, and
+///   renders its provenance under the finding. Serde-additive — an older reader
+///   defaults the field to an empty list.
+const SCHEMA: u32 = 3;
 
 /// Default coalescing window for non-urgent flushes.
 ///
@@ -72,6 +78,19 @@ const MAX_DEAD_SERVERS: usize = 64;
 /// (observability ticket 08).
 const MAX_ACTIVITY: usize = 64;
 
+/// Maximum `(language, root)` activity buckets tracked before new ones are
+/// dropped — the activity ledger is provenance, not history (tui-rework 09).
+const MAX_ACTIVITY_LANGS: usize = 64;
+
+/// Maximum distinct touched files tracked per activity bucket. Bounds the
+/// count and the memory a long-lived session can accrue; the provenance render
+/// only needs a representative sample plus the tally.
+const MAX_ACTIVITY_FILES: usize = 128;
+
+/// Representative touched files serialized per activity bucket — enough for a
+/// provenance line, far below the tracked-file cap.
+const ACTIVITY_FILES_SHOWN: usize = 8;
+
 /// Immutable daemon identity, recorded once at startup.
 #[derive(Debug, Clone)]
 pub struct DaemonInfo {
@@ -86,6 +105,27 @@ pub struct DaemonInfo {
 }
 
 impl DaemonInfo {
+    /// Builds the daemon identity for the running binary, stamping [`version`]
+    /// from the single binary-version source ([`crate::health::skew::BINARY_VERSION`],
+    /// the `git describe` string `catenary version` and the skew check read).
+    ///
+    /// The daemon snapshot once wrote the bare `CARGO_PKG_VERSION` while the
+    /// skew check compared against the git-describe `CATENARY_VERSION`, so every
+    /// non-tag build read as falsely skewed (tui-rework 09, item 1). Sourcing
+    /// both from the same constant makes that class of false positive
+    /// impossible.
+    ///
+    /// [`version`]: Self::version
+    #[must_use]
+    pub fn current(instance_id: String, pid: u32, started_at: String) -> Self {
+        Self {
+            instance_id,
+            pid,
+            version: crate::health::skew::BINARY_VERSION.to_string(),
+            started_at,
+        }
+    }
+
     /// Builds the serialized `daemon` block, stamping `generated_at` now.
     fn to_meta(&self) -> DaemonMeta<'_> {
         DaemonMeta {
@@ -414,6 +454,31 @@ pub struct Milestone {
     pub scope: Option<String>,
 }
 
+/// A configured language made live by tracked-session activity, with the
+/// provenance that triggered it (tui-rework 09, items 4–5).
+///
+/// The daemon appends to this ledger whenever a tracked session touches a file
+/// of a configured language (edit / read / shell write). The health model gates
+/// suggestion and Fatal findings on activity — a language present only in a
+/// dormant fixture directory no one touched is quiet Info inventory, not a
+/// finding — and renders `root` + `files` as the "why is this being probed?"
+/// provenance under the finding.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LanguageActivity {
+    /// The configured language id (e.g. `cmake`, `rust`).
+    pub language: String,
+    /// The tracked root under which the touch happened (canonical path).
+    pub root: String,
+    /// Representative touched files, root-relative, sorted and bounded — the
+    /// provenance sample (`routed by <file> …`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    /// Total distinct touched files for this `(language, root)` bucket —
+    /// the `(N files)` tally, which may exceed [`Self::files`].
+    pub file_count: usize,
+}
+
 /// Reader-side parse of a `state.json` snapshot — the daemon→TUI contract.
 ///
 /// The owned counterpart to the writer's borrowed [`SnapshotView`]. Lives here,
@@ -439,6 +504,10 @@ pub struct Snapshot {
     pub alerts: Vec<Alert>,
     /// Bounded curated activity ring (milestones, newest-first).
     pub activity: Vec<Milestone>,
+    /// Configured languages made live by tracked-session activity, with their
+    /// provenance (schema 3). The health model's suggestion/Fatal gate and the
+    /// finding provenance read this ledger.
+    pub activity_languages: Vec<LanguageActivity>,
 }
 
 /// Reader-side `daemon` block — owned counterpart to [`DaemonMeta`].
@@ -489,6 +558,10 @@ struct SnapshotState {
     alerts: VecDeque<Alert>,
     /// Activity ring (curated milestones), newest-first.
     activity: VecDeque<Milestone>,
+    /// Language-activity ledger: `(language, root)` → the distinct touched
+    /// files, bounded. Serialized into [`Snapshot::activity_languages`] as the
+    /// health model's suggestion/Fatal gate and provenance source (tui-rework 09).
+    activity_languages: BTreeMap<(String, String), BTreeSet<String>>,
     dirty: bool,
     urgent: bool,
 }
@@ -717,6 +790,45 @@ impl SnapshotState {
         }
     }
 
+    /// Records a tracked-session file touch into the language-activity ledger,
+    /// returning whether it changed the ledger (a new bucket or a new distinct
+    /// file) — a `false` return leaves the snapshot clean, so steady-state
+    /// re-touches never trigger a flush.
+    ///
+    /// Bounded on both axes: [`MAX_ACTIVITY_LANGS`] `(language, root)` buckets,
+    /// [`MAX_ACTIVITY_FILES`] distinct files per bucket — the ledger is
+    /// provenance, not history.
+    fn record_activity(&mut self, language: &str, root: &str, file: &str) -> bool {
+        let key = (language.to_string(), root.to_string());
+        if let Some(files) = self.activity_languages.get_mut(&key) {
+            if files.contains(file) || files.len() >= MAX_ACTIVITY_FILES {
+                return false;
+            }
+            files.insert(file.to_string());
+            return true;
+        }
+        if self.activity_languages.len() >= MAX_ACTIVITY_LANGS {
+            return false;
+        }
+        self.activity_languages
+            .insert(key, BTreeSet::from([file.to_string()]));
+        true
+    }
+
+    /// Materializes the language-activity ledger into serializable entries,
+    /// sorted by `(language, root)` for stable output.
+    fn activity_languages(&self) -> Vec<LanguageActivity> {
+        self.activity_languages
+            .iter()
+            .map(|((language, root), files)| LanguageActivity {
+                language: language.clone(),
+                root: root.clone(),
+                files: files.iter().take(ACTIVITY_FILES_SHOWN).cloned().collect(),
+                file_count: files.len(),
+            })
+            .collect()
+    }
+
     /// Drops the oldest terminal entries past [`MAX_DEAD_SERVERS`].
     fn reap_dead(&mut self) {
         let mut dead: Vec<(String, String)> = self
@@ -753,6 +865,7 @@ impl SnapshotState {
             roots,
             alerts: self.alerts.iter().collect(),
             activity: self.activity.iter().collect(),
+            activity_languages: self.activity_languages(),
         };
         serde_json::to_string_pretty(&view).unwrap_or_else(|e| {
             tracing::debug!(error = %e, "state.json serialization failed");
@@ -771,6 +884,7 @@ struct SnapshotView<'a> {
     roots: Vec<&'a RootEntry>,
     alerts: Vec<&'a Alert>,
     activity: Vec<&'a Milestone>,
+    activity_languages: Vec<LanguageActivity>,
 }
 
 /// Shared inner state plus flush coordination.
@@ -890,6 +1004,7 @@ impl SnapshotWriter {
                 servers: HashMap::new(),
                 alerts: VecDeque::new(),
                 activity: VecDeque::new(),
+                activity_languages: BTreeMap::new(),
                 dirty: false,
                 urgent: false,
             }),
@@ -1044,6 +1159,27 @@ impl SnapshotWriter {
         self.inner.notify.notify_one();
     }
 
+    /// Records a tracked-session file touch into the language-activity ledger
+    /// (coalesced flush). No-op — leaving the snapshot clean — when the touch is
+    /// already recorded or a bound is hit, so a busy session never flush-storms.
+    ///
+    /// `root` is the tracked root the file lives under (the provenance root);
+    /// `file` is that file root-relative. The health model gates suggestion and
+    /// Fatal findings on this ledger (tui-rework 09, item 5).
+    pub fn record_activity(&self, language: &str, root: &str, file: &str) {
+        let changed = {
+            let mut state = self.inner.lock_state();
+            let changed = state.record_activity(language, root, file);
+            if changed {
+                state.dirty = true;
+            }
+            changed
+        };
+        if changed {
+            self.inner.notify.notify_one();
+        }
+    }
+
     /// Marks the snapshot dirty and wakes the flush task (coalesced).
     ///
     /// Used by session action boundaries (`last_action` updates, status
@@ -1158,6 +1294,7 @@ mod tests {
             servers: HashMap::new(),
             alerts: VecDeque::new(),
             activity: VecDeque::new(),
+            activity_languages: BTreeMap::new(),
             dirty: false,
             urgent: false,
         }
@@ -1221,7 +1358,7 @@ mod tests {
         assert_eq!(server["state"], "probing");
         assert!(server["state_since"].is_string());
         assert_eq!(server["id"], "rust-analyzer@/p");
-        assert_eq!(json["schema"], 2);
+        assert_eq!(json["schema"], 3);
         assert_eq!(json["daemon"]["pid"], 4242);
         assert!(json["daemon"]["generated_at"].is_string());
     }
@@ -2007,6 +2144,7 @@ mod tests {
             summary: "2 errors, 1 warnings · 3 files".to_string(),
             scope: Some("mcp:7f3a".to_string()),
         });
+        state.record_activity("rust", "/p/Catenary", "src/db.rs");
 
         let session = session_entry("mcp:7f3a", SessionStatus::Editing, vec!["/p/Catenary"]);
         let roots = vec![
@@ -2072,6 +2210,47 @@ mod tests {
             "2 errors, 1 warnings · 3 files"
         );
         assert_eq!(snapshot.activity[0].scope.as_deref(), Some("mcp:7f3a"));
+
+        // The language-activity ledger round-trips with its provenance.
+        assert_eq!(snapshot.activity_languages.len(), 1);
+        let act = &snapshot.activity_languages[0];
+        assert_eq!(act.language, "rust");
+        assert_eq!(act.root, "/p/Catenary");
+        assert_eq!(act.files, vec!["src/db.rs"]);
+        assert_eq!(act.file_count, 1);
+    }
+
+    #[test]
+    fn record_activity_dedups_files_and_counts_distinct() {
+        let mut state = fresh_state();
+        // A repeat touch of the same file is not a change (no flush storm).
+        assert!(state.record_activity("rust", "/p", "src/a.rs"));
+        assert!(!state.record_activity("rust", "/p", "src/a.rs"));
+        assert!(state.record_activity("rust", "/p", "src/b.rs"));
+        let langs = state.activity_languages();
+        assert_eq!(langs.len(), 1);
+        assert_eq!(langs[0].file_count, 2, "distinct files counted");
+        assert_eq!(langs[0].files, vec!["src/a.rs", "src/b.rs"]);
+    }
+
+    #[test]
+    fn record_activity_separates_language_and_root_buckets() {
+        let mut state = fresh_state();
+        state.record_activity("rust", "/p", "a.rs");
+        state.record_activity("cmake", "/p", "CMakeLists.txt");
+        state.record_activity("rust", "/q", "b.rs");
+        let langs = state.activity_languages();
+        assert_eq!(langs.len(), 3, "each (language, root) is its own bucket");
+    }
+
+    #[test]
+    fn daemon_current_version_matches_the_skew_source() {
+        // Regression (tui-rework 09, item 1): the daemon snapshot must record the
+        // same binary version the skew check compares against, so a non-tag build
+        // never reads as falsely skewed. Both source it from `BINARY_VERSION`.
+        let daemon = DaemonInfo::current("daemon:x".to_string(), 7, now_iso());
+        assert_eq!(daemon.version, crate::health::skew::BINARY_VERSION);
+        assert_eq!(daemon.version, env!("CATENARY_VERSION"));
     }
 
     #[test]

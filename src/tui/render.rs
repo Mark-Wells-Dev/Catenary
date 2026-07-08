@@ -560,60 +560,67 @@ pub fn verdict_spans(verdict: Verdict, daemon_up: bool, theme: &Theme) -> Vec<Sp
     spans
 }
 
-/// The header/status strip: verdict, daemon identity, version + skew, staleness.
+/// The daemon-status spans for the footer: pid, version (+ skew), and snapshot
+/// freshness (tui-rework 09, item 2 — moved off the retired header strip).
+///
+/// Empty when the daemon is down (no snapshot generated). The version reads from
+/// the single [`BINARY_VERSION`](crate::health::skew::BINARY_VERSION) source, so
+/// it agrees with `catenary version` and the skew finding — a non-tag build is
+/// never falsely flagged (item 1).
 #[must_use]
-pub fn header_line(snapshot: &Snapshot, verdict: Verdict, theme: &Theme) -> Line<'static> {
-    let daemon_up = !snapshot.daemon.generated_at.is_empty();
-    let mut spans = verdict_spans(verdict, daemon_up, theme);
-
-    if daemon_up {
-        let sep = || Span::styled("  ·  ".to_string(), theme.muted);
-        spans.push(sep());
-        spans.push(Span::styled(
-            format!("daemon pid {}", snapshot.daemon.pid),
-            theme.muted,
-        ));
-
-        // Version + skew.
-        spans.push(sep());
-        let binary = env!("CATENARY_VERSION");
-        let dv = &snapshot.daemon.version;
-        if dv.is_empty() || dv == binary {
-            spans.push(Span::styled(format!("v{binary}"), theme.muted));
-        } else {
-            spans.push(Span::styled(format!("v{dv}"), theme.warning));
-            spans.push(Span::styled(
-                format!(" (binary v{binary} — skew)"),
-                theme.warning,
-            ));
-        }
-
-        // Staleness.
-        if let Some(secs) = seconds_since(&snapshot.daemon.generated_at) {
-            spans.push(sep());
-            let style = if secs > SNAPSHOT_STALE_SECS {
-                theme.warning
-            } else {
-                theme.muted
-            };
-            spans.push(Span::styled(
-                format!(
-                    "updated {} ago",
-                    elapsed_short(&snapshot.daemon.generated_at)
-                ),
-                style,
-            ));
-        }
+pub fn daemon_status_spans(snapshot: &Snapshot, theme: &Theme) -> Vec<Span<'static>> {
+    if snapshot.daemon.generated_at.is_empty() {
+        return Vec::new();
     }
-    Line::from(spans)
+    let sep = || Span::styled(" · ".to_string(), theme.muted);
+    let mut spans = vec![Span::styled(
+        format!("daemon pid {}", snapshot.daemon.pid),
+        theme.muted,
+    )];
+
+    // Version + skew.
+    spans.push(sep());
+    let binary = crate::health::skew::BINARY_VERSION;
+    let dv = &snapshot.daemon.version;
+    if dv.is_empty() || dv == binary {
+        spans.push(Span::styled(format!("v{binary}"), theme.muted));
+    } else {
+        spans.push(Span::styled(format!("v{dv}"), theme.warning));
+        spans.push(Span::styled(
+            format!(" (binary v{binary} — skew)"),
+            theme.warning,
+        ));
+    }
+
+    // Snapshot freshness rides with the daemon identity.
+    if let Some(secs) = seconds_since(&snapshot.daemon.generated_at) {
+        spans.push(sep());
+        let style = if secs > SNAPSHOT_STALE_SECS {
+            theme.warning
+        } else {
+            theme.muted
+        };
+        spans.push(Span::styled(
+            format!(
+                "updated {} ago",
+                elapsed_short(&snapshot.daemon.generated_at)
+            ),
+            style,
+        ));
+    }
+    spans
 }
 
-/// The compact footer keybinding hint.
+/// The footer status bar: the compact keybinding hint packed left, the
+/// daemon status (pid · version + skew · freshness) flushed right (item 2).
+///
+/// When the two would collide the keybind hint truncates so the daemon status
+/// stays visible; the `?` panel carries the full key list.
 #[must_use]
-pub fn footer_line(theme: &Theme) -> Line<'static> {
+pub fn footer_line(snapshot: &Snapshot, width: usize, theme: &Theme) -> Line<'static> {
     let key = theme.hint_key;
     let lbl = theme.hint_label;
-    let mut spans = Vec::new();
+    let mut left = Vec::new();
     for (k, d) in [
         ("Tab", "panes"),
         ("j/k", "move"),
@@ -625,10 +632,15 @@ pub fn footer_line(theme: &Theme) -> Line<'static> {
         ("?", "keys"),
         ("q", "quit"),
     ] {
-        spans.push(Span::styled(format!(" {k} "), key));
-        spans.push(Span::styled(format!("{d} "), lbl));
+        left.push(Span::styled(format!(" {k} "), key));
+        left.push(Span::styled(format!("{d} "), lbl));
     }
-    Line::from(spans)
+    let right = daemon_status_spans(snapshot, theme);
+    if right.is_empty() {
+        Line::from(left)
+    } else {
+        super::format::justify(left, right, width)
+    }
 }
 
 // ── Detail pane ──────────────────────────────────────────────────────
@@ -648,7 +660,9 @@ pub fn detail_lines(
             theme.muted,
         )])],
         Some(EntityKey::Root(path)) => root_detail(path, snapshot, theme),
-        Some(EntityKey::Server { name, .. }) => server_detail(name, snapshot, config, theme),
+        Some(EntityKey::Server { name, .. }) => {
+            server_detail(name, snapshot, config, findings, theme)
+        }
         Some(EntityKey::Client(name)) => client_detail(name, snapshot, findings, theme),
         Some(EntityKey::Session(id)) => session_detail(id, snapshot, theme),
     }
@@ -712,10 +726,15 @@ fn root_detail(path: &str, snapshot: &Snapshot, theme: &Theme) -> Vec<Line<'stat
     lines
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one cohesive detail: source, command, routing, findings + provenance, instances"
+)]
 fn server_detail(
     name: &str,
     snapshot: &Snapshot,
     config: Option<&Config>,
+    findings: &[OwnedFinding],
     theme: &Theme,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![title(format!("Server  {name}"), theme)];
@@ -761,6 +780,44 @@ fn server_detail(
             .collect();
         if !langs.is_empty() {
             lines.push(kv("routes for", langs.join(", "), theme));
+        }
+    }
+
+    // Findings for this server: message, fix-it, then the routing provenance
+    // (item 4) under the fix-it line — "why is this being probed at all?".
+    let server_findings: Vec<&OwnedFinding> = findings
+        .iter()
+        .filter(|f| matches!(&f.owner, Owner::Server(s) if s == name))
+        .collect();
+    if !server_findings.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "  Findings".to_string(),
+            theme.title,
+        )]));
+        for f in server_findings {
+            lines.push(Line::from(vec![Span::styled(
+                format!(
+                    "    {} {}",
+                    severity_glyph(f.finding.severity),
+                    f.finding.message
+                ),
+                severity_style(theme, f.finding.severity),
+            )]));
+            if let Some(fix) = &f.finding.fix_it {
+                for l in fix.lines() {
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("      {l}"),
+                        theme.muted,
+                    )]));
+                }
+            }
+            if let Some(prov) = &f.finding.provenance {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("      {prov}"),
+                    theme.muted,
+                )]));
+            }
         }
     }
 

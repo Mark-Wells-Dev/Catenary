@@ -5,17 +5,20 @@
 //! probe feed doctor drives with the daemon down.
 //!
 //! A server is **routed** iff a configured language binding targets it *and*
-//! that language is active in a tracked root ([`is_routed`]). Everything else
-//! configured is **dormant inventory** — never a warning, even with a missing
-//! binary (feedback 08: `csharp-ls: command not found` is noise when nothing
-//! routes to it). This is the one intended behavior change of the extraction.
+//! either that language is **activity-live** (a tracked session touched a file
+//! of it) or the server is explicitly configured ([`is_intent_routed`]).
+//! Everything else configured is **dormant inventory** — never a warning, even
+//! with a missing binary (feedback 08: `csharp-ls: command not found` is noise
+//! when nothing routes to it). Activity-gating (tui-rework 09) means presence
+//! alone — a vendored sample or a fixture directory no session opened — never
+//! lights a language.
 //!
 //! The [`HealthFeed`] seam supplies the live inputs the model cannot derive from
 //! config files alone: each server's observed runtime [`ServerStatus`], the set
-//! of active languages (detected files, or a live per-root instance), and the
-//! daemon's version. Doctor materializes a [`ProbeFeed`] from its own one-shot
-//! `initialize` probes; the TUI (a later phase) will materialize a snapshot feed
-//! from `state.json`.
+//! of activity-live languages and their [`Provenance`], and the daemon's
+//! version. Doctor materializes a [`ProbeFeed`] from its own one-shot
+//! `initialize` probes plus the snapshot's activity ledger; the TUI materializes
+//! a snapshot feed from `state.json`.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -23,6 +26,87 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::health::{Finding, FindingCode, Severity};
 use crate::lsp;
+
+/// Routing provenance for a language (tui-rework 09, items 4–5).
+///
+/// The root and representative file(s) whose touch made the language
+/// activity-live — the "why is this server being probed at all?" evidence,
+/// carried on a routed-broken or suggestion [`Finding`] and rendered under its
+/// fix-it line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provenance {
+    /// The tracked root the touch happened under, in display form (home path
+    /// collapsed to `~`).
+    pub root: String,
+    /// A representative touched file, root-relative.
+    pub file: String,
+    /// Total distinct touched files for this language in `root`.
+    pub file_count: usize,
+}
+
+impl Provenance {
+    /// The one-line provenance string, e.g.
+    /// `routed by tests/fixtures/conformance/cmake/CMakeLists.txt (1 file) in ~/Projects/Catenary`.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let files = if self.file_count == 1 {
+            "1 file".to_string()
+        } else {
+            format!("{} files", self.file_count)
+        };
+        format!("routed by {} ({files}) in {}", self.file, self.root)
+    }
+}
+
+/// Derive the activity-live language set and per-language provenance from a
+/// snapshot's activity ledger (tui-rework 09, items 4–5).
+///
+/// The single source both the TUI snapshot feed and doctor read, so the
+/// suggestion/Fatal gate and the provenance never diverge across the two
+/// renderers. A language touched under several roots keeps the provenance with
+/// the most evidence (highest file count).
+#[must_use]
+pub fn activity_inputs(
+    activity: &[crate::state_snapshot::LanguageActivity],
+) -> (HashSet<String>, HashMap<String, Provenance>) {
+    let mut languages = HashSet::new();
+    let mut provenance: HashMap<String, Provenance> = HashMap::new();
+    for entry in activity {
+        if entry.language.is_empty() {
+            continue;
+        }
+        languages.insert(entry.language.clone());
+        let candidate = Provenance {
+            root: display_root(&entry.root),
+            file: entry.files.first().cloned().unwrap_or_default(),
+            file_count: entry.file_count,
+        };
+        match provenance.entry(entry.language.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                if candidate.file_count > o.get().file_count {
+                    o.insert(candidate);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(candidate);
+            }
+        }
+    }
+    (languages, provenance)
+}
+
+/// Collapse a canonical root path's home prefix to `~` for provenance display.
+fn display_root(root: &str) -> String {
+    if let Some(home) = dirs::home_dir()
+        && let Ok(rel) = std::path::Path::new(root).strip_prefix(&home)
+    {
+        if rel.as_os_str().is_empty() {
+            return "~".to_string();
+        }
+        return format!("~/{}", rel.display());
+    }
+    root.to_string()
+}
 
 /// Observed runtime status of a configured server, from whichever feed supplies
 /// it.
@@ -83,27 +167,39 @@ pub enum ServerClass {
 pub trait HealthFeed {
     /// The observed runtime status of `server`, if the feed has one.
     fn server_status(&self, server: &str) -> Option<&ServerStatus>;
-    /// The languages active in a tracked root — detected files, or (for a
-    /// snapshot feed) a live per-root instance. The routed-vs-dormant input.
+    /// The languages made **activity-live** — a tracked session touched a file
+    /// of them (snapshot feed), or doctor read the same activity ledger. The
+    /// routed-vs-dormant input, gated on activity rather than presence so a
+    /// dormant fixture directory no one touched lights nothing (tui-rework 09,
+    /// item 5).
     fn active_languages(&self) -> &HashSet<String>;
     /// The running daemon's version, if known — the version-skew input.
     fn daemon_version(&self) -> Option<&str>;
+    /// The routing provenance for `language`, if the feed tracked it — the
+    /// "why is this live?" evidence rendered under a finding (item 4). Feeds
+    /// without provenance (older snapshots, tests) return `None`.
+    fn language_provenance(&self, language: &str) -> Option<&Provenance> {
+        let _ = language;
+        None
+    }
 }
 
 /// A materialized probe feed: the statuses doctor's async probes gathered, the
-/// languages it detected in the workspace, and the daemon version it observed.
+/// activity-live languages and their provenance (read from the snapshot's
+/// activity ledger), and the daemon version it observed.
 #[derive(Debug, Default)]
 pub struct ProbeFeed {
     statuses: HashMap<String, ServerStatus>,
     active_languages: HashSet<String>,
     daemon_version: Option<String>,
+    provenance: HashMap<String, Provenance>,
 }
 
 impl ProbeFeed {
-    /// Build a probe feed from gathered statuses, detected languages, and an
-    /// optional observed daemon version.
+    /// Build a probe feed from gathered statuses, activity-live languages, and
+    /// an optional observed daemon version, with no provenance.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         statuses: HashMap<String, ServerStatus>,
         active_languages: HashSet<String>,
         daemon_version: Option<String>,
@@ -112,7 +208,17 @@ impl ProbeFeed {
             statuses,
             active_languages,
             daemon_version,
+            provenance: HashMap::new(),
         }
+    }
+
+    /// Attach per-language provenance (from the snapshot activity ledger),
+    /// chainable.
+    #[must_use]
+    #[allow(clippy::implicit_hasher, reason = "callers use the default hasher")]
+    pub fn with_provenance(mut self, provenance: HashMap<String, Provenance>) -> Self {
+        self.provenance = provenance;
+        self
     }
 }
 
@@ -128,10 +234,14 @@ impl HealthFeed for ProbeFeed {
     fn daemon_version(&self) -> Option<&str> {
         self.daemon_version.as_deref()
     }
+
+    fn language_provenance(&self, language: &str) -> Option<&Provenance> {
+        self.provenance.get(language)
+    }
 }
 
 /// Whether `server` is *routed*: a configured `[lsp.language.*]` binding targets
-/// it and that language is present in `active_languages`.
+/// it and that language is **activity-live** (present in `active_languages`).
 #[allow(clippy::implicit_hasher, reason = "callers use the default hasher")]
 #[must_use]
 pub fn is_routed(config: &Config, server: &str, active_languages: &HashSet<String>) -> bool {
@@ -140,7 +250,38 @@ pub fn is_routed(config: &Config, server: &str, active_languages: &HashSet<Strin
     })
 }
 
-/// Classify `server` as [`ServerClass::Routed`] or [`ServerClass::Dormant`].
+/// Whether some `[lsp.language.*]` binding targets `server`.
+fn has_binding(config: &Config, server: &str) -> bool {
+    config
+        .language
+        .values()
+        .any(|lc| lc.servers().iter().any(|b| b.name == server))
+}
+
+/// Whether `server` is *explicitly configured* — defined under a non-default
+/// name, i.e. a user/project layer named it. Mirrors [`server_intent`]'s config
+/// arm: a user def reusing a default name adopts the default's stance.
+fn is_explicitly_configured(server: &str) -> bool {
+    !crate::config::default_server_names().contains(server)
+}
+
+/// Whether `server` is **routed** for health classification (tui-rework 09).
+///
+/// True when a binding targets it *and* either that language is activity-live
+/// ([`is_routed`]) or the server is explicitly configured — the intent axis the
+/// severity ladder gates Fatal on. An installed-but-failing *default* server
+/// whose language no tracked session touched is not intent: it stays dormant
+/// Info inventory, not a Fatal. An explicitly-configured server is intent
+/// regardless of activity.
+#[allow(clippy::implicit_hasher, reason = "callers use the default hasher")]
+#[must_use]
+pub fn is_intent_routed(config: &Config, server: &str, active_languages: &HashSet<String>) -> bool {
+    is_routed(config, server, active_languages)
+        || (is_explicitly_configured(server) && has_binding(config, server))
+}
+
+/// Classify `server` as [`ServerClass::Routed`] or [`ServerClass::Dormant`],
+/// gated on the intent axis ([`is_intent_routed`]).
 #[allow(clippy::implicit_hasher, reason = "callers use the default hasher")]
 #[must_use]
 pub fn classify_server(
@@ -148,7 +289,7 @@ pub fn classify_server(
     server: &str,
     active_languages: &HashSet<String>,
 ) -> ServerClass {
-    if is_routed(config, server, active_languages) {
+    if is_intent_routed(config, server, active_languages) {
         ServerClass::Routed
     } else {
         ServerClass::Dormant
@@ -187,7 +328,10 @@ pub fn server_findings(config: &Config, feed: &dyn HealthFeed) -> Vec<Finding> {
                         format!("{name}: ready{suffix}"),
                     )
                 }
-                Some(status) => broken_finding(name, class, status),
+                Some(status) => {
+                    let finding = broken_finding(name, class, status);
+                    attach_provenance(finding, config, name, feed)
+                }
                 None => Finding::new(
                     FindingCode::ServerDormant,
                     Severity::Info,
@@ -196,6 +340,39 @@ pub fn server_findings(config: &Config, feed: &dyn HealthFeed) -> Vec<Finding> {
             }
         })
         .collect()
+}
+
+/// Attach the routing provenance (item 4) to a routed-broken or suggestion
+/// finding: the first bound language the feed tracked provenance for. Other
+/// findings pass through untouched — provenance answers "why is this server
+/// being probed?", which only makes sense for a routed server.
+fn attach_provenance(
+    finding: Finding,
+    config: &Config,
+    server: &str,
+    feed: &dyn HealthFeed,
+) -> Finding {
+    if !matches!(
+        finding.code,
+        FindingCode::ServerRoutedBroken | FindingCode::ServerInstallSuggestion
+    ) {
+        return finding;
+    }
+    match routing_provenance(config, server, feed) {
+        Some(provenance) => finding.with_provenance(provenance),
+        None => finding,
+    }
+}
+
+/// The rendered provenance for the first `[lsp.language.*]` binding to `server`
+/// the feed has provenance for, or `None`.
+fn routing_provenance(config: &Config, server: &str, feed: &dyn HealthFeed) -> Option<String> {
+    config
+        .language
+        .iter()
+        .filter(|(_, lc)| lc.servers().iter().any(|b| b.name == server))
+        .find_map(|(lang, _)| feed.language_provenance(lang))
+        .map(Provenance::render)
 }
 
 /// Whether a broken routed server carries **intent** — the axis that splits a
@@ -595,5 +772,106 @@ mod tests {
     fn binary_exists_finds_and_rejects() {
         assert!(binary_exists("sh"));
         assert!(!binary_exists("catenary_nonexistent_binary_xyz"));
+    }
+
+    #[test]
+    fn default_server_broken_without_activity_is_dormant_info() {
+        // A shipped-default server (`cmake-ls`) whose probe fails but whose
+        // language no session touched is quiet dormant Info — the phantom Fatal
+        // the conformance fixtures produced (tui-rework 09, item 5).
+        let config = routed_config("cmake", "cmake-ls");
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            "cmake-ls".to_string(),
+            ServerStatus::InitializeFailed("boom".to_string()),
+        );
+        let feed = ProbeFeed::new(statuses, HashSet::new(), None);
+        let finding = server_findings(&config, &feed)
+            .into_iter()
+            .next()
+            .expect("one server finding");
+        assert_eq!(finding.code, FindingCode::ServerDormant);
+        assert_eq!(finding.severity, Severity::Info);
+        assert!(
+            !finding.severity.is_problem(),
+            "no phantom Fatal without activity",
+        );
+    }
+
+    #[test]
+    fn default_server_broken_with_activity_is_fatal() {
+        // The same failure, but a tracked session touched a cmake file → the
+        // language is activity-live → the failure is an intent-broken Fatal.
+        let config = routed_config("cmake", "cmake-ls");
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            "cmake-ls".to_string(),
+            ServerStatus::InitializeFailed("boom".to_string()),
+        );
+        let active: HashSet<String> = std::iter::once("cmake".to_string()).collect();
+        let feed = ProbeFeed::new(statuses, active, None);
+        let finding = server_findings(&config, &feed)
+            .into_iter()
+            .next()
+            .expect("finding");
+        assert_eq!(finding.code, FindingCode::ServerRoutedBroken);
+        assert_eq!(finding.severity, Severity::Fatal);
+    }
+
+    #[test]
+    fn explicitly_configured_server_is_intent_routed_without_activity() {
+        // A user-named server (non-default name) is intent regardless of
+        // activity; a default-named one needs the language to be activity-live.
+        let user = routed_config("mylang", "my-custom-ls");
+        assert!(is_intent_routed(&user, "my-custom-ls", &HashSet::new()));
+        let default_cfg = routed_config("cmake", "cmake-ls");
+        assert!(!is_intent_routed(&default_cfg, "cmake-ls", &HashSet::new()));
+    }
+
+    #[test]
+    fn routed_broken_finding_carries_provenance() {
+        let config = routed_config("mylang", "my-custom-ls");
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            "my-custom-ls".to_string(),
+            ServerStatus::InitializeFailed("boom".to_string()),
+        );
+        let active: HashSet<String> = std::iter::once("mylang".to_string()).collect();
+        let mut provenance = HashMap::new();
+        provenance.insert(
+            "mylang".to_string(),
+            Provenance {
+                root: "~/Projects/Catenary".to_string(),
+                file: "src/main.ml".to_string(),
+                file_count: 2,
+            },
+        );
+        let feed = ProbeFeed::new(statuses, active, None).with_provenance(provenance);
+        let finding = server_findings(&config, &feed)
+            .into_iter()
+            .next()
+            .expect("finding");
+        let prov = finding.provenance.expect("provenance attached");
+        assert!(prov.contains("routed by src/main.ml"), "{prov}");
+        assert!(prov.contains("2 files"), "{prov}");
+        assert!(prov.contains("~/Projects/Catenary"), "{prov}");
+    }
+
+    #[test]
+    fn activity_inputs_derives_languages_and_provenance() {
+        let activity = vec![crate::state_snapshot::LanguageActivity {
+            language: "cmake".to_string(),
+            // A non-home path stays verbatim, so the render is deterministic.
+            root: "/p/root".to_string(),
+            files: vec!["tests/fixtures/CMakeLists.txt".to_string()],
+            file_count: 1,
+        }];
+        let (langs, prov) = activity_inputs(&activity);
+        assert!(langs.contains("cmake"));
+        let p = prov.get("cmake").expect("provenance for cmake");
+        assert_eq!(
+            p.render(),
+            "routed by tests/fixtures/CMakeLists.txt (1 file) in /p/root",
+        );
     }
 }

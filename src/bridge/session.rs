@@ -893,6 +893,52 @@ impl Session {
         )
     }
 
+    /// Records that tracked-session activity touched `path`, making its
+    /// configured language **activity-live** for the health dashboard
+    /// (tui-rework 09, item 5).
+    ///
+    /// Classifies `path` against the configured language set (the same
+    /// filename/extension-then-shebang rule the workspace scan uses) and, on a
+    /// match, records the language, its enclosing tracked root, and the
+    /// root-relative file on the snapshot's activity ledger — the gate that keeps
+    /// a dormant fixture directory no one opened quiet, and the provenance the
+    /// TUI/doctor render under a routed-broken or suggestion finding.
+    /// Independent of diagnostics coverage: a language whose server is not even
+    /// installed still becomes live (that is precisely the install-suggestion
+    /// case). No-op outside daemon mode, for an unconfigured language, or a path
+    /// under no tracked root.
+    pub fn record_activity_touch(&self, path: &Path) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let Some(language) = self.configured_language(path) else {
+            return;
+        };
+        let Some(root) = self.resolve_root(path) else {
+            return;
+        };
+        let file = path
+            .strip_prefix(&root)
+            .map_or_else(|_| self.display_path(path), |rel| rel.display().to_string());
+        snapshot.record_activity(&language, &root.display().to_string(), &file);
+    }
+
+    /// Classify `path`'s language, restricted to the configured language set —
+    /// filename/extension then shebang, with a raw-extension fallback for custom
+    /// languages, mirroring `detect_workspace_languages`'s per-file rule.
+    fn configured_language(&self, path: &Path) -> Option<String> {
+        if let Some(lang) = self.fs_manager.language_id(path)
+            && self.config.language.contains_key(lang.as_str())
+        {
+            return Some(lang);
+        }
+        let ext = path.extension().and_then(|e| e.to_str())?;
+        self.config
+            .language
+            .contains_key(ext)
+            .then(|| ext.to_string())
+    }
+
     /// Builds the merged command filter from user config + all project configs.
     ///
     /// Returns `None` when no `[commands]` section is configured. The merged

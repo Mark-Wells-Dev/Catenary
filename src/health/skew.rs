@@ -12,6 +12,17 @@
 
 use crate::health::{Finding, FindingCode, Severity};
 
+/// The running binary's version — the single source both the daemon snapshot
+/// writer ([`crate::state_snapshot::DaemonInfo::current`]) and the skew check
+/// read.
+///
+/// The same `git describe` string `catenary version` and `catenary --version`
+/// print (`CATENARY_VERSION`), never the bare `CARGO_PKG_VERSION`. Routing both
+/// the recorded daemon version and the comparison through one constant makes the
+/// "every non-tag build reads as skewed" false positive impossible (tui-rework
+/// 09, item 1).
+pub const BINARY_VERSION: &str = env!("CATENARY_VERSION");
+
 /// A version-skew finding when `daemon_version` is present and differs from
 /// `binary_version`; otherwise `None`.
 ///

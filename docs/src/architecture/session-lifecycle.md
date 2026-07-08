@@ -208,9 +208,9 @@ it cannot affect (or wedge) a running session.
 
 The snapshot holds live state only, so the dashboard renders a
 health/config surface rather than a message stream: a 2×2 master-detail
-grid with the root/server tree and client/session tree on the left, a
-contextual detail pane top-right, and the problems pane bottom-right. On
-narrow terminals the four panes stack full-width.
+grid with the Servers (by root) tree and Sessions (by client) tree on the
+left, a contextual Details pane top-right, and the problems pane
+bottom-right. On narrow terminals the four panes stack full-width.
 
 For full protocol and trace history — request/response pairing, the LSP
 traffic behind a single command — query the firehose with `catenary

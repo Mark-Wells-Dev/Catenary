@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::config::Config;
-use crate::health::servers::{HealthFeed, ServerStatus, binary_exists};
+use crate::health::servers::{HealthFeed, Provenance, ServerStatus, binary_exists};
 use crate::health::{Finding, FindingCode, Severity};
 use crate::state_snapshot::{ServerEntry, Snapshot};
 
@@ -66,6 +66,7 @@ pub struct SnapshotFeed {
     statuses: HashMap<String, ServerStatus>,
     active_languages: HashSet<String>,
     daemon_version: Option<String>,
+    provenance: HashMap<String, Provenance>,
 }
 
 impl SnapshotFeed {
@@ -99,13 +100,14 @@ impl SnapshotFeed {
             }
         }
 
-        // Routed servers with no live instance: a PATH check distinguishes
-        // "not installed" (a problem/suggestion) from "installed but idle".
+        // Intent-routed servers with no live instance: a PATH check
+        // distinguishes "not installed" (a problem/suggestion) from "installed
+        // but idle".
         for (name, def) in &config.server {
             if statuses.contains_key(name) {
                 continue;
             }
-            let routed = crate::health::servers::is_routed(config, name, &active_languages);
+            let routed = crate::health::servers::is_intent_routed(config, name, &active_languages);
             if routed && !binary_exists(&def.command) {
                 statuses.insert(
                     name.clone(),
@@ -119,10 +121,15 @@ impl SnapshotFeed {
             (!v.is_empty()).then(|| v.clone())
         };
 
+        // Provenance rides the same activity ledger the gate reads, so the
+        // "why is this live?" evidence never disagrees with the finding.
+        let (_, provenance) = crate::health::servers::activity_inputs(&snapshot.activity_languages);
+
         Self {
             statuses,
             active_languages,
             daemon_version,
+            provenance,
         }
     }
 }
@@ -138,6 +145,10 @@ impl HealthFeed for SnapshotFeed {
 
     fn daemon_version(&self) -> Option<&str> {
         self.daemon_version.as_deref()
+    }
+
+    fn language_provenance(&self, language: &str) -> Option<&Provenance> {
+        self.provenance.get(language)
     }
 }
 
@@ -159,11 +170,12 @@ fn status_for_entry(entry: &ServerEntry) -> ServerStatus {
     }
 }
 
-/// The active workspace languages implied purely by the live board.
+/// The languages of every up-or-failed server instance on the live board.
 ///
-/// The language of every non-dead server instance — the cheap half of the
-/// routed-vs-dormant input (no filesystem walk). The caller unions it with a
-/// cached filesystem detection for the missing-binary/suggestion cases.
+/// A convenience view of the board's languages. It is **not** the health
+/// suggestion/Fatal gate — that is now the activity ledger
+/// ([`crate::health::servers::activity_inputs`]), so a server the daemon spawned
+/// on mere presence never counts as intent (tui-rework 09, item 5).
 #[must_use]
 pub fn live_languages(snapshot: &Snapshot) -> HashSet<String> {
     snapshot
@@ -217,7 +229,9 @@ pub fn gather_snapshot(
     // ── Version skew (daemon vs this binary) ─────────────────────────
     let daemon_version =
         (!snapshot.daemon.version.is_empty()).then_some(snapshot.daemon.version.as_str());
-    if let Some(f) = crate::health::skew::skew_finding(env!("CATENARY_VERSION"), daemon_version) {
+    if let Some(f) =
+        crate::health::skew::skew_finding(crate::health::skew::BINARY_VERSION, daemon_version)
+    {
         out.push(OwnedFinding {
             finding: f,
             owner: Owner::Global,
@@ -499,5 +513,55 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].finding.severity, Severity::Warning);
         assert!(findings[0].finding.fix_it.is_some());
+    }
+
+    #[test]
+    fn fixture_language_without_activity_is_silent_touching_it_surfaces_it() {
+        // Acceptance (tui-rework 09, item 5): a default server routed to a
+        // language present only via a spawned-then-failed instance — the exact
+        // conformance-fixture shape — raises NO finding while no session has
+        // touched a file of that language. Recording activity for it makes the
+        // same failure a Fatal, carrying the triggering file as provenance.
+        let config = routed_config("cmake", "cmake-ls", "cmake-language-server");
+        let snap = Snapshot {
+            servers: vec![server_entry("cmake-ls", "cmake", "failed")],
+            ..Snapshot::default()
+        };
+
+        let quiet = gather_snapshot(&snap, &config, HashSet::new());
+        assert!(
+            !quiet
+                .iter()
+                .any(|f| matches!(&f.owner, Owner::Server(s) if s == "cmake-ls")),
+            "a fixture language no session touched raises no finding",
+        );
+
+        // `snap` is done being read above, so move it into the touched variant.
+        let mut touched = snap;
+        touched
+            .activity_languages
+            .push(crate::state_snapshot::LanguageActivity {
+                language: "cmake".to_string(),
+                root: "/p/root".to_string(),
+                files: vec!["tests/fixtures/conformance/cmake/CMakeLists.txt".to_string()],
+                file_count: 1,
+            });
+        let active: HashSet<String> = std::iter::once("cmake".to_string()).collect();
+        let loud = gather_snapshot(&touched, &config, active);
+        let cmake = loud
+            .iter()
+            .find(|f| matches!(&f.owner, Owner::Server(s) if s == "cmake-ls"))
+            .expect("touching a cmake file surfaces the failure");
+        assert_eq!(cmake.finding.severity, Severity::Fatal);
+        assert!(
+            cmake
+                .finding
+                .provenance
+                .as_deref()
+                .unwrap_or_default()
+                .contains("CMakeLists.txt"),
+            "provenance names the triggering file: {:?}",
+            cmake.finding.provenance,
+        );
     }
 }

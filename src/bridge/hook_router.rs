@@ -163,6 +163,11 @@ impl HookRouter {
                 if result.is_none() {
                     // File tracking for Edit/Write tools.
                     if let Some(ref path) = file_path {
+                        // Any touched file (read or edit) makes its language
+                        // activity-live for the health dashboard — the
+                        // filetype-open gate (tui-rework 09, item 5), independent
+                        // of diagnostics coverage below.
+                        self.session.record_activity_touch(Path::new(path));
                         self.handle_file_accumulation(
                             path,
                             session_id.as_deref(),
@@ -174,6 +179,9 @@ impl HookRouter {
                     // (ws38 ticket 02): covered targets enter the caller's
                     // modified-set, the first one entering editing mode.
                     if !writes.is_empty() {
+                        for write in &writes {
+                            self.session.record_activity_touch(write);
+                        }
                         self.handle_shell_write_accumulation(
                             &writes,
                             session_id.as_deref(),

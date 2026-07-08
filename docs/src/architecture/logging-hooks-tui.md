@@ -391,31 +391,45 @@ question: *is it working?* Its inputs are `state.json` and the health
 model's findings; it never probes an LSP or opens the firehose. Four
 panes share a 2×2 master-detail grid:
 
-- **Root/server tree** (top-left) — grouped by root (the lifecycle/RAM
+- **Servers (by root)** (top-left) — grouped by root (the lifecycle/RAM
   unit), collapsible; root lines carry the schema-2 contributor labels
   and ephemeral idle countdowns, with per-root server rows
   (lifecycle / time-in-state / respawns / last-death) and dormant
   inventory behind a toggle. A healthy fleet collapses to one line per
   root — nothing green shouts.
-- **Client/session tree** (bottom-left) — grouped by client, with
+- **Sessions (by client)** (bottom-left) — grouped by client, with
   install-health findings inline at the client node and live sessions
   underneath. Session status is capability-aware: each host renders only
   what its events feed (Claude Code adds subagent sub-rows; a host with
   no stop coverage degrades to an honest `last seen Nm` — no fabricated
   statuses).
-- **Detail pane** (top-right) — the contextual view of the cursored
-  node: a server's effective config by layer with provenance, a root's
+- **Details (Servers / Sessions)** (top-right) — the contextual view of
+  the cursored node, titled for the focused tree: a server's config,
+  live instances, and its findings with routing provenance, a root's
   routing table, or a session's recent actions + live subagents.
 - **Problems pane** (bottom-right) — the durable notification surface:
   every finding sorted `Fatal`/`Error`/`Warning` with its fix-it line,
-  suggestions as a collapsed tail that never displaces a problem.
-  Selecting a problem focuses the board on its owner. An empty pane is
-  the working verdict.
+  suggestions as a collapsed tail that never displaces a problem. The
+  pane title carries the one-line verdict (`● working` /
+  `✗ N problems · M suggestions`). Selecting a problem focuses the board
+  on its owner. An empty pane is the working verdict.
 
 Findings render twice — inline at their owning tree node and in the
 problems pane — from one health model, so the two views can never
-disagree. A header strip carries the one-line verdict, daemon identity,
-version + skew, and snapshot staleness.
+disagree. There is no header strip: the verdict rides the Problems pane
+title, and the footer carries the daemon pid, version + skew, and
+snapshot freshness.
+
+Suggestion and Fatal findings are **activity-gated** (tui-rework 09): a
+language is live only when tracked-session activity has touched a file of
+it — the daemon records the touch into the snapshot's
+`activity_languages` ledger, and the health model reads that rather than
+scanning the filesystem for presence. A dormant fixture directory no
+session opened lights nothing; a server the daemon spawned on mere
+presence and that then failed is quiet dormant Info, not a Fatal, unless
+its language is activity-live or the server is explicitly configured. The
+provenance (`routed by <file> (N files) in <root>`) renders under the
+finding's fix-it line so "why is this being probed?" is always answerable.
 
 ### Layout
 

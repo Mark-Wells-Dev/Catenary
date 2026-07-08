@@ -423,6 +423,7 @@ fn set(buf: &mut Buffer, x: u16, y: u16, s: &str, style: Style) {
 )]
 fn render_list(
     title: &str,
+    title_extra: &[ratatui::text::Span<'static>],
     focused: bool,
     entries: &[Vec<Line<'static>>],
     cursor: &mut Cursor,
@@ -433,9 +434,12 @@ fn render_list(
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    // Title line inside the body.
+    // Title line inside the body: the pane title, then any extra spans (the
+    // Problems pane carries the verdict counts here — tui-rework 09, item 2).
     let title_style = if focused { theme.accent } else { theme.title };
-    buf.set_string(inner.x, inner.y, truncate(title, inner.width), title_style);
+    let mut title_spans = vec![ratatui::text::Span::styled(title.to_string(), title_style)];
+    title_spans.extend(title_extra.iter().cloned());
+    buf.set_line(inner.x, inner.y, &Line::from(title_spans), inner.width);
 
     let list_y = inner.y + 1;
     let list_h = inner.height.saturating_sub(1);
@@ -557,6 +561,29 @@ fn tree_entries(
         .collect()
 }
 
+/// The detail pane title, named for the focused tree (tui-rework 09, item 3):
+/// `Details (Servers)` when the root/server tree drove the selection,
+/// `Details (Sessions)` when the client/session tree did.
+fn detail_title(app: &App<'_>) -> &'static str {
+    if app.last_tree == Pane::SessionTree {
+        " Details (Sessions)"
+    } else {
+        " Details (Servers)"
+    }
+}
+
+/// The verdict counts that ride the Problems pane title (item 2): a leading gap
+/// then the `● working` / `✗ N problems · M suggestions` spans.
+fn problems_verdict_spans(app: &App<'_>, theme: &Theme) -> Vec<ratatui::text::Span<'static>> {
+    let mut spans = vec![ratatui::text::Span::raw("   ".to_string())];
+    spans.extend(render::verdict_spans(
+        app.verdict,
+        app.daemon_present(),
+        theme,
+    ));
+    spans
+}
+
 /// Render one full frame.
 #[allow(
     clippy::too_many_lines,
@@ -574,10 +601,9 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
     let icons = app.icons;
     let buf = f.buffer_mut();
 
-    // Header strip (row 0) + footer (last row); grid between.
-    let header = render::header_line(&app.snapshot, app.verdict, theme);
-    buf.set_line(area.x, area.y, &header, area.width);
-
+    // No header strip (item 2): the verdict rides the Problems pane title and
+    // the daemon identity/version/freshness ride the footer, so the grid runs
+    // from the top row down to the footer.
     let footer_y = area.y + area.height - 1;
     if app.keybinds_expanded {
         // Expanded keybind panel occupies the lines just above the footer.
@@ -588,7 +614,7 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
             theme,
         );
     }
-    let footer = render::footer_line(theme);
+    let footer = render::footer_line(&app.snapshot, area.width as usize, theme);
     buf.set_line(area.x, footer_y, &footer, area.width);
 
     if !app.daemon_present() {
@@ -600,12 +626,7 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
         return;
     }
 
-    let grid = Rect::new(
-        area.x,
-        area.y + 1,
-        area.width,
-        area.height.saturating_sub(2),
-    );
+    let grid = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
 
     // Precompute detail lines + tree entries before mutating cursors.
     let detail_entity = app.detail_entity();
@@ -636,8 +657,10 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
         theme,
     ));
 
+    let problems_title_extra = problems_verdict_spans(app, theme);
     render_list(
-        " Roots & Servers",
+        " Servers (by root)",
+        &[],
         app.focus == Pane::RootTree,
         &root_entries,
         &mut app.root_cursor,
@@ -646,7 +669,7 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
         theme,
     );
     render_detail(
-        " Detail",
+        detail_title(app),
         app.focus == Pane::Detail,
         &detail_lines,
         tr,
@@ -654,7 +677,8 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
         theme,
     );
     render_list(
-        " Clients & Sessions",
+        " Sessions (by client)",
+        &[],
         app.focus == Pane::SessionTree,
         &session_entries,
         &mut app.session_cursor,
@@ -664,6 +688,7 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
     );
     render_list(
         " Problems",
+        &problems_title_extra,
         app.focus == Pane::Problems,
         &problem_entries,
         &mut app.problem_cursor,
@@ -775,8 +800,10 @@ fn render_narrow(
         theme,
     ));
 
+    let problems_title_extra = problems_verdict_spans(app, theme);
     render_list(
-        " Roots & Servers",
+        " Servers (by root)",
+        &[],
         app.focus == Pane::RootTree,
         &root_entries,
         &mut app.root_cursor,
@@ -785,7 +812,8 @@ fn render_narrow(
         theme,
     );
     render_list(
-        " Clients & Sessions",
+        " Sessions (by client)",
+        &[],
         app.focus == Pane::SessionTree,
         &session_entries,
         &mut app.session_cursor,
@@ -794,7 +822,7 @@ fn render_narrow(
         theme,
     );
     render_detail(
-        " Detail",
+        detail_title(app),
         app.focus == Pane::Detail,
         detail_lines,
         tr,
@@ -803,6 +831,7 @@ fn render_narrow(
     );
     render_list(
         " Problems",
+        &problems_title_extra,
         app.focus == Pane::Problems,
         &problem_entries,
         &mut app.problem_cursor,
@@ -867,7 +896,8 @@ fn run_loop(
 mod tests {
     use super::*;
     use crate::state_snapshot::{
-        ClientInfo, DaemonSnapshot, LastMessage, ServerEntry, SessionEntry, Snapshot, Subagent,
+        ClientInfo, DaemonSnapshot, LanguageActivity, LastMessage, ServerEntry, SessionEntry,
+        Snapshot, Subagent,
     };
     use crate::tui::data::MockDataSource;
     use ratatui::backend::TestBackend;
@@ -913,6 +943,15 @@ mod tests {
                     at: crate::state_snapshot::now_iso(),
                 }),
                 ..ServerEntry::default()
+            });
+            // A tracked session touched a julia file, so julia is activity-live
+            // and julia-ls's failure is an intent-broken Fatal (item 5). Without
+            // this the failed instance would be quiet dormant inventory.
+            snap.activity_languages.push(LanguageActivity {
+                language: "julia".to_string(),
+                root: "/p/root0".to_string(),
+                files: vec!["src/main.jl".to_string()],
+                file_count: 1,
             });
         }
         snap.sessions = vec![
@@ -1007,7 +1046,7 @@ mod tests {
     fn healthy_fleet_renders_quiet_verdict() {
         let out = render_to_string(fleet_fixture(false), fleet_config(false), 100, 30);
         assert!(out.contains("working"), "green verdict when healthy: {out}");
-        assert!(out.contains("Roots & Servers"), "root tree title");
+        assert!(out.contains("Servers (by root)"), "root tree title");
         assert!(out.contains("Problems"), "problems pane title");
     }
 
@@ -1075,7 +1114,7 @@ mod tests {
     #[test]
     fn narrow_layout_stacks_panes() {
         let out = render_to_string(fleet_fixture(true), fleet_config(true), 60, 40);
-        assert!(out.contains("Roots & Servers"), "{out}");
+        assert!(out.contains("Servers (by root)"), "{out}");
         assert!(out.contains("Problems"), "{out}");
     }
 

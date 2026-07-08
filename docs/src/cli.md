@@ -9,17 +9,20 @@ MCP instead — no flags needed.
 The dashboard is the primary way to answer *"is it working?"* at a
 glance. It reads a daemon-owned `state.json` snapshot plus the health
 model's findings and renders a **2×2 master-detail grid**: the
-root/server tree (top-left, grouped by root, healthy fleets collapsed to
-one line each), the client/session tree (bottom-left, grouped by client
-with capability-aware session status), a contextual detail pane
-(top-right, effective config / routing / session actions for the
-cursored node), and the **problems pane** (bottom-right — the durable
-notification surface, every finding with its fix-it). A header strip
-carries the one-line verdict, daemon identity, version + skew, and
-snapshot staleness. It is a pure file reader — it never connects to the
-daemon, probes an LSP, or opens the firehose. Full protocol and trace
-history streams to an append-only JSONL telemetry firehose, which
-`catenary query` reads after the fact.
+**Servers (by root)** tree (top-left, grouped by root, healthy fleets
+collapsed to one line each), the **Sessions (by client)** tree
+(bottom-left, grouped by client with capability-aware session status),
+a contextual **Details (Servers / Sessions)** pane (top-right — titled
+for the focused tree: config / routing / findings with provenance /
+session actions for the cursored node), and the **problems pane**
+(bottom-right — the durable notification surface, every finding with its
+fix-it). There is no header strip: the Problems pane title carries the
+one-line verdict (`● working` / `✗ N problems · M suggestions`), and the
+footer carries the daemon pid, version + skew, and snapshot freshness. It
+is a pure file reader — it never connects to the daemon, probes an LSP, or
+opens the firehose. Full protocol and trace history streams to an
+append-only JSONL telemetry firehose, which `catenary query` reads after
+the fact.
 
 ```bash
 catenary  # launch dashboard
