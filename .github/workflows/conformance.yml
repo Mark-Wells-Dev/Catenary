@@ -95,9 +95,45 @@ jobs:
             echo "empty=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # Build the harness + catenary binaries ONCE; every matrix job downloads
+  # and executes them instead of recompiling (~1 min × 24 jobs saved). Safe
+  # because cargo bakes CARGO_BIN_EXE_*/CARGO_MANIFEST_DIR as absolute
+  # paths at compile time and every ubuntu runner checks out to the same
+  # /home/runner/work/<repo>/<repo> — the matrix restores the binaries at
+  # those exact paths.
+  build:
+    name: Build harness once
+    needs: discover
+    if: needs.discover.outputs.empty != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile harness and binaries
+        run: |
+          set -euo pipefail
+          cargo test --test conformance_harness --features mockls \
+            --no-run --message-format=json > cargo-build.jsonl
+          exe="$(jq -r 'select(.reason=="compiler-artifact")
+            | select(.target.name=="conformance_harness")
+            | .executable // empty' cargo-build.jsonl | tail -n1)"
+          test -n "$exe"
+          mkdir -p dist/target/debug
+          cp "$exe" dist/conformance_harness
+          cp target/debug/catenary dist/target/debug/catenary
+          if [ -f target/debug/mockls ]; then
+            cp target/debug/mockls dist/target/debug/mockls
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conformance-dist
+          path: dist
+          retention-days: 1
+
   conform:
     name: "Conform ${{ matrix.server }}"
-    needs: discover
+    needs: [discover, build]
     if: needs.discover.outputs.empty != 'true'
     runs-on: ubuntu-latest
     strategy:
@@ -105,10 +141,22 @@ jobs:
       matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v5
+      # rustup stays for the provisions that need a toolchain
+      # (rustup-component, cargo-git-locked); no compile happens here.
       - run: rustup show
-      # One shared compile cache across the whole matrix (ci.yml precedent) —
-      # 24 jobs otherwise each cold-build the harness.
-      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch prebuilt harness
+        uses: actions/download-artifact@v4
+        with:
+          name: conformance-dist
+          path: dist
+
+      - name: Install prebuilt binaries at their baked paths
+        run: |
+          set -euo pipefail
+          mkdir -p target/debug
+          cp dist/target/debug/* target/debug/
+          chmod +x target/debug/* dist/conformance_harness
 
       - name: Provision runtime dependency (${{ matrix.runtime_name }})
         if: matrix.runtime_name == 'jdk'
@@ -266,18 +314,14 @@ jobs:
       - name: Run conformance harness (${{ matrix.server }})
         env:
           CATENARY_CONFORMANCE: ${{ matrix.server }}
-        # Plain cargo, matching ci.yml — the runner has no nextest and this
-        # repo installs no third-party runner tooling for it (first live
-        # dispatch failed all 24 jobs on `no such command: nextest`).
-        #
-        # ONLY the matrix entry point runs: the per-server skip-if-missing
-        # sentinels are for local dev, and on runners the rustup proxy shim
-        # (~/.cargo/bin/rust-analyzer, no component behind it) defeats their
-        # binary-missing skip — the second dispatch failed all 23 harness
-        # jobs on that one poisoned sentinel.
+        # The prebuilt libtest binary runs directly — no toolchain, no
+        # compile. ONLY the matrix entry point runs: the per-server
+        # skip-if-missing sentinels are for local dev, and on runners the
+        # rustup proxy shim (~/.cargo/bin/rust-analyzer, no component behind
+        # it) defeats their binary-missing skip — the second dispatch failed
+        # all 23 harness jobs on that one poisoned sentinel.
         run: |
-          cargo test --test conformance_harness --features mockls \
-            conformance_selected_server
+          ./dist/conformance_harness conformance_selected_server
 
       - name: Emit blessed entry
         run: |
