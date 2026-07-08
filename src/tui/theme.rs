@@ -30,13 +30,9 @@ pub struct Theme {
     pub hint_label: Style,
     /// Style for the selection highlight.
     pub selection: Style,
-    /// Style for visual selection highlight (distinct from cursor).
-    pub visual_selection: Style,
 
     /// Style for active sessions.
     pub session_active: Style,
-    /// Style for dead sessions.
-    pub session_dead: Style,
     /// Style for session metadata (language list, etc.).
     pub session_meta: Style,
 
@@ -56,9 +52,6 @@ pub struct Theme {
     pub info: Style,
     /// Style for muted/dimmed text.
     pub muted: Style,
-
-    /// Style for display rows matching the current search query.
-    pub search_match: Style,
 }
 
 impl Default for Theme {
@@ -82,10 +75,8 @@ impl Theme {
             hint_key: Style::new().add_modifier(Modifier::BOLD),
             hint_label: Style::new().add_modifier(Modifier::DIM),
             selection: Style::new().add_modifier(Modifier::BOLD),
-            visual_selection: Style::new().bg(Color::Yellow),
 
             session_active: Style::new().fg(Color::Green),
-            session_dead: Style::new().add_modifier(Modifier::DIM),
             session_meta: Style::new().add_modifier(Modifier::DIM),
 
             timestamp: Style::new().add_modifier(Modifier::DIM),
@@ -96,8 +87,6 @@ impl Theme {
             warning: Style::new().fg(Color::Yellow),
             info: Style::new().fg(Color::Blue),
             muted: Style::new().add_modifier(Modifier::DIM),
-
-            search_match: Style::new().fg(Color::Black).bg(Color::Yellow),
         }
     }
 }
@@ -117,5 +106,34 @@ mod tests {
         assert!(!theme.selection.add_modifier.contains(Modifier::REVERSED));
         assert_eq!(theme.selection.bg, None, "no background swap on selection");
         assert_eq!(theme.selection.fg, None, "no foreground swap on selection");
+    }
+
+    #[test]
+    fn no_field_hard_codes_a_background() {
+        // The palette law (tui-rework 11 item 3, swept in 12 item 3): no theme
+        // field assumes a terminal background — the dead `visual_selection` /
+        // `search_match` fields that carried `bg(Yellow)` are gone, and nothing
+        // replaced them. Every field defers to the terminal's own palette.
+        let t = Theme::new();
+        for (name, style) in [
+            ("border_focused", t.border_focused),
+            ("border_unfocused", t.border_unfocused),
+            ("title", t.title),
+            ("hint_key", t.hint_key),
+            ("hint_label", t.hint_label),
+            ("selection", t.selection),
+            ("session_active", t.session_active),
+            ("session_meta", t.session_meta),
+            ("timestamp", t.timestamp),
+            ("text", t.text),
+            ("accent", t.accent),
+            ("success", t.success),
+            ("error", t.error),
+            ("warning", t.warning),
+            ("info", t.info),
+            ("muted", t.muted),
+        ] {
+            assert_eq!(style.bg, None, "{name} must not hard-code a background");
+        }
     }
 }

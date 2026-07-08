@@ -185,6 +185,75 @@ pub fn justify(
     Line::from(spans)
 }
 
+/// Wrap a span sequence to `width` display columns across as many lines as it
+/// takes, marking nothing (wrapping replaces truncation — the full text stays).
+///
+/// The selected-row twin of [`truncate_spans`] (tui-rework 12, item 1): the row
+/// under the cursor shows its full text instead of a one-line `…` truncation.
+/// Continuation lines are prefixed with `indent` spaces so they sit under the
+/// first line's text column; the caller draws the caret only on the first line.
+/// Unicode-honest — measured and cut by display width via the same `take_cols`
+/// primitive [`truncate_to_width`] uses, never a parallel byte path. A
+/// wrap-boundary space is dropped so a padded gap never opens a blank
+/// continuation line. Every emitted line is `≤ width`.
+#[must_use]
+pub fn wrap_line(spans: &[Span<'static>], width: usize, indent: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![Line::from(Vec::new())];
+    }
+    // A leading indent must fit within the width or continuation lines would
+    // overflow; clamp it so wrapping always makes progress.
+    let indent = indent.min(width.saturating_sub(1));
+    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    // Columns already used on the current line, including its leading indent.
+    let mut used = 0usize;
+
+    for span in spans {
+        let mut piece = String::new();
+        for ch in span.content.chars() {
+            let cw = ch.to_string().width();
+            let prefix = if lines.len() > 1 { indent } else { 0 };
+            if used == 0 {
+                used = prefix;
+            }
+            if used + cw > width && used > prefix {
+                // Flush the piece onto the current line and start a fresh one.
+                if !piece.is_empty()
+                    && let Some(line) = lines.last_mut()
+                {
+                    line.push(Span::styled(std::mem::take(&mut piece), span.style));
+                }
+                lines.push(Vec::new());
+                used = 0;
+                // Drop a single space at the wrap boundary so a padded gap does
+                // not open a blank continuation line.
+                if ch == ' ' {
+                    continue;
+                }
+                used = indent;
+            }
+            piece.push(ch);
+            used += cw;
+        }
+        if !piece.is_empty()
+            && let Some(line) = lines.last_mut()
+        {
+            line.push(Span::styled(piece, span.style));
+        }
+    }
+
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut spans)| {
+            if i > 0 && indent > 0 {
+                spans.insert(0, Span::raw(" ".repeat(indent)));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
 /// Truncate a span sequence to `max` display columns, marking any drop with `…`.
 ///
 /// Preserves each span's style and appends a single `…` (in the trailing span's
@@ -317,6 +386,36 @@ mod tests {
         assert!(spans_width(&out) <= 5, "within bound");
         let text: String = out.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains('…'), "boundary drop is marked: {text}");
+    }
+
+    #[test]
+    fn wrap_line_reflows_full_text_within_width_with_indent() {
+        // A single long span wraps to several lines, each within the width, with
+        // the full text preserved and continuation lines indented (item 1).
+        let spans = vec![Span::styled(
+            "the quick brown fox jumps over the lazy dog again and again".to_string(),
+            Style::new(),
+        )];
+        let lines = wrap_line(&spans, 20, 2);
+        assert!(lines.len() > 1, "long text wraps to multiple lines");
+        for line in &lines {
+            assert!(spans_width(&line.spans) <= 20, "each line within width");
+        }
+        // Continuation lines carry the 2-col indent; the first does not.
+        assert!(
+            !lines[0].spans[0].content.starts_with("  "),
+            "first line is unindented"
+        );
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+            .replace(' ', "");
+        assert!(
+            joined.contains("lazydogagainandagain"),
+            "no text is lost across the wrap: {joined}"
+        );
     }
 
     #[test]

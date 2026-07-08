@@ -586,16 +586,35 @@ fn truncate(s: &str, width: u16) -> String {
 }
 
 /// Build the entry line-groups for a tree pane (one line per row).
+///
+/// The row at `wrapped` (the selected index when its pane is focused) renders its
+/// full text wrapped across as many lines as it needs instead of the one-line `…`
+/// truncation every other row keeps (tui-rework 12, item 1).
 fn tree_entries(
     rows: &[model::Row],
     width: u16,
     theme: &Theme,
     icons: &IconSet,
     now: DateTime<Utc>,
+    wrapped: Option<usize>,
 ) -> Vec<Vec<Line<'static>>> {
     rows.iter()
-        .map(|r| vec![render::tree_line(r, width as usize, theme, icons, now)])
+        .enumerate()
+        .map(|(i, r)| {
+            if wrapped == Some(i) {
+                render::tree_line_wrapped(r, width as usize, theme, icons, now)
+            } else {
+                vec![render::tree_line(r, width as usize, theme, icons, now)]
+            }
+        })
         .collect()
+}
+
+/// The entry index whose full text should wrap: the pane's selected index when
+/// it is focused (tui-rework 12, item 1 — only the cursored row expands), else
+/// `None` so every row stays compact.
+const fn wrapped_index(focused: bool, cursor: &Cursor) -> Option<usize> {
+    if focused { Some(cursor.index) } else { None }
 }
 
 /// The detail pane title, named for the focused tree (tui-rework 09, item 3):
@@ -698,9 +717,28 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
     };
     emphasize_border(buf, focus_rect, theme.border_focused);
 
-    let root_entries = tree_entries(&app.root_rows, tl.width, theme, icons, now);
-    let session_entries = tree_entries(&app.session_rows, bl.width, theme, icons, now);
-    let mut problem_entries = render::problem_entries(&app.problem_rows, br.width as usize, theme);
+    let root_entries = tree_entries(
+        &app.root_rows,
+        tl.width,
+        theme,
+        icons,
+        now,
+        wrapped_index(app.focus == Pane::RootTree, &app.root_cursor),
+    );
+    let session_entries = tree_entries(
+        &app.session_rows,
+        bl.width,
+        theme,
+        icons,
+        now,
+        wrapped_index(app.focus == Pane::SessionTree, &app.session_cursor),
+    );
+    let mut problem_entries = render::problem_entries(
+        &app.problem_rows,
+        br.width as usize,
+        theme,
+        wrapped_index(app.focus == Pane::Problems, &app.problem_cursor),
+    );
     problem_entries.extend(render::pending_restart_entries(
         &app.pending_restarts,
         br.width as usize,
@@ -842,9 +880,28 @@ fn render_narrow(
     let tr = Rect::new(grid.x, grid.y + 2 * h, grid.width, h);
     let br = Rect::new(grid.x, grid.y + 3 * h, grid.width, grid.height - 3 * h);
 
-    let root_entries = tree_entries(&app.root_rows, tl.width, theme, icons, now);
-    let session_entries = tree_entries(&app.session_rows, bl.width, theme, icons, now);
-    let mut problem_entries = render::problem_entries(&app.problem_rows, br.width as usize, theme);
+    let root_entries = tree_entries(
+        &app.root_rows,
+        tl.width,
+        theme,
+        icons,
+        now,
+        wrapped_index(app.focus == Pane::RootTree, &app.root_cursor),
+    );
+    let session_entries = tree_entries(
+        &app.session_rows,
+        bl.width,
+        theme,
+        icons,
+        now,
+        wrapped_index(app.focus == Pane::SessionTree, &app.session_cursor),
+    );
+    let mut problem_entries = render::problem_entries(
+        &app.problem_rows,
+        br.width as usize,
+        theme,
+        wrapped_index(app.focus == Pane::Problems, &app.problem_cursor),
+    );
     problem_entries.extend(render::pending_restart_entries(
         &app.pending_restarts,
         br.width as usize,

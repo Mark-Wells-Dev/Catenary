@@ -209,7 +209,69 @@ pub fn tree_line(
     }
 }
 
-fn root_line(r: &RootRow, width: usize, theme: &Theme, icons: &IconSet) -> Line<'static> {
+/// The wrapped, full-text form of a tree row for the row under the cursor.
+///
+/// The same content as [`tree_line`] (tui-rework 12, item 1) but reflowed across
+/// as many lines as its full text needs rather than truncated to one line with
+/// `…`. Continuation lines indent under the text column (2 cols, the caret
+/// gutter); the caller draws the caret on the first line only. Right-column
+/// status/time (up-count, time-in-state) follows the left content inline so it
+/// survives the wrap.
+#[must_use]
+pub fn tree_line_wrapped(
+    row: &Row,
+    width: usize,
+    theme: &Theme,
+    icons: &IconSet,
+    now: DateTime<Utc>,
+) -> Vec<Line<'static>> {
+    let spans = match row {
+        Row::Root(r) => join_lr(root_parts(r, theme, icons)),
+        Row::Server(e) => join_lr(server_parts(e, theme, icons, now)),
+        Row::Client(c) => join_lr(client_parts(c, theme, icons)),
+        Row::Session(s) => join_lr(session_parts(s, theme, now)),
+        Row::InlineFinding {
+            severity,
+            message,
+            depth,
+        } => vec![
+            Span::styled(
+                format!("{}{} ", indent(*depth), severity_glyph(*severity)),
+                severity_style(theme, *severity),
+            ),
+            Span::styled(message.clone(), severity_style(theme, *severity)),
+        ],
+        // Rows with fixed, already-compact text stay one line even when selected.
+        Row::DormantToggle { .. } | Row::Dormant(_) | Row::Subagent(_) => {
+            return vec![tree_line(row, width, theme, icons, now)];
+        }
+    };
+    // Only wrap when the full text overflows; a row that already fits keeps its
+    // normal (right-justified) single line — selection adds bold + a caret, not a
+    // layout change (tui-rework 12, item 1: compact by default).
+    if super::format::spans_width(&spans) <= width {
+        return vec![tree_line(row, width, theme, icons, now)];
+    }
+    super::format::wrap_line(&spans, width, 2)
+}
+
+/// Join a left/right span pair into a single inline span sequence separated by a
+/// space, so the right column (status/time) wraps alongside the left rather than
+/// being right-flushed. Used only by the wrapped selected-row path.
+fn join_lr(parts: (Vec<Span<'static>>, Vec<Span<'static>>)) -> Vec<Span<'static>> {
+    let (mut left, right) = parts;
+    if !right.is_empty() {
+        left.push(Span::raw(" ".to_string()));
+        left.extend(right);
+    }
+    left
+}
+
+fn root_parts(
+    r: &RootRow,
+    theme: &Theme,
+    icons: &IconSet,
+) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     let glyph = if r.expanded {
         &icons.workspace_open
     } else {
@@ -247,16 +309,20 @@ fn root_line(r: &RootRow, width: usize, theme: &Theme, icons: &IconSet) -> Line<
         format!("{}/{} up", r.up, r.total),
         theme.muted,
     ));
+    (left, right)
+}
+
+fn root_line(r: &RootRow, width: usize, theme: &Theme, icons: &IconSet) -> Line<'static> {
+    let (left, right) = root_parts(r, theme, icons);
     super::format::justify(left, right, width)
 }
 
-fn server_line(
+fn server_parts(
     e: &ServerEntry,
-    width: usize,
     theme: &Theme,
     icons: &IconSet,
     now: DateTime<Utc>,
-) -> Line<'static> {
+) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     let (label, style) = state_style(&e.state, e.busy_count, theme);
     let up = super::model::is_up(&e.state);
     let dot = if up {
@@ -292,6 +358,17 @@ fn server_line(
         right.push(Span::styled(format!("{tis} "), theme.timestamp));
     }
     right.push(Span::styled(label, style));
+    (left, right)
+}
+
+fn server_line(
+    e: &ServerEntry,
+    width: usize,
+    theme: &Theme,
+    icons: &IconSet,
+    now: DateTime<Utc>,
+) -> Line<'static> {
+    let (left, right) = server_parts(e, theme, icons, now);
     super::format::justify(left, right, width)
 }
 
@@ -313,7 +390,11 @@ fn finding_line(
     ])
 }
 
-fn client_line(c: &ClientRow, width: usize, theme: &Theme, icons: &IconSet) -> Line<'static> {
+fn client_parts(
+    c: &ClientRow,
+    theme: &Theme,
+    icons: &IconSet,
+) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     let glyph = if c.expanded {
         &icons.workspace_open
     } else {
@@ -341,15 +422,19 @@ fn client_line(c: &ClientRow, width: usize, theme: &Theme, icons: &IconSet) -> L
             severity_style(theme, w),
         )]
     });
+    (left, right)
+}
+
+fn client_line(c: &ClientRow, width: usize, theme: &Theme, icons: &IconSet) -> Line<'static> {
+    let (left, right) = client_parts(c, theme, icons);
     super::format::justify(left, right, width)
 }
 
-fn session_line(
+fn session_parts(
     s: &SessionEntry,
-    width: usize,
     theme: &Theme,
     now: DateTime<Utc>,
-) -> Line<'static> {
+) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     let (cell, cell_style) = session_status_cell(s, theme, now);
     let mut left = vec![
         Span::raw(indent(1)),
@@ -359,19 +444,35 @@ fn session_line(
         left.push(Span::styled(format!("  {}", a.summary), theme.muted));
     }
     let right = vec![Span::styled(cell, cell_style)];
+    (left, right)
+}
+
+fn session_line(
+    s: &SessionEntry,
+    width: usize,
+    theme: &Theme,
+    now: DateTime<Utc>,
+) -> Line<'static> {
+    let (left, right) = session_parts(s, theme, now);
     super::format::justify(left, right, width)
 }
 
 // ── Problems pane ────────────────────────────────────────────────────
 
-/// Render the problems pane as entry groups (one or two lines each): the
-/// labelled finding, then its fix-it indented. A suggestion tail renders with a
-/// dim header so it can never be mistaken for a problem.
+/// Render the problems pane as entry groups (one or two lines each).
+///
+/// Each entry is the labelled finding, then its fix-it indented. A suggestion
+/// tail renders with a dim header so it can never be mistaken for a problem. The
+/// entry at `selected` (an entry index, matching what the list highlights) wraps
+/// its finding message to the full text across as many lines as it needs rather
+/// than truncating it to one line with `…` (tui-rework 12, item 1); every other
+/// entry stays compact. Continuation lines indent under the message column.
 #[must_use]
 pub fn problem_entries(
     rows: &[ProblemRow],
     width: usize,
     theme: &Theme,
+    selected: Option<usize>,
 ) -> Vec<Vec<Line<'static>>> {
     let mut out: Vec<Vec<Line<'static>>> = Vec::new();
     let mut suggestion_header_emitted = false;
@@ -385,11 +486,22 @@ pub fn problem_entries(
         }
         let style = severity_style(theme, r.severity);
         let label = format!("  {}: ", r.severity.label());
-        let head_avail = width.saturating_sub(label.chars().count());
-        let mut lines = vec![Line::from(vec![
-            Span::styled(label, style),
-            Span::styled(truncate_to_width(&r.message, head_avail), style),
-        ])];
+        let label_w = label.chars().count();
+        let is_selected = selected == Some(out.len());
+        let mut lines = if is_selected {
+            // Full message, wrapped under the message column (item 1).
+            let head = vec![
+                Span::styled(label, style),
+                Span::styled(r.message.clone(), style),
+            ];
+            super::format::wrap_line(&head, width, label_w)
+        } else {
+            let head_avail = width.saturating_sub(label_w);
+            vec![Line::from(vec![
+                Span::styled(label, style),
+                Span::styled(truncate_to_width(&r.message, head_avail), style),
+            ])]
+        };
         if let Some(fix) = &r.fix_it {
             for l in fix.lines() {
                 lines.push(Line::from(vec![Span::styled(
@@ -1087,6 +1199,68 @@ mod tests {
             missing.contains("NOT found on $PATH"),
             "unresolvable command keeps the honest wording: {missing}"
         );
+    }
+
+    #[test]
+    fn selected_problem_wraps_full_text_unselected_truncates() {
+        use crate::health::FindingCode;
+        use crate::tui::format::spans_width;
+
+        let long = "a diagnostic message that is far too long to fit on a single \
+            line of the problems pane and therefore must wrap when selected";
+        let rows = vec![ProblemRow {
+            code: FindingCode::ServerRoutedBroken,
+            severity: Severity::Error,
+            message: long.to_string(),
+            fix_it: None,
+            owner: Owner::Global,
+            is_suggestion: false,
+        }];
+        let theme = Theme::new();
+        let width = 40usize;
+
+        // Selected: the entry wraps to multiple lines, each within the width, and
+        // the full message survives across them.
+        let sel = crate::tui::render::problem_entries(&rows, width, &theme, Some(0));
+        let entry = &sel[0];
+        assert!(
+            entry.len() > 1,
+            "a long selected row wraps to multiple lines, got {}",
+            entry.len()
+        );
+        for line in entry {
+            assert!(
+                spans_width(&line.spans) <= width,
+                "every wrapped line is within the pane width"
+            );
+        }
+        let joined: String = entry
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            joined.contains("must wrap when selected"),
+            "the full message is present when selected: {joined}"
+        );
+        assert!(
+            !joined.contains('…'),
+            "no truncation ellipsis when selected"
+        );
+
+        // Unselected: the same row is one line, truncated with `…`.
+        let plain = crate::tui::render::problem_entries(&rows, width, &theme, None);
+        assert_eq!(plain[0].len(), 1, "unselected row stays one line");
+        let head: String = plain[0][0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            head.ends_with('…'),
+            "unselected row truncates with `…`: {head}"
+        );
+        assert!(spans_width(&plain[0][0].spans) <= width, "within width");
     }
 
     #[test]

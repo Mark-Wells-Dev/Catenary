@@ -364,6 +364,14 @@ upgrading.
 
 ### Changed
 
+- **The cursor is the magnifier: the selected row wraps to its full text.**
+  Rows stay compact one-liners by default; the row under the cursor reflows
+  to as many width-bounded lines as its full message needs (caret on the
+  first line, continuation indented) — density by default, full detail on
+  demand. The `? keys` popup gained a border and breathing room between
+  keys and descriptions. The theme lost its last hard-coded backgrounds
+  (dead fields), with a test pinning the palette law: no field may assume
+  a light or dark terminal.
 - **The board is calm: when the engine is idle, nothing on screen moves.**
   Durations quantize to coarse buckets (`7m`, not a ticking `7m25s`;
   footer freshness says `just now`, `<1m ago`, `4m ago`), so an unchanged
