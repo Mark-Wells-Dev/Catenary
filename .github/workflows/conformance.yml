@@ -189,6 +189,14 @@ jobs:
             rustup-component)
               # Rides the pinned toolchain; the component adds the binary.
               rustup component add "${{ matrix.component }}"
+              # The ~/.cargo/bin proxy shim resolves the DEFAULT toolchain
+              # outside the repo (the bridge spawns servers in a tempdir),
+              # where the component is absent — put the real binary first
+              # on PATH (GITHUB_PATH prepends).
+              real="$(rustup which "${{ matrix.component }}")"
+              bindir="$HOME/.local/bin"; mkdir -p "$bindir"
+              ln -sf "$real" "$bindir/${{ matrix.component }}"
+              echo "$bindir" >> "$GITHUB_PATH"
               ;;
             system-apt)
               sudo apt-get update && sudo apt-get install -y "${{ matrix.apt }}"
@@ -261,8 +269,15 @@ jobs:
         # Plain cargo, matching ci.yml — the runner has no nextest and this
         # repo installs no third-party runner tooling for it (first live
         # dispatch failed all 24 jobs on `no such command: nextest`).
+        #
+        # ONLY the matrix entry point runs: the per-server skip-if-missing
+        # sentinels are for local dev, and on runners the rustup proxy shim
+        # (~/.cargo/bin/rust-analyzer, no component behind it) defeats their
+        # binary-missing skip — the second dispatch failed all 23 harness
+        # jobs on that one poisoned sentinel.
         run: |
-          cargo test --test conformance_harness --features mockls --no-fail-fast
+          cargo test --test conformance_harness --features mockls \
+            conformance_selected_server
 
       - name: Emit blessed entry
         run: |
