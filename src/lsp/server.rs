@@ -146,6 +146,14 @@ pub struct LspServer {
     capabilities: OnceLock<Value>,
 
     supports_pull_diagnostics: AtomicBool,
+    /// Engine-internal casing: when set, this server is never advertised the
+    /// `textDocument.diagnostic` client capability and is never sent
+    /// `textDocument/diagnostic` — advertised pull *or* best-effort probe — even
+    /// if it spontaneously advertises `diagnosticProvider` (misc 157). Set once
+    /// at construction from
+    /// [`super::server_behavior::ServerProfile::suppresses_pull_diagnostics`],
+    /// immutable thereafter.
+    pull_suppressed: bool,
     supports_workspace_diagnostics: OnceLock<bool>,
     supports_text_document_sync: OnceLock<bool>,
     supports_definition: OnceLock<bool>,
@@ -230,9 +238,13 @@ impl LspServer {
     /// to populate capability fields.
     #[must_use]
     pub fn new(language_id: String, server_name: String, settings: Option<Value>) -> Self {
+        let pull_suppressed =
+            super::server_behavior::ServerProfile::for_server(server_name.as_str())
+                .suppresses_pull_diagnostics();
         Self {
             capabilities: OnceLock::new(),
             supports_pull_diagnostics: AtomicBool::new(false),
+            pull_suppressed,
             supports_workspace_diagnostics: OnceLock::new(),
             supports_text_document_sync: OnceLock::new(),
             supports_definition: OnceLock::new(),
@@ -337,8 +349,13 @@ impl LspServer {
                 .get(key)
                 .is_some_and(|v| v.as_bool() != Some(false) && !v.is_null())
         };
-        self.supports_pull_diagnostics
-            .store(has("diagnosticProvider"), Ordering::SeqCst);
+        // A pull-suppressed server (misc 157) never gets pull turned on, even if
+        // it spontaneously advertises `diagnosticProvider` — the client-side pull
+        // path stays structurally unreachable for it.
+        self.supports_pull_diagnostics.store(
+            !self.pull_suppressed && has("diagnosticProvider"),
+            Ordering::SeqCst,
+        );
         // `workspace/diagnostic` is gated on the nested
         // `diagnosticProvider.workspaceDiagnostics` boolean (LSP 3.17), not on
         // the provider's mere presence — a server can pull per-document without
@@ -413,9 +430,20 @@ impl LspServer {
     ///
     /// Initially set from the `diagnosticProvider` capability. Can be
     /// downgraded to `false` at runtime via [`Self::downgrade_pull_diagnostics`]
-    /// if the server fails the actual request.
+    /// if the server fails the actual request. Always `false` for a
+    /// pull-suppressed server (misc 157), regardless of what it advertised.
     pub fn supports_pull_diagnostics(&self) -> bool {
-        self.supports_pull_diagnostics.load(Ordering::SeqCst)
+        !self.pull_suppressed && self.supports_pull_diagnostics.load(Ordering::SeqCst)
+    }
+
+    /// Returns whether this server is cased to never receive `textDocument/diagnostic`.
+    ///
+    /// Engine-internal per-server casing (misc 157): a suppressed server is never
+    /// sent an advertised pull *or* the best-effort probe, so its native pushes
+    /// are the sole diagnostic channel. Set once at construction; see
+    /// [`super::server_behavior::ServerProfile::suppresses_pull_diagnostics`].
+    pub const fn pull_suppressed(&self) -> bool {
+        self.pull_suppressed
     }
 
     /// Returns whether the server supports whole-workspace pull diagnostics.
@@ -1355,6 +1383,28 @@ mod tests {
     fn no_diagnostic_provider() {
         let server = server_with_caps(json!({}));
         assert!(!server.supports_pull_diagnostics());
+    }
+
+    #[test]
+    fn pull_suppressed_server_never_reports_pull_support() {
+        // rust-analyzer is cased to suppress pull (misc 157). Even when it
+        // spontaneously advertises `diagnosticProvider`, pull stays off — the
+        // client-side pull path is structurally unreachable.
+        let server = LspServer::new("rust".to_string(), "rust-analyzer".to_string(), None);
+        assert!(server.pull_suppressed());
+        server.set_capabilities(json!({ "diagnosticProvider": { "interFileDependencies": true } }));
+        assert!(
+            !server.supports_pull_diagnostics(),
+            "a pull-suppressed server must never report pull support",
+        );
+    }
+
+    #[test]
+    fn uncased_server_is_not_pull_suppressed() {
+        let server = LspServer::new("go".to_string(), "gopls".to_string(), None);
+        assert!(!server.pull_suppressed());
+        server.set_capabilities(json!({ "diagnosticProvider": {} }));
+        assert!(server.supports_pull_diagnostics());
     }
 
     #[test]

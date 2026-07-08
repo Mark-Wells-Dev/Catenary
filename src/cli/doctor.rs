@@ -493,6 +493,7 @@ pub async fn run_doctor_single(
     let init_params = lsp::params::initialize(
         std::process::id(),
         &folder_refs,
+        server_name,
         server_def.initialization_options.as_ref(),
     );
 

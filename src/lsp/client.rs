@@ -382,6 +382,7 @@ impl LspClient {
         let init_params = params::initialize(
             std::process::id(),
             &folder_refs,
+            self.server.server_name(),
             initialization_options.as_ref(),
         );
 

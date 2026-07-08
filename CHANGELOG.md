@@ -364,6 +364,19 @@ upgrading.
 
 ### Changed
 
+- **Per-server conformance profiles: the engine now cases server behavior
+  where the server's own design demands it.** One engine-internal lookup
+  carries the invariants Catenary needs to work correctly against a given
+  server — applied after every config merge and not overridable, distinct
+  from the user-configurable server definitions. Cased today:
+  rust-analyzer is push-first by construction (it never receives the pull
+  client capability and is never sent `textDocument/diagnostic` — its
+  cargo/clippy family is push-only upstream, so pull was never a complete
+  answer, and pull could silently drop the warnings the push channel
+  carries); gopls gets real pull diagnostics plus a zeroed diagnostics
+  debounce via forced initialization options (the debounce coalesces human
+  keystrokes; Catenary sends discrete batches). Every profile invariant is
+  re-verified by the conformance matrix on each server re-pin.
 - **The board tells the truth about sessions and roots.** `editing` now
   means the gate is armed; a fully-diagnosed batch shows `working`, quiet
   shows `idle` — derived from the daemon's own batch state, with an

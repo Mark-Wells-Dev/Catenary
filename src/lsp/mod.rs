@@ -21,6 +21,8 @@ pub(crate) mod params;
 pub mod protocol;
 /// Server profile: init-time capabilities and runtime observations.
 pub(crate) mod server;
+/// Engine-internal per-server behavior casing (capability shaping, shipped levers).
+pub mod server_behavior;
 /// Idle detection and profiling: polls process tree for quiet detection.
 pub mod settle;
 /// Server state and progress tracking.

@@ -29,14 +29,23 @@ fn folder_array(folders: &[(&str, &str)]) -> Vec<Value> {
 
 // ── Lifecycle ───────────────────────────────────────────────────────
 
-/// Builds `InitializeParams` with the full `ClientCapabilities` that
-/// Catenary advertises to servers.
+/// Builds `InitializeParams` with the `ClientCapabilities` Catenary advertises
+/// to the named server, shaped by its conformance profile (misc 157).
+///
+/// The server's [`super::server_behavior::ServerProfile`] is resolved once and
+/// drives both conformance seams: [a pull-suppressed
+/// server](super::server_behavior::ServerProfile::shape_client_capabilities) does
+/// **not** receive the `textDocument.diagnostic` client capability (every other
+/// server receives today's shape unchanged), and forced
+/// [`initializationOptions`](super::server_behavior::ServerProfile::effective_initialization_options)
+/// are overlaid onto — and win over — any user-supplied options.
 ///
 /// `roots` is a slice of `(uri, name)` pairs for workspace folders.
 #[must_use]
 pub fn initialize(
     pid: u32,
     roots: &[(&str, &str)],
+    server_name: &str,
     initialization_options: Option<&Value>,
 ) -> Value {
     // Per the LSP spec: null workspaceFolders means "single file open,
@@ -125,8 +134,20 @@ pub fn initialize(
         "workspaceFolders": workspace_folders
     });
 
-    if let Some(opts) = initialization_options {
-        params["initializationOptions"] = opts.clone();
+    // Resolve the server's conformance profile once; both seams below consult it,
+    // so this builder never tests a server name itself (misc 157).
+    let profile = super::server_behavior::ServerProfile::for_server(server_name);
+
+    // Client-capability shaping: a pull-suppressed server loses the
+    // `textDocument.diagnostic` capability; an un-profiled server is untouched.
+    if let Some(caps) = params.get_mut("capabilities") {
+        profile.shape_client_capabilities(caps);
+    }
+
+    // Initialization options: forced conformance levers overlaid onto (and
+    // winning over) the user's options. Absent both, no `initializationOptions`.
+    if let Some(opts) = profile.effective_initialization_options(initialization_options) {
+        params["initializationOptions"] = opts;
     }
 
     params
@@ -342,7 +363,8 @@ mod tests {
 
     #[test]
     fn initialize_single_root() {
-        let ours = initialize(42, &[("file:///workspace", "workspace")], None);
+        // An un-cased server receives today's capability shape unchanged.
+        let ours = initialize(42, &[("file:///workspace", "workspace")], "clangd", None);
 
         let expected = json!({
             "processId": 42,
@@ -427,7 +449,7 @@ mod tests {
 
     #[test]
     fn initialize_capabilities_advertise_did_change_watched_files() {
-        let ours = initialize(1, &[("file:///ws", "ws")], None);
+        let ours = initialize(1, &[("file:///ws", "ws")], "clangd", None);
         let dcwf = &ours["capabilities"]["workspace"]["didChangeWatchedFiles"];
         assert_eq!(dcwf["dynamicRegistration"], json!(true));
         assert_eq!(dcwf["relativePatternSupport"], json!(true));
@@ -435,7 +457,7 @@ mod tests {
 
     #[test]
     fn initialize_capabilities_advertise_did_change_configuration() {
-        let ours = initialize(1, &[("file:///ws", "ws")], None);
+        let ours = initialize(1, &[("file:///ws", "ws")], "clangd", None);
         let dcc = &ours["capabilities"]["workspace"]["didChangeConfiguration"];
         assert_eq!(dcc["dynamicRegistration"], json!(true));
     }
@@ -443,7 +465,8 @@ mod tests {
     #[test]
     fn initialize_with_options() {
         let opts = json!({"key": "value"});
-        let ours = initialize(1, &[("file:///ws", "ws")], Some(&opts));
+        // An un-cased server passes its user options through unchanged.
+        let ours = initialize(1, &[("file:///ws", "ws")], "clangd", Some(&opts));
 
         assert_eq!(ours["processId"], 1);
         assert_eq!(ours["rootUri"], "file:///ws");
@@ -452,6 +475,56 @@ mod tests {
             ours["workspaceFolders"],
             json!([{"uri": "file:///ws", "name": "ws"}])
         );
+    }
+
+    #[test]
+    fn initialize_suppresses_diagnostic_capability_for_rust_analyzer() {
+        // rust-analyzer is cased to not receive the pull client capability.
+        let ours = initialize(7, &[("file:///ws", "ws")], "rust-analyzer", None);
+        let text_doc = &ours["capabilities"]["textDocument"];
+        assert!(
+            text_doc.get("diagnostic").is_none(),
+            "rust-analyzer must not receive textDocument.diagnostic, got: {text_doc}",
+        );
+        // Every other textDocument capability stays present — only `diagnostic`
+        // is removed.
+        assert!(text_doc.get("definition").is_some());
+        assert!(text_doc.get("documentSymbol").is_some());
+        assert!(text_doc.get("publishDiagnostics").is_some());
+    }
+
+    #[test]
+    fn initialize_keeps_diagnostic_capability_for_uncased_server() {
+        // An un-cased server keeps today's shape, `diagnostic` included.
+        let ours = initialize(7, &[("file:///ws", "ws")], "clangd", None);
+        assert!(
+            ours["capabilities"]["textDocument"]
+                .get("diagnostic")
+                .is_some(),
+            "an un-cased server must still advertise textDocument.diagnostic",
+        );
+    }
+
+    #[test]
+    fn initialize_forces_gopls_conformance_levers() {
+        // gopls carries the forced conformance levers even when the user supplies
+        // no initializationOptions.
+        let ours = initialize(7, &[("file:///ws", "ws")], "gopls", None);
+        let opts = &ours["initializationOptions"];
+        assert_eq!(opts["pullDiagnostics"], json!(true));
+        assert_eq!(opts["diagnosticsDelay"], json!("0s"));
+    }
+
+    #[test]
+    fn initialize_gopls_conformance_wins_over_user_options() {
+        let user = json!({ "diagnosticsDelay": "100ms", "buildFlags": ["-tags=x"] });
+        let ours = initialize(7, &[("file:///ws", "ws")], "gopls", Some(&user));
+        let opts = &ours["initializationOptions"];
+        // Conformance wins on the conflicting key — never overridable by the user.
+        assert_eq!(opts["diagnosticsDelay"], json!("0s"));
+        assert_eq!(opts["pullDiagnostics"], json!(true));
+        // The user's unrelated key survives.
+        assert_eq!(opts["buildFlags"], json!(["-tags=x"]));
     }
 
     // ── Document synchronization ────────────────────────────────────

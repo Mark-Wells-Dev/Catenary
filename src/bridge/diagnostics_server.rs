@@ -1323,6 +1323,12 @@ impl DiagnosticsServer {
                         }
                     }
                 }
+                // Never heard, pull suppressed by engine casing (misc 157): the
+                // server is push-first by design (rust-analyzer) and must never be
+                // sent `textDocument/diagnostic`, not even the best-effort probe —
+                // its native pushes are the sole channel. Never-heard resolves the
+                // same as a genuinely silent push-only server.
+                None if client.server().pull_suppressed() => Vec::new(),
                 // Never heard and no advertised pull capability. Some servers
                 // still answer `textDocument/diagnostic` on demand without
                 // advertising it (lattice): ask directly rather than report a
