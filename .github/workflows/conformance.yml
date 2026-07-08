@@ -202,12 +202,11 @@ jobs:
               bindir="$HOME/.local/bin"; mkdir -p "$bindir"
               mv elm "$bindir/elm"
               echo "$bindir" >> "$GITHUB_PATH"
-              # Pre-warm ELM_HOME (elm/core etc. download on first use) so
-              # the harness's settle window never carries cold package
-              # fetches. The fixture's intentional error makes this exit
-              # non-zero — the pre-warm, not the exit code, is the point.
-              (cd tests/fixtures/conformance/elm && \
-                "$bindir/elm" make src/Main.elm --output=/dev/null || true)
+              # NO ELM_HOME pre-warm (maintainer ruling, 2026-07-08):
+              # elm's cold-cache package fetch at first compile is the
+              # product's bootstrap gap (misc 156), and conformance
+              # must see it, not absorb it. A red here is the honest
+              # signal until the settle engine models bootstrap.
               ;;
             *) echo "no extra diagnostic dependency for ${{ matrix.server }}" ;;
           esac
