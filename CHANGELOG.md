@@ -832,6 +832,15 @@ upgrading.
 
 ### Fixed
 
+- **Project `.catenary.toml` language bindings now reach server dispatch.**
+  A project-layer `[lsp.language.*]` binding drove file classification but
+  never which server spawned or answered — silently masked whenever the
+  shipped default was also installed. Dispatch now resolves bindings
+  per-root: the project entry merges over the global (shipped + user)
+  resolution with the same array-replace semantics the user layer uses,
+  project winning per root, and a server defined only in the project's own
+  `[lsp.server.*]` is a legal binding target. The editing-boundary coverage
+  gate and diagnostics delivery flags honor the same per-root resolution.
 - **The health probe no longer executes servers for a method they don't
   speak.** The liveness probe sent `textDocument/documentSymbol` and read
   a clean JSON-RPC "method not found" reply as failure — killing perfectly

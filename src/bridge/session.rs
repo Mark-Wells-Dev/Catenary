@@ -1031,7 +1031,7 @@ impl Session {
             if self.client_manager.is_lsp_disabled(&root) {
                 return false;
             }
-            return lang.is_some_and(|id| self.client_manager.has_configured_server(&id));
+            return lang.is_some_and(|id| self.client_manager.has_configured_server(&root, &id));
         }
         lang.is_some_and(|id| self.client_manager.has_single_file_coverage(&id))
     }

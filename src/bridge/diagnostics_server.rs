@@ -692,10 +692,22 @@ impl DiagnosticsServer {
                     .map(str::to_string)
             });
             let lsp_covered = lang.is_some_and(|lang| {
-                self.client_manager
-                    .config()
-                    .resolve_language(&lang)
-                    .is_some()
+                // Resolve per-root so a project `[lsp.language.*]` binding counts
+                // as coverage — mirrors the dispatch sites (misc 155). Unrooted
+                // files fall back to the global resolution.
+                self.fs.resolve_root(&path).map_or_else(
+                    || {
+                        self.client_manager
+                            .config()
+                            .resolve_language(&lang)
+                            .is_some()
+                    },
+                    |root| {
+                        self.client_manager
+                            .effective_language(&root, &lang)
+                            .is_some()
+                    },
+                )
             });
             if lsp_covered || self.client_manager.lint_covers(&path) {
                 files.push(path);

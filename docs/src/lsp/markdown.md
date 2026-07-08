@@ -60,18 +60,21 @@ reports.
 
 [marksman](https://github.com/artempyanykh/marksman) remains a shipped server
 definition — it is simply no longer the default. Re-enable it with a one-line
-binding (no need to redefine the server), in your **user** config
-(`~/.config/catenary/config.toml`):
+binding (no need to redefine the server), in either your **user** config
+(`~/.config/catenary/config.toml`) or a project `.catenary.toml` at a
+workspace root:
 
 ```toml
 [lsp.language.markdown]
 servers = ["marksman"]
 ```
 
-If `marksman` is on PATH, that binding is all you need. Put the binding in your
-user config, not a project `.catenary.toml`: a project config's
-`[lsp.language.*]` `servers` list currently drives classification only, not
-server dispatch, so a project-level binding does not reroute the language.
+If `marksman` is on PATH, that binding is all you need. Both layers reach server
+dispatch: the user binding reroutes everywhere, and a project `.catenary.toml`
+binding reroutes that root — the project layer wins per root. A project
+`[lsp.language.*]` `servers` list *replaces* the binding (array-replace, never
+append), and a server the project defines in its own `[lsp.server.*]` is a legal
+binding target.
 
 ## Notes
 

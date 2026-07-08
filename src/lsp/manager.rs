@@ -353,6 +353,55 @@ impl LspClientManager {
         linters
     }
 
+    /// The effective language configuration for a `(root, lang)` pair (bug 81 /
+    /// misc 155).
+    ///
+    /// The global resolution ([`Config::resolve_language`] — shipped defaults
+    /// overlaid with the user config) with the root's project-layer
+    /// `[lsp.language.{lang}]` merged on top, the project winning per field. The
+    /// merge is [`LanguageConfig::merge`] — the **same array-replace semantics
+    /// the user layer already uses**: a project `servers` list *replaces* the
+    /// binding, it never appends, and a project entry for a language the global
+    /// layer never defined stands on its own. This is the dispatch-resolution
+    /// counterpart to [`Self::effective_linters`] / [`Self::effective_weights`]
+    /// (project-layer siblings that already reach dispatch); the language table
+    /// was the one layer never consulted, so a project binding drove
+    /// classification but never which server spawned or answered.
+    ///
+    /// Binding names still resolve against the merged server-def set spawn uses
+    /// ([`Self::effective_server_def`]), so a project `[lsp.server.*]` def is a
+    /// legal binding target. When the project layer contributes an override the
+    /// merged `root_markers` are recompiled so [`LanguageConfig::marker_set`]
+    /// stays truthful (the `#[serde(skip)]` compiled globs do not travel through
+    /// [`LanguageConfig::merge`]).
+    ///
+    /// Returns `None` only when neither layer defines the language.
+    #[must_use]
+    pub fn effective_language(&self, root: &Path, lang: &str) -> Option<LanguageConfig> {
+        let global = self.config.resolve_language(lang);
+        let project = self
+            .fs
+            .root(root)
+            .and_then(|r| r.config().language.get(lang).cloned());
+
+        match (global, project) {
+            (Some(global), Some(project)) => {
+                let mut merged = global.clone();
+                merged.merge(project);
+                // `merge` copies `root_markers` but not the `#[serde(skip)]`
+                // compiled globs; recompile so `marker_set` reflects a project
+                // override. A malformed project glob would already have failed
+                // the root's own `compile_markers` at load, so this cannot
+                // regress a working config.
+                let _ = merged.compile_markers();
+                Some(merged)
+            }
+            (Some(global), None) => Some(global.clone()),
+            (None, Some(project)) => Some(project),
+            (None, None) => None,
+        }
+    }
+
     /// The effective cross-feeder diagnostic weights for a root (linters ticket
     /// 05).
     ///
@@ -451,13 +500,17 @@ impl LspClientManager {
         match self.fs.resolve_root(file) {
             Some(root) => {
                 // In-root LSP feeders: every configured server bound to the
-                // language, unless the root turns LSP off.
+                // language, unless the root turns LSP off. Per-root resolution
+                // so a project `[lsp.language.*]` binding reaches the feeder set;
+                // a project `[lsp.server.*]` def is a legal binding target.
                 if !self.is_lsp_disabled(&root)
                     && let Some(id) = lang.as_deref()
-                    && let Some(lc) = self.config.resolve_language(id)
+                    && let Some(lc) = self.effective_language(&root, id)
                 {
                     for binding in lc.servers() {
-                        if self.config.server.contains_key(&binding.name) {
+                        if self.config.server.contains_key(&binding.name)
+                            || self.effective_server_def(&binding.name, &root).is_some()
+                        {
                             names.insert(binding.name.clone());
                         }
                     }
@@ -512,11 +565,10 @@ impl LspClientManager {
     /// - The language has no root markers.
     /// - No marker is found within the workspace root.
     fn resolve_server_root(&self, file: &Path, lang: &str, workspace_root: &Path) -> PathBuf {
-        let Some((markers, compiled)) = self
-            .config
-            .resolve_language(lang)
-            .and_then(LanguageConfig::marker_set)
-        else {
+        let Some(lang_config) = self.effective_language(workspace_root, lang) else {
+            return workspace_root.to_path_buf();
+        };
+        let Some((markers, compiled)) = lang_config.marker_set() else {
             return workspace_root.to_path_buf();
         };
 
@@ -606,7 +658,7 @@ impl LspClientManager {
             );
 
             for lang in &detected {
-                let Some(lang_config) = self.config.resolve_language(lang) else {
+                let Some(lang_config) = self.effective_language(root, lang) else {
                     continue;
                 };
 
@@ -662,7 +714,7 @@ impl LspClientManager {
         })
     }
 
-    /// Returns whether any server is configured for this language.
+    /// Returns whether any server is configured for this language in `root`.
     ///
     /// Used by the editing-boundary gate to decide whether an in-root edit
     /// has LSP coverage. Unlike [`Self::has_single_file_coverage`], this does
@@ -674,15 +726,19 @@ impl LspClientManager {
     /// classification-only entries, or types absent from every `[lsp.language.*]`
     /// table (`.txt`, logs, data/scratch files) — return `false`, so
     /// non-served in-root edits flow free.
+    ///
+    /// Resolves the binding per-root ([`Self::effective_language`]), so a project
+    /// `[lsp.language.*]` rebinding decides coverage; a project `[lsp.server.*]`
+    /// def is a legal binding target ([`Self::effective_server_def`]).
     #[must_use]
-    pub fn has_configured_server(&self, lang: &str) -> bool {
-        let Some(lang_config) = self.config.resolve_language(lang) else {
+    pub fn has_configured_server(&self, root: &Path, lang: &str) -> bool {
+        let Some(lang_config) = self.effective_language(root, lang) else {
             return false;
         };
-        lang_config
-            .servers()
-            .iter()
-            .any(|binding| self.config.server.contains_key(&binding.name))
+        lang_config.servers().iter().any(|binding| {
+            self.config.server.contains_key(&binding.name)
+                || self.effective_server_def(&binding.name, root).is_some()
+        })
     }
 
     /// Returns the current workspace roots.
@@ -852,15 +908,14 @@ impl LspClientManager {
             return Vec::new();
         };
 
-        // Look up language config.
-        let Some(lang_config) = self.config.resolve_language(&lang_id) else {
-            return Vec::new();
-        };
-
         // Resolve owning workspace root. If unrooted, fall through to
         // tier 3 (single-file servers).
         if let Some(root) = self.fs.resolve_root(path) {
-            // Tiers 1–2: rooted file lookup.
+            // Tiers 1–2: rooted file lookup. Resolve the binding per-root so a
+            // project `[lsp.language.*]` rebinding decides dispatch.
+            let Some(lang_config) = self.effective_language(&root, &lang_id) else {
+                return Vec::new();
+            };
             // Resolve marker root once for all servers in this language.
             let resolved = self.resolve_server_root(path, &lang_id, &root);
             let clients = self.clients.lock().await;
@@ -879,7 +934,9 @@ impl LspClientManager {
                     skip("method disabled");
                     continue;
                 }
-                let Some(server_def) = self.config.server.get(&binding.name) else {
+                // A project `[lsp.server.*]` def is a legal binding target, so
+                // resolve the def per-root rather than user-config only.
+                let Some(server_def) = self.effective_server_def(&binding.name, &root) else {
                     skip("server def not found");
                     continue;
                 };
@@ -942,7 +999,11 @@ impl LspClientManager {
             return result;
         }
 
-        // Tier 3: single-file servers for unrooted files.
+        // Tier 3: single-file servers for unrooted files. Unrooted ⇒ no project
+        // layer to consult, so the binding resolves globally.
+        let Some(lang_config) = self.config.resolve_language(&lang_id) else {
+            return Vec::new();
+        };
         let mut result = Vec::new();
         for binding in lang_config.servers() {
             if method.is_some_and(|m| binding.is_method_disabled(m)) {
@@ -988,11 +1049,6 @@ impl LspClientManager {
             return;
         };
 
-        // Look up language config — unconfigured languages skip.
-        let Some(lang_config) = self.config.resolve_language(&lang_id) else {
-            return;
-        };
-
         // Collect matching instances under the lock, then release before waiting.
         #[allow(
             clippy::option_if_let_else,
@@ -1001,7 +1057,11 @@ impl LspClientManager {
         let to_wait: Vec<Arc<Mutex<LspClient>>> = {
             let clients = self.clients.lock().await;
             if let Some(root) = self.fs.resolve_root(path) {
-                // Tiers 1–2: rooted file.
+                // Tiers 1–2: rooted file. Resolve the binding per-root so a
+                // project `[lsp.language.*]` rebinding is waited on.
+                let Some(lang_config) = self.effective_language(&root, &lang_id) else {
+                    return;
+                };
                 // Use resolve_server_root to match the instance key used
                 // by ensure_clients_for_paths and get_servers.
                 let resolved = self.resolve_server_root(path, &lang_id, &root);
@@ -1020,7 +1080,10 @@ impl LspClientManager {
                 }
                 instances
             } else {
-                // Tier 3: single-file servers.
+                // Tier 3: single-file servers. Unrooted ⇒ global binding.
+                let Some(lang_config) = self.config.resolve_language(&lang_id) else {
+                    return;
+                };
                 lang_config
                     .servers()
                     .iter()
@@ -1551,9 +1614,15 @@ impl LspClientManager {
                 .and_then(|e| e.to_str())
                 .map(str::to_string)
         });
-        let lang_config = lang_id
-            .as_deref()
-            .and_then(|id| self.config.resolve_language(id));
+        // Resolve the binding per-root so a project `[lsp.language.*]` rebinding's
+        // `diagnostics` flags govern delivery; unrooted files use the global
+        // binding.
+        let lang_config = lang_id.as_deref().and_then(|id| {
+            self.fs.resolve_root(path).map_or_else(
+                || self.config.resolve_language(id).cloned(),
+                |root| self.effective_language(&root, id),
+            )
+        });
 
         let mut clients = Vec::new();
         for client in &servers {
@@ -1596,10 +1665,11 @@ impl LspClientManager {
         }) else {
             return Vec::new();
         };
-        let Some(lang_config) = self.config.resolve_language(&lang_id) else {
+        let Some(root) = self.fs.resolve_root(path) else {
             return Vec::new();
         };
-        let Some(root) = self.fs.resolve_root(path) else {
+        // Resolve the binding + server defs per-root (misc 155).
+        let Some(lang_config) = self.effective_language(&root, &lang_id) else {
             return Vec::new();
         };
         let resolved = self.resolve_server_root(path, &lang_id, &root);
@@ -1610,7 +1680,7 @@ impl LspClientManager {
             if !lang_config.diagnostics_enabled(&binding.name) {
                 continue;
             }
-            let Some(server_def) = self.config.server.get(&binding.name) else {
+            let Some(server_def) = self.effective_server_def(&binding.name, &root) else {
                 continue;
             };
             if !file_matches_patterns(path, &server_def.compiled_patterns) {
@@ -1714,8 +1784,7 @@ impl LspClientManager {
                 continue;
             }
             let diag_enabled = self
-                .config
-                .resolve_language(&key.language_id)
+                .effective_language(root, &key.language_id)
                 .is_some_and(|lc| lc.diagnostics_enabled(&key.server));
             if !diag_enabled {
                 continue;
@@ -1777,7 +1846,7 @@ impl LspClientManager {
                     continue;
                 }
 
-                let Some(lang_config) = self.config.resolve_language(&lang) else {
+                let Some(lang_config) = self.effective_language(&root, &lang) else {
                     continue;
                 };
 
@@ -2280,10 +2349,10 @@ impl LspClientManager {
                 let Some(servers) = active_langs.get(lang) else {
                     continue;
                 };
-                let marker_set = self
-                    .config
-                    .resolve_language(lang)
-                    .and_then(LanguageConfig::marker_set);
+                // Per-root markers so a project `[lsp.language.*]` `root_markers`
+                // override governs the sub-root gate (misc 155).
+                let lang_config = self.effective_language(root, lang);
+                let marker_set = lang_config.as_ref().and_then(LanguageConfig::marker_set);
                 // Skip roots without markers when markers are configured.
                 if marker_set.is_some_and(|(m, c)| !dir_has_marker(root, m, c)) {
                     continue;
@@ -2318,19 +2387,26 @@ impl LspClientManager {
     /// Returns the effective `ServerDef` for a server in a root.
     ///
     /// Deep-merges the root's project `[lsp.server.{name}]` (if any)
-    /// over the user-level `[lsp.server.{name}]`. Returns user-level
-    /// def unchanged if no project override exists.
+    /// over the user-level `[lsp.server.{name}]`. Returns the user-level
+    /// def unchanged if no project override exists, or the project def alone
+    /// when the server is defined only at project scope — so a project
+    /// `[lsp.server.*]` def is a legal spawn/binding target (misc 155).
     #[must_use]
     pub fn effective_server_def(&self, server_name: &str, root: &Path) -> Option<ServerDef> {
-        let user_def = self.config.server.get(server_name)?;
+        let user_def = self.config.server.get(server_name);
 
         let project_def = self
             .fs
             .root(root)
             .and_then(|r| r.config().server.get(server_name).cloned());
 
-        let Some(project_def) = project_def else {
-            return Some(user_def.clone());
+        // At most one layer defines the server: return whichever exists (a
+        // project-only def is a legal spawn/binding target). Only when both are
+        // present do we field-merge below.
+        let (user_def, project_def) = match (user_def, project_def) {
+            (Some(user_def), Some(project_def)) => (user_def, project_def),
+            (None, project_def) => return project_def,
+            (Some(user_def), None) => return Some(user_def.clone()),
         };
 
         // Field-level merge: project fields override user fields when
@@ -2576,6 +2652,50 @@ mod tests {
             registry: None,
             linter: HashMap::new(),
         })
+    }
+
+    /// Config whose language `MOCK_LANG_A` is globally bound to a single
+    /// "shipped default" mockls server, with a second mockls server defined but
+    /// NOT bound. A project `.catenary.toml` can rebind the language to the
+    /// alternate server — the reroute-over-the-shipped-default shape (bug 81 /
+    /// misc 155). Returns the `(default, alternate)` server names.
+    fn mockls_default_plus_alt_config() -> (Arc<Config>, String, String) {
+        let bin = mockls_bin();
+        let default_name = format!("mockls-{MOCK_LANG_A}-default");
+        let alt_name = format!("mockls-{MOCK_LANG_A}-alt");
+        let mut server = HashMap::new();
+        for name in [&default_name, &alt_name] {
+            server.insert(
+                name.clone(),
+                ServerDef {
+                    command: bin.to_string_lossy().to_string(),
+                    args: vec![MOCK_LANG_A.to_string()],
+                    ..ServerDef::default()
+                },
+            );
+        }
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new(default_name.clone())]),
+                ..LanguageConfig::default()
+            },
+        );
+        let config = Arc::new(Config {
+            language,
+            server,
+            log_retention_days: 7,
+            notifications: None,
+            icons: None,
+            tools: None,
+            resolved_commands: None,
+            observability: None,
+            roots: None,
+            registry: None,
+            linter: HashMap::new(),
+        });
+        (config, default_name, alt_name)
     }
 
     fn mockls_workspace_folders_config() -> Arc<Config> {
@@ -4853,6 +4973,121 @@ mod tests {
         assert_eq!(settings["b"]["d"], 3);
     }
 
+    /// Project-layer sibling of the config-level pinned
+    /// `user_config_language_binding_reroutes_over_the_shipped_default`
+    /// (bug 81 / misc 155): the global layer binds a language to a "shipped
+    /// default" server, and a root's `.catenary.toml` `[lsp.language.*]`
+    /// `servers` list REPLACES it (array-replace, never append) — the reroute
+    /// is by binding, and it holds both when the default server is absent from
+    /// the effective binding and while its definition is still present (the
+    /// masked shape). A server defined only in the root's `[lsp.server.*]` is a
+    /// legal binding target.
+    #[test]
+    fn project_config_language_binding_reroutes_over_the_shipped_default() {
+        let mut config = test_config_raw();
+        // The shipped default: language MOCK_LANG_A → "shipped-default".
+        config.server.insert(
+            "shipped-default".to_string(),
+            ServerDef {
+                command: "shipped-default".to_string(),
+                ..ServerDef::default()
+            },
+        );
+        // A second globally-defined server the project can rebind to.
+        config.server.insert(
+            "alt".to_string(),
+            ServerDef {
+                command: "alt".to_string(),
+                ..ServerDef::default()
+            },
+        );
+        config.language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new("shipped-default")]),
+                ..LanguageConfig::default()
+            },
+        );
+
+        let manager = LspClientManager::new(
+            Arc::new(config),
+            test_logging(),
+            test_fs_with_roots(&["/p"]),
+        );
+        let root = PathBuf::from("/p");
+
+        // Before any project config: the global binding governs.
+        assert_eq!(
+            manager
+                .effective_language(&root, MOCK_LANG_A)
+                .expect("global binding")
+                .servers(),
+            &[ServerBinding::new("shipped-default")],
+        );
+
+        // The project rebinds to a globally-defined `alt` server — the default
+        // definition is still present (the masked shape).
+        let mut pc = crate::config::ProjectConfig::default();
+        pc.language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new("alt")]),
+                ..LanguageConfig::default()
+            },
+        );
+        manager.install_root_config(root.clone(), pc);
+
+        let rebound = manager
+            .effective_language(&root, MOCK_LANG_A)
+            .expect("project binding");
+        assert_eq!(
+            rebound.servers(),
+            &[ServerBinding::new("alt")],
+            "the project binding must REPLACE the shipped default, not merge with it",
+        );
+        // The shipped-default definition survives — the reroute is by binding,
+        // not by removing the default.
+        assert!(manager.config().server.contains_key("shipped-default"));
+        // `alt` resolves through the merged server-def set.
+        assert!(manager.effective_server_def("alt", &root).is_some());
+
+        // A server defined only at project scope is a legal binding target.
+        let mut pc2 = crate::config::ProjectConfig::default();
+        pc2.language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new("proj-only")]),
+                ..LanguageConfig::default()
+            },
+        );
+        pc2.server.insert(
+            "proj-only".to_string(),
+            ServerDef {
+                command: "proj-only".to_string(),
+                ..ServerDef::default()
+            },
+        );
+        manager.install_root_config(root.clone(), pc2);
+
+        assert_eq!(
+            manager
+                .effective_language(&root, MOCK_LANG_A)
+                .expect("project binding")
+                .servers(),
+            &[ServerBinding::new("proj-only")],
+        );
+        // The project-only server def resolves even though no user-level def
+        // exists — so it can spawn and answer.
+        let proj_def = manager
+            .effective_server_def("proj-only", &root)
+            .expect("project-only def resolves");
+        assert_eq!(proj_def.command, "proj-only");
+        assert!(
+            !manager.config().server.contains_key("proj-only"),
+            "the target is defined only at project scope",
+        );
+    }
+
     // --- find_instance tests ---
 
     #[tokio::test]
@@ -5184,6 +5419,170 @@ mod tests {
             "Should return the workspace instance for /tmp"
         );
 
+        Ok(())
+    }
+
+    /// misc 155 (bug 81): a root `.catenary.toml` `[lsp.language.*]` binding
+    /// reroutes dispatch to the rebound server even when the shipped default
+    /// server is NOT spawned — the exact CI shape that exposed bug 81 (only the
+    /// rebound server present). `get_servers` returns the rebound instance.
+    #[tokio::test]
+    async fn project_language_binding_reroutes_dispatch_default_absent() -> Result<()> {
+        let (config, default_name, alt_name) = mockls_default_plus_alt_config();
+        let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/proj"]));
+        let root = Path::new("/proj");
+
+        // The root rebinds the language to `alt` — a project-scoped root.
+        let mut pc = crate::config::ProjectConfig::default();
+        pc.language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new(alt_name.clone())]),
+                ..LanguageConfig::default()
+            },
+        );
+        manager.install_root_config(root.to_path_buf(), pc);
+
+        // Only the rebound `alt` server is spawned; the shipped default is absent.
+        let (_, alt_client) = manager
+            .spawn_project_scoped(&alt_name, MOCK_LANG_A, root)
+            .await?;
+
+        let path = PathBuf::from(format!("/proj/test.{MOCK_LANG_A}"));
+        let servers = manager
+            .get_servers(&path, LspServer::supports_document_symbols, None)
+            .await;
+        assert_eq!(
+            servers.len(),
+            1,
+            "the project binding must route to the rebound server",
+        );
+        assert!(
+            Arc::ptr_eq(&servers[0], &alt_client),
+            "get_servers must return the rebound `alt` instance",
+        );
+        // The shipped default is not the answering server.
+        assert_ne!(alt_name, default_name);
+        Ok(())
+    }
+
+    /// misc 155 (bug 81): the *masked* shape — the shipped default server IS
+    /// spawned and alive, yet the root's project binding still reroutes dispatch
+    /// to the rebound server. The reroute is by binding, not by the default's
+    /// absence (locally lattice-was-installed masked the non-reroute).
+    #[tokio::test]
+    async fn project_language_binding_reroutes_dispatch_default_present() -> Result<()> {
+        let (config, default_name, alt_name) = mockls_default_plus_alt_config();
+        let manager = LspClientManager::new(
+            config,
+            test_logging(),
+            test_fs_with_roots(&["/shared", "/proj"]),
+        );
+        let root = Path::new("/proj");
+
+        // The root rebinds the language to `alt`.
+        let mut pc = crate::config::ProjectConfig::default();
+        pc.language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new(alt_name.clone())]),
+                ..LanguageConfig::default()
+            },
+        );
+        manager.install_root_config(root.to_path_buf(), pc);
+
+        // The shipped default is spawned and alive at a shared, non-rebound root,
+        // AND at the project root (the masked shape: the default is present
+        // everywhere the global binding would reach).
+        let default_shared = manager
+            .ensure_server(MOCK_LANG_A, &default_name, Path::new("/shared"))
+            .await?;
+        assert!(default_shared.lock().await.is_alive());
+        let (_, default_at_proj) = manager
+            .spawn_project_scoped(&default_name, MOCK_LANG_A, root)
+            .await?;
+        assert!(default_at_proj.lock().await.is_alive());
+
+        // The rebound server is also spawned at the project root.
+        let (_, alt_client) = manager
+            .spawn_project_scoped(&alt_name, MOCK_LANG_A, root)
+            .await?;
+
+        // Dispatch for a project file still routes ONLY to the rebound `alt`
+        // instance — the still-alive default is not in the binding.
+        let path = PathBuf::from(format!("/proj/test.{MOCK_LANG_A}"));
+        let servers = manager
+            .get_servers(&path, LspServer::supports_document_symbols, None)
+            .await;
+        assert_eq!(
+            servers.len(),
+            1,
+            "the project binding replaces the default, so only `alt` answers",
+        );
+        assert!(
+            Arc::ptr_eq(&servers[0], &alt_client),
+            "get_servers must return `alt`, never the still-alive shipped default",
+        );
+        Ok(())
+    }
+
+    /// misc 155: a project binding whose target server is defined ONLY in the
+    /// root's own `[lsp.server.*]` (no user-level def) spawns and answers.
+    #[tokio::test]
+    async fn project_defined_server_binding_spawns_and_answers() -> Result<()> {
+        // Global config: no server bound to the language at all.
+        let mut config = test_config_raw();
+        config.language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(Vec::new()),
+                ..LanguageConfig::default()
+            },
+        );
+        let manager = LspClientManager::new(
+            Arc::new(config),
+            test_logging(),
+            test_fs_with_roots(&["/proj"]),
+        );
+        let root = Path::new("/proj");
+
+        // The root both binds the language AND defines its target server.
+        let proj_server = format!("proj-{MOCK_LANG_A}");
+        let mut pc = crate::config::ProjectConfig::default();
+        pc.language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new(proj_server.clone())]),
+                ..LanguageConfig::default()
+            },
+        );
+        pc.server.insert(
+            proj_server.clone(),
+            ServerDef {
+                command: mockls_bin().to_string_lossy().to_string(),
+                args: vec![MOCK_LANG_A.to_string()],
+                ..ServerDef::default()
+            },
+        );
+        manager.install_root_config(root.to_path_buf(), pc);
+
+        // The project-only server is a legal spawn target and starts.
+        let (_, client) = manager
+            .spawn_project_scoped(&proj_server, MOCK_LANG_A, root)
+            .await?;
+        assert!(client.lock().await.is_alive());
+
+        // Dispatch routes to it even though it exists only at project scope.
+        let path = PathBuf::from(format!("/proj/test.{MOCK_LANG_A}"));
+        let servers = manager
+            .get_servers(&path, LspServer::supports_document_symbols, None)
+            .await;
+        assert_eq!(servers.len(), 1, "the project-only server must answer");
+        assert!(Arc::ptr_eq(&servers[0], &client));
+        assert!(
+            !manager.config().server.contains_key(&proj_server),
+            "the answering server is defined only at project scope",
+        );
         Ok(())
     }
 
