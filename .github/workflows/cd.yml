@@ -1,5 +1,7 @@
+---
 # CD — on a vX.Y.Z tag push:
-#   1. build-release   cross-platform binaries (Linux / macOS x64+arm64 / Windows)
+#   1. build-release   cross-platform binaries (Linux / macOS x64+arm64 /
+#                      Windows)
 #   2. create-release  cut a GitHub Release with the binaries attached
 #   3. publish-crate   publish to crates.io via Trusted Publishing (OIDC — no
 #                      stored token): catenary-proc, then catenary-mcp
@@ -16,21 +18,21 @@
 #         repository   TwoWells/Catenary
 #         workflow     cd.yml
 #         environment  release
-#   - GitHub → repo Settings → Environments → create `release` (optionally add
-#       required-reviewer / tag-protection rules). If skipped, GitHub auto-creates
-#       it (unprotected) on first run.
-#   - After the first successful run, the old `CRATES_IO_TOKEN` repo secret is no
-#     longer used and can be deleted.
+#   - GitHub → repo Settings → Environments → create `release` (optionally
+#       add required-reviewer / tag-protection rules). If skipped, GitHub
+#       auto-creates it (unprotected) on first run.
+#   - After the first successful run, the old `CRATES_IO_TOKEN` repo secret
+#     is no longer used and can be deleted.
 name: CD
 
-on:
+"on":
   push:
     tags:
       - 'v*'
 
 permissions:
-  contents: write # create-release: cut the GitHub Release
-  id-token: write # publish-crate: OIDC token for crates.io Trusted Publishing
+  contents: write  # create-release: cut the GitHub Release
+  id-token: write  # publish-crate: OIDC for crates.io Trusted Publishing
 
 jobs:
   build-release:
@@ -57,7 +59,7 @@ jobs:
             asset_name: catenary-windows-amd64.exe
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         run: |
@@ -84,7 +86,7 @@ jobs:
     needs: build-release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download Artifacts
         uses: actions/download-artifact@v4
@@ -93,7 +95,9 @@ jobs:
           merge-multiple: true
 
       - name: Create Release
-        run: gh release create "${{ github.ref_name }}" artifacts/* --generate-notes --verify-tag
+        run: >-
+          gh release create "${{ github.ref_name }}" artifacts/*
+          --generate-notes --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}
 
@@ -102,11 +106,11 @@ jobs:
     needs: build-release
     runs-on: ubuntu-latest
     # Must match the Environment registered in crates.io Trusted Publishing.
-    # Scopes the OIDC token's subject to this environment and is the hook for any
-    # required-reviewer / tag-protection rules (repo Settings → Environments).
+    # Scopes the OIDC token's subject to this environment and is the hook
+    # for required-reviewer / tag-protection rules (Settings → Environments).
     environment: release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show
 
       # OIDC: exchange the GitHub id-token for a short-lived crates.io token.
@@ -121,9 +125,12 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
-          # Workspace subcrate first; skip if its version is already published.
-          cargo publish -p catenary-proc || echo "catenary-proc: already published, skipping"
-          # Wait for the crates.io index to propagate before the dependent crate.
+          # Workspace subcrate first; skip if its version is already
+          # published.
+          cargo publish -p catenary-proc \
+            || echo "catenary-proc: already published, skipping"
+          # Wait for the crates.io index to propagate before the dependent
+          # crate.
           sleep 30
           # Root package (catenary-mcp).
           cargo publish --allow-dirty

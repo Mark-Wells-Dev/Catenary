@@ -1,6 +1,7 @@
+---
 name: CI
 
-on:
+"on":
   push:
     branches: [main]
   pull_request:
@@ -14,7 +15,7 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show
       - run: cargo fmt --check
 
@@ -22,7 +23,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show
       - run: cargo clippy --all-targets --features mockls -- -D warnings
 
@@ -30,18 +31,19 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --bins --tests --features mockls
       - run: cargo test --lib --bins --no-fail-fast --features mockls
-      # Integration tests require LSP servers (e.g. rust-analyzer), run locally via `make test`
+      # Integration tests require LSP servers (e.g. rust-analyzer); they run
+      # locally via `make test`.
 
   build:
     name: Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
