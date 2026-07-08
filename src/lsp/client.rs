@@ -921,17 +921,24 @@ impl LspClient {
         Ok(super::extract::workspace_diagnostic_report(&result))
     }
 
-    /// Gets cached diagnostics for a specific URI.
-    pub fn get_diagnostics(&self, uri: &str) -> Vec<Value> {
+    /// Gets cached diagnostics for a specific URI, preserving the heard-empty
+    /// vs never-heard distinction.
+    ///
+    /// Returns `Some(diagnostics)` when the server has published a
+    /// `textDocument/publishDiagnostics` for this URI — **including
+    /// `Some(vec![])`** when that publish carried an empty set. An explicit
+    /// empty publish is the server's evidence-backed clean, not the absence of
+    /// evidence. Returns `None` when the server has never published for this URI
+    /// (never-heard), so a caller can distinguish a heard-empty clean from a
+    /// genuine no-result and decide whether a best-effort pull is warranted
+    /// (misc 153).
+    pub fn get_diagnostics(&self, uri: &str) -> Option<Vec<Value>> {
         let cache = self
             .server
             .diagnostics
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache
-            .get(uri)
-            .map(|(_, diags)| diags.clone())
-            .unwrap_or_default()
+        cache.get(uri).map(|(_, diags)| diags.clone())
     }
 
     /// Removes cached diagnostics for the given URIs.
@@ -1846,7 +1853,8 @@ mod tests {
     /// Verifies that `get_diagnostics` returns cached diagnostics.
     ///
     /// mockls publishes diagnostics on `didOpen`. We poll until they
-    /// appear in the cache, then verify `get_diagnostics` returns them.
+    /// appear in the cache, then verify `get_diagnostics` returns them as
+    /// `Some(non-empty)` (heard-dirty) and `None` (never-heard) after a clear.
     #[tokio::test]
     async fn get_diagnostics_returns_cached() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1858,30 +1866,69 @@ mod tests {
         let uri = format!("file://{}", script.display());
         client.did_open(&uri, MOCK_LANG, 1, "let x\n").await?;
 
-        // Poll until diagnostics arrive (mockls publishes on didOpen)
+        // Poll until diagnostics arrive (mockls publishes on didOpen). Before the
+        // publish lands the URI is never-heard (`None`); the `Some` arm ends the
+        // wait, and mockls always publishes a non-empty set for this file.
         let mut found = false;
         for _ in 0..50 {
-            let diags = client.get_diagnostics(&uri);
-            if !diags.is_empty() {
-                found = true;
+            if let Some(diags) = client.get_diagnostics(&uri) {
                 assert!(
                     diags
                         .iter()
                         .any(|d| d.get("source").and_then(Value::as_str) == Some("mockls")),
                     "diagnostics should come from mockls: {diags:?}"
                 );
+                found = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(found, "diagnostics should appear in cache after didOpen");
 
-        // clear_diagnostics_for removes the cached entry
+        // clear_diagnostics_for removes the cached entry, returning the URI to
+        // never-heard (`None`) for the next batch.
         client.clear_diagnostics_for(&[&uri]);
         let after_clear = client.get_diagnostics(&uri);
         assert!(
-            after_clear.is_empty(),
-            "cache should be empty after clear: {after_clear:?}"
+            after_clear.is_none(),
+            "cache should be None (never-heard) after clear: {after_clear:?}"
+        );
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    /// `get_diagnostics` reads a heard-empty publish as `Some(vec![])`, distinct
+    /// from a never-heard `None` (misc 153).
+    ///
+    /// An explicit empty `publishDiagnostics` is the server's evidence-backed
+    /// clean — the post-Lattice-16 push-only contract. It must not collapse into
+    /// the never-heard `None` that `retrieve_diagnostics` treats as license to
+    /// fire a best-effort probe, or the honest empty is second-guessed forever.
+    /// mockls has no wire flag to push an empty set, so we inject the exact
+    /// notification a clean push server sends and read it back through the cache.
+    #[tokio::test]
+    async fn get_diagnostics_heard_empty_is_some_empty() -> Result<()> {
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        let uri = "file:///heard/empty.ext";
+
+        // Never published for this URI → never-heard.
+        assert!(
+            client.get_diagnostics(uri).is_none(),
+            "an unseen URI must read as None (never-heard)"
+        );
+
+        // Inject the explicit empty publish a clean push server emits.
+        client.server().on_notification(
+            "textDocument/publishDiagnostics",
+            &serde_json::json!({ "uri": uri, "diagnostics": [] }),
+        );
+
+        let heard = client.get_diagnostics(uri);
+        assert!(
+            matches!(heard, Some(ref d) if d.is_empty()),
+            "an empty publish must read as Some(empty) (heard-empty), got: {heard:?}"
         );
 
         client.shutdown().await?;

@@ -20,9 +20,9 @@ mod common;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde_json::json;
+use serde_json::{Value, json};
 
-use common::{BridgeProcess, ipc_request, ipc_request_progress_aware};
+use common::{BridgeProcess, ipc_request, ipc_request_progress_aware, read_merged_log};
 
 const MOCK_LANG_A: &str = "yX4Za";
 
@@ -34,6 +34,19 @@ fn spawn_mockls(mockls_args: &[&str], root: &str) -> Result<BridgeProcess> {
     let flags = mockls_args.join(" ");
     let lsp = common::mockls_lsp_arg(MOCK_LANG_A, &flags);
     BridgeProcess::spawn(&[&lsp], root)
+}
+
+/// Counts request-log lines whose `method` equals `method` (misc 153).
+///
+/// mockls's `--request-log` appends one `{"method":"..."}` object per handled
+/// request. `call_diagnostics` runs the whole pipeline to completion before it
+/// returns, so every pull the retrieval decided to issue is already logged —
+/// the count is authoritative with no sleep or poll.
+fn count_request_method(log: &str, method: &str) -> usize {
+    log.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|v| v.get("method").and_then(Value::as_str) == Some(method))
+        .count()
 }
 
 /// Default mockls: publishes diagnostics on didOpen/didChange without
@@ -610,6 +623,125 @@ fn test_pull_downgrade_with_push() -> Result<()> {
     assert!(
         text.contains("mock diagnostic"),
         "Server with working push should return diagnostics even with broken pull. Got: {text}"
+    );
+
+    Ok(())
+}
+
+// ─── Push-received precedence (misc 153) ──────────────────────────────
+
+/// Never-heard draws exactly one best-effort probe (misc 153 / bug 74).
+///
+/// A silent mockls — never publishes (`--no-push-diagnostics`) and does not
+/// advertise `diagnosticProvider` — leaves the push cache empty (never-heard).
+/// `retrieve_diagnostics` then issues exactly one best-effort
+/// `textDocument/diagnostic`, the bug-74 rescue for a genuinely silent server.
+/// mockls answers a pull it never advertised with an empty report, so the file
+/// verifies `[clean]`, and the request log carries precisely one probe.
+#[test]
+fn never_heard_draws_one_best_effort_probe() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let logs = tempfile::tempdir()?;
+    let rlog = logs.path().join("requests.jsonl");
+    let rlog_arg = rlog.to_str().context("rlog path")?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mut bridge = spawn_mockls(
+        &["--no-push-diagnostics", "--request-log", rlog_arg],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+    assert!(
+        text.contains("[clean]"),
+        "a silent server verifies clean via the best-effort probe. Got: {text}"
+    );
+
+    let rlog_text = read_merged_log(&rlog);
+    assert_eq!(
+        count_request_method(&rlog_text, "textDocument/diagnostic"),
+        1,
+        "a never-heard file draws exactly one best-effort pull; log:\n{rlog_text}"
+    );
+
+    Ok(())
+}
+
+/// Heard-empty: an explicit empty publish is evidence — no probe (misc 153).
+///
+/// mockls with `--push-empty` publishes `"diagnostics": []` on `didOpen` — the
+/// push-only Lattice-16 contract shape: a clean file gets an explicit empty
+/// publish, not silence. The push cache then holds `Some(vec![])`
+/// (heard-empty), which is authoritative: `retrieve_diagnostics` reports
+/// `[clean]` backed by that evidence and never fires the best-effort probe.
+/// The request log shows zero `textDocument/diagnostic`. This is the
+/// end-to-end twin of `never_heard_draws_one_best_effort_probe`: same absent
+/// capability, opposite publish behavior, opposite probe outcome.
+#[test]
+fn heard_empty_push_suppresses_probe() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let logs = tempfile::tempdir()?;
+    let rlog = logs.path().join("requests.jsonl");
+    let rlog_arg = rlog.to_str().context("rlog path")?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mut bridge = spawn_mockls(
+        &["--push-empty", "--request-log", rlog_arg],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+    assert!(
+        text.contains("[clean]"),
+        "an explicit empty publish reads as clean. Got: {text}"
+    );
+
+    let rlog_text = read_merged_log(&rlog);
+    assert_eq!(
+        count_request_method(&rlog_text, "textDocument/diagnostic"),
+        0,
+        "heard-empty is evidence — the probe must not fire; log:\n{rlog_text}"
+    );
+
+    Ok(())
+}
+
+/// Heard-dirty: a push publish wins outright — no pull of any kind (misc 153).
+///
+/// Default mockls publishes a non-empty diagnostic on `didOpen`, so the push
+/// cache holds evidence (`Some(non-empty)`). `retrieve_diagnostics` reports it
+/// and never consults pull, so a push server is never double-reported and no
+/// off-spec probe fires. The request log shows zero `textDocument/diagnostic`.
+#[test]
+fn heard_dirty_push_wins_no_pull() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let logs = tempfile::tempdir()?;
+    let rlog = logs.path().join("requests.jsonl");
+    let rlog_arg = rlog.to_str().context("rlog path")?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mut bridge = spawn_mockls(
+        &["--request-log", rlog_arg],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+    assert!(
+        text.contains("mock diagnostic"),
+        "a heard push diagnostic should be reported. Got: {text}"
+    );
+
+    let rlog_text = read_merged_log(&rlog);
+    assert_eq!(
+        count_request_method(&rlog_text, "textDocument/diagnostic"),
+        0,
+        "a heard push must never trigger a pull; log:\n{rlog_text}"
     );
 
     Ok(())

@@ -54,6 +54,14 @@ struct Args {
     #[arg(long)]
     no_push_diagnostics: bool,
 
+    /// Publish an EMPTY diagnostics set (`"diagnostics": []`) on the
+    /// didOpen/didChange/didSave push path instead of the mock diagnostic —
+    /// a push server's explicit, evidence-backed clean (misc 153; the
+    /// push-only Lattice contract). Progress and flycheck publishes are
+    /// unaffected.
+    #[arg(long)]
+    push_empty: bool,
+
     /// Advertise `diagnosticProvider` and handle `textDocument/diagnostic`
     /// pull requests.
     #[arg(long)]
@@ -1897,12 +1905,13 @@ impl MockServer {
             None
         };
         let extra = parse_extra_diagnostics(&self.args.extra_diagnostic);
+        let push_empty = self.args.push_empty;
 
         if delay > 0 {
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(delay));
                 send_diagnostics_notification(
-                    &writer, &uri_owned, version, line_count, open_count, &extra,
+                    &writer, &uri_owned, version, line_count, open_count, &extra, push_empty,
                 );
             });
         } else {
@@ -1913,6 +1922,7 @@ impl MockServer {
                 line_count,
                 open_count,
                 &extra,
+                push_empty,
             );
         }
     }
@@ -2022,7 +2032,7 @@ impl MockServer {
 
             if !no_diagnostics {
                 send_diagnostics_notification(
-                    &writer, &uri_owned, version, line_count, open_count, &extra,
+                    &writer, &uri_owned, version, line_count, open_count, &extra, false,
                 );
             }
 
@@ -2116,7 +2126,7 @@ impl MockServer {
             // Publish diagnostics after subprocess completes
             if !no_diagnostics {
                 send_diagnostics_notification(
-                    &writer, &uri_owned, version, line_count, open_count, &extra,
+                    &writer, &uri_owned, version, line_count, open_count, &extra, false,
                 );
             }
 
@@ -2292,21 +2302,30 @@ fn send_diagnostics_notification(
     line_count: usize,
     open_count: Option<usize>,
     extra: &[Value],
+    push_empty: bool,
 ) {
-    let message = open_count.map_or_else(
-        || format!("mockls: mock diagnostic ({line_count} lines)"),
-        |n| format!("mockls: mock diagnostic ({line_count} lines, {n} open)"),
-    );
-    let mut diagnostics = vec![serde_json::json!({
-        "range": {
-            "start": { "line": 0, "character": 0 },
-            "end": { "line": 0, "character": 1 }
-        },
-        "severity": 2,
-        "source": "mockls",
-        "message": message
-    })];
-    diagnostics.extend(extra.iter().cloned());
+    // `push_empty` publishes the explicit empty set — a push server's
+    // evidence-backed clean (misc 153) — overriding the mock diagnostic and
+    // any `--extra-diagnostic`.
+    let diagnostics = if push_empty {
+        Vec::new()
+    } else {
+        let message = open_count.map_or_else(
+            || format!("mockls: mock diagnostic ({line_count} lines)"),
+            |n| format!("mockls: mock diagnostic ({line_count} lines, {n} open)"),
+        );
+        let mut diagnostics = vec![serde_json::json!({
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 1 }
+            },
+            "severity": 2,
+            "source": "mockls",
+            "message": message
+        })];
+        diagnostics.extend(extra.iter().cloned());
+        diagnostics
+    };
 
     let mut params = serde_json::json!({
         "uri": uri,
@@ -2672,6 +2691,7 @@ mod tests {
             response_delay: 0,
             diagnostics_delay: 0,
             no_push_diagnostics: false,
+            push_empty: false,
             pull_diagnostics: false,
             workspace_diagnostics: false,
             fail_pull: false,
@@ -4798,6 +4818,44 @@ const PI: f64
             !has_diag,
             "no_push_diagnostics should suppress all push diagnostics"
         );
+    }
+
+    /// `--push-empty` publishes on the push path but with an EMPTY diagnostics
+    /// array — the explicit, evidence-backed clean of a push-only server
+    /// (misc 153). Distinct from `--no-push-diagnostics`, which publishes
+    /// nothing at all.
+    #[test]
+    fn test_push_empty_publishes_empty_set() {
+        let mut args = default_args();
+        args.push_empty = true;
+        let uri = "file:///tmp/test.yX4Za";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, "fn hello\n")));
+        input.extend(frame(&shutdown_request(2)));
+
+        let messages = run_server_with(args, &input);
+
+        let publishes: Vec<&Value> = messages
+            .iter()
+            .filter(|m| {
+                m.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
+            })
+            .collect();
+        assert!(
+            !publishes.is_empty(),
+            "push-empty must still publish (an explicit clean, not silence)"
+        );
+        for publish in publishes {
+            let diags = publish
+                .pointer("/params/diagnostics")
+                .and_then(Value::as_array)
+                .expect("publish carries a diagnostics array");
+            assert!(
+                diags.is_empty(),
+                "push-empty publishes an empty set, got: {diags:?}"
+            );
+        }
     }
 
     #[test]

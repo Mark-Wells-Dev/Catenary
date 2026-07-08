@@ -1291,15 +1291,17 @@ impl DiagnosticsServer {
         });
 
         for (path, uri) in opened_uris {
-            let diagnostics = {
-                let cached = client.get_diagnostics(uri);
-                if !cached.is_empty() {
-                    // Push is authoritative when present: a server that
-                    // publishes keeps its exact behavior, and pull is never
-                    // consulted, so a push+pull server reports one source per
-                    // file per run (no double-reporting).
-                    cached
-                } else if client.supports_pull_diagnostics() {
+            let diagnostics = match client.get_diagnostics(uri) {
+                // A publish was heard for this file — authoritative, EVEN WHEN
+                // EMPTY. `Some(vec![])` is the server's evidence-backed clean: an
+                // explicit empty publish, not the absence of one. Pull is never
+                // consulted, so a push+pull server reports one source per file
+                // per run (no double-reporting) and a push-only server's honest
+                // empty is never second-guessed by an off-spec probe (misc 153).
+                Some(diags) => diags,
+                // Never heard AND the server advertises the pull model: ask it
+                // the way it asked to be asked. Unchanged.
+                None if client.supports_pull_diagnostics() => {
                     match client.pull_diagnostics(uri).await {
                         Ok(diags) => diags,
                         Err(e) => {
@@ -1308,16 +1310,14 @@ impl DiagnosticsServer {
                             Vec::new()
                         }
                     }
-                } else {
-                    // No push recorded and no advertised pull capability. Some
-                    // servers still answer `textDocument/diagnostic` on demand
-                    // without advertising it (lattice): ask directly rather than
-                    // report a false `[clean]` for a fast publisher whose first
-                    // publish the settle-then-collect pipeline cleared (bug 74).
-                    // Errors map to empty, so a genuinely push-only server is
-                    // unchanged.
-                    client.try_pull_diagnostics(uri).await
                 }
+                // Never heard and no advertised pull capability. Some servers
+                // still answer `textDocument/diagnostic` on demand without
+                // advertising it (lattice): ask directly rather than report a
+                // false `[clean]` for a fast publisher whose first publish the
+                // settle-then-collect pipeline cleared (bug 74). Errors map to
+                // empty, so a genuinely silent push-only server is unchanged.
+                None => client.try_pull_diagnostics(uri).await,
             };
 
             // Apply per-server min_severity filter before quick-fix

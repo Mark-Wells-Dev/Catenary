@@ -350,6 +350,17 @@ upgrading.
 
 ### Changed
 
+- **A heard-empty publish is evidence; only never-heard probes.** The
+  diagnostics push cache always kept the distinction between "the server
+  published an empty set for this file" and "the server never published",
+  but retrieval flattened both to empty and fired the best-effort
+  `textDocument/diagnostic` probe for each. Now an explicit empty publish
+  is authoritative — the `[clean]` it produces is backed by the server's
+  own evidence, and no pull of any kind follows. Never-heard files keep
+  the full chain: advertised pull when offered, one best-effort probe
+  otherwise. This is Catenary's half of the push-only Lattice contract
+  (clean files get an explicit empty publish on open); a genuinely silent
+  server is unchanged.
 - **The notification queue retires: three channels, each doing what it's
   for.** The store-and-forward `systemMessage` queue — which could deliver
   a warning minutes after its problem was already fixed — is gone. In its
