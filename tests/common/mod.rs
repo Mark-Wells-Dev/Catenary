@@ -67,6 +67,23 @@ pub fn isolate_env(cmd: &mut Command, root: &str) {
     }
 }
 
+/// CI triage escape hatch: with `CATENARY_CONFORMANCE_KEEP` set in the
+/// *test process* environment, a tempdir survives `Drop` — including the
+/// panic unwind of a failing assertion — so a red conformance matrix job
+/// can upload its evidence (`daemon.log`, the JSONL firehose carrying the
+/// server's own stderr as `lsp.stderr` events, `bridge_stderr*.log`).
+/// Conformance run 6 uploaded zero artifacts because every log lived in a
+/// `TempDir` that was wiped during unwind before the upload step ran.
+///
+/// A no-op unless the variable is set, so local runs never litter. (The
+/// variable is read from the harness process itself; `isolate_env`'s
+/// `CATENARY_*` clearing applies only to spawned subprocesses.)
+pub fn keep_for_triage(dir: &mut tempfile::TempDir) {
+    if std::env::var_os("CATENARY_CONFORMANCE_KEEP").is_some() {
+        dir.disable_cleanup(true);
+    }
+}
+
 /// The `XDG_CONFIG_HOME` subdir [`isolate_env`] configures under `root`.
 ///
 /// `config_sources()` resolves user config at
@@ -267,7 +284,8 @@ impl BridgeProcess {
         configure: impl FnOnce(&mut Command),
         setup: impl FnOnce(&str) -> Result<()>,
     ) -> Result<Self> {
-        let state_dir = tempfile::tempdir().context("Failed to create state dir")?;
+        let mut state_dir = tempfile::tempdir().context("Failed to create state dir")?;
+        keep_for_triage(&mut state_dir);
         let state_home = state_dir
             .path()
             .to_str()

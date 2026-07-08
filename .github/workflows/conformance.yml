@@ -180,6 +180,10 @@ jobs:
               pipx install ansible-lint || pip install ansible-lint ;;
             vim-ls)
               pipx install vim-vint || pip install vim-vint
+              # vint 0.3.21 (2020) imports pkg_resources; Python 3.12 venvs
+              # no longer ship setuptools — run 6's proof line caught the
+              # ModuleNotFoundError exactly as designed. Inject it.
+              pipx inject vim-vint setuptools || pip install setuptools
               # Prove the linter executes AND flags the fixture — run 5's
               # vim-ls red pattern-matched vint silently failing under the
               # runner's Python, indistinguishable from a server bug
@@ -364,11 +368,12 @@ jobs:
       - name: Run conformance harness (${{ matrix.server }})
         env:
           CATENARY_CONFORMANCE: ${{ matrix.server }}
-          # Pin the harness tempdirs somewhere uploadable so a red job's
-          # bridge_stderr.log (the server's own stderr) can be captured
-          # below — run 5's instant-death reds were only diagnosable by
-          # ecosystem forensics because that log stayed on the runner.
+          # Pin the harness tempdirs somewhere uploadable, and keep them
+          # past Drop/panic-unwind (run 6 uploaded ZERO artifacts: every
+          # log lived in a TempDir wiped during unwind before the upload
+          # step ran).
           TMPDIR: ${{ runner.temp }}/conformance
+          CATENARY_CONFORMANCE_KEEP: "1"
         # The prebuilt libtest binary runs directly — no toolchain, no
         # compile. ONLY the matrix entry point runs: the per-server
         # skip-if-missing sentinels are for local dev, and on runners the
@@ -379,12 +384,22 @@ jobs:
           mkdir -p "$TMPDIR"
           ./dist/conformance_harness conformance_selected_server
 
-      - name: Upload server stderr (failure triage)
+      # The server's own stderr is NOT bridge_stderr.log — it is piped into
+      # the daemon and re-emitted as `lsp.stderr` events in the JSONL
+      # firehose (under the tempdir's cache base); the daemon's stderr goes
+      # to state/catenary/daemon.log. Upload all three log families.
+      # include-hidden-files: tempfile dirs are dot-prefixed and
+      # upload-artifact v4 skips hidden paths by default.
+      - name: Upload triage logs (failure only)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: stderr-${{ matrix.server }}
-          path: ${{ runner.temp }}/conformance/**/bridge_stderr.log
+          name: triage-${{ matrix.server }}
+          path: |
+            ${{ runner.temp }}/conformance/**/daemon.log
+            ${{ runner.temp }}/conformance/**/*.jsonl
+            ${{ runner.temp }}/conformance/**/bridge_stderr*.log
+          include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7
 

@@ -515,7 +515,8 @@ fn run_conformance(case: &Case, require: bool) -> Result<()> {
         return Ok(());
     }
 
-    let root = tempfile::tempdir().context("create fixture root")?;
+    let mut root = tempfile::tempdir().context("create fixture root")?;
+    common::keep_for_triage(&mut root);
     let src = fixture_dir(case);
     if !src.is_dir() {
         bail!("fixture `{}` missing at {}", case.fixture, src.display());
