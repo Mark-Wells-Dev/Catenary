@@ -687,19 +687,21 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
 
     let grid = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
 
-    // Precompute detail lines + tree entries before mutating cursors.
+    // The cursored detail entity; its lines are computed once the detail pane's
+    // width is known (the full session id wraps to it — tui-rework 14, item 4).
     let detail_entity = app.detail_entity();
-    let detail_lines = render::detail_lines(
-        detail_entity.as_ref(),
-        &app.snapshot,
-        app.config.as_ref(),
-        &app.findings,
-        theme,
-        now,
-    );
 
     if area.width < NARROW_THRESHOLD {
-        render_narrow(app, grid, buf, theme, icons, &detail_lines, now, rects);
+        render_narrow(
+            app,
+            grid,
+            buf,
+            theme,
+            icons,
+            detail_entity.as_ref(),
+            now,
+            rects,
+        );
         draw_action_overlay(app, area, buf, theme);
         return;
     }
@@ -707,6 +709,15 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
     let split_x = grid.x + grid.width * LEFT_PCT / 100;
     let split_y = grid.y + grid.height / 2;
     let [tl, tr, bl, br] = draw_grid_borders(grid, split_x, split_y, buf, theme.border_unfocused);
+    let detail_lines = render::detail_lines(
+        detail_entity.as_ref(),
+        &app.snapshot,
+        app.config.as_ref(),
+        &app.findings,
+        theme,
+        now,
+        tr.width as usize,
+    );
     // Focus is a "bounding box" (item 3): the focused pane's frame is redrawn
     // emphasized (bold), no reverse-video anywhere.
     let focus_rect = match app.focus {
@@ -867,7 +878,7 @@ fn render_narrow(
     buf: &mut Buffer,
     theme: &Theme,
     icons: &IconSet,
-    detail_lines: &[Line<'static>],
+    detail_entity: Option<&model::EntityKey>,
     now: DateTime<Utc>,
     rects: &mut PanelRects,
 ) {
@@ -879,6 +890,16 @@ fn render_narrow(
     let bl = Rect::new(grid.x, grid.y + h, grid.width, h);
     let tr = Rect::new(grid.x, grid.y + 2 * h, grid.width, h);
     let br = Rect::new(grid.x, grid.y + 3 * h, grid.width, grid.height - 3 * h);
+
+    let detail_lines = render::detail_lines(
+        detail_entity,
+        &app.snapshot,
+        app.config.as_ref(),
+        &app.findings,
+        theme,
+        now,
+        tr.width as usize,
+    );
 
     let root_entries = tree_entries(
         &app.root_rows,
@@ -932,7 +953,7 @@ fn render_narrow(
     render_detail(
         detail_title(app),
         app.focus == Pane::Detail,
-        detail_lines,
+        &detail_lines,
         tr,
         buf,
         theme,
@@ -1073,6 +1094,7 @@ mod tests {
                 subagents: vec![Subagent {
                     id: "agent-1".to_string(),
                     started_at: crate::state_snapshot::now_iso(),
+                    ..Subagent::default()
                 }],
                 ..SessionEntry::default()
             },
@@ -1191,6 +1213,7 @@ mod tests {
                 subagents: vec![Subagent {
                     id: "agent-1".to_string(),
                     started_at: "2026-07-07T12:00:00Z".to_string(),
+                    ..Subagent::default()
                 }],
                 ..SessionEntry::default()
             },
@@ -1409,7 +1432,7 @@ mod tests {
         );
         let idx = app.root_cursor.index;
         assert!(
-            matches!(&app.root_rows[idx], model::Row::Server(s) if s.server == "julia-ls"),
+            matches!(&app.root_rows[idx], model::Row::Server { entry, .. } if entry.server == "julia-ls"),
             "cursor lands on the owning server",
         );
     }

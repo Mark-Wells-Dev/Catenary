@@ -364,6 +364,20 @@ upgrading.
 
 ### Changed
 
+- **The board tells the truth about sessions and roots.** `editing` now
+  means the gate is armed; a fully-diagnosed batch shows `working`, quiet
+  shows `idle` — derived from the daemon's own batch state, with an
+  unknown-tolerant wire form so older readers degrade quietly instead of
+  claiming a false `editing`. The stale diagnostics summary no longer
+  outlives its batch. Subagents show their own status, are selectable,
+  and get a real detail pane (full agent id, parent, worktree, batch
+  state); the session detail shows the full session id. Server instances
+  anchored on a subdirectory (a fixture's `package.json` pulling the
+  server's rootUri inward) nest under their workspace root instead of
+  posing as top-level roots. Companion roots nest under their primary
+  marked `↳`, single-connection roots carry a session tag instead of a
+  bare `[mcp:1]`, and lifetime badges (`[pin]`, `[worktree]`,
+  `[activity]`) ride the root line.
 - **The cursor is the magnifier: the selected row wraps to its full text.**
   Rows stay compact one-liners by default; the row under the cursor reflows
   to as many width-bounded lines as its full message needs (caret on the

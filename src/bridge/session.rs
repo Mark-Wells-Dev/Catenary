@@ -837,9 +837,15 @@ impl Session {
 
     /// Derives the session's board status from live editing state.
     ///
-    /// `diagnostics` while a run is in flight; otherwise `editing` when an
-    /// editing accumulator is active; otherwise `idle`. No transition tracking
-    /// — read at snapshot-build time (observability ticket 05).
+    /// The editing debt gate is the truth source (tui-rework 14, item 1),
+    /// evaluated at snapshot-build time with no transition tracking:
+    ///
+    /// - `diagnostics` while a `catenary diagnostics` run is in flight;
+    /// - `editing` when the gate is **armed** — any agent's batch holds an
+    ///   undelivered covered file;
+    /// - `working` when the gate is **paid** but an editing accumulator is still
+    ///   held — the batch is fully diagnosed, yet the session is mid-edit;
+    /// - `idle` when no accumulator is active (the session did `done_editing`).
     #[must_use]
     pub fn status(&self) -> crate::state_snapshot::SessionStatus {
         use crate::state_snapshot::SessionStatus;
@@ -848,8 +854,32 @@ impl Session {
             .load(std::sync::atomic::Ordering::Acquire)
         {
             SessionStatus::Diagnostics
-        } else if self.editing.is_active() {
+        } else if self.editing.has_undelivered_any() {
             SessionStatus::Editing
+        } else if self.editing.is_active() {
+            SessionStatus::Working
+        } else {
+            SessionStatus::Idle
+        }
+    }
+
+    /// Derives a subagent's board status from its own per-`(session, agent)`
+    /// editing batch (tui-rework 14, item 3).
+    ///
+    /// Same gate axis as [`status`](Self::status), but scoped to one agent:
+    /// `editing` when that agent's batch holds an undelivered covered file,
+    /// `working` when it holds a batch that is fully delivered, `idle` when it
+    /// has no accumulator. A subagent never runs its own `catenary diagnostics`
+    /// pass through the parent's in-flight flag, so `diagnostics` is not a
+    /// subagent status.
+    #[must_use]
+    pub fn subagent_status(&self, agent_id: &str) -> crate::state_snapshot::SessionStatus {
+        use crate::state_snapshot::SessionStatus;
+        let session_id = Some(&*self.instance_id);
+        if self.editing.has_undelivered(session_id, agent_id) {
+            SessionStatus::Editing
+        } else if self.editing.has_files(session_id, agent_id) {
+            SessionStatus::Working
         } else {
             SessionStatus::Idle
         }

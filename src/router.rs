@@ -569,7 +569,20 @@ impl crate::state_snapshot::SessionBoard for SessionBoardImpl {
                 roots: entry.meta.roots.clone(),
                 status: entry.router.session.status(),
                 last_action: entry.router.session.last_action(),
-                subagents: self.subagents.for_session(id),
+                // Enrich each subagent with its own per-`(session, agent)` batch
+                // status, derived from the parent session's editing manager
+                // (tui-rework 14, item 3). `last_seen` stays the subagent's
+                // start time until a per-subagent recency signal is plumbed —
+                // the render falls back to it, so no status is fabricated.
+                subagents: self
+                    .subagents
+                    .for_session(id)
+                    .into_iter()
+                    .map(|mut sub| {
+                        sub.status = entry.router.session.subagent_status(&sub.id);
+                        sub
+                    })
+                    .collect(),
             })
             .collect()
     }
@@ -609,9 +622,13 @@ impl SubagentRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let list = map.entry(session_id.to_string()).or_default();
         if list.iter().all(|s| s.id != agent_id) {
+            // `status` / `last_seen` are enriched at snapshot-build time from the
+            // parent session's batch (tui-rework 14, item 3); the registry seeds
+            // their defaults here.
             list.push(crate::state_snapshot::Subagent {
                 id: agent_id.to_string(),
                 started_at,
+                ..crate::state_snapshot::Subagent::default()
             });
         }
         drop(map);
@@ -6749,12 +6766,37 @@ mod tests {
             "last_seen is a non-empty ISO string"
         );
 
-        // An active editing accumulator → status `editing`.
+        // The gate is the truth source (tui-rework 14, item 1): an accumulator
+        // with no undelivered covered file is `working`, not `editing` — only
+        // an armed gate reads as `editing`.
         session
             .editing
             .start_editing(Some("sess-1"), "")
             .expect("start editing");
+        assert_eq!(board.sessions()[0].status, SessionStatus::Working);
+
+        // A covered edit arms the gate → `editing`.
+        session.editing.record_covered_edit(
+            Some("sess-1"),
+            "",
+            std::path::PathBuf::from("/p/A/src/lib.rs"),
+        );
         assert_eq!(board.sessions()[0].status, SessionStatus::Editing);
+
+        // Full delivery (a bare `catenary diagnostics` receipt) pays the gate:
+        // the batch is retained but fully diagnosed → back to `working`.
+        session.editing.mark_delivered_all(Some("sess-1"), "");
+        assert_eq!(board.sessions()[0].status, SessionStatus::Working);
+
+        // `done_editing` drops the accumulator → `idle`.
+        session.editing.done_editing(Some("sess-1"), "");
+        assert_eq!(board.sessions()[0].status, SessionStatus::Idle);
+
+        // Re-arm for the diagnostics-in-flight leg below.
+        session
+            .editing
+            .start_editing(Some("sess-1"), "")
+            .expect("restart editing");
 
         // An in-flight diagnostics run shows `diagnostics`; completion records
         // last_action with the counts.
@@ -6766,6 +6808,34 @@ mod tests {
         let la = after[0].last_action.as_ref().expect("last_action set");
         assert_eq!(la.summary, "diagnostics: 2 errors, 1 warnings");
         assert!(!la.at.is_empty(), "last_action carries a timestamp");
+
+        // A subagent's board entry is enriched with its own per-(session, agent)
+        // batch status (tui-rework 14, item 3): fresh → idle, covered edit →
+        // editing, delivered → working.
+        board
+            .subagents
+            .start("sess-1", "agent-a", "2026-06-08T13:11:00.000Z".to_string());
+        assert_eq!(board.sessions()[0].subagents[0].status, SessionStatus::Idle);
+        session
+            .editing
+            .start_editing(Some("sess-1"), "agent-a")
+            .expect("subagent editing");
+        session.editing.record_covered_edit(
+            Some("sess-1"),
+            "agent-a",
+            std::path::PathBuf::from("/p/A/src/sub.rs"),
+        );
+        assert_eq!(
+            board.sessions()[0].subagents[0].status,
+            SessionStatus::Editing
+        );
+        session
+            .editing
+            .mark_delivered_all(Some("sess-1"), "agent-a");
+        assert_eq!(
+            board.sessions()[0].subagents[0].status,
+            SessionStatus::Working
+        );
     }
 
     /// Send a hook JSON request and read the response line.

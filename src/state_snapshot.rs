@@ -54,7 +54,10 @@ use crate::lsp::{InstanceKey, ServerLifecycle};
 ///   file(s) that made each live (tui-rework 09). The health model gates
 ///   suggestion/Fatal findings on this activity ledger rather than presence, and
 ///   renders its provenance under the finding. Serde-additive — an older reader
-///   defaults the field to an empty list.
+///   defaults the field to an empty list. Later additive additions on the same
+///   schema (tui-rework 14): [`SessionStatus::Working`] (the gate-paid status),
+///   plus per-subagent `status`/`last_seen` on [`Subagent`] — each defaults on a
+///   reader predating it, so no schema bump is warranted.
 const SCHEMA: u32 = 3;
 
 /// Default coalescing window for non-urgent flushes.
@@ -249,17 +252,35 @@ pub struct ClientInfo {
 
 /// A session's current activity, derived at snapshot-build time from the
 /// daemon's live editing state.
+///
+/// The distinction between [`Editing`](Self::Editing) and
+/// [`Working`](Self::Working) is the editing debt gate: `editing` means the gate
+/// is *armed* (a covered edit is still undiagnosed), while `working` means the
+/// gate has been paid — the batch is fully diagnosed but the session still holds
+/// an editing accumulator (tui-rework 14, item 1). A stale reader that predates
+/// `working` degrades it to [`Unknown`](Self::Unknown), which the render layer
+/// treats as quiet — never as a false `editing`.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionStatus {
-    /// The session holds an active editing accumulator (a covered edit is
-    /// pending diagnostics).
+    /// The editing gate is armed: the session's batch holds an undelivered
+    /// covered file (a covered edit is pending diagnostics).
     Editing,
+    /// The editing gate is paid but the session is still editing: the batch is
+    /// fully delivered (diagnosed) and an editing accumulator is still held
+    /// (tui-rework 14, item 1).
+    Working,
     /// A `catenary diagnostics` run is in flight for the session.
     Diagnostics,
     /// Neither editing nor running diagnostics.
     #[default]
     Idle,
+    /// Forward-compat catch-all: a status a newer daemon emits that this reader
+    /// does not recognize. Never produced by the writer; rendered as quiet
+    /// (like [`Idle`](Self::Idle)), so an unknown future status never reads as a
+    /// false `editing`.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The most recent attributable action a session took.
@@ -286,6 +307,16 @@ pub struct Subagent {
     pub id: String,
     /// When the subagent started (ISO 8601).
     pub started_at: String,
+    /// The subagent's derived activity, from its own per-`(session, agent)`
+    /// editing batch (tui-rework 14, item 3). Additive on schema 3 — a reader
+    /// predating this field defaults it to [`SessionStatus::Idle`].
+    pub status: SessionStatus,
+    /// When the daemon last saw a hook dispatch attributed to this subagent
+    /// (ISO 8601), or empty when never resolved. Additive on schema 3 — a reader
+    /// predating this field defaults it to empty and the render falls back to the
+    /// subagent's start time.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_seen: String,
 }
 
 /// A connected session's board entry — the rich session board (ticket 05).
@@ -1983,10 +2014,13 @@ mod tests {
             Subagent {
                 id: "agent-a".to_string(),
                 started_at: "2026-06-08T13:10:00.000Z".to_string(),
+                status: SessionStatus::Editing,
+                ..Subagent::default()
             },
             Subagent {
                 id: "agent-b".to_string(),
                 started_at: "2026-06-08T13:11:00.000Z".to_string(),
+                ..Subagent::default()
             },
         ];
         let json = serde_json::to_string(&entry).expect("serialize");
@@ -1998,6 +2032,9 @@ mod tests {
         );
         assert_eq!(back.subagents[0].id, "agent-a");
         assert_eq!(back.subagents[1].started_at, "2026-06-08T13:11:00.000Z");
+        // The per-subagent status field (tui-rework 14, item 3) round-trips.
+        assert_eq!(back.subagents[0].status, SessionStatus::Editing);
+        assert_eq!(back.subagents[1].status, SessionStatus::Idle);
     }
 
     #[test]
@@ -2008,6 +2045,31 @@ mod tests {
             serde_json::from_str(r#"{"id":"s1","started_at":"t","last_seen":"t","status":"idle"}"#)
                 .expect("legacy session entry parses");
         assert!(entry.subagents.is_empty(), "missing field defaults empty");
+    }
+
+    #[test]
+    fn session_status_working_serializes_and_unknown_variant_tolerated() {
+        // The `working` (gate-paid) status round-trips lowercase (item 1) …
+        let entry = session_entry("s1", SessionStatus::Working, vec!["/p/Catenary"]);
+        let json = serde_json::to_value(&entry).expect("serialize");
+        assert_eq!(json["status"], "working");
+        // … and a future status a stale reader cannot name degrades to `Unknown`
+        // (never a false `editing`) rather than failing the parse.
+        let back: SessionEntry = serde_json::from_str(
+            r#"{"id":"s1","started_at":"t","last_seen":"t","status":"future"}"#,
+        )
+        .expect("unknown status variant tolerated");
+        assert_eq!(back.status, SessionStatus::Unknown);
+    }
+
+    #[test]
+    fn subagent_status_field_defaults_on_legacy_entry() {
+        // Schema-3 additive: a subagent written before `status`/`last_seen`
+        // still parses, defaulting them (item 3).
+        let sub: Subagent =
+            serde_json::from_str(r#"{"id":"agent-a","started_at":"t"}"#).expect("legacy subagent");
+        assert_eq!(sub.status, SessionStatus::Idle);
+        assert!(sub.last_seen.is_empty());
     }
 
     #[tokio::test]

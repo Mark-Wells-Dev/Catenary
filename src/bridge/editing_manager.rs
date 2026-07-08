@@ -139,6 +139,23 @@ impl EditingManager {
             .is_empty()
     }
 
+    /// Returns `true` if **any** agent in this session has an undelivered
+    /// covered file — the session-wide armed-gate signal (tui-rework 14, item 1).
+    ///
+    /// Distinct from [`is_active`](Self::is_active): a batch that has been fully
+    /// diagnosed (`mark_delivered_all`) keeps its accumulator, so `is_active`
+    /// stays `true` while this returns `false`. That gap is exactly the
+    /// `editing` (gate armed) vs `working` (gate paid, still editing)
+    /// distinction the session status renders.
+    #[must_use]
+    pub fn has_undelivered_any(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .any(|state| state.files.iter().any(|f| !f.delivered))
+    }
+
     /// Returns `true` if the agent is currently in editing mode.
     #[must_use]
     pub fn is_editing(&self, session_id: Option<&str>, agent_id: &str) -> bool {

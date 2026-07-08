@@ -74,6 +74,16 @@ impl CompanionRules {
         self.rules.is_empty()
     }
 
+    /// The configured `(matcher, template)` pairs, for a read-only consumer that
+    /// wants to reason about the derivation without running it (the TUI's
+    /// companion-nesting render — tui-rework 14, item 6a).
+    ///
+    /// This exposes only the parsed rule strings; the fs-touching derivation
+    /// ([`expand_companions`]) stays the sole mount path.
+    pub fn pairs(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.rules.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
     /// Test constructor from `(matcher, template)` pairs.
     #[cfg(test)]
     #[must_use]

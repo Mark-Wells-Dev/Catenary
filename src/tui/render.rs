@@ -79,15 +79,23 @@ fn short_id(id: &str) -> String {
     }
 }
 
-/// Compact contributor label from a root's sources (`[hook mcp:3 worktree:1]`).
+/// Compact contributor label from a root's sources (`[hook mcp:27 worktree:1]`).
+///
+/// The `mcp` class carries a **session tag** when a single MCP connection holds
+/// the root (tui-rework 14, item 6b): `[mcp:27]` names the connection so the two
+/// roots one session mounts (e.g. `Catenary` + `CatenaryInternal`) share a tag
+/// and stay distinguishable from another session's pair — replacing the bare
+/// `[mcp:1]` count that collapsed session identity. When several connections
+/// hold the root, no single tag disambiguates, so the count returns (`mcp:2`).
 #[must_use]
 pub fn contributor_label(sources: &[String]) -> String {
-    let (mut hook, mut mcp, mut worktree, mut ephemeral, mut other) = (false, 0, 0, false, 0);
+    let (mut hook, mut worktree, mut ephemeral, mut other) = (false, 0, false, 0);
+    let mut mcp_tags: Vec<&str> = Vec::new();
     for s in sources {
         if s == "hook" {
             hook = true;
-        } else if s.starts_with("mcp:") {
-            mcp += 1;
+        } else if let Some(tag) = s.strip_prefix("mcp:") {
+            mcp_tags.push(tag);
         } else if s.starts_with("worktree:") {
             worktree += 1;
         } else if s.starts_with("ephemeral:") {
@@ -100,8 +108,10 @@ pub fn contributor_label(sources: &[String]) -> String {
     if hook {
         parts.push("hook".to_string());
     }
-    if mcp > 0 {
-        parts.push(format!("mcp:{mcp}"));
+    match mcp_tags.as_slice() {
+        [] => {}
+        [tag] => parts.push(format!("mcp:{}", session_tag(tag))),
+        tags => parts.push(format!("mcp:{}", tags.len())),
     }
     if worktree > 0 {
         parts.push(format!("worktree:{worktree}"));
@@ -116,6 +126,25 @@ pub fn contributor_label(sources: &[String]) -> String {
         String::new()
     } else {
         format!("[{}]", parts.join(" "))
+    }
+}
+
+/// A short, disambiguating tag for a contributor connection id — the raw id when
+/// it is already short (a small `mcp:{fd}`), else its `…`-elided tail so a long
+/// opaque id stays compact (tui-rework 14, item 6b).
+fn session_tag(id: &str) -> String {
+    if id.chars().count() <= 6 {
+        id.to_string()
+    } else {
+        let tail: String = id
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("…{tail}")
     }
 }
 
@@ -152,10 +181,22 @@ fn session_status_cell(entry: &SessionEntry, theme: &Theme, now: DateTime<Utc>) 
             theme.muted,
         );
     }
-    match entry.status {
+    status_cell(entry.status, theme)
+}
+
+/// The label + style for a derived [`SessionStatus`], with no staleness gate.
+///
+/// The shared status vocabulary for both a session row and a subagent sub-row
+/// (tui-rework 14, item 3): `editing` (gate armed), `working` (gate paid, still
+/// editing), `diagnostics` (a run in flight), and `idle`. An unknown future
+/// status a stale reader cannot name renders as quiet `idle` — never a false
+/// `editing`.
+fn status_cell(status: SessionStatus, theme: &Theme) -> (String, Style) {
+    match status {
         SessionStatus::Editing => ("editing".to_string(), theme.session_active),
+        SessionStatus::Working => ("working".to_string(), theme.success),
         SessionStatus::Diagnostics => ("diagnostics".to_string(), theme.accent),
-        SessionStatus::Idle => ("idle".to_string(), theme.session_meta),
+        SessionStatus::Idle | SessionStatus::Unknown => ("idle".to_string(), theme.session_meta),
     }
 }
 
@@ -174,7 +215,9 @@ pub fn tree_line(
 ) -> Line<'static> {
     match row {
         Row::Root(r) => root_line(r, width, theme, icons),
-        Row::Server(e) => server_line(e, width, theme, icons, now),
+        Row::Server { entry, subroot } => {
+            server_line(entry, subroot.as_deref(), width, theme, icons, now)
+        }
         Row::InlineFinding {
             severity,
             message,
@@ -197,15 +240,7 @@ pub fn tree_line(
         )]),
         Row::Client(c) => client_line(c, width, theme, icons),
         Row::Session(s) => session_line(s, width, theme, now),
-        Row::Subagent(s) => Line::from(vec![Span::styled(
-            format!(
-                "{}⤷ {}  up {}",
-                indent(2),
-                short_id(&s.id),
-                elapsed_at(&s.started_at, now)
-            ),
-            theme.session_meta,
-        )]),
+        Row::Subagent { subagent, .. } => subagent_line(subagent, width, theme, now),
     }
 }
 
@@ -227,7 +262,9 @@ pub fn tree_line_wrapped(
 ) -> Vec<Line<'static>> {
     let spans = match row {
         Row::Root(r) => join_lr(root_parts(r, theme, icons)),
-        Row::Server(e) => join_lr(server_parts(e, theme, icons, now)),
+        Row::Server { entry, subroot } => {
+            join_lr(server_parts(entry, subroot.as_deref(), theme, icons, now))
+        }
         Row::Client(c) => join_lr(client_parts(c, theme, icons)),
         Row::Session(s) => join_lr(session_parts(s, theme, now)),
         Row::InlineFinding {
@@ -242,7 +279,7 @@ pub fn tree_line_wrapped(
             Span::styled(message.clone(), severity_style(theme, *severity)),
         ],
         // Rows with fixed, already-compact text stay one line even when selected.
-        Row::DormantToggle { .. } | Row::Dormant(_) | Row::Subagent(_) => {
+        Row::DormantToggle { .. } | Row::Dormant(_) | Row::Subagent { .. } => {
             return vec![tree_line(row, width, theme, icons, now)];
         }
     };
@@ -267,6 +304,24 @@ fn join_lr(parts: (Vec<Span<'static>>, Vec<Span<'static>>)) -> Vec<Span<'static>
     left
 }
 
+/// Compact lifetime badge for a root, keyed on the lifetime its sources imply
+/// (tui-rework 14, item 6c): `[pin]` for a hook-held (pinned / cwd-tracked)
+/// root, `[worktree]` for a worktree-scoped mount, `[activity]` for an ephemeral
+/// activity mount. Empty when only an MCP connection holds it — its lifetime is
+/// already conveyed by the `[mcp:…]` session tag. Pin outranks the others (a
+/// pinned root does not idle-expire regardless of what else holds it).
+fn lifetime_badge(sources: &[String], ephemeral: bool) -> &'static str {
+    if sources.iter().any(|s| s == "hook") {
+        "[pin]"
+    } else if sources.iter().any(|s| s.starts_with("worktree:")) {
+        "[worktree]"
+    } else if ephemeral {
+        "[activity]"
+    } else {
+        ""
+    }
+}
+
 fn root_parts(
     r: &RootRow,
     theme: &Theme,
@@ -277,14 +332,26 @@ fn root_parts(
     } else {
         &icons.workspace_closed
     };
+    // A companion root nests: an extra indent step and a `↳` marker before the
+    // folder glyph, so it reads as a child of its primary (item 6a).
+    let (indent, marker) = if r.companion_of.is_some() {
+        ("    ".to_string(), "↳ ".to_string())
+    } else {
+        ("  ".to_string(), String::new())
+    };
     let mut left = vec![
-        Span::raw("  ".to_string()),
+        Span::raw(indent),
+        Span::styled(marker, theme.muted),
         Span::styled(format!("{glyph} "), theme.accent),
         Span::styled(basename(&r.path).to_string(), theme.text),
     ];
     let label = contributor_label(&r.sources);
     if !label.is_empty() {
         left.push(Span::styled(format!("  {label}"), theme.muted));
+    }
+    let badge = lifetime_badge(&r.sources, r.ephemeral);
+    if !badge.is_empty() {
+        left.push(Span::styled(format!("  {badge}"), theme.timestamp));
     }
     if r.ephemeral {
         let idle = r.idle_remaining_secs.map_or_else(
@@ -319,6 +386,7 @@ fn root_line(r: &RootRow, width: usize, theme: &Theme, icons: &IconSet) -> Line<
 
 fn server_parts(
     e: &ServerEntry,
+    subroot: Option<&str>,
     theme: &Theme,
     icons: &IconSet,
     now: DateTime<Utc>,
@@ -337,6 +405,12 @@ fn server_parts(
     ];
     if !e.language.is_empty() {
         left.push(Span::styled(format!("  {}", e.language), theme.muted));
+    }
+    // A server anchored on a subtree of its tracked root shows that subpath
+    // relative to the root — the fixture subdirectory it walked to, no longer a
+    // phantom top-level peer root (tui-rework 14, item 5).
+    if let Some(rel) = subroot {
+        left.push(Span::styled(format!("  ./{rel}"), theme.timestamp));
     }
     let mut right = Vec::new();
     if e.respawns > 0 {
@@ -363,12 +437,13 @@ fn server_parts(
 
 fn server_line(
     e: &ServerEntry,
+    subroot: Option<&str>,
     width: usize,
     theme: &Theme,
     icons: &IconSet,
     now: DateTime<Utc>,
 ) -> Line<'static> {
-    let (left, right) = server_parts(e, theme, icons, now);
+    let (left, right) = server_parts(e, subroot, theme, icons, now);
     super::format::justify(left, right, width)
 }
 
@@ -430,6 +505,34 @@ fn client_line(c: &ClientRow, width: usize, theme: &Theme, icons: &IconSet) -> L
     super::format::justify(left, right, width)
 }
 
+/// Whether the session is idle-stale: past the staleness gate for its
+/// `last_seen`.
+fn session_is_stale(entry: &SessionEntry, now: DateTime<Utc>) -> bool {
+    seconds_between(&entry.last_seen, now).is_some_and(|secs| secs > SESSION_STALE_SECS)
+}
+
+/// The `last_action` summary to render on a session row/detail, scoping the
+/// diagnostics summary to its batch (tui-rework 14, item 2).
+///
+/// A `diagnostics: N errors, M warnings` line is shown only while the batch that
+/// produced it is still current — the session is actively editing/working or
+/// running diagnostics and not idle-stale. Once the batch closes (status back to
+/// `idle`/`unknown`) or the session goes stale, the line is dropped so a
+/// zero-count summary does not loiter (the idle-board law). A non-diagnostics
+/// action (`edited …`) is always shown — it is not batch-scoped.
+fn current_action_summary(entry: &SessionEntry, now: DateTime<Utc>) -> Option<&str> {
+    let action = entry.last_action.as_ref()?;
+    let is_diagnostics = action.summary.starts_with("diagnostics:");
+    if !is_diagnostics {
+        return Some(action.summary.as_str());
+    }
+    let batch_current = matches!(
+        entry.status,
+        SessionStatus::Editing | SessionStatus::Working | SessionStatus::Diagnostics
+    ) && !session_is_stale(entry, now);
+    batch_current.then_some(action.summary.as_str())
+}
+
 fn session_parts(
     s: &SessionEntry,
     theme: &Theme,
@@ -440,8 +543,8 @@ fn session_parts(
         Span::raw(indent(1)),
         Span::styled(short_id(&s.id), theme.text),
     ];
-    if let Some(a) = &s.last_action {
-        left.push(Span::styled(format!("  {}", a.summary), theme.muted));
+    if let Some(summary) = current_action_summary(s, now) {
+        left.push(Span::styled(format!("  {summary}"), theme.muted));
     }
     let right = vec![Span::styled(cell, cell_style)];
     (left, right)
@@ -454,6 +557,37 @@ fn session_line(
     now: DateTime<Utc>,
 ) -> Line<'static> {
     let (left, right) = session_parts(s, theme, now);
+    super::format::justify(left, right, width)
+}
+
+/// A subagent sub-row's left/right span pair: `⤷ <id>  up <age>` on the left,
+/// the capability-aware status cell on the right (tui-rework 14, item 3).
+fn subagent_parts(
+    s: &crate::state_snapshot::Subagent,
+    theme: &Theme,
+    now: DateTime<Utc>,
+) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+    let left = vec![Span::styled(
+        format!(
+            "{}⤷ {}  up {}",
+            indent(2),
+            short_id(&s.id),
+            elapsed_at(&s.started_at, now)
+        ),
+        theme.session_meta,
+    )];
+    let (cell, cell_style) = status_cell(s.status, theme);
+    let right = vec![Span::styled(cell, cell_style)];
+    (left, right)
+}
+
+fn subagent_line(
+    s: &crate::state_snapshot::Subagent,
+    width: usize,
+    theme: &Theme,
+    now: DateTime<Utc>,
+) -> Line<'static> {
+    let (left, right) = subagent_parts(s, theme, now);
     super::format::justify(left, right, width)
 }
 
@@ -806,6 +940,7 @@ pub fn detail_lines(
     findings: &[OwnedFinding],
     theme: &Theme,
     now: DateTime<Utc>,
+    width: usize,
 ) -> Vec<Line<'static>> {
     match entity {
         None => vec![Line::from(vec![Span::styled(
@@ -817,7 +952,10 @@ pub fn detail_lines(
             server_detail(name, snapshot, config, findings, theme, now)
         }
         Some(EntityKey::Client(name)) => client_detail(name, snapshot, findings, theme),
-        Some(EntityKey::Session(id)) => session_detail(id, snapshot, theme, now),
+        Some(EntityKey::Session(id)) => session_detail(id, snapshot, theme, now, width),
+        Some(EntityKey::Subagent { session, agent }) => {
+            subagent_detail(session, agent, snapshot, theme, now, width)
+        }
     }
 }
 
@@ -857,10 +995,15 @@ fn root_detail(path: &str, snapshot: &Snapshot, theme: &Theme) -> Vec<Line<'stat
         "  Routing (why a file is covered)".to_string(),
         theme.title,
     )]));
+    // Include servers whose scope root is this root OR a subtree of it (a
+    // fixture-subdir anchor) — the same nesting the tree renders (tui-rework 14,
+    // item 5). A subtree anchor is named by its relative subpath so it stays
+    // legibly attributed to this root, not hidden.
+    let tracked: Vec<&str> = snapshot.roots.iter().map(|r| r.path.as_str()).collect();
     let mut servers: Vec<&ServerEntry> = snapshot
         .servers
         .iter()
-        .filter(|s| s.scope_root == path)
+        .filter(|s| super::model::server_nests_under(&s.scope_root, path, &tracked))
         .collect();
     servers.sort_by(|a, b| a.language.cmp(&b.language));
     if servers.is_empty() {
@@ -871,8 +1014,12 @@ fn root_detail(path: &str, snapshot: &Snapshot, theme: &Theme) -> Vec<Line<'stat
     }
     for s in servers {
         let (label, style) = state_style(&s.state, s.busy_count, theme);
+        let sub = super::model::subroot_display(path, &s.scope_root);
         lines.push(Line::from(vec![
-            Span::styled(format!("    {} → {}  ", s.language, s.server), theme.text),
+            Span::styled(
+                format!("    {} → {}{}  ", s.language, s.server, sub),
+                theme.text,
+            ),
             Span::styled(label, style),
         ]));
     }
@@ -1063,16 +1210,35 @@ fn client_detail(
     lines
 }
 
+/// Emit an `id:`-labelled full identifier, wrapped to the pane width via 12's
+/// `wrap_line` machinery so a long id is fully readable instead of truncated
+/// (tui-rework 14, item 4). Short ids that fit stay a single line.
+fn full_id_lines(label: &str, id: &str, theme: &Theme, width: usize) -> Vec<Line<'static>> {
+    let spans = vec![
+        Span::styled(format!("  {label}: "), theme.muted),
+        Span::styled(id.to_string(), theme.text),
+    ];
+    if super::format::spans_width(&spans) <= width {
+        return vec![Line::from(spans)];
+    }
+    super::format::wrap_line(&spans, width, 2)
+}
+
 fn session_detail(
     id: &str,
     snapshot: &Snapshot,
     theme: &Theme,
     now: DateTime<Utc>,
+    width: usize,
 ) -> Vec<Line<'static>> {
     let Some(s) = snapshot.sessions.iter().find(|s| s.id == id) else {
-        return vec![title(format!("Session  {}", short_id(id)), theme)];
+        let mut lines = vec![title("Session".to_string(), theme)];
+        lines.extend(full_id_lines("id", id, theme, width));
+        return lines;
     };
-    let mut lines = vec![title(format!("Session  {}", short_id(id)), theme)];
+    let mut lines = vec![title("Session".to_string(), theme)];
+    // The FULL session id, wrapped — the tree row keeps the short form.
+    lines.extend(full_id_lines("id", id, theme, width));
     lines.push(kv("client", s.client.name.clone(), theme));
     let (cell, _) = session_status_cell(s, theme, now);
     lines.push(kv("status", cell, theme));
@@ -1081,10 +1247,10 @@ fn session_detail(
         format!("{} ago", elapsed_at(&s.last_seen, now)),
         theme,
     ));
-    if let Some(a) = &s.last_action {
+    if let (Some(summary), Some(a)) = (current_action_summary(s, now), s.last_action.as_ref()) {
         lines.push(kv(
             "last action",
-            format!("{} ({} ago)", a.summary, elapsed_at(&a.at, now)),
+            format!("{summary} ({} ago)", elapsed_at(&a.at, now)),
             theme,
         ));
     }
@@ -1106,15 +1272,64 @@ fn session_detail(
             theme.title,
         )]));
         for sub in &s.subagents {
-            lines.push(Line::from(vec![Span::styled(
-                format!(
-                    "    ⤷ {}  up {}",
-                    short_id(&sub.id),
-                    elapsed_at(&sub.started_at, now)
+            let (cell, cell_style) = status_cell(sub.status, theme);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "    ⤷ {}  up {}  ",
+                        short_id(&sub.id),
+                        elapsed_at(&sub.started_at, now)
+                    ),
+                    theme.session_meta,
                 ),
-                theme.session_meta,
-            )]));
+                Span::styled(cell, cell_style),
+            ]));
         }
+    }
+    lines
+}
+
+/// The detail block for a selected subagent (tui-rework 14, item 3): full agent
+/// id, parent session, started/up, its worktree root when a `worktree:<session>:
+/// <agent>` root source matches, and its batch-derived status.
+fn subagent_detail(
+    session_id: &str,
+    agent_id: &str,
+    snapshot: &Snapshot,
+    theme: &Theme,
+    now: DateTime<Utc>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![title("Subagent".to_string(), theme)];
+    lines.extend(full_id_lines("agent", agent_id, theme, width));
+    lines.extend(full_id_lines("parent session", session_id, theme, width));
+    let Some(sub) = snapshot
+        .sessions
+        .iter()
+        .find(|s| s.id == session_id)
+        .and_then(|s| s.subagents.iter().find(|a| a.id == agent_id))
+    else {
+        // The subagent left between snapshot and selection — name what we have.
+        lines.push(kv("status", "gone".to_string(), theme));
+        return lines;
+    };
+    let (cell, _) = status_cell(sub.status, theme);
+    lines.push(kv("status", cell, theme));
+    lines.push(kv(
+        "up",
+        format!("{} ago", elapsed_at(&sub.started_at, now)),
+        theme,
+    ));
+    // The subagent's own worktree root, when a `worktree:<session>:<agent>`
+    // contributor holds one — the root source class the daemon stamps for a
+    // subagent's mounted worktree (tui-rework 14, item 3).
+    let marker = format!("worktree:{session_id}:{agent_id}");
+    if let Some(root) = snapshot
+        .roots
+        .iter()
+        .find(|r| r.sources.iter().any(|src| src == &marker))
+    {
+        lines.push(kv("worktree", root.path.clone(), theme));
     }
     lines
 }
@@ -1141,6 +1356,179 @@ mod tests {
         assert!(label.contains("mcp:2"));
         assert!(label.contains("worktree:1"));
         assert!(label.contains("ephemeral"));
+    }
+
+    /// Item 6b: a single MCP contributor is labelled by its session tag — the
+    /// two roots one session mounts share the tag and stay distinguishable from
+    /// another session's — while a long opaque id elides to its tail.
+    #[test]
+    fn contributor_label_tags_single_mcp_session() {
+        let catenary_pair = vec!["mcp:27".to_string()];
+        let lattice_pair = vec!["mcp:151".to_string()];
+        assert_eq!(contributor_label(&catenary_pair), "[mcp:27]");
+        assert_eq!(contributor_label(&lattice_pair), "[mcp:151]");
+        assert_ne!(
+            contributor_label(&catenary_pair),
+            contributor_label(&lattice_pair),
+            "distinct sessions carry distinct labels",
+        );
+        let long = vec!["mcp:0123456789a76a".to_string()];
+        assert_eq!(contributor_label(&long), "[mcp:…a76a]");
+    }
+
+    /// Item 6c: the lifetime badge names the root's lifetime class; an MCP-only
+    /// root carries none (its `[mcp:…]` tag already conveys the lifetime).
+    #[test]
+    fn lifetime_badge_reflects_root_lifetime() {
+        let hook = vec!["hook".to_string(), "mcp:3".to_string()];
+        assert_eq!(lifetime_badge(&hook, false), "[pin]");
+        let wt = vec!["worktree:s:a".to_string()];
+        assert_eq!(lifetime_badge(&wt, false), "[worktree]");
+        let eph = vec!["ephemeral:query".to_string()];
+        assert_eq!(lifetime_badge(&eph, true), "[activity]");
+        let mcp_only = vec!["mcp:3".to_string()];
+        assert_eq!(lifetime_badge(&mcp_only, false), "");
+    }
+
+    fn session_with(status: SessionStatus, last_seen: &str, summary: &str) -> SessionEntry {
+        SessionEntry {
+            id: "sess-1".to_string(),
+            last_seen: last_seen.to_string(),
+            status,
+            last_action: Some(crate::state_snapshot::LastAction {
+                summary: summary.to_string(),
+                at: last_seen.to_string(),
+            }),
+            ..SessionEntry::default()
+        }
+    }
+
+    /// Item 2: the `diagnostics: …` summary renders only while the batch that
+    /// produced it is current — never on an idle or idle-stale session — while a
+    /// non-batch action (`edited …`) always renders.
+    #[test]
+    fn diagnostics_summary_scoped_to_its_batch() {
+        let now = crate::tui::format::parse_iso("2026-07-08T12:00:30Z").expect("iso");
+        let fresh = "2026-07-08T12:00:00Z";
+        let stale = "2026-07-08T11:00:00Z";
+        let diag = "diagnostics: 0 errors, 0 warnings";
+
+        let working = session_with(SessionStatus::Working, fresh, diag);
+        assert_eq!(
+            current_action_summary(&working, now),
+            Some(diag),
+            "current batch → summary shows",
+        );
+        let idle = session_with(SessionStatus::Idle, fresh, diag);
+        assert_eq!(
+            current_action_summary(&idle, now),
+            None,
+            "batch closed → the zero-count line must not loiter",
+        );
+        let gone_stale = session_with(SessionStatus::Working, stale, diag);
+        assert_eq!(
+            current_action_summary(&gone_stale, now),
+            None,
+            "idle-stale session → summary dropped",
+        );
+        let edited = session_with(SessionStatus::Idle, fresh, "edited src/db.rs");
+        assert_eq!(
+            current_action_summary(&edited, now),
+            Some("edited src/db.rs"),
+            "a non-diagnostics action is not batch-scoped",
+        );
+    }
+
+    /// Item 1 render leg: the status cell names `working` distinctly from
+    /// `editing`, and an unknown future status renders quiet — never a false
+    /// `editing`.
+    #[test]
+    fn status_cell_names_working_and_degrades_unknown() {
+        let theme = Theme::new();
+        assert_eq!(status_cell(SessionStatus::Editing, &theme).0, "editing");
+        assert_eq!(status_cell(SessionStatus::Working, &theme).0, "working");
+        assert_eq!(status_cell(SessionStatus::Idle, &theme).0, "idle");
+        assert_eq!(status_cell(SessionStatus::Unknown, &theme).0, "idle");
+    }
+
+    /// Item 3: the subagent tree row carries the capability-aware status cell,
+    /// and selecting a subagent renders a detail block — full agent id, parent
+    /// session, status, and its worktree root when the `worktree:<session>:
+    /// <agent>` source matches.
+    #[test]
+    fn subagent_row_and_detail_render_status_and_worktree() {
+        let theme = Theme::new();
+        let now = crate::tui::format::parse_iso("2026-07-08T12:01:00Z").expect("iso");
+        let sub = crate::state_snapshot::Subagent {
+            id: "agent-7da239b1-d3c7-42b7-a7a4-38b4205f576a".to_string(),
+            started_at: "2026-07-08T12:00:00Z".to_string(),
+            status: SessionStatus::Editing,
+            ..crate::state_snapshot::Subagent::default()
+        };
+        let line = subagent_line(&sub, 80, &theme, now);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("editing"),
+            "row carries the status cell: {text}"
+        );
+
+        let mut snapshot = Snapshot::default();
+        snapshot.sessions.push(SessionEntry {
+            id: "sess-1".to_string(),
+            subagents: vec![sub.clone()],
+            ..SessionEntry::default()
+        });
+        snapshot.roots.push(crate::state_snapshot::RootEntry {
+            path: "/wt/agents/x".to_string(),
+            sources: vec![format!("worktree:sess-1:{}", sub.id)],
+            ..crate::state_snapshot::RootEntry::default()
+        });
+        let lines = subagent_detail("sess-1", &sub.id, &snapshot, &theme, now, 200);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains(&sub.id), "full agent id present");
+        assert!(text.contains("sess-1"), "parent session named");
+        assert!(text.contains("editing"), "batch-derived status present");
+        assert!(text.contains("/wt/agents/x"), "worktree root resolved");
+    }
+
+    /// Item 4: the session detail renders the FULL id; a long id wraps to the
+    /// pane width via 12's wrap machinery, with no emitted line overflowing.
+    #[test]
+    fn session_detail_renders_full_session_id_wrapped() {
+        let theme = Theme::new();
+        let now = crate::tui::format::parse_iso("2026-07-08T12:01:00Z").expect("iso");
+        let id = "7da239b1-d3c7-42b7-a7a4-38b4205f576a-aa68869b04e4520be";
+        let mut snapshot = Snapshot::default();
+        snapshot.sessions.push(SessionEntry {
+            id: id.to_string(),
+            last_seen: "2026-07-08T12:00:50Z".to_string(),
+            ..SessionEntry::default()
+        });
+        let width = 24;
+        let lines = session_detail(id, &snapshot, &theme, now, width);
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join("");
+        let compact: String = joined.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains(
+                &id.chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>()
+            ),
+            "the FULL id is present across wrapped lines",
+        );
+        for line in &lines {
+            assert!(
+                crate::tui::format::spans_width(&line.spans) <= width,
+                "no emitted line exceeds the pane width",
+            );
+        }
     }
 
     /// The binary line names the resolved path — "where is it?" — not bare

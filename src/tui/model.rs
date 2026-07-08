@@ -76,6 +76,14 @@ pub enum EntityKey {
     Client(String),
     /// A live session (by id).
     Session(String),
+    /// A subagent running under a session, keyed by its parent session id and
+    /// its own agent id (tui-rework 14, item 3).
+    Subagent {
+        /// The parent session's id.
+        session: String,
+        /// The subagent's own agent id.
+        agent: String,
+    },
 }
 
 /// A collapse toggle target — what `Enter`/click flips.
@@ -108,6 +116,11 @@ pub struct RootRow {
     pub total: usize,
     /// Worst finding severity among this root's servers, if any.
     pub worst: Option<Severity>,
+    /// When this root is a companion (a config-paired sibling of another tracked
+    /// root, e.g. `CatenaryInternal` next to `Catenary`), the primary root it
+    /// nests under; `None` for a primary or a standalone root (tui-rework 14,
+    /// item 6a). A companion row renders nested and marked.
+    pub companion_of: Option<String>,
 }
 
 /// A client header row (session tree) — grouped by host CLI.
@@ -136,7 +149,18 @@ pub enum Row {
     /// A root header (root/server tree).
     Root(RootRow),
     /// A server instance under an expanded root.
-    Server(ServerEntry),
+    ///
+    /// `subroot` is the server's scope-root path *relative to* the tracked
+    /// workspace root it nests under, present only when the server anchored on a
+    /// subtree of that root (a root-marker walk that landed on a fixture
+    /// subdirectory — tui-rework 14, item 5). `None` when the server's scope root
+    /// is the tracked root itself.
+    Server {
+        /// The server instance.
+        entry: ServerEntry,
+        /// The scope root relative to the enclosing tracked root, when nested.
+        subroot: Option<String>,
+    },
     /// A finding rendered inline under its owning server/client node.
     InlineFinding {
         /// The finding severity (for glyph + color).
@@ -159,8 +183,14 @@ pub enum Row {
     Client(ClientRow),
     /// A live session under an expanded client.
     Session(SessionEntry),
-    /// A subagent sub-row under a session.
-    Subagent(Subagent),
+    /// A subagent sub-row under a session, paired with its parent session id so
+    /// selection can resolve the detail block (tui-rework 14, item 3).
+    Subagent {
+        /// The parent session's id.
+        session: String,
+        /// The subagent entry.
+        subagent: Subagent,
+    },
 }
 
 impl Row {
@@ -169,8 +199,8 @@ impl Row {
     pub const fn depth(&self) -> u8 {
         match self {
             Self::Root(_) | Self::Client(_) | Self::DormantToggle { .. } => 0,
-            Self::Server(_) | Self::Dormant(_) | Self::Session(_) => 1,
-            Self::Subagent(_) => 2,
+            Self::Server { .. } | Self::Dormant(_) | Self::Session(_) => 1,
+            Self::Subagent { .. } => 2,
             Self::InlineFinding { depth, .. } => *depth,
         }
     }
@@ -186,12 +216,16 @@ impl Row {
     pub fn entity(&self) -> Option<EntityKey> {
         match self {
             Self::Root(r) => Some(EntityKey::Root(r.path.clone())),
-            Self::Server(s) => Some(EntityKey::Server {
-                name: s.server.clone(),
-                id: s.id.clone(),
+            Self::Server { entry, .. } => Some(EntityKey::Server {
+                name: entry.server.clone(),
+                id: entry.id.clone(),
             }),
             Self::Client(c) => Some(EntityKey::Client(c.name.clone())),
             Self::Session(s) => Some(EntityKey::Session(s.id.clone())),
+            Self::Subagent { session, subagent } => Some(EntityKey::Subagent {
+                session: session.clone(),
+                agent: subagent.id.clone(),
+            }),
             _ => None,
         }
     }
@@ -211,9 +245,9 @@ impl Row {
     #[must_use]
     pub fn yank_text(&self) -> Option<String> {
         match self {
-            Self::Server(s) => Some(s.id.clone()),
+            Self::Server { entry, .. } => Some(entry.id.clone()),
             Self::Session(s) => Some(s.id.clone()),
-            Self::Subagent(s) => Some(s.id.clone()),
+            Self::Subagent { subagent, .. } => Some(subagent.id.clone()),
             Self::Root(r) => Some(r.path.clone()),
             _ => None,
         }
@@ -366,13 +400,23 @@ pub fn build_root_tree(
         }
     }
 
-    // Group live server instances by scope_root.
+    // The tracked workspace roots, longest-first so a nested pair (`…/Catenary`
+    // vs a fixture subtree of it) resolves to the *nearest* enclosing root
+    // (tui-rework 14, item 5).
+    let mut tracked: Vec<&str> = snapshot.roots.iter().map(|r| r.path.as_str()).collect();
+    tracked.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+
+    // Group live server instances by their **enclosing tracked root**. A server
+    // whose scope root is a path-prefix subtree of a tracked root (a root-marker
+    // walk that anchored on a fixture subdirectory) nests under that root rather
+    // than rendering as a top-level peer; its relative subpath rides the server
+    // row.
     let mut by_root: BTreeMap<String, Vec<&ServerEntry>> = BTreeMap::new();
     for s in &snapshot.servers {
         let root = if s.scope_root.is_empty() {
             "(single file)".to_string()
         } else {
-            s.scope_root.clone()
+            enclosing_tracked_root(&s.scope_root, &tracked).unwrap_or_else(|| s.scope_root.clone())
         };
         by_root.entry(root).or_default().push(s);
     }
@@ -386,6 +430,11 @@ pub fn build_root_tree(
         .iter()
         .map(|r| (r.path.as_str(), r))
         .collect();
+
+    // companion path → its primary. A config-paired sibling (e.g.
+    // `CatenaryInternal` next to `Catenary`) nests under its primary rather than
+    // rendering as a top-level peer (tui-rework 14, item 6a).
+    let companion_of = companion_map(&by_root.keys().cloned().collect::<Vec<_>>(), config);
 
     // Build root summaries, sort problems-first then by path.
     let mut roots: Vec<RootRow> = by_root
@@ -407,13 +456,36 @@ pub fn build_root_tree(
                 up,
                 total: servers.len(),
                 worst: w,
+                companion_of: companion_of.get(path).cloned(),
             }
         })
         .collect();
+    // Sort so a companion sorts immediately after its primary: key each row on
+    // its primary group's (worst, path), then order primaries before companions
+    // and companions among themselves by their own path. The group rank is the
+    // *best* (worst-severity) rank across primary + companions, so a problem on
+    // either member floats the pair — problems-first still holds. Density law:
+    // one line per healthy root; a companion adds a line only when it exists.
+    let sort_key = |r: &RootRow| -> (String, bool, String) {
+        let primary = r.companion_of.clone().unwrap_or_else(|| r.path.clone());
+        (primary, r.companion_of.is_some(), r.path.clone())
+    };
+    let mut rank_by_group: HashMap<String, u8> = HashMap::new();
+    for r in &roots {
+        let (primary, _, _) = sort_key(r);
+        let rank = rank_by_group.entry(primary).or_insert(u8::MAX);
+        *rank = (*rank).min(rank_opt(r.worst));
+    }
     roots.sort_by(|a, b| {
-        rank_opt(a.worst)
-            .cmp(&rank_opt(b.worst))
-            .then_with(|| a.path.cmp(&b.path))
+        let (pa, ca, wa) = sort_key(a);
+        let (pb, cb, wb) = sort_key(b);
+        let rank_a = rank_by_group.get(&pa).copied().unwrap_or(u8::MAX);
+        let rank_b = rank_by_group.get(&pb).copied().unwrap_or(u8::MAX);
+        rank_a
+            .cmp(&rank_b)
+            .then_with(|| pa.cmp(&pb))
+            .then_with(|| ca.cmp(&cb))
+            .then_with(|| wa.cmp(&wb))
     });
 
     let mut rows: Vec<Row> = Vec::new();
@@ -431,7 +503,14 @@ pub fn build_root_tree(
                 .then_with(|| a.server.cmp(&b.server))
         });
         for s in servers {
-            rows.push(Row::Server((*s).clone()));
+            // When the server anchored on a subtree of this tracked root, show
+            // its path relative to the root; otherwise it *is* the root's own
+            // scope, so no subpath rides the row.
+            let subroot = subroot_relative(&path, &s.scope_root);
+            rows.push(Row::Server {
+                entry: (*s).clone(),
+                subroot,
+            });
             if let Some(msgs) = server_msgs.get(s.server.as_str()) {
                 for (severity, message) in msgs {
                     rows.push(Row::InlineFinding {
@@ -539,7 +618,10 @@ pub fn build_session_tree(
         for s in sessions {
             rows.push(Row::Session((*s).clone()));
             for sub in &s.subagents {
-                rows.push(Row::Subagent(sub.clone()));
+                rows.push(Row::Subagent {
+                    session: s.id.clone(),
+                    subagent: sub.clone(),
+                });
             }
         }
     }
@@ -552,6 +634,156 @@ const fn rank_opt(s: Option<Severity>) -> u8 {
         Some(sev) => sev.rank(),
         None => u8::MAX,
     }
+}
+
+/// The nearest tracked workspace root that is a path-prefix ancestor of
+/// `scope_root` (tui-rework 14, item 5).
+///
+/// `tracked` must be pre-sorted longest-first so the *nearest* enclosing root
+/// wins when roots nest. A `scope_root` equal to a tracked root returns that
+/// root (it nests under itself, i.e. it stays a top-level root). Matching is on
+/// path components (`…/Catenary` does not enclose `…/CatenaryInternal`), so a
+/// sibling whose name merely shares a prefix never falsely nests.
+#[must_use]
+fn enclosing_tracked_root(scope_root: &str, tracked: &[&str]) -> Option<String> {
+    tracked
+        .iter()
+        .find(|root| is_path_prefix(root, scope_root))
+        .map(|root| (*root).to_string())
+}
+
+/// Whether `prefix` is `path` or a path-component ancestor of it. Component-wise,
+/// so `/a/b` is a prefix of `/a/b/c` but not of `/a/bc`.
+#[must_use]
+fn is_path_prefix(prefix: &str, path: &str) -> bool {
+    if prefix == path {
+        return true;
+    }
+    let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The `scope_root` rendered relative to the tracked `root` it nests under, or
+/// `None` when the scope root *is* the tracked root (no subpath to show).
+#[must_use]
+fn subroot_relative(root: &str, scope_root: &str) -> Option<String> {
+    if scope_root.is_empty() || scope_root == root {
+        return None;
+    }
+    let base = root.strip_suffix('/').unwrap_or(root);
+    scope_root
+        .strip_prefix(base)
+        .map(|rest| rest.trim_start_matches('/').to_string())
+        .filter(|rel| !rel.is_empty())
+}
+
+/// Whether a server at `scope_root` nests under the tracked `root`
+/// (tui-rework 14, item 5).
+///
+/// True when `root` is the server's **nearest** enclosing tracked root. Used by
+/// the root-detail routing table so it lists the same servers the tree nests
+/// under the root.
+#[must_use]
+pub fn server_nests_under(scope_root: &str, root: &str, tracked: &[&str]) -> bool {
+    if scope_root.is_empty() {
+        return false;
+    }
+    if scope_root == root {
+        return true;
+    }
+    let mut tracked: Vec<&str> = tracked.to_vec();
+    tracked.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    enclosing_tracked_root(scope_root, &tracked).as_deref() == Some(root)
+}
+
+/// The ` (./sub/path)` suffix for a subtree-nested server in the root-detail
+/// routing table, or an empty string when the scope root *is* the tracked root.
+#[must_use]
+pub fn subroot_display(root: &str, scope_root: &str) -> String {
+    subroot_relative(root, scope_root).map_or_else(String::new, |rel| format!(" (./{rel})"))
+}
+
+/// Maps each companion root path to the primary it nests under (tui-rework 14,
+/// item 6a).
+///
+/// Reader-safe: the render layer never touches the filesystem, so this applies
+/// the config's `[roots.companions]` rule *templates* as pure string
+/// substitution against the tracked root paths (already canonical in the
+/// snapshot) rather than running the fs-touching
+/// [`crate::companions::expand_companions`]. A `"*"` matcher pairs any root; a
+/// literal matcher pairs only its exact path. A derived companion path is a pair
+/// only when it is *itself* a tracked root in `paths`. A path that is already a
+/// companion is never also treated as a primary (no `FooInternalInternal`).
+#[must_use]
+fn companion_map(
+    paths: &[String],
+    config: Option<&crate::config::Config>,
+) -> HashMap<String, String> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    let Some(rules) = config.and_then(crate::config::Config::companion_rules) else {
+        return map;
+    };
+    let tracked: HashSet<&str> = paths.iter().map(String::as_str).collect();
+    for primary in paths {
+        for (matcher, template) in rules.pairs() {
+            if !companion_matcher_matches(matcher, primary) {
+                continue;
+            }
+            let companion = expand_companion_template(template, primary);
+            // A companion is a pair only when it is itself tracked, differs from
+            // its primary, and is not already claimed as another root's primary.
+            if companion != *primary
+                && tracked.contains(companion.as_str())
+                && !map.contains_key(&companion)
+            {
+                map.insert(companion, primary.clone());
+            }
+        }
+    }
+    // A primary that is itself someone's companion is a chain — drop the inner
+    // link so a root is either a primary or a companion, never both.
+    let primaries: HashSet<String> = map.values().cloned().collect();
+    map.retain(|companion, _| !primaries.contains(companion));
+    map
+}
+
+/// Whether a companion matcher fires for `root` — `"*"` matches any root, else
+/// an exact (`~`-expanded) path equality. Reader-safe: no canonicalization.
+#[must_use]
+fn companion_matcher_matches(matcher: &str, root: &str) -> bool {
+    matcher.trim() == "*" || expand_home(matcher) == root
+}
+
+/// Applies a companion template's `{root}`/`{name}` substitution and `~`
+/// expansion as pure strings (tui-rework 14, item 6a) — the fs-free subset of
+/// `crate::companions::expand_template`, sufficient for the render's pairing.
+#[must_use]
+#[allow(
+    clippy::literal_string_with_formatting_args,
+    reason = "`{root}`/`{name}` are companion-template placeholders, not format args"
+)]
+fn expand_companion_template(template: &str, root: &str) -> String {
+    let name = root.rsplit('/').next().unwrap_or(root);
+    let substituted = template.replace("{root}", root).replace("{name}", name);
+    expand_home(&substituted)
+}
+
+/// Expands a leading `~`/`~/` to `$HOME`, leaving the string unchanged when
+/// `HOME` is unset or no tilde is present.
+#[must_use]
+fn expand_home(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return format!("{}/{rest}", home.to_string_lossy());
+    }
+    if s == "~"
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return home.to_string_lossy().into_owned();
+    }
+    s.to_string()
 }
 
 /// Whether a live server-entry state is up (serving or coming up).
@@ -643,7 +875,7 @@ mod tests {
         let rows = build_root_tree(&snap, &findings, None, &expanded, false);
         // Root, Server, InlineFinding.
         assert!(matches!(rows[0], Row::Root(_)));
-        assert!(matches!(rows[1], Row::Server(_)));
+        assert!(matches!(rows[1], Row::Server { .. }));
         assert!(matches!(rows[2], Row::InlineFinding { .. }));
     }
 
@@ -660,13 +892,14 @@ mod tests {
             subagents: vec![Subagent {
                 id: "agent-a".to_string(),
                 started_at: crate::state_snapshot::now_iso(),
+                ..Subagent::default()
             }],
             ..SessionEntry::default()
         });
         let rows = build_session_tree(&snap, &[], &HashSet::new());
         assert!(matches!(&rows[0], Row::Client(c) if c.name == "claude"));
         assert!(matches!(rows[1], Row::Session(_)));
-        assert!(matches!(rows[2], Row::Subagent(_)));
+        assert!(matches!(rows[2], Row::Subagent { .. }));
     }
 
     #[test]
@@ -769,5 +1002,86 @@ mod tests {
         assert!(r.ephemeral);
         assert_eq!(r.idle_remaining_secs, Some(42));
         assert_eq!(r.sources, vec!["ephemeral:query".to_string()]);
+    }
+
+    /// Item 5: a server whose own root-marker walk anchored on a fixture
+    /// subdirectory of a tracked root nests under that root — never a top-level
+    /// peer — and its server row carries the relative subpath.
+    #[test]
+    fn subtree_server_root_nests_under_tracked_root() {
+        let mut snap = Snapshot::default();
+        snap.roots.push(RootEntry {
+            path: "/p/Catenary".to_string(),
+            ..RootEntry::default()
+        });
+        snap.servers.push(server(
+            "svelte-ls",
+            "/p/Catenary/tests/fixtures/conformance/svelte",
+            "healthy",
+        ));
+        let expanded: HashSet<String> = std::iter::once("/p/Catenary".to_string()).collect();
+        let rows = build_root_tree(&snap, &[], None, &expanded, false);
+        let roots: Vec<&RootRow> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Root(root) => Some(root),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(roots.len(), 1, "no fixture-subtree top-level peer root");
+        assert_eq!(roots[0].path, "/p/Catenary");
+        assert_eq!(roots[0].total, 1, "the subtree server counts on its root");
+        let sub = rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Server { entry, subroot } if entry.server == "svelte-ls" => {
+                    Some(subroot.clone())
+                }
+                _ => None,
+            })
+            .expect("server row present under the tracked root");
+        assert_eq!(
+            sub.as_deref(),
+            Some("tests/fixtures/conformance/svelte"),
+            "the server row shows the scope root relative to its tracked root",
+        );
+        // A sibling that merely shares a name prefix must NOT nest.
+        assert!(!is_path_prefix("/p/Catenary", "/p/CatenaryInternal"));
+    }
+
+    /// Item 6a: a config-paired companion root nests under its primary (marked
+    /// via `companion_of`) and sorts immediately after it.
+    #[test]
+    fn companion_root_nests_under_its_primary() {
+        let mut config = crate::config::Config::default();
+        config.roots = Some(crate::config::RootsConfig {
+            companions: Some(crate::companions::CompanionRules::from_pairs([(
+                "*",
+                "{root}Internal",
+            )])),
+        });
+        let mut snap = Snapshot::default();
+        for path in ["/p/Catenary", "/p/CatenaryInternal", "/p/Aaa"] {
+            snap.roots.push(RootEntry {
+                path: (*path).to_string(),
+                ..RootEntry::default()
+            });
+        }
+        let rows = build_root_tree(&snap, &[], Some(&config), &HashSet::new(), false);
+        let roots: Vec<&RootRow> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Root(root) => Some(root),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(roots.len(), 3, "companion adds a line only when it exists");
+        // /p/Aaa sorts first (path order among primaries); the companion rides
+        // immediately after its primary, marked.
+        assert_eq!(roots[0].path, "/p/Aaa");
+        assert_eq!(roots[1].path, "/p/Catenary");
+        assert!(roots[1].companion_of.is_none());
+        assert_eq!(roots[2].path, "/p/CatenaryInternal");
+        assert_eq!(roots[2].companion_of.as_deref(), Some("/p/Catenary"));
     }
 }

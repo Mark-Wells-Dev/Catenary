@@ -653,7 +653,7 @@ impl<'a> App<'a> {
                 if let Some(i) = self
                     .root_rows
                     .iter()
-                    .position(|r| matches!(r, Row::Server(s) if &s.server == name))
+                    .position(|r| matches!(r, Row::Server { entry, .. } if &entry.server == name))
                 {
                     self.root_cursor.index = i;
                     self.root_cursor.settle(self.root_rows.len());
@@ -962,7 +962,7 @@ fn selectable(rows: &[Row]) -> Vec<usize> {
 fn root_row_is_problem(row: &Row, problem_servers: &HashSet<String>) -> bool {
     match row {
         Row::Root(r) => r.worst.is_some_and(crate::health::Severity::is_problem),
-        Row::Server(e) => problem_servers.contains(&e.server),
+        Row::Server { entry, .. } => problem_servers.contains(&entry.server),
         Row::InlineFinding { severity, .. } => severity.is_problem(),
         _ => false,
     }
@@ -1131,7 +1131,7 @@ mod tests {
         let idx = app
             .root_rows
             .iter()
-            .position(|r| matches!(r, Row::Server(s) if s.server == "srv0"))
+            .position(|r| matches!(r, Row::Server { entry, .. } if entry.server == "srv0"))
             .expect("server row present");
         app.root_cursor.index = idx;
         app.set_focus(Pane::RootTree);
