@@ -276,7 +276,6 @@ extensions = ["xml", "xsl", "xslt", "xsd"]
 
 [lsp.language.sql]
 extensions = ["sql"]
-servers = ["sql-ls"]
 
 [lsp.language.graphql]
 extensions = ["graphql", "gql"]

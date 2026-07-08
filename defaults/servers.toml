@@ -113,10 +113,6 @@ args = ["--stdio"]
 [lsp.server.cmake-ls]
 command = "cmake-language-server"
 
-[lsp.server.sql-ls]
-command = "sql-language-server"
-args = ["up", "--method", "stdio"]
-
 [lsp.server.docker-ls]
 command = "docker-langserver"
 args = ["--stdio"]

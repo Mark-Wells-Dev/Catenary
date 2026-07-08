@@ -161,15 +161,6 @@ draft = true
 hash = "sha512-DPTmckrnNCf8KdeSu9pE/mjnovSL28InnQhDS2lsuDrLI8obapMxAU0KLDYnC++aTjCK8bZhhkR5HFh3lDddqw=="
 note = "diagnostics depend on ansible-lint being present; a conformance job provisions it (pip) as well."
 
-[recipe.sql-ls]
-ecosystem = "npm"
-package = "sql-language-server"
-version = "1.7.1"
-tier = "npm-tarball-sha512"
-draft = true
-hash = "sha512-HiS8siZQJD9EzkMhY7Jnz3XBbu/rZ99VSmCJE0+gF2CHEtlQCeA+X4Dee0BNjpbJ3dVFMAXmEw4tsM5Y6GbU0w=="
-note = "resolves transitive deps at install time within the pinned version."
-
 # ── cargo tranche ────────────────────────────────────────────────────
 # cargo is the implied host toolchain; `--locked` + index checksums verify.
 

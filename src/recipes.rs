@@ -987,10 +987,10 @@ mod tests {
                 "`{name}` must not be in the conformed set"
             );
         }
-        // A representative conformed server (sql-ls, class-B-fixed) is present.
+        // A representative conformed server (ansible-ls, class-D-fixed) is present.
         assert!(
-            conformed.iter().any(|c| c == "sql-ls"),
-            "sql-ls conforms after the class B health-probe fix"
+            conformed.iter().any(|c| c == "ansible-ls"),
+            "ansible-ls conforms after the class D fixture fix"
         );
         // jdtls is pending, so it is in neither set (the matrix skips it).
         assert!(

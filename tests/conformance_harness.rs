@@ -275,14 +275,6 @@ const CASES: &[Case] = &[
         slow_start: false,
     },
     Case {
-        server: "sql-ls",
-        fixture: "sql",
-        file: "broken.sql",
-        probe: "sql-language-server",
-        binding: None,
-        slow_start: false,
-    },
-    Case {
         server: "gopls",
         fixture: "go",
         file: "main.go",

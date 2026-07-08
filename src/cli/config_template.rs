@@ -579,7 +579,6 @@ mod tests {
             "yaml-ls",
             "ansible-ls",
             "cmake-ls",
-            "sql-ls",
             "docker-ls",
             "csharp-ls",
             "fsautocomplete",
