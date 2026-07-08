@@ -364,6 +364,18 @@ upgrading.
 
 ### Changed
 
+- **The board is calm: when the engine is idle, nothing on screen moves.**
+  Durations quantize to coarse buckets (`7m`, not a ticking `7m25s`;
+  footer freshness says `just now`, `<1m ago`, `4m ago`), so an unchanged
+  daemon renders a byte-identical board. Every line is bounded to its
+  width — truncated with `…`, never clipped raw off the screen edge. The
+  footer slims to the `? keys` hint plus daemon status; the keys popup
+  carries the full binding list. Focus no longer relies on reverse-video
+  (illegible grays on light terminals): the focused pane's frame renders
+  emphasized and the selected row keeps its `▸` caret in bold — no
+  background or color swaps, honest on any palette. The server detail
+  pane now names the resolved binary path (`~/.cargo/bin/rust-analyzer`)
+  instead of just "found on $PATH".
 - **The dashboard reports what you work on, not what's lying around.**
   Language suggestions (and the intent that turns an
   installed-but-failing server into a Fatal) are now gated on tracked

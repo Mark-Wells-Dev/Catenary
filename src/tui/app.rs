@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 
 use crate::config::{Config, Mutation};
 use crate::health::{FindingCode, servers::binary_exists};
@@ -149,6 +150,11 @@ pub struct App<'a> {
     /// production; `false` under the fleet-scale tests, which inject a config
     /// and drive [`findings::gather_snapshot`] for a deterministic finding set.
     env_findings: bool,
+    /// Injected render clock. `None` in production (reads `Utc::now()` each
+    /// frame); a fixed instant under tests so a render is deterministic and two
+    /// refreshes inside one quantization bucket are byte-identical (tui-rework
+    /// 11, item 4).
+    now_override: Option<DateTime<Utc>>,
 }
 
 impl<'a> App<'a> {
@@ -213,6 +219,7 @@ impl<'a> App<'a> {
             last_generated_at: String::new(),
             needs_rebuild: true,
             env_findings,
+            now_override: None,
         };
         app.recompute_findings();
         app.rebuild_rows();
@@ -262,6 +269,22 @@ impl<'a> App<'a> {
     #[must_use]
     pub const fn daemon_present(&self) -> bool {
         !self.snapshot.daemon.generated_at.is_empty()
+    }
+
+    /// The clock the current frame renders every duration against: the injected
+    /// instant under tests, otherwise the wall clock. Threading a single `now`
+    /// through the render is what makes an idle board byte-identical between
+    /// refreshes within a quantization bucket (tui-rework 11, item 4).
+    #[must_use]
+    pub fn render_now(&self) -> DateTime<Utc> {
+        self.now_override.unwrap_or_else(Utc::now)
+    }
+
+    /// Pin the render clock to a fixed instant — the seam the calm-board tests
+    /// drive to render a snapshot deterministically at a chosen `now`.
+    #[cfg(test)]
+    pub const fn inject_now(&mut self, now: DateTime<Utc>) {
+        self.now_override = Some(now);
     }
 
     /// Re-read the snapshot; recompute findings + rows only when the snapshot

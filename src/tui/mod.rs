@@ -36,6 +36,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
 };
@@ -414,6 +415,35 @@ fn set(buf: &mut Buffer, x: u16, y: u16, s: &str, style: Style) {
     }
 }
 
+/// Patch a single cell's style in place (keeps its glyph), bounds-guarded.
+fn patch_cell_style(buf: &mut Buffer, x: u16, y: u16, style: Style) {
+    if x < buf.area.right() && y < buf.area.bottom() {
+        buf[(x, y)].set_style(style);
+    }
+}
+
+/// Emphasize the frame around a focused pane (tui-rework 11, item 3): patch the
+/// border cells surrounding the pane's content rect with `style` (bold), keeping
+/// the light box glyphs. Palette-honest — a modifier, never a color/background
+/// swap — so focus reads on any terminal.
+fn emphasize_border(buf: &mut Buffer, inner: Rect, style: Style) {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let x0 = inner.x.saturating_sub(1);
+    let x1 = inner.x + inner.width; // right border column
+    let y0 = inner.y.saturating_sub(1);
+    let y1 = inner.y + inner.height; // bottom border row
+    for x in x0..=x1 {
+        patch_cell_style(buf, x, y0, style);
+        patch_cell_style(buf, x, y1, style);
+    }
+    for y in y0..=y1 {
+        patch_cell_style(buf, x0, y, style);
+        patch_cell_style(buf, x1, y, style);
+    }
+}
+
 /// Render one list pane: a title line, then scrollable entries with a
 /// cursor-highlighted (glyph + color) selected entry.
 #[allow(
@@ -436,10 +466,13 @@ fn render_list(
     }
     // Title line inside the body: the pane title, then any extra spans (the
     // Problems pane carries the verdict counts here — tui-rework 09, item 2).
-    let title_style = if focused { theme.accent } else { theme.title };
+    // Focus is shown by a bold title (item 3) and a bold pane frame; unfocused
+    // panes stay plain — no reverse-video, palette-honest on any terminal.
+    let title_style = if focused { theme.title } else { Style::new() };
     let mut title_spans = vec![ratatui::text::Span::styled(title.to_string(), title_style)];
     title_spans.extend(title_extra.iter().cloned());
-    buf.set_line(inner.x, inner.y, &Line::from(title_spans), inner.width);
+    let title_line = format::bound_line(&Line::from(title_spans), inner.width as usize);
+    buf.set_line(inner.x, inner.y, &title_line, inner.width);
 
     let list_y = inner.y + 1;
     let list_h = inner.height.saturating_sub(1);
@@ -474,14 +507,15 @@ fn render_list(
             if y >= end_y {
                 break;
             }
+            let bounded = format::bound_line(line, inner.width as usize);
             if selected {
-                let hl = highlight_line(line, inner.width as usize, theme.selection);
+                let hl = highlight_line(&bounded, theme.selection);
                 buf.set_line(inner.x, y, &hl, inner.width);
                 if li == 0 {
                     buf.set_string(inner.x, y, "▸", theme.selection);
                 }
             } else {
-                buf.set_line(inner.x, y, line, inner.width);
+                buf.set_line(inner.x, y, &bounded, inner.width);
             }
             y += 1;
         }
@@ -517,7 +551,8 @@ fn render_detail(
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let title_style = if focused { theme.accent } else { theme.title };
+    // Focus is shown by a bold title (item 3); unfocused panes stay plain.
+    let title_style = if focused { theme.title } else { Style::new() };
     buf.set_string(inner.x, inner.y, truncate(title, inner.width), title_style);
     let end_y = inner.y + inner.height;
     for (i, line) in lines.iter().enumerate() {
@@ -525,22 +560,23 @@ fn render_detail(
         if y >= end_y {
             break;
         }
-        buf.set_line(inner.x, y, line, inner.width);
+        let bounded = format::bound_line(line, inner.width as usize);
+        buf.set_line(inner.x, y, &bounded, inner.width);
     }
 }
 
-/// Re-style a line for the selection highlight, padding to `width`.
-fn highlight_line(line: &Line<'static>, width: usize, style: Style) -> Line<'static> {
+/// Re-style a line for the selection highlight (tui-rework 11, item 3):
+/// patch each span with the selection modifier (bold — no background or
+/// foreground swap, so grays stay grays on any terminal palette). The `▸`
+/// gutter caret is drawn separately; no width padding is needed without a
+/// filled background.
+fn highlight_line(line: &Line<'static>, style: Style) -> Line<'static> {
     use ratatui::text::Span;
-    let mut spans: Vec<Span<'static>> = line
+    let spans: Vec<Span<'static>> = line
         .spans
         .iter()
         .map(|s| Span::styled(s.content.clone(), s.style.patch(style)))
         .collect();
-    let used: usize = line.spans.iter().map(|s| s.content.width()).sum();
-    if used < width {
-        spans.push(Span::styled(" ".repeat(width - used), style));
-    }
     Line::from(spans)
 }
 
@@ -555,9 +591,10 @@ fn tree_entries(
     width: u16,
     theme: &Theme,
     icons: &IconSet,
+    now: DateTime<Utc>,
 ) -> Vec<Vec<Line<'static>>> {
     rows.iter()
-        .map(|r| vec![render::tree_line(r, width as usize, theme, icons)])
+        .map(|r| vec![render::tree_line(r, width as usize, theme, icons, now)])
         .collect()
 }
 
@@ -599,6 +636,9 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
 
     let theme = app.theme;
     let icons = app.icons;
+    // One injected clock per frame: every duration renders against it, so an
+    // idle board is byte-identical between refreshes within a bucket (item 4).
+    let now = app.render_now();
     let buf = f.buffer_mut();
 
     // No header strip (item 2): the verdict rides the Problems pane title and
@@ -614,7 +654,7 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
             theme,
         );
     }
-    let footer = render::footer_line(&app.snapshot, area.width as usize, theme);
+    let footer = render::footer_line(&app.snapshot, area.width as usize, theme, now);
     buf.set_line(area.x, footer_y, &footer, area.width);
 
     if !app.daemon_present() {
@@ -636,10 +676,11 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
         app.config.as_ref(),
         &app.findings,
         theme,
+        now,
     );
 
     if area.width < NARROW_THRESHOLD {
-        render_narrow(app, grid, buf, theme, icons, &detail_lines, rects);
+        render_narrow(app, grid, buf, theme, icons, &detail_lines, now, rects);
         draw_action_overlay(app, area, buf, theme);
         return;
     }
@@ -647,9 +688,18 @@ fn render_frame(f: &mut Frame<'_>, app: &mut App<'_>, rects: &mut PanelRects) {
     let split_x = grid.x + grid.width * LEFT_PCT / 100;
     let split_y = grid.y + grid.height / 2;
     let [tl, tr, bl, br] = draw_grid_borders(grid, split_x, split_y, buf, theme.border_unfocused);
+    // Focus is a "bounding box" (item 3): the focused pane's frame is redrawn
+    // emphasized (bold), no reverse-video anywhere.
+    let focus_rect = match app.focus {
+        Pane::RootTree => tl,
+        Pane::Detail => tr,
+        Pane::SessionTree => bl,
+        Pane::Problems => br,
+    };
+    emphasize_border(buf, focus_rect, theme.border_focused);
 
-    let root_entries = tree_entries(&app.root_rows, tl.width, theme, icons);
-    let session_entries = tree_entries(&app.session_rows, bl.width, theme, icons);
+    let root_entries = tree_entries(&app.root_rows, tl.width, theme, icons, now);
+    let session_entries = tree_entries(&app.session_rows, bl.width, theme, icons, now);
     let mut problem_entries = render::problem_entries(&app.problem_rows, br.width as usize, theme);
     problem_entries.extend(render::pending_restart_entries(
         &app.pending_restarts,
@@ -780,6 +830,7 @@ fn render_narrow(
     theme: &Theme,
     icons: &IconSet,
     detail_lines: &[Line<'static>],
+    now: DateTime<Utc>,
     rects: &mut PanelRects,
 ) {
     let h = grid.height / 4;
@@ -791,8 +842,8 @@ fn render_narrow(
     let tr = Rect::new(grid.x, grid.y + 2 * h, grid.width, h);
     let br = Rect::new(grid.x, grid.y + 3 * h, grid.width, grid.height - 3 * h);
 
-    let root_entries = tree_entries(&app.root_rows, tl.width, theme, icons);
-    let session_entries = tree_entries(&app.session_rows, bl.width, theme, icons);
+    let root_entries = tree_entries(&app.root_rows, tl.width, theme, icons, now);
+    let session_entries = tree_entries(&app.session_rows, bl.width, theme, icons, now);
     let mut problem_entries = render::problem_entries(&app.problem_rows, br.width as usize, theme);
     problem_entries.extend(render::pending_restart_entries(
         &app.pending_restarts,
@@ -1040,6 +1091,210 @@ mod tests {
             s.push('\n');
         }
         s
+    }
+
+    /// Parse a fixed ISO instant for the injected render clock.
+    fn at(iso: &str) -> DateTime<Utc> {
+        crate::tui::format::parse_iso(iso).expect("iso")
+    }
+
+    /// A calm board with **fixed** timestamps so a render is deterministic under
+    /// an injected `now`: one root with two healthy servers aged two minutes, a
+    /// fresh claude session with a subagent, and a stale antigravity session.
+    fn calm_fixture() -> Snapshot {
+        let mut snap = Snapshot {
+            daemon: DaemonSnapshot {
+                instance_id: "daemon:test".to_string(),
+                pid: 4242,
+                version: env!("CATENARY_VERSION").to_string(),
+                started_at: "2026-07-07T12:00:00Z".to_string(),
+                generated_at: "2026-07-07T12:01:20Z".to_string(),
+            },
+            ..Snapshot::default()
+        };
+        for s in 0..2 {
+            snap.servers.push(ServerEntry {
+                id: format!("srv{s}@/p/root0"),
+                language: format!("lang{s}"),
+                server: format!("srv{s}"),
+                scope_root: "/p/root0".to_string(),
+                state: "healthy".to_string(),
+                state_since: "2026-07-07T12:00:00Z".to_string(),
+                ..ServerEntry::default()
+            });
+        }
+        snap.sessions = vec![
+            SessionEntry {
+                id: "claude-abc".to_string(),
+                client: ClientInfo {
+                    name: "claude".to_string(),
+                    version: None,
+                },
+                last_seen: "2026-07-07T12:01:10Z".to_string(),
+                subagents: vec![Subagent {
+                    id: "agent-1".to_string(),
+                    started_at: "2026-07-07T12:00:00Z".to_string(),
+                }],
+                ..SessionEntry::default()
+            },
+            SessionEntry {
+                id: "antigravity-xyz".to_string(),
+                client: ClientInfo {
+                    name: "antigravity".to_string(),
+                    version: None,
+                },
+                last_seen: "2026-07-07T11:55:00Z".to_string(),
+                ..SessionEntry::default()
+            },
+        ];
+        snap
+    }
+
+    /// Build an app over a fixture with the render clock pinned to `now`.
+    fn calm_app<'a>(
+        theme: &'a Theme,
+        icons: &'a IconSet,
+        snap: Snapshot,
+        now: DateTime<Utc>,
+    ) -> App<'a> {
+        let mut app = App::with_injected_config(
+            theme,
+            icons,
+            PathBuf::from("/nonexistent"),
+            crate::config::Config::default(),
+            Box::new(MockDataSource::new(snap)),
+        )
+        .expect("app");
+        app.inject_now(now);
+        app
+    }
+
+    /// Draw an app to a buffer string at the given size.
+    fn draw_app(app: &mut App<'_>, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut rects = PanelRects::default();
+        terminal
+            .draw(|f| render_frame(f, app, &mut rects))
+            .expect("draw");
+        buffer_to_string(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn idle_board_is_byte_identical_within_a_quantization_bucket() {
+        // Two renders 10s apart within the same minute: quantized durations mean
+        // the board must be byte-for-byte identical — the idle-engine design law.
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = calm_app(&theme, &icons, calm_fixture(), at("2026-07-07T12:01:35Z"));
+        // Expand the root so the servers' time-in-state renders in the tree.
+        app.set_focus(Pane::RootTree);
+        app.jump_home();
+        app.activate();
+
+        let out1 = draw_app(&mut app, 100, 30);
+        app.inject_now(at("2026-07-07T12:01:45Z"));
+        let out2 = draw_app(&mut app, 100, 30);
+
+        assert_eq!(
+            out1, out2,
+            "an unchanged board within one bucket must be byte-identical:\n{out1}"
+        );
+        // And the durations really are quantized (no ticking seconds past 1m).
+        assert!(
+            out1.contains("just now"),
+            "fresh snapshot freshness: {out1}"
+        );
+        assert!(
+            out1.contains("last seen 6m"),
+            "stale session quantized to minutes: {out1}"
+        );
+    }
+
+    #[test]
+    fn nothing_renders_past_width_at_narrow_size() {
+        // A long, skewed daemon version overruns 60 columns; the footer must
+        // truncate with `…` (item 1), never clip raw like `updated 4m21s ag`.
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut snap = calm_fixture();
+        snap.daemon.version = "9.9.9-longbuild-gdeadbeefcafef00d-dirty".to_string();
+        let mut app = calm_app(&theme, &icons, snap, at("2026-07-07T12:01:35Z"));
+
+        let out = draw_app(&mut app, 60, 20);
+        for line in out.lines() {
+            assert!(
+                UnicodeWidthStr::width(line) <= 60,
+                "no line exceeds its area width: {line:?}"
+            );
+        }
+        let footer = out.lines().last().expect("footer row");
+        assert!(
+            footer.contains('…'),
+            "footer truncates with an ellipsis instead of clipping raw: {footer:?}"
+        );
+        assert!(
+            footer.contains("? keys"),
+            "the `? keys` hint survives; the daemon status yields first: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn focus_and_selection_use_no_reverse_video() {
+        use ratatui::style::Modifier;
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = calm_app(&theme, &icons, calm_fixture(), at("2026-07-07T12:01:35Z"));
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut rects = PanelRects::default();
+        terminal
+            .draw(|f| render_frame(f, &mut app, &mut rects))
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+
+        // No cell anywhere reverse-videos — palette honesty (item 3).
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                assert!(
+                    !buf[(x, y)].modifier.contains(Modifier::REVERSED),
+                    "no reverse-video at ({x},{y})"
+                );
+            }
+        }
+        // The focused pane (RootTree, top-left) shows a bold frame corner.
+        assert!(
+            buf[(0, 0)].modifier.contains(Modifier::BOLD),
+            "focused pane border is emphasized (bold)"
+        );
+        // The selected row keeps its `▸` gutter caret.
+        assert!(
+            buffer_to_string(buf).contains('▸'),
+            "selected row keeps its caret gutter"
+        );
+    }
+
+    #[test]
+    fn footer_slims_to_keys_hint_and_daemon_status() {
+        // The per-key hints left the footer (item 2): only `? keys` + daemon
+        // status remain; the moved hints (e.g. `problems-only`) are gone from it.
+        let theme = Theme::new();
+        let icons = IconSet::from_config(IconConfig::default());
+        let mut app = calm_app(&theme, &icons, calm_fixture(), at("2026-07-07T12:01:35Z"));
+        let out = draw_app(&mut app, 120, 30);
+        let footer = out.lines().last().expect("footer row");
+        assert!(
+            footer.contains("? keys"),
+            "keeps the discovery hint: {footer:?}"
+        );
+        assert!(
+            footer.contains("daemon pid"),
+            "keeps daemon status: {footer:?}"
+        );
+        assert!(
+            !footer.contains("problems-only"),
+            "per-key hints left the footer: {footer:?}"
+        );
     }
 
     #[test]

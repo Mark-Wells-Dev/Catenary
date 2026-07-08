@@ -12,11 +12,15 @@ use ratatui::text::{Line, Span};
 
 use super::theme::Theme;
 
-/// All keybindings (flat list, no modal sections).
+/// All keybindings (flat list, no modal sections). This popup is the sole full
+/// key list now that the footer slimmed to `? keys` (tui-rework 11, item 2), so
+/// every binding a hint ever carried — including `a` (apply fix-it) — lives
+/// here.
 const KEYBINDS: &[(&str, &str)] = &[
     ("j/k", "navigate"),
     ("Tab", "cycle panes"),
     ("Enter", "expand / focus"),
+    ("a", "apply fix-it"),
     ("p", "problems only"),
     ("d", "dormant toggle"),
     ("y", "yank scope id"),

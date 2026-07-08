@@ -9,6 +9,7 @@
 //! cursor and problem tiers read on a monochrome terminal too (the accessibility
 //! ruling: a glyph column alongside color).
 
+use chrono::{DateTime, Utc};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -18,7 +19,9 @@ use crate::state_snapshot::{ServerEntry, SessionEntry, SessionStatus, Snapshot};
 
 use super::action::{ActionState, InstallState, PendingRestart};
 use super::findings::{OwnedFinding, Owner};
-use super::format::{elapsed_short, seconds_since, truncate_to_width};
+use super::format::{
+    elapsed_at, format_elapsed_secs, format_freshness, seconds_between, truncate_to_width,
+};
 use super::icons::{IconSet, basename};
 use super::model::{ClientRow, EntityKey, ProblemRow, RootRow, Row, Verdict};
 use super::theme::Theme;
@@ -140,12 +143,12 @@ fn state_style(state: &str, busy_count: Option<u32>, theme: &Theme) -> (String, 
 /// statuses" — a stale session degrades to `last seen Nm` for every host, and a
 /// fresh one shows its activity. (Claude subagents render as sub-rows; that is
 /// the one host capability the snapshot distinguishes.)
-fn session_status_cell(entry: &SessionEntry, theme: &Theme) -> (String, Style) {
-    if let Some(secs) = seconds_since(&entry.last_seen)
+fn session_status_cell(entry: &SessionEntry, theme: &Theme, now: DateTime<Utc>) -> (String, Style) {
+    if let Some(secs) = seconds_between(&entry.last_seen, now)
         && secs > SESSION_STALE_SECS
     {
         return (
-            format!("last seen {}", elapsed_short(&entry.last_seen)),
+            format!("last seen {}", elapsed_at(&entry.last_seen, now)),
             theme.muted,
         );
     }
@@ -157,11 +160,21 @@ fn session_status_cell(entry: &SessionEntry, theme: &Theme) -> (String, Style) {
 }
 
 /// Render one tree row into a single styled line.
+///
+/// `now` is the injected render clock: every duration on the row is computed
+/// against it so the row is byte-identical between refreshes within a
+/// quantization bucket (tui-rework 11, item 4).
 #[must_use]
-pub fn tree_line(row: &Row, width: usize, theme: &Theme, icons: &IconSet) -> Line<'static> {
+pub fn tree_line(
+    row: &Row,
+    width: usize,
+    theme: &Theme,
+    icons: &IconSet,
+    now: DateTime<Utc>,
+) -> Line<'static> {
     match row {
         Row::Root(r) => root_line(r, width, theme, icons),
-        Row::Server(e) => server_line(e, width, theme, icons),
+        Row::Server(e) => server_line(e, width, theme, icons, now),
         Row::InlineFinding {
             severity,
             message,
@@ -183,13 +196,13 @@ pub fn tree_line(row: &Row, width: usize, theme: &Theme, icons: &IconSet) -> Lin
             theme.muted,
         )]),
         Row::Client(c) => client_line(c, width, theme, icons),
-        Row::Session(s) => session_line(s, width, theme),
+        Row::Session(s) => session_line(s, width, theme, now),
         Row::Subagent(s) => Line::from(vec![Span::styled(
             format!(
                 "{}⤷ {}  up {}",
                 indent(2),
                 short_id(&s.id),
-                elapsed_short(&s.started_at)
+                elapsed_at(&s.started_at, now)
             ),
             theme.session_meta,
         )]),
@@ -212,9 +225,15 @@ fn root_line(r: &RootRow, width: usize, theme: &Theme, icons: &IconSet) -> Line<
         left.push(Span::styled(format!("  {label}"), theme.muted));
     }
     if r.ephemeral {
-        let idle = r
-            .idle_remaining_secs
-            .map_or_else(|| "idle".to_string(), |s| format!("idle {s}s"));
+        let idle = r.idle_remaining_secs.map_or_else(
+            || "idle".to_string(),
+            |s| {
+                format!(
+                    "idle {}",
+                    format_elapsed_secs(i64::try_from(s).unwrap_or(i64::MAX))
+                )
+            },
+        );
         left.push(Span::styled(format!("  {idle}"), theme.timestamp));
     }
     let mut right = Vec::new();
@@ -231,7 +250,13 @@ fn root_line(r: &RootRow, width: usize, theme: &Theme, icons: &IconSet) -> Line<
     super::format::justify(left, right, width)
 }
 
-fn server_line(e: &ServerEntry, width: usize, theme: &Theme, icons: &IconSet) -> Line<'static> {
+fn server_line(
+    e: &ServerEntry,
+    width: usize,
+    theme: &Theme,
+    icons: &IconSet,
+    now: DateTime<Utc>,
+) -> Line<'static> {
     let (label, style) = state_style(&e.state, e.busy_count, theme);
     let up = super::model::is_up(&e.state);
     let dot = if up {
@@ -252,7 +277,7 @@ fn server_line(e: &ServerEntry, width: usize, theme: &Theme, icons: &IconSet) ->
         let death = e
             .last_died_at
             .as_deref()
-            .map(|d| format!(" died {}", elapsed_short(d)))
+            .map(|d| format!(" died {}", elapsed_at(d, now)))
             .unwrap_or_default();
         right.push(Span::styled(
             format!("↻{}{death} ", e.respawns),
@@ -262,7 +287,7 @@ fn server_line(e: &ServerEntry, width: usize, theme: &Theme, icons: &IconSet) ->
     if e.degraded_reason.is_some() {
         right.push(Span::styled("⚠ ".to_string(), theme.warning));
     }
-    let tis = elapsed_short(&e.state_since);
+    let tis = elapsed_at(&e.state_since, now);
     if !tis.is_empty() {
         right.push(Span::styled(format!("{tis} "), theme.timestamp));
     }
@@ -319,8 +344,13 @@ fn client_line(c: &ClientRow, width: usize, theme: &Theme, icons: &IconSet) -> L
     super::format::justify(left, right, width)
 }
 
-fn session_line(s: &SessionEntry, width: usize, theme: &Theme) -> Line<'static> {
-    let (cell, cell_style) = session_status_cell(s, theme);
+fn session_line(
+    s: &SessionEntry,
+    width: usize,
+    theme: &Theme,
+    now: DateTime<Utc>,
+) -> Line<'static> {
+    let (cell, cell_style) = session_status_cell(s, theme, now);
     let mut left = vec![
         Span::raw(indent(1)),
         Span::styled(short_id(&s.id), theme.text),
@@ -568,7 +598,11 @@ pub fn verdict_spans(verdict: Verdict, daemon_up: bool, theme: &Theme) -> Vec<Sp
 /// it agrees with `catenary version` and the skew finding — a non-tag build is
 /// never falsely flagged (item 1).
 #[must_use]
-pub fn daemon_status_spans(snapshot: &Snapshot, theme: &Theme) -> Vec<Span<'static>> {
+pub fn daemon_status_spans(
+    snapshot: &Snapshot,
+    theme: &Theme,
+    now: DateTime<Utc>,
+) -> Vec<Span<'static>> {
     if snapshot.daemon.generated_at.is_empty() {
         return Vec::new();
     }
@@ -592,8 +626,8 @@ pub fn daemon_status_spans(snapshot: &Snapshot, theme: &Theme) -> Vec<Span<'stat
         ));
     }
 
-    // Snapshot freshness rides with the daemon identity.
-    if let Some(secs) = seconds_since(&snapshot.daemon.generated_at) {
+    // Snapshot freshness rides with the daemon identity (quantized — item 4).
+    if let Some(secs) = seconds_between(&snapshot.daemon.generated_at, now) {
         spans.push(sep());
         let style = if secs > SNAPSHOT_STALE_SECS {
             theme.warning
@@ -601,51 +635,57 @@ pub fn daemon_status_spans(snapshot: &Snapshot, theme: &Theme) -> Vec<Span<'stat
             theme.muted
         };
         spans.push(Span::styled(
-            format!(
-                "updated {} ago",
-                elapsed_short(&snapshot.daemon.generated_at)
-            ),
+            format!("updated {}", format_freshness(secs)),
             style,
         ));
     }
     spans
 }
 
-/// The footer status bar: the compact keybinding hint packed left, the
-/// daemon status (pid · version + skew · freshness) flushed right (item 2).
+/// The slimmed footer status bar (tui-rework 11, item 2).
 ///
-/// When the two would collide the keybind hint truncates so the daemon status
-/// stays visible; the `?` panel carries the full key list.
+/// The sole `? keys` discovery hint packs left; the daemon status (pid ·
+/// version + skew · freshness) flushes right. The per-key hints left the footer
+/// — the `?` panel carries the full key list. The whole line is bounded to
+/// `width` and truncated with `…` (item 1) so the freshness never clips raw at
+/// the terminal edge; the `? keys` hint is kept (the daemon status yields its
+/// tail first).
 #[must_use]
-pub fn footer_line(snapshot: &Snapshot, width: usize, theme: &Theme) -> Line<'static> {
-    let key = theme.hint_key;
-    let lbl = theme.hint_label;
-    let mut left = Vec::new();
-    for (k, d) in [
-        ("Tab", "panes"),
-        ("j/k", "move"),
-        ("Enter", "expand/focus"),
-        ("a", "fix-it"),
-        ("p", "problems-only"),
-        ("d", "dormant"),
-        ("y", "yank"),
-        ("?", "keys"),
-        ("q", "quit"),
-    ] {
-        left.push(Span::styled(format!(" {k} "), key));
-        left.push(Span::styled(format!("{d} "), lbl));
-    }
-    let right = daemon_status_spans(snapshot, theme);
+pub fn footer_line(
+    snapshot: &Snapshot,
+    width: usize,
+    theme: &Theme,
+    now: DateTime<Utc>,
+) -> Line<'static> {
+    let left = vec![
+        Span::styled(" ? ".to_string(), theme.hint_key),
+        Span::styled("keys".to_string(), theme.hint_label),
+    ];
+    let left_w = super::format::spans_width(&left);
+    let right = daemon_status_spans(snapshot, theme, now);
     if right.is_empty() {
-        Line::from(left)
-    } else {
-        super::format::justify(left, right, width)
+        return super::format::bound_line(&Line::from(left), width);
     }
+    // Keep `? keys` — the sole discovery hint — and let the daemon status yield
+    // its tail (freshness first) so the line never clips raw (items 1 & 2).
+    let right = super::format::truncate_spans(right, width.saturating_sub(left_w + 1));
+    let right_w = super::format::spans_width(&right);
+    let gap = width.saturating_sub(left_w + right_w);
+    let mut spans = left;
+    if gap > 0 {
+        spans.push(Span::raw(" ".repeat(gap)));
+    }
+    spans.extend(right);
+    super::format::bound_line(&Line::from(spans), width)
 }
 
 // ── Detail pane ──────────────────────────────────────────────────────
 
 /// Render the contextual detail pane for the cursored entity.
+///
+/// `now` is the injected render clock (tui-rework 11, item 4): the detail pane
+/// keeps finer wording than the board but still quantizes so it does not tick
+/// every second.
 #[must_use]
 pub fn detail_lines(
     entity: Option<&EntityKey>,
@@ -653,6 +693,7 @@ pub fn detail_lines(
     config: Option<&Config>,
     findings: &[OwnedFinding],
     theme: &Theme,
+    now: DateTime<Utc>,
 ) -> Vec<Line<'static>> {
     match entity {
         None => vec![Line::from(vec![Span::styled(
@@ -661,10 +702,10 @@ pub fn detail_lines(
         )])],
         Some(EntityKey::Root(path)) => root_detail(path, snapshot, theme),
         Some(EntityKey::Server { name, .. }) => {
-            server_detail(name, snapshot, config, findings, theme)
+            server_detail(name, snapshot, config, findings, theme, now)
         }
         Some(EntityKey::Client(name)) => client_detail(name, snapshot, findings, theme),
-        Some(EntityKey::Session(id)) => session_detail(id, snapshot, theme),
+        Some(EntityKey::Session(id)) => session_detail(id, snapshot, theme, now),
     }
 }
 
@@ -736,6 +777,7 @@ fn server_detail(
     config: Option<&Config>,
     findings: &[OwnedFinding],
     theme: &Theme,
+    now: DateTime<Utc>,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![title(format!("Server  {name}"), theme)];
 
@@ -758,16 +800,13 @@ fn server_detail(
             format!("{} {}", def.command, def.args.join(" "))
         };
         lines.push(kv("command", cmd, theme));
-        let installed = crate::health::servers::binary_exists(&def.command);
-        lines.push(kv(
-            "binary",
-            if installed {
-                "found on $PATH".to_string()
-            } else {
-                "NOT found on $PATH".to_string()
-            },
-            theme,
-        ));
+        // Name the resolved path (home-relativized), not just presence —
+        // "where is it?" is the question the pane answers (ticket 11 item 5).
+        let binary = crate::health::servers::resolve_binary(&def.command).map_or_else(
+            || "NOT found on $PATH".to_string(),
+            |path| crate::bridge::compress_home(&path),
+        );
+        lines.push(kv("binary", binary, theme));
     }
 
     // Languages routing to this server.
@@ -847,14 +886,14 @@ fn server_detail(
         let mut spans = vec![
             Span::styled(format!("    {root}  "), theme.text),
             Span::styled(format!("{label} "), style),
-            Span::styled(elapsed_short(&s.state_since), theme.timestamp),
+            Span::styled(elapsed_at(&s.state_since, now), theme.timestamp),
         ];
         if s.respawns > 0 {
             spans.push(Span::styled(format!("  ↻{}", s.respawns), theme.warning));
         }
         if let Some(d) = &s.last_died_at {
             spans.push(Span::styled(
-                format!("  last death {} ago", elapsed_short(d)),
+                format!("  last death {} ago", elapsed_at(d, now)),
                 theme.muted,
             ));
         }
@@ -912,23 +951,28 @@ fn client_detail(
     lines
 }
 
-fn session_detail(id: &str, snapshot: &Snapshot, theme: &Theme) -> Vec<Line<'static>> {
+fn session_detail(
+    id: &str,
+    snapshot: &Snapshot,
+    theme: &Theme,
+    now: DateTime<Utc>,
+) -> Vec<Line<'static>> {
     let Some(s) = snapshot.sessions.iter().find(|s| s.id == id) else {
         return vec![title(format!("Session  {}", short_id(id)), theme)];
     };
     let mut lines = vec![title(format!("Session  {}", short_id(id)), theme)];
     lines.push(kv("client", s.client.name.clone(), theme));
-    let (cell, _) = session_status_cell(s, theme);
+    let (cell, _) = session_status_cell(s, theme, now);
     lines.push(kv("status", cell, theme));
     lines.push(kv(
         "last seen",
-        format!("{} ago", elapsed_short(&s.last_seen)),
+        format!("{} ago", elapsed_at(&s.last_seen, now)),
         theme,
     ));
     if let Some(a) = &s.last_action {
         lines.push(kv(
             "last action",
-            format!("{} ({} ago)", a.summary, elapsed_short(&a.at)),
+            format!("{} ({} ago)", a.summary, elapsed_at(&a.at, now)),
             theme,
         ));
     }
@@ -954,7 +998,7 @@ fn session_detail(id: &str, snapshot: &Snapshot, theme: &Theme) -> Vec<Line<'sta
                 format!(
                     "    ⤷ {}  up {}",
                     short_id(&sub.id),
-                    elapsed_short(&sub.started_at)
+                    elapsed_at(&sub.started_at, now)
                 ),
                 theme.session_meta,
             )]));
@@ -985,6 +1029,64 @@ mod tests {
         assert!(label.contains("mcp:2"));
         assert!(label.contains("worktree:1"));
         assert!(label.contains("ephemeral"));
+    }
+
+    /// The binary line names the resolved path — "where is it?" — not bare
+    /// presence (ticket 11 item 5); an unresolvable command keeps the honest
+    /// NOT-found wording.
+    #[test]
+    fn server_detail_names_the_resolved_binary_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("mock-server-bin");
+        std::fs::write(&bin, "").expect("touch binary");
+
+        let mut config = Config::default();
+        config.server.insert(
+            "mock-server".to_string(),
+            crate::config::ServerDef {
+                command: bin.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        );
+        config.server.insert(
+            "gone-server".to_string(),
+            crate::config::ServerDef {
+                command: "definitely-not-a-real-binary-xyz".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let snapshot = Snapshot::default();
+        let render = |name: &str| -> String {
+            server_detail(
+                name,
+                &snapshot,
+                Some(&config),
+                &[],
+                &Theme::new(),
+                chrono::Utc::now(),
+            )
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref().to_string())
+            .collect::<String>()
+        };
+
+        let found = render("mock-server");
+        assert!(
+            found.contains("mock-server-bin"),
+            "binary line names the resolved path: {found}"
+        );
+        assert!(
+            !found.contains("found on $PATH"),
+            "presence-only wording replaced when resolved: {found}"
+        );
+
+        let missing = render("gone-server");
+        assert!(
+            missing.contains("NOT found on $PATH"),
+            "unresolvable command keeps the honest wording: {missing}"
+        );
     }
 
     #[test]

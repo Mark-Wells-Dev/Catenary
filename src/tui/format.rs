@@ -4,11 +4,15 @@
 //! Low-level time and layout helpers shared by the grid's renderers.
 //!
 //! Time-in-state ([`elapsed_short`]) is the primitive that makes a stuck
-//! `probing` server visible — a steadily growing value. Layout helpers
-//! ([`truncate_to_width`], [`justify`]) keep a right-flushed status column
-//! visible when a row is too narrow (filter before columns).
+//! `probing` server visible — a steadily growing value. Durations are
+//! **quantized** ([`format_elapsed_secs`]) to coarse buckets so an idle board
+//! stays byte-identical between refreshes (tui-rework 11, item 4 — idle engine,
+//! idle board). Layout helpers ([`truncate_to_width`], [`bound_line`],
+//! [`justify`]) keep every rendered line within its area width, truncating with
+//! `…` rather than clipping raw (item 1).
 
 use chrono::{DateTime, Local, Utc};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
@@ -32,31 +36,73 @@ pub fn local_hms(iso: &str) -> String {
 
 /// Seconds elapsed since `iso` until now (non-negative), or `None` if
 /// unparseable — the freshness/staleness primitive.
+///
+/// Reads the wall clock; the render layer uses the injected-clock twin
+/// [`seconds_between`] so a board renders deterministically from a fixed `now`.
 #[must_use]
 pub fn seconds_since(iso: &str) -> Option<i64> {
-    parse_iso(iso).map(|start| (Utc::now() - start).num_seconds().max(0))
+    seconds_between(iso, Utc::now())
 }
 
-/// Compact elapsed time from `since` until now, e.g. `3m12s`, `2h05m`, `4d01h`.
+/// Seconds elapsed from `since` until `now` (non-negative), or `None` if
+/// `since` is unparseable — the injected-clock freshness primitive.
 ///
-/// The **time-in-state** primitive: a server stuck in `probing` shows a
-/// steadily growing value. Returns an empty string if `since` is unparseable.
+/// The render layer computes every duration against a single injected `now`, so
+/// two refreshes inside the same quantization bucket produce byte-identical
+/// output (tui-rework 11, item 4).
+#[must_use]
+pub fn seconds_between(since: &str, now: DateTime<Utc>) -> Option<i64> {
+    parse_iso(since).map(|start| (now - start).num_seconds().max(0))
+}
+
+/// Compact elapsed time from `since` until now, quantized (see
+/// [`format_elapsed_secs`]). Returns an empty string if `since` is unparseable.
+///
+/// Reads the wall clock; the render layer uses the injected-clock twin
+/// [`elapsed_at`].
 #[must_use]
 pub fn elapsed_short(since: &str) -> String {
     seconds_since(since).map_or_else(String::new, format_elapsed_secs)
 }
 
-/// Format a non-negative second count as a compact duration.
+/// Quantized compact elapsed from `since` until `now`; empty on unparseable
+/// input. The render-layer twin of [`elapsed_short`].
+#[must_use]
+pub fn elapsed_at(since: &str, now: DateTime<Utc>) -> String {
+    seconds_between(since, now).map_or_else(String::new, format_elapsed_secs)
+}
+
+/// Format a non-negative second count as a **quantized** compact duration.
+///
+/// Coarse buckets so an idle row stops ticking (tui-rework 11, item 4): seconds
+/// only under a minute (`42s`), then whole minutes (`7m`, never `7m25s`), then
+/// `1h05m` under a day, then whole days (`2d`). A healthy row is then
+/// byte-identical between refreshes for minutes at a time.
 #[must_use]
 pub fn format_elapsed_secs(secs: i64) -> String {
     if secs < 60 {
         format!("{secs}s")
     } else if secs < 3600 {
-        format!("{}m{:02}s", secs / 60, secs % 60)
+        format!("{}m", secs / 60)
     } else if secs < 86_400 {
         format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
     } else {
-        format!("{}d{:02}h", secs / 86_400, (secs % 86_400) / 3600)
+        format!("{}d", secs / 86_400)
+    }
+}
+
+/// Footer freshness phrase for a snapshot age (tui-rework 11, item 4).
+///
+/// `just now` under ~30s, then `<1m ago`, then the quantized `Nm ago` / `1h05m
+/// ago` / `Nd ago`. Reads naturally after the word `updated`.
+#[must_use]
+pub fn format_freshness(secs: i64) -> String {
+    if secs < 30 {
+        "just now".to_string()
+    } else if secs < 60 {
+        "<1m ago".to_string()
+    } else {
+        format!("{} ago", format_elapsed_secs(secs))
     }
 }
 
@@ -68,6 +114,21 @@ pub fn spans_width(spans: &[Span<'_>]) -> usize {
     spans.iter().map(|s| s.content.width()).sum()
 }
 
+/// Take the leading `cols` display columns of `s` (no ellipsis), Unicode-honest.
+fn take_cols(s: &str, cols: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let cw = ch.to_string().width();
+        if w + cw > cols {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out
+}
+
 /// Truncate a string to `max` display columns, appending `…` when it was cut.
 #[must_use]
 pub fn truncate_to_width(s: &str, max: usize) -> String {
@@ -77,19 +138,22 @@ pub fn truncate_to_width(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    let budget = max.saturating_sub(1);
-    let mut out = String::new();
-    let mut w = 0;
-    for ch in s.chars() {
-        let cw = ch.to_string().width();
-        if w + cw > budget {
-            break;
-        }
-        out.push(ch);
-        w += cw;
-    }
+    let mut out = take_cols(s, max.saturating_sub(1));
     out.push('…');
     out
+}
+
+/// Bound a whole line to `width` display columns, marking any cut with `…`.
+///
+/// The safety net every rendered line passes through so nothing clips raw at its
+/// pane edge (tui-rework 11, item 1); the `…` inherits the trailing span's
+/// style. Unicode-honest: measured and cut by display width, not bytes.
+#[must_use]
+pub fn bound_line(line: &Line<'static>, width: usize) -> Line<'static> {
+    if spans_width(&line.spans) <= width {
+        return line.clone();
+    }
+    Line::from(truncate_spans(line.spans.clone(), width))
 }
 
 /// Build a line with `left` packed left and `right` flushed right.
@@ -121,55 +185,138 @@ pub fn justify(
     Line::from(spans)
 }
 
-/// Truncate a span sequence to `max` columns, preserving each span's style and
-/// appending `…` to the last surviving span when content was dropped.
+/// Truncate a span sequence to `max` display columns, marking any drop with `…`.
+///
+/// Preserves each span's style and appends a single `…` (in the trailing span's
+/// style) whenever content is dropped. The one truncation primitive the grid
+/// shares — `justify` truncates its left column through it, and [`bound_line`]
+/// bounds whole lines.
 #[must_use]
 pub fn truncate_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
+    if spans_width(&spans) <= max {
+        return spans;
+    }
+    if max == 0 {
+        return Vec::new();
+    }
+    // Content must be dropped; reserve one column for the ellipsis.
+    let budget = max - 1;
     let mut out: Vec<Span<'static>> = Vec::new();
     let mut used = 0;
+    let mut ellipsis_style = Style::default();
     for span in spans {
         let w = span.content.width();
-        if used + w <= max {
+        if used + w <= budget {
             used += w;
+            ellipsis_style = span.style;
             out.push(span);
         } else {
-            let remaining = max.saturating_sub(used);
+            let remaining = budget - used;
             if remaining > 0 {
-                let style = span.style;
+                ellipsis_style = span.style;
                 out.push(Span::styled(
-                    truncate_to_width(&span.content, remaining),
-                    style,
+                    take_cols(&span.content, remaining),
+                    span.style,
                 ));
             }
             break;
         }
     }
+    out.push(Span::styled("…".to_string(), ellipsis_style));
     out
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
     use ratatui::style::Style;
 
     #[test]
-    fn format_elapsed_buckets() {
-        assert_eq!(format_elapsed_secs(5), "5s");
-        assert_eq!(format_elapsed_secs(72), "1m12s");
+    fn format_elapsed_buckets_quantize_at_boundaries() {
+        // Under a minute: seconds resolution.
+        assert_eq!(format_elapsed_secs(0), "0s");
+        assert_eq!(format_elapsed_secs(59), "59s");
+        // A minute and up: whole minutes only — no ticking seconds.
+        assert_eq!(format_elapsed_secs(60), "1m");
+        assert_eq!(format_elapsed_secs(72), "1m");
+        assert_eq!(format_elapsed_secs(119), "1m");
+        assert_eq!(format_elapsed_secs(7 * 60 + 25), "7m");
+        // An hour and up: `NhMMm`.
+        assert_eq!(format_elapsed_secs(3600), "1h00m");
         assert_eq!(format_elapsed_secs(3 * 3600 + 5 * 60), "3h05m");
-        assert_eq!(format_elapsed_secs(2 * 86_400 + 3600), "2d01h");
+        // A day and up: whole days.
+        assert_eq!(format_elapsed_secs(86_400), "1d");
+        assert_eq!(format_elapsed_secs(2 * 86_400 + 3600), "2d");
+    }
+
+    #[test]
+    fn freshness_buckets() {
+        assert_eq!(format_freshness(0), "just now");
+        assert_eq!(format_freshness(29), "just now");
+        assert_eq!(format_freshness(30), "<1m ago");
+        assert_eq!(format_freshness(59), "<1m ago");
+        assert_eq!(format_freshness(60), "1m ago");
+        assert_eq!(format_freshness(4 * 60 + 21), "4m ago");
+    }
+
+    #[test]
+    fn elapsed_at_is_deterministic_within_a_bucket() {
+        let start = "2026-07-07T12:00:00Z";
+        let base = parse_iso("2026-07-07T12:01:40Z").expect("iso");
+        // 100s and 110s elapsed both floor to the same whole minute.
+        assert_eq!(elapsed_at(start, base), "1m");
+        assert_eq!(
+            elapsed_at(start, base + chrono::Duration::seconds(10)),
+            "1m"
+        );
     }
 
     #[test]
     fn elapsed_short_handles_garbage() {
         assert_eq!(elapsed_short("not-a-date"), "");
         assert!(seconds_since("not-a-date").is_none());
+        assert!(seconds_between("not-a-date", Utc::now()).is_none());
     }
 
     #[test]
     fn truncate_appends_ellipsis() {
         assert_eq!(truncate_to_width("hello world", 5), "hell…");
         assert_eq!(truncate_to_width("hi", 5), "hi");
+    }
+
+    #[test]
+    fn bound_line_never_exceeds_width_and_marks_truncation() {
+        // A line wider than the bound truncates to width with a trailing `…`.
+        let line = Line::from(vec![
+            Span::styled("daemon pid 4242".to_string(), Style::new()),
+            Span::styled(" · updated just now".to_string(), Style::new()),
+        ]);
+        let bounded = bound_line(&line, 10);
+        assert_eq!(spans_width(&bounded.spans), 10, "bounded to exactly width");
+        let text: String = bounded.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.ends_with('…'), "carries the ellipsis: {text}");
+        // A line that already fits is returned unchanged (no ellipsis).
+        let fits = bound_line(&line, 100);
+        let fits_text: String = fits.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!fits_text.contains('…'), "no ellipsis when it fits");
+    }
+
+    #[test]
+    fn truncate_spans_marks_drop_at_a_span_boundary() {
+        // Two full-width spans, bound to the first span's width: the second is
+        // dropped, so the result must still carry an ellipsis.
+        let spans = vec![
+            Span::styled("AAAAA".to_string(), Style::new()),
+            Span::styled("BBBBB".to_string(), Style::new()),
+        ];
+        let out = truncate_spans(spans, 5);
+        assert!(spans_width(&out) <= 5, "within bound");
+        let text: String = out.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains('…'), "boundary drop is marked: {text}");
     }
 
     #[test]

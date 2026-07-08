@@ -13,12 +13,14 @@ use ratatui::style::{Color, Modifier, Style};
 /// Semantic color theme that defers to the terminal's ANSI palette.
 ///
 /// Uses only base ANSI colors (`Color::Green`, `Color::Red`, etc.) and
-/// modifiers (`DIM`, `BOLD`, `REVERSED`) so the TUI automatically inherits
-/// whatever theme the user has configured in their terminal emulator.
+/// modifiers (`BOLD`, `DIM`) so the TUI automatically inherits whatever theme
+/// the user has configured in their terminal emulator. It never reverse-videos
+/// or hard-codes a background — grays must stay grays on both light and dark
+/// terminals (tui-rework 11, item 3).
 pub struct Theme {
-    /// Style for the focused pane border.
+    /// Style for the focused pane border (bold frame — the "bounding box").
     pub border_focused: Style,
-    /// Style for the unfocused pane border.
+    /// Style for the unfocused pane border (plain).
     pub border_unfocused: Style,
     /// Style for pane titles.
     pub title: Style,
@@ -68,17 +70,18 @@ impl Default for Theme {
 impl Theme {
     /// Build the default theme from the terminal's palette.
     ///
-    /// Uses `REVERSED` for selection highlight, which automatically uses
-    /// the terminal's own ANSI colors on both light and dark terminals.
+    /// Focus and selection are shown with the `BOLD` modifier — never a
+    /// reverse-video or background swap — so grays stay legible on both light
+    /// and dark terminals (tui-rework 11, item 3).
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            border_focused: Style::new(),
-            border_unfocused: Style::new().add_modifier(Modifier::DIM),
+            border_focused: Style::new().add_modifier(Modifier::BOLD),
+            border_unfocused: Style::new(),
             title: Style::new().add_modifier(Modifier::BOLD),
             hint_key: Style::new().add_modifier(Modifier::BOLD),
             hint_label: Style::new().add_modifier(Modifier::DIM),
-            selection: Style::new().add_modifier(Modifier::REVERSED),
+            selection: Style::new().add_modifier(Modifier::BOLD),
             visual_selection: Style::new().bg(Color::Yellow),
 
             session_active: Style::new().fg(Color::Green),
@@ -106,9 +109,13 @@ mod tests {
     #[test]
     fn test_theme_construction() {
         let theme = Theme::new();
-        assert!(!theme.border_focused.add_modifier.contains(Modifier::DIM));
-        assert!(theme.border_unfocused.add_modifier.contains(Modifier::DIM));
-        assert!(theme.selection.add_modifier.contains(Modifier::REVERSED));
-        assert_eq!(theme.visual_selection.bg, Some(Color::Yellow));
+        // Focus is a bold frame; the unfocused border stays plain (item 3).
+        assert!(theme.border_focused.add_modifier.contains(Modifier::BOLD));
+        assert!(theme.border_unfocused.add_modifier.is_empty());
+        // Selection is bold, never reverse-video (palette honesty).
+        assert!(theme.selection.add_modifier.contains(Modifier::BOLD));
+        assert!(!theme.selection.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(theme.selection.bg, None, "no background swap on selection");
+        assert_eq!(theme.selection.fg, None, "no foreground swap on selection");
     }
 }
