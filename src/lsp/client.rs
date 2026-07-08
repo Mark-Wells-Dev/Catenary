@@ -291,12 +291,22 @@ impl LspClient {
             .await
     }
 
-    /// Runs the health probe: sends `documentSymbol` to verify the server
-    /// can respond. Transitions `Probing` → `Healthy` on success, `Probing` →
-    /// `Failed` on error.
+    /// Runs the health probe: sends `documentSymbol` to verify the server is
+    /// alive and answering. Transitions `Probing` → `Healthy` when the server
+    /// responds (with a result **or** an error), `Probing` → `Failed` only on a
+    /// transport failure (death / stuck / closed connection).
     ///
     /// Uses the same file the diagnostics pipeline is processing — the
     /// `didOpen` that the pipeline sends serves as the probe's `didOpen`.
+    ///
+    /// The probe verifies **liveness**, not capability. A server may legitimately
+    /// not implement `documentSymbol` and answer `-32601 Method not found`
+    /// (`sql-language-server`, `cmake-language-server`): that error *response* is
+    /// proof the server received the request, processed it, and replied — it is
+    /// alive. Treating it as a failure tombstoned working servers as
+    /// `unavailable`, dropping the diagnostics they *did* publish (tui-rework 13
+    /// class B). So an [`LspResponseError`] (any JSON-RPC error response) is a
+    /// PASS; only a transport failure fails the probe.
     ///
     /// No wall-clock timeout wraps the request: under heavy CPU load a
     /// starved-but-alive server can take well over a minute to answer, and a
@@ -323,8 +333,16 @@ impl LspClient {
                 debug!("Health probe succeeded — server is Healthy");
                 true
             }
+            Err(e) if e.is::<super::connection::LspResponseError>() => {
+                // The server answered — with an error, but it answered. That is
+                // liveness (an unadvertised capability yields `-32601`, not a
+                // dead server). Mark it Healthy: it is up and responsive.
+                debug!("Health probe: server answered with an error ({e}) — alive");
+                self.server.try_transition_probing_to_healthy();
+                true
+            }
             Err(e) => {
-                debug!("Health probe failed: {e}");
+                debug!("Health probe failed (transport): {e}");
                 self.server.set_lifecycle(ServerLifecycle::Failed);
                 false
             }
@@ -1422,6 +1440,41 @@ mod tests {
 
         let result = client.run_health_probe("file:///fake.rs").await;
         assert!(!result, "health probe should return false when Dead");
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn health_probe_passes_when_document_symbol_is_unsupported() -> Result<()> {
+        // tui-rework 13 class B: a server that answers `documentSymbol` with
+        // `-32601` (sql-language-server, cmake-language-server) is ALIVE — the
+        // error *response* proves liveness. The probe must transition
+        // Probing → Healthy, not tombstone the server as `unavailable` and drop
+        // the diagnostics it publishes. Regression for the `unavailable: sql-ls`
+        // false failure.
+        let dir = tempfile::tempdir()?;
+        let script = dir.path().join(format!("probe.{MOCK_LANG}"));
+        std::fs::write(&script, "fn hello\nhello\n")?;
+
+        let (mut client, _dir) = spawn_and_init(&["--reject-document-symbol"]).await?;
+        assert_eq!(client.lifecycle(), ServerLifecycle::Probing);
+
+        let uri = format!("file://{}", script.display());
+        client
+            .did_open(&uri, MOCK_LANG, 1, "fn hello\nhello\n")
+            .await?;
+
+        let result = client.run_health_probe(&uri).await;
+        assert!(
+            result,
+            "a documentSymbol `-32601` error response is liveness — the probe must pass"
+        );
+        assert_eq!(
+            client.lifecycle(),
+            ServerLifecycle::Healthy,
+            "the server must be Healthy, not Failed"
+        );
 
         client.shutdown().await?;
         Ok(())

@@ -832,6 +832,18 @@ upgrading.
 
 ### Fixed
 
+- **The health probe no longer executes servers for a method they don't
+  speak.** The liveness probe sent `textDocument/documentSymbol` and read
+  a clean JSON-RPC "method not found" reply as failure — killing perfectly
+  healthy servers (sql-language-server initialized, published its
+  diagnostic, and was then marked unavailable). An error *response* now
+  proves liveness; only transport death fails the probe. Same first-run
+  matrix also fixed: project-layer language bindings routed through the
+  user-config layer where dispatch actually reads them (a project
+  `.catenary.toml` binding classified files but never reached server
+  spawn — masked whenever the shipped default was also installed), and a
+  bounded re-diagnose through the product's own repeat-run contract
+  closes the cold false-`[clean]` for debounce publishers like gopls.
 - **The dashboard no longer cries "stale daemon" on every non-tag build.**
   The snapshot recorded the bare crate semver while the binary reports the
   git-describe build version, so the TUI/doctor version-skew finding fired

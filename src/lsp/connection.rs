@@ -146,6 +146,29 @@ const fn is_retriable_lsp_error(code: i64) -> bool {
     code == -32801 || code == -32800
 }
 
+/// A JSON-RPC error *response* from the server — the server received the
+/// request, processed it, and answered with an error object.
+///
+/// This is categorically distinct from a transport failure (server death,
+/// stuck server, closed connection): an error *response* is proof the server
+/// is alive and answering, which is exactly what a liveness probe verifies.
+/// [`Connection::request`] returns this (via `anyhow`) for every non-retriable
+/// error response, so a caller can `downcast_ref` to tell "the server said no"
+/// (e.g. `-32601 Method not found` for an unadvertised capability) from "the
+/// server is gone". The [`std::fmt::Display`] output is byte-identical to the
+/// prior inline `anyhow!` message, so logs and existing assertions are
+/// unchanged.
+#[derive(Debug, thiserror::Error)]
+#[error("[{language}] LSP error {code}: {message}")]
+pub struct LspResponseError {
+    /// The server's JSON-RPC error code (e.g. `-32601` for method-not-found).
+    pub code: i64,
+    /// The language tag the connection carries (for the message prefix).
+    pub language: String,
+    /// The server's human-readable error message.
+    pub message: String,
+}
+
 /// Poll interval for failure detection sampling.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -477,12 +500,15 @@ impl Connection {
                     }
                     continue;
                 }
-                return Err(anyhow!(
-                    "[{}] LSP error {}: {}",
-                    self.language,
-                    error.code,
-                    error.message
-                ));
+                // An error *response* — the server answered. Carry it as a
+                // typed error so a liveness probe can tell "the server said no"
+                // (alive) from a transport failure (gone). Display is unchanged.
+                return Err(LspResponseError {
+                    code: error.code,
+                    language: self.language.clone(),
+                    message: error.message,
+                }
+                .into());
             }
 
             return Ok(response.result.unwrap_or(serde_json::Value::Null));
@@ -951,6 +977,50 @@ mod tests {
     use crate::logging::LoggingServer;
     use crate::logging::test_support::{query_all_messages, setup_logging};
     use std::time::Duration;
+
+    #[test]
+    fn lsp_response_error_display_is_byte_identical_to_the_prior_message() {
+        // The typed error must render exactly the old inline `anyhow!` string so
+        // logs and any message-matching stay unchanged (tui-rework 13 class B).
+        let err = LspResponseError {
+            code: -32601,
+            language: "sql".to_string(),
+            message: "Unhandled method textDocument/documentSymbol".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "[sql] LSP error -32601: Unhandled method textDocument/documentSymbol"
+        );
+    }
+
+    #[test]
+    fn lsp_response_error_downcasts_through_anyhow() {
+        // The health probe distinguishes an error *response* (server alive) from a
+        // transport failure by downcasting; a plain `anyhow!` transport error must
+        // NOT match, while an `LspResponseError` (via `.into()`) must.
+        let response_err: anyhow::Error = LspResponseError {
+            code: -32601,
+            language: "cmake".to_string(),
+            message: "Method Not Found".to_string(),
+        }
+        .into();
+        assert!(
+            response_err.is::<LspResponseError>(),
+            "error response is typed"
+        );
+        assert_eq!(
+            response_err
+                .downcast_ref::<LspResponseError>()
+                .map(|e| e.code),
+            Some(-32601)
+        );
+
+        let transport_err = anyhow::anyhow!("[cmake] server died during 'x'");
+        assert!(
+            !transport_err.is::<LspResponseError>(),
+            "a transport failure must NOT read as an error response"
+        );
+    }
 
     /// Verify that `emit_lsp_event` routes each tracing level to the
     /// correct macro, producing DB rows with the expected level string.

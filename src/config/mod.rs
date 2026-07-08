@@ -911,6 +911,44 @@ servers = ["tsserver"]
     }
 
     #[test]
+    fn user_config_language_binding_reroutes_over_the_shipped_default() -> anyhow::Result<()> {
+        // tui-rework 13 class E: the conformance harness routes the marksman
+        // fixture to marksman with a one-line USER-config binding over the
+        // shipped defaults (markdown → lattice, decision 015). This pins the
+        // mechanism that fix depends on: a user `[lsp.language.markdown]`
+        // `servers` list REPLACES the default binding (array-replace merge), and
+        // does so even though the default server (lattice) is never absent from
+        // the shipped server definitions — the reroute is by binding, not by the
+        // default's absence. The shipped `[lsp.server.marksman]` definition is
+        // untouched, so its command still comes from the defaults.
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "[lsp.language.markdown]\nservers = [\"marksman\"]\n",
+        )?;
+
+        let config = Config::load_from_sources(&[config_path])?;
+
+        let markdown = config
+            .resolve_language("markdown")
+            .expect("markdown resolves from the shipped defaults");
+        assert_eq!(
+            markdown.servers,
+            Some(vec![ServerBinding::new("marksman")]),
+            "the user binding must replace the shipped `lattice` default, not merge with it"
+        );
+        // The shipped marksman server definition still loads (its command is not
+        // redefined by the routing opt-in).
+        assert!(
+            config.server.contains_key("marksman"),
+            "the shipped [lsp.server.marksman] definition must survive the binding override"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_empty_config() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let config_path = dir.path().join("config.toml");

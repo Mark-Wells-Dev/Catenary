@@ -1697,6 +1697,7 @@ mod tests {
             draft: true,
             hash: None,
             note: None,
+            conformance: true,
             runtime: None,
         };
         let mut manifest = BlessedManifest::default();

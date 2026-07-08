@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<!-- Conformance fixture (tui-rework 13).
+     Intentional diagnostic: vscode-html-language-server validates embedded CSS
+     by default and flags the unknown property `colr` in the <style> block. -->
+<html>
+  <head>
+    <style>
+      .conformance { colr: red; }
+    </style>
+  </head>
+  <body>
+    <h1>Conformance</h1>
+  </body>
+</html>

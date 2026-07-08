@@ -166,9 +166,10 @@ jobs:
           java-version: ${{ matrix.runtime_version || '21' }}
 
       # Some servers derive diagnostics from an external linter named in the
-      # recipe `note` (bash-ls → shellcheck, ansible-ls → ansible-lint, elm-ls →
-      # the elm compiler). Provisioned here so the intentional diagnostic can
-      # publish. (These should graduate to structured `runtime` fields.)
+      # recipe `note` (bash-ls → shellcheck, ansible-ls → ansible-lint, vim-ls →
+      # vint, elm-ls → the elm compiler). Provisioned here so the intentional
+      # diagnostic can publish. (These should graduate to structured `runtime`
+      # fields.)
       - name: Provision diagnostic dependencies
         run: |
           set -euo pipefail
@@ -177,6 +178,7 @@ jobs:
               sudo apt-get update && sudo apt-get install -y shellcheck ;;
             ansible-ls)
               pipx install ansible-lint || pip install ansible-lint ;;
+            vim-ls) pipx install vim-vint || pip install vim-vint ;;
             elm-ls) npm install -g --ignore-scripts elm ;;
             *) echo "no extra diagnostic dependency for ${{ matrix.server }}" ;;
           esac

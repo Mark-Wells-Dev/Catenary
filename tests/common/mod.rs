@@ -320,11 +320,30 @@ impl BridgeProcess {
     /// which must outlive the returned process). It becomes both the sole
     /// workspace root and the IPC `cwd`.
     pub fn spawn_conformance(root: &Path) -> Result<Self> {
+        Self::spawn_conformance_with_config(root, None)
+    }
+
+    /// Like [`Self::spawn_conformance`], but layers an explicit **user** config
+    /// file (`CATENARY_CONFIG`) over the shipped defaults.
+    ///
+    /// The shipped defaults still load (embedded, lowest priority); the named
+    /// file merges on top, so a one-line `[lsp.language.<lang>]` binding
+    /// override reroutes the language while every shipped server *definition*
+    /// (its command/args) stays intact. This is the layer a routing opt-in must
+    /// live in to take effect: a project `.catenary.toml` `[lsp.language.*]`
+    /// `servers` list drives classification only, not server dispatch, so it
+    /// does not reroute (tui-rework 13 class E — the marksman CI miss). `None`
+    /// spawns pure shipped defaults, unchanged.
+    pub fn spawn_conformance_with_config(root: &Path, config: Option<&Path>) -> Result<Self> {
         let inherited_path = std::env::var_os("PATH").unwrap_or_default();
         let root_env = root.to_path_buf();
+        let config_env = config.map(Path::to_path_buf);
         let mut proc = Self::spawn_with(|cmd| {
             cmd.env("PATH", inherited_path);
             cmd.env("CATENARY_ROOTS", &root_env);
+            if let Some(config_path) = config_env {
+                cmd.env("CATENARY_CONFIG", config_path);
+            }
         })?;
         proc.ipc_cwd = Some(root.to_path_buf());
         Ok(proc)

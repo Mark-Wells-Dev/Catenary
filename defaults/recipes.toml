@@ -93,6 +93,8 @@ version = "4.10.0"
 tier = "npm-tarball-sha512"
 draft = true
 hash = "sha512-EFf9uQI4dAKbzMQFjDvVm1xJq1DXAQvBEuEfPGrK/xzfsL5xWTfIuRr90NgfmqwO+IEt6vLZm9EOj6R66xIifg=="
+conformance = false
+note = "conformance = false (tui-rework 13): vscode-eslint-language-server needs the `eslint` npm package co-installed in the fixture project (a bare fixture yields `-32603: path argument must be of type string`), AND a VS-Code-shaped `settings` payload (workspaceFolder / nodePath / validate) that Catenary's shipped defaults do not deliver — its textDocument/diagnostic pull errors without it. Conforming it needs both an eslint co-install recipe and a shipped `[lsp.server.vscode-eslint]` settings block (unverifiable on the maintainer host — eslint is absent); excluded until that lands rather than shipped as a guaranteed-red job."
 
 [recipe.typescript-ls]
 ecosystem = "npm"
@@ -101,7 +103,8 @@ version = "5.3.0"
 tier = "npm-tarball-sha512"
 draft = true
 hash = "sha512-5puofxZHgFdAYtfNpmwCAvgtaYgg8wrUnH30m7Ze3QuguId5RNRadKASpOpyDxTyUdAF51FjhTdjntLw/EuWcQ=="
-note = "resolves transitive deps at install time within the pinned version; the engine's --ignore-scripts install caps the residual to non-executing dep code."
+conformance = false
+note = "resolves transitive deps at install time within the pinned version; the engine's --ignore-scripts install caps the residual to non-executing dep code. conformance = false (tui-rework 13): typescript-language-server is a push-only publisher (no textDocument/diagnostic pull) whose first didOpen/didSave diagnostic lands on an internal debounce AFTER the process has gone scheduler-idle, so the settle-then-collect window (and even the product's warm re-diagnose round) closes before the publish — verified locally, deterministic [clean]. This is the residual push-only tail of bug 74 the best-effort pull cannot cover (see the tui-rework 13 report's class C product observation); excluded until the settle/publish gap is closed product-side rather than shipped as a guaranteed-red job."
 
 # pyright's npm package is bundled (ships its own bundled node code); minimal
 # residual install-time dependency risk. The pyright class (findings 5/6) is why
@@ -165,6 +168,7 @@ version = "2.3.1"
 tier = "npm-tarball-sha512"
 draft = true
 hash = "sha512-Y9Zy3NKzfndLUfuZRrITkpfGvpL2K7hNPV8sJ1iB6mf1YRxIX3Hs6lwZimoD5pmvamUaOQhNGYMS/Ox9itzA4Q=="
+note = "diagnostics come from `vint` (a vimscript linter the server shells out to); a conformance job provisions it (pip). Without vint the server publishes an empty diagnostic set, so the fixture's intentional diagnostic depends on vint being present (like bash-ls → shellcheck, ansible-ls → ansible-lint)."
 
 [recipe.sql-ls]
 ecosystem = "npm"
@@ -194,7 +198,8 @@ package = "cmake-language-server"
 version = "0.1.11"
 tier = "pip-hashes"
 draft = true
-note = "hash pending: --require-hashes needs the sha256 of every artifact in the resolved closure (pip-compile --generate-hashes), which refresh-recipes produces — a single-package hash is not shippable, so it is honestly omitted."
+conformance = false
+note = "hash pending: --require-hashes needs the sha256 of every artifact in the resolved closure (pip-compile --generate-hashes), which refresh-recipes produces — a single-package hash is not shippable, so it is honestly omitted. conformance = false (tui-rework 13): cmake-language-server 0.1.11 implements NO diagnostics (only completion/hover/formatting — no publishDiagnostics, no textDocument/diagnostic), so it cannot satisfy the intentional-diagnostic contract and is excluded from the matrix rather than shipped as a guaranteed-red job."
 
 # ── go tranche ───────────────────────────────────────────────────────
 # the go toolchain is the implied host; the checksum DB verifies transparently.

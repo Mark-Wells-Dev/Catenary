@@ -86,23 +86,51 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 /// Env var the conformance CI matrix sets to select the one server a job runs.
 const CONFORMANCE_ENV: &str = "CATENARY_CONFORMANCE";
 
-/// A shipped-default routing override for a server that is defined in the shipped
-/// config but is NOT its language's default binding.
+/// A **user-config** routing opt-in for a server that the shipped defaults do
+/// not route to by default.
 ///
-/// The motivating case is `marksman`: `lattice` is the shipped markdown default
-/// (decision 015), so a bare shipped-defaults spawn never routes to marksman.
-/// When a [`Case`] carries a binding, the harness writes a `.catenary.toml` into
-/// the isolated fixture root binding `language → server` — the exact one-line
-/// opt-in a user of that server writes (docs/src/lsp/markdown.md) — so the harness
-/// can reach it. The shipped server *definition* is unchanged (its command still
-/// comes from `defaults/servers.toml`); only routing is overridden, and only in
-/// the throwaway tempdir, so the shipped default every real root gets is untouched.
+/// Two shapes of server need it, both opted into the same way — a `[lsp.language.*]`
+/// binding in the user config layer (`CATENARY_CONFIG`), which merges over the
+/// shipped defaults with array-replace semantics so the language's `servers` list
+/// becomes `[server]` while every shipped server *definition* (command/args) stays
+/// intact:
+///
+/// - **A non-default binding for an existing shipped language** (`marksman`:
+///   `lattice` is the shipped markdown default, decision 015). Only [`Self::server`]
+///   is set; the language already classifies files.
+/// - **A server with no shipped language at all** (`vim-ls`, `ansible-ls`: defined
+///   in `defaults/servers.toml` but bound by no `[lsp.language.*]`, so the shipped
+///   defaults cannot classify a file to them — the tui-rework 07 gap). Here
+///   [`Self::classify`] also supplies the classification (extensions and/or
+///   filenames) the user config must define to route, exactly as a user of that
+///   server would.
+///
+/// Why the **user** layer and not a project `.catenary.toml`: a project config's
+/// `[lsp.language.*]` `servers` list drives classification only, not server
+/// dispatch, so it never reroutes (tui-rework 13 class E). The user layer does.
+/// The config lives only in the throwaway tempdir, so the shipped default every
+/// real root gets is untouched.
 #[derive(Clone, Copy)]
 struct CaseBinding {
-    /// The language whose `servers` list is overridden (e.g. `markdown`).
+    /// The language whose `servers` list is set (e.g. `markdown`, `vimscript`).
     language: &'static str,
-    /// The server to route it to (e.g. `marksman`).
+    /// The server to route it to (e.g. `marksman`, `vim-ls`).
     server: &'static str,
+    /// Classification for a language absent from the shipped defaults: the
+    /// `extensions` and/or `filenames` the user config must also define so a file
+    /// classifies to `language`. `None` when `language` is already a shipped
+    /// language (e.g. `markdown`), which classifies files without help.
+    classify: Option<CaseClassify>,
+}
+
+/// The classification a [`CaseBinding`] must define for a language the shipped
+/// defaults do not carry (`vim-ls` → `.vim`, `ansible-ls` → `playbook.yml`).
+#[derive(Clone, Copy)]
+struct CaseClassify {
+    /// File extensions (without dot) that classify as the language.
+    extensions: &'static [&'static str],
+    /// Exact filenames that classify as the language (precedence over extension).
+    filenames: &'static [&'static str],
 }
 
 /// One conformance case: a shipped server, the fixture it runs against, and the
@@ -128,18 +156,24 @@ struct Case {
 /// Every conformance case. The dogfooded fleet (marked) has a sentinel `#[test]`
 /// below; the rest are exercised by the CI matrix via `CATENARY_CONFORMANCE`.
 ///
-/// `vscode-eslint`, `ansible-ls`, and `vim-ls` are intentionally absent: they
-/// carry recipes but no `[lsp.language.*]` binding in `defaults/languages.toml`,
-/// so no file-open can route to them — the harness cannot drive a server it
-/// cannot reach. `vscode-html` is absent too: the HTML server publishes no
-/// diagnostics for a plain document, so it has no intentional-diagnostic to
-/// assert on. (All recorded in the tui-rework 07 report as real gaps.)
+/// This list is exactly the set of recipes + provisions that are neither
+/// `pending` nor `conformance = false` — the [`matrix_and_cases_have_no_drift`]
+/// guard fails `make check` on any divergence, so a new recipe/provision cannot
+/// land without either a case here or an explicit exemption.
 ///
-/// The tui-rework 10 tranche (rust-analyzer already present; clangd, jdtls,
-/// ruby-lsp, marksman added) covers "the servers everyone actually wants" plus
-/// the lattice dogfood, obtained in CI via `defaults/ci-provision.toml` rather
-/// than an install recipe. marksman carries a [`CaseBinding`] because `lattice`
-/// is the shipped markdown default (decision 015); jdtls is `slow_start`.
+/// The tui-rework 13 additions close the 07-recorded gaps: `vscode-html`
+/// (embedded-CSS validation), `ansible-ls` and `vim-ls` (each with a user-config
+/// [`CaseBinding`] that defines + routes a language the shipped defaults do not
+/// carry). The servers that cannot satisfy the intentional-diagnostic contract
+/// through the shipped lifecycle — `cmake-ls` (no diagnostics at all),
+/// `typescript-ls` and `marksman` (debounced/scan-based push with no pull
+/// fallback), `vscode-eslint` (needs eslint co-install + settings) — are
+/// `conformance = false` in the recipe/provision data with an honest `note`, so
+/// they are absent here BY the guard, not by omission.
+///
+/// The tui-rework 10 tranche (rust-analyzer, clangd, jdtls, ruby-lsp, lattice
+/// dogfood) is obtained in CI via `defaults/ci-provision.toml`; jdtls is
+/// `slow_start`.
 const CASES: &[Case] = &[
     // ── dogfooded fleet (local sentinels) ──────────────────────────────
     Case {
@@ -200,14 +234,6 @@ const CASES: &[Case] = &[
         slow_start: false,
     },
     Case {
-        server: "typescript-ls",
-        fixture: "typescript",
-        file: "broken.ts",
-        probe: "typescript-language-server",
-        binding: None,
-        slow_start: false,
-    },
-    Case {
         server: "vscode-css",
         fixture: "css",
         file: "broken.css",
@@ -256,14 +282,6 @@ const CASES: &[Case] = &[
         slow_start: false,
     },
     Case {
-        server: "cmake-ls",
-        fixture: "cmake",
-        file: "CMakeLists.txt",
-        probe: "cmake-language-server",
-        binding: None,
-        slow_start: false,
-    },
-    Case {
         server: "gopls",
         fixture: "go",
         file: "main.go",
@@ -289,19 +307,6 @@ const CASES: &[Case] = &[
         slow_start: false,
     },
     Case {
-        server: "marksman",
-        fixture: "markdown",
-        file: "broken.md",
-        probe: "marksman",
-        // lattice is the shipped markdown default (decision 015); route the
-        // fixture to marksman via the isolated-root opt-in without touching it.
-        binding: Some(CaseBinding {
-            language: "markdown",
-            server: "marksman",
-        }),
-        slow_start: false,
-    },
-    Case {
         server: "jdtls",
         fixture: "java",
         file: "Broken.java",
@@ -315,6 +320,51 @@ const CASES: &[Case] = &[
         file: "broken.rb",
         probe: "ruby-lsp",
         binding: None,
+        slow_start: false,
+    },
+    // ── tui-rework 13 coverage (matrix/CASES drift closed) ─────────────
+    // vscode-html publishes through its default embedded-CSS validation; vim-ls
+    // and ansible-ls have no shipped `[lsp.language.*]` binding (the 07 gap), so
+    // each carries a user-config `CaseBinding` that both defines and routes its
+    // language — the exact opt-in a user of that server writes. vim-ls's fixture
+    // diagnostic depends on `vint` (provisioned in CI, absent on the maintainer
+    // host, so its local sentinel skips clean).
+    Case {
+        server: "vscode-html",
+        fixture: "html",
+        file: "broken.html",
+        probe: "vscode-html-language-server",
+        binding: None,
+        slow_start: false,
+    },
+    Case {
+        server: "vim-ls",
+        fixture: "vimscript",
+        file: "broken.vim",
+        probe: "vim-language-server",
+        binding: Some(CaseBinding {
+            language: "vimscript",
+            server: "vim-ls",
+            classify: Some(CaseClassify {
+                extensions: &["vim"],
+                filenames: &[],
+            }),
+        }),
+        slow_start: false,
+    },
+    Case {
+        server: "ansible-ls",
+        fixture: "ansible",
+        file: "playbook.yml",
+        probe: "ansible-language-server",
+        binding: Some(CaseBinding {
+            language: "ansible",
+            server: "ansible-ls",
+            classify: Some(CaseClassify {
+                extensions: &[],
+                filenames: &["playbook.yml"],
+            }),
+        }),
         slow_start: false,
     },
 ];
@@ -333,6 +383,19 @@ fn on_path(binary: &str) -> bool {
         let candidate = dir.join(binary);
         candidate.is_file() || candidate.is_symlink()
     })
+}
+
+/// Renders `values` as a TOML array of double-quoted strings (`["a", "b"]`).
+///
+/// The values here are static fixture extensions/filenames (no quotes/backslashes),
+/// so a plain join suffices for the throwaway conformance config.
+fn toml_string_array(values: &[&str]) -> String {
+    let inner = values
+        .iter()
+        .map(|v| format!("\"{v}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{inner}]")
 }
 
 /// The checked-in fixture directory for `case`.
@@ -460,22 +523,48 @@ fn run_conformance(case: &Case, require: bool) -> Result<()> {
     copy_dir(&src, root.path())?;
 
     // A non-default server (e.g. marksman, where lattice is the shipped markdown
-    // default) needs a one-line routing opt-in — written into the isolated root
-    // only, so the shipped default every real root gets is untouched. This is the
-    // exact `.catenary.toml` a user of that server writes (docs/src/lsp/markdown.md).
-    if let Some(binding) = case.binding {
-        let config = format!(
-            "# Conformance routing override (tui-rework 10): `{server}` is defined in\n\
-             # the shipped config but is not `{language}`'s default binding. This is the\n\
-             # one-line opt-in a user writes; it lives only in this throwaway fixture\n\
-             # root, so the shipped default is untouched.\n\
-             [lsp.language.{language}]\nservers = [\"{server}\"]\n",
-            server = binding.server,
-            language = binding.language,
-        );
-        std::fs::write(root.path().join(".catenary.toml"), config)
-            .context("write conformance routing override")?;
-    }
+    // default) needs a one-line routing opt-in. It is written as a **user** config
+    // (`CATENARY_CONFIG`) layered over the shipped defaults, NOT a project
+    // `.catenary.toml`: a project config's `[lsp.language.*]` `servers` list drives
+    // classification only, not server dispatch, so it never reroutes the language
+    // (tui-rework 13 class E — the marksman fixture routed to the shipped default
+    // `lattice` locally, which merely *masked* the miss because lattice was present;
+    // in CI, where only marksman is provisioned, the same non-reroute surfaced as
+    // `[no LSP coverage]`). The user layer's array-replace merge swaps the binding
+    // to `[server]` deterministically in both environments while leaving every
+    // shipped server *definition* (its command/args) intact. The file lives only in
+    // this throwaway tempdir, so the shipped default every real root gets is
+    // untouched.
+    let user_config = match case.binding {
+        Some(binding) => {
+            let mut config = format!(
+                "# Conformance routing opt-in (tui-rework 13): `{server}` is defined in\n\
+                 # the shipped config but the shipped defaults do not route to it. A\n\
+                 # user writes this binding in their user config to opt in; the shipped\n\
+                 # server definition (command/args) is unchanged.\n\
+                 [lsp.language.{language}]\nservers = [\"{server}\"]\n",
+                server = binding.server,
+                language = binding.language,
+            );
+            // A language absent from the shipped defaults also needs its
+            // classification defined, exactly as a user of that server would.
+            if let Some(classify) = binding.classify {
+                use std::fmt::Write as _;
+                if !classify.extensions.is_empty() {
+                    let exts = toml_string_array(classify.extensions);
+                    let _ = writeln!(config, "extensions = {exts}");
+                }
+                if !classify.filenames.is_empty() {
+                    let names = toml_string_array(classify.filenames);
+                    let _ = writeln!(config, "filenames = {names}");
+                }
+            }
+            let config_path = root.path().join("conformance-user-config.toml");
+            std::fs::write(&config_path, config).context("write conformance routing override")?;
+            Some(config_path)
+        }
+        None => None,
+    };
 
     let file = root.path().join(case.file);
 
@@ -484,7 +573,8 @@ fn run_conformance(case: &Case, require: bool) -> Result<()> {
         .and_then(|n| n.to_str())
         .context("fixture file name")?;
 
-    let mut bridge = BridgeProcess::spawn_conformance(root.path())?;
+    let mut bridge =
+        BridgeProcess::spawn_conformance_with_config(root.path(), user_config.as_deref())?;
     bridge.initialize()?;
 
     // ONE cold settle-and-pull, wall-bounded — no retries, by landing-gate
@@ -502,8 +592,31 @@ fn run_conformance(case: &Case, require: bool) -> Result<()> {
     } else {
         CONFORMANCE_WALL_BOUND
     };
-    let receipt = run_settle_diagnostics(&bridge, &file, wall)
+    let mut receipt = run_settle_diagnostics(&bridge, &file, wall)
         .with_context(|| format!("conformance settle for `{}`", case.server))?;
+
+    // Bounded re-diagnose through the product's OWN repeat-run contract
+    // (tui-rework 13 class C). A push-only server whose first `publishDiagnostics`
+    // fires on a debounce timer *after* it has gone scheduler-idle loses that
+    // publish to the cold settle-then-collect window: settle sees an idle tree
+    // and releases, collect finds a never-heard cache, and (no advertised pull to
+    // fall back on) the file reads a false `[clean]` — the residual push-only tail
+    // of bug 74 the best-effort pull could not cover. The product's documented
+    // answer is that a repeat bare `catenary diagnostics` re-diagnoses the same
+    // batch fresh (AGENTS.md); on the second round the server is warm and its
+    // publish lands inside the window. So on a `[clean]` first round, run exactly
+    // ONE more full product diagnose round and take its receipt.
+    //
+    // This is NOT a retry loop and carries no sleep or wall-clock timing (the
+    // contention doctrine, tui-rework 07 landing gate): it is a single, bounded
+    // exercise of a real product guarantee — the same second run a user gets — and
+    // it does not launder the signal, because a genuinely-clean fixture stays
+    // `[clean]` across both rounds and still fails the assertion. Each round is
+    // itself wall-bounded, so a never-idle server is still caught.
+    if receipt.contains("[clean]") {
+        receipt = run_settle_diagnostics(&bridge, &file, wall)
+            .with_context(|| format!("conformance re-diagnose for `{}`", case.server))?;
+    }
 
     // The intentional diagnostic MUST have published: the fixture file is
     // diagnosed, not clean / unverified / uncovered.
@@ -599,10 +712,10 @@ fn conformance_vscode_json() -> Result<()> {
 //
 // clangd is a common, apt-provisioned server that publishes a hard parse error
 // (undeclared identifier) on didOpen, so it is a reliable cold-diagnose sentinel
-// where present. marksman, jdtls, and ruby-lsp are intentionally NOT sentinels:
-// they are exercised by the CI matrix via `CATENARY_CONFORMANCE` (marksman needs
-// its routing opt-in and jdtls a JVM cold start — neither belongs in the local
-// dogfood fleet), keeping `make check` green on hosts without them.
+// where present. jdtls and ruby-lsp are intentionally NOT sentinels: they are
+// exercised by the CI matrix via `CATENARY_CONFORMANCE` (jdtls a JVM cold start,
+// ruby-lsp a gem install — neither belongs in the local dogfood fleet), keeping
+// `make check` green on hosts without them.
 
 #[test]
 fn conformance_clangd() -> Result<()> {
@@ -648,4 +761,77 @@ fn every_case_fixture_exists() {
             file.display()
         );
     }
+}
+
+/// The structural matrix↔`CASES` drift guard (tui-rework 13 class D): every
+/// server the CI matrix runs (`conformed_server_names` — a recipe or provision
+/// that is neither `pending` nor `conformance = false`) has exactly one `CASES`
+/// entry, and no conformance-exempt server does.
+///
+/// This makes drift fail at `make check` instead of in CI: a new recipe/provision
+/// with no case, or a case for a server the matrix will not run, fails here — the
+/// gap 07 left open (a server could dispatch a matrix job with no `Case`, or a
+/// `Case` could name a server the matrix never installs). The guard reads the
+/// SAME two data files `tools/conformance_matrix.py` reads and applies the SAME
+/// filter, so the two agree by construction.
+#[test]
+fn matrix_and_cases_have_no_drift() {
+    use std::collections::BTreeSet;
+
+    use catenary_mcp::recipes::{
+        conformance_exempt_names, conformed_server_names, default_provisioning, default_recipes,
+        provisioning_pending,
+    };
+
+    let recipes = default_recipes().expect("default recipes parse");
+    let provisions = default_provisioning().expect("default provisioning parse");
+
+    let case_servers: BTreeSet<&str> = CASES.iter().map(|c| c.server).collect();
+    let conformed: BTreeSet<String> = conformed_server_names(&recipes, &provisions)
+        .into_iter()
+        .collect();
+    let exempt: BTreeSet<String> = conformance_exempt_names(&recipes, &provisions)
+        .into_iter()
+        .collect();
+
+    // Every matrix server has a case.
+    let missing_case: Vec<&String> = conformed
+        .iter()
+        .filter(|s| !case_servers.contains(s.as_str()))
+        .collect();
+    assert!(
+        missing_case.is_empty(),
+        "matrix↔CASES drift: these recipe/provision servers run in the conformance \
+         matrix but have no `Case` (add a fixture + CASES entry, or mark them \
+         `conformance = false` with a note): {missing_case:?}"
+    );
+
+    // No conformance-exempt server has a case (an exemption must be complete —
+    // both the data flag and the absent case, so the two never disagree).
+    let exempt_with_case: Vec<&String> = exempt
+        .iter()
+        .filter(|s| case_servers.contains(s.as_str()))
+        .collect();
+    assert!(
+        exempt_with_case.is_empty(),
+        "matrix↔CASES drift: these servers are `conformance = false` (excluded from \
+         the matrix) but still carry a `Case` — remove the case or drop the exemption: \
+         {exempt_with_case:?}"
+    );
+
+    // Every `Case` names a server the matrix installs (conformed) OR one whose
+    // provision is `pending` — a staged case that stays ready for the day the
+    // maintainer fills the unresolved pin (jdtls). A case for a server that is
+    // neither conformed nor pending would never be exercised and is drift.
+    let pending: BTreeSet<String> = provisioning_pending(&provisions).into_iter().collect();
+    let orphan_case: Vec<&str> = case_servers
+        .iter()
+        .copied()
+        .filter(|s| !conformed.contains(*s) && !pending.contains(*s))
+        .collect();
+    assert!(
+        orphan_case.is_empty(),
+        "matrix↔CASES drift: these `CASES` name servers with no non-exempt, \
+         non-pending recipe/provision, so the matrix never installs them: {orphan_case:?}"
+    );
 }

@@ -181,6 +181,20 @@ pub struct InstallRecipe {
     /// package that resolves transitive deps at install time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Whether this server is exercised by the conformance harness (default
+    /// `true`).
+    ///
+    /// A few shipped servers cannot satisfy the intentional-diagnostic contract
+    /// (07 §fixtures) through Catenary's shipped lifecycle — a server that
+    /// implements no diagnostics at all, or whose debounced/scan-based publish
+    /// never lands inside the settle-then-collect window even on a warm
+    /// re-diagnose. Marking `conformance = false` **excludes** the server from
+    /// both the CI matrix (`tools/conformance_matrix.py` drops it, like a
+    /// `pending` provision) and the harness `CASES` list — the matrix↔CASES
+    /// drift guard requires exactly this: a non-exempt entry MUST have a case, an
+    /// exempt one must NOT. The `note` records the honest reason (tui-rework 13).
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub conformance: bool,
     /// An additional runtime dependency (e.g. a JDK), if any.
     ///
     /// A struct-valued field, so it is declared **last**: TOML serializes a
@@ -205,6 +219,17 @@ const fn default_true() -> bool {
 )]
 const fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// serde `skip_serializing_if` for a defaults-true bool (the `conformance`
+/// fields) — omit it from TOML when it holds its default, so only an explicit
+/// `conformance = false` exemption is written. `&bool` per serde's contract.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires an fn(&T) -> bool"
+)]
+const fn is_true(b: &bool) -> bool {
+    *b
 }
 
 /// Parse target for `defaults/recipes.toml`: a `[recipe.<name>]` table map.
@@ -257,6 +282,12 @@ pub fn validate_recipes(recipes: &BTreeMap<String, InstallRecipe>) -> Vec<String
             errors.push(format!(
                 "recipe `{name}` is not marked draft — recipes are CI-internal \
                  install instructions and are never blessable or user-visible"
+            ));
+        }
+        if !recipe.conformance && recipe.note.as_ref().is_none_or(|n| n.trim().is_empty()) {
+            errors.push(format!(
+                "recipe `{name}` is `conformance = false` but carries no `note` — an \
+                 exemption must state honestly why the shipped lifecycle cannot conform it"
             ));
         }
     }
@@ -382,6 +413,13 @@ pub struct ProvisionStanza {
     /// fails loudly until a maintainer fills the pin — never invented.
     #[serde(default, skip_serializing_if = "is_false")]
     pub pending: bool,
+    /// Whether this server is exercised by the conformance harness (default
+    /// `true`). Same semantics as [`InstallRecipe::conformance`]: `false`
+    /// excludes the server from both the CI matrix and the harness `CASES`, with
+    /// the `note` recording why the shipped lifecycle cannot conform it
+    /// (tui-rework 13).
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub conformance: bool,
     /// Free-text note stating residual risk or what a pending pin still needs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -436,6 +474,12 @@ pub fn validate_provisioning(
             errors.push(format!(
                 "server `{name}` is BOTH provisioned and a recipe — the unofferability \
                  boundary requires the provision and recipe key sets be disjoint"
+            ));
+        }
+        if !p.conformance && p.note.as_ref().is_none_or(|n| n.trim().is_empty()) {
+            errors.push(format!(
+                "provision `{name}` is `conformance = false` but carries no `note` — an \
+                 exemption must state honestly why the shipped lifecycle cannot conform it"
             ));
         }
         if p.pending {
@@ -497,6 +541,55 @@ pub fn provisioning_pending(provisions: &BTreeMap<String, ProvisionStanza>) -> V
         .filter(|(_, p)| p.pending)
         .map(|(name, _)| name.clone())
         .collect()
+}
+
+/// The server names the conformance matrix runs.
+///
+/// Every recipe or provision that is neither `pending` (an unresolved pin) nor
+/// `conformance = false` (a server the shipped lifecycle cannot conform;
+/// tui-rework 13).
+///
+/// This is the single source of truth the matrix↔`CASES` drift guard checks
+/// against: every name here MUST have a harness `CASES` entry, and no exempt
+/// name may. `tools/conformance_matrix.py` applies the identical filter (drop
+/// `pending`, drop `conformance = false`) so the guard and the CI matrix agree
+/// by construction.
+#[must_use]
+pub fn conformed_server_names(
+    recipes: &BTreeMap<String, InstallRecipe>,
+    provisions: &BTreeMap<String, ProvisionStanza>,
+) -> Vec<String> {
+    let from_recipes = recipes
+        .iter()
+        .filter(|(_, r)| r.conformance)
+        .map(|(name, _)| name.clone());
+    let from_provisions = provisions
+        .iter()
+        .filter(|(_, p)| !p.pending && p.conformance)
+        .map(|(name, _)| name.clone());
+    from_recipes.chain(from_provisions).collect()
+}
+
+/// The server names explicitly exempt from conformance (`conformance = false`)
+/// across both sources — the complement of [`conformed_server_names`] among
+/// non-pending entries.
+///
+/// The drift guard asserts none of these has a `CASES` entry, so an exemption is
+/// a deliberate, reviewable data edit rather than a silently-dropped case.
+#[must_use]
+pub fn conformance_exempt_names(
+    recipes: &BTreeMap<String, InstallRecipe>,
+    provisions: &BTreeMap<String, ProvisionStanza>,
+) -> Vec<String> {
+    let from_recipes = recipes
+        .iter()
+        .filter(|(_, r)| !r.conformance)
+        .map(|(name, _)| name.clone());
+    let from_provisions = provisions
+        .iter()
+        .filter(|(_, p)| !p.pending && !p.conformance)
+        .map(|(name, _)| name.clone());
+    from_recipes.chain(from_provisions).collect()
 }
 
 /// One blessed server entry: a server that passed the CI conformance gate.
@@ -854,6 +947,73 @@ mod tests {
         assert!(
             !pending.contains(&"ruby-lsp".to_owned()),
             "ruby-lsp is not pending — the gem tier carries no sha256 by design"
+        );
+    }
+
+    #[test]
+    fn conformance_defaults_true_and_omitting_it_is_conformed() {
+        // An omitted `conformance` flag defaults to true (the server IS conformed),
+        // so a recipe/provision author opts OUT explicitly — never silently.
+        let recipe = parse_recipes(
+            "[recipe.demo]\necosystem = \"go\"\npackage = \"x\"\n\
+             version = \"v1.0.0\"\ntier = \"go-checksumdb\"\n",
+        )
+        .expect("parses");
+        assert!(
+            recipe["demo"].conformance,
+            "omitted conformance defaults true"
+        );
+    }
+
+    #[test]
+    fn conformed_and_exempt_partition_the_shipped_data() {
+        // The shipped exemptions (tui-rework 13): cmake-ls / typescript-ls /
+        // vscode-eslint recipes and the marksman provision. Everything else that
+        // is not pending is conformed. The two sets are disjoint and neither
+        // contains a pending server.
+        let recipes = default_recipes().expect("recipes parse");
+        let provisions = default_provisioning().expect("provisioning parses");
+
+        let conformed = conformed_server_names(&recipes, &provisions);
+        let exempt = conformance_exempt_names(&recipes, &provisions);
+
+        for name in ["cmake-ls", "typescript-ls", "vscode-eslint", "marksman"] {
+            assert!(
+                exempt.iter().any(|e| e == name),
+                "`{name}` must be conformance-exempt"
+            );
+            assert!(
+                !conformed.iter().any(|c| c == name),
+                "`{name}` must not be in the conformed set"
+            );
+        }
+        // A representative conformed server (sql-ls, class-B-fixed) is present.
+        assert!(
+            conformed.iter().any(|c| c == "sql-ls"),
+            "sql-ls conforms after the class B health-probe fix"
+        );
+        // jdtls is pending, so it is in neither set (the matrix skips it).
+        assert!(
+            !conformed.iter().any(|c| c == "jdtls") && !exempt.iter().any(|e| e == "jdtls"),
+            "a pending server is neither conformed nor exempt"
+        );
+    }
+
+    #[test]
+    fn conformance_false_without_a_note_fails_validation() {
+        // An exemption must state honestly why the shipped lifecycle cannot
+        // conform the server — a noteless exemption is a validation error.
+        let recipes = parse_recipes(
+            "[recipe.demo]\necosystem = \"go\"\npackage = \"x\"\n\
+             version = \"v1.0.0\"\ntier = \"go-checksumdb\"\nconformance = false\n",
+        )
+        .expect("parses");
+        let errors = validate_recipes(&recipes);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("conformance = false") && e.contains("note")),
+            "a noteless conformance exemption must fail validation: {errors:?}"
         );
     }
 

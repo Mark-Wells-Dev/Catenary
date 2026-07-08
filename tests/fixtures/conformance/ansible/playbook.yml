@@ -1,0 +1,12 @@
+---
+# Conformance fixture (tui-rework 13).
+# Intentional diagnostic: ansible-lint (fed through ansible-language-server)
+# flags the task with no `name` (rule `name[missing]`) and the trailing-space /
+# octal-permission issues below.
+- hosts: all
+  tasks:
+    - command: echo hello
+      register: result
+    - file:
+        path: /tmp/conformance
+        mode: 777

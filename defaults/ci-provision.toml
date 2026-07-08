@@ -98,7 +98,8 @@ version = "2026-02-08"
 asset = "marksman-linux-x64"
 sha256 = "be5098e8213219269c47fc0d916a66fa31ce0602ec967475c722260aabf26087"
 bin = "marksman"
-note = "the asset is a bare executable, not an archive; the job copies it to `bin` (basename must equal the shipped [lsp.server.marksman] command `marksman`) and puts it on PATH."
+conformance = false
+note = "the asset is a bare executable, not an archive; the job copies it to `bin` (basename must equal the shipped [lsp.server.marksman] command `marksman`) and puts it on PATH. conformance = false (tui-rework 13): the class-E ROUTING gap is fixed (the harness now reaches marksman via the user-config layer — a project .catenary.toml language→server binding drives classification only, not dispatch), but marksman itself publishes NO diagnostics through Catenary's open→settle→collect flow: it is a scan-based publisher (diagnostics arrive on workspace-index completion, not per-didOpen) that also answers textDocument/diagnostic with -32601, so neither the push cache nor the best-effort pull nor the warm re-diagnose surfaces its diagnostic — the hardest bug-74 tail (scan-publish AND no pull, unlike lattice which answers pull). Excluded until that gap closes; the routing fix is covered by a mockls unit test instead."
 
 # ── git-pinned source build (the lattice dogfood) ────────────────────
 # lattice — the maintainer's own markdown LSP, built from the Lattice repo at a

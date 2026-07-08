@@ -133,14 +133,27 @@ def main() -> int:
         recipe_names &= only
         provision_names &= only
 
+    # `conformance = false` (default true) excludes a server the shipped
+    # lifecycle cannot conform (no diagnostics at all, or a debounced/scan-based
+    # publish that never lands in the settle window). Dropping it here — the same
+    # filter the Rust matrix<->CASES drift guard applies — keeps a guaranteed-red
+    # job out of the matrix; the recipe/provision `note` records the honest reason.
     include = []
+    skipped_exempt = []
     for name in sorted(recipe_names):
-        include.append(recipe_entry(name, recipes[name]))
+        recipe = recipes[name]
+        if not recipe.get("conformance", True):
+            skipped_exempt.append(name)
+            continue
+        include.append(recipe_entry(name, recipe))
     skipped_pending = []
     for name in sorted(provision_names):
         prov = provisions[name]
         if prov.get("pending"):
             skipped_pending.append(name)
+            continue
+        if not prov.get("conformance", True):
+            skipped_exempt.append(name)
             continue
         include.append(provision_entry(name, prov))
 
@@ -154,6 +167,8 @@ def main() -> int:
     )
     for name in skipped_pending:
         print(f"skip: provision `{name}` is pending an unresolved pin", file=sys.stderr)
+    for name in sorted(skipped_exempt):
+        print(f"skip: `{name}` is conformance = false (cannot conform)", file=sys.stderr)
     return 0
 
 

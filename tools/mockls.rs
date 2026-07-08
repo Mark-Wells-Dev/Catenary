@@ -82,6 +82,14 @@ struct Args {
     #[arg(long)]
     fail_pull: bool,
 
+    /// Reject `textDocument/documentSymbol` with `-32601` (method not found),
+    /// mimicking a server that implements no document-symbol support
+    /// (`sql-language-server`, `cmake-language-server`). Used to test that the
+    /// health probe reads an error *response* as liveness, not failure
+    /// (tui-rework 13 class B).
+    #[arg(long)]
+    reject_document_symbol: bool,
+
     /// Only publish diagnostics on `didSave`, not `didOpen`/`didChange`.
     #[arg(long)]
     diagnostics_on_save: bool,
@@ -634,7 +642,23 @@ impl MockServer {
             "textDocument/typeDefinition" => self.handle_type_definition(&request.params),
             "textDocument/references" => self.handle_references(&request.params),
             "textDocument/implementation" => self.handle_implementation(&request.params),
-            "textDocument/documentSymbol" => self.handle_document_symbols(&request.params),
+            "textDocument/documentSymbol" => {
+                if self.args.reject_document_symbol {
+                    self.send_response(&Response {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: None,
+                        error: Some(RpcError {
+                            code: -32601,
+                            message: "mockls: Unhandled method textDocument/documentSymbol \
+                                      (--reject-document-symbol)"
+                                .to_string(),
+                        }),
+                    });
+                    return;
+                }
+                self.handle_document_symbols(&request.params)
+            }
             "workspace/symbol" => Some(self.handle_workspace_symbols(&request.params)),
             "workspaceSymbol/resolve" => self.handle_workspace_symbol_resolve(&request.params),
             "textDocument/prepareCallHierarchy" => {
@@ -2695,6 +2719,7 @@ mod tests {
             pull_diagnostics: false,
             workspace_diagnostics: false,
             fail_pull: false,
+            reject_document_symbol: false,
             diagnostics_on_save: false,
             drop_after: None,
             hang_on: vec![],
