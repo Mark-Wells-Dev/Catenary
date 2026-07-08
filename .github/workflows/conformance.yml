@@ -178,8 +178,48 @@ jobs:
               sudo apt-get update && sudo apt-get install -y shellcheck ;;
             ansible-ls)
               pipx install ansible-lint || pip install ansible-lint ;;
-            vim-ls) pipx install vim-vint || pip install vim-vint ;;
-            elm-ls) npm install -g --ignore-scripts elm ;;
+            vim-ls)
+              pipx install vim-vint || pip install vim-vint
+              # Prove the linter executes AND flags the fixture — run 5's
+              # vim-ls red pattern-matched vint silently failing under the
+              # runner's Python, indistinguishable from a server bug
+              # without this bisect line.
+              out="$(vint tests/fixtures/conformance/vimscript/broken.vim \
+                || true)"
+              echo "$out"
+              test -n "$out"
+              ;;
+            elm-ls)
+              # The npm `elm` package is a stub whose install SCRIPT
+              # downloads the real compiler — dead under --ignore-scripts
+              # (run-5 red: elm-ls fine, nothing to compile with). Fetch
+              # the pinned compiler binary directly; same no-scripts
+              # posture. Pin cross-verified against two independent public
+              # pinners (cashapp/hermit-packages elm.hcl, chaotic-aur
+              # PKGBUILD).
+              rel="releases/download/0.19.1/binary-for-linux-64-bit.gz"
+              curl -sSL "https://github.com/elm/compiler/$rel" -o elm.gz
+              want="e44af52bb27f725a973478e589d990a6428e115fe1bb14f0"
+              want="${want}3833134d6c0f155c"
+              actual="$(sha256sum elm.gz | cut -d' ' -f1)"
+              if [ "$actual" != "$want" ]; then
+                echo "sha256 mismatch for elm compiler"
+                echo "  expected $want"
+                echo "  actual   $actual"
+                exit 1
+              fi
+              gunzip elm.gz
+              chmod +x elm
+              bindir="$HOME/.local/bin"; mkdir -p "$bindir"
+              mv elm "$bindir/elm"
+              echo "$bindir" >> "$GITHUB_PATH"
+              # Pre-warm ELM_HOME (elm/core etc. download on first use) so
+              # the harness's settle window never carries cold package
+              # fetches. The fixture's intentional error makes this exit
+              # non-zero — the pre-warm, not the exit code, is the point.
+              (cd tests/fixtures/conformance/elm && \
+                "$bindir/elm" make src/Main.elm --output=/dev/null || true)
+              ;;
             *) echo "no extra diagnostic dependency for ${{ matrix.server }}" ;;
           esac
 
@@ -308,6 +348,14 @@ jobs:
                 --version "${{ matrix.version }}"
               userbin="$(ruby -e 'puts Gem.user_dir')/bin"
               echo "$userbin" >> "$GITHUB_PATH"
+              # The runner's RubyGems derives Gem.user_dir from
+              # XDG_DATA_HOME, which the harness's isolate_env re-points
+              # at the test tempdir — the spawned server then can't find
+              # its own gems (run-5 red: instant GemNotFoundException).
+              # GEM_PATH survives isolate_env (only CATENARY_* is
+              # cleared), so the lookup holds wherever XDG points.
+              echo "GEM_PATH=$(ruby -e 'puts Gem.user_dir')" \
+                >> "$GITHUB_ENV"
               ;;
             *)
               echo "unknown provisioning kind: ${{ matrix.kind }}"; exit 1 ;;
@@ -316,6 +364,11 @@ jobs:
       - name: Run conformance harness (${{ matrix.server }})
         env:
           CATENARY_CONFORMANCE: ${{ matrix.server }}
+          # Pin the harness tempdirs somewhere uploadable so a red job's
+          # bridge_stderr.log (the server's own stderr) can be captured
+          # below — run 5's instant-death reds were only diagnosable by
+          # ecosystem forensics because that log stayed on the runner.
+          TMPDIR: ${{ runner.temp }}/conformance
         # The prebuilt libtest binary runs directly — no toolchain, no
         # compile. ONLY the matrix entry point runs: the per-server
         # skip-if-missing sentinels are for local dev, and on runners the
@@ -323,7 +376,17 @@ jobs:
         # it) defeats their binary-missing skip — the second dispatch failed
         # all 23 harness jobs on that one poisoned sentinel.
         run: |
+          mkdir -p "$TMPDIR"
           ./dist/conformance_harness conformance_selected_server
+
+      - name: Upload server stderr (failure triage)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stderr-${{ matrix.server }}
+          path: ${{ runner.temp }}/conformance/**/bridge_stderr.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Emit blessed entry
         run: |
