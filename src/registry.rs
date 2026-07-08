@@ -705,8 +705,12 @@ mod tests {
     fn seed_payload_parses_the_shipped_defaults() {
         let seed = seed_payload().expect("seed payload parses");
         assert!(!seed.recipes.is_empty(), "the seed ships recipes");
-        // The shipped manifest is empty by design (nothing blessed yet).
-        assert_eq!(seed.manifest.blessed.len(), 0);
+        // First blessing landed 2026-07-08 (conformance run 28948357654):
+        // the seed carries the committed blessed set from then on.
+        assert!(
+            !seed.manifest.blessed.is_empty(),
+            "the shipped manifest carries the blessed set"
+        );
     }
 
     #[test]
