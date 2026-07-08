@@ -182,8 +182,12 @@ jobs:
               pipx install vim-vint || pip install vim-vint
               # vint 0.3.21 (2020) imports pkg_resources; Python 3.12 venvs
               # no longer ship setuptools — run 6's proof line caught the
-              # ModuleNotFoundError exactly as designed. Inject it.
-              pipx inject vim-vint setuptools || pip install setuptools
+              # ModuleNotFoundError exactly as designed. Run 7: a bare
+              # inject pulls setuptools >= 82 (Feb 2026), which REMOVED
+              # pkg_resources — pin below it. (vint is abandoned upstream;
+              # this pin is a shim, not a cure.)
+              pipx inject vim-vint "setuptools<82" \
+                || pip install "setuptools<82"
               # Prove the linter executes AND flags the fixture — run 5's
               # vim-ls red pattern-matched vint silently failing under the
               # runner's Python, indistinguishable from a server bug
@@ -387,19 +391,26 @@ jobs:
       # The server's own stderr is NOT bridge_stderr.log — it is piped into
       # the daemon and re-emitted as `lsp.stderr` events in the JSONL
       # firehose (under the tempdir's cache base); the daemon's stderr goes
-      # to state/catenary/daemon.log. Upload all three log families.
-      # include-hidden-files: tempfile dirs are dot-prefixed and
-      # upload-artifact v4 skips hidden paths by default.
+      # to state/catenary/daemon.log. Bundle all three log families into ONE
+      # tarball first: run 7's direct upload got to "7 files" and then
+      # upload-artifact v4 hard-errored on the firehose instance dir
+      # `daemon:<uuid>` (colon is NTFS-invalid; bug 86) and aborted the
+      # whole artifact. A tarball is immune to any filename characters.
+      - name: Bundle triage logs (failure only)
+        if: failure()
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/conformance" 2>/dev/null || exit 0
+          find . \( -name 'daemon.log' -o -name '*.jsonl' \
+            -o -name 'bridge_stderr*.log' \) -print0 \
+            | tar -czf "$RUNNER_TEMP/triage.tgz" --null -T -
+
       - name: Upload triage logs (failure only)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: triage-${{ matrix.server }}
-          path: |
-            ${{ runner.temp }}/conformance/**/daemon.log
-            ${{ runner.temp }}/conformance/**/*.jsonl
-            ${{ runner.temp }}/conformance/**/bridge_stderr*.log
-          include-hidden-files: true
+          path: ${{ runner.temp }}/triage.tgz
           if-no-files-found: ignore
           retention-days: 7
 
