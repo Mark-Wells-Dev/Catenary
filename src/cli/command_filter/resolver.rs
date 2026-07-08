@@ -42,6 +42,10 @@ use super::parse::{
     self, Assignment, ListOp, ParsedScript, Redirect, RedirectOp, SimpleCommand, WordMeta,
 };
 
+/// `catenary worktree land` write-set resolution (misc 158): the land verb
+/// writes a worktree's diff into the owning repo — a Write in `catenary`-
+/// subcommand clothing, resolved by querying the worktree's changed paths.
+mod catenary;
 /// Git authorship split (ws38 ticket 03, decision 026 §2): sync navigation
 /// between committed states carries no debt (and barriers downstream state
 /// queries); content introduction resolves its write-set by querying git.
@@ -517,6 +521,10 @@ fn resolve_segment(cmd: &SimpleCommand, state: &mut State, ctx: SegCtx) -> Segme
         // content introduction resolves via a git state query (ws38 ticket 03).
         "git" => git::resolve_git(cmd, state, &seg_name),
         "patch" => git::resolve_patch(cmd, state, &seg_name),
+        // `catenary worktree land <path>` writes the worktree's diff into the
+        // owning repo — resolved by querying the worktree's changed paths (misc
+        // 158). Every other catenary form is NoWrite (regime-1 canonical matcher).
+        "catenary" => catenary::resolve_catenary(cmd, state, &seg_name),
         "bash" | "sh" | "zsh" | "dash" | "ksh" => resolve_shell_wrapper(cmd, state, &seg_name),
         "xargs" => resolve_xargs(cmd, state, &seg_name),
         "dd" | "install" | "truncate" => SegmentClass::Opaque(

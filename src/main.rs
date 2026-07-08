@@ -440,6 +440,24 @@ enum WorktreeCommand {
         /// Path of the worktree to remove.
         path: PathBuf,
     },
+    /// Print a worktree's complete diff vs HEAD (tracked changes plus untracked
+    /// files as new-file hunks; a valid `git apply` patch).
+    Diff {
+        /// Path of the worktree to diff.
+        path: PathBuf,
+        /// Print only the changed paths, one per line, instead of the full diff.
+        #[arg(long)]
+        name_only: bool,
+    },
+    /// Land a worktree's changes into its owning repo (`git apply --3way`), arm
+    /// the diagnostics batch, and remove the worktree. Never commits.
+    Land {
+        /// Path of the worktree to land.
+        path: PathBuf,
+        /// Land the changes without removing the worktree afterward.
+        #[arg(long)]
+        keep: bool,
+    },
 }
 
 /// Hook subcommands invoked by host CLI hooks.
@@ -777,6 +795,12 @@ fn main() -> Result<()> {
                 }
                 WorktreeCommand::Rm { path } => {
                     build_runtime()?.block_on(cli::worktree::run_rm(&mut out, path))
+                }
+                WorktreeCommand::Diff { path, name_only } => {
+                    cli::worktree::run_diff(&mut out, &path, name_only)
+                }
+                WorktreeCommand::Land { path, keep } => {
+                    build_runtime()?.block_on(cli::worktree::run_land(&mut out, path, keep))
                 }
             }
         }

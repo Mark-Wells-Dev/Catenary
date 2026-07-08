@@ -62,6 +62,18 @@ upgrading.
 
 ### Added
 
+- **`catenary worktree diff` and `catenary worktree land` close the
+  worktree lifecycle.** `diff` prints a worktree's complete change vs HEAD
+  — tracked modifications *plus* untracked files as new-file hunks, so
+  nothing is invisible until a `git add -N` incantation — as a valid
+  `git apply` patch (`--name-only` for just the paths; pipe-friendly).
+  `land` applies that diff into the owning repository, arms the
+  diagnostics batch for exactly the landed files through the same
+  write-resolution path as `git apply`, and removes the worktree only on
+  full success (`--keep` to retain it). It never commits, never
+  auto-cleans: a conflict names the diverging files and leaves both sides
+  untouched; a worktree with local commits, a non-git working copy, or an
+  unregistered path refuses with the reason spelled out.
 - **Conformance CI now covers the servers people actually reach for.**
   Install recipes only exist where a package ecosystem can carry a
   verifiable pin — but "can we install it for you" and "does it work with

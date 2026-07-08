@@ -669,13 +669,24 @@ enum Sub {
     /// lifecycle verbs (misc 151). Bare-only lifecycle: each mutates the on-disk
     /// worktree set and must run as the sole command.
     WorktreeAddRm,
+    /// `catenary worktree diff` — the complete worktree-vs-HEAD diff (misc 158).
+    /// Search-class: no handoff, complete client-owned output (a `git apply`
+    /// patch), so it chains and pipes like `grep`/`glob`.
+    WorktreeDiff,
+    /// `catenary worktree land` — apply a worktree's diff into its owning repo
+    /// (misc 158). Bare-only lifecycle: it writes to the owning repo (its
+    /// write-set resolves through the same filter as `git apply`) and removes the
+    /// worktree, so it must run as the sole command.
+    WorktreeLand,
 }
 
 impl Sub {
     /// Correlation class governing the canonical-form rules.
     const fn class(self) -> CatenaryClass {
         match self {
-            Self::Grep | Self::Glob | Self::Query | Self::WorktreeLs => CatenaryClass::Search,
+            Self::Grep | Self::Glob | Self::Query | Self::WorktreeLs | Self::WorktreeDiff => {
+                CatenaryClass::Search
+            }
             Self::Sed | Self::Diagnostics | Self::EditingStop => CatenaryClass::Correlated,
             Self::EditingStart
             | Self::Roots
@@ -684,7 +695,8 @@ impl Sub {
             | Self::Unpin
             | Self::Primer
             | Self::Commands
-            | Self::WorktreeAddRm => CatenaryClass::Lifecycle,
+            | Self::WorktreeAddRm
+            | Self::WorktreeLand => CatenaryClass::Lifecycle,
         }
     }
 
@@ -706,6 +718,8 @@ impl Sub {
             Self::Commands => "commands",
             Self::WorktreeLs => "worktree ls",
             Self::WorktreeAddRm => "worktree add/rm",
+            Self::WorktreeDiff => "worktree diff",
+            Self::WorktreeLand => "worktree land",
         }
     }
 }
@@ -750,6 +764,12 @@ fn recognize_catenary_sub(rest: &[&str]) -> Recog {
         // bare-word arms so the two-word forms are matched exactly.
         (Some("worktree"), Some("ls")) => Recog::Agent(Sub::WorktreeLs),
         (Some("worktree"), Some("add" | "rm")) => Recog::Agent(Sub::WorktreeAddRm),
+        // `worktree diff` is Search-class (a complete `git apply` patch on
+        // stdout, pipe-friendly); `worktree land` is a bare-only lifecycle verb
+        // that writes the diff into the owning repo (misc 158). Split before the
+        // bare-word arms so the two-word forms are matched exactly.
+        (Some("worktree"), Some("diff")) => Recog::Agent(Sub::WorktreeDiff),
+        (Some("worktree"), Some("land")) => Recog::Agent(Sub::WorktreeLand),
         (Some("grep"), _) => Recog::Agent(Sub::Grep),
         (Some("glob"), _) => Recog::Agent(Sub::Glob),
         (Some("query"), _) => Recog::Agent(Sub::Query),
@@ -988,11 +1008,12 @@ const fn occ_needs_isolation(occ: &CatenaryOcc) -> bool {
             | Sub::Unpin
             | Sub::Primer
             | Sub::Commands
-            | Sub::WorktreeAddRm,
+            | Sub::WorktreeAddRm
+            | Sub::WorktreeLand,
         ) => true,
-        // search (grep/glob/query/worktree ls), the subcommand-less global read,
-        // and the already-denied non-agent/unknown forms carry no handoff.
-        Recog::Agent(Sub::Grep | Sub::Glob | Sub::Query | Sub::WorktreeLs)
+        // search (grep/glob/query/worktree ls/diff), the subcommand-less global
+        // read, and the already-denied non-agent/unknown forms carry no handoff.
+        Recog::Agent(Sub::Grep | Sub::Glob | Sub::Query | Sub::WorktreeLs | Sub::WorktreeDiff)
         | Recog::GlobalRead
         | Recog::NotAgent
         | Recog::Unknown => false,
@@ -1141,8 +1162,8 @@ fn catenary_occ_denial(occ: &CatenaryOcc) -> Option<String> {
 
 /// The recognized agent-facing command surface, for "unknown subcommand" denials.
 const CATENARY_SURFACE: &str = "Available: `grep`, `glob`, `query`, `diagnostics`, \
-     `editing start`, `pin`, `unpin`, `roots`, `worktree ls/add/rm`, `commands`, \
-     `primer`, `version`. Run `catenary primer` for the workflow.";
+     `editing start`, `pin`, `unpin`, `roots`, `worktree ls/add/rm/diff/land`, \
+     `commands`, `primer`, `version`. Run `catenary primer` for the workflow.";
 
 fn unknown_subcommand_denial() -> String {
     format!("That isn't a recognized `catenary` command. {CATENARY_SURFACE}")
@@ -1185,6 +1206,12 @@ fn stdin_denial(sub: Sub) -> Option<String> {
         Sub::WorktreeLs => Some(
             "`catenary worktree ls` takes no stdin — invoke it first in the pipeline.".to_string(),
         ),
+        // `worktree diff` takes a path argument, not stdin: a pipe INTO it is a
+        // no-op, though its diff output pipes freely (into `git apply`, a pager).
+        Sub::WorktreeDiff => Some(
+            "`catenary worktree diff` takes no stdin — invoke it first in the pipeline."
+                .to_string(),
+        ),
         Sub::Diagnostics => {
             Some("`catenary diagnostics` takes no input — run it bare.".to_string())
         }
@@ -1197,7 +1224,8 @@ fn stdin_denial(sub: Sub) -> Option<String> {
         | Sub::Unpin
         | Sub::Primer
         | Sub::Commands
-        | Sub::WorktreeAddRm => Some(format!(
+        | Sub::WorktreeAddRm
+        | Sub::WorktreeLand => Some(format!(
             "`catenary {}` takes no stdin — run it bare.",
             sub.label()
         )),
@@ -4175,6 +4203,58 @@ mod tests {
                 CatenaryAction::Deny(_),
             ),
             "worktree rm must not pipe out",
+        );
+    }
+
+    #[test]
+    fn worktree_diff_is_search_class_pipes_and_chains() {
+        // `catenary worktree diff <path>` is Search-class (misc 158): its diff is
+        // complete client-owned output (a `git apply` patch), so it pipes and
+        // chains like `grep`/`glob`.
+        assert_eq!(
+            analyze_catenary_command("catenary worktree diff /wt"),
+            CatenaryAction::Allow { has_foreign: false },
+        );
+        assert_eq!(
+            analyze_catenary_command("catenary worktree diff /wt | git apply -"),
+            CatenaryAction::Allow { has_foreign: true },
+            "worktree diff pipes into a downstream git apply",
+        );
+        assert_eq!(
+            analyze_catenary_command("catenary worktree diff /wt --name-only | sort"),
+            CatenaryAction::Allow { has_foreign: true },
+            "--name-only pipes into a downstream filter",
+        );
+    }
+
+    #[test]
+    fn worktree_land_is_bare_only_lifecycle() {
+        // `land` writes the diff into the owning repo and removes the worktree:
+        // bare-only lifecycle (misc 158).
+        assert_eq!(
+            analyze_catenary_command("catenary worktree land /wt"),
+            CatenaryAction::Allow { has_foreign: false },
+            "a bare land is allowed",
+        );
+        assert_eq!(
+            analyze_catenary_command("catenary worktree land /wt --keep"),
+            CatenaryAction::Allow { has_foreign: false },
+            "--keep is still a bare allow",
+        );
+        // Chained or piped → bare-only violation.
+        assert!(
+            matches!(
+                analyze_catenary_command("cd /repo && catenary worktree land /wt"),
+                CatenaryAction::Deny(_),
+            ),
+            "worktree land must be the sole command",
+        );
+        assert!(
+            matches!(
+                analyze_catenary_command("catenary worktree land /wt | tee log"),
+                CatenaryAction::Deny(_),
+            ),
+            "worktree land must not pipe out",
         );
     }
 

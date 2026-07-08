@@ -3392,6 +3392,107 @@ fn worktree_rm_response(
     }
 }
 
+/// Handle a `tool/worktree-land` request (misc 158): apply the worktree's
+/// complete diff into its owning repo and remove the worktree on success.
+///
+/// The owning repo comes from the registered
+/// [`WorktreeMeta`](crate::worktree_create::WorktreeMeta). The apply is
+/// atomic — a plain `git apply --check` validates before mutating, so a refusal
+/// (an apply conflict, local commits, a non-git worktree, a missing path) leaves
+/// the owning repo untouched and the worktree kept, with a teaching message
+/// naming the cause. On full success the worktree is disposed (unless `keep`).
+/// Never commits.
+///
+/// The diagnostics batch is armed by the `PreToolUse` hook's write-set resolver
+/// (misc 158, the `catenary worktree land` resolver arm), which resolves land's
+/// changed-path set client-side and records it into the lander's batch exactly
+/// as `git apply` does — the first-class arming leg, keyed on the actual caller.
+/// The daemon carries the applied paths back in the response so the CLI can
+/// report the count.
+#[cfg(unix)]
+async fn handle_worktree_land(
+    ctx: &HookDispatchContext,
+    raw: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(raw_path) = raw.get("path").and_then(|v| v.as_str()) else {
+        return serde_json::json!({ "status": "error", "message": "missing path" });
+    };
+    let keep = raw
+        .get("keep")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let worktree = Path::new(raw_path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(raw_path));
+
+    let sidecar = crate::worktree_create::sidecar_path(&worktree);
+    let Some(meta) = std::fs::read_to_string(&sidecar)
+        .ok()
+        .and_then(|c| serde_json::from_str::<crate::worktree_create::WorktreeMeta>(&c).ok())
+    else {
+        return serde_json::json!({
+            "status": "not_ours",
+            "message": format!("{} is not a Catenary-managed worktree — it is not registered", worktree.display()),
+        });
+    };
+
+    // Reap any live mount so the worktree's servers shut down before the apply
+    // reads it and the disposal removes it (mirrors `handle_worktree_rm`). The
+    // apply runs against the owning repo, not the worktree, so this is purely to
+    // quiesce the worktree ahead of removal.
+    if let Some(tracker) = &ctx.root_tracker
+        && let Some((contributor, _)) = tracker
+            .contributors_with_prefix("worktree:")
+            .into_iter()
+            .find(|(_, roots)| roots.iter().any(|r| r == &worktree))
+    {
+        let sid = worktree_contributor_session_id(&contributor)
+            .unwrap_or("default")
+            .to_string();
+        reap_worktree_root(ctx, tracker, &sid, &contributor, &worktree, "worktree land").await;
+    }
+
+    // The apply + remove is blocking (git subprocesses) — run it off the async
+    // executor so the socket task is not pinned.
+    let land_meta = meta.clone();
+    let outcome = tokio::task::spawn_blocking(move || crate::worktree_land::land(&land_meta, keep))
+        .await
+        .unwrap_or_else(|_| crate::worktree_land::LandOutcome::Refused {
+            reason: "the land task failed to run".to_string(),
+        });
+
+    match outcome {
+        crate::worktree_land::LandOutcome::Landed { paths, removed } => {
+            if removed {
+                ctx.worktree_registry.forget(&worktree);
+            }
+            info!(
+                source = Source::DaemonDispatch.as_str(),
+                worktree = %worktree.display(),
+                count = paths.len(),
+                removed,
+                "worktree land: applied the diff into the owning repo",
+            );
+            serde_json::json!({
+                "status": "ok",
+                "removed": removed,
+                "paths": paths,
+                "path": worktree.display().to_string(),
+            })
+        }
+        crate::worktree_land::LandOutcome::Empty => serde_json::json!({
+            "status": "empty",
+            "removed": false,
+            "path": worktree.display().to_string(),
+        }),
+        crate::worktree_land::LandOutcome::Refused { reason } => serde_json::json!({
+            "status": "refused",
+            "removed": false,
+            "message": reason,
+        }),
+    }
+}
+
 /// Load a worktree's [`WorktreeMeta`](crate::worktree_create::WorktreeMeta) from
 /// its sidecar (the durable disposal record), for a background dispose after a
 /// registry miss (daemon restarted since creation).
@@ -3843,6 +3944,23 @@ async fn handle_hook_dispatch(
     // dirty (uncommitted or unpushed). Daemon-level.
     if method == "tool/worktree-rm" {
         let response = handle_worktree_rm(&ctx, &raw).await;
+        let mut payload = serde_json::to_vec(&response)?;
+        payload.push(b'\n');
+        writer.write_all(&payload).await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
+    // ── worktree land — apply the diff into the owning repo (misc 158) ─
+    //
+    // `tool/worktree-land` is sent by `catenary worktree land <path>`. Loads the
+    // sidecar, reaps any live mount, applies the worktree's complete diff into
+    // the owning repo via `git apply --3way` (atomic — a plain `--check` refusal
+    // leaves the owning repo untouched), and disposes the worktree on success
+    // (unless `--keep`). Never commits; the diagnostics batch arms via the
+    // PreToolUse hook's write-set resolver. Daemon-level.
+    if method == "tool/worktree-land" {
+        let response = handle_worktree_land(&ctx, &raw).await;
         let mut payload = serde_json::to_vec(&response)?;
         payload.push(b'\n');
         writer.write_all(&payload).await?;
