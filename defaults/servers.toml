@@ -102,10 +102,6 @@ args = ["--stdio"]
 [lsp.server.lua-ls]
 command = "lua-language-server"
 
-[lsp.server.vim-ls]
-command = "vim-language-server"
-args = ["--stdio"]
-
 [lsp.server.yaml-ls]
 command = "yaml-language-server"
 args = ["--stdio"]

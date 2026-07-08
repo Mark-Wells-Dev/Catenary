@@ -166,8 +166,8 @@ jobs:
           java-version: ${{ matrix.runtime_version || '21' }}
 
       # Some servers derive diagnostics from an external linter named in the
-      # recipe `note` (bash-ls → shellcheck, ansible-ls → ansible-lint, vim-ls →
-      # vint, elm-ls → the elm compiler). Provisioned here so the intentional
+      # recipe `note` (bash-ls → shellcheck, ansible-ls → ansible-lint,
+      # elm-ls → the elm compiler). Provisioned here so the intentional
       # diagnostic can publish. (These should graduate to structured `runtime`
       # fields.)
       - name: Provision diagnostic dependencies
@@ -178,25 +178,6 @@ jobs:
               sudo apt-get update && sudo apt-get install -y shellcheck ;;
             ansible-ls)
               pipx install ansible-lint || pip install ansible-lint ;;
-            vim-ls)
-              pipx install vim-vint || pip install vim-vint
-              # vint 0.3.21 (2020) imports pkg_resources; Python 3.12 venvs
-              # no longer ship setuptools — run 6's proof line caught the
-              # ModuleNotFoundError exactly as designed. Run 7: a bare
-              # inject pulls setuptools >= 82 (Feb 2026), which REMOVED
-              # pkg_resources — pin below it. (vint is abandoned upstream;
-              # this pin is a shim, not a cure.)
-              pipx inject vim-vint "setuptools<82" \
-                || pip install "setuptools<82"
-              # Prove the linter executes AND flags the fixture — run 5's
-              # vim-ls red pattern-matched vint silently failing under the
-              # runner's Python, indistinguishable from a server bug
-              # without this bisect line.
-              out="$(vint tests/fixtures/conformance/vimscript/broken.vim \
-                || true)"
-              echo "$out"
-              test -n "$out"
-              ;;
             elm-ls)
               # The npm `elm` package is a stub whose install SCRIPT
               # downloads the real compiler — dead under --ignore-scripts

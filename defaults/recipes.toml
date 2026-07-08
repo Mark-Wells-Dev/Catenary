@@ -161,15 +161,6 @@ draft = true
 hash = "sha512-DPTmckrnNCf8KdeSu9pE/mjnovSL28InnQhDS2lsuDrLI8obapMxAU0KLDYnC++aTjCK8bZhhkR5HFh3lDddqw=="
 note = "diagnostics depend on ansible-lint being present; a conformance job provisions it (pip) as well."
 
-[recipe.vim-ls]
-ecosystem = "npm"
-package = "vim-language-server"
-version = "2.3.1"
-tier = "npm-tarball-sha512"
-draft = true
-hash = "sha512-Y9Zy3NKzfndLUfuZRrITkpfGvpL2K7hNPV8sJ1iB6mf1YRxIX3Hs6lwZimoD5pmvamUaOQhNGYMS/Ox9itzA4Q=="
-note = "diagnostics come from `vint` (a vimscript linter the server shells out to); a conformance job provisions it (pip). Without vint the server publishes an empty diagnostic set, so the fixture's intentional diagnostic depends on vint being present (like bash-ls → shellcheck, ansible-ls → ansible-lint)."
-
 [recipe.sql-ls]
 ecosystem = "npm"
 package = "sql-language-server"

@@ -98,23 +98,24 @@ const CONFORMANCE_ENV: &str = "CATENARY_CONFORMANCE";
 /// - **A non-default binding for an existing shipped language** (`marksman`:
 ///   `lattice` is the shipped markdown default, decision 015). Only [`Self::server`]
 ///   is set; the language already classifies files.
-/// - **A server with no shipped language at all** (`vim-ls`, `ansible-ls`: defined
-///   in `defaults/servers.toml` but bound by no `[lsp.language.*]`, so the shipped
-///   defaults cannot classify a file to them — the tui-rework 07 gap). Here
+/// - **A server with no shipped language at all** (`ansible-ls`: defined in
+///   `defaults/servers.toml` but bound by no `[lsp.language.*]`, so the shipped
+///   defaults cannot classify a file to it — the tui-rework 07 gap). Here
 ///   [`Self::classify`] also supplies the classification (extensions and/or
 ///   filenames) the user config must define to route, exactly as a user of that
 ///   server would.
 ///
-/// Why the **user** layer and not a project `.catenary.toml`: a project config's
-/// `[lsp.language.*]` `servers` list drives classification only, not server
-/// dispatch, so it never reroutes (tui-rework 13 class E). The user layer does.
-/// The config lives only in the throwaway tempdir, so the shipped default every
-/// real root gets is untouched.
+/// Why the **user** layer and not a project `.catenary.toml`: both layers reach
+/// dispatch since misc 155 (bug 81's fix), but the harness deliberately routes
+/// through the user layer — that is the layer these cases pin (the project-layer
+/// reroute has its own dispatch-level tests in `src/lsp/manager.rs`). The config
+/// lives only in the throwaway tempdir, so the shipped default every real root
+/// gets is untouched.
 #[derive(Clone, Copy)]
 struct CaseBinding {
-    /// The language whose `servers` list is set (e.g. `markdown`, `vimscript`).
+    /// The language whose `servers` list is set (e.g. `markdown`, `ansible`).
     language: &'static str,
-    /// The server to route it to (e.g. `marksman`, `vim-ls`).
+    /// The server to route it to (e.g. `marksman`, `ansible-ls`).
     server: &'static str,
     /// Classification for a language absent from the shipped defaults: the
     /// `extensions` and/or `filenames` the user config must also define so a file
@@ -124,7 +125,7 @@ struct CaseBinding {
 }
 
 /// The classification a [`CaseBinding`] must define for a language the shipped
-/// defaults do not carry (`vim-ls` → `.vim`, `ansible-ls` → `playbook.yml`).
+/// defaults do not carry (`ansible-ls` → `playbook.yml`).
 #[derive(Clone, Copy)]
 struct CaseClassify {
     /// File extensions (without dot) that classify as the language.
@@ -162,9 +163,9 @@ struct Case {
 /// land without either a case here or an explicit exemption.
 ///
 /// The tui-rework 13 additions close the 07-recorded gaps: `vscode-html`
-/// (embedded-CSS validation), `ansible-ls` and `vim-ls` (each with a user-config
-/// [`CaseBinding`] that defines + routes a language the shipped defaults do not
-/// carry). The servers that cannot satisfy the intentional-diagnostic contract
+/// (embedded-CSS validation) and `ansible-ls` (a user-config [`CaseBinding`]
+/// that defines + routes a language the shipped defaults do not carry).
+/// The servers that cannot satisfy the intentional-diagnostic contract
 /// through the shipped lifecycle — `cmake-ls` (no diagnostics at all),
 /// `typescript-ls` and `marksman` (debounced/scan-based push with no pull
 /// fallback), `vscode-eslint` (needs eslint co-install + settings) — are
@@ -323,33 +324,18 @@ const CASES: &[Case] = &[
         slow_start: false,
     },
     // ── tui-rework 13 coverage (matrix/CASES drift closed) ─────────────
-    // vscode-html publishes through its default embedded-CSS validation; vim-ls
-    // and ansible-ls have no shipped `[lsp.language.*]` binding (the 07 gap), so
-    // each carries a user-config `CaseBinding` that both defines and routes its
-    // language — the exact opt-in a user of that server writes. vim-ls's fixture
-    // diagnostic depends on `vint` (provisioned in CI, absent on the maintainer
-    // host, so its local sentinel skips clean).
+    // vscode-html publishes through its default embedded-CSS validation;
+    // ansible-ls has no shipped `[lsp.language.*]` binding (the 07 gap), so it
+    // carries a user-config `CaseBinding` that both defines and routes its
+    // language — the exact opt-in a user of that server writes. (vim-ls was
+    // dropped 2026-07-08: upstream dead 3 years, its vint linter dead since
+    // 2020 — "if we install it for the user, it has to work".)
     Case {
         server: "vscode-html",
         fixture: "html",
         file: "broken.html",
         probe: "vscode-html-language-server",
         binding: None,
-        slow_start: false,
-    },
-    Case {
-        server: "vim-ls",
-        fixture: "vimscript",
-        file: "broken.vim",
-        probe: "vim-language-server",
-        binding: Some(CaseBinding {
-            language: "vimscript",
-            server: "vim-ls",
-            classify: Some(CaseClassify {
-                extensions: &["vim"],
-                filenames: &[],
-            }),
-        }),
         slow_start: false,
     },
     Case {

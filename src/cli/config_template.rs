@@ -576,7 +576,6 @@ mod tests {
             "haskell-ls",
             "typescript-ls",
             "lua-ls",
-            "vim-ls",
             "yaml-ls",
             "ansible-ls",
             "cmake-ls",
