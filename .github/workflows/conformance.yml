@@ -98,6 +98,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
+      # One shared compile cache across the whole matrix (ci.yml precedent) —
+      # 24 jobs otherwise each cold-build the harness.
+      - uses: Swatinem/rust-cache@v2
 
       - name: Provision runtime dependency (${{ matrix.runtime_name }})
         if: matrix.runtime_name == 'jdk'
@@ -229,9 +232,11 @@ jobs:
       - name: Run conformance harness (${{ matrix.server }})
         env:
           CATENARY_CONFORMANCE: ${{ matrix.server }}
+        # Plain cargo, matching ci.yml — the runner has no nextest and this
+        # repo installs no third-party runner tooling for it (first live
+        # dispatch failed all 24 jobs on `no such command: nextest`).
         run: |
-          cargo nextest run --workspace --features mockls --no-fail-fast \
-            --status-level all -E 'binary(conformance_harness)'
+          cargo test --test conformance_harness --features mockls --no-fail-fast
 
       - name: Emit blessed entry
         run: |
