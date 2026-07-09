@@ -81,9 +81,10 @@ kind = "system-apt"
 apt = "clangd"
 
 # ── checksummed GitHub releases ──────────────────────────────────────
-# lua-ls, marksman — pinned tag + pinned asset sha256, unpacked to a temp dir.
+# lua-language-server, marksman — pinned tag + pinned asset sha256, unpacked to
+# a temp dir.
 
-[provision.lua-ls]
+[provision.lua-language-server]
 kind = "github-release-sha256"
 repo = "LuaLS/lua-language-server"
 version = "3.18.2"

@@ -38,7 +38,8 @@
 //! ## Gating
 //!
 //! - **Local / ordinary `make test` runs** exercise the maintainer's dogfooded
-//!   fleet (rust-analyzer, lattice, taplo, yaml-ls, vscode-json, bash-ls) as the
+//!   fleet (rust-analyzer, lattice, taplo, yaml-language-server,
+//!   vscode-json-language-server, bash-language-server) as the
 //!   sentinel: one `#[test]` per server, each **skip-if-binary-missing** so a
 //!   host lacking a server stays green. (Ordinary CI's `ci.yml` runs only
 //!   `cargo test --lib --bins`, so these integration tests do not run there — the
@@ -98,8 +99,8 @@ const CONFORMANCE_ENV: &str = "CATENARY_CONFORMANCE";
 /// - **A non-default binding for an existing shipped language** (`marksman`:
 ///   `lattice` is the shipped markdown default, decision 015). Only [`Self::server`]
 ///   is set; the language already classifies files.
-/// - **A server with no shipped language at all** (`ansible-ls`: defined in
-///   `defaults/servers.toml` but bound by no `[lsp.language.*]`, so the shipped
+/// - **A server with no shipped language at all** (`ansible-language-server`:
+///   defined in `defaults/servers.toml` but bound by no `[lsp.language.*]`, so the shipped
 ///   defaults cannot classify a file to it — the tui-rework 07 gap). Here
 ///   [`Self::classify`] also supplies the classification (extensions and/or
 ///   filenames) the user config must define to route, exactly as a user of that
@@ -115,7 +116,7 @@ const CONFORMANCE_ENV: &str = "CATENARY_CONFORMANCE";
 struct CaseBinding {
     /// The language whose `servers` list is set (e.g. `markdown`, `ansible`).
     language: &'static str,
-    /// The server to route it to (e.g. `marksman`, `ansible-ls`).
+    /// The server to route it to (e.g. `marksman`, `ansible-language-server`).
     server: &'static str,
     /// Classification for a language absent from the shipped defaults: the
     /// `extensions` and/or `filenames` the user config must also define so a file
@@ -125,7 +126,7 @@ struct CaseBinding {
 }
 
 /// The classification a [`CaseBinding`] must define for a language the shipped
-/// defaults do not carry (`ansible-ls` → `playbook.yml`).
+/// defaults do not carry (`ansible-language-server` → `playbook.yml`).
 #[derive(Clone, Copy)]
 struct CaseClassify {
     /// File extensions (without dot) that classify as the language.
@@ -138,14 +139,15 @@ struct CaseClassify {
 /// binary whose presence gates a local run.
 struct Case {
     /// Canonical server name (`[lsp.server.*]` in `defaults/servers.toml`).
+    ///
+    /// The key IS the executable Catenary spawns (misc 162), so it is also the
+    /// binary whose presence on `PATH` gates a local run — there is no separate
+    /// `probe` field.
     server: &'static str,
     /// Fixture project directory under `tests/fixtures/conformance/`.
     fixture: &'static str,
     /// The representative file within the fixture, relative to its dir.
     file: &'static str,
-    /// The binary the shipped command launches — the first token of the
-    /// `[lsp.server.<server>].command`. Its presence on `PATH` gates a local run.
-    probe: &'static str,
     /// A shipped-default routing override for a non-default server (see
     /// [`CaseBinding`]); `None` routes purely through the shipped defaults.
     binding: Option<CaseBinding>,
@@ -162,13 +164,13 @@ struct Case {
 /// guard fails `make check` on any divergence, so a new recipe/provision cannot
 /// land without either a case here or an explicit exemption.
 ///
-/// The tui-rework 13 additions close the 07-recorded gaps: `vscode-html`
-/// (embedded-CSS validation) and `ansible-ls` (a user-config [`CaseBinding`]
+/// The tui-rework 13 additions close the 07-recorded gaps: `vscode-html-language-server`
+/// (embedded-CSS validation) and `ansible-language-server` (a user-config [`CaseBinding`]
 /// that defines + routes a language the shipped defaults do not carry).
 /// The servers that cannot satisfy the intentional-diagnostic contract
-/// through the shipped lifecycle — `cmake-ls` (no diagnostics at all),
-/// `typescript-ls` and `marksman` (debounced/scan-based push with no pull
-/// fallback), `vscode-eslint` (needs eslint co-install + settings) — are
+/// through the shipped lifecycle — `cmake-language-server` (no diagnostics at all),
+/// `typescript-language-server` and `marksman` (debounced/scan-based push with no pull
+/// fallback), `vscode-eslint-language-server` (needs eslint co-install + settings) — are
 /// `conformance = false` in the recipe/provision data with an honest `note`, so
 /// they are absent here BY the guard, not by omission.
 ///
@@ -181,7 +183,6 @@ const CASES: &[Case] = &[
         server: "rust-analyzer",
         fixture: "rust",
         file: "src/main.rs",
-        probe: "rustup",
         binding: None,
         slow_start: false,
     },
@@ -189,7 +190,6 @@ const CASES: &[Case] = &[
         server: "taplo",
         fixture: "toml",
         file: "broken.toml",
-        probe: "taplo",
         binding: None,
         slow_start: false,
     },
@@ -197,48 +197,42 @@ const CASES: &[Case] = &[
         server: "lattice",
         fixture: "markdown",
         file: "broken.md",
-        probe: "lattice",
         binding: None,
         slow_start: false,
     },
     Case {
-        server: "yaml-ls",
+        server: "yaml-language-server",
         fixture: "yaml",
         file: "broken.yaml",
-        probe: "yaml-language-server",
         binding: None,
         slow_start: false,
     },
     Case {
-        server: "vscode-json",
+        server: "vscode-json-language-server",
         fixture: "json",
         file: "broken.json",
-        probe: "vscode-json-language-server",
         binding: None,
         slow_start: false,
     },
     Case {
-        server: "bash-ls",
+        server: "bash-language-server",
         fixture: "shellscript",
         file: "broken.sh",
-        probe: "bash-language-server",
         binding: None,
         slow_start: false,
     },
     // ── npm / cargo / pip / go tranche (CI matrix) ─────────────────────
     Case {
-        server: "pyright",
+        server: "pyright-langserver",
         fixture: "python",
         file: "broken.py",
-        probe: "pyright-langserver",
         binding: None,
         slow_start: false,
     },
     Case {
-        server: "vscode-css",
+        server: "vscode-css-language-server",
         fixture: "css",
         file: "broken.css",
-        probe: "vscode-css-language-server",
         binding: None,
         slow_start: false,
     },
@@ -246,31 +240,27 @@ const CASES: &[Case] = &[
         server: "intelephense",
         fixture: "php",
         file: "broken.php",
-        probe: "intelephense",
         binding: None,
         slow_start: false,
     },
     Case {
-        server: "svelte-ls",
+        server: "svelteserver",
         fixture: "svelte",
         file: "src/Broken.svelte",
-        probe: "svelteserver",
         binding: None,
         slow_start: false,
     },
     Case {
-        server: "elm-ls",
+        server: "elm-language-server",
         fixture: "elm",
         file: "src/Main.elm",
-        probe: "elm-language-server",
         binding: None,
         slow_start: false,
     },
     Case {
-        server: "docker-ls",
+        server: "docker-langserver",
         fixture: "dockerfile",
         file: "Dockerfile",
-        probe: "docker-langserver",
         binding: None,
         slow_start: false,
     },
@@ -278,15 +268,13 @@ const CASES: &[Case] = &[
         server: "gopls",
         fixture: "go",
         file: "main.go",
-        probe: "gopls",
         binding: None,
         slow_start: false,
     },
     Case {
-        server: "lua-ls",
+        server: "lua-language-server",
         fixture: "lua",
         file: "broken.lua",
-        probe: "lua-language-server",
         binding: None,
         slow_start: false,
     },
@@ -295,7 +283,6 @@ const CASES: &[Case] = &[
         server: "clangd",
         fixture: "c",
         file: "broken.c",
-        probe: "clangd",
         binding: None,
         slow_start: false,
     },
@@ -303,7 +290,6 @@ const CASES: &[Case] = &[
         server: "jdtls",
         fixture: "java",
         file: "Broken.java",
-        probe: "jdtls",
         binding: None,
         slow_start: true,
     },
@@ -311,33 +297,31 @@ const CASES: &[Case] = &[
         server: "ruby-lsp",
         fixture: "ruby",
         file: "broken.rb",
-        probe: "ruby-lsp",
         binding: None,
         slow_start: false,
     },
     // ── tui-rework 13 coverage (matrix/CASES drift closed) ─────────────
-    // vscode-html publishes through its default embedded-CSS validation;
-    // ansible-ls has no shipped `[lsp.language.*]` binding (the 07 gap), so it
-    // carries a user-config `CaseBinding` that both defines and routes its
-    // language — the exact opt-in a user of that server writes. (vim-ls was
-    // dropped 2026-07-08: upstream dead 3 years, its vint linter dead since
-    // 2020 — "if we install it for the user, it has to work".)
+    // vscode-html-language-server publishes through its default embedded-CSS
+    // validation; ansible-language-server has no shipped `[lsp.language.*]`
+    // binding (the 07 gap), so it carries a user-config `CaseBinding` that both
+    // defines and routes its language — the exact opt-in a user of that server
+    // writes. (vim-language-server was dropped 2026-07-08: upstream dead 3
+    // years, its vint linter dead since 2020 — "if we install it for the user,
+    // it has to work".)
     Case {
-        server: "vscode-html",
+        server: "vscode-html-language-server",
         fixture: "html",
         file: "broken.html",
-        probe: "vscode-html-language-server",
         binding: None,
         slow_start: false,
     },
     Case {
-        server: "ansible-ls",
+        server: "ansible-language-server",
         fixture: "ansible",
         file: "playbook.yml",
-        probe: "ansible-language-server",
         binding: Some(CaseBinding {
             language: "ansible",
-            server: "ansible-ls",
+            server: "ansible-language-server",
             classify: Some(CaseClassify {
                 extensions: &[],
                 filenames: &["playbook.yml"],
@@ -352,15 +336,18 @@ fn lookup(server: &str) -> Option<&'static Case> {
     CASES.iter().find(|c| c.server == server)
 }
 
-/// Whether `binary` resolves on the inherited `PATH`.
-fn on_path(binary: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(binary);
-        candidate.is_file() || candidate.is_symlink()
-    })
+/// Whether the executable for server `name` is actually installed on the
+/// inherited `PATH`.
+///
+/// Since misc 162 the server key IS the executable, so this is the local-run
+/// gate. It defers to the product's own [`server_binary_installed`], which is
+/// honest against the rust-analyzer rustup proxy shim: a bare proxy with no
+/// component behind it reads as NOT installed, so the sentinel skips cleanly on
+/// a rustup host without the component (rather than spawning the shim and
+/// failing). In CI the workflow links the real component ahead of the shim, so
+/// the resolved binary is the component and the gate passes.
+fn on_path(name: &str) -> bool {
+    catenary_mcp::health::servers::server_binary_installed(name, name)
 }
 
 /// Renders `values` as a TOML array of double-quoted strings (`["a", "b"]`).
@@ -477,18 +464,19 @@ fn read_editing_stop_wall_bounded(socket: &Path, wall: Duration) -> Result<Strin
 /// cleanly when the probe binary is absent; `true` (CI-matrix selection) treats
 /// an absent binary as a failed install and errors.
 fn run_conformance(case: &Case, require: bool) -> Result<()> {
-    if !on_path(case.probe) {
+    // The server key IS the executable (misc 162), so its presence on PATH is
+    // exactly the local-run gate — no separate probe binary.
+    if !on_path(case.server) {
         if require {
             bail!(
                 "conformance for `{}` was selected via {CONFORMANCE_ENV} but its binary \
-                 `{}` is not on PATH — the pinned install did not land",
+                 is not on PATH — the pinned install did not land",
                 case.server,
-                case.probe
             );
         }
         eprintln!(
-            "conformance: skipping `{}` — binary `{}` not on PATH",
-            case.server, case.probe
+            "conformance: skipping `{}` — binary not on PATH",
+            case.server
         );
         return Ok(());
     }
@@ -564,7 +552,7 @@ fn run_conformance(case: &Case, require: bool) -> Result<()> {
     // publish anyway. A server that intermittently loses its first publish
     // to the cold race fails here honestly — that race is a real Catenary
     // settle/pull gap (bug 74; the waitv2 finding-7 pull-diagnostics class),
-    // and its known-deterministic casualties (`lattice`, `vscode-json`) are
+    // and its known-deterministic casualties (`lattice`, `vscode-json-language-server`) are
     // `#[ignore]`d sentinels pointing at the bug, not absorbed.
     let wall = if case.slow_start {
         CONFORMANCE_WALL_BOUND_SLOW
@@ -638,9 +626,10 @@ fn sentinel(server: &str) -> Result<()> {
 // ── Dogfooded-fleet sentinels (skip-if-binary-missing) ────────────────
 //
 // These run in ordinary `make test` / `make check` and skip cleanly where a
-// server binary is absent. rust-analyzer (native + flycheck), taplo, yaml-ls,
-// and bash-ls (shellcheck linter feeder) deliver diagnostics that survive a cold
-// diagnose and so are reliable make-check sentinels.
+// server binary is absent. rust-analyzer (native + flycheck), taplo,
+// yaml-language-server, and bash-language-server (shellcheck linter feeder)
+// deliver diagnostics that survive a cold diagnose and so are reliable
+// make-check sentinels.
 
 #[test]
 fn conformance_rust_analyzer() -> Result<()> {
@@ -654,24 +643,25 @@ fn conformance_taplo() -> Result<()> {
 
 #[test]
 fn conformance_yaml_ls() -> Result<()> {
-    sentinel("yaml-ls")
+    sentinel("yaml-language-server")
 }
 
 #[test]
 fn conformance_bash_ls() -> Result<()> {
-    sentinel("bash-ls")
+    sentinel("bash-language-server")
 }
 
 // ── Formerly-ignored cold-diagnose sentinels (bug 74, now fixed) ──────
 //
-// lattice and vscode-json each returned a deterministic `[clean]` on a cold
-// daemon. The tui-rework 07 report filed both under one "cold-pull" heading, but
-// they were two distinct gaps the conformance harness caught: lattice publishes
-// once on its workspace scan (which `clear_stale_diagnostics` wipes before the
-// batch reopens the unchanged file) and never advertises `diagnosticProvider`,
-// so the settle-then-collect pipeline never pulled it — even though it answers
-// `textDocument/diagnostic` on demand (fixed: best-effort pull on an empty push
-// cache); vscode-json is pull-only and *was* pulled, but Catenary's empty
+// lattice and vscode-json-language-server each returned a deterministic
+// `[clean]` on a cold daemon. The tui-rework 07 report filed both under one
+// "cold-pull" heading, but they were two distinct gaps the conformance harness
+// caught: lattice publishes once on its workspace scan (which
+// `clear_stale_diagnostics` wipes before the batch reopens the unchanged file)
+// and never advertises `diagnosticProvider`, so the settle-then-collect
+// pipeline never pulled it — even though it answers `textDocument/diagnostic`
+// on demand (fixed: best-effort pull on an empty push cache);
+// vscode-json-language-server is pull-only and *was* pulled, but Catenary's empty
 // `workspace/didChangeConfiguration {}` at init disabled its JSON validation, so
 // the pull returned an empty report (fixed: an empty settings push is no longer
 // sent, letting the server keep its defaults). Both now diagnose their fixture
@@ -684,7 +674,7 @@ fn conformance_lattice() -> Result<()> {
 
 #[test]
 fn conformance_vscode_json() -> Result<()> {
-    sentinel("vscode-json")
+    sentinel("vscode-json-language-server")
 }
 
 // ── tui-rework 10 coverage sentinel (skip-if-binary-missing) ──────────

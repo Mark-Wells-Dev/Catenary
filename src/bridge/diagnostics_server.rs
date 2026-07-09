@@ -1759,7 +1759,7 @@ fn source_of(diagnostic: &Value) -> &str {
 ///
 /// Collapses findings that are the *same* — keyed coarse on `(code, start-line)`,
 /// codeless fallback `(normalized-message, line)`. The key **drops `source`**, so
-/// the same finding reported by two different sources collapses: bash-ls's
+/// the same finding reported by two different sources collapses: bash-language-server's
 /// wrapped shellcheck `SC2086` and standalone shellcheck's `SC2086`, or a real
 /// error reported by both rust-analyzer-native and rustc-flycheck. Anchored on
 /// line, not column/span — LSP (0-based char) and CLI (1-based) ranges drift and
@@ -2815,11 +2815,13 @@ mod tests {
     fn format_banner_lists_each_distinct_server_sorted() {
         // Distinct unavailable servers each get a banner line, sorted.
         let unverified = vec![
-            ue("a.jl", "/project", "julia-lsp"),
+            ue("a.jl", "/project", "julia-language-server"),
             ue("b.rs", "/project", "rust-analyzer"),
         ];
         let output = format_diagnostics(&[], &[], &[], &unverified, false);
-        let julia = output.find("unavailable: julia-lsp").expect("julia banner");
+        let julia = output
+            .find("unavailable: julia-language-server")
+            .expect("julia banner");
         let rust = output
             .find("unavailable: rust-analyzer")
             .expect("rust banner");

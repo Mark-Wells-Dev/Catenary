@@ -48,7 +48,6 @@ composer global require phpactor/phpactor
 
 ```toml
 [lsp.server.phpactor]
-command = "phpactor"
 args = ["language-server"]
 
 [lsp.language.php]

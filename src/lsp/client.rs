@@ -429,7 +429,7 @@ impl LspClient {
         // push is for legacy servers that don't. An *empty* `{}` push, however,
         // is not the no-op it looks like: some servers read it as "the entire
         // configuration is now empty" and drop their built-in defaults —
-        // vscode-json disables JSON validation on an empty settings push, which
+        // vscode-json-language-server disables JSON validation on an empty settings push, which
         // silently suppressed every diagnostic it would otherwise report
         // (bug 74). A server with no configured settings keeps its own
         // defaults, which is exactly what "no configuration" should mean, so we
@@ -1019,7 +1019,7 @@ impl LspClient {
         self.server.language_id()
     }
 
-    /// Returns the server config name (e.g., "rust-analyzer", "pyright").
+    /// Returns the server config name (e.g., "rust-analyzer", "pyright-langserver").
     #[must_use]
     pub fn server_name(&self) -> &str {
         self.server.server_name()

@@ -166,26 +166,26 @@ jobs:
           java-version: ${{ matrix.runtime_version || '21' }}
 
       # Some servers derive diagnostics from an external linter named in the
-      # recipe `note` (bash-ls → shellcheck, ansible-ls → ansible-lint,
-      # elm-ls → the elm compiler). Provisioned here so the intentional
-      # diagnostic can publish. (These should graduate to structured `runtime`
-      # fields.)
+      # recipe `note` (bash-language-server → shellcheck,
+      # ansible-language-server → ansible-lint, elm-language-server → the elm
+      # compiler). Provisioned here so the intentional diagnostic can publish.
+      # (These should graduate to structured `runtime` fields.)
       - name: Provision diagnostic dependencies
         run: |
           set -euo pipefail
           case "${{ matrix.server }}" in
-            bash-ls)
+            bash-language-server)
               sudo apt-get update && sudo apt-get install -y shellcheck ;;
-            ansible-ls)
+            ansible-language-server)
               pipx install ansible-lint || pip install ansible-lint ;;
-            elm-ls)
+            elm-language-server)
               # The npm `elm` package is a stub whose install SCRIPT
               # downloads the real compiler — dead under --ignore-scripts
-              # (run-5 red: elm-ls fine, nothing to compile with). Fetch
-              # the pinned compiler binary directly; same no-scripts
-              # posture. Pin cross-verified against two independent public
-              # pinners (cashapp/hermit-packages elm.hcl, chaotic-aur
-              # PKGBUILD).
+              # (run-5 red: elm-language-server fine, nothing to compile
+              # with). Fetch the pinned compiler binary directly; same
+              # no-scripts posture. Pin cross-verified against two
+              # independent public pinners (cashapp/hermit-packages elm.hcl,
+              # chaotic-aur PKGBUILD).
               rel="releases/download/0.19.1/binary-for-linux-64-bit.gz"
               curl -sSL "https://github.com/elm/compiler/$rel" -o elm.gz
               want="e44af52bb27f725a973478e589d990a6428e115fe1bb14f0"
@@ -416,7 +416,10 @@ jobs:
           if [ -z "$ver" ]; then
             case "${{ matrix.server }}" in
               rust-analyzer)
-                ra="rustup run stable rust-analyzer"
+                # The provision step linked the real component ahead of the
+                # rustup proxy shim on PATH (misc 162), so the bare key resolves
+                # the component and reports the toolchain's honest version.
+                ra="rust-analyzer"
                 ver="$($ra --version 2>/dev/null | head -1 || true)" ;;
               clangd)
                 ver="$(clangd --version 2>/dev/null | head -1 || true)" ;;

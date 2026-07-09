@@ -32,7 +32,6 @@ needed. If `lattice` is on PATH it works automatically:
 
 ```toml
 [lsp.server.lattice]
-command = "lattice"
 args = ["serve"]
 ```
 

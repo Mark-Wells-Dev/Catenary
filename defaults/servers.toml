@@ -4,14 +4,16 @@
 # `[lsp.server.*]` entries completely replace the built-in default for
 # that name — no merging.
 #
-# Names follow Decision 011 (server naming convention):
-#   1. Server has its own name  → use as-is  (rust-analyzer, gopls)
-#   2. Named {name}-language-server → shorten to {name}-ls  (bash-ls)
-#   3. Runtime-embedded  → {lang}-ls  (julia-ls, r-ls)
+# The server KEY is the executable Catenary spawns (misc 162): the key is
+# the upstream project's published binary name (`bash-language-server`,
+# `svelteserver`, `docker-langserver`), or the runtime the server rides
+# (`dart`, `julia`, `R` — case-sensitive). There is no `command` field —
+# a config that sets one is rejected with a teaching error. To relocate a
+# binary that is not on `PATH` under its key, set an optional absolute
+# `path` (relocation, never renaming — the key stays the identity).
 #
-# Mostly only `command` and `args` are defined here;
-# `initialization_options`, `settings`, `env`, and other fields are user
-# preferences.
+# Mostly only `args` are defined here; `initialization_options`,
+# `settings`, `env`, and other fields are user preferences.
 #
 # Diagnostic source weights (misc 115) are co-located on the source definition:
 # as of linters ticket 05 a `[lsp.server.*]` may set `weight` (native-source
@@ -23,145 +25,115 @@
 # redefining `[lsp.server.rust-analyzer]`, and is keyed on the LSP `source` field,
 # so it is inert for any root whose diagnostics carry none of those sources.
 
-# ── Own name ─────────────────────────────────────────────────────
+# ── Binary is the key ────────────────────────────────────────────
 
+# rust-analyzer is the `rust-analyzer` rustup proxy on PATH (misc 162): it
+# honors the project's rust-toolchain.toml rather than forcing stable, which
+# is more correct. The proxy shim exists even when the component is absent, so
+# doctor distinguishes proxy-present from component-installed
+# (`server_binary_installed`).
 [lsp.server.rust-analyzer]
-command = "rustup"
-args = ["run", "stable", "rust-analyzer"]
 
 [lsp.server.gopls]
-command = "gopls"
 
 [lsp.server.clangd]
-command = "clangd"
 
 [lsp.server.zls]
-command = "zls"
 
-[lsp.server.pyright]
-command = "pyright-langserver"
+# pyright ships the `pyright-langserver` executable (the npm package is
+# `pyright`, but the key is what Catenary spawns).
+[lsp.server.pyright-langserver]
 args = ["--stdio"]
 
 [lsp.server.taplo]
-command = "taplo"
 args = ["lsp", "stdio"]
 
 [lsp.server.lattice]
-command = "lattice"
 args = ["serve"]
 
 [lsp.server.marksman]
-command = "marksman"
 args = ["server"]
 
 [lsp.server.intelephense]
-command = "intelephense"
 args = ["--stdio"]
 
-[lsp.server.vscode-css]
-command = "vscode-css-language-server"
+[lsp.server.vscode-css-language-server]
 args = ["--stdio"]
 
-[lsp.server.vscode-html]
-command = "vscode-html-language-server"
+[lsp.server.vscode-html-language-server]
 args = ["--stdio"]
 
-[lsp.server.vscode-json]
-command = "vscode-json-language-server"
+[lsp.server.vscode-json-language-server]
 args = ["--stdio"]
 
-[lsp.server.vscode-eslint]
-command = "vscode-eslint-language-server"
+[lsp.server.vscode-eslint-language-server]
 args = ["--stdio"]
 
 # jdtls (Eclipse JDT Language Server) is the Java default (tui-rework 10). The
 # `jdtls` launcher manages its own workspace data dir, so no args. It requires a
 # JDK >= 17 runtime — recorded on the CI provisioning stanza
-# (defaults/ci-provision.toml), not here (servers.toml carries command/args only).
+# (defaults/ci-provision.toml), not here (servers.toml carries args only).
 [lsp.server.jdtls]
-command = "jdtls"
 
 # ruby-lsp serves Ruby over stdio by default (tui-rework 10).
 [lsp.server.ruby-lsp]
-command = "ruby-lsp"
 
-# ── {name}-ls ────────────────────────────────────────────────────
+# ── {name}-language-server and friends ───────────────────────────
 
-[lsp.server.bash-ls]
-command = "bash-language-server"
+[lsp.server.bash-language-server]
 args = ["start"]
 
-[lsp.server.haskell-ls]
-command = "haskell-language-server-wrapper"
+[lsp.server.haskell-language-server-wrapper]
 args = ["--lsp"]
 
-[lsp.server.typescript-ls]
-command = "typescript-language-server"
+[lsp.server.typescript-language-server]
 args = ["--stdio"]
 
-[lsp.server.lua-ls]
-command = "lua-language-server"
+[lsp.server.lua-language-server]
 
-[lsp.server.yaml-ls]
-command = "yaml-language-server"
+[lsp.server.yaml-language-server]
 args = ["--stdio"]
 
-[lsp.server.ansible-ls]
-command = "ansible-language-server"
+[lsp.server.ansible-language-server]
 args = ["--stdio"]
 
-[lsp.server.cmake-ls]
-command = "cmake-language-server"
+[lsp.server.cmake-language-server]
 
-[lsp.server.docker-ls]
-command = "docker-langserver"
+[lsp.server.docker-langserver]
 args = ["--stdio"]
 
 [lsp.server.csharp-ls]
-command = "csharp-ls"
 
 [lsp.server.fsautocomplete]
-command = "fsautocomplete"
 args = ["--adaptive-lsp-server-enabled"]
 
-[lsp.server.kotlin-ls]
-command = "kotlin-language-server"
+[lsp.server.kotlin-language-server]
 
 [lsp.server.ocamllsp]
-command = "ocamllsp"
 
-[lsp.server.elm-ls]
-command = "elm-language-server"
+[lsp.server.elm-language-server]
 args = ["--stdio"]
 
-[lsp.server.svelte-ls]
-command = "svelteserver"
+[lsp.server.svelteserver]
 args = ["--stdio"]
 
 [lsp.server.nil]
-command = "nil"
 
 [lsp.server.terraform-ls]
-command = "terraform-ls"
 args = ["serve"]
 
 [lsp.server.sourcekit-lsp]
-command = "sourcekit-lsp"
 
 [lsp.server.metals]
-command = "metals"
 
-[lsp.server.dart-ls]
-command = "dart"
+[lsp.server.dart]
 args = ["language-server"]
 
 # ── Runtime-embedded ─────────────────────────────────────────────
 
-[lsp.server.julia-ls]
-command = "julia"
+[lsp.server.julia]
 args = ["--startup-file=no", "--history-file=no", "-e",
         "using LanguageServer; runserver()"]
 
-[lsp.server.r-ls]
-command = "R"
+[lsp.server.R]
 args = ["--slave", "-e", "languageserver::run()"]

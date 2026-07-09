@@ -1186,7 +1186,7 @@ mod tests {
         config.server.insert(
             SF_SERVER.to_string(),
             ServerDef {
-                command: "mockls".to_string(),
+                path: Some("mockls".to_string()),
                 args: vec![SF_LANG.to_string()],
                 single_file: true,
                 ..ServerDef::default()

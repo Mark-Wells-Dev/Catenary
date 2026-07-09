@@ -229,7 +229,7 @@ def self_test() -> int:
             return ["GHSA-bad"] if version == "5.6.0" else []
 
     recipes = {
-        "bash-ls": {"ecosystem": "npm", "package": "bash-language-server", "version": "5.6.0"},
+        "bash-language-server": {"ecosystem": "npm", "package": "bash-language-server", "version": "5.6.0"},
         "taplo": {"ecosystem": "cargo", "package": "taplo-cli", "version": "0.10.0"},
     }
     hist = {"bash-language-server": ["5.4.0", "5.5.0", "5.6.0"]}
@@ -237,7 +237,7 @@ def self_test() -> int:
     assert report["clean"] == 1, report
     assert report["action_required"] is True
     assert report["rollbacks"] == [
-        {"server": "bash-ls", "from": "5.6.0", "to": "5.5.0", "advisories": ["GHSA-bad"]}
+        {"server": "bash-language-server", "from": "5.6.0", "to": "5.5.0", "advisories": ["GHSA-bad"]}
     ], report
     assert "5.6.0 -> 5.5.0" in render_diff(report)
 

@@ -12,7 +12,8 @@
 # LSP configuration lives under the [lsp] table in two sub-sections:
 #
 #   [lsp.server.<name>]        — defines HOW to run a language server
-#   command = "server-binary"
+#   # the section key IS the binary Catenary spawns; add `path = "/abs/path"`
+#   # only to relocate a binary that is not on PATH.
 #   args    = ["arg1", "arg2"]
 #
 #   [lsp.language.<language-id>]   — BINDS a language to one or more servers
@@ -43,8 +44,6 @@
 # Strip lint URLs from rust-analyzer diagnostics (saves agent context),
 # and run clippy on save.
 [lsp.server.rust-analyzer]
-command = "rustup"
-args = ["run", "stable", "rust-analyzer"]
 env = { CLIPPY_DISABLE_DOCS_LINKS = "1" }
 
 [lsp.server.rust-analyzer.initialization_options]
@@ -55,17 +54,16 @@ servers = ["rust-analyzer"]
 
 # Server settings are returned in workspace/configuration responses. The
 # TOML nesting mirrors the JSON object the server expects. A user-defined
-# [lsp.server.X] fully replaces the built-in, so repeat command/args when you
-# add settings.
-[lsp.server.pyright]
-command = "pyright-langserver"
+# [lsp.server.X] fully replaces the built-in, so repeat args/settings when you
+# customize.
+[lsp.server.pyright-langserver]
 args = ["--stdio"]
 
-[lsp.server.pyright.settings.python.analysis]
+[lsp.server.pyright-langserver.settings.python.analysis]
 exclude = ["**/target", "**/node_modules"]
 
 [lsp.language.python]
-servers = ["pyright"]
+servers = ["pyright-langserver"]
 
 # ─────────────────────────────────────────────────────────────────────
 # Variant languages
@@ -74,14 +72,14 @@ servers = ["pyright"]
 # There is no `inherit` field. To make a variant language use the same
 # servers as a base language, copy the base language's `servers` list
 # into the variant binding. (typescriptreact and javascriptreact already
-# bind to typescript-ls in the built-in defaults — this is only needed
-# when you define your own variant.)
+# bind to typescript-language-server in the built-in defaults — this is only
+# needed when you define your own variant.)
 #
 # [lsp.language.typescript]
-# servers = ["typescript-ls"]
+# servers = ["typescript-language-server"]
 #
 # [lsp.language.typescriptreact]
-# servers = ["typescript-ls"]   # same list as typescript
+# servers = ["typescript-language-server"]   # same list as typescript
 
 # ─────────────────────────────────────────────────────────────────────
 # Defining a server from scratch
@@ -91,7 +89,6 @@ servers = ["pyright"]
 # from [lsp.language.*]:
 #
 # [lsp.server.phpactor]
-# command = "phpactor"
 # args = ["language-server"]
 #
 # [lsp.language.php]
@@ -117,36 +114,33 @@ servers = ["pyright"]
 # These all ship as built-in [lsp.server.*] defaults and built-in
 # [lsp.language.*] bindings — uncomment and customize only to override.
 
-# [lsp.server.bash-ls]
-# command = "bash-language-server"
+# [lsp.server.bash-language-server]
 # args = ["start"]
 # single_file = true            # also serve files outside any workspace root
 #
 # [lsp.language.shellscript]
-# servers = ["bash-ls"]
+# servers = ["bash-language-server"]
 
-# [lsp.server.yaml-ls]
-# command = "yaml-language-server"
+# [lsp.server.yaml-language-server]
 # args = ["--stdio"]
 #
 # [lsp.language.yaml]
-# servers = ["yaml-ls"]
+# servers = ["yaml-language-server"]
 
 # [lsp.server.taplo]
-# command = "taplo"
 # args = ["lsp", "stdio"]
 #
 # [lsp.language.toml]
 # servers = ["taplo"]
 
-# [lsp.server.lua-ls]
-# command = "lua-language-server"
+# [lsp.server.lua-language-server]
+# # no config needed — the key `lua-language-server` is the binary on PATH
 #
 # [lsp.language.lua]
-# servers = ["lua-ls"]
+# servers = ["lua-language-server"]
 
 # [lsp.server.zls]
-# command = "zls"
+# # no config needed — the key `zls` is the binary on PATH
 #
 # [lsp.language.zig]
 # servers = ["zls"]

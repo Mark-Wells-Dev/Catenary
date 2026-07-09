@@ -765,10 +765,10 @@ fn test_diagnostics_multi_server_concatenation() -> Result<()> {
             &config_path,
             format!(
                 "[lsp.server.mockls-a]\n\
-                 command = \"{mockls_bin}\"\n\
+                 path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\"]\n\n\
                  [lsp.server.mockls-b]\n\
-                 command = \"{mockls_bin}\"\n\
+                 path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\"]\n\n\
                  [lsp.language.{MOCK_LANG_A}]\n\
                  servers = [\"mockls-a\", \"mockls-b\"]\n"
@@ -809,10 +809,10 @@ fn test_diagnostics_one_server_suppressed() -> Result<()> {
             &config_path,
             format!(
                 "[lsp.server.mockls-diag]\n\
-                 command = \"{mockls_bin}\"\n\
+                 path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\"]\n\n\
                  [lsp.server.mockls-nodiag]\n\
-                 command = \"{mockls_bin}\"\n\
+                 path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\"]\n\n\
                  [lsp.language.{MOCK_LANG_A}]\n\
                  servers = [\"mockls-diag\", {{ name = \"mockls-nodiag\", diagnostics = false }}]\n"
@@ -847,11 +847,11 @@ fn test_diagnostics_per_server_min_severity() -> Result<()> {
             &config_path,
             format!(
                 "[lsp.server.mockls-strict]\n\
-                 command = \"{mockls_bin}\"\n\
+                 path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\"]\n\
                  min_severity = \"error\"\n\n\
                  [lsp.server.mockls-lax]\n\
-                 command = \"{mockls_bin}\"\n\
+                 path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\"]\n\n\
                  [lsp.language.{MOCK_LANG_A}]\n\
                  servers = [\"mockls-strict\", \"mockls-lax\"]\n"
@@ -887,7 +887,7 @@ fn test_diagnostics_no_servers() -> Result<()> {
             &config_path,
             format!(
                 "[lsp.server.mockls-only]\n\
-                 command = \"{mockls_bin}\"\n\
+                 path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\"]\n\n\
                  [lsp.language.{MOCK_LANG_A}]\n\
                  diagnostics = false\n\
@@ -930,10 +930,10 @@ fn test_diagnostics_one_server_dies() -> Result<()> {
             &config_path,
             format!(
                 "[lsp.server.mockls-crash]\n\
-                 command = \"{mockls_bin}\"\n\
+                 path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\", \"--drop-after\", \"3\"]\n\n\
                  [lsp.server.mockls-stable]\n\
-                 command = \"{mockls_bin}\"\n\
+                 path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\"]\n\n\
                  [lsp.language.{MOCK_LANG_A}]\n\
                  servers = [\"mockls-crash\", \"mockls-stable\"]\n"

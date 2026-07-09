@@ -720,16 +720,11 @@
       "properties": {
         "args": {
           "default": [],
-          "description": "Arguments to pass to the command.",
+          "description": "Arguments to pass to the executable.",
           "items": {
             "type": "string"
           },
           "type": "array"
-        },
-        "command": {
-          "default": "",
-          "description": "The command to execute (e.g., \"rust-analyzer\", \"clangd\").",
-          "type": "string"
         },
         "env": {
           "additionalProperties": {
@@ -757,6 +752,14 @@
         "min_severity": {
           "default": null,
           "description": "Minimum diagnostic severity to deliver to agents. Valid values: `\"error\"`, `\"warning\"`, `\"information\"`, `\"hint\"`. When absent, all severities are delivered.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "default": null,
+          "description": "Absolute path to the executable, for **relocating** the binary the key names — never for renaming it (the key stays the server's identity, so profiles, recipes, and conformance keep keying off it).\n\nThe server key IS the executable Catenary spawns (misc 162): with `path` unset the key is resolved on `PATH`; with `path` set that absolute path is spawned instead. The old `command` field is retired — a config that still supplies it is rejected with a teaching error naming this migration (`src/config/parse.rs`).",
           "type": [
             "string",
             "null"

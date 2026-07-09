@@ -997,7 +997,7 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
             &config_path,
             format!(
                 "[lsp.server.mockls]\n\
-                 command = \"{mockls_bin}\"\n\
+                 path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
                  [lsp.language.{MOCK_LANG_A}]\nservers = [\"mockls\"]\n"
             ),
@@ -1925,10 +1925,10 @@ fn test_grep_prepare_rename_priority_chain() -> Result<()> {
             &config_path,
             format!(
                 "[lsp.server.mockls-fail]\n\
-                 command = \"{mockls_bin}\"\n\
+                 path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\", \"--scan-roots\", \"--fail-on\", \"textDocument/prepareRename\"]\n\n\
                  [lsp.server.mockls-ok]\n\
-                 command = \"{mockls_bin}\"\n\
+                 path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
                  [lsp.language.{MOCK_LANG_A}]\n\
                  servers = [\"mockls-fail\", \"mockls-ok\"]\n"
@@ -2760,7 +2760,7 @@ fn test_grep_paged_integration() -> Result<()> {
             &config_path,
             format!(
                 "[lsp.server.mockls]\n\
-                 command = \"{mockls_bin}\"\n\
+                 path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\", \"--scan-roots\"]\n\n\
                  [lsp.language.{MOCK_LANG_A}]\nservers = [\"mockls\"]\n"
             ),

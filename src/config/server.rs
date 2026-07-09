@@ -23,11 +23,19 @@ use crate::lsp::glob::LspGlob;
 #[derive(Debug, Default, Deserialize, Serialize, Clone, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ServerDef {
-    /// The command to execute (e.g., "rust-analyzer", "clangd").
+    /// Absolute path to the executable, for **relocating** the binary the key
+    /// names — never for renaming it (the key stays the server's identity, so
+    /// profiles, recipes, and conformance keep keying off it).
+    ///
+    /// The server key IS the executable Catenary spawns (misc 162): with `path`
+    /// unset the key is resolved on `PATH`; with `path` set that absolute path is
+    /// spawned instead. The old `command` field is retired — a config that still
+    /// supplies it is rejected with a teaching error naming this migration
+    /// (`src/config/parse.rs`).
     #[serde(default)]
-    pub command: String,
+    pub path: Option<String>,
 
-    /// Arguments to pass to the command.
+    /// Arguments to pass to the executable.
     #[serde(default)]
     pub args: Vec<String>,
 
@@ -112,6 +120,17 @@ pub struct ServerDef {
 }
 
 impl ServerDef {
+    /// The executable Catenary spawns for the server named `key` (misc 162).
+    ///
+    /// Spawn resolution is: the [`path`](Self::path) override if set (relocating
+    /// the binary), else the server `key` itself resolved on `PATH`. The key IS
+    /// the command — there is no separate `command` field to name a different
+    /// binary.
+    #[must_use]
+    pub fn program<'a>(&'a self, key: &'a str) -> &'a str {
+        self.path.as_deref().unwrap_or(key)
+    }
+
     /// Compiles `file_patterns` into [`LspGlob`] matchers.
     ///
     /// Called once after deserialization. Fails fast on invalid patterns

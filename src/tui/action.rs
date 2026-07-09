@@ -167,12 +167,10 @@ impl ActionState {
     #[must_use]
     pub fn effective_mutation(&self) -> Mutation {
         match (&self.mutation, &self.value) {
-            (Mutation::SetServerCommand { server, .. }, Some(command)) => {
-                Mutation::SetServerCommand {
-                    server: server.clone(),
-                    command: command.clone(),
-                }
-            }
+            (Mutation::SetServerPath { server, .. }, Some(path)) => Mutation::SetServerPath {
+                server: server.clone(),
+                path: path.clone(),
+            },
             (m, _) => m.clone(),
         }
     }
@@ -345,9 +343,9 @@ mod tests {
 
     #[test]
     fn effective_mutation_substitutes_edited_value() {
-        let base = Mutation::SetServerCommand {
+        let base = Mutation::SetServerPath {
             server: "gopls".to_string(),
-            command: "gopls".to_string(),
+            path: "/usr/bin/gopls".to_string(),
         };
         let state = ActionState::new(
             base,
@@ -355,17 +353,17 @@ mod tests {
             0,
             Some("/opt/gopls".to_string()),
         );
-        let Mutation::SetServerCommand { command, .. } = state.effective_mutation() else {
-            panic!("expected a command mutation")
+        let Mutation::SetServerPath { path, .. } = state.effective_mutation() else {
+            panic!("expected a path mutation")
         };
-        assert_eq!(command, "/opt/gopls");
+        assert_eq!(path, "/opt/gopls");
     }
 
     #[test]
     fn value_edit_push_and_backspace() {
-        let base = Mutation::SetServerCommand {
+        let base = Mutation::SetServerPath {
             server: "x".to_string(),
-            command: String::new(),
+            path: String::new(),
         };
         let mut state = ActionState::new(base, vec![ConfigLayer::User], 0, Some(String::new()));
         state.push_char('a');

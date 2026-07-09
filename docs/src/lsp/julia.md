@@ -13,7 +13,7 @@ Pkg.add("LanguageServer")
 
 ## Config
 
-Catenary ships a built-in definition for `julia-ls` — no `[lsp.server.*]`
+Catenary ships a built-in definition for `julia` — no `[lsp.server.*]`
 config is needed. If `julia` is on PATH and `LanguageServer.jl` is
 installed, it works automatically.
 
@@ -36,8 +36,7 @@ create_sysimage([:LanguageServer], sysimage_path="languageserver.so")
 Then override the built-in default:
 
 ```toml
-[lsp.server.julia-ls]
-command = "julia"
+[lsp.server.julia]
 args = ["--sysimage=/path/to/languageserver.so", "-e", "using LanguageServer; runserver()"]
 ```
 

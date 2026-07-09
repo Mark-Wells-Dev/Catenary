@@ -41,7 +41,7 @@
 # ── npm tranche ──────────────────────────────────────────────────────
 # node is the implied host runtime for every npm recipe (no `runtime` field).
 
-[recipe.bash-ls]
+[recipe.bash-language-server]
 ecosystem = "npm"
 package = "bash-language-server"
 version = "5.6.0"
@@ -50,7 +50,7 @@ draft = true
 hash = "sha512-DCuV+/BZAAozsp5blvi6jDnU/ZDaTpJpWM0zqwGjnirfqv7iBsMK32xOze/jipxU0PUZ6CBUKgRUMKI7Kk70Lg=="
 note = "diagnostics come from shellcheck; a conformance job provisions it too."
 
-[recipe.yaml-ls]
+[recipe.yaml-language-server]
 ecosystem = "npm"
 package = "yaml-language-server"
 version = "1.23.0"
@@ -62,7 +62,7 @@ hash = "sha512-3qVyCOexLCWw06PQa5kRPwvMWMZ/eZeCRWUvgD6a0OkqL/4iCnxy2WumbWifa937U
 # from one package; each server gets its own recipe so the matrix runs one job
 # per conformed binary. The package is bundled (webpacked) — no transitive deps
 # resolve at install time. All four share the one package tarball's sha512.
-[recipe.vscode-json]
+[recipe.vscode-json-language-server]
 ecosystem = "npm"
 package = "vscode-langservers-extracted"
 version = "4.10.0"
@@ -70,7 +70,7 @@ tier = "npm-tarball-sha512"
 draft = true
 hash = "sha512-EFf9uQI4dAKbzMQFjDvVm1xJq1DXAQvBEuEfPGrK/xzfsL5xWTfIuRr90NgfmqwO+IEt6vLZm9EOj6R66xIifg=="
 
-[recipe.vscode-css]
+[recipe.vscode-css-language-server]
 ecosystem = "npm"
 package = "vscode-langservers-extracted"
 version = "4.10.0"
@@ -78,7 +78,7 @@ tier = "npm-tarball-sha512"
 draft = true
 hash = "sha512-EFf9uQI4dAKbzMQFjDvVm1xJq1DXAQvBEuEfPGrK/xzfsL5xWTfIuRr90NgfmqwO+IEt6vLZm9EOj6R66xIifg=="
 
-[recipe.vscode-html]
+[recipe.vscode-html-language-server]
 ecosystem = "npm"
 package = "vscode-langservers-extracted"
 version = "4.10.0"
@@ -86,7 +86,7 @@ tier = "npm-tarball-sha512"
 draft = true
 hash = "sha512-EFf9uQI4dAKbzMQFjDvVm1xJq1DXAQvBEuEfPGrK/xzfsL5xWTfIuRr90NgfmqwO+IEt6vLZm9EOj6R66xIifg=="
 
-[recipe.vscode-eslint]
+[recipe.vscode-eslint-language-server]
 ecosystem = "npm"
 package = "vscode-langservers-extracted"
 version = "4.10.0"
@@ -94,9 +94,9 @@ tier = "npm-tarball-sha512"
 draft = true
 hash = "sha512-EFf9uQI4dAKbzMQFjDvVm1xJq1DXAQvBEuEfPGrK/xzfsL5xWTfIuRr90NgfmqwO+IEt6vLZm9EOj6R66xIifg=="
 conformance = false
-note = "conformance = false (tui-rework 13): vscode-eslint-language-server needs the `eslint` npm package co-installed in the fixture project (a bare fixture yields `-32603: path argument must be of type string`), AND a VS-Code-shaped `settings` payload (workspaceFolder / nodePath / validate) that Catenary's shipped defaults do not deliver — its textDocument/diagnostic pull errors without it. Conforming it needs both an eslint co-install recipe and a shipped `[lsp.server.vscode-eslint]` settings block (unverifiable on the maintainer host — eslint is absent); excluded until that lands rather than shipped as a guaranteed-red job."
+note = "conformance = false (tui-rework 13): vscode-eslint-language-server needs the `eslint` npm package co-installed in the fixture project (a bare fixture yields `-32603: path argument must be of type string`), AND a VS-Code-shaped `settings` payload (workspaceFolder / nodePath / validate) that Catenary's shipped defaults do not deliver — its textDocument/diagnostic pull errors without it. Conforming it needs both an eslint co-install recipe and a shipped `[lsp.server.vscode-eslint-language-server]` settings block (unverifiable on the maintainer host — eslint is absent); excluded until that lands rather than shipped as a guaranteed-red job."
 
-[recipe.typescript-ls]
+[recipe.typescript-language-server]
 ecosystem = "npm"
 package = "typescript-language-server"
 version = "5.3.0"
@@ -110,7 +110,7 @@ note = "resolves transitive deps at install time within the pinned version; the 
 # residual install-time dependency risk. The pyright class (findings 5/6) is why
 # the harness runs the shipped config as one unit — the wall bound catches a
 # server that never yields on an under-configured workspace.
-[recipe.pyright]
+[recipe.pyright-langserver]
 ecosystem = "npm"
 package = "pyright"
 version = "1.1.411"
@@ -126,7 +126,7 @@ tier = "npm-tarball-sha512"
 draft = true
 hash = "sha512-dqCH1YNCRlHGBLND+iUFjBJlGwM4pPimX2jm8AaP/6K2WZNM2K2+E8dOWCD3ZYMP2zC2ICBD9Soe2oxKtU9d9A=="
 
-[recipe.svelte-ls]
+[recipe.svelteserver]
 ecosystem = "npm"
 package = "svelte-language-server"
 version = "0.18.3"
@@ -135,7 +135,7 @@ draft = true
 hash = "sha512-60hbZVquRLjP/VIU3BS82IXQDT4JsDIJ15NvcnlMimy6tQfAkAv+og3SXGP3IT7TlaPdCrqmFe/kjOQOKtWTfw=="
 note = "resolves transitive deps at install time within the pinned version."
 
-[recipe.elm-ls]
+[recipe.elm-language-server]
 ecosystem = "npm"
 package = "@elm-tooling/elm-language-server"
 version = "2.8.0"
@@ -144,7 +144,7 @@ draft = true
 hash = "sha512-SOmEr2EaYAy/QYK84zOyEJDxvEu0B7xDszCBzGMGaFSoksGrYAo54Ot0g9I7wEpcr2H+LLFTDjPsbaHcP1T2lA=="
 note = "the elm compiler itself is a separate runtime the server shells out to; a conformance job installs it via the elm npm package."
 
-[recipe.docker-ls]
+[recipe.docker-langserver]
 ecosystem = "npm"
 package = "dockerfile-language-server-nodejs"
 version = "0.15.0"
@@ -152,7 +152,7 @@ tier = "npm-tarball-sha512"
 draft = true
 hash = "sha512-iS3GUUAn1bC3sDdLyg6CUnIaVQfViJBh+FhWBPftK6kJkhUMxFG2sr25OqMVaZgRsVuJEoNpflgJN3FCbkA01A=="
 
-[recipe.ansible-ls]
+[recipe.ansible-language-server]
 ecosystem = "npm"
 package = "@ansible/ansible-language-server"
 version = "26.6.0"
@@ -174,7 +174,7 @@ draft = true
 # ── pip tranche ──────────────────────────────────────────────────────
 # python is the implied host runtime; `--require-hashes` pins the sha256 set.
 
-[recipe.cmake-ls]
+[recipe.cmake-language-server]
 ecosystem = "pip"
 package = "cmake-language-server"
 version = "0.1.11"

@@ -485,7 +485,6 @@ mod tests {
             &config_path,
             r#"
 [lsp.server.rust-analyzer]
-command = "rust-analyzer-local"
 
 [lsp.language.rust]
 servers = ["rust-analyzer"]
@@ -682,11 +681,9 @@ command = "rust-analyzer"
             &config_path,
             r#"
 [lsp.server.rust-analyzer]
-command = "rust-analyzer"
 args = ["--log-level", "info"]
 
 [lsp.server.clangd]
-command = "clangd"
 args = ["--background-index"]
 settings = { checkOnSave = true }
 
@@ -706,11 +703,11 @@ servers = ["clangd"]
             .server
             .get("rust-analyzer")
             .expect("rust-analyzer server def");
-        assert_eq!(ra.command, "rust-analyzer");
+        assert_eq!(ra.program("rust-analyzer"), "rust-analyzer");
         assert_eq!(ra.args, vec!["--log-level", "info"]);
 
         let clangd = config.server.get("clangd").expect("clangd server def");
-        assert_eq!(clangd.command, "clangd");
+        assert_eq!(clangd.program("clangd"), "clangd");
         assert_eq!(clangd.args, vec!["--background-index"]);
         assert!(clangd.settings.is_some());
 
@@ -726,7 +723,6 @@ servers = ["clangd"]
             &config_path,
             r#"
 [lsp.server.rust-analyzer]
-command = "rust-analyzer"
 
 [lsp.language.rust]
 servers = ["rust-analyzer"]
@@ -750,10 +746,8 @@ servers = ["rust-analyzer"]
             &source1,
             r#"
 [lsp.server.rust-analyzer]
-command = "rust-analyzer"
 
 [lsp.server.clangd]
-command = "clangd"
 args = ["--background-index"]
 
 [lsp.language.rust]
@@ -766,10 +760,8 @@ servers = ["rust-analyzer"]
             &source2,
             r#"
 [lsp.server.rust-analyzer]
-command = "rust-analyzer"
 
 [lsp.server.clangd]
-command = "clangd"
 args = ["--background-index", "--clang-tidy"]
 settings = { checkOnSave = true }
 
@@ -796,10 +788,9 @@ servers = ["rust-analyzer"]
             &config_path,
             r#"
 [lsp.server.rust-analyzer]
-command = "rust-analyzer"
 
 [lsp.server.bad-server]
-command = ""
+path = ""
 
 [lsp.language.rust]
 servers = ["rust-analyzer"]
@@ -811,8 +802,8 @@ servers = ["rust-analyzer"]
         assert!(result.is_err());
         let err = format!("{:#}", result.expect_err("should error"));
         assert!(
-            err.contains("empty") && err.contains("command"),
-            "error should mention empty command: {err}",
+            err.contains("empty") && err.contains("path"),
+            "error should mention empty path: {err}",
         );
     }
 
@@ -825,7 +816,6 @@ servers = ["rust-analyzer"]
             &config_path,
             r#"
 [lsp.server.tsserver]
-command = "typescript-language-server"
 
 [lsp.language.typescript]
 servers = ["tsserver"]
@@ -879,7 +869,6 @@ diagnostics = false
             &config_path,
             r#"
 [lsp.server.tsserver]
-command = "typescript-language-server"
 args = ["--stdio"]
 
 [lsp.language.typescript]
@@ -900,8 +889,8 @@ servers = ["tsserver"]
             .expect("should exist from defaults");
         assert_eq!(
             tsx.servers,
-            Some(vec![ServerBinding::new("typescript-ls")]),
-            "TSX should have built-in typescript-ls binding"
+            Some(vec![ServerBinding::new("typescript-language-server")]),
+            "TSX should have built-in typescript-language-server binding"
         );
 
         // Truly unconfigured language returns None
@@ -982,7 +971,6 @@ servers = ["tsserver"]
 log_retention_days = 14
 
 [lsp.server.rust-analyzer]
-command = "rust-analyzer-local"
 
 [lsp.language.rust]
 servers = ["rust-analyzer"]
@@ -1014,12 +1002,10 @@ log_retention_days = 30
             &config_path,
             r#"
 [lsp.server.rust-analyzer]
-command = "rust-analyzer"
 args = ["--log-level", "info"]
 min_severity = "warning"
 
 [lsp.server.clangd]
-command = "clangd"
 args = ["--background-index"]
 
 [lsp.language.rust]
@@ -1040,7 +1026,7 @@ servers = ["clangd"]
             .server
             .get("rust-analyzer")
             .expect("rust-analyzer server def");
-        assert_eq!(ra.command, "rust-analyzer");
+        assert_eq!(ra.program("rust-analyzer"), "rust-analyzer");
         assert_eq!(ra.args, vec!["--log-level", "info"]);
         assert_eq!(ra.min_severity.as_deref(), Some("warning"));
 
@@ -1078,8 +1064,8 @@ command = "rust-analyzer"
         assert!(result.is_err());
         let err = format!("{:#}", result.expect_err("should error"));
         assert!(
-            err.contains("command") && err.contains("[lsp.server.*]"),
-            "error should mention server definition migration: {err}",
+            err.contains("command") && err.contains("retired"),
+            "error should mention the retired command field: {err}",
         );
     }
 
@@ -1096,7 +1082,6 @@ single_file = true
 servers = ["bash-language-server"]
 
 [lsp.server.bash-language-server]
-command = "bash-language-server"
 args = ["start"]
 "#,
         )
@@ -1119,7 +1104,7 @@ args = ["start"]
         use std::collections::HashMap;
 
         let def = ServerDef {
-            command: "x".into(),
+            path: Some("x".into()),
             args: vec!["a".into()],
             env: Some(HashMap::from([("K".into(), "V".into())])),
             initialization_options: Some(serde_json::json!({})),
@@ -1218,7 +1203,6 @@ servers = []
             &config_path,
             r#"
 [lsp.server.rust-analyzer]
-command = "rust-analyzer"
 weight = 10
 provisional = "^E[0-9]+$"
 
@@ -1250,7 +1234,6 @@ servers = ["rust-analyzer"]
             &config_path,
             r#"
 [lsp.server.rust-analyzer]
-command = "rust-analyzer"
 provisional = "^E[0-9+$"
 
 [lsp.language.rust]
@@ -1294,7 +1277,6 @@ weight = 70
             &config_path,
             r#"
 [lsp.server.tsserver]
-command = "typescript-language-server"
 min_severity = "warning"
 
 [lsp.language.typescript]
@@ -1323,27 +1305,28 @@ servers = ["tsserver"]
 
         let (lang, server_def, lang_config) = &results[0];
         assert_eq!(lang, "rust");
-        assert_eq!(server_def.command, "rust-analyzer");
+        assert_eq!(server_def.path.as_deref(), Some("rust-analyzer"));
         assert_eq!(server_def.args, vec!["--log-level", "info"]);
         assert_eq!(lang_config.servers, Some(vec![ServerBinding::new("rust")]));
     }
 
     #[test]
     fn test_parse_server_specs_multiple() {
-        let results =
-            parse::parse_server_specs("rust:rust-analyzer;python:pyright --stdio;c:clangd");
+        let results = parse::parse_server_specs(
+            "rust:rust-analyzer;python:pyright-langserver --stdio;c:clangd",
+        );
         assert_eq!(results.len(), 3);
 
         assert_eq!(results[0].0, "rust");
-        assert_eq!(results[0].1.command, "rust-analyzer");
+        assert_eq!(results[0].1.path.as_deref(), Some("rust-analyzer"));
         assert!(results[0].1.args.is_empty());
 
         assert_eq!(results[1].0, "python");
-        assert_eq!(results[1].1.command, "pyright");
+        assert_eq!(results[1].1.path.as_deref(), Some("pyright-langserver"));
         assert_eq!(results[1].1.args, vec!["--stdio"]);
 
         assert_eq!(results[2].0, "c");
-        assert_eq!(results[2].1.command, "clangd");
+        assert_eq!(results[2].1.path.as_deref(), Some("clangd"));
     }
 
     #[test]
@@ -1351,7 +1334,7 @@ servers = ["tsserver"]
         let results = parse::parse_server_specs("  ; ;rust:ra;  ");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "rust");
-        assert_eq!(results[0].1.command, "ra");
+        assert_eq!(results[0].1.path.as_deref(), Some("ra"));
     }
 
     /// Regression for bug 50: a `CATENARY_SERVERS` override keyed by a built-in
@@ -1381,7 +1364,7 @@ servers = ["tsserver"]
         // Only the server binding is overridden, to the env-derived server.
         assert_eq!(rust.servers, Some(vec![ServerBinding::new("rust")]));
         let server = config.server.get("rust").expect("env server def");
-        assert_eq!(server.command, "somebin");
+        assert_eq!(server.path.as_deref(), Some("somebin"));
 
         Ok(())
     }
@@ -1404,7 +1387,7 @@ servers = ["tsserver"]
             .expect("new language inserted");
         assert_eq!(lang.servers, Some(vec![ServerBinding::new("yX4Za")]));
         let server = config.server.get("yX4Za").expect("env server def");
-        assert_eq!(server.command, "mockls");
+        assert_eq!(server.path.as_deref(), Some("mockls"));
         assert_eq!(
             server.args,
             vec!["yX4Za".to_string(), "--scan-roots".to_string()]
@@ -1422,7 +1405,6 @@ servers = ["tsserver"]
             &config_path,
             r#"
 [lsp.server.tsserver]
-command = "typescript-language-server"
 
 [lsp.language.typescript]
 servers = ["tsserver"]
@@ -1451,7 +1433,6 @@ servers = ["tsserver"]
             &config_path,
             r#"
 [lsp.server.rust-analyzer]
-command = "rust-analyzer"
 
 [lsp.language.rust]
 servers = ["rust-analyzer"]
@@ -1729,7 +1710,6 @@ command = "rust-analyzer"
             &path,
             r#"
 [lsp.server.foo]
-command = "foo-server"
 
 [lsp.language.test]
 servers = ["foo"]
@@ -1753,7 +1733,6 @@ servers = ["foo"]
             &path,
             r#"
 [lsp.server.foo]
-command = "foo-server"
 
 [lsp.language.test]
 servers = [{ name = "foo", diagnostics = false }]
@@ -1777,10 +1756,8 @@ servers = [{ name = "foo", diagnostics = false }]
             &path,
             r#"
 [lsp.server.alpha]
-command = "alpha-server"
 
 [lsp.server.beta]
-command = "beta-server"
 
 [lsp.language.test]
 servers = ["alpha", { name = "beta", diagnostics = false }]
@@ -1813,7 +1790,6 @@ servers = ["alpha", { name = "beta", diagnostics = false }]
             &path,
             r#"
 [lsp.server.foo]
-command = "foo-server"
 
 [lsp.language.test]
 servers = [{ name = "foo", typo = true }]
@@ -1838,7 +1814,6 @@ servers = [{ name = "foo", typo = true }]
             &path,
             r#"
 [lsp.server.alpha]
-command = "alpha-server"
 
 [lsp.language.test]
 servers = [{ name = "alpha", disabled_methods = ["textDocument/references"] }]
@@ -1866,7 +1841,6 @@ servers = [{ name = "alpha", disabled_methods = ["textDocument/references"] }]
             &path,
             r#"
 [lsp.server.alpha]
-command = "alpha-server"
 
 [lsp.language.test]
 servers = [{ name = "alpha", disabled_methods = ["textDocument/typo"] }]
@@ -1891,7 +1865,6 @@ servers = [{ name = "alpha", disabled_methods = ["textDocument/typo"] }]
             &path,
             r#"
 [lsp.server.alpha]
-command = "alpha-server"
 
 [lsp.language.test]
 servers = [{ name = "alpha", disabled_methods = ["textDocument/diagnostic"] }]
@@ -1916,7 +1889,6 @@ servers = [{ name = "alpha", disabled_methods = ["textDocument/diagnostic"] }]
             &path,
             r#"
 [lsp.server.foo]
-command = "foo-server"
 
 [lsp.language.test]
 servers = ["foo"]
@@ -1938,7 +1910,6 @@ servers = ["foo"]
             &path,
             r#"
 [lsp.server.foo]
-command = "foo-server"
 
 [lsp.language.test]
 servers = ["foo"]
@@ -1960,7 +1931,6 @@ servers = ["foo"]
             &path,
             r#"
 [lsp.server.md-server]
-command = "md-server"
 
 [lsp.language.markdown]
 servers = ["md-server"]
@@ -2044,7 +2014,6 @@ diagnostics = false
             &path,
             r#"
 [lsp.server.foo]
-command = "foo-server"
 min_severity = "warning"
 
 [lsp.language.test]
@@ -2067,7 +2036,6 @@ servers = ["foo"]
             &path,
             r#"
 [lsp.server.foo]
-command = "foo-server"
 
 [lsp.language.rust]
 servers = ["foo"]
@@ -2093,7 +2061,6 @@ min_severity = "warning"
             &path,
             r#"
 [lsp.server.foo]
-command = "foo-server"
 
 [lsp.language.test]
 servers = ["foo"]
@@ -2117,7 +2084,6 @@ servers = ["foo"]
             &path,
             r#"
 [lsp.server.rust-analyzer]
-command = "rust-analyzer"
 
 [lsp.language.rust]
 servers = ["rust-analyzer"]
@@ -2147,11 +2113,10 @@ servers = ["rust-analyzer"]
         fs::write(
             &path,
             r#"
-[lsp.server.bash-ls]
-command = "bash-language-server"
+[lsp.server.bash-language-server]
 
 [lsp.language.shellscript]
-servers = ["bash-ls"]
+servers = ["bash-language-server"]
 filenames = ["PKGBUILD", "APKBUILD"]
 "#,
         )?;
@@ -2184,7 +2149,6 @@ filenames = ["PKGBUILD", "APKBUILD"]
             &path,
             r#"
 [lsp.server.pkgbuild-ls]
-command = "pkgbuild-ls"
 file_patterns = ["PKGBUILD"]
 
 [lsp.language.shellscript]
@@ -2207,7 +2171,6 @@ servers = ["pkgbuild-ls"]
             &path,
             r#"
 [lsp.server.bad]
-command = "bad-server"
 file_patterns = ["[invalid"]
 
 [lsp.language.test]
@@ -2233,7 +2196,6 @@ servers = ["bad"]
             &path,
             r#"
 [lsp.server.bad]
-command = "bad-server"
 file_patterns = [""]
 
 [lsp.language.test]
@@ -2282,7 +2244,6 @@ extensions = ["rs", ""]
             &base,
             r#"
 [lsp.server.foo]
-command = "foo-server"
 
 [lsp.language.test]
 servers = ["foo"]
@@ -2665,7 +2626,6 @@ build = "npm"
             &config_path,
             r#"
 [lsp.server.rust-analyzer]
-command = "rust-analyzer"
 
 [lsp.language.rust]
 servers = ["rust-analyzer"]
@@ -2692,7 +2652,6 @@ servers = ["rust-analyzer"]
             &config_path,
             r#"
 [lsp.server.rust-analyzer]
-command = "rust-analyzer"
 
 [lsp.language.rust]
 servers = ["rust-analyzer"]
@@ -2720,7 +2679,6 @@ root_markers = ["rust-toolchain.toml"]
             &config_path,
             r#"
 [lsp.server.rust-analyzer]
-command = "rust-analyzer"
 
 [lsp.language.rust]
 servers = ["rust-analyzer"]
@@ -2752,7 +2710,6 @@ root_markers = []
             &config_path,
             r#"
 [lsp.server.my-custom-server]
-command = "my-server"
 
 [lsp.language.custom]
 servers = ["my-custom-server"]
@@ -2779,7 +2736,7 @@ servers = ["my-custom-server"]
         let go = config.language.get("go").expect("go language config");
         assert_eq!(go.servers, Some(vec![ServerBinding::new("gopls")]));
         let gopls = config.server.get("gopls").expect("gopls server def");
-        assert_eq!(gopls.command, "gopls");
+        assert_eq!(gopls.program("gopls"), "gopls");
         Ok(())
     }
 
@@ -2793,7 +2750,6 @@ servers = ["my-custom-server"]
             &config_path,
             r#"
 [lsp.server.rust-analyzer]
-command = "rust-analyzer"
 
 [lsp.language.rust]
 servers = ["rust-analyzer"]
@@ -2805,7 +2761,11 @@ servers = ["rust-analyzer"]
             .server
             .get("rust-analyzer")
             .expect("rust-analyzer server def");
-        assert_eq!(ra.command, "rust-analyzer", "user command should win");
+        assert_eq!(
+            ra.program("rust-analyzer"),
+            "rust-analyzer",
+            "user command should win"
+        );
         assert!(ra.args.is_empty(), "built-in args should NOT be inherited");
         Ok(())
     }
@@ -2820,7 +2780,6 @@ servers = ["rust-analyzer"]
             &config_path,
             r#"
 [lsp.server.rust-analyzer]
-command = "rust-analyzer"
 
 [lsp.language.rust]
 servers = ["rust-analyzer"]
@@ -2832,7 +2791,7 @@ servers = ["rust-analyzer"]
             .server
             .get("rust-analyzer")
             .expect("rust-analyzer server def");
-        assert_eq!(ra.command, "rust-analyzer");
+        assert_eq!(ra.program("rust-analyzer"), "rust-analyzer");
         assert!(
             ra.args.is_empty(),
             "user override with no args should not inherit built-in args",
@@ -2866,13 +2825,14 @@ servers = ["nonexistent"]
     }
 
     #[test]
-    fn test_builtin_servers_all_have_command() -> anyhow::Result<()> {
-        // Every built-in server def must have a non-empty command.
+    fn test_builtin_servers_spawn_via_key() -> anyhow::Result<()> {
+        // Every built-in server spawns via its key (the executable); any `path`
+        // override must be non-empty.
         let config = Config::load_from_sources(&[])?;
         for (name, def) in &config.server {
             assert!(
-                !def.command.is_empty(),
-                "built-in server '{name}' has an empty command",
+                def.path.as_ref().is_none_or(|p| !p.is_empty()),
+                "built-in server '{name}' has an empty path",
             );
         }
         Ok(())
@@ -3011,13 +2971,13 @@ servers = ["nonexistent"]
         let config = Config::load_from_sources(&[example])?;
 
         // Spot-check the split format took effect: the rust-analyzer override
-        // is a [lsp.server.*] definition with a command, and the markdown default
-        // resolves to lattice (decision 015), not marksman.
+        // is a [lsp.server.*] definition (the key IS the executable), and the
+        // markdown default resolves to lattice (decision 015), not marksman.
         let ra = config
             .server
             .get("rust-analyzer")
             .expect("rust-analyzer server def");
-        assert_eq!(ra.command, "rustup");
+        assert_eq!(ra.program("rust-analyzer"), "rust-analyzer");
 
         let markdown = config.language.get("markdown").expect("markdown language");
         assert_eq!(

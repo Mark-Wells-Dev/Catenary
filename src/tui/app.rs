@@ -16,7 +16,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 
 use crate::config::{Config, Mutation};
-use crate::health::{FindingCode, servers::binary_exists};
+use crate::health::{FindingCode, servers::server_binary_installed};
 use crate::install::{
     BlessedRecipe, CommandRunner, InstallPlan, ProcessRunner, TarballFetcher, UreqFetcher,
 };
@@ -716,7 +716,7 @@ impl<'a> App<'a> {
                 find_migration_source().map(|source| Mutation::MigrateNamespace { source })
             }
             FindingCode::ServerRoutedBroken => match &row.owner {
-                Owner::Server(name) => self.set_command_mutation(name),
+                Owner::Server(name) => self.set_path_mutation(name),
                 _ => None,
             },
             _ => None,
@@ -724,22 +724,32 @@ impl<'a> App<'a> {
     }
 
     /// The mutation the detail pane offers for a cursored server: set its binary
-    /// path when the binary is missing, else toggle its diagnostics.
+    /// path when the executable is not installed, else toggle its diagnostics.
     fn mutation_for_server(&self, name: &str) -> Option<Mutation> {
         let def = self.config.as_ref()?.server.get(name)?;
-        if binary_exists(&def.command) {
+        // The server key IS the executable (misc 162); `server_binary_installed`
+        // is honest against the rust-analyzer rustup proxy shim.
+        if server_binary_installed(name, def.program(name)) {
             self.toggle_server_mutation(name)
         } else {
-            self.set_command_mutation(name)
+            self.set_path_mutation(name)
         }
     }
 
-    /// A "set the binary path" mutation seeded with the server's current command.
-    fn set_command_mutation(&self, name: &str) -> Option<Mutation> {
-        let command = self.config.as_ref()?.server.get(name)?.command.clone();
-        Some(Mutation::SetServerCommand {
+    /// A "relocate the binary" mutation seeded with the server's current `path`
+    /// override (empty when it spawns off `PATH` under its key).
+    fn set_path_mutation(&self, name: &str) -> Option<Mutation> {
+        let path = self
+            .config
+            .as_ref()?
+            .server
+            .get(name)?
+            .path
+            .clone()
+            .unwrap_or_default();
+        Some(Mutation::SetServerPath {
             server: name.to_string(),
-            command,
+            path,
         })
     }
 
@@ -777,7 +787,7 @@ impl<'a> App<'a> {
         };
         let candidates = mutation.candidate_layers(Some(&self.project_root));
         let value = match &mutation {
-            Mutation::SetServerCommand { command, .. } => Some(command.clone()),
+            Mutation::SetServerPath { path, .. } => Some(path.clone()),
             _ => None,
         };
         self.pending_action = Some(ActionState::new(mutation, candidates, 0, value));
@@ -1028,13 +1038,10 @@ mod tests {
     fn config_with_server(server: &str, language: &str) -> Config {
         use crate::config::{LanguageConfig, ServerBinding, ServerDef};
         let mut config = Config::default();
-        config.server.insert(
-            server.to_string(),
-            ServerDef {
-                command: server.to_string(),
-                ..ServerDef::default()
-            },
-        );
+        // The key IS the executable (misc 162): a bare def spawns `server` on PATH.
+        config
+            .server
+            .insert(server.to_string(), ServerDef::default());
         config.language.insert(
             language.to_string(),
             LanguageConfig {
@@ -1120,7 +1127,7 @@ mod tests {
     }
 
     #[test]
-    fn cursored_server_with_missing_binary_offers_set_command() {
+    fn cursored_server_with_missing_binary_offers_set_path() {
         let theme = Theme::new();
         let icons = IconSet::from_config(crate::config::IconConfig::default());
         let mut snap = snap_with_servers(1);
@@ -1135,13 +1142,13 @@ mod tests {
             .expect("server row present");
         app.root_cursor.index = idx;
         app.set_focus(Pane::RootTree);
-        // `srv0` isn't on `$PATH`, so the action is "set the binary path".
+        // `srv0` isn't on `$PATH`, so the action is "relocate the binary".
         assert!(
             matches!(
                 app.available_mutation(),
-                Some(crate::config::Mutation::SetServerCommand { server, .. }) if server == "srv0"
+                Some(crate::config::Mutation::SetServerPath { server, .. }) if server == "srv0"
             ),
-            "a missing-binary server offers a set-command mutation",
+            "a missing-binary server offers a set-path mutation",
         );
     }
 

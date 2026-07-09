@@ -1053,15 +1053,18 @@ fn server_detail(
     ));
 
     if let Some(def) = config.and_then(|c| c.server.get(name)) {
+        // The server key IS the executable (misc 162); resolve the `path`
+        // override if set, else the key itself.
+        let program = def.program(name);
         let cmd = if def.args.is_empty() {
-            def.command.clone()
+            program.to_string()
         } else {
-            format!("{} {}", def.command, def.args.join(" "))
+            format!("{} {}", program, def.args.join(" "))
         };
         lines.push(kv("command", cmd, theme));
         // Name the resolved path (home-relativized), not just presence —
         // "where is it?" is the question the pane answers (ticket 11 item 5).
-        let binary = crate::health::servers::resolve_binary(&def.command).map_or_else(
+        let binary = crate::health::servers::resolve_binary(program).map_or_else(
             || "NOT found on $PATH".to_string(),
             |path| crate::bridge::compress_home(&path),
         );
@@ -1544,14 +1547,14 @@ mod tests {
         config.server.insert(
             "mock-server".to_string(),
             crate::config::ServerDef {
-                command: bin.to_string_lossy().into_owned(),
+                path: Some(bin.to_string_lossy().into_owned()),
                 ..Default::default()
             },
         );
         config.server.insert(
             "gone-server".to_string(),
             crate::config::ServerDef {
-                command: "definitely-not-a-real-binary-xyz".to_string(),
+                path: Some("definitely-not-a-real-binary-xyz".to_string()),
                 ..Default::default()
             },
         );

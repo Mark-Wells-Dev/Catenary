@@ -30,7 +30,7 @@ fn write_marker_config(dir: &Path, markers: &[&str]) -> Result<std::path::PathBu
         &config_path,
         format!(
             "[lsp.server.mockls-{MOCK_LANG}]\n\
-             command = \"{mockls_bin}\"\n\
+             path = \"{mockls_bin}\"\n\
              args = [\"{MOCK_LANG}\"]\n\
              root_markers = [{markers}]\n\n\
              [lsp.language.{MOCK_LANG}]\n\
@@ -50,7 +50,7 @@ fn write_no_marker_config(dir: &Path) -> Result<std::path::PathBuf> {
         &config_path,
         format!(
             "[lsp.server.mockls-{MOCK_LANG}]\n\
-             command = \"{mockls_bin}\"\n\
+             path = \"{mockls_bin}\"\n\
              args = [\"{MOCK_LANG}\"]\n\
              root_markers = []\n\n\
              [lsp.language.{MOCK_LANG}]\n\

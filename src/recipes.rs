@@ -139,7 +139,7 @@ impl VerificationTier {
 ///
 /// The npm/cargo/pip/go ecosystems each imply their own host (node, cargo,
 /// python, go); this field records an *additional* runtime a server needs — the
-/// motivating case is a JDK for a JVM-based server (kotlin-ls, metals). The
+/// motivating case is a JDK for a JVM-based server (kotlin-language-server, metals). The
 /// conformance workflow provisions it before running the harness, and a later
 /// suggestion surface needs it in its fix-it text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -801,7 +801,7 @@ mod tests {
     #[test]
     fn recipe_parses_and_roundtrips_a_runtime_dependency() {
         // The `runtime` field is the schema hook for the JVM/dotnet tail (a JDK
-        // for metals/kotlin-ls) the conformance workflow must provision before
+        // for metals/kotlin-language-server) the conformance workflow must provision before
         // running the harness. No shipped draft sets it yet (the runtime tail is
         // out of tranche 1/2), so exercise it directly: inline-table on parse,
         // sub-table on serialize (it is declared last for exactly this).
@@ -896,7 +896,7 @@ mod tests {
         for server in [
             "rust-analyzer",
             "clangd",
-            "lua-ls",
+            "lua-language-server",
             "marksman",
             "lattice",
             "jdtls",
@@ -967,17 +967,23 @@ mod tests {
 
     #[test]
     fn conformed_and_exempt_partition_the_shipped_data() {
-        // The shipped exemptions (tui-rework 13): cmake-ls / typescript-ls /
-        // vscode-eslint recipes and the marksman provision. Everything else that
-        // is not pending is conformed. The two sets are disjoint and neither
-        // contains a pending server.
+        // The shipped exemptions (tui-rework 13): cmake-language-server /
+        // typescript-language-server / vscode-eslint-language-server recipes and
+        // the marksman provision. Everything else that is not pending is
+        // conformed. The two sets are disjoint and neither contains a pending
+        // server.
         let recipes = default_recipes().expect("recipes parse");
         let provisions = default_provisioning().expect("provisioning parses");
 
         let conformed = conformed_server_names(&recipes, &provisions);
         let exempt = conformance_exempt_names(&recipes, &provisions);
 
-        for name in ["cmake-ls", "typescript-ls", "vscode-eslint", "marksman"] {
+        for name in [
+            "cmake-language-server",
+            "typescript-language-server",
+            "vscode-eslint-language-server",
+            "marksman",
+        ] {
             assert!(
                 exempt.iter().any(|e| e == name),
                 "`{name}` must be conformance-exempt"
@@ -987,10 +993,11 @@ mod tests {
                 "`{name}` must not be in the conformed set"
             );
         }
-        // A representative conformed server (ansible-ls, class-D-fixed) is present.
+        // A representative conformed server (ansible-language-server,
+        // class-D-fixed) is present.
         assert!(
-            conformed.iter().any(|c| c == "ansible-ls"),
-            "ansible-ls conforms after the class D fixture fix"
+            conformed.iter().any(|c| c == "ansible-language-server"),
+            "ansible-language-server conforms after the class D fixture fix"
         );
         // jdtls is pending, so it is in neither set (the matrix skips it).
         assert!(

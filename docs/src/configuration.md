@@ -14,9 +14,11 @@ Catenary loads configuration from multiple sources, in order of priority
 Configuration uses two sections: `[lsp.server.*]` defines how to run a
 language server, and `[lsp.language.*]` binds languages to servers.
 
+The section key `<name>` **is** the server binary Catenary spawns; add an
+optional `path = "/abs/path"` only to relocate a binary that is not on PATH.
+
 ```toml
 [lsp.server.<name>]
-command = "server-binary"
 args = ["arg1", "arg2"]
 
 [lsp.language.<language-id>]
@@ -51,10 +53,10 @@ cargo.features = "all"
 diagnostics.disabled = ["inactive-code"]
 
 # Override pyright with workspace settings
-[lsp.server.pyright.settings.python]
+[lsp.server.pyright-langserver.settings.python]
 pythonPath = "/usr/bin/python3"
 
-[lsp.server.pyright.settings.python.analysis]
+[lsp.server.pyright-langserver.settings.python.analysis]
 exclude = ["**/target", "**/node_modules"]
 extraPaths = []
 ```
@@ -63,7 +65,6 @@ To define a server from scratch (or one without a built-in default):
 
 ```toml
 [lsp.server.phpactor]
-command = "phpactor"
 args = ["language-server"]
 
 [lsp.language.php]
@@ -92,17 +93,17 @@ the server expects — Catenary matches the `section` path from each
 request and returns the corresponding subtree.
 
 ```toml
-[lsp.server.pyright.settings.python]
+[lsp.server.pyright-langserver.settings.python]
 pythonPath = "/usr/bin/python3"
 
-[lsp.server.pyright.settings.python.analysis]
+[lsp.server.pyright-langserver.settings.python.analysis]
 exclude = ["**/target", "**/node_modules"]
 extraPaths = []
 ```
 
 When pyright sends `workspace/configuration` with
 `{ "items": [{ "section": "python.analysis" }] }`, Catenary returns
-the matching subtree from `[lsp.server.pyright.settings]`.
+the matching subtree from `[lsp.server.pyright-langserver.settings]`.
 
 Items with no matching path receive `{}`.
 
@@ -114,7 +115,6 @@ When absent, all severities are delivered.
 
 ```toml
 [lsp.server.lattice]
-command = "lattice"
 args = ["serve"]
 min_severity = "warning"
 ```
@@ -127,8 +127,6 @@ already exists, the config value wins.
 
 ```toml
 [lsp.server.rust-analyzer]
-command = "rustup"
-args = ["run", "stable", "rust-analyzer"]
 env = { CLIPPY_DISABLE_DOCS_LINKS = "1" }
 ```
 
@@ -144,7 +142,7 @@ each server in order and returns the first non-empty result.
 
 ```toml
 [lsp.language.shellscript]
-servers = ["termux-ls", "bash-ls"]
+servers = ["termux-language-server", "bash-language-server"]
 ```
 
 To suppress diagnostics from a specific server, use inline-table syntax:
@@ -152,8 +150,8 @@ To suppress diagnostics from a specific server, use inline-table syntax:
 ```toml
 [lsp.language.shellscript]
 servers = [
-    "termux-ls",
-    { name = "bash-ls", diagnostics = false },
+    "termux-language-server",
+    { name = "bash-language-server", diagnostics = false },
 ]
 ```
 
@@ -183,8 +181,8 @@ To suppress specific LSP methods from a server for a language binding, use
 ```toml
 [lsp.language.shellscript]
 servers = [
-    "termux-ls",
-    { name = "bash-ls", disabled_methods = ["textDocument/references"] },
+    "termux-language-server",
+    { name = "bash-language-server", disabled_methods = ["textDocument/references"] },
 ]
 ```
 
@@ -199,23 +197,21 @@ within its language. Patterns match against the filename (not the full path).
 Servers without `file_patterns` handle all files for their language.
 
 ```toml
-[lsp.server.termux-ls]
-command = "termux-language-server"
+[lsp.server.termux-language-server]
 args = ["--stdio"]
 file_patterns = ["PKGBUILD", "*.ebuild"]
 
-[lsp.server.bash-ls]
-command = "bash-language-server"
+[lsp.server.bash-language-server]
 args = ["start"]
 
 [lsp.language.shellscript]
-servers = ["termux-ls", "bash-ls"]
+servers = ["termux-language-server", "bash-language-server"]
 ```
 
-Here, `termux-ls` only receives PKGBUILD and `*.ebuild` files.
-`bash-ls` has no `file_patterns`, so it handles all shellscript files.
-For a PKGBUILD file, both servers are active — `termux-ls` is tried
-first (higher priority), with `bash-ls` as fallback.
+Here, `termux-language-server` only receives PKGBUILD and `*.ebuild` files.
+`bash-language-server` has no `file_patterns`, so it handles all shellscript
+files. For a PKGBUILD file, both servers are active — `termux-language-server`
+is tried first (higher priority), with `bash-language-server` as fallback.
 
 ### Single-file Mode
 
@@ -226,8 +222,7 @@ single-file semantics). The server operates on individual documents
 without workspace context.
 
 ```toml
-[lsp.server.bash-ls]
-command = "bash-language-server"
+[lsp.server.bash-language-server]
 args = ["start"]
 single_file = true
 ```
@@ -321,7 +316,7 @@ classification fields and a server binding:
 ```toml
 [lsp.language.pkgbuild]
 filenames = ["PKGBUILD"]
-servers = ["termux-ls"]
+servers = ["termux-language-server"]
 ```
 
 Classification fields:
@@ -396,9 +391,9 @@ distinction.
 
 Project config is deep-merged with user config at the key level:
 
-- **Scalars replace** — `command`, `args`, `min_severity`.
+- **Scalars replace** — `path`, `args`, `min_severity`.
 - **Tables deep-merge by key** — a project `[lsp.server.rust-analyzer]` with just
-  `settings` inherits `command` and `args` from the user's (or built-in) `[lsp.server.rust-analyzer]`.
+  `settings` inherits `path` and `args` from the user's (or built-in) `[lsp.server.rust-analyzer]`.
 - **Arrays replace** — `servers`, `file_patterns`, `extensions`,
   `filenames`, `shebangs`.
 
@@ -414,7 +409,7 @@ cargo.features = ["embedded"]
 ```
 
 This merges with the built-in (or user-defined) `[lsp.server.rust-analyzer]`
-definition — the project inherits `command`, `args`, and
+definition — the project inherits `path`, `args`, and
 `initialization_options`, and overrides only the `settings` subtree.
 
 ### Tier Promotion

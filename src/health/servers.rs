@@ -478,21 +478,24 @@ fn probe_timeout() -> Duration {
 ///
 /// This is doctor's own one-shot probe — daemon-down capable, since it spawns
 /// the server directly rather than asking a running daemon.
+///
+/// `program` is the executable the server key resolves to (misc 162): the
+/// server's own `path` override if set, else the key itself on `PATH`.
 #[allow(clippy::implicit_hasher, reason = "callers use the default hasher")]
 pub async fn probe_server(
     name: String,
-    command: String,
+    program: String,
     args: Vec<String>,
     initialization_options: Option<serde_json::Value>,
     env: Option<HashMap<String, String>>,
 ) -> (String, ServerStatus) {
-    if !binary_exists(&command) {
-        return (name, ServerStatus::BinaryNotFound(command));
+    if !server_binary_installed(&name, &program) {
+        return (name, ServerStatus::BinaryNotFound(program));
     }
 
     let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let spawn_result = lsp::LspClient::spawn_quiet(
-        &command,
+        &program,
         &args_refs,
         &name,
         &name,
@@ -534,6 +537,69 @@ pub async fn probe_server(
 #[must_use]
 pub fn binary_exists(command: &str) -> bool {
     resolve_binary(command).is_some()
+}
+
+/// Whether the executable for server `name` (resolving to `program`) is actually
+/// **installed** — honest against the rust-analyzer rustup proxy shim (misc 162).
+///
+/// For every server but rust-analyzer this is a plain `$PATH` resolution
+/// ([`binary_exists`]). rust-analyzer is special: since misc 162 the server key
+/// is the `rust-analyzer` rustup *proxy* on `PATH`, which is present the moment
+/// rustup is installed — **even when the `rust-analyzer` component is not** (the
+/// class-A shim). Trusting the shim's existence would report a Fatal
+/// intent-broken server (you "installed" it, it fails) where the honest reading
+/// is an uninstalled default (a Suggestion). So when `program` resolves through
+/// the key to a rustup proxy, we cross-check that the component itself resolves —
+/// the same signal the conformance workflow relies on when it links the real
+/// component ahead of the shim. A relocating `path` override bypasses all of this
+/// (the user pointed us at a concrete binary).
+#[must_use]
+pub fn server_binary_installed(name: &str, program: &str) -> bool {
+    let Some(resolved) = resolve_binary(program) else {
+        return false;
+    };
+    // Only the rust-analyzer *key* (not a `path` override) can hit the proxy shim.
+    if name == "rust-analyzer" && program == "rust-analyzer" && is_rustup_proxy(&resolved) {
+        return rustup_component_installed("rust-analyzer");
+    }
+    true
+}
+
+/// Whether `resolved` is a rustup proxy shim rather than a real component binary.
+///
+/// rustup installs its proxies under `<CARGO_HOME>/bin` (default `~/.cargo/bin`);
+/// the real component lives under `~/.rustup/toolchains/<tc>/bin`. A proxy in the
+/// cargo-bin dir is the shim that exists regardless of component installation.
+fn is_rustup_proxy(resolved: &std::path::Path) -> bool {
+    let cargo_bin = std::env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cargo")))
+        .map(|c| c.join("bin"));
+    cargo_bin.is_some_and(|dir| resolved.parent() == Some(dir.as_path()))
+}
+
+/// Whether the rustup `component` resolves to a real binary in the active
+/// toolchain — the shim-proof "is the component actually installed?" check.
+///
+/// `rustup which <component>` resolves through the active toolchain and prints the
+/// component's path; it **fails** (non-zero, or an error to stderr) when the
+/// component is not installed. We then confirm the printed path exists on disk, so
+/// a stale/bogus resolution cannot pass. This is the doctor half of the
+/// conformance workflow's `rustup which` step (misc 162) — a real probe, not a
+/// `which()` the shim would defeat.
+fn rustup_component_installed(component: &str) -> bool {
+    let Ok(output) = std::process::Command::new("rustup")
+        .args(["which", component])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let path = String::from_utf8_lossy(&output.stdout);
+    let path = path.trim();
+    !path.is_empty() && std::path::Path::new(path).is_file()
 }
 
 /// Resolve a binary command to its full path on `$PATH`, or `None`.
@@ -775,14 +841,73 @@ mod tests {
     }
 
     #[test]
+    fn server_binary_installed_matches_path_for_ordinary_servers() {
+        // For every server but rust-analyzer, "installed" is a plain PATH check.
+        assert!(server_binary_installed("gopls", "sh")); // `sh` resolves
+        assert!(!server_binary_installed(
+            "gopls",
+            "catenary_nonexistent_binary_xyz"
+        ));
+    }
+
+    #[test]
+    fn server_binary_installed_absent_binary_is_not_installed() {
+        // A missing binary is never "installed", rust-analyzer or otherwise — the
+        // shim distinction only matters once *something* resolves on PATH.
+        assert!(!server_binary_installed(
+            "rust-analyzer",
+            "catenary_nonexistent_binary_xyz"
+        ));
+    }
+
+    #[test]
+    fn server_binary_installed_path_override_bypasses_the_shim_check() {
+        // A rust-analyzer server with a concrete `path` override that resolves is
+        // installed — the proxy-shim cross-check applies only to the bare key.
+        // `sh` stands in for a real, resolvable absolute binary; it is not under
+        // ~/.cargo/bin, so `is_rustup_proxy` is false and no rustup probe runs.
+        let sh = resolve_binary("sh").expect("sh resolves on the test host");
+        let sh = sh.to_string_lossy().into_owned();
+        assert!(server_binary_installed("rust-analyzer", &sh));
+    }
+
+    #[test]
+    fn is_rustup_proxy_identifies_cargo_bin_only() {
+        // Compute the cargo-bin dir the same way `is_rustup_proxy` does (reading
+        // CARGO_HOME / ~/.cargo), without mutating the process env (the crate
+        // forbids `unsafe`, and env is process-global). A binary inside that dir
+        // is the proxy shim; one under a toolchain bin (or anywhere else) is not.
+        let cargo_bin = std::env::var_os("CARGO_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|h| h.join(".cargo")))
+            .map(|c| c.join("bin"))
+            .expect("a cargo-bin dir resolves on the test host");
+
+        assert!(
+            super::is_rustup_proxy(&cargo_bin.join("rust-analyzer")),
+            "a binary under <CARGO_HOME>/bin is the proxy shim",
+        );
+        assert!(
+            !super::is_rustup_proxy(std::path::Path::new(
+                "/home/user/.rustup/toolchains/stable/bin/rust-analyzer"
+            )),
+            "a toolchain-bin component is not the proxy shim",
+        );
+        assert!(
+            !super::is_rustup_proxy(std::path::Path::new("/usr/local/bin/rust-analyzer")),
+            "a system-bin binary is not the proxy shim",
+        );
+    }
+
+    #[test]
     fn default_server_broken_without_activity_is_dormant_info() {
-        // A shipped-default server (`cmake-ls`) whose probe fails but whose
+        // A shipped-default server (`cmake-language-server`) whose probe fails but whose
         // language no session touched is quiet dormant Info — the phantom Fatal
         // the conformance fixtures produced (tui-rework 09, item 5).
-        let config = routed_config("cmake", "cmake-ls");
+        let config = routed_config("cmake", "cmake-language-server");
         let mut statuses = HashMap::new();
         statuses.insert(
-            "cmake-ls".to_string(),
+            "cmake-language-server".to_string(),
             ServerStatus::InitializeFailed("boom".to_string()),
         );
         let feed = ProbeFeed::new(statuses, HashSet::new(), None);
@@ -802,10 +927,10 @@ mod tests {
     fn default_server_broken_with_activity_is_fatal() {
         // The same failure, but a tracked session touched a cmake file → the
         // language is activity-live → the failure is an intent-broken Fatal.
-        let config = routed_config("cmake", "cmake-ls");
+        let config = routed_config("cmake", "cmake-language-server");
         let mut statuses = HashMap::new();
         statuses.insert(
-            "cmake-ls".to_string(),
+            "cmake-language-server".to_string(),
             ServerStatus::InitializeFailed("boom".to_string()),
         );
         let active: HashSet<String> = std::iter::once("cmake".to_string()).collect();
@@ -824,8 +949,12 @@ mod tests {
         // activity; a default-named one needs the language to be activity-live.
         let user = routed_config("mylang", "my-custom-ls");
         assert!(is_intent_routed(&user, "my-custom-ls", &HashSet::new()));
-        let default_cfg = routed_config("cmake", "cmake-ls");
-        assert!(!is_intent_routed(&default_cfg, "cmake-ls", &HashSet::new()));
+        let default_cfg = routed_config("cmake", "cmake-language-server");
+        assert!(!is_intent_routed(
+            &default_cfg,
+            "cmake-language-server",
+            &HashSet::new()
+        ));
     }
 
     #[test]

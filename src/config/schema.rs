@@ -695,7 +695,7 @@ mod tests {
     #[test]
     fn unknown_keys_silent_inside_passthrough_subtrees() {
         let found = unknown_keys(
-            "[lsp.server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
+            "[lsp.server.rust-analyzer]\npath = \"/opt/rust-analyzer\"\n\n\
              [lsp.server.rust-analyzer.initialization_options]\n\
              anything = true\nnested = { deep = 1 }\n\n\
              [lsp.server.rust-analyzer.settings]\nwhatever = \"x\"\n\n\
@@ -713,7 +713,7 @@ mod tests {
     #[test]
     fn unknown_keys_respects_wildcard_map_keys() {
         let found = unknown_keys(
-            "[lsp.server.my-custom-server]\ncommand = \"foo\"\ntypo_field = 3\n\n\
+            "[lsp.server.my-custom-server]\npath = \"/opt/foo\"\ntypo_field = 3\n\n\
              [roots.companions]\n\"*-internal\" = \"{base}\"\n",
         );
         assert_eq!(
@@ -734,7 +734,7 @@ mod tests {
              [notifications]\ndesktop = true\n\n\
              [tools]\ndiagnostics_severity = \"warning\"\n\n\
              [tools.glob]\noutline_suppress = [\"**/*.min.js\"]\n\n\
-             [lsp.server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
+             [lsp.server.rust-analyzer]\npath = \"/opt/rust-analyzer\"\n\n\
              [lsp.language.rust]\nservers = [\"rust-analyzer\"]\n\n\
              [commands]\nallow = [\"git\"]\n\n\
              [commands.deny]\ngit = [\"push\"]\n\n\

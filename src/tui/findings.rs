@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::config::Config;
-use crate::health::servers::{HealthFeed, Provenance, ServerStatus, binary_exists};
+use crate::health::servers::{HealthFeed, Provenance, ServerStatus, server_binary_installed};
 use crate::health::{Finding, FindingCode, Severity};
 use crate::state_snapshot::{ServerEntry, Snapshot};
 
@@ -108,10 +108,13 @@ impl SnapshotFeed {
                 continue;
             }
             let routed = crate::health::servers::is_intent_routed(config, name, &active_languages);
-            if routed && !binary_exists(&def.command) {
+            // The server key IS the executable (misc 162); `server_binary_installed`
+            // is honest about the rust-analyzer rustup proxy shim.
+            let program = def.program(name);
+            if routed && !server_binary_installed(name, program) {
                 statuses.insert(
                     name.clone(),
-                    ServerStatus::BinaryNotFound(def.command.clone()),
+                    ServerStatus::BinaryNotFound(program.to_string()),
                 );
             }
         }
@@ -420,15 +423,12 @@ mod tests {
     use super::*;
     use crate::config::{LanguageConfig, ServerBinding, ServerDef};
 
-    fn routed_config(lang: &str, server: &str, command: &str) -> Config {
+    fn routed_config(lang: &str, server: &str) -> Config {
         let mut config = Config::default();
-        config.server.insert(
-            server.to_string(),
-            ServerDef {
-                command: command.to_string(),
-                ..ServerDef::default()
-            },
-        );
+        // The key IS the executable (misc 162): a bare def spawns `server`.
+        config
+            .server
+            .insert(server.to_string(), ServerDef::default());
         config.language.insert(
             lang.to_string(),
             LanguageConfig {
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn failed_instance_aggregates_to_broken_even_beside_healthy() {
-        let config = routed_config("mylang", "my-ls", "my-ls");
+        let config = routed_config("mylang", "my-ls");
         let snap = Snapshot {
             servers: vec![
                 server_entry("my-ls", "mylang", "healthy"),
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn routed_missing_binary_reports_binary_not_found() {
-        let config = routed_config("mylang", "my-ls", "my-ls-binary-xyz");
+        let config = routed_config("mylang", "my-ls");
         let snap = Snapshot::default();
         // No live instance, but the language is active (detected).
         let active: HashSet<String> = std::iter::once("mylang".to_string()).collect();
@@ -522,9 +522,9 @@ mod tests {
         // conformance-fixture shape — raises NO finding while no session has
         // touched a file of that language. Recording activity for it makes the
         // same failure a Fatal, carrying the triggering file as provenance.
-        let config = routed_config("cmake", "cmake-ls", "cmake-language-server");
+        let config = routed_config("cmake", "cmake-language-server");
         let snap = Snapshot {
-            servers: vec![server_entry("cmake-ls", "cmake", "failed")],
+            servers: vec![server_entry("cmake-language-server", "cmake", "failed")],
             ..Snapshot::default()
         };
 
@@ -532,7 +532,7 @@ mod tests {
         assert!(
             !quiet
                 .iter()
-                .any(|f| matches!(&f.owner, Owner::Server(s) if s == "cmake-ls")),
+                .any(|f| matches!(&f.owner, Owner::Server(s) if s == "cmake-language-server")),
             "a fixture language no session touched raises no finding",
         );
 
@@ -550,7 +550,7 @@ mod tests {
         let loud = gather_snapshot(&touched, &config, active);
         let cmake = loud
             .iter()
-            .find(|f| matches!(&f.owner, Owner::Server(s) if s == "cmake-ls"))
+            .find(|f| matches!(&f.owner, Owner::Server(s) if s == "cmake-language-server"))
             .expect("touching a cmake file surfaces the failure");
         assert_eq!(cmake.finding.severity, Severity::Fatal);
         assert!(

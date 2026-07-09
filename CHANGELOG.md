@@ -376,6 +376,23 @@ upgrading.
 
 ### Changed
 
+- **Server keys are the executables they spawn.** The invented `-ls`
+  aliases are gone (`bash-ls` → `bash-language-server`, `pyright` →
+  `pyright-langserver`, `svelte-ls` → `svelteserver`,
+  `dart-ls`/`julia-ls`/`r-ls` → `dart`/`julia`/`R`, …): a
+  `[lsp.server.*]` key now names the binary Catenary runs, so the name
+  you'd naturally write is the name that works — configuring
+  `[lsp.server.typescript-language-server]` overrides the shipped
+  default instead of silently defining a parallel server. The `command`
+  field is retired; a config still carrying it fails with a teaching
+  error naming the migration, and the new optional `path` relocates a
+  binary that isn't on `PATH` under its key (relocation, never
+  renaming — the key stays the server's identity for profiles, recipes,
+  and conformance alike). rust-analyzer now spawns its rustup proxy
+  directly — honoring the project's `rust-toolchain.toml` instead of
+  forcing stable — and installed-detection distinguishes the proxy shim
+  from the real component. Recipes, CI provisioning, the blessed
+  manifest, and the conformance matrix all key off the same names.
 - **Per-server conformance profiles: the engine now cases server behavior
   where the server's own design demands it.** One engine-internal lookup
   carries the invariants Catenary needs to work correctly against a given

@@ -1215,12 +1215,13 @@ impl LspClientManager {
             anyhow::bail!("LSP server '{server_name}' ({lang}) is dead");
         }
 
+        let program = server_def.program(server_name);
         info!(
             source = Source::LspLifecycle.as_str(),
             server = server_name,
             scope_root = %root.display(),
             "Spawning LSP server for {lang}: {} {}",
-            server_def.command,
+            program,
             server_def.args.join(" ")
         );
 
@@ -1231,7 +1232,7 @@ impl LspClientManager {
             .collect();
         let root_str = root.display().to_string();
         let mut client = LspClient::spawn(
-            &server_def.command,
+            program,
             &args,
             lang,
             server_name,
@@ -1404,15 +1405,16 @@ impl LspClientManager {
             anyhow::bail!("Single-file LSP server '{server_name}' ({lang}) is dead");
         }
 
+        let program = server_def.program(server_name);
         info!(
             "Spawning single-file LSP server for {lang}: {} {}",
-            server_def.command,
+            program,
             server_def.args.join(" ")
         );
 
         let args: Vec<&str> = server_def.args.iter().map(String::as_str).collect();
         let mut client = LspClient::spawn(
-            &server_def.command,
+            program,
             &args,
             lang,
             server_name,
@@ -2412,8 +2414,10 @@ impl LspClientManager {
         // Field-level merge: project fields override user fields when
         // present. Settings use deep_merge for nested object merging.
         let mut merged = user_def.clone();
-        if !project_def.command.is_empty() {
-            merged.command.clone_from(&project_def.command);
+        // A project `path` override relocates the executable (misc 162); it
+        // carries its own args, mirroring the pre-162 command+args coupling.
+        if project_def.path.is_some() {
+            merged.path.clone_from(&project_def.path);
             merged.args.clone_from(&project_def.args);
         }
         if project_def.initialization_options.is_some() {
@@ -2626,7 +2630,7 @@ mod tests {
         server.insert(
             server_name.clone(),
             ServerDef {
-                command: bin.to_string_lossy().to_string(),
+                path: Some(bin.to_string_lossy().to_string()),
                 args: vec![MOCK_LANG_A.to_string()],
                 ..ServerDef::default()
             },
@@ -2668,7 +2672,7 @@ mod tests {
             server.insert(
                 name.clone(),
                 ServerDef {
-                    command: bin.to_string_lossy().to_string(),
+                    path: Some(bin.to_string_lossy().to_string()),
                     args: vec![MOCK_LANG_A.to_string()],
                     ..ServerDef::default()
                 },
@@ -2705,7 +2709,7 @@ mod tests {
         server.insert(
             server_name.clone(),
             ServerDef {
-                command: bin.to_string_lossy().to_string(),
+                path: Some(bin.to_string_lossy().to_string()),
                 args: vec![MOCK_LANG_A.to_string(), "--workspace-folders".to_string()],
                 ..ServerDef::default()
             },
@@ -2743,7 +2747,7 @@ mod tests {
             server.insert(
                 name.clone(),
                 ServerDef {
-                    command: bin.to_string_lossy().to_string(),
+                    path: Some(bin.to_string_lossy().to_string()),
                     args: vec![MOCK_LANG_A.to_string()],
                     initialization_options: None,
                     settings: None,
@@ -2788,7 +2792,7 @@ mod tests {
             server.insert(
                 name.clone(),
                 ServerDef {
-                    command: bin.to_string_lossy().to_string(),
+                    path: Some(bin.to_string_lossy().to_string()),
                     args: vec![MOCK_LANG_A.to_string(), "--workspace-folders".to_string()],
                     initialization_options: None,
                     settings: None,
@@ -2832,7 +2836,7 @@ mod tests {
         server.insert(
             server_ws.clone(),
             ServerDef {
-                command: bin.to_string_lossy().to_string(),
+                path: Some(bin.to_string_lossy().to_string()),
                 args: vec![MOCK_LANG_A.to_string(), "--workspace-folders".to_string()],
                 ..ServerDef::default()
             },
@@ -2840,7 +2844,7 @@ mod tests {
         server.insert(
             server_legacy.clone(),
             ServerDef {
-                command: bin.to_string_lossy().to_string(),
+                path: Some(bin.to_string_lossy().to_string()),
                 args: vec![MOCK_LANG_A.to_string()],
                 ..ServerDef::default()
             },
@@ -3018,7 +3022,7 @@ mod tests {
         server.insert(
             server_name.clone(),
             ServerDef {
-                command: bin.to_string_lossy().to_string(),
+                path: Some(bin.to_string_lossy().to_string()),
                 args: vec![
                     MOCK_LANG_A.to_string(),
                     "--send-configuration-request".to_string(),
@@ -3473,7 +3477,7 @@ mod tests {
             server.insert(
                 server_name.clone(),
                 ServerDef {
-                    command: bin.to_string_lossy().to_string(),
+                    path: Some(bin.to_string_lossy().to_string()),
                     args: vec![lang.to_string()],
                     ..ServerDef::default()
                 },
@@ -3970,7 +3974,7 @@ mod tests {
         server.insert(
             server_name.clone(),
             ServerDef {
-                command: bin.to_string_lossy().to_string(),
+                path: Some(bin.to_string_lossy().to_string()),
                 args: vec![MOCK_LANG_A.to_string()],
                 initialization_options: None,
                 settings: None,
@@ -4029,7 +4033,7 @@ mod tests {
         server.insert(
             server_name.clone(),
             ServerDef {
-                command: bin.to_string_lossy().to_string(),
+                path: Some(bin.to_string_lossy().to_string()),
                 args: vec![MOCK_LANG_A.to_string()],
                 initialization_options: None,
                 settings: None,
@@ -4087,7 +4091,7 @@ mod tests {
         server.insert(
             server_name.clone(),
             ServerDef {
-                command: bin.to_string_lossy().to_string(),
+                path: Some(bin.to_string_lossy().to_string()),
                 args: vec![MOCK_LANG_A.to_string()],
                 initialization_options: None,
                 settings: None,
@@ -4184,7 +4188,7 @@ mod tests {
         server.insert(
             server_name.clone(),
             ServerDef {
-                command: bin.to_string_lossy().to_string(),
+                path: Some(bin.to_string_lossy().to_string()),
                 args: vec![MOCK_LANG_A.to_string()],
                 ..ServerDef::default()
             },
@@ -4811,7 +4815,6 @@ mod tests {
         pc.server.insert(
             "rust-analyzer".to_string(),
             ServerDef {
-                command: String::new(),
                 args: Vec::new(),
                 settings: Some(serde_json::json!({"key": "value"})),
                 ..ServerDef::default()
@@ -4836,7 +4839,6 @@ mod tests {
         config.server.insert(
             "rust-analyzer".to_string(),
             ServerDef {
-                command: "rust-analyzer".to_string(),
                 args: vec!["--log-level".to_string(), "info".to_string()],
                 settings: Some(serde_json::json!({"check": {"command": "clippy"}, "cargo": {"features": ["a"]}})),
                 ..ServerDef::default()
@@ -4846,12 +4848,13 @@ mod tests {
         let manager = LspClientManager::new(config, test_logging(), test_fs());
         let root = PathBuf::from("/project");
 
-        // Project config only overrides settings.
+        // Project config only overrides settings (no `path` = inherit the user
+        // executable + args; the key `rust-analyzer` still spawns).
         let mut pc = crate::config::ProjectConfig::default();
         pc.server.insert(
             "rust-analyzer".to_string(),
             ServerDef {
-                command: String::new(), // empty = inherit from user
+                path: None, // no override = inherit from user
                 args: Vec::new(),
                 settings: Some(serde_json::json!({"check": {"command": "check"}, "new_key": true})),
                 ..ServerDef::default()
@@ -4863,8 +4866,9 @@ mod tests {
             .effective_server_def("rust-analyzer", &root)
             .expect("should exist");
 
-        // command/args inherited from user
-        assert_eq!(merged.command, "rust-analyzer");
+        // path/args inherited from user (key spawns rust-analyzer on PATH)
+        assert_eq!(merged.path, None);
+        assert_eq!(merged.program("rust-analyzer"), "rust-analyzer");
         assert_eq!(merged.args, vec!["--log-level", "info"]);
 
         // settings deep-merged
@@ -4880,7 +4884,6 @@ mod tests {
         config.server.insert(
             "rust-analyzer".to_string(),
             ServerDef {
-                command: "rust-analyzer".to_string(),
                 args: vec!["--log-level".to_string(), "info".to_string()],
                 settings: Some(serde_json::json!({"key": "user"})),
                 ..ServerDef::default()
@@ -4894,7 +4897,7 @@ mod tests {
         pc.server.insert(
             "rust-analyzer".to_string(),
             ServerDef {
-                command: "custom-ra".to_string(),
+                path: Some("/opt/custom/rust-analyzer".to_string()),
                 args: vec!["--custom".to_string()],
                 settings: Some(serde_json::json!({"key": "project"})),
                 min_severity: Some("warning".to_string()),
@@ -4907,7 +4910,9 @@ mod tests {
             .effective_server_def("rust-analyzer", &root)
             .expect("should exist");
 
-        assert_eq!(merged.command, "custom-ra");
+        // A project `path` relocates the executable; the key stays the identity.
+        assert_eq!(merged.path.as_deref(), Some("/opt/custom/rust-analyzer"));
+        assert_eq!(merged.program("rust-analyzer"), "/opt/custom/rust-analyzer");
         assert_eq!(merged.args, vec!["--custom"]);
         assert_eq!(merged.min_severity.as_deref(), Some("warning"));
         assert_eq!(merged.settings.expect("settings")["key"], "project");
@@ -4919,7 +4924,6 @@ mod tests {
         config.server.insert(
             "rust-analyzer".to_string(),
             ServerDef {
-                command: "rust-analyzer".to_string(),
                 args: Vec::new(),
                 settings: Some(serde_json::json!({"key": "user"})),
                 ..ServerDef::default()
@@ -4933,7 +4937,8 @@ mod tests {
             .effective_server_def("rust-analyzer", &root)
             .expect("should exist");
 
-        assert_eq!(def.command, "rust-analyzer");
+        assert_eq!(def.path, None);
+        assert_eq!(def.program("rust-analyzer"), "rust-analyzer");
         assert_eq!(def.settings.expect("settings")["key"], "user");
     }
 
@@ -4943,7 +4948,6 @@ mod tests {
         config.server.insert(
             "ra".to_string(),
             ServerDef {
-                command: "ra".to_string(),
                 args: Vec::new(),
                 settings: Some(serde_json::json!({"a": 1, "b": {"c": 2}})),
                 ..ServerDef::default()
@@ -4957,7 +4961,6 @@ mod tests {
         pc.server.insert(
             "ra".to_string(),
             ServerDef {
-                command: String::new(),
                 args: Vec::new(),
                 settings: Some(serde_json::json!({"b": {"d": 3}})),
                 ..ServerDef::default()
@@ -4986,21 +4989,13 @@ mod tests {
     fn project_config_language_binding_reroutes_over_the_shipped_default() {
         let mut config = test_config_raw();
         // The shipped default: language MOCK_LANG_A → "shipped-default".
-        config.server.insert(
-            "shipped-default".to_string(),
-            ServerDef {
-                command: "shipped-default".to_string(),
-                ..ServerDef::default()
-            },
-        );
+        config
+            .server
+            .insert("shipped-default".to_string(), ServerDef::default());
         // A second globally-defined server the project can rebind to.
-        config.server.insert(
-            "alt".to_string(),
-            ServerDef {
-                command: "alt".to_string(),
-                ..ServerDef::default()
-            },
-        );
+        config
+            .server
+            .insert("alt".to_string(), ServerDef::default());
         config.language.insert(
             MOCK_LANG_A.to_string(),
             LanguageConfig {
@@ -5060,13 +5055,8 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
-        pc2.server.insert(
-            "proj-only".to_string(),
-            ServerDef {
-                command: "proj-only".to_string(),
-                ..ServerDef::default()
-            },
-        );
+        pc2.server
+            .insert("proj-only".to_string(), ServerDef::default());
         manager.install_root_config(root.clone(), pc2);
 
         assert_eq!(
@@ -5077,11 +5067,12 @@ mod tests {
             &[ServerBinding::new("proj-only")],
         );
         // The project-only server def resolves even though no user-level def
-        // exists — so it can spawn and answer.
+        // exists — so it can spawn and answer. The key IS the executable (misc
+        // 162): with no `path` override it spawns `proj-only` on PATH.
         let proj_def = manager
             .effective_server_def("proj-only", &root)
             .expect("project-only def resolves");
-        assert_eq!(proj_def.command, "proj-only");
+        assert_eq!(proj_def.program("proj-only"), "proj-only");
         assert!(
             !manager.config().server.contains_key("proj-only"),
             "the target is defined only at project scope",
@@ -5168,7 +5159,7 @@ mod tests {
         config.server.insert(
             server_name.clone(),
             ServerDef {
-                command: bin.to_string_lossy().to_string(),
+                path: Some(bin.to_string_lossy().to_string()),
                 args: vec![MOCK_LANG_A.to_string()],
                 settings: Some(serde_json::json!({"user_key": true})),
                 ..ServerDef::default()
@@ -5196,7 +5187,6 @@ mod tests {
         pc.server.insert(
             server_name.clone(),
             ServerDef {
-                command: String::new(),
                 args: Vec::new(),
                 settings: Some(serde_json::json!({"project_key": true})),
                 ..ServerDef::default()
@@ -5209,7 +5199,7 @@ mod tests {
             .await?;
 
         assert_eq!(key.scope, Scope::Root(PathBuf::from("/tmp")));
-        // Server should be alive (spawned with user command + project settings).
+        // Server should be alive (spawned with user path + project settings).
         assert!(client.lock().await.is_alive());
         // Settings should be the merged result.
         let settings = client.lock().await.server().settings().cloned();
@@ -5559,7 +5549,7 @@ mod tests {
         pc.server.insert(
             proj_server.clone(),
             ServerDef {
-                command: mockls_bin().to_string_lossy().to_string(),
+                path: Some(mockls_bin().to_string_lossy().to_string()),
                 args: vec![MOCK_LANG_A.to_string()],
                 ..ServerDef::default()
             },
@@ -5712,7 +5702,7 @@ mod tests {
         server.insert(
             server_name.clone(),
             ServerDef {
-                command: bin.to_string_lossy().to_string(),
+                path: Some(bin.to_string_lossy().to_string()),
                 args: vec![MOCK_LANG_A.to_string()],
                 single_file: true,
                 ..ServerDef::default()
@@ -5749,7 +5739,7 @@ mod tests {
         server.insert(
             server_name.clone(),
             ServerDef {
-                command: bin.to_string_lossy().to_string(),
+                path: Some(bin.to_string_lossy().to_string()),
                 args: vec![
                     MOCK_LANG_A.to_string(),
                     "--reject-null-workspace".to_string(),
@@ -6051,7 +6041,7 @@ mod tests {
             config.server.insert(
                 name.clone(),
                 ServerDef {
-                    command: bin.to_string_lossy().to_string(),
+                    path: Some(bin.to_string_lossy().to_string()),
                     args: vec![lang.to_string()],
                     single_file: true,
                     ..ServerDef::default()
@@ -6108,7 +6098,7 @@ mod tests {
         config.server.insert(
             server_name.clone(),
             ServerDef {
-                command: bin.to_string_lossy().to_string(),
+                path: Some(bin.to_string_lossy().to_string()),
                 args: vec![
                     MOCK_LANG_A.to_string(),
                     "--send-configuration-request".to_string(),
@@ -6564,7 +6554,6 @@ mod tests {
         config.server.insert(
             "rust-analyzer".to_string(),
             ServerDef {
-                command: "rust-analyzer".to_string(),
                 weight: Some(20),
                 ..ServerDef::default()
             },
@@ -6592,7 +6581,6 @@ mod tests {
         project.server.insert(
             "rust-analyzer".to_string(),
             ServerDef {
-                command: "rust-analyzer".to_string(),
                 weight: Some(3),
                 sources: HashMap::from([("rustc".to_string(), 90)]),
                 ..ServerDef::default()
@@ -6775,7 +6763,6 @@ mod tests {
         config.server.insert(
             "rust-analyzer".to_string(),
             ServerDef {
-                command: "rust-analyzer".to_string(),
                 file_patterns: vec!["*.rs".to_string()],
                 ..ServerDef::default()
             },
@@ -6789,7 +6776,6 @@ mod tests {
         pc.server.insert(
             "rust-analyzer".to_string(),
             ServerDef {
-                command: String::new(),
                 file_patterns: vec!["*.py".to_string()],
                 ..ServerDef::default()
             },
@@ -6813,7 +6799,6 @@ mod tests {
         config.server.insert(
             "rust-analyzer".to_string(),
             ServerDef {
-                command: "rust-analyzer".to_string(),
                 file_patterns: vec!["*.rs".to_string()],
                 ..ServerDef::default()
             },
@@ -6824,13 +6809,8 @@ mod tests {
 
         // Project config with empty file_patterns → should NOT override
         let mut pc = crate::config::ProjectConfig::default();
-        pc.server.insert(
-            "rust-analyzer".to_string(),
-            ServerDef {
-                command: String::new(),
-                ..ServerDef::default()
-            },
-        );
+        pc.server
+            .insert("rust-analyzer".to_string(), ServerDef::default());
         manager.install_root_config(root.clone(), pc);
 
         let merged = manager
@@ -6981,7 +6961,7 @@ mod tests {
         server.insert(
             server_name.clone(),
             ServerDef {
-                command: bin.to_string_lossy().to_string(),
+                path: Some(bin.to_string_lossy().to_string()),
                 args: vec![MOCK_LANG_A.to_string(), "--workspace-folders".to_string()],
                 ..ServerDef::default()
             },
@@ -7018,7 +6998,7 @@ mod tests {
         server.insert(
             server_name.clone(),
             ServerDef {
-                command: bin.to_string_lossy().to_string(),
+                path: Some(bin.to_string_lossy().to_string()),
                 args: vec![MOCK_LANG_A.to_string()],
                 ..ServerDef::default()
             },

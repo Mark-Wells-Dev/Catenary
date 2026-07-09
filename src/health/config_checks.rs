@@ -450,8 +450,10 @@ pub fn project_config_findings(project_root: &Path, user_config: &Config) -> Vec
 
             findings.extend(ignored_enforcement_findings(&config_path));
 
-            for (server_name, server_def) in &pc.server {
-                if server_def.command.is_empty() {
+            for server_name in pc.server.keys() {
+                // A def whose key already names a known server (misc 162: the key
+                // IS the executable) is an override, not an orphan.
+                if user_config.server.contains_key(server_name) {
                     continue;
                 }
                 let referenced_by_project = pc
@@ -467,7 +469,7 @@ pub fn project_config_findings(project_root: &Path, user_config: &Config) -> Vec
                         FindingCode::ProjectOrphanServer,
                         Severity::Warning,
                         format!(
-                            "[lsp.server.{server_name}] has a `command` but no \
+                            "[lsp.server.{server_name}] defines a server no \
                              [lsp.language.*] references it"
                         ),
                     ));
@@ -655,7 +657,7 @@ mod tests {
         fs::write(
             &cfg,
             "[icons]\npreset = \"unicode\"\n\n\
-             [lsp.server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
+             [lsp.server.rust-analyzer]\npath = \"/usr/local/bin/rust-analyzer\"\n\n\
              [lsp.server.rust-analyzer.initialization_options]\ncheck = { command = \"clippy\" }\n\n\
              [lsp.server.rust-analyzer.settings]\nanything = true\n",
         )

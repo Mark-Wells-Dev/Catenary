@@ -22,8 +22,9 @@ rustup component add rust-analyzer
 
 ## Config
 
-Catenary ships a built-in definition for `rust-analyzer` that invokes
-`rustup run stable rust-analyzer` — no `[lsp.server.*]` config is needed.
+Catenary ships a built-in definition for `rust-analyzer` — no `[lsp.server.*]`
+config is needed. If `rust-analyzer` is on PATH (the `rustup` proxy installed
+by `rustup component add rust-analyzer` provides it), it works automatically.
 
 To customise, add to `~/.config/catenary/config.toml`:
 
@@ -45,9 +46,9 @@ tokens.
 
 - rust-analyzer is the official Rust language server
 - Installing via rustup ensures it stays in sync with your Rust toolchain
-- The built-in default uses `rustup run stable` to avoid conflicts with
-  project-level `rust-toolchain.toml` files, which can pin a toolchain
-  that doesn't have rust-analyzer installed
+- The `rust-analyzer` on PATH is the rustup proxy, which dispatches to the
+  toolchain's own rust-analyzer — so it tracks a project-level
+  `rust-toolchain.toml` automatically
 - First run on a project may take time to index (watch for "Indexing" status)
 
 ## Links

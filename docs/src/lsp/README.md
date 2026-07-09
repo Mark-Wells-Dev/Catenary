@@ -13,7 +13,7 @@ Catenary configuration.
 | Julia              | [Julia](julia.md)                  | LanguageServer.jl            |
 | Markdown           | [Markdown](markdown.md)            | lattice                      |
 | PHP                | [PHP](php.md)                      | intelephense                 |
-| Python             | [Python](python.md)                | pyright                      |
+| Python             | [Python](python.md)                | pyright-langserver           |
 | Rust               | [Rust](rust.md)                    | rust-analyzer                |
 | Shell (Bash)       | [Shell](shell.md)                  | bash-language-server         |
 | Termux & Packaging | [Termux](termux.md)                | termux-language-server       |
@@ -23,7 +23,7 @@ Catenary configuration.
 
 Want to add a language?
 
-1. Create `your-language.md` in the `lsp/` folder following the template below
+1. Create a page for your language in the `lsp/` folder following the template below
 2. Add a row to the table above
 3. Submit a PR
 
@@ -54,17 +54,18 @@ Want to add a language?
 
 ## Config
 
-Catenary ships a built-in definition for `your-server-name` — no
-`[lsp.server.*]` config is needed. If `your-server-binary` is on PATH,
+Catenary ships a built-in definition for `your-language-server` — no
+`[lsp.server.*]` config is needed. If `your-language-server` is on PATH,
 it works automatically.
 
 <!-- OR, if the server is not in the built-in defaults: -->
 
-Add to `~/.config/catenary/config.toml`:
+Add to `~/.config/catenary/config.toml`. The `[lsp.server.*]` section key
+**is** the server binary Catenary spawns (add `path = "/abs/path"` only to
+relocate a binary that is not on PATH):
 
 ```toml
 [lsp.server.your-language-server]
-command = "your-language-server"
 args = ["--stdio"]
 
 [lsp.language.yourlanguage]

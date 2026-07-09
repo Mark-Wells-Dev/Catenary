@@ -269,7 +269,7 @@ pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
 /// Must match every config-visible field on `ServerDef` (i.e. every
 /// field except `#[serde(skip)]`). `test_server_def_keys_sync` enforces this.
 pub const SERVER_DEF_KEYS: &[&str] = &[
-    "command",
+    "path",
     "args",
     "initialization_options",
     "settings",
@@ -291,6 +291,45 @@ pub const SERVER_DEF_KEYS: &[&str] = &[
 /// directly above the error there, so pointing back at doctor would be
 /// self-referential (feedback 08 finding 1). See `src/cli/doctor.rs`.
 pub const MIGRATION_GUIDANCE_POINTER: &str = "Run `catenary doctor` for guidance.";
+
+/// The teaching error for a config that still supplies the retired `command`
+/// field on a `[lsp.server.<name>]` entry (misc 162).
+///
+/// `{name}` is the offending server key. The server key IS the binary now, so
+/// there is no field to name a different executable — relocation goes through the
+/// new optional `path` field. The maintainer's own live config carries `command`
+/// entries, so this must fail loud and helpful rather than silently ignore the
+/// field.
+fn retired_command_error(name: &str) -> String {
+    format!(
+        "`{name}` sets the retired `command` field — the server key IS the executable \
+         Catenary spawns now (misc 162), so a `[lsp.server.*]` entry no longer names a \
+         separate binary with `command`. Drop it; if the key `{name}` is not on `PATH`, \
+         set `path = \"/absolute/path/to/{name}\"` to relocate the executable (the key \
+         stays the server's identity). {MIGRATION_GUIDANCE_POINTER}"
+    )
+}
+
+/// Hard-errors when any `[lsp.server.<name>]` entry carries the retired `command`
+/// field (misc 162).
+///
+/// Scanned before deserialization so the failure is the [`retired_command_error`]
+/// teaching message, not the cryptic serde unknown-field error that
+/// `deny_unknown_fields` would otherwise produce once `command` left `ServerDef`.
+fn reject_retired_command(raw: &toml::Value) -> Result<()> {
+    if let Some(server_table) = raw
+        .get("lsp")
+        .and_then(|v| v.get("server"))
+        .and_then(toml::Value::as_table)
+    {
+        for (name, entry) in server_table {
+            if entry.as_table().is_some_and(|t| t.contains_key("command")) {
+                bail!("{}", retired_command_error(name));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Returns a migration error message when a config still uses the
 /// pre-namespacing top-level definition keys (linters ticket 04), else `None`.
@@ -367,6 +406,11 @@ fn deserialize_source(contents: &str) -> Result<RawConfig> {
 
     reject_pre_namespacing_keys(&raw)?;
 
+    // Reject the retired `command` field on any [lsp.server.*] entry with a
+    // teaching error (misc 162) — before deserialization, so the failure is the
+    // migration message rather than the cryptic deny_unknown_fields serde error.
+    reject_retired_command(&raw)?;
+
     // Reject [lsp.language.*] entries that contain inline server definition
     // fields or the removed `inherit` field. These belong in [lsp.server.*].
     if let Some(lang_table) = raw
@@ -382,6 +426,13 @@ fn deserialize_source(contents: &str) -> Result<RawConfig> {
                          copy the base language's `servers` list into \
                          [lsp.language.{lang_key}] instead. {MIGRATION_GUIDANCE_POINTER}",
                     );
+                }
+
+                // The retired `command` field on a language entry gets the same
+                // teaching error as on a server entry — it names neither a
+                // language field nor a live server field (misc 162).
+                if entry_table.contains_key("command") {
+                    bail!("{}", retired_command_error(lang_key));
                 }
 
                 let stale: Vec<&str> = SERVER_DEF_KEYS
@@ -606,8 +657,10 @@ pub(super) fn apply_server_specs(config: &mut Config, val: &str) {
 
 /// Parse a `CATENARY_SERVERS` value into `(lang, ServerDef, LanguageConfig)` triples.
 ///
-/// Format: semicolon-separated `"lang:command args"` specs. The language
-/// key doubles as the server name for env-derived entries.
+/// Format: semicolon-separated `"lang:command args"` specs. The language key
+/// doubles as the server name for env-derived entries; the executable named by
+/// the spec becomes the server's `path` override (misc 162) — the server key
+/// (the language name) is not itself the binary here, so the spec relocates it.
 pub(super) fn parse_server_specs(val: &str) -> Vec<(String, ServerDef, LanguageConfig)> {
     let mut results = Vec::new();
     for spec in val.split(';') {
@@ -625,7 +678,7 @@ pub(super) fn parse_server_specs(val: &str) -> Vec<(String, ServerDef, LanguageC
                 results.push((
                     lang.to_string(),
                     ServerDef {
-                        command: program.to_string(),
+                        path: Some(program.to_string()),
                         args: cmd_args,
                         ..ServerDef::default()
                     },
@@ -791,6 +844,24 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         }
     }
 
+    // Reject the retired `command` field on any [lsp.server.*] entry (misc 162),
+    // with a teaching error — same guard as user config, before deserialization.
+    if let Some(server_table) = raw
+        .get("lsp")
+        .and_then(|v| v.get("server"))
+        .and_then(toml::Value::as_table)
+    {
+        for (name, entry) in server_table {
+            if entry.as_table().is_some_and(|t| t.contains_key("command")) {
+                bail!(
+                    "Project config {}: {}",
+                    config_path.display(),
+                    retired_command_error(name),
+                );
+            }
+        }
+    }
+
     // Validate [lsp.language.*] entries for rejected fields, same as user config.
     if let Some(lang_table) = raw
         .get("lsp")
@@ -805,6 +876,16 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
                          `inherit` field — copy the base language's `servers` list \
                          into [lsp.language.{lang_key}] instead.",
                         config_path.display(),
+                    );
+                }
+
+                // The retired `command` field on a language entry: it names
+                // neither a language field nor a live server field (misc 162).
+                if entry_table.contains_key("command") {
+                    bail!(
+                        "Project config {}: {}",
+                        config_path.display(),
+                        retired_command_error(lang_key),
                     );
                 }
 
@@ -906,16 +987,15 @@ pub fn load_project_config(root: &std::path::Path) -> Result<Option<ProjectConfi
         })?;
     }
 
-    // Validate server definitions — no empty commands.
+    // Validate server definitions — the key IS the executable (misc 162), so
+    // there is no `command` to be empty; reject only an explicitly-empty `path`
+    // override (it would spawn the empty string rather than falling back to the
+    // key). A def with no `path` is a legal settings/args-only override.
     for (name, server_def) in &server {
-        if server_def.command.is_empty()
-            && (!server_def.args.is_empty()
-                || server_def.initialization_options.is_some()
-                || server_def.min_severity.is_some()
-                || !server_def.file_patterns.is_empty())
-        {
+        if server_def.path.as_ref().is_some_and(String::is_empty) {
             bail!(
-                "Project config {}: [lsp.server.{name}] has an empty `command`",
+                "Project config {}: [lsp.server.{name}] has an empty `path` — omit it \
+                 to spawn the key `{name}` on PATH, or set the executable's absolute path",
                 config_path.display()
             );
         }
@@ -1071,7 +1151,6 @@ mod project_config_tests {
             dir.path().join(".catenary.toml"),
             r#"
 [lsp.server.rust-analyzer]
-command = "rust-analyzer"
 settings = { checkOnSave = true }
 
 [lsp.language.rust]
@@ -1084,7 +1163,7 @@ servers = ["rust-analyzer"]
         assert!(config.language.contains_key("rust"));
         assert!(config.server.contains_key("rust-analyzer"));
         let ra = &config.server["rust-analyzer"];
-        assert_eq!(ra.command, "rust-analyzer");
+        assert_eq!(ra.program("rust-analyzer"), "rust-analyzer");
         assert!(ra.settings.is_some());
 
         Ok(())
@@ -1246,12 +1325,11 @@ servers = []
         fs::write(
             dir.path().join(".catenary.toml"),
             r#"
-[lsp.server.pyright]
-command = "pyright"
+[lsp.server.pyright-langserver]
 settings = { python = { analysis = { typeCheckingMode = "strict" } } }
 
 [lsp.language.python]
-servers = ["pyright"]
+servers = ["pyright-langserver"]
 "#,
         )?;
 
@@ -1640,7 +1718,6 @@ cargo = "Use make instead"
             dir.path().join(".catenary.toml"),
             r#"
 [lsp.server.rust-analyzer]
-command = "rust-analyzer"
 env = { CLIPPY_DISABLE_DOCS_LINKS = "1", RUST_LOG = "info" }
 
 [lsp.language.rust]
@@ -1667,18 +1744,17 @@ servers = ["rust-analyzer"]
         fs::write(
             dir.path().join(".catenary.toml"),
             r#"
-[lsp.server.pyright]
-command = "pyright-langserver"
+[lsp.server.pyright-langserver]
 args = ["--stdio"]
 
 [lsp.language.python]
-servers = ["pyright"]
+servers = ["pyright-langserver"]
 "#,
         )?;
 
         let result = load_project_config(dir.path())?;
         let config = result.expect("should find project config");
-        let pyright = &config.server["pyright"];
+        let pyright = &config.server["pyright-langserver"];
         assert!(pyright.env.is_none(), "env should default to None");
 
         Ok(())
@@ -1762,7 +1838,6 @@ servers = ["pyright"]
         fs::write(
             dir.path().join(".catenary.toml"),
             "[lsp.server.rust-analyzer]\n\
-             command = \"rust-analyzer\"\n\
              weight = 5\n\
              provisional = \"^E[0-9]+$\"\n\n\
              [lsp.server.rust-analyzer.sources]\n\
@@ -1784,7 +1859,6 @@ servers = ["pyright"]
         fs::write(
             dir.path().join(".catenary.toml"),
             "[lsp.server.rust-analyzer]\n\
-             command = \"rust-analyzer\"\n\
              provisional = \"^E[0-9+$\"\n",
         )
         .expect("write");
@@ -1806,7 +1880,7 @@ servers = ["pyright"]
         fs::write(
             dir.path().join(".catenary.toml"),
             "[lsp]\ndisable = true\n\n\
-             [lsp.server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
+             [lsp.server.rust-analyzer]\nweight = 5\n\n\
              [lsp.language.rust]\nservers = [\"rust-analyzer\"]\n",
         )?;
 
@@ -1954,7 +2028,7 @@ servers = ["pyright"]
         // The namespaced forms (`rule` map, `disable` toggle, `[lsp.*]`) must
         // not trip the guard.
         let raw: toml::Value = toml::from_str(
-            "[lsp.server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
+            "[lsp.server.rust-analyzer]\nweight = 5\n\n\
              [linter]\ndisable = true\n\n\
              [linter.rule.shellcheck]\ncommand = \"shellcheck\"\n",
         )
@@ -1969,7 +2043,7 @@ servers = ["pyright"]
     fn deserialize_source_accepts_namespaced_definitions() -> Result<()> {
         // The new form parses: [lsp.server.*] / [lsp.language.*] / [linter.rule.*].
         let config = deserialize_source(
-            "[lsp.server.rust-analyzer]\ncommand = \"rust-analyzer\"\n\n\
+            "[lsp.server.rust-analyzer]\nweight = 5\n\n\
              [lsp.language.rust]\nservers = [\"rust-analyzer\"]\n\n\
              [linter.rule.shellcheck]\ncommand = \"shellcheck\"\npatterns = [\"**/*.sh\"]\n",
         )?;
@@ -1977,5 +2051,113 @@ servers = ["pyright"]
         assert!(config.lsp.language.contains_key("rust"));
         assert!(config.linter.rule.contains_key("shellcheck"));
         Ok(())
+    }
+}
+
+/// The server-key-is-the-executable schema (misc 162): the retired `command`
+/// field teaches its migration, and `path` relocates the binary.
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
+mod key_is_executable_tests {
+    use crate::config::Config;
+    use std::fs;
+    use tempfile::tempdir;
+
+    /// A `[lsp.server.*]` still carrying the retired `command` field fails with a
+    /// TEACHING error that names the migration (the maintainer's own live config
+    /// carries `command =` entries — it must fail loud and helpful, not silently
+    /// ignore the field). The error names `command`, its retirement, the
+    /// `[lsp.server.*]` locus, and the `path` replacement.
+    #[test]
+    fn user_config_command_field_is_a_teaching_error() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[lsp.server.rust-analyzer]
+command = "rustup"
+args = ["run", "stable", "rust-analyzer"]
+"#,
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[config_path]);
+        let err = format!("{:#}", result.expect_err("command must be rejected"));
+        assert!(err.contains("command"), "names the dead field: {err}");
+        assert!(err.contains("retired"), "says it is retired: {err}");
+        assert!(
+            err.contains("[lsp.server.*]"),
+            "names the server locus: {err}",
+        );
+        assert!(err.contains("path"), "names the `path` replacement: {err}");
+        // The offending key is named so the fix is obvious.
+        assert!(
+            err.contains("rust-analyzer"),
+            "names the offending server key: {err}",
+        );
+    }
+
+    /// A `path` override resolves as the spawn program; without it, the server
+    /// key itself is the program.
+    #[test]
+    fn path_override_resolves_over_the_key() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[lsp.server.rust-analyzer]
+path = "/opt/toolchains/rust-analyzer"
+
+[lsp.language.rust]
+servers = ["rust-analyzer"]
+"#,
+        )
+        .expect("write config");
+
+        let config = Config::load_from_sources(&[config_path]).expect("loads");
+        let ra = config
+            .server
+            .get("rust-analyzer")
+            .expect("rust-analyzer def");
+        // `path` set → the override is the spawn program.
+        assert_eq!(ra.program("rust-analyzer"), "/opt/toolchains/rust-analyzer");
+
+        // gopls has no path override → the key IS the program.
+        let gopls = config.server.get("gopls").expect("gopls default");
+        assert_eq!(gopls.path, None);
+        assert_eq!(gopls.program("gopls"), "gopls");
+    }
+
+    /// An explicitly-empty `path` is rejected: it would spawn the empty string
+    /// rather than falling back to the key.
+    #[test]
+    fn empty_path_override_is_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[lsp.server.rust-analyzer]
+path = ""
+
+[lsp.language.rust]
+servers = ["rust-analyzer"]
+"#,
+        )
+        .expect("write config");
+
+        let err = format!(
+            "{:#}",
+            Config::load_from_sources(&[config_path]).expect_err("empty path must be rejected"),
+        );
+        assert!(
+            err.contains("empty") && err.contains("path"),
+            "error names the empty path: {err}",
+        );
     }
 }

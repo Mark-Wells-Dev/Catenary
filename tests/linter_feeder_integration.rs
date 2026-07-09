@@ -325,7 +325,7 @@ fn write_cross_feeder_config(dir: &Path) -> Result<PathBuf> {
         &config_path,
         format!(
             "[lsp.server.mockls-{MOCK_LANG}]\n\
-             command = \"{mockls}\"\n\
+             path = \"{mockls}\"\n\
              args = [\"{MOCK_LANG}\", \"--log-pid-suffix\", \
              \"--extra-diagnostic\", \"shellcheck|SC2086|wrapped by language server\"]\n\n\
              [lsp.language.{MOCK_LANG}]\n\
@@ -405,7 +405,7 @@ fn cross_feeder_heavier_source_wins_over_first_seen() -> Result<()> {
             &config_path,
             format!(
                 "[lsp.server.mockls-{MOCK_LANG}]\n\
-                 command = \"{mockls}\"\n\
+                 path = \"{mockls}\"\n\
                  args = [\"{MOCK_LANG}\", \"--log-pid-suffix\", \
                  \"--extra-diagnostic\", \"native-analysis|SC2086|server-side preview\"]\n\n\
                  [lsp.language.{MOCK_LANG}]\n\

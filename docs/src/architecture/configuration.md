@@ -76,9 +76,9 @@ fields (`extensions`, `filenames`, `shebangs`) without repeating them.
 
 For nested structures:
 
-- **Scalars replace.** `command`, `args`, `min_severity`, `diagnostics`.
+- **Scalars replace.** `path`, `args`, `min_severity`, `diagnostics`.
 - **Tables deep-merge by key.** A project `[lsp.server.rust-analyzer]` with
-  only `settings` inherits `command` and `args` from the user's (or
+  only `settings` inherits `path` and `args` from the user's (or
   built-in) `[lsp.server.rust-analyzer]`.
 - **Arrays replace.** `servers`, `file_patterns`, `extensions`,
   `filenames`, `shebangs`, and array-valued settings entries. No

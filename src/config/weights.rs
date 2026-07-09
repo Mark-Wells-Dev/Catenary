@@ -158,7 +158,6 @@ mod tests {
     fn apply_server_def_overrides_native_sub_sources_and_band() {
         let mut w = DiagnosticWeights::rust_analyzer_default();
         let def = ServerDef {
-            command: "rust-analyzer".to_string(),
             weight: Some(5),
             sources: HashMap::from([("rustc".to_string(), 80)]),
             provisional: Some("^X[0-9]+$".to_string()),
@@ -178,11 +177,11 @@ mod tests {
 
     #[test]
     fn apply_server_def_without_weight_keeps_seeded_default() {
-        // A user redefining the command only (no weight fields) must not erase
-        // the seeded rust-analyzer/flycheck weights.
+        // A user redefining the server def only (e.g. a `path` override, no
+        // weight fields) must not erase the seeded rust-analyzer/flycheck weights.
         let mut w = DiagnosticWeights::rust_analyzer_default();
         let def = ServerDef {
-            command: "my-rust-analyzer".to_string(),
+            path: Some("/opt/my-rust-analyzer".to_string()),
             ..ServerDef::default()
         };
         w.apply_server_def("rust-analyzer", &def);

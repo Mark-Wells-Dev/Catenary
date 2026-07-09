@@ -187,7 +187,13 @@ mod tests {
 
     #[test]
     fn other_servers_do_not_suppress_pull() {
-        for name in ["gopls", "lattice", "clangd", "typescript-ls", "yX4Za"] {
+        for name in [
+            "gopls",
+            "lattice",
+            "clangd",
+            "typescript-language-server",
+            "yX4Za",
+        ] {
             assert!(
                 !ServerProfile::for_server(name).suppresses_pull_diagnostics(),
                 "{name} must not suppress pull",

@@ -124,12 +124,15 @@ impl BindingSpec {
 /// than one structural rename.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mutation {
-    /// Set a server's binary command (`[lsp.server.<server>].command`).
-    SetServerCommand {
+    /// Relocate a server's executable (`[lsp.server.<server>].path`).
+    ///
+    /// The server key IS the executable now (misc 162); `path` is the optional
+    /// absolute-path override for a binary that is not on `PATH` under its key.
+    SetServerPath {
         /// The `[lsp.server.*]` name.
         server: String,
-        /// The command / path to write.
-        command: String,
+        /// The absolute path to write.
+        path: String,
     },
     /// Enable or disable a server for one language binding by rewriting
     /// `[lsp.language.<language>].servers` with `<server>`'s `diagnostics` flag
@@ -186,7 +189,7 @@ impl Mutation {
     #[must_use]
     pub const fn top_section(&self) -> Option<&'static str> {
         match self {
-            Self::SetServerCommand { .. } | Self::SetServerEnabled { .. } => Some("lsp"),
+            Self::SetServerPath { .. } | Self::SetServerEnabled { .. } => Some("lsp"),
             Self::SetLinterDisabled { .. } => Some("linter"),
             Self::MigrateNamespace { .. } => None,
         }
@@ -219,8 +222,8 @@ impl Mutation {
     #[must_use]
     pub fn key_label(&self) -> String {
         match self {
-            Self::SetServerCommand { server, .. } => {
-                format!("[lsp.server.{server}] command")
+            Self::SetServerPath { server, .. } => {
+                format!("[lsp.server.{server}] path")
             }
             Self::SetServerEnabled { language, .. } => {
                 format!("[lsp.language.{language}] servers")
@@ -236,7 +239,7 @@ impl Mutation {
     #[must_use]
     pub fn value_label(&self) -> String {
         match self {
-            Self::SetServerCommand { command, .. } => format!("\"{command}\""),
+            Self::SetServerPath { path, .. } => format!("\"{path}\""),
             Self::SetServerEnabled {
                 server, enabled, ..
             } => {
@@ -260,9 +263,9 @@ impl Mutation {
     pub fn apply(&self, path: &Path) -> Result<()> {
         let mut doc = read_document(path)?;
         match self {
-            Self::SetServerCommand { server, command } => {
+            Self::SetServerPath { server, path } => {
                 let table = ensure_table_path(doc.as_table_mut(), &["lsp", "server", server])?;
-                table.insert("command", Item::Value(Value::from(command.as_str())));
+                table.insert("path", Item::Value(Value::from(path.as_str())));
             }
             Self::SetServerEnabled {
                 language,
@@ -435,21 +438,21 @@ mod tests {
     }
 
     #[test]
-    fn set_server_command_updates_existing_key_only() {
+    fn set_server_path_updates_existing_key_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = write(
             dir.path(),
             "config.toml",
-            "# my servers\n[lsp.server.rust-analyzer]\ncommand = \"rust-analyzer\"  # inline\n",
+            "# my servers\n[lsp.server.rust-analyzer]\npath = \"/old/rust-analyzer\"  # inline\n",
         );
-        Mutation::SetServerCommand {
+        Mutation::SetServerPath {
             server: "rust-analyzer".to_string(),
-            command: "/opt/ra/rust-analyzer".to_string(),
+            path: "/opt/ra/rust-analyzer".to_string(),
         }
         .apply(&path)
         .expect("apply");
         let out = std::fs::read_to_string(&path).expect("read");
-        assert!(out.contains("command = \"/opt/ra/rust-analyzer\""));
+        assert!(out.contains("path = \"/opt/ra/rust-analyzer\""));
         assert!(
             out.contains("# my servers"),
             "header comment survives: {out}"
@@ -457,12 +460,12 @@ mod tests {
     }
 
     #[test]
-    fn set_server_command_creates_namespaced_header_not_inline() {
+    fn set_server_path_creates_namespaced_header_not_inline() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        Mutation::SetServerCommand {
+        Mutation::SetServerPath {
             server: "gopls".to_string(),
-            command: "gopls".to_string(),
+            path: "/opt/go/bin/gopls".to_string(),
         }
         .apply(&path)
         .expect("apply");
@@ -474,8 +477,8 @@ mod tests {
         // Round-trips through the real loader.
         let doc: toml::Value = toml::from_str(&out).expect("valid toml");
         assert_eq!(
-            doc["lsp"]["server"]["gopls"]["command"].as_str(),
-            Some("gopls")
+            doc["lsp"]["server"]["gopls"]["path"].as_str(),
+            Some("/opt/go/bin/gopls")
         );
     }
 
@@ -487,17 +490,17 @@ mod tests {
 log_retention_days = 14   # keep two weeks
 
 [notifications]
-threshold = \"warn\"   # only warns and above
+desktop = true   # keep the interrupt
 
 # rust toolchain
 [lsp.server.rust-analyzer]
-command = \"rust-analyzer\"
+path = \"/old/rust-analyzer\"
 args = [\"--log-file\", \"/tmp/ra.log\"]   # debug
 ";
         let path = write(dir.path(), "config.toml", original);
-        Mutation::SetServerCommand {
+        Mutation::SetServerPath {
             server: "rust-analyzer".to_string(),
-            command: "/usr/local/bin/rust-analyzer".to_string(),
+            path: "/usr/local/bin/rust-analyzer".to_string(),
         }
         .apply(&path)
         .expect("apply");
@@ -506,13 +509,13 @@ args = [\"--log-file\", \"/tmp/ra.log\"]   # debug
         for line in [
             "# Catenary config — hand tuned.",
             "log_retention_days = 14   # keep two weeks",
-            "threshold = \"warn\"   # only warns and above",
+            "desktop = true   # keep the interrupt",
             "# rust toolchain",
             "args = [\"--log-file\", \"/tmp/ra.log\"]   # debug",
         ] {
             assert!(out.contains(line), "preserved line missing: {line}\n{out}");
         }
-        assert!(out.contains("command = \"/usr/local/bin/rust-analyzer\""));
+        assert!(out.contains("path = \"/usr/local/bin/rust-analyzer\""));
     }
 
     #[test]
@@ -654,9 +657,9 @@ command = \"shellcheck\"
     #[test]
     fn candidate_layers_offers_project_for_lsp_and_linter() {
         let root = PathBuf::from("/p/root");
-        let cmd = Mutation::SetServerCommand {
+        let cmd = Mutation::SetServerPath {
             server: "x".to_string(),
-            command: "x".to_string(),
+            path: "/opt/x".to_string(),
         };
         let layers = cmd.candidate_layers(Some(&root));
         assert_eq!(layers.len(), 2, "user + project");

@@ -156,10 +156,13 @@ mod tests {
     fn test_instance_key_display() {
         let key = InstanceKey::new(
             "python".to_string(),
-            "pyright".to_string(),
+            "pyright-langserver".to_string(),
             Scope::Root(PathBuf::from("/home/user/project")),
         );
-        assert_eq!(key.to_string(), "python:pyright:root(/home/user/project)");
+        assert_eq!(
+            key.to_string(),
+            "python:pyright-langserver:root(/home/user/project)"
+        );
 
         let key = InstanceKey::new("text".to_string(), "ltex".to_string(), Scope::SingleFile);
         assert_eq!(key.to_string(), "text:ltex:single_file");

@@ -1015,7 +1015,7 @@ mod tests {
             ..RootEntry::default()
         });
         snap.servers.push(server(
-            "svelte-ls",
+            "svelteserver",
             "/p/Catenary/tests/fixtures/conformance/svelte",
             "healthy",
         ));
@@ -1034,7 +1034,7 @@ mod tests {
         let sub = rows
             .iter()
             .find_map(|r| match r {
-                Row::Server { entry, subroot } if entry.server == "svelte-ls" => {
+                Row::Server { entry, subroot } if entry.server == "svelteserver" => {
                     Some(subroot.clone())
                 }
                 _ => None,

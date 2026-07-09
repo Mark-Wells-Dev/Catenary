@@ -55,7 +55,7 @@ fn write_config(dir: &Path, extra_diagnostics: &[&str]) -> Result<PathBuf> {
         &config_path,
         format!(
             "[lsp.server.mockls-{MOCK_LANG}]\n\
-             command = \"{mockls_bin}\"\n\
+             path = \"{mockls_bin}\"\n\
              args = [{args_line}]\n\n\
              [lsp.server.mockls-{MOCK_LANG}.sources]\n\
              mockls = 1\n\n\

@@ -1060,9 +1060,9 @@ mod tests {
         }
         if one_broken {
             snap.servers.push(ServerEntry {
-                id: "julia-ls@/p/root0".to_string(),
+                id: "julia@/p/root0".to_string(),
                 language: "julia".to_string(),
-                server: "julia-ls".to_string(),
+                server: "julia".to_string(),
                 scope_root: "/p/root0".to_string(),
                 state: "failed".to_string(),
                 state_since: crate::state_snapshot::now_iso(),
@@ -1074,7 +1074,7 @@ mod tests {
                 ..ServerEntry::default()
             });
             // A tracked session touched a julia file, so julia is activity-live
-            // and julia-ls's failure is an intent-broken Fatal (item 5). Without
+            // and julia's failure is an intent-broken Fatal (item 5). Without
             // this the failed instance would be quiet dormant inventory.
             snap.activity_languages.push(LanguageActivity {
                 language: "julia".to_string(),
@@ -1112,23 +1112,19 @@ mod tests {
     }
 
     /// The config the fleet fixture routes against: empty for the healthy
-    /// fleet, `julia-ls → julia` for the broken variant (so the failed instance
+    /// fleet, `julia → julia` for the broken variant (so the failed instance
     /// surfaces as an intent-broken `Fatal`).
     fn fleet_config(one_broken: bool) -> crate::config::Config {
         let mut config = crate::config::Config::default();
         if one_broken {
             use crate::config::{LanguageConfig, ServerBinding, ServerDef};
-            config.server.insert(
-                "julia-ls".to_string(),
-                ServerDef {
-                    command: "julia-ls".to_string(),
-                    ..ServerDef::default()
-                },
-            );
+            config
+                .server
+                .insert("julia".to_string(), ServerDef::default());
             config.language.insert(
                 "julia".to_string(),
                 LanguageConfig {
-                    servers: Some(vec![ServerBinding::new("julia-ls")]),
+                    servers: Some(vec![ServerBinding::new("julia")]),
                     ..Default::default()
                 },
             );
@@ -1413,11 +1409,9 @@ mod tests {
             Box::new(MockDataSource::new(fleet_fixture(true))),
         )
         .expect("app");
-        // julia-ls failed → a problem with a fix-it.
+        // julia failed → a problem with a fix-it.
         assert!(
-            app.problem_rows
-                .iter()
-                .any(|p| p.message.contains("julia-ls")),
+            app.problem_rows.iter().any(|p| p.message.contains("julia")),
             "broken server is in the problems pane",
         );
         assert!(!app.verdict.is_working(), "verdict is not working");
@@ -1432,7 +1426,7 @@ mod tests {
         );
         let idx = app.root_cursor.index;
         assert!(
-            matches!(&app.root_rows[idx], model::Row::Server { entry, .. } if entry.server == "julia-ls"),
+            matches!(&app.root_rows[idx], model::Row::Server { entry, .. } if entry.server == "julia"),
             "cursor lands on the owning server",
         );
     }
@@ -1443,7 +1437,7 @@ mod tests {
         let out = render_to_string(fleet_fixture(true), fleet_config(true), 80, 24);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines.len() <= 24, "fits the height: {}", lines.len());
-        assert!(out.contains("julia-ls"), "the problem is visible: {out}");
+        assert!(out.contains("julia"), "the problem is visible: {out}");
     }
 
     #[test]

@@ -239,7 +239,7 @@ async fn gather_probe_feed(
     for (name, def) in &config.server {
         join_set.spawn(crate::health::servers::probe_server(
             name.clone(),
-            def.command.clone(),
+            def.program(name).to_string(),
             def.args.clone(),
             def.initialization_options.clone(),
             def.env.clone(),
@@ -380,7 +380,9 @@ pub async fn run_doctor_single(
     };
 
     // ── 1. Resolved command ─────────────────────────────────────────
-    let command = server_def.command.as_str();
+    // The server key IS the executable (misc 162): resolve the `path` override
+    // if set, else spawn the key `server_name` on PATH.
+    let command = server_def.program(server_name);
     let args_display = if server_def.args.is_empty() {
         String::new()
     } else {
@@ -408,19 +410,37 @@ pub async fn run_doctor_single(
     }
 
     // ── 2. Binary check ────────────────────────────────────────────
+    // `server_binary_installed` is honest against the rust-analyzer rustup proxy
+    // shim (misc 162): a bare proxy with no component behind it reads as NOT
+    // installed, not a phantom `✓`.
     let _ = out.writeln(format_args!("{}:", out.colors.bold("Binary")));
-    if let Some(path) = crate::health::servers::resolve_binary(command) {
-        let _ = out.writeln(format_args!(
-            "  {} {}",
-            out.colors.green("✓"),
-            path.display()
-        ));
-    } else {
-        let _ = out.writeln(format_args!(
-            "  {}",
-            out.colors.red(&format!("✗ {command}: command not found")),
-        ));
-        return Ok(());
+    match crate::health::servers::resolve_binary(command) {
+        Some(path) if crate::health::servers::server_binary_installed(server_name, command) => {
+            let _ = out.writeln(format_args!(
+                "  {} {}",
+                out.colors.green("✓"),
+                path.display()
+            ));
+        }
+        Some(path) => {
+            // The proxy shim exists, but the component behind it does not.
+            let _ = out.writeln(format_args!(
+                "  {}",
+                out.colors.red(&format!(
+                    "✗ {command}: the rustup proxy at {} has no component behind it — \
+                     run `rustup component add {command}`",
+                    path.display(),
+                )),
+            ));
+            return Ok(());
+        }
+        None => {
+            let _ = out.writeln(format_args!(
+                "  {}",
+                out.colors.red(&format!("✗ {command}: command not found")),
+            ));
+            return Ok(());
+        }
     }
     let _ = out.writeln(format_args!(""));
 

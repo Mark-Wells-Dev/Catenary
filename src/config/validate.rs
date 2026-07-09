@@ -85,10 +85,14 @@ pub fn validate(config: &Config) -> Vec<String> {
 
     // Validate server definitions
     for (name, server_def) in &config.server {
-        if server_def.command.is_empty() {
+        // The server key IS the executable (misc 162): there is no `command`
+        // field to be empty. An empty `path` override is meaningless — it would
+        // resolve to the empty string rather than falling back to the key — so
+        // reject it, keeping the "a server must spawn *something*" guarantee.
+        if server_def.path.as_ref().is_some_and(String::is_empty) {
             errors.push(format!(
-                "Server '{name}' has an empty `command` — \
-                 server definitions must specify a command"
+                "Server '{name}' has an empty `path` — omit it to spawn the key \
+                 `{name}` on PATH, or set it to the executable's absolute path"
             ));
         }
 
@@ -156,18 +160,21 @@ fn validate_linters(config: &Config, errors: &mut Vec<String>) {
 
 /// Warns about orphan `[lsp.server.*]` entries in a project config.
 ///
-/// A project server def is an orphan if it has spawn fields (`command`)
-/// but neither the project's `[lsp.language.*]` nor the user's `[lsp.language.*]`
-/// references it. Settings-only overrides (no `command`) are not orphans
-/// — they override user-level server settings for this root.
+/// A project server def is an orphan if it introduces a **new** server (a key
+/// unknown to the user/default layer) that no `[lsp.language.*]` — project or
+/// user — references. A def whose key already names a server in the merged
+/// user/default config is an *override* of that server (its executable is the
+/// key, misc 162; the def refines args/env/settings for this root), never an
+/// orphan.
 pub fn warn_orphan_project_servers(
     project: &super::ProjectConfig,
     user_config: &Config,
     root: &std::path::Path,
 ) {
-    for (server_name, server_def) in &project.server {
-        // Settings-only override — not an orphan.
-        if server_def.command.is_empty() {
+    for server_name in project.server.keys() {
+        // Override of a known server (shipped default or user-defined) — not an
+        // orphan. The key IS the executable now, so a bare override still spawns.
+        if user_config.server.contains_key(server_name) {
             continue;
         }
 
@@ -186,8 +193,8 @@ pub fn warn_orphan_project_servers(
                 source = Source::ConfigValidation.as_str(),
                 root = %root.display(),
                 server = server_name.as_str(),
-                "Project config at {}: [lsp.server.{server_name}] has a `command` \
-                 but no [lsp.language.*] references it — this server will never be spawned",
+                "Project config at {}: [lsp.server.{server_name}] defines a server \
+                 no [lsp.language.*] references — this server will never be spawned",
                 root.display(),
             );
         }
@@ -207,16 +214,12 @@ mod tests {
 
     #[test]
     fn test_orphan_server_warning() {
-        // A project server with command but no language references is an orphan.
+        // A project server introducing a NEW key (unknown to the user/default
+        // layer) that no language references is an orphan.
         let mut project = ProjectConfig::default();
-        project.server.insert(
-            "unused-server".to_string(),
-            ServerDef {
-                command: "unused-server-bin".to_string(),
-                args: Vec::new(),
-                ..ServerDef::default()
-            },
-        );
+        project
+            .server
+            .insert("unused-server".to_string(), ServerDef::default());
 
         let user_config = Config::default();
         let root = PathBuf::from("/test");
@@ -228,8 +231,9 @@ mod tests {
 
     #[test]
     fn test_orphan_server_settings_only_no_warning() {
-        // A project server with empty command (settings-only override) is not
-        // an orphan — it just overrides the user-level server's settings.
+        // A project server whose key already names a known server (misc 162: the
+        // key IS the executable) is an override, not an orphan — even when it
+        // only refines settings.
         let mut project = ProjectConfig::default();
         project.server.insert(
             "rust-analyzer".to_string(),
@@ -239,10 +243,14 @@ mod tests {
             },
         );
 
-        let user_config = Config::default();
+        // The merged user/default layer knows rust-analyzer (shipped default).
+        let mut user_config = Config::default();
+        user_config
+            .server
+            .insert("rust-analyzer".to_string(), ServerDef::default());
         let root = PathBuf::from("/test");
 
-        // Should not warn — settings-only overrides are valid.
+        // Should not warn — overriding a known server is valid.
         warn_orphan_project_servers(&project, &user_config, &root);
     }
 
@@ -250,14 +258,9 @@ mod tests {
     fn test_orphan_server_referenced_by_project_language() {
         // Server is referenced by project's own language config — not orphan.
         let mut project = ProjectConfig::default();
-        project.server.insert(
-            "my-server".to_string(),
-            ServerDef {
-                command: "my-server-bin".to_string(),
-                args: Vec::new(),
-                ..ServerDef::default()
-            },
-        );
+        project
+            .server
+            .insert("my-server".to_string(), ServerDef::default());
         project.language.insert(
             "custom".to_string(),
             LanguageConfig {
@@ -276,14 +279,9 @@ mod tests {
     fn test_orphan_server_referenced_by_user_language() {
         // Server is referenced by user's language config — not orphan.
         let mut project = ProjectConfig::default();
-        project.server.insert(
-            "rust-analyzer".to_string(),
-            ServerDef {
-                command: "custom-ra".to_string(),
-                args: Vec::new(),
-                ..ServerDef::default()
-            },
-        );
+        project
+            .server
+            .insert("rust-analyzer".to_string(), ServerDef::default());
 
         let mut user_config = Config::default();
         let mut language = HashMap::new();

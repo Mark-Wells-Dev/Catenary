@@ -30,22 +30,22 @@ Use `file_patterns` to add `termux-language-server` alongside
 [bash-language-server](shell.md) for packaging files:
 
 ```toml
-[lsp.server.termux-ls]
-command = "termux-language-server"
+[lsp.server.termux-language-server]
 args = ["--stdio"]
 file_patterns = ["PKGBUILD", "*.ebuild", "*.eclass"]
 
-# bash-ls is built-in — no [lsp.server.bash-ls] needed
+# bash-language-server is built-in — no [lsp.server.bash-language-server] needed
 
 [lsp.language.shellscript]
-servers = ["termux-ls", "bash-ls"]
+servers = ["termux-language-server", "bash-language-server"]
 ```
 
-`termux-ls` handles PKGBUILD and ebuild files with package-specific
-intelligence. `bash-ls` provides shell fundamentals (definition,
-references, symbols) for all shellscript files. For PKGBUILD files,
-`termux-ls` is tried first; `bash-ls` fills in for methods it doesn't
-handle. See [Dispatch Filtering](../configuration.md#dispatch-filtering).
+`termux-language-server` handles PKGBUILD and ebuild files with
+package-specific intelligence. `bash-language-server` provides shell
+fundamentals (definition, references, symbols) for all shellscript files. For
+PKGBUILD files, `termux-language-server` is tried first; `bash-language-server`
+fills in for methods it doesn't handle. See
+[Dispatch Filtering](../configuration.md#dispatch-filtering).
 
 ### As a standalone server
 
@@ -53,21 +53,20 @@ For the full set of termux-language-server language IDs, define
 each as a [custom language](../configuration.md#custom-languages):
 
 ```toml
-[lsp.server.termux-ls]
-command = "termux-language-server"
+[lsp.server.termux-language-server]
 args = ["--stdio"]
 
 [lsp.language.pkgbuild]
 filenames = ["PKGBUILD"]
-servers = ["termux-ls"]
+servers = ["termux-language-server"]
 
 [lsp.language.ebuild]
 extensions = ["ebuild"]
-servers = ["termux-ls"]
+servers = ["termux-language-server"]
 
 [lsp.language.eclass]
 extensions = ["eclass"]
-servers = ["termux-ls"]
+servers = ["termux-language-server"]
 ```
 
 Add entries for other language IDs as needed (`termux`, `makepkg`,

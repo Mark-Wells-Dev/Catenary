@@ -1103,7 +1103,12 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             VerificationTier::NpmTarballSha512,
         );
         r.hash = Some(sri);
-        let blessed = BlessedRecipe::resolve("bash-ls", &r, &manifest("bash-ls", "5.6.0")).unwrap();
+        let blessed = BlessedRecipe::resolve(
+            "bash-language-server",
+            &r,
+            &manifest("bash-language-server", "5.6.0"),
+        )
+        .unwrap();
         let plan = InstallPlan::resolve(&blessed).expect("npm resolves");
 
         let runner = FakeRunner::ok();
@@ -1150,7 +1155,12 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             "sha512-{}",
             base64_standard(&sha512(b"the real bytes"))
         ));
-        let blessed = BlessedRecipe::resolve("bash-ls", &r, &manifest("bash-ls", "5.6.0")).unwrap();
+        let blessed = BlessedRecipe::resolve(
+            "bash-language-server",
+            &r,
+            &manifest("bash-language-server", "5.6.0"),
+        )
+        .unwrap();
         let plan = InstallPlan::resolve(&blessed).unwrap();
 
         let runner = FakeRunner::ok();
@@ -1177,7 +1187,12 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             "5.6.0",
             VerificationTier::NpmTarballSha512,
         );
-        let blessed = BlessedRecipe::resolve("bash-ls", &r, &manifest("bash-ls", "5.6.0")).unwrap();
+        let blessed = BlessedRecipe::resolve(
+            "bash-language-server",
+            &r,
+            &manifest("bash-language-server", "5.6.0"),
+        )
+        .unwrap();
         let err = InstallPlan::resolve(&blessed).expect_err("npm without a hash refuses");
         assert!(
             err.to_string().contains("unverified"),
@@ -1196,8 +1211,12 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
         r.hash = Some(
             "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
         );
-        let blessed =
-            BlessedRecipe::resolve("cmake-ls", &r, &manifest("cmake-ls", "0.1.11")).unwrap();
+        let blessed = BlessedRecipe::resolve(
+            "cmake-language-server",
+            &r,
+            &manifest("cmake-language-server", "0.1.11"),
+        )
+        .unwrap();
         let plan = InstallPlan::resolve(&blessed).expect("pip with a hash resolves");
         let PlanKind::PipRequireHashes { requirement } = &plan.kind else {
             panic!("pip is a require-hashes install")
@@ -1228,8 +1247,12 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             VerificationTier::PipHashes,
         );
         r.note = Some("closure hashes pending".to_owned());
-        let blessed =
-            BlessedRecipe::resolve("cmake-ls", &r, &manifest("cmake-ls", "0.1.11")).unwrap();
+        let blessed = BlessedRecipe::resolve(
+            "cmake-language-server",
+            &r,
+            &manifest("cmake-language-server", "0.1.11"),
+        )
+        .unwrap();
         let err = InstallPlan::resolve(&blessed).expect_err("pip without a hash refuses");
         assert!(
             err.to_string().contains("closure hashes pending"),

@@ -213,7 +213,7 @@ fn test_doctor_single_server_found() -> Result<()> {
         config_dir.join("config.toml"),
         format!(
             "[lsp.server.mockls-test]\n\
-             command = \"{mockls_bin}\"\n\
+             path = \"{mockls_bin}\"\n\
              args = [\"test\"]\n\n\
              [lsp.language.test]\n\
              servers = [\"mockls-test\"]\n"
@@ -286,7 +286,7 @@ fn test_doctor_single_server_not_found() -> Result<()> {
         config_dir.join("config.toml"),
         format!(
             "[lsp.server.mockls-test]\n\
-             command = \"{mockls_bin}\"\n\
+             path = \"{mockls_bin}\"\n\
              args = [\"test\"]\n\n\
              [lsp.language.test]\n\
              servers = [\"mockls-test\"]\n"
@@ -332,7 +332,7 @@ fn test_doctor_no_args_unchanged() -> Result<()> {
         config_dir.join("config.toml"),
         format!(
             "[lsp.server.mockls-test]\n\
-             command = \"{mockls_bin}\"\n\
+             path = \"{mockls_bin}\"\n\
              args = [\"test\"]\n\n\
              [lsp.language.test]\n\
              servers = [\"mockls-test\"]\n"
@@ -385,13 +385,13 @@ fn test_doctor_parallel_all_ready() -> Result<()> {
         config_dir.join("config.toml"),
         format!(
             "[lsp.server.alpha-server]\n\
-             command = \"{mockls_bin}\"\n\
+             path = \"{mockls_bin}\"\n\
              args = [\"alpha\"]\n\n\
              [lsp.server.beta-server]\n\
-             command = \"{mockls_bin}\"\n\
+             path = \"{mockls_bin}\"\n\
              args = [\"beta\"]\n\n\
              [lsp.server.gamma-server]\n\
-             command = \"{mockls_bin}\"\n\
+             path = \"{mockls_bin}\"\n\
              args = [\"gamma\"]\n\n\
              [lsp.language.alpha]\n\
              servers = [\"alpha-server\"]\n\n\
@@ -449,10 +449,10 @@ fn test_doctor_parallel_one_fails() -> Result<()> {
         config_dir.join("config.toml"),
         format!(
             "[lsp.server.good-server]\n\
-             command = \"{mockls_bin}\"\n\
+             path = \"{mockls_bin}\"\n\
              args = [\"test\"]\n\n\
              [lsp.server.bad-server]\n\
-             command = \"nonexistent-binary-xyz-12345\"\n\
+             path = \"nonexistent-binary-xyz-12345\"\n\
              args = []\n\n\
              [lsp.language.good]\n\
              servers = [\"good-server\"]\n\n\
@@ -500,13 +500,13 @@ fn test_doctor_output_sorted() -> Result<()> {
         config_dir.join("config.toml"),
         format!(
             "[lsp.server.zulu-server]\n\
-             command = \"{mockls_bin}\"\n\
+             path = \"{mockls_bin}\"\n\
              args = [\"zulu\"]\n\n\
              [lsp.server.alpha-server]\n\
-             command = \"{mockls_bin}\"\n\
+             path = \"{mockls_bin}\"\n\
              args = [\"alpha\"]\n\n\
              [lsp.server.mike-server]\n\
-             command = \"{mockls_bin}\"\n\
+             path = \"{mockls_bin}\"\n\
              args = [\"mike\"]\n\n\
              [lsp.language.zulu]\n\
              servers = [\"zulu-server\"]\n\n\
@@ -555,10 +555,10 @@ fn test_doctor_parallel_timeout() -> Result<()> {
         config_dir.join("config.toml"),
         format!(
             "[lsp.server.fast-server]\n\
-             command = \"{mockls_bin}\"\n\
+             path = \"{mockls_bin}\"\n\
              args = [\"fast\"]\n\n\
              [lsp.server.hanging-server]\n\
-             command = \"{mockls_bin}\"\n\
+             path = \"{mockls_bin}\"\n\
              args = [\"hang\", \"--hang-on\", \"initialize\"]\n\n\
              [lsp.language.fast]\n\
              servers = [\"fast-server\"]\n\n\
@@ -607,7 +607,7 @@ fn test_doctor_piped_no_ansi() -> Result<()> {
         config_dir.join("config.toml"),
         format!(
             "[lsp.server.mockls-pipe]\n\
-             command = \"{mockls_bin}\"\n\
+             path = \"{mockls_bin}\"\n\
              args = [\"test\"]\n\n\
              [lsp.language.test]\n\
              servers = [\"mockls-pipe\"]\n"

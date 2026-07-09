@@ -31,7 +31,7 @@ fn write_mockls_config(dir: &Path) -> Result<PathBuf> {
         &config_path,
         format!(
             "[lsp.server.mockls-{MOCK_LANG_A}]\n\
-             command = \"{mockls_bin}\"\n\
+             path = \"{mockls_bin}\"\n\
              args = [\"{MOCK_LANG_A}\"]\n\n\
              [lsp.language.{MOCK_LANG_A}]\n\
              servers = [\"mockls-{MOCK_LANG_A}\"]\n"

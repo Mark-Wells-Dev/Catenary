@@ -37,10 +37,10 @@ automatically.
 To customise settings, add to `~/.config/catenary/config.toml`:
 
 ```toml
-[lsp.server.pyright.settings.python]
+[lsp.server.pyright-langserver.settings.python]
 pythonPath = "/usr/bin/python3"
 
-[lsp.server.pyright.settings.python.analysis]
+[lsp.server.pyright-langserver.settings.python.analysis]
 exclude = ["**/target", "**/node_modules"]
 extraPaths = []
 ```
@@ -75,12 +75,12 @@ pip install python-lsp-server
 ```
 
 ```toml
-[lsp.server.pylsp]
-command = "pylsp"
-
 [lsp.language.python]
 servers = ["pylsp"]
 ```
+
+No `[lsp.server.pylsp]` block is needed — the section key `pylsp` is the
+binary Catenary spawns; add one with `path = "/abs/path"` only to relocate it.
 
 ### Jedi Language Server
 
@@ -91,12 +91,13 @@ pip install jedi-language-server
 ```
 
 ```toml
-[lsp.server.jedi]
-command = "jedi-language-server"
-
 [lsp.language.python]
-servers = ["jedi"]
+servers = ["jedi-language-server"]
 ```
+
+The section key `jedi-language-server` is the binary Catenary spawns, so no
+`[lsp.server.*]` block is needed — add one with `path = "/abs/path"` only to
+relocate a binary that is not on PATH.
 
 ## Links
 
