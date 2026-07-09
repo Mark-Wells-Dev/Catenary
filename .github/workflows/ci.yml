@@ -7,6 +7,12 @@ name: CI
   pull_request:
     branches: [main]
 
+# A new push to the same branch/PR cancels the prior in-flight run.
+# Releases live in cd.yml (tag-triggered), so this never cancels a release.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -20,28 +26,46 @@ jobs:
       - run: cargo fmt --check
 
   clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
+    name: Clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
       - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      # macOS lints the target_os = "macos" branches (e.g. notify.rs
+      # osascript) that never compile on the Linux runner.
       - run: cargo clippy --all-targets --features mockls -- -D warnings
 
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --bins --tests --features mockls
-      - run: cargo test --lib --bins --no-fail-fast --features mockls
-      # Integration tests require LSP servers (e.g. rust-analyzer); they run
-      # locally via `make test`.
+      # Full suite: unit + tests/ integration (mockls-driven, no real
+      # servers). The few real-server cases are #[ignore]'d and skip by
+      # default; they run locally via `make test-ignored` and in the
+      # conformance harness.
+      - run: cargo test --no-fail-fast --features mockls
 
   build:
-    name: Build
-    runs-on: ubuntu-latest
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
       - run: rustup show
