@@ -732,7 +732,20 @@ impl Connection {
                         let value: serde_json::Value = match serde_json::from_str(&message_str) {
                             Ok(v) => v,
                             Err(e) => {
-                                debug!("Failed to parse JSON: {}", e);
+                                // A framing-valid message whose body is not JSON
+                                // is DROPPED — and a dropped frame can strand a
+                                // pipeline waiting on a response (bug 95). Make
+                                // it a health finding, not a silent debug line.
+                                let preview: String = message_str.chars().take(96).collect();
+                                warn!(
+                                    server = server_name.as_str(),
+                                    source = crate::source::Source::LspDispatch.as_str(),
+                                    scope_root = scope_root_ref,
+                                    byte_len = message_str.len(),
+                                    body_preview = preview.as_str(),
+                                    "dropping framing-valid but non-JSON LSP \
+                                     message from {server_name}: {e}"
+                                );
                                 continue;
                             }
                         };
