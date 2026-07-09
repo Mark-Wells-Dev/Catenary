@@ -109,6 +109,10 @@ others.
 ## Building
 
 All build, test, lint, and release tasks run through the `Makefile` — e.g.
-`make check` (format + clippy + deny + machete + test in one pass). The `Makefile`
+`make check` (format + clippy + deny + machete + test in one pass). **Prefer
+Makefile targets over raw commands** (`cargo`, `rustc`, ad-hoc scripts): targets
+are repeatable across sessions and keep the maintainer monitoring code and
+design instead of command lines. If a task has no target, propose adding one
+rather than running the raw form. The `Makefile`
 targets and `.github/workflows/` (`ci.yml`, `cd.yml`) are the source of truth for
 the build / CI / release surface; this document does not duplicate them.
