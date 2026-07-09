@@ -341,7 +341,7 @@ pub fn set_parent_death_signal(cmd: &mut std::process::Command) {
 ///
 /// No-op on non-Linux platforms. See the Linux variant for details.
 #[cfg(not(target_os = "linux"))]
-pub fn set_parent_death_signal(_cmd: &mut std::process::Command) {}
+pub const fn set_parent_death_signal(_cmd: &mut std::process::Command) {}
 
 /// Returns `true` if the calling process is in the foreground process
 /// group of its controlling terminal.
@@ -644,10 +644,10 @@ mod platform {
     impl MonitorInner {
         /// Verifies the process exists and returns a monitor.
         pub fn new(pid: u32) -> Option<Self> {
-            let (_, _, _, ppid, _) = sample_raw(pid)?;
+            let (_, _, _, parent_pid, _) = sample_raw(pid)?;
             Some(Self {
                 pid,
-                ppid,
+                ppid: parent_pid,
                 last_csw: 0,
             })
         }
@@ -662,7 +662,7 @@ mod platform {
         }
 
         /// Returns cumulative context switches from the most recent sample.
-        pub fn context_switches(&mut self) -> u64 {
+        pub const fn context_switches(&self) -> u64 {
             self.last_csw
         }
     }
@@ -683,7 +683,7 @@ mod platform {
         let (info, state) = unsafe { read_task_info(pid) }?;
 
         let mut timebase = mach2::mach_time::mach_timebase_info_data_t { numer: 0, denom: 0 };
-        unsafe { mach2::mach_time::mach_timebase_info(&mut timebase) };
+        unsafe { mach2::mach_time::mach_timebase_info(&raw mut timebase) };
 
         let numer = u64::from(timebase.numer);
         let denom = u64::from(timebase.denom);
@@ -732,9 +732,9 @@ mod platform {
                 bsd_size,
             )
         };
-        let ppid = if bsd_ret > 0 { bsd_info.pbi_ppid } else { 0 };
+        let parent_pid = if bsd_ret > 0 { bsd_info.pbi_ppid } else { 0 };
 
-        Some((utime, stime, pfc, ppid, state))
+        Some((utime, stime, pfc, parent_pid, state))
     }
 
     /// Read `proc_taskinfo` and derive scheduling state.
@@ -792,9 +792,8 @@ mod platform {
     ///
     /// Calls `libc::proc_listchildpids` with a correctly sized buffer.
     unsafe fn list_child_pids(pid: u32) -> Vec<u32> {
-        let pid_i32 = match i32::try_from(pid) {
-            Ok(v) => v,
-            Err(_) => return Vec::new(),
+        let Ok(pid_i32) = i32::try_from(pid) else {
+            return Vec::new();
         };
 
         // First call with size 0 to get the count.
@@ -806,9 +805,8 @@ mod platform {
         #[allow(clippy::cast_sign_loss, reason = "count is checked > 0 above")]
         let num = count as usize;
         let mut buf = vec![0i32; num];
-        let buf_size = match i32::try_from(num * std::mem::size_of::<i32>()) {
-            Ok(v) => v,
-            Err(_) => return Vec::new(),
+        let Ok(buf_size) = i32::try_from(num * std::mem::size_of::<i32>()) else {
+            return Vec::new();
         };
 
         let ret = unsafe { libc::proc_listchildpids(pid_i32, buf.as_mut_ptr().cast(), buf_size) };
@@ -829,12 +827,12 @@ mod platform {
 
     /// Stateless sample for the `sample(pid)` function.
     pub fn sample(pid: u32) -> Option<ProcessSample> {
-        let (utime, stime, pfc, ppid, state) = sample_raw(pid)?;
+        let (utime, stime, pfc, parent_pid, state) = sample_raw(pid)?;
         Some(ProcessSample {
             utime,
             stime,
             pfc,
-            ppid,
+            ppid: parent_pid,
             state,
         })
     }
@@ -1442,8 +1440,13 @@ mod tests {
         );
 
         // Kill the entire process group (negative PID = group).
-        let pgid = parent.id();
-        unsafe { libc::kill(-(i32::try_from(pgid).expect("PID fits i32")), libc::SIGKILL) };
+        let group_pid = parent.id();
+        unsafe {
+            libc::kill(
+                -(i32::try_from(group_pid).expect("PID fits i32")),
+                libc::SIGKILL,
+            )
+        };
         parent.wait().expect("Failed to wait for parent");
     }
 }

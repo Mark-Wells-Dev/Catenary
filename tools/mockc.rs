@@ -76,7 +76,8 @@ fn self_cpu_ticks() -> u64 {
     #[cfg(not(target_os = "linux"))]
     {
         // Fallback: catenary-proc's stateless sampler on our own PID.
-        catenary_proc::sample(std::process::id()).map_or(0, |s| s.cpu_ticks)
+        // Same quantity as the Linux fast path: utime + stime, centiseconds.
+        catenary_proc::sample(std::process::id()).map_or(0, |s| s.utime + s.stime)
     }
 }
 
