@@ -362,7 +362,7 @@ fn test_batch_all_files_open_simultaneously() -> Result<()> {
     Ok(())
 }
 
-// ─── Real rust-analyzer: unlinked-file investigation ────────────────
+// ─── Real rust-analyzer: unlinked-file regression guard (#101) ──────
 
 /// Resolves an absolute path for a binary on $PATH.
 ///
@@ -390,7 +390,7 @@ fn find_binary(name: &str) -> Option<PathBuf> {
 ///
 /// Run with: `make test-ignored T=unlinked_file_new_module`
 #[test]
-#[ignore = "requires rust-analyzer — run manually to investigate #101"]
+#[ignore = "regression guard for #101 (fixed); requires rust-analyzer"]
 fn test_unlinked_file_new_module() -> Result<()> {
     let ra_bin = find_binary("rust-analyzer").context("rust-analyzer not found on PATH")?;
 
@@ -434,56 +434,6 @@ fn test_unlinked_file_new_module() -> Result<()> {
         main_rs.to_str().context("main path")?,
     ])?;
 
-    assert_no_unlinked(&text);
-
-    Ok(())
-}
-
-/// Same scenario but the `mod` declaration is behind a feature flag
-/// that RA doesn't evaluate. The diagnostic is legitimate — RA
-/// correctly reports the file as unlinked. Tests whether the noise
-/// filter should suppress it.
-///
-/// Run with: `make test-ignored T=unlinked_file_feature_gated`
-#[test]
-#[ignore = "requires rust-analyzer — run manually to investigate #101"]
-fn test_unlinked_file_feature_gated() -> Result<()> {
-    let ra_bin = find_binary("rust-analyzer").context("rust-analyzer not found on PATH")?;
-
-    let dir = tempfile::tempdir()?;
-    let src = dir.path().join("src");
-    std::fs::create_dir_all(&src)?;
-
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname = \"test-unlinked\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[features]\nextra = []\n",
-    )?;
-
-    // mod declaration behind a feature flag RA won't enable
-    let main_rs = src.join("main.rs");
-    std::fs::write(
-        &main_rs,
-        "#[cfg(feature = \"extra\")]\nmod new_module;\n\nfn main() {}\n",
-    )?;
-
-    let new_module_rs = src.join("new_module.rs");
-    std::fs::write(&new_module_rs, "pub fn hello() {}\n")?;
-
-    let root = dir.path().to_str().context("root path")?;
-    let ra_path = ra_bin.to_str().context("ra path")?;
-    let lsp = format!("rust:{ra_path}");
-
-    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
-    bridge.initialize()?;
-
-    let text = bridge.call_diagnostics_multi(&[
-        new_module_rs.to_str().context("new_module path")?,
-        main_rs.to_str().context("main path")?,
-    ])?;
-
-    // If this fails, the feature-gated mod produces an unlinked-file
-    // diagnostic that the pipeline correctly preserves. The fix would
-    // be filtering, not timing.
     assert_no_unlinked(&text);
 
     Ok(())
