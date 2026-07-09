@@ -874,6 +874,15 @@ upgrading.
 
 ### Fixed
 
+- **rustup proxy shims are recognized by identity, not location.** The
+  doctor's proxy-vs-component cross-check only engaged for shims under
+  `<CARGO_HOME>/bin`, so distro-packaged rustup (Arch keeps its shims in
+  `/usr/lib/rustup/bin`) fell through it — a bare proxy with no installed
+  component spawned and died as a phantom-Fatal instead of reading as an
+  honest not-installed Suggestion. A shim is now identified by what it
+  is: the same file as the `rustup` binary itself (inode identity for
+  hardlinks, canonical target for symlinks), wherever it sits; the
+  cargo-bin directory test remains as the fallback for plain copies.
 - **`catenary glob` expansion is bounded by pattern depth, and `--count`
   reads zero file content.** A multi-directory single-star pattern
   (`~/.claude/t*`) walked the entire base subtree during expansion — a

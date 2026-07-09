@@ -567,15 +567,51 @@ pub fn server_binary_installed(name: &str, program: &str) -> bool {
 
 /// Whether `resolved` is a rustup proxy shim rather than a real component binary.
 ///
-/// rustup installs its proxies under `<CARGO_HOME>/bin` (default `~/.cargo/bin`);
-/// the real component lives under `~/.rustup/toolchains/<tc>/bin`. A proxy in the
-/// cargo-bin dir is the shim that exists regardless of component installation.
+/// A rustup proxy is not identified by *where* it sits — distro-packaged rustup
+/// keeps its shims outside `<CARGO_HOME>/bin` (Arch: `/usr/lib/rustup/bin`), so a
+/// directory test alone silently misses every distro layout (bug 92). Instead we
+/// identify the proxy by what it **is**: rustup proxies are hardlinks (or copies)
+/// of the `rustup` binary itself. We resolve the `rustup` binary on `PATH` and
+/// treat `resolved` as a proxy when it is the *same file* —
+///
+/// - the same inode (identical `dev`+`ino`), which catches hardlinks and the same
+///   path reached two ways; or
+/// - the same target after symlink resolution ([`std::fs::canonicalize`]), which
+///   catches a symlinked shim.
+///
+/// A copy that is byte-identical but a distinct inode is deliberately **not**
+/// identity here (nothing ties the two files together on disk); such a layout
+/// falls through to the known-directory heuristic below (`<CARGO_HOME>/bin`,
+/// default `~/.cargo/bin`), which still catches the classic cargo-bin copy.
 fn is_rustup_proxy(resolved: &std::path::Path) -> bool {
+    if let Some(rustup) = resolve_binary("rustup")
+        && same_file(resolved, &rustup)
+    {
+        return true;
+    }
     let cargo_bin = std::env::var_os("CARGO_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".cargo")))
         .map(|c| c.join("bin"));
     cargo_bin.is_some_and(|dir| resolved.parent() == Some(dir.as_path()))
+}
+
+/// Whether `a` and `b` are the *same file* on disk: the same inode (identical
+/// `dev`+`ino`, catching hardlinks) or the same canonical target after symlink
+/// resolution. `MetadataExt` is safe under `forbid(unsafe_code)`.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b))
+        && ma.dev() == mb.dev()
+        && ma.ino() == mb.ino()
+    {
+        return true;
+    }
+    matches!(
+        (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+        (Ok(ca), Ok(cb)) if ca == cb
+    )
 }
 
 /// Whether the rustup `component` resolves to a real binary in the active
@@ -896,6 +932,73 @@ mod tests {
         assert!(
             !super::is_rustup_proxy(std::path::Path::new("/usr/local/bin/rust-analyzer")),
             "a system-bin binary is not the proxy shim",
+        );
+    }
+
+    #[test]
+    fn same_file_detects_hardlink() {
+        // A rustup proxy is a hardlink of the rustup binary: same inode, distinct
+        // path. This is the distro-layout case (bug 92) — the proxy sits in an
+        // arbitrary dir, not under <CARGO_HOME>/bin.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rustup = dir.path().join("rustup");
+        std::fs::write(&rustup, b"fake rustup binary").expect("write rustup");
+        let proxy = dir.path().join("bin").join("rust-analyzer");
+        std::fs::create_dir_all(proxy.parent().expect("parent")).expect("mkdir");
+        std::fs::hard_link(&rustup, &proxy).expect("hardlink");
+
+        assert!(
+            super::same_file(&proxy, &rustup),
+            "a hardlink of the rustup binary is the same file",
+        );
+    }
+
+    #[test]
+    fn same_file_detects_symlink() {
+        // A symlinked proxy resolves to the same canonical target as rustup.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rustup = dir.path().join("rustup");
+        std::fs::write(&rustup, b"fake rustup binary").expect("write rustup");
+        let proxy = dir.path().join("bin").join("rust-analyzer");
+        std::fs::create_dir_all(proxy.parent().expect("parent")).expect("mkdir");
+        std::os::unix::fs::symlink(&rustup, &proxy).expect("symlink");
+
+        assert!(
+            super::same_file(&proxy, &rustup),
+            "a symlink to the rustup binary resolves to the same file",
+        );
+    }
+
+    #[test]
+    fn same_file_rejects_content_copy() {
+        // A byte-identical *copy* is a distinct inode with no on-disk link to
+        // rustup — deliberately NOT identity. Such a layout falls back to the
+        // known-directory heuristic in `is_rustup_proxy`, not this check.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rustup = dir.path().join("rustup");
+        std::fs::write(&rustup, b"fake rustup binary").expect("write rustup");
+        let copy = dir.path().join("bin").join("rust-analyzer");
+        std::fs::create_dir_all(copy.parent().expect("parent")).expect("mkdir");
+        std::fs::copy(&rustup, &copy).expect("copy");
+
+        assert!(
+            !super::same_file(&copy, &rustup),
+            "a same-content copy is a distinct file, not identity",
+        );
+    }
+
+    #[test]
+    fn same_file_rejects_unrelated_binaries() {
+        // Two independent files are never the same file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("rustup");
+        let b = dir.path().join("rust-analyzer");
+        std::fs::write(&a, b"one").expect("write a");
+        std::fs::write(&b, b"two").expect("write b");
+
+        assert!(
+            !super::same_file(&a, &b),
+            "unrelated binaries are not the same file",
         );
     }
 
