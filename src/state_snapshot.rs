@@ -846,6 +846,20 @@ impl SnapshotState {
         true
     }
 
+    /// Drops every language-activity bucket whose root is `root`, returning
+    /// whether any bucket was removed (bug 93).
+    ///
+    /// The provenance-source counterpart to a retired root: when a worktree is
+    /// landed/removed its `(language, root)` buckets must leave the ledger, or
+    /// the doctor/TUI keep rendering `routed by … in <removed root>` against a
+    /// path that can no longer route anything — the ghost provenance that made a
+    /// config break read as a daemon break.
+    fn forget_root_activity(&mut self, root: &str) -> bool {
+        let before = self.activity_languages.len();
+        self.activity_languages.retain(|(_, r), _| r != root);
+        before != self.activity_languages.len()
+    }
+
     /// Materializes the language-activity ledger into serializable entries,
     /// sorted by `(language, root)` for stable output.
     fn activity_languages(&self) -> Vec<LanguageActivity> {
@@ -1203,6 +1217,29 @@ impl SnapshotWriter {
             let changed = state.record_activity(language, root, file);
             if changed {
                 state.dirty = true;
+            }
+            changed
+        };
+        if changed {
+            self.inner.notify.notify_one();
+        }
+    }
+
+    /// Prunes the language-activity ledger of every bucket rooted at `root`
+    /// (bug 93): the provenance source a retired root must leave behind.
+    ///
+    /// Called when a worktree is landed/removed so the doctor and TUI stop
+    /// rendering `routed by … in <removed root>` against a path that can no
+    /// longer route anything. Flushes promptly (urgent), like a lifecycle
+    /// change — a stale provenance ghost misdirects triage exactly as a stale
+    /// server ghost does. No-op (no flush) when the root held no activity.
+    pub fn forget_root(&self, root: &str) {
+        let changed = {
+            let mut state = self.inner.lock_state();
+            let changed = state.forget_root_activity(root);
+            if changed {
+                state.dirty = true;
+                state.urgent = true;
             }
             changed
         };
@@ -2303,6 +2340,35 @@ mod tests {
         state.record_activity("rust", "/q", "b.rs");
         let langs = state.activity_languages();
         assert_eq!(langs.len(), 3, "each (language, root) is its own bucket");
+    }
+
+    #[test]
+    fn forget_root_activity_prunes_only_the_named_root() {
+        // Bug 93: a landed/removed root's provenance buckets must leave the
+        // ledger so the doctor stops rendering `routed by … in <removed root>`.
+        // Buckets under other roots survive; the target root's — across every
+        // language — are dropped.
+        let mut state = fresh_state();
+        state.record_activity("rust", "/gone", "a.rs");
+        state.record_activity("cmake", "/gone", "CMakeLists.txt");
+        state.record_activity("rust", "/stay", "b.rs");
+
+        assert!(
+            state.forget_root_activity("/gone"),
+            "pruning a root with buckets reports a change",
+        );
+        let langs = state.activity_languages();
+        assert_eq!(langs.len(), 1, "only the surviving root's bucket remains");
+        assert_eq!(langs[0].root, "/stay");
+
+        assert!(
+            !state.forget_root_activity("/gone"),
+            "pruning an already-absent root is a no-op (no spurious flush)",
+        );
+        assert!(
+            !state.forget_root_activity("/never-seen"),
+            "pruning a root that was never recorded reports no change",
+        );
     }
 
     #[test]

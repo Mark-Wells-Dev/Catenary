@@ -874,6 +874,20 @@ upgrading.
 
 ### Fixed
 
+- **`worktree land`/`rm` retire the root in the same round-trip that
+  removes the directory — no more ghost `initialize failed` against a
+  deleted path.** Landing a worktree removed its directory but left the
+  daemon-side root alive: contributors beyond the `worktree:` mount kept
+  it in the root union, and the snapshot's language-activity ledger was
+  never pruned, so doctor kept rendering `routed by … in <removed root>`
+  and a spawn against the deleted cwd died instantly as a phantom Fatal
+  on the flagship server. Retirement now runs once the disposal confirms
+  the directory is gone: every contributor releases exactly that root
+  (multi-root contributors keep their other roots), its watches and idle
+  clock unregister, its provenance leaves the ledger, and one root sync
+  shuts its servers down. Defensively, a per-root spawn whose directory
+  no longer exists refuses with `root gone — retired` instead of
+  spawning into a phantom `initialize failed`.
 - **rustup proxy shims are recognized by identity, not location.** The
   doctor's proxy-vs-component cross-check only engaged for shims under
   `<CARGO_HOME>/bin`, so distro-packaged rustup (Arch keeps its shims in

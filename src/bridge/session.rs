@@ -1009,6 +1009,19 @@ impl Session {
         snapshot.record_activity(&language, &root.display().to_string(), &file);
     }
 
+    /// Retires a root from the snapshot's language-activity ledger (bug 93):
+    /// every `(language, root)` provenance bucket for `root` leaves the ledger.
+    ///
+    /// The provenance counterpart to a per-root server teardown — called when a
+    /// worktree is landed/removed so the doctor and TUI stop rendering `routed
+    /// by … in <removed root>` against a path that can no longer route anything.
+    /// No-op outside daemon mode.
+    pub fn forget_root_activity(&self, root: &Path) {
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.forget_root(&root.display().to_string());
+        }
+    }
+
     /// Classify `path`'s language, restricted to the configured language set —
     /// filename/extension then shebang, with a raw-extension fallback for custom
     /// languages, mirroring `detect_workspace_languages`'s per-file rule.

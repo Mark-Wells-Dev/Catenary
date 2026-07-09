@@ -1180,6 +1180,24 @@ impl LspClientManager {
         root: &Path,
         project_scoped: bool,
     ) -> Result<(InstanceKey, Arc<Mutex<LspClient>>)> {
+        // Defensive leg (bug 93): never spawn a per-root server against a root
+        // whose directory is gone. A landed/removed worktree that slipped
+        // retirement would otherwise have the language server spawned with a
+        // deleted `cwd` — the process dies instantly and the flagship server's
+        // status wears a phantom `initialize failed` routed by a path that can
+        // route nothing again. Refuse before spawn with a `root gone — retired`
+        // reason (debug, not error: this is expected convergence, not an
+        // actionable break — `error!` would fire a desktop notification).
+        if !root.exists() {
+            debug!(
+                source = Source::LspLifecycle.as_str(),
+                server = server_name,
+                scope_root = %root.display(),
+                "root gone — retired: skipping per-root spawn for a removed directory",
+            );
+            anyhow::bail!("root gone — retired: {}", root.display());
+        }
+
         let server_def = if project_scoped {
             self.effective_server_def(server_name, root)
                 .ok_or_else(|| {
@@ -3288,6 +3306,47 @@ mod tests {
         assert_eq!(key.language_id, MOCK_LANG_A);
         assert_eq!(key.scope, Scope::Root(PathBuf::from("/tmp")));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn spawn_against_gone_root_is_retired_not_init_failed() {
+        // Bug 93, defensive leg: a per-root spawn whose root directory no longer
+        // exists (a landed/removed worktree that slipped retirement) must refuse
+        // BEFORE spawning — the error names `root gone — retired`, never a
+        // phantom `initialize failed`, and no tombstone client is inserted (so
+        // the board never wears a Fatal for a path that can route nothing again).
+        let gone = PathBuf::from("/catenary-nonexistent-root-93");
+        assert!(!gone.exists(), "the test root must not exist");
+        let config = mockls_config();
+        let server_name = config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers()[0]
+            .name
+            .clone();
+        let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
+        // The Ok variant (`LspClient`) is not `Debug`, so take the error via
+        // `.err()` (which discards Ok without needing a `Debug` bound) rather
+        // than `expect_err`.
+        let err = manager
+            .spawn_project_scoped(&server_name, MOCK_LANG_A, &gone)
+            .await
+            .err();
+        let msg = err
+            .expect("a spawn against a gone root must fail")
+            .to_string();
+        assert!(
+            msg.contains("root gone — retired"),
+            "the refusal names the retired root, not an init failure: {msg}",
+        );
+        assert!(
+            !msg.contains("initialize failed") && !msg.contains("died during"),
+            "never a phantom init-failure for a removed directory: {msg}",
+        );
+        assert!(
+            manager.clients().await.is_empty(),
+            "no tombstone client is inserted for a gone root",
+        );
     }
 
     #[tokio::test]
@@ -5419,8 +5478,15 @@ mod tests {
     #[tokio::test]
     async fn project_language_binding_reroutes_dispatch_default_absent() -> Result<()> {
         let (config, default_name, alt_name) = mockls_default_plus_alt_config();
-        let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/proj"]));
-        let root = Path::new("/proj");
+        // A real root dir: the per-root spawn guard (bug 93) refuses a spawn
+        // against a directory that does not exist on disk.
+        let proj_dir = tempfile::tempdir()?;
+        let root = proj_dir.path();
+        let manager = LspClientManager::new(
+            config,
+            test_logging(),
+            test_fs_with_roots(&[root.to_str().expect("proj path")]),
+        );
 
         // The root rebinds the language to `alt` — a project-scoped root.
         let mut pc = crate::config::ProjectConfig::default();
@@ -5438,7 +5504,7 @@ mod tests {
             .spawn_project_scoped(&alt_name, MOCK_LANG_A, root)
             .await?;
 
-        let path = PathBuf::from(format!("/proj/test.{MOCK_LANG_A}"));
+        let path = root.join(format!("test.{MOCK_LANG_A}"));
         let servers = manager
             .get_servers(&path, LspServer::supports_document_symbols, None)
             .await;
@@ -5463,12 +5529,20 @@ mod tests {
     #[tokio::test]
     async fn project_language_binding_reroutes_dispatch_default_present() -> Result<()> {
         let (config, default_name, alt_name) = mockls_default_plus_alt_config();
+        // Real root dirs: the per-root spawn guard (bug 93) refuses a spawn
+        // against a directory that does not exist on disk.
+        let shared_dir = tempfile::tempdir()?;
+        let proj_dir = tempfile::tempdir()?;
+        let shared = shared_dir.path();
+        let root = proj_dir.path();
         let manager = LspClientManager::new(
             config,
             test_logging(),
-            test_fs_with_roots(&["/shared", "/proj"]),
+            test_fs_with_roots(&[
+                shared.to_str().expect("shared path"),
+                root.to_str().expect("proj path"),
+            ]),
         );
-        let root = Path::new("/proj");
 
         // The root rebinds the language to `alt`.
         let mut pc = crate::config::ProjectConfig::default();
@@ -5485,7 +5559,7 @@ mod tests {
         // AND at the project root (the masked shape: the default is present
         // everywhere the global binding would reach).
         let default_shared = manager
-            .ensure_server(MOCK_LANG_A, &default_name, Path::new("/shared"))
+            .ensure_server(MOCK_LANG_A, &default_name, shared)
             .await?;
         assert!(default_shared.lock().await.is_alive());
         let (_, default_at_proj) = manager
@@ -5500,7 +5574,7 @@ mod tests {
 
         // Dispatch for a project file still routes ONLY to the rebound `alt`
         // instance — the still-alive default is not in the binding.
-        let path = PathBuf::from(format!("/proj/test.{MOCK_LANG_A}"));
+        let path = root.join(format!("test.{MOCK_LANG_A}"));
         let servers = manager
             .get_servers(&path, LspServer::supports_document_symbols, None)
             .await;
@@ -5529,12 +5603,15 @@ mod tests {
                 ..LanguageConfig::default()
             },
         );
+        // A real root dir: the per-root spawn guard (bug 93) refuses a spawn
+        // against a directory that does not exist on disk.
+        let proj_dir = tempfile::tempdir()?;
+        let root = proj_dir.path();
         let manager = LspClientManager::new(
             Arc::new(config),
             test_logging(),
-            test_fs_with_roots(&["/proj"]),
+            test_fs_with_roots(&[root.to_str().expect("proj path")]),
         );
-        let root = Path::new("/proj");
 
         // The root both binds the language AND defines its target server.
         let proj_server = format!("proj-{MOCK_LANG_A}");
@@ -5563,7 +5640,7 @@ mod tests {
         assert!(client.lock().await.is_alive());
 
         // Dispatch routes to it even though it exists only at project scope.
-        let path = PathBuf::from(format!("/proj/test.{MOCK_LANG_A}"));
+        let path = root.join(format!("test.{MOCK_LANG_A}"));
         let servers = manager
             .get_servers(&path, LspServer::supports_document_symbols, None)
             .await;

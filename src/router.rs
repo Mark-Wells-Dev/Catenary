@@ -1221,6 +1221,27 @@ impl RootTracker {
             .collect()
     }
 
+    /// Returns every contributor key whose root set contains `root`, whatever
+    /// its prefix (bug 93).
+    ///
+    /// [`contributors_with_prefix`](Self::contributors_with_prefix) filters by
+    /// key namespace; this filters by the root a contributor declares — the
+    /// primitive a full root retirement needs, since a landed worktree may be
+    /// held by its `worktree:` mount *and* an `ephemeral:`/`hook`/`mcp:`
+    /// contributor at once, and every one must let go for the root to leave the
+    /// union (and its per-root servers to shut down). Semantics-free: a pure
+    /// query over the provenance index.
+    fn contributors_of_root(&self, root: &Path) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contributors
+            .iter()
+            .filter(|(_, roots)| roots.contains(root))
+            .map(|(contributor, _)| contributor.clone())
+            .collect()
+    }
+
     /// Removes a single root from a contributor's set.
     ///
     /// Returns `true` if the root was present and removed, `false` if
@@ -3242,6 +3263,62 @@ async fn reap_worktree_root(
     );
 }
 
+/// Retires a landed/removed worktree root from ALL daemon-side state in the
+/// same round-trip the disposal ran (bug 93).
+///
+/// The land verb's contract is "landed and gone" — but before this leg the
+/// daemon-side root could live on: [`reap_worktree_root`] only drops the one
+/// `worktree:{sid}:{path}` mount contributor, so a root also held by an
+/// `ephemeral:`/`hook`/`mcp:` contributor stayed in the union, its per-root
+/// language servers stayed up, and a later spawn against the now-deleted `cwd`
+/// died instantly as `initialize failed` — routed by the removed path.
+///
+/// This retires the root completely: every contributor declaring it releases
+/// exactly this root (`remove_root`, never `remove_contributor` — a multi-root
+/// contributor such as an `mcp:` connection declaring the primary repo keeps
+/// its other roots; a per-path contributor empties and drops), its deletion
+/// watch and idle clock are unregistered, and its language-activity provenance
+/// leaves the snapshot ledger — so the doctor and TUI stop rendering `routed
+/// by … in <removed root>`. The reduced root set is synced once, which shuts
+/// down the root's per-root instances and drops their board entries.
+/// Idempotent: removing an absent root is a no-op, so this composes with the
+/// watch reaper, the GC, and `SessionEnd`.
+///
+/// Internal lifecycle only: `debug!`, never `warn!`/`error!` — a retired root is
+/// expected convergence, not an actionable condition (`docs/src/tracing-conventions`).
+#[cfg(unix)]
+async fn retire_root(ctx: &HookDispatchContext, tracker: &RootTracker, worktree: &Path) {
+    let contributors = tracker.contributors_of_root(worktree);
+    for contributor in &contributors {
+        tracker.remove_root(contributor, worktree);
+        // Drop the in-memory deletion watch + idle clock keyed on this
+        // contributor so neither outlives the retired root (idempotent; a
+        // multi-root contributor has neither registered, so both are no-ops).
+        if let Some(ref watcher) = ctx.worktree_watcher {
+            watcher.unregister(contributor);
+        }
+        ctx.worktree_mounts.remove(contributor);
+    }
+    // Prune the provenance ledger so no phantom `routed by … in <path>` survives
+    // the removal — even when no contributor held the path (a stale ledger entry
+    // from a prior touch), so this runs unconditionally.
+    ctx.primary.forget_root_activity(worktree);
+    let global = tracker.global_roots_rich();
+    if let Err(e) = ctx.primary.sync_roots(global).await {
+        debug!(
+            source = Source::DaemonDispatch.as_str(),
+            worktree = %worktree.display(),
+            "root sync after worktree retirement failed: {e}",
+        );
+    }
+    debug!(
+        source = Source::DaemonDispatch.as_str(),
+        worktree = %worktree.display(),
+        contributors = contributors.len(),
+        "retired landed/removed worktree root from the daemon",
+    );
+}
+
 /// Build one `catenary worktree ls` row (misc 151) from a sidecar meta and the
 /// live mount/blocked map.
 ///
@@ -3331,19 +3408,6 @@ async fn handle_worktree_rm(
         });
     };
 
-    // Reap any live mount so the worktree's servers shut down before removal.
-    if let Some(tracker) = &ctx.root_tracker
-        && let Some((contributor, _)) = tracker
-            .contributors_with_prefix("worktree:")
-            .into_iter()
-            .find(|(_, roots)| roots.iter().any(|r| r == &worktree))
-    {
-        let sid = worktree_contributor_session_id(&contributor)
-            .unwrap_or("default")
-            .to_string();
-        reap_worktree_root(ctx, tracker, &sid, &contributor, &worktree, "worktree rm").await;
-    }
-
     let disposition = if meta.class == crate::worktree_create::WORKTREE_CLASS_FEAT {
         crate::worktree_dispose::remove_feat(&meta)
     } else {
@@ -3357,6 +3421,18 @@ async fn handle_worktree_rm(
         );
         crate::worktree_dispose::remove_agent_asserted(&meta)
     };
+
+    // Retire the root in the SAME round-trip that removed the directory (bug 93):
+    // once the dir is gone the root can route nothing, so every contributor lets
+    // go, its per-root servers shut down, and its provenance leaves the ledger —
+    // no window where a removed directory is still a live root. A kept/refused
+    // disposition left the dir in place, so the root stays.
+    if disposition.is_disposed()
+        && let Some(tracker) = &ctx.root_tracker
+    {
+        retire_root(ctx, tracker, &worktree).await;
+    }
+
     worktree_rm_response(&disposition, &worktree)
 }
 
@@ -3465,6 +3541,15 @@ async fn handle_worktree_land(
         crate::worktree_land::LandOutcome::Landed { paths, removed } => {
             if removed {
                 ctx.worktree_registry.forget(&worktree);
+                // Retire the root in the SAME round-trip that removed the
+                // directory (bug 93): the pre-apply reap above only released the
+                // `worktree:` mount, so any other contributor still holding the
+                // path — plus the stale activity provenance — is cleared here.
+                // No window where the landed-and-gone directory is still a live
+                // root wearing an `initialize failed` ghost.
+                if let Some(tracker) = &ctx.root_tracker {
+                    retire_root(ctx, tracker, &worktree).await;
+                }
             }
             info!(
                 source = Source::DaemonDispatch.as_str(),
@@ -8958,6 +9043,63 @@ mod tests {
         tracker.remove_contributor("mcp:20");
         assert_eq!(tracker.refcount(Path::new("/foo")), 0);
         assert!(tracker.global_roots().is_empty());
+    }
+
+    #[test]
+    fn contributors_of_root_finds_every_holder_across_prefixes() {
+        // Bug 93: a landed worktree can be held by its `worktree:` mount AND an
+        // `ephemeral:`/`hook`/`mcp:` contributor at once. Full retirement needs
+        // every holder regardless of key prefix — the narrow `worktree:`-only
+        // reap left the root alive under the other keys.
+        let tracker = RootTracker::new();
+        let wt = PathBuf::from("/wt/landed");
+        tracker.set_roots("worktree:sess:/wt/landed", vec![wt.clone()]);
+        tracker.set_roots("ephemeral:/wt/landed", vec![wt.clone()]);
+        tracker.set_roots("hook", vec![wt.clone(), PathBuf::from("/other")]);
+        tracker.set_roots("mcp:7", vec![PathBuf::from("/other")]);
+
+        let mut holders = tracker.contributors_of_root(&wt);
+        holders.sort();
+        assert_eq!(
+            holders,
+            vec![
+                "ephemeral:/wt/landed".to_string(),
+                "hook".to_string(),
+                "worktree:sess:/wt/landed".to_string(),
+            ],
+            "every contributor declaring the landed path is returned, whatever its prefix",
+        );
+
+        // A path held by nobody yields an empty holder set.
+        assert!(
+            tracker
+                .contributors_of_root(Path::new("/never/tracked"))
+                .is_empty(),
+            "an untracked path has no holders",
+        );
+
+        // Retirement releases exactly this root from every holder (`remove_root`,
+        // never `remove_contributor`): the union drops it, while a multi-root
+        // contributor keeps its OTHER roots — an `mcp:` connection declaring the
+        // primary repo must not lose it when a worktree it also declared lands.
+        for holder in holders {
+            assert!(tracker.remove_root(&holder, &wt));
+        }
+        assert_eq!(
+            tracker.refcount(&wt),
+            0,
+            "the retired root leaves the union once every holder lets go",
+        );
+        assert!(
+            tracker
+                .contributors_of_root(Path::new("/other"))
+                .contains(&"hook".to_string()),
+            "a multi-root holder keeps its other roots after the retirement",
+        );
+        assert!(
+            tracker.global_roots().contains(&PathBuf::from("/other")),
+            "an unrelated root survives the retirement",
+        );
     }
 
     #[test]
