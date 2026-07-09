@@ -2180,6 +2180,7 @@ impl LspClientManager {
                 &c.server,
                 IdleDetector::unconditional(),
                 CancellationToken::new(),
+                &c.name,
             )
             .await;
             debug!(

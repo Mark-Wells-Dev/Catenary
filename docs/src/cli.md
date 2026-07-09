@@ -162,7 +162,12 @@ has **degraded**. Coverage is *effective, not nominal*: a server that cannot
 be brought back means its files owe nothing for this run — the same class as
 a file no server covers, because the gap is Catenary's to close, never
 yours. Such a file is neither clean nor dirty; it is listed as `[unverified
-— <server> returned no result]`, and the receipt **opens with a top-line
+— <server> returned no result]` — or `[unverified — <server> stuck]` when
+process-state evidence types the server as wedged (respawn-dead, or init-hung so
+its tick-budgeted `initialize` failed): "stuck" is a claim about the process,
+made only on the evidence, so an armed gate is **always payable** — a stuck
+server yields an honest receipt rather than a silent hang, and paying is
+diagnosing, not fixing. The receipt **opens with a top-line
 banner naming the unavailable server** (`unavailable: <server>`) so degraded
 never reads as clean — the absence of evidence is not evidence of absence.
 An all-unverified run can never render as empty stdout (mistakable for a
@@ -179,6 +184,15 @@ the flags unflipped and the gate armed — the batch is intact, and the next bar
 run re-diagnoses it in full. A kill *after* a successful write recovers the same
 way: the batch is retained, so re-running bare re-serves it. Recovery is always
 "run it again."
+
+**The batch does not survive the daemon.** It is in-memory state keyed by
+`(session_id, agent_id)`: durable *across runs within a daemon instance*, but
+**released when the instance dies** (maintainer ruling, bug 79). On daemon death
+the debt is dropped, never spooled — a fresh daemon starts with a disarmed gate,
+and a bare run answers `[no edited files]`. This is deliberate: an unstable
+daemon must never lock a session out of the shell. The cost is that unpaid debt
+across a restart is forgotten silently; the benefit is that a wedged daemon is
+always recoverable by restart, never a permanent lockout.
 
 ```bash
 catenary diagnostics                 # the whole edited set

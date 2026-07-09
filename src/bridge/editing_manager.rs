@@ -52,8 +52,12 @@ struct BatchFile {
 /// file (the flat rule — no inside/outside distinction). Bare `catenary
 /// diagnostics` diagnoses the whole batch and flips every flag; scoped
 /// diagnostics flips exactly the named files. The debt gate is armed while any
-/// flag is false. The batch is durable daemon state — diagnostics are always
-/// recomputed over it — so repeat bare runs re-diagnose the same scope.
+/// flag is false. The batch is **in-memory** daemon state keyed by
+/// `(session_id, agent_id)`: it persists across diagnose runs within a daemon
+/// instance — diagnostics are always recomputed over it, so repeat bare runs
+/// re-diagnose the same scope — and is **released with the instance**. On daemon
+/// death the debt is dropped, never spooled (maintainer ruling, bug 79): a fresh
+/// daemon disarms the gate so an unstable daemon cannot lock a session out.
 ///
 /// Holds the covered batch alongside the count of files skipped during
 /// accumulation because they lacked LSP coverage (outside tracked roots), so a
@@ -496,6 +500,46 @@ mod tests {
         let em = EditingManager::new();
         em.record_covered_edit(None, "ghost", PathBuf::from("/src/main.rs"));
         assert!(em.files(None, "ghost").is_empty());
+    }
+
+    #[test]
+    fn daemon_restart_releases_the_debt() {
+        // Leg 4 (misc 160 / bug 79 maintainer ruling): the batch is in-memory
+        // daemon state, released with the instance. On daemon death the debt is
+        // dropped — not spooled — so a fresh daemon disarms the gate and a bare
+        // run answers `[no edited files]`. Without this, an unstable daemon would
+        // lock a session out of the shell.
+        let sid = Some("session-1");
+
+        // First daemon instance: an armed gate (undelivered covered edit).
+        let before = EditingManager::new();
+        before.start_editing(sid, "agent-a").expect("start");
+        before.record_covered_edit(sid, "agent-a", PathBuf::from("/src/main.rs"));
+        assert!(
+            before.has_undelivered(sid, "agent-a"),
+            "the gate must be armed before the restart"
+        );
+
+        // Daemon death + restart: the EditingManager is in-memory, owned by the
+        // Session which the daemon process owns, so a fresh daemon starts with a
+        // fresh, empty manager — the batch does not survive.
+        drop(before);
+        let after = EditingManager::new();
+
+        // The gate is disarmed and the honest answer is `[no edited files]`
+        // (no files, nothing undelivered) for the SAME identity.
+        assert!(
+            !after.has_undelivered(sid, "agent-a"),
+            "daemon restart must disarm the gate — the debt is released, not spooled"
+        );
+        assert!(
+            !after.has_files(sid, "agent-a"),
+            "the restarted daemon has no batch for the identity — `[no edited files]`"
+        );
+        assert!(
+            after.files(sid, "agent-a").is_empty(),
+            "no batch files survive the restart"
+        );
     }
 
     #[test]

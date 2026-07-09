@@ -256,7 +256,7 @@ async fn test_settle_waits_through_busy_to_healthy() -> Result<()> {
     let detector = IdleDetector::after_activity(0);
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        await_idle(&server, detector, cancel),
+        await_idle(&server, detector, cancel, MOCK_LANG_A),
     )
     .await
     .expect("await_idle should complete within 5s");
@@ -300,7 +300,7 @@ async fn test_settle_returns_settled_on_quiet_tree() -> Result<()> {
     let detector = IdleDetector::after_activity(0);
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        await_idle(&server, detector, cancel),
+        await_idle(&server, detector, cancel, MOCK_LANG_A),
     )
     .await
     .expect("await_idle should complete within 5s");

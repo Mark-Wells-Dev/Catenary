@@ -61,9 +61,14 @@ others.
 - **Diagnostics:** `catenary diagnostics` triggers the diagnostics pipeline:
   compute over the current batch of modified files, send to LSP servers, collect
   diagnostics, print to stdout. The batch (its files, each with a delivered flag)
-  is durable per `(session_id, agent_id)`; diagnostics are recomputed fresh over
-  it each run. The agent sees diagnostics in the shell tool output. Diagnostic
-  events are also emitted to the JSONL telemetry firehose.
+  lives in memory, keyed by `(session_id, agent_id)`: it persists across diagnose
+  runs within a daemon instance — repeat bare runs re-diagnose the same set — and
+  is **released with the instance**. On daemon death the debt is dropped, not
+  spooled (maintainer ruling, bug 79): a fresh daemon disarms the gate and a bare
+  run answers `[no edited files]`, so an unstable daemon never locks a session
+  out. Diagnostics are recomputed fresh over the batch each run. The agent sees
+  diagnostics in the shell tool output. Diagnostic events are also emitted to the
+  JSONL telemetry firehose.
 - **Logging:** `LoggingServer` is a `tracing_subscriber::Layer` that subscribes
   to every tracing event and dispatches structured events to its sinks: the
   per-root-sharded JSONL telemetry firehose (`src/logging/jsonl_sink.rs`, carries

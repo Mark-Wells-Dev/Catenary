@@ -880,6 +880,22 @@ upgrading.
 
 ### Fixed
 
+- **An armed diagnostics gate is never unpayable: a stuck server yields
+  an honest receipt, and long settles are observable.** Armed gate +
+  one wedged server could lock an agent out of every shell command with
+  no way to tell working from wedged. The receipt now types the escape
+  on process-state evidence — a file owed entirely by terminal servers
+  (respawn-dead after the one bounded recovery, or init-hung past the
+  tick-budgeted `initialize`) renders `[unverified — <server> stuck]`
+  (an alive-but-silent server keeps `returned no result`) — and paying
+  stays what it always was: the receipt returning. Settle remains
+  deliberately unbounded, but a wait that crosses a poll-sample
+  interval now emits a firehose heartbeat (`settling: <server> still
+  working|quiet but not settled, N samples`) so working and wedged are
+  distinguishable from outside — a work count, never a wall clock. The
+  diagnostics batch's lifetime is also now documented as it truly is:
+  in-memory per daemon instance, released on daemon death (never
+  spooled), so an unstable daemon can never permanently lock a session.
 - **A killed daemon no longer strands live sessions, and `grep`/`glob`
   degrade honestly when no daemon is up.** The bridge treated a daemon
   read error as fatal, so `kill <daemon>` left every connected session

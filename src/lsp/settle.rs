@@ -23,15 +23,28 @@ use std::time::Duration;
 
 use catenary_proc::{ProcessState, SCHEDULER_STATE_OBSERVABLE};
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::server::LspServer;
 use super::state::ServerLifecycle;
+use crate::source::Source;
 
 // ── Constants ────────────────────────────────────────────────────────
 
 /// Polling interval for tree walks (validated by profiling).
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Poll-sample count after which an unsettled wait is *evidence-backed long*
+/// and earns a heartbeat note (misc 160 leg 3 / bug 78 + 79 rider).
+///
+/// A **work count**, not a wall-clock bound: it counts poll iterations of the
+/// settle loop, and crossing it adds **no** ceiling — settle stays deliberately
+/// unbounded (bug 28/55). Its sole effect is to emit an `info!` note to the
+/// firehose so a caller can tell a still-working server from a wedged one from
+/// outside. A declared protocol constant (contention-doctrine exempt). At the
+/// 50 ms [`POLL_INTERVAL`] this is a first note near ~15 s of continuous
+/// waiting, then one per interval thereafter.
+const HEARTBEAT_SAMPLE_INTERVAL: u32 = 300;
 
 // ── IdleDetector ─────────────────────────────────────────────────────
 
@@ -226,16 +239,28 @@ const fn is_pending_work(state: ProcessState) -> bool {
 ///
 /// Returns when the server is idle, the root process dies, or the cancel
 /// token fires.
+///
+/// `server_name` names the server in the settle heartbeat
+/// ([`HEARTBEAT_SAMPLE_INTERVAL`]) — an `info!` note emitted while the wait is
+/// evidence-backed long, so a still-working server is distinguishable from a
+/// wedged one from outside without touching any output contract or adding any
+/// bound (misc 160 leg 3).
 pub async fn await_idle(
     server: &Arc<LspServer>,
     mut detector: IdleDetector,
     cancel: CancellationToken,
+    server_name: &str,
 ) -> SettleResult {
+    // Poll-sample counter feeding the heartbeat. Counts iterations of this
+    // loop, never elapsed wall-clock time — a work count (contention doctrine).
+    let mut samples: u32 = 0;
     loop {
         tokio::select! {
             () = tokio::time::sleep(POLL_INTERVAL) => {}
             () = cancel.cancelled() => { return SettleResult::Settled; }
         }
+
+        samples = samples.saturating_add(1);
 
         let lifecycle = server.lifecycle();
 
@@ -244,8 +269,11 @@ pub async fn await_idle(
             return SettleResult::RootDied;
         }
 
-        // During Busy: activity is implicit, skip tree walking
+        // During Busy: activity is implicit (an open `$/progress` bracket),
+        // skip tree walking. The server is provably working, so the heartbeat
+        // reports it as such.
         if matches!(lifecycle, ServerLifecycle::Busy(_)) {
+            heartbeat(server_name, samples, true);
             continue;
         }
 
@@ -269,7 +297,57 @@ pub async fn await_idle(
             debug!("idle_detector: server idle");
             return SettleResult::Settled;
         }
+
+        // Not settled this poll. Once the wait is evidence-backed long, note it
+        // — carrying whether the tree still shows CPU/scheduler activity
+        // (working) or is quiet-but-gated (which reads as wedged from outside).
+        heartbeat(server_name, samples, tree_working(&snapshot));
     }
+}
+
+/// Whether a settle snapshot still shows the server doing work: any nonzero CPU
+/// or page-fault delta, or — where scheduler state is observable — any live
+/// process runnable or blocked (the same pending-work ground truth
+/// [`IdleDetector::check`] gates idle on). A `true` here means "still working";
+/// a `false` across a long wait is the wedged signature.
+fn tree_working(snapshot: &catenary_proc::TreeSnapshot) -> bool {
+    snapshot.samples.iter().any(|ts| {
+        ts.delta_pfc > 0 || ts.delta_utime > 0 || ts.delta_stime > 0 || is_pending_work(ts.state)
+    })
+}
+
+/// Whether a poll-sample count has crossed a [`HEARTBEAT_SAMPLE_INTERVAL`]
+/// boundary and is thus due for a heartbeat note. A work count — evaluated on
+/// the sample counter, never elapsed time.
+const fn heartbeat_due(samples: u32) -> bool {
+    samples != 0 && samples.is_multiple_of(HEARTBEAT_SAMPLE_INTERVAL)
+}
+
+/// Emits the settle heartbeat when the wait crosses a [`HEARTBEAT_SAMPLE_INTERVAL`]
+/// boundary.
+///
+/// `info!` only — a long-but-working settle is not an actionable interrupt
+/// (`error!` fires a desktop notification, `warn!` raises a TUI finding; neither
+/// is warranted). The note lands in the firehose, the "from outside"
+/// observability surface (`catenary query`), carrying the poll-sample count and
+/// the `working` flag so working and wedged are distinguishable. No bound is
+/// added — the caller keeps waiting.
+fn heartbeat(server_name: &str, samples: u32, working: bool) {
+    if !heartbeat_due(samples) {
+        return;
+    }
+    info!(
+        source = Source::LspLifecycle.as_str(),
+        server = server_name,
+        samples,
+        working,
+        "settling: {server_name} {}, {samples} samples",
+        if working {
+            "still working"
+        } else {
+            "quiet but not settled"
+        },
+    );
 }
 
 /// Pure root-death detection logic — determines whether the root process
@@ -667,6 +745,59 @@ mod tests {
         );
     }
 
+    // ── settle heartbeat (misc 160 leg 3) ───────────────────────────
+
+    #[test]
+    fn heartbeat_due_only_on_sample_boundaries() {
+        // The heartbeat is a work count over poll samples — it fires only when
+        // the counter crosses a HEARTBEAT_SAMPLE_INTERVAL multiple, never before
+        // the first interval and never off-boundary. No wall-clock is consulted.
+        assert!(!heartbeat_due(0), "sample 0 is never due");
+        assert!(!heartbeat_due(1), "before the first interval: not due");
+        assert!(
+            !heartbeat_due(HEARTBEAT_SAMPLE_INTERVAL - 1),
+            "one short of the boundary: not due"
+        );
+        assert!(
+            heartbeat_due(HEARTBEAT_SAMPLE_INTERVAL),
+            "first boundary: due"
+        );
+        assert!(
+            !heartbeat_due(HEARTBEAT_SAMPLE_INTERVAL + 1),
+            "just past the boundary: not due"
+        );
+        assert!(
+            heartbeat_due(HEARTBEAT_SAMPLE_INTERVAL * 3),
+            "every interval thereafter: due"
+        );
+    }
+
+    #[test]
+    fn tree_working_distinguishes_working_from_quiet() {
+        // A snapshot with any CPU/page-fault delta is "still working".
+        assert!(
+            tree_working(&make_snapshot(vec![active_sample(100)])),
+            "nonzero deltas read as working"
+        );
+        // An all-quiet (Sleeping, zero-delta) tree is not working — the wedged
+        // signature when it persists across a long wait.
+        assert!(
+            !tree_working(&make_snapshot(vec![quiet_sample(100)])),
+            "a Sleeping, zero-delta tree is not working"
+        );
+        // Where scheduler state is observable, a zero-delta Running process is
+        // pending work (starved-but-runnable) and reads as working; where it is
+        // not observable, deltas alone decide.
+        assert_eq!(
+            tree_working(&make_snapshot(vec![zero_delta_sample(
+                100,
+                ProcessState::Running
+            )])),
+            SCHEDULER_STATE_OBSERVABLE,
+            "a zero-delta Running process is pending work where scheduler state is observable"
+        );
+    }
+
     // ── root_state unit tests ─────────────────────────────────────────
 
     #[test]
@@ -749,7 +880,7 @@ mod tests {
         server.set_lifecycle(ServerLifecycle::Dead);
         let cancel = CancellationToken::new();
         let detector = IdleDetector::unconditional();
-        let result = await_idle(&server, detector, cancel).await;
+        let result = await_idle(&server, detector, cancel, "test-server").await;
         assert_eq!(result, SettleResult::RootDied);
     }
 
@@ -759,7 +890,7 @@ mod tests {
         server.set_lifecycle(ServerLifecycle::Healthy);
         let cancel = CancellationToken::new();
         let detector = IdleDetector::unconditional();
-        let result = await_idle(&server, detector, cancel).await;
+        let result = await_idle(&server, detector, cancel, "test-server").await;
         assert_eq!(result, SettleResult::RootDied);
     }
 
