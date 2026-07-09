@@ -300,6 +300,40 @@ pub fn intensity(delta_pfc: u64, delta_utime: u64) -> Option<f64> {
     Some((1.0_f64.max(delta_pfc as f64 / delta_utime as f64)).ln())
 }
 
+/// Collect every descendant PID of `root` from a parent → children adjacency
+/// map, breadth-first.
+///
+/// `children_map` maps each parent PID to the PIDs of its direct children (the
+/// shape produced by a full-process scan bucketed on parent PID). The returned
+/// vector excludes `root` itself and lists each discovered descendant once.
+///
+/// Pure and platform-agnostic: the tree-walk logic is factored out here so it
+/// is testable without a live process table (the platform code supplies the
+/// map from an OS-specific scan). A `visited` set guards against cycles — a
+/// process table can momentarily present one when a PID is reused across a
+/// reap/spawn race, and an unguarded walk would loop forever.
+#[must_use]
+pub fn subtree_from_ppid_map<S: std::hash::BuildHasher>(
+    root: u32,
+    children_map: &HashMap<u32, Vec<u32>, S>,
+) -> Vec<u32> {
+    let mut result = Vec::new();
+    let mut visited = HashSet::new();
+    visited.insert(root);
+    let mut stack = vec![root];
+    while let Some(pid) = stack.pop() {
+        if let Some(kids) = children_map.get(&pid) {
+            for &child_pid in kids {
+                if visited.insert(child_pid) {
+                    result.push(child_pid);
+                    stack.push(child_pid);
+                }
+            }
+        }
+    }
+    result
+}
+
 /// Sample a single process by PID (stateless).
 ///
 /// Returns absolute CPU times (centiseconds), page fault count, parent PID,
@@ -630,7 +664,17 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::{ProcessSample, ProcessState};
+    use std::collections::HashMap;
+
+    use super::{ProcessSample, ProcessState, subtree_from_ppid_map};
+
+    /// `proc_listpids` selector: enumerate every PID on the system.
+    ///
+    /// From `<sys/proc_info.h>` (`PROC_ALL_PIDS`); libc does not name it. Unlike
+    /// the `PROC_PPID_ONLY` selector that backs `proc_listchildpids`, the
+    /// all-PIDs scan is the primitive we build the parent map from — see
+    /// [`discover_children`].
+    const PROC_ALL_PIDS: u32 = 1;
 
     /// macOS monitor — no persistent handle needed (`proc_pidinfo` is stateless).
     /// Caches ppid at construction to avoid the `PROC_PIDTBSDINFO` syscall
@@ -770,52 +814,76 @@ mod platform {
         Some((info, state))
     }
 
-    /// Discover all descendant PIDs via `proc_listchildpids`.
+    /// Discover all descendant PIDs by scanning the whole process table and
+    /// walking the parent map down from `root_pid`.
+    ///
+    /// The per-parent `proc_listchildpids` (`PROC_PPID_ONLY`) path was replaced:
+    /// on the macOS 26 CI runner it returned no children for a live direct child
+    /// (bug 96), leaving the settle monitor tree-blind. This scans every PID once
+    /// via `proc_listpids(PROC_ALL_PIDS)`, reads each one's parent PID from
+    /// `proc_pidinfo(PROC_PIDTBSDINFO)` — the same libproc call the per-process
+    /// sampler uses, which is proven to work on the runner — buckets them into a
+    /// parent → children map, then BFS-walks it via [`subtree_from_ppid_map`].
+    /// It is O(nprocs) per call, but the tree walk runs on a poll cadence, not a
+    /// hot path.
     pub fn discover_children(root_pid: u32) -> Vec<u32> {
-        let mut result = Vec::new();
-        let mut stack = vec![root_pid];
-        while let Some(pid) = stack.pop() {
-            // Safety: `proc_listchildpids` is a standard macOS API called with
-            // a correctly sized buffer.
-            let children = unsafe { list_child_pids(pid) };
-            for child_pid in children {
-                result.push(child_pid);
-                stack.push(child_pid);
-            }
-        }
-        result
+        // Safety: calls `proc_listpids` and `proc_pidinfo` with correctly sized,
+        // zeroed buffers; see the inner `# Safety` docs.
+        let children_map = unsafe { build_children_map() };
+        subtree_from_ppid_map(root_pid, &children_map)
     }
 
-    /// List direct child PIDs of a process.
+    /// Build a parent → direct-children map for every process on the system.
     ///
     /// # Safety
     ///
-    /// Calls `libc::proc_listchildpids` with a correctly sized buffer.
-    unsafe fn list_child_pids(pid: u32) -> Vec<u32> {
-        let Ok(pid_i32) = i32::try_from(pid) else {
-            return Vec::new();
-        };
+    /// Calls `libc::proc_listpids` (`PROC_ALL_PIDS`) to enumerate PIDs into a
+    /// correctly sized buffer, then `libc::proc_pidinfo` (`PROC_PIDTBSDINFO`) per
+    /// PID with a correctly sized and zeroed `proc_bsdinfo` buffer.
+    unsafe fn build_children_map() -> HashMap<u32, Vec<u32>> {
+        let pids = unsafe { list_all_pids() };
+        let mut map: HashMap<u32, Vec<u32>> = HashMap::new();
+        for pid in pids {
+            if let Some(ppid) = unsafe { parent_of(pid) } {
+                map.entry(ppid).or_default().push(pid);
+            }
+        }
+        map
+    }
 
-        // First call with size 0 to get the count.
-        let count = unsafe { libc::proc_listchildpids(pid_i32, std::ptr::null_mut(), 0) };
-        if count <= 0 {
+    /// Enumerate every PID on the system via `proc_listpids(PROC_ALL_PIDS)`.
+    ///
+    /// # Safety
+    ///
+    /// Calls `libc::proc_listpids` twice: once with a null buffer to size the
+    /// result, then with a correctly sized `i32` buffer to receive the PIDs.
+    unsafe fn list_all_pids() -> Vec<u32> {
+        // First call with a null buffer returns the byte size needed. The kernel
+        // pads this (nprocs + headroom), so a follow-up spawn cannot overflow.
+        let size_bytes = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+        if size_bytes <= 0 {
             return Vec::new();
         }
 
-        #[allow(clippy::cast_sign_loss, reason = "count is checked > 0 above")]
-        let num = count as usize;
+        #[allow(clippy::cast_sign_loss, reason = "size_bytes is checked > 0 above")]
+        let num = size_bytes as usize / std::mem::size_of::<i32>();
+        if num == 0 {
+            return Vec::new();
+        }
+
         let mut buf = vec![0i32; num];
         let Ok(buf_size) = i32::try_from(num * std::mem::size_of::<i32>()) else {
             return Vec::new();
         };
 
-        let ret = unsafe { libc::proc_listchildpids(pid_i32, buf.as_mut_ptr().cast(), buf_size) };
+        let ret =
+            unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, buf.as_mut_ptr().cast(), buf_size) };
         if ret <= 0 {
             return Vec::new();
         }
 
         #[allow(clippy::cast_sign_loss, reason = "ret is checked > 0 above")]
-        let actual = ret as usize / std::mem::size_of::<i32>();
+        let actual = (ret as usize / std::mem::size_of::<i32>()).min(num);
         buf.truncate(actual);
 
         #[allow(clippy::cast_sign_loss, reason = "PIDs are always non-negative")]
@@ -823,6 +891,42 @@ mod platform {
             .filter(|&p| p > 0)
             .map(|p| p as u32)
             .collect()
+    }
+
+    /// Read a process's parent PID via `proc_pidinfo(PROC_PIDTBSDINFO)`.
+    ///
+    /// Returns `None` if the process has exited between enumeration and this
+    /// query, or if it cannot be read. `pid` 0 (the kernel) has no meaningful
+    /// parent and is skipped.
+    ///
+    /// # Safety
+    ///
+    /// Calls `libc::proc_pidinfo` with `PROC_PIDTBSDINFO` and a correctly sized
+    /// and zeroed `proc_bsdinfo` buffer.
+    unsafe fn parent_of(pid: u32) -> Option<u32> {
+        if pid == 0 {
+            return None;
+        }
+        let mut bsd_info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let bsd_size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+
+        let ret = unsafe {
+            libc::proc_pidinfo(
+                i32::try_from(pid).ok()?,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                std::ptr::addr_of_mut!(bsd_info).cast(),
+                bsd_size,
+            )
+        };
+
+        // A short read means the struct did not come back fully populated;
+        // treat it as a miss rather than trusting a partial `pbi_ppid`.
+        if ret < bsd_size {
+            return None;
+        }
+
+        Some(bsd_info.pbi_ppid)
     }
 
     /// Stateless sample for the `sample(pid)` function.
@@ -842,7 +946,7 @@ mod platform {
 
 #[cfg(target_os = "windows")]
 mod platform {
-    use super::{ProcessSample, ProcessState};
+    use super::{ProcessSample, ProcessState, subtree_from_ppid_map};
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
@@ -1049,17 +1153,7 @@ mod platform {
         unsafe { CloseHandle(snapshot) };
 
         // Walk from root, collecting all descendants.
-        let mut result = Vec::new();
-        let mut stack = vec![root_pid];
-        while let Some(pid) = stack.pop() {
-            if let Some(kids) = children_map.get(&pid) {
-                for &child_pid in kids {
-                    result.push(child_pid);
-                    stack.push(child_pid);
-                }
-            }
-        }
-        result
+        subtree_from_ppid_map(root_pid, &children_map)
     }
 
     /// Stateless sample — opens handle, reads, closes.
@@ -1448,5 +1542,105 @@ mod tests {
             )
         };
         parent.wait().expect("Failed to wait for parent");
+    }
+
+    // ─── subtree_from_ppid_map tests (platform-agnostic) ────────────────
+    //
+    // The ppid-map BFS is the shared tree-walk core the macOS and Windows
+    // discovery paths build on. It is pure over a synthetic pid/ppid table,
+    // so it is exercised here on any host — the OS-specific scan that fills
+    // the map is what needs a live process table.
+
+    /// Build a parent → children map from a flat `(pid, ppid)` table.
+    fn ppid_table(rows: &[(u32, u32)]) -> HashMap<u32, Vec<u32>> {
+        let mut map: HashMap<u32, Vec<u32>> = HashMap::new();
+        for &(pid, ppid) in rows {
+            map.entry(ppid).or_default().push(pid);
+        }
+        map
+    }
+
+    #[test]
+    fn subtree_direct_child() {
+        // root=100, child 200 with parent 100.
+        let map = ppid_table(&[(200, 100)]);
+        let kids = subtree_from_ppid_map(100, &map);
+        assert_eq!(kids, vec![200], "single direct child should be found");
+    }
+
+    #[test]
+    fn subtree_deep_chain() {
+        // 100 → 200 → 300 → 400 (grandchildren must be walked).
+        let map = ppid_table(&[(200, 100), (300, 200), (400, 300)]);
+        let mut kids = subtree_from_ppid_map(100, &map);
+        kids.sort_unstable();
+        assert_eq!(
+            kids,
+            vec![200, 300, 400],
+            "descendants at every depth should be discovered"
+        );
+    }
+
+    #[test]
+    fn subtree_multiple_siblings() {
+        // 100 has three direct children.
+        let map = ppid_table(&[(200, 100), (300, 100), (400, 100)]);
+        let mut kids = subtree_from_ppid_map(100, &map);
+        kids.sort_unstable();
+        assert_eq!(kids, vec![200, 300, 400], "all siblings should be found");
+    }
+
+    #[test]
+    fn subtree_excludes_unrelated_and_root() {
+        // 100 → 200; 999 → 998 is a separate tree. Neither the root (100)
+        // nor the unrelated tree should appear.
+        let map = ppid_table(&[(200, 100), (998, 999)]);
+        let kids = subtree_from_ppid_map(100, &map);
+        assert_eq!(kids, vec![200], "unrelated processes and root are excluded");
+    }
+
+    #[test]
+    fn subtree_childless_root_is_empty() {
+        // A leaf process — legitimately no children.
+        let map = ppid_table(&[(200, 100), (300, 200)]);
+        let kids = subtree_from_ppid_map(400, &map);
+        assert!(kids.is_empty(), "a childless root yields no descendants");
+    }
+
+    #[test]
+    fn subtree_empty_map_is_empty() {
+        let map: HashMap<u32, Vec<u32>> = HashMap::new();
+        let kids = subtree_from_ppid_map(100, &map);
+        assert!(kids.is_empty(), "empty table yields no descendants");
+    }
+
+    #[test]
+    fn subtree_survives_cycle() {
+        // A PID-reuse race can momentarily present a cycle (200 → 300 → 200).
+        // The walk must terminate and not double-count.
+        let mut map = ppid_table(&[(200, 100), (300, 200)]);
+        // Inject the back-edge: 200 also listed as a child of 300.
+        map.entry(300).or_default().push(200);
+        let mut kids = subtree_from_ppid_map(100, &map);
+        kids.sort_unstable();
+        assert_eq!(
+            kids,
+            vec![200, 300],
+            "cycle must be broken; each node counted once"
+        );
+    }
+
+    #[test]
+    fn subtree_does_not_revisit_shared_grandchild() {
+        // Diamond: 100 → 200, 100 → 300, and both list 400 as a child.
+        // 400 must appear exactly once.
+        let map = ppid_table(&[(200, 100), (300, 100), (400, 200), (400, 300)]);
+        let mut kids = subtree_from_ppid_map(100, &map);
+        kids.sort_unstable();
+        assert_eq!(
+            kids,
+            vec![200, 300, 400],
+            "a shared descendant is collected once"
+        );
     }
 }
