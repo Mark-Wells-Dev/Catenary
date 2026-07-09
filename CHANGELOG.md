@@ -62,6 +62,12 @@ upgrading.
 
 ### Added
 
+- **`catenary start` — the missing daemon-lifecycle verb.** The
+  counterpart to `stop`: brings the daemon up through the same
+  single-instance start path the bridge init uses, idempotently (a
+  running daemon is reported, not doubled). A manual stop or a killed
+  daemon now has a one-command remedy instead of a per-session MCP
+  reconnect dance.
 - **`catenary worktree diff` and `catenary worktree land` close the
   worktree lifecycle.** `diff` prints a worktree's complete change vs HEAD
   — tracked modifications *plus* untracked files as new-file hunks, so
@@ -874,6 +880,22 @@ upgrading.
 
 ### Fixed
 
+- **A killed daemon no longer strands live sessions, and `grep`/`glob`
+  degrade honestly when no daemon is up.** The bridge treated a daemon
+  read error as fatal, so `kill <daemon>` left every connected session
+  holding a dead socket behind a "connected" MCP server with no way back
+  but a session restart. The bridge proxy is now reconnect-aware: on
+  daemon loss (EOF *or* `ECONNRESET` — a SIGKILLed daemon yields the
+  latter, which the old code mis-read as fatal) it respawns the daemon
+  through the same single-instance start path, replays the captured
+  `initialize`, and resumes — a write issued after the loss waits for
+  the heal, so it reaches the fresh daemon, not the void. With no daemon
+  at all, `catenary grep`/`glob` run the daemon's own search pipeline
+  in-process with no LSP manager — stdout byte-identical to a
+  daemon-served answer over an uncovered tree (pinned by golden tests) —
+  and mark the mode on stderr only: `[no daemon — results unenriched;
+  start one with catenary start]`. The command filter provably keeps
+  enforcing daemon-less (never open, never closed).
 - **`worktree land`/`rm` retire the root in the same round-trip that
   removes the directory — no more ghost `initialize failed` against a
   deleted path.** Landing a worktree removed its directory but left the

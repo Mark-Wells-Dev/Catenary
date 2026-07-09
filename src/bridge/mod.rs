@@ -49,6 +49,7 @@ pub use hook_router::HookRouter;
 pub use hook_router::is_edit_tool;
 pub use parent_context::ParentContextQueue;
 pub use path_security::PathValidator;
+pub use session::DaemonlessSearch;
 
 /// Partial-result annotation emitted by `grep` and `glob` when a searched
 /// scope has no LSP coverage — the scope is outside every workspace root, or

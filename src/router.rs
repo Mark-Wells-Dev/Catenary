@@ -3891,6 +3891,111 @@ fn shaped_to_string(output: ShapedOutput) -> Result<String> {
     Ok(out)
 }
 
+// ── Daemon-less in-process search (bug 80, leg 4) ────────────────────
+//
+// When the daemon is down, `catenary grep`/`glob` degrade honestly: they run
+// the daemon's own search pipeline in-process with no LSP manager, so stdout is
+// byte-identical to a daemon-served answer over a tree with no language-server
+// coverage. These two functions are the in-process twins of the `METHOD_GREP` /
+// `METHOD_GLOB` daemon dispatch arms — same `to_params`, same `execute`, same
+// outcome→response conversion (`shaped_to_string`, the `no_match_indices`
+// remap) — so the two paths cannot drift. The honesty marker (`[no daemon …]`)
+// is the CLI's responsibility and lives on stderr only; these produce the
+// stdout body unchanged.
+
+/// Runs a `catenary grep` request in-process, daemon-less (bug 80, leg 4).
+///
+/// Builds a [`DaemonlessSearch`] from the loaded config, resolves the request
+/// with the same [`GrepRequest::to_params`] the daemon uses, and runs the grep
+/// pipeline in-process. Returns the same [`GrepResponse`] the daemon would build
+/// for a tree with no LSP coverage. `cancel` never fires (no client-disconnect
+/// race — the CLI awaits its own result).
+///
+/// # Errors
+///
+/// Returns an error if the config cannot be loaded or the grep pipeline faults.
+#[cfg(unix)]
+pub async fn run_grep_daemon_less(req: &GrepRequest) -> Result<GrepResponse> {
+    let config = crate::config::Config::load().context("load config for daemon-less grep")?;
+    let search = crate::bridge::DaemonlessSearch::from_config(config);
+
+    let params = req.to_params();
+    let cancel = CancellationToken::new();
+    let outcome = search.grep.execute(&params, None, &cancel).await;
+
+    Ok(match outcome {
+        Ok(GrepOutcome::Rendered { output, skipped }) => GrepResponse {
+            output: shaped_to_string(output)?,
+            matches: None,
+            files: None,
+            skipped,
+        },
+        Ok(GrepOutcome::Count {
+            matches,
+            files,
+            skipped,
+        }) => GrepResponse {
+            output: String::new(),
+            matches: Some(matches),
+            files: Some(files),
+            skipped,
+        },
+        Err(e) => GrepResponse {
+            output: format!("grep error: {e}"),
+            matches: None,
+            files: None,
+            skipped: GrepSkips::default(),
+        },
+    })
+}
+
+/// Runs a `catenary glob` request in-process, daemon-less (bug 80, leg 4).
+///
+/// The in-process twin of the `METHOD_GLOB` daemon arm: same [`GlobRequest::to_params`],
+/// same `execute`, same zero-match index→original-spelling remap. Returns the
+/// [`GlobResponse`] the daemon would build for a tree with no LSP coverage.
+///
+/// # Errors
+///
+/// Returns an error if the config cannot be loaded or the glob pipeline faults.
+#[cfg(unix)]
+pub async fn run_glob_daemon_less(req: &GlobRequest) -> Result<GlobResponse> {
+    let config = crate::config::Config::load().context("load config for daemon-less glob")?;
+    let search = crate::bridge::DaemonlessSearch::from_config(config);
+
+    let params = req.to_params();
+    let cancel = CancellationToken::new();
+    let outcome = search.glob.execute(&params, None, &cancel).await;
+
+    Ok(match outcome {
+        Ok(GlobOutcome::Rendered {
+            output,
+            no_match_indices,
+        }) => {
+            let no_match_patterns = no_match_indices
+                .into_iter()
+                .filter_map(|i| req.paths.get(i))
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            GlobResponse {
+                output,
+                paths: None,
+                no_match_patterns,
+            }
+        }
+        Ok(GlobOutcome::Count { paths }) => GlobResponse {
+            output: String::new(),
+            paths: Some(paths),
+            no_match_patterns: Vec::new(),
+        },
+        Err(e) => GlobResponse {
+            output: format!("glob error: {e}"),
+            paths: None,
+            no_match_patterns: Vec::new(),
+        },
+    })
+}
+
 /// Handles a single hook connection with session-aware dispatch.
 ///
 /// Reads the JSON request, extracts `session_id` for routing, looks up
@@ -5570,6 +5675,18 @@ const MAX_CONNECT_ATTEMPTS: u32 = 10;
 /// Delay between connection retry attempts.
 const CONNECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Maximum number of full connect-or-start *rounds* a mid-session reconnect
+/// makes before giving up (bug 80, leg 1).
+///
+/// A reconnect must out-persist the one-shot init: a killed daemon respawns
+/// under whatever load killed it, and under heavy contention a fresh daemon can
+/// take longer than one [`MAX_CONNECT_ATTEMPTS`] round (~1s) to bind its socket.
+/// Where init can fail and let the host retry, a stranded mid-session bridge is
+/// exactly the bug-80 orphan state — so the reconnect retries the whole
+/// start-or-connect round, attempt-structured (not wall-clock-bounded), before
+/// conceding.
+const MAX_RECONNECT_ROUNDS: u32 = 30;
+
 /// Runs the bridge proxy: connect-or-start the daemon, then proxy
 /// stdin/stdout to/from the daemon socket.
 ///
@@ -5651,6 +5768,78 @@ fn connect_or_start_daemon() -> Result<std::os::unix::net::UnixStream> {
     )
 }
 
+/// The outcome of an idempotent `catenary start` (bug 80, leg 2).
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonStartOutcome {
+    /// A daemon was already up; `start` connected and left it running.
+    AlreadyRunning,
+    /// No daemon was up; `start` spawned one and confirmed it bound its sockets.
+    Started,
+}
+
+/// Starts the Catenary daemon explicitly and idempotently (bug 80, leg 2).
+///
+/// The `stop` counterpart: brings the daemon up through the **same**
+/// single-instance start path the bridge init uses ([`spawn_daemon`] + the same
+/// stale-socket cleanup and attempt-structured connect retry), so a manual
+/// `catenary stop` or a killed daemon has a one-command remedy.
+///
+/// Idempotent: probes the IPC socket first — a successful connect means a daemon
+/// is already up, so it reports [`DaemonStartOutcome::AlreadyRunning`] and
+/// spawns nothing. The probe uses the **IPC** socket, never the MCP socket:
+/// an MCP connect-and-drop would register then release the only connection and
+/// trip the daemon's last-disconnect shutdown, whereas an IPC probe never holds
+/// the daemon alive.
+///
+/// When no daemon answers, it clears any stale socket files, spawns one, and
+/// waits — attempt-bounded, not wall-clock — for the IPC socket to accept a
+/// connection, returning [`DaemonStartOutcome::Started`].
+///
+/// # Errors
+///
+/// Returns an error if the daemon cannot be spawned or does not bind its sockets
+/// within [`MAX_CONNECT_ATTEMPTS`].
+#[cfg(unix)]
+pub fn ensure_daemon_running() -> Result<DaemonStartOutcome> {
+    let ipc_path = socket_path();
+
+    // Idempotent fast path: a live IPC socket means a daemon is already up.
+    if std::os::unix::net::UnixStream::connect(&ipc_path).is_ok() {
+        return Ok(DaemonStartOutcome::AlreadyRunning);
+    }
+
+    // No daemon answered. Clear stale socket files (a clean daemon exit removes
+    // them, but a crash may leave them), then spawn through the shared path.
+    let mcp_path = mcp_socket_path();
+    if mcp_path.exists() {
+        let _ = std::fs::remove_file(&mcp_path);
+    }
+    if ipc_path.exists() {
+        let _ = std::fs::remove_file(&ipc_path);
+    }
+    spawn_daemon()?;
+
+    // Wait — attempt-structured, not test-observable timing — for the daemon to
+    // bind its IPC socket and accept a connection.
+    for attempt in 0..MAX_CONNECT_ATTEMPTS {
+        if std::os::unix::net::UnixStream::connect(&ipc_path).is_ok() {
+            info!(
+                source = Source::DaemonLifecycle.as_str(),
+                attempt, "daemon started via `catenary start`",
+            );
+            return Ok(DaemonStartOutcome::Started);
+        }
+        std::thread::sleep(CONNECT_RETRY_DELAY);
+    }
+
+    anyhow::bail!(
+        "daemon spawned but did not bind its socket \
+         after {MAX_CONNECT_ATTEMPTS} attempts ({})",
+        ipc_path.display(),
+    )
+}
+
 /// Spawns `catenary daemon` as a detached child process.
 ///
 /// The daemon binds the MCP socket and begins accepting connections.
@@ -5712,64 +5901,302 @@ fn spawn_daemon() -> Result<()> {
 /// daemon connection closes before stdin (unexpected termination).
 #[cfg(unix)]
 fn proxy_stdio(stream: std::os::unix::net::UnixStream) -> Result<()> {
-    use std::io::{Read, Write};
-
-    // Phase 1: Version handshake (blocking, sequential).
-    // Intercepts the first MCP exchange (initialize) to verify that the
-    // daemon version matches this bridge. On mismatch, the handshake
-    // sends a catenary/version-mismatch notification to the daemon and
-    // returns Err.
-    {
+    // Phase 1: Version handshake (blocking, sequential). Intercepts the first
+    // MCP exchange (initialize) to verify the daemon version, and captures the
+    // initialize request line so the reconnect path can replay it (bug 80).
+    let init_line = {
         let mut stdin = std::io::stdin().lock();
         let mut stdout = std::io::stdout().lock();
-        version_handshake(&mut stdin, &stream, &mut stdout)?;
-    }
+        version_handshake(&mut stdin, &stream, &mut stdout)?
+    };
 
-    // Phase 2: Concurrent byte proxy for remaining messages.
-    let writer = stream.try_clone().context("clone daemon socket")?;
-    let reader = stream;
+    // Phase 2: Reconnect-aware byte proxy (bug 80, leg 1). A mid-session daemon
+    // loss is a transparent blip: the reader thread reconnects (respawning the
+    // daemon through the same single-instance path when absent), replays the
+    // captured initialize against the fresh daemon, and resumes — the host↔bridge
+    // stdio link never breaks, so the MCP server stays "connected" for real.
+    proxy_with_reconnect(stream, &init_line)
+}
 
-    // stdin → socket: dedicated thread, blocks until stdin EOF.
-    let stdin_thread = std::thread::spawn(move || -> Result<()> {
+/// The swappable current daemon write-half plus a generation counter (bug 80,
+/// leg 1).
+///
+/// The reader thread owns reconnection: on daemon loss it installs a fresh
+/// write-half here and bumps `generation`. The writer (stdin) thread writes to
+/// the current half; on failure it waits on the condvar for a newer generation,
+/// then retries the pending line against the reconnected socket. `done` is set
+/// when either direction ends terminally (stdin EOF, stdout gone, or reconnect
+/// exhausted) so the other side stops.
+#[cfg(unix)]
+struct SocketSlot {
+    /// The current daemon write-half, or `None` once the proxy is done.
+    writer: Option<std::os::unix::net::UnixStream>,
+    /// Bumped on every reconnect so the writer can detect a fresh socket.
+    generation: u64,
+    /// Terminal flag: no more reconnects, both directions should exit.
+    done: bool,
+    /// `false` while a daemon loss is known but not yet healed (the reader set
+    /// it on detecting loss and clears it after reinstalling a fresh writer).
+    /// The writer refuses to write while unhealthy — a write to a just-dead
+    /// socket can succeed *silently* (the bytes land in a kernel buffer the RST
+    /// discards), so waiting for the heal is the only way to guarantee a host
+    /// request written **after** the loss is observed reaches the fresh daemon,
+    /// not the void.
+    healthy: bool,
+}
+
+/// Runs the reconnect-aware MCP byte proxy (bug 80, leg 1).
+///
+/// Two blocking threads share a [`SocketSlot`] behind a `Mutex`/`Condvar`:
+///
+/// - **reader** (this fn's own loop): reads daemon→stdout. On EOF/error it
+///   reconnects via [`reconnect_daemon`] — respawning the daemon through the
+///   same single-instance path the init used, then replaying `init_line` —
+///   installs the fresh write-half into the slot, bumps the generation, notifies
+///   the writer, and resumes reading from the new socket. Reconnection is
+///   attempt-structured (bounded by [`MAX_CONNECT_ATTEMPTS`] per socket), never
+///   wall-clock-bounded.
+/// - **writer**: reads stdin→daemon line by line. On a write failure (the daemon
+///   just died) it waits for a newer generation, then rewrites the same line to
+///   the reconnected socket, so no host request is dropped by the swap.
+///
+/// Returns `Ok(())` when stdin closes (host ended the session) or the stdout
+/// pipe breaks (host killed the process); `Err` only when reconnection is
+/// exhausted.
+#[cfg(unix)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the reconnect proxy is one cohesive state machine — the writer thread, the reader/reconnect loop, and their shared-slot coordination read most clearly together"
+)]
+fn proxy_with_reconnect(stream: std::os::unix::net::UnixStream, init_line: &str) -> Result<()> {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    let write_half = stream.try_clone().context("clone daemon socket")?;
+    let slot = Arc::new((
+        Mutex::new(SocketSlot {
+            writer: Some(write_half),
+            generation: 0,
+            done: false,
+            healthy: true,
+        }),
+        Condvar::new(),
+    ));
+
+    // stdin → daemon: writes each line to the current socket; on failure, waits
+    // for a reconnect (newer generation) and retries the same line.
+    let writer_slot = Arc::clone(&slot);
+    let stdin_thread = std::thread::spawn(move || {
+        let (lock, cvar) = &*writer_slot;
         let mut stdin = std::io::stdin().lock();
-        let mut w = writer;
-        std::io::copy(&mut stdin, &mut w).context("proxy stdin to socket")?;
-        let _ = w.shutdown(std::net::Shutdown::Write);
-        Ok(())
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            // Read one newline-delimited JSON-RPC message.
+            let mut byte = [0u8; 1];
+            let read = loop {
+                match stdin.read(&mut byte) {
+                    Ok(0) => break Ok(false), // stdin EOF
+                    Ok(_) => {
+                        line.push(byte[0]);
+                        if byte[0] == b'\n' {
+                            break Ok(true);
+                        }
+                    }
+                    Err(e) => break Err(e),
+                }
+            };
+            match read {
+                Ok(false) | Err(_) => {
+                    // stdin closed — signal done and stop.
+                    if let Ok(mut slot) = lock.lock() {
+                        slot.done = true;
+                        if let Some(w) = slot.writer.take() {
+                            let _ = w.shutdown(std::net::Shutdown::Write);
+                        }
+                    }
+                    cvar.notify_all();
+                    return;
+                }
+                Ok(true) => {}
+            }
+            // Write this line to the current socket, retrying across reconnects.
+            loop {
+                // Acquire the current write-half. Wait while the slot is
+                // momentarily empty OR the daemon is known-lost-but-not-yet-healed
+                // — writing during that window would silently drop the request
+                // into a dead socket. Single lock guard — no re-entrancy.
+                let (mut sock, generation) = {
+                    let mut slot = lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    while !slot.done && (!slot.healthy || slot.writer.is_none()) {
+                        slot = cvar
+                            .wait(slot)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    if slot.done {
+                        return;
+                    }
+                    match slot.writer.as_ref().and_then(|w| w.try_clone().ok()) {
+                        Some(w) => (w, slot.generation),
+                        None => continue,
+                    }
+                };
+                if sock.write_all(&line).and_then(|()| sock.flush()).is_ok() {
+                    break;
+                }
+                // Write failed — the daemon died. Wait for a generation newer
+                // than the one we just failed on, then retry the same line.
+                let failed_gen = generation;
+                let mut slot = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !slot.done && slot.generation <= failed_gen {
+                    slot = cvar
+                        .wait(slot)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                if slot.done {
+                    return;
+                }
+            }
+        }
     });
 
-    // socket → stdout: runs on calling thread, blocks until socket EOF.
+    // daemon → stdout: this thread. On daemon loss (EOF *or* a read error like
+    // ECONNRESET from a SIGKILLed daemon), reconnect and resume.
     let mut stdout = std::io::stdout().lock();
     let mut buf = vec![0u8; 8192];
-    let mut r = reader;
-    let stdout_result: Result<()> = loop {
-        match r.read(&mut buf) {
-            Ok(0) => break Err(anyhow::anyhow!("daemon connection closed unexpectedly")),
-            Ok(n) => {
+    let mut reader = stream;
+    let result: Result<()> = loop {
+        // A daemon read that returns 0 bytes (clean EOF) *or* fails (ECONNRESET,
+        // broken pipe, …) means the daemon is gone — both route to reconnect. A
+        // `kill -9` yields ECONNRESET, not EOF, so treating only EOF as loss (the
+        // pre-bug-80 behavior) would strand the very case bug 80 filed.
+        match reader.read(&mut buf) {
+            Ok(n) if n > 0 => {
                 if let Err(e) = stdout.write_all(&buf[..n]) {
                     break Err(anyhow::Error::from(e).context("write to stdout"));
                 }
                 if let Err(e) = stdout.flush() {
                     break Err(anyhow::Error::from(e).context("flush stdout"));
                 }
+                continue;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                // stdout pipe closed (host killed the process).
-                break Ok(());
+            // `Ok(0)` (clean EOF) or `Err(_)` (ECONNRESET, EPIPE, …): daemon gone.
+            _ => {}
+        }
+
+        // Daemon gone. Mark unhealthy at once so the writer stops writing into
+        // the dead socket (a silent-loss window) until the reconnect heals it. If
+        // stdin already ended, this is a clean exit.
+        {
+            let (lock, cvar) = &*slot;
+            if let Ok(mut s) = lock.lock() {
+                if s.done {
+                    break Ok(());
+                }
+                s.healthy = false;
             }
-            Err(e) => break Err(anyhow::Error::from(e).context("read from daemon")),
+            cvar.notify_all();
+        }
+        // Reconnect: respawn the daemon (if absent) and replay init.
+        match reconnect_daemon(init_line) {
+            Ok(fresh) => {
+                let new_write = match fresh.try_clone().context("clone reconnected socket") {
+                    Ok(w) => w,
+                    Err(e) => break Err(e),
+                };
+                let (lock, cvar) = &*slot;
+                if let Ok(mut s) = lock.lock() {
+                    if s.done {
+                        break Ok(());
+                    }
+                    s.writer = Some(new_write);
+                    s.generation += 1;
+                    s.healthy = true;
+                }
+                cvar.notify_all();
+                reader = fresh;
+            }
+            Err(e) => {
+                // Reconnection exhausted — stop both directions.
+                let (lock, cvar) = &*slot;
+                if let Ok(mut s) = lock.lock() {
+                    s.done = true;
+                    s.writer = None;
+                }
+                cvar.notify_all();
+                break Err(e);
+            }
         }
     };
 
-    // If we got here, the socket→stdout loop ended. Either the daemon
-    // died (Err) or stdout pipe broke (Ok). The stdin thread may still
-    // be blocked; don't join it — the process is exiting.
-    //
-    // If stdin closed first, the stdin thread already exited and the
-    // daemon will close the connection → we exit via the read loop above.
+    // On stdin-EOF the writer thread already exited; otherwise it observes
+    // `done` (or the process exits). Don't block on the join.
     drop(stdin_thread);
+    result
+}
 
-    stdout_result
+/// Reconnects to the daemon after a mid-session loss, respawning it if absent
+/// and replaying the captured initialize (bug 80, leg 1).
+///
+/// Retries the full start-or-connect round up to [`MAX_RECONNECT_ROUNDS`] times.
+/// Each round uses [`connect_or_start_daemon`] — the exact single-instance
+/// start-or-connect path the bridge init took, so a killed daemon is respawned
+/// through the same stale-socket cleanup and attempt-bounded retry (no
+/// wall-clock bound) — then replays `init_line` against the fresh daemon and
+/// **swallows** its initialize response (the host already received one at session
+/// start; a second would corrupt the MCP stream). The extra rounds out-persist
+/// the one-shot init so a fresh daemon that binds slowly under heavy load still
+/// heals the session instead of stranding it. The fresh socket is returned ready
+/// for the resumed byte proxy.
+///
+/// # Errors
+///
+/// Returns an error only after every round fails to reach or re-handshake a
+/// daemon.
+#[cfg(unix)]
+fn reconnect_daemon(init_line: &str) -> Result<std::os::unix::net::UnixStream> {
+    use std::io::Write;
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for round in 0..MAX_RECONNECT_ROUNDS {
+        let socket = match connect_or_start_daemon() {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(e.context("reconnect to daemon"));
+                continue;
+            }
+        };
+
+        // Replay the captured initialize so the fresh daemon rebuilds the MCP
+        // session. Swallow its response — the host already saw the first one.
+        let replay = (&socket)
+            .write_all(init_line.as_bytes())
+            .and_then(|()| (&socket).flush())
+            .map_err(anyhow::Error::from)
+            .and_then(|()| read_json_line(&socket));
+        match replay {
+            Ok(_response) => {
+                info!(
+                    source = Source::DaemonLifecycle.as_str(),
+                    round, "reconnected to daemon and replayed initialize",
+                );
+                return Ok(socket);
+            }
+            Err(e) => {
+                // The daemon we just reached died mid-handshake (a respawn racing
+                // its own predecessor's teardown). Drop it and try another round.
+                last_err = Some(e.context("replay initialize to reconnected daemon"));
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        anyhow!("failed to reconnect to daemon after {MAX_RECONNECT_ROUNDS} rounds")
+    }))
 }
 
 /// Intercepts the MCP initialize handshake to verify daemon version.
@@ -5783,12 +6210,16 @@ fn proxy_stdio(stream: std::os::unix::net::UnixStream) -> Result<()> {
 ///
 /// Generic over reader/writer for testability — `proxy_stdio` passes
 /// stdin/stdout, tests pass in-memory buffers.
+///
+/// Returns the captured initialize request line so the reconnect path (bug 80,
+/// leg 1) can replay it against a fresh daemon after a mid-session daemon loss —
+/// re-establishing the MCP session without the host re-driving `initialize`.
 #[cfg(unix)]
 fn version_handshake<R: std::io::BufRead, W: std::io::Write>(
     client: &mut R,
     socket: &std::os::unix::net::UnixStream,
     output: &mut W,
-) -> Result<()> {
+) -> Result<String> {
     use std::io::Write;
 
     // Read the initialize request from the client (one JSON-RPC line).
@@ -5853,7 +6284,7 @@ fn version_handshake<R: std::io::BufRead, W: std::io::Write>(
         .context("forward initialize response to client")?;
     output.flush()?;
 
-    Ok(())
+    Ok(init_line)
 }
 
 /// Reads a single newline-terminated line from a socket without buffering.

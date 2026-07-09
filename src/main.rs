@@ -295,6 +295,16 @@ enum Command {
         force: bool,
     },
 
+    /// Start the Catenary daemon explicitly.
+    ///
+    /// The counterpart to `stop`: brings the daemon up through the same
+    /// single-instance start-or-connect path the bridge uses, so a manual
+    /// `catenary stop` (or a killed daemon) has a one-command remedy without a
+    /// per-session `/mcp` reconnect. Idempotent — if a daemon is already up, it
+    /// connects, reports that, and leaves it running. Live sessions reconnect
+    /// transparently once the daemon is back (bug 80).
+    Start,
+
     /// Stop the running Catenary daemon.
     ///
     /// With a terminal on stdin and one or more connected sessions, prints the
@@ -860,6 +870,13 @@ fn main() -> Result<()> {
             let mut out = cli::Output::stdout(false);
             cli::update::run_update(&mut out, check, force)
         }
+        #[cfg(unix)]
+        Some(Command::Start) => {
+            let mut out = cli::Output::stdout(false);
+            run_start(&mut out)
+        }
+        #[cfg(not(unix))]
+        Some(Command::Start) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
         Some(Command::Stop { force }) => {
             let mut out = cli::Output::stdout(false);
@@ -1489,6 +1506,31 @@ fn drain_db_at(db: &Path) -> u64 {
     reclaimed
 }
 
+/// Starts the Catenary daemon explicitly and idempotently (bug 80, leg 2).
+///
+/// Delegates to [`catenary_mcp::router::ensure_daemon_running`] — the same
+/// single-instance start path the bridge init uses — and prints whether a daemon
+/// was already up or a fresh one was started. Synchronous (no tokio runtime):
+/// the start path is blocking socket I/O and a process spawn.
+///
+/// # Errors
+///
+/// Returns an error if the daemon cannot be started.
+#[cfg(unix)]
+fn run_start(out: &mut cli::Output) -> Result<()> {
+    use catenary_mcp::router::DaemonStartOutcome;
+
+    match catenary_mcp::router::ensure_daemon_running()? {
+        DaemonStartOutcome::AlreadyRunning => {
+            let _ = out.writeln(format_args!("Daemon already running"));
+        }
+        DaemonStartOutcome::Started => {
+            let _ = out.writeln(format_args!("Daemon started"));
+        }
+    }
+    Ok(())
+}
+
 /// Stops the running Catenary daemon.
 ///
 /// Connects to the daemon's IPC socket and sends a shutdown request.
@@ -1707,7 +1749,14 @@ async fn run_grep(
             chunked: true,
             flags,
         };
-        search_ipc(METHOD_GREP, &request).await?
+        // Daemon-served when up; in-process (honestly labeled) when down.
+        if let Some(stream) = connect_daemon_ipc().await {
+            search_ipc_on(stream, METHOD_GREP, &request).await?
+        } else {
+            let resp = catenary_mcp::router::run_grep_daemon_less(&request).await?;
+            emit_no_daemon_marker();
+            SearchResponse::from(resp)
+        }
     } else {
         SearchResponse::default()
     };
@@ -1818,6 +1867,39 @@ struct SearchResponse {
     skipped: catenary_mcp::bridge::GrepSkips,
 }
 
+/// Adapts a daemon-less [`GrepResponse`](catenary_mcp::router::GrepResponse) into
+/// the CLI's [`SearchResponse`] so the daemon-served and in-process paths render
+/// through the identical code (bug 80, leg 4).
+#[cfg(unix)]
+impl From<catenary_mcp::router::GrepResponse> for SearchResponse {
+    fn from(r: catenary_mcp::router::GrepResponse) -> Self {
+        Self {
+            output: r.output,
+            matches: r.matches,
+            files: r.files,
+            paths: None,
+            no_match_patterns: Vec::new(),
+            skipped: r.skipped,
+        }
+    }
+}
+
+/// Adapts a daemon-less [`GlobResponse`](catenary_mcp::router::GlobResponse) into
+/// the CLI's [`SearchResponse`] (bug 80, leg 4).
+#[cfg(unix)]
+impl From<catenary_mcp::router::GlobResponse> for SearchResponse {
+    fn from(r: catenary_mcp::router::GlobResponse) -> Self {
+        Self {
+            output: r.output,
+            matches: None,
+            files: None,
+            paths: r.paths,
+            no_match_patterns: r.no_match_patterns,
+            skipped: catenary_mcp::bridge::GrepSkips::default(),
+        }
+    }
+}
+
 /// Renders the `catenary grep --count` summary: `N matches in M files`.
 ///
 /// `matches` is the matching-line total (one per rendered leaf row); `files`
@@ -1850,32 +1932,51 @@ fn render_glob_count(out: &mut cli::Output, paths: usize) {
     let _ = out.writeln(format_args!("{paths} paths"));
 }
 
-/// Sends a `tool/grep` or `tool/glob` request to the daemon and returns the
-/// parsed [`SearchResponse`].
+/// Connects to the daemon IPC socket, returning `None` when the daemon is down.
 ///
-/// Connects to the daemon IPC socket, serializes `request` with `method`
-/// injected, and reads the response. The first response line decides the shape:
-/// a chunked [`GrepFrame`] stream (misc 140 phase 2, tagged by the `"frame"`
-/// key) is reassembled into a [`SearchResponse`]; a legacy single JSON envelope
-/// (glob, or a daemon that predates framing) is parsed directly. An empty line
-/// maps to a default [`SearchResponse`]. A non-zero exit is reserved for genuine
-/// faults — no daemon, transport failure, or a malformed response — so soft
-/// conditions never cancel a parallel tool batch.
+/// The daemon-down signal for the honest-degradation path (bug 80, leg 4): a
+/// missing socket file or a refused connection means no daemon, so `catenary
+/// grep`/`glob` fall back to the in-process pipeline. Any *other* connect error
+/// also maps to `None` — a daemon that cannot be reached is, from the CLI's
+/// vantage, down.
+#[cfg(unix)]
+async fn connect_daemon_ipc() -> Option<tokio::net::UnixStream> {
+    let ipc_path = catenary_mcp::router::socket_path();
+    tokio::net::UnixStream::connect(&ipc_path).await.ok()
+}
+
+/// The mandatory daemon-less honesty marker (bug 80, leg 4).
+///
+/// Printed to **stderr only** — stdout stays byte-identical to a daemon-served
+/// uncovered answer — so `unenriched-because-uncovered` and
+/// `unenriched-because-no-daemon` are never indistinguishable. This is CLI
+/// output, not a `tracing` event: it must not fire a desktop notification or
+/// land on the TUI health surface.
+#[cfg(unix)]
+fn emit_no_daemon_marker() {
+    eprintln!("[no daemon \u{2014} results unenriched; start one with catenary start]");
+}
+
+/// Sends a search request over an already-connected daemon IPC `stream` and
+/// returns the parsed [`SearchResponse`].
+///
+/// Serializes `request` with `method` injected, reads the response, and
+/// reassembles a chunked [`GrepFrame`] stream (misc 140 phase 2) or parses a
+/// legacy single envelope. Split from [`search_ipc`] so the daemon-down branch
+/// can decide *before* connecting whether to fall back to the in-process
+/// pipeline (bug 80, leg 4).
 ///
 /// # Errors
 ///
-/// Returns an error if no daemon is running or the query fails.
+/// Returns an error if the query fails or the response is malformed.
 #[cfg(unix)]
-async fn search_ipc<R: serde::Serialize + Sync>(
+async fn search_ipc_on<R: serde::Serialize + Sync>(
+    stream: tokio::net::UnixStream,
     method: &str,
     request: &R,
 ) -> Result<SearchResponse> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let ipc_path = catenary_mcp::router::socket_path();
-    let stream = tokio::net::UnixStream::connect(&ipc_path)
-        .await
-        .context("no daemon running — start a Catenary session first")?;
     let (reader, mut writer) = stream.into_split();
 
     let mut envelope = serde_json::to_value(request)?;
@@ -2015,7 +2116,14 @@ async fn run_glob(
             include_gitignored,
             include_hidden,
         };
-        search_ipc(METHOD_GLOB, &request).await?
+        // Daemon-served when up; in-process (honestly labeled) when down.
+        if let Some(stream) = connect_daemon_ipc().await {
+            search_ipc_on(stream, METHOD_GLOB, &request).await?
+        } else {
+            let resp = catenary_mcp::router::run_glob_daemon_less(&request).await?;
+            emit_no_daemon_marker();
+            SearchResponse::from(resp)
+        }
     } else {
         SearchResponse::default()
     };

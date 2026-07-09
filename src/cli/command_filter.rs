@@ -778,7 +778,10 @@ fn recognize_catenary_sub(rest: &[&str]) -> Recog {
         (Some("primer"), _) => Recog::Agent(Sub::Primer),
         (Some("commands"), _) => Recog::Agent(Sub::Commands),
         (
-            Some("hook" | "stop" | "debug" | "config" | "doctor" | "install" | "update" | "daemon"),
+            Some(
+                "hook" | "start" | "stop" | "debug" | "config" | "doctor" | "install" | "update"
+                | "daemon",
+            ),
             _,
         ) => Recog::NotAgent,
         // Global reads — pure, side-effect-free introspection (no handoff, no
@@ -4710,6 +4713,16 @@ mod tests {
         // And the full pipeline still denies both forms for the agent surface.
         assert!(deny_text("catenary stop").contains("host CLI hooks"));
         assert!(deny_text("catenary stop --force").contains("host CLI hooks"));
+    }
+
+    /// `catenary start` (bug 80, leg 2) is a daemon-lifecycle verb like `stop`,
+    /// not an agent surface: `recognize_catenary_sub` classifies it `NotAgent`
+    /// (so it is not an unknown-subcommand denial), and the full agent pipeline
+    /// still routes it away from the agent surface.
+    #[test]
+    fn recognize_catenary_start_stays_not_agent() {
+        assert_eq!(recognize_catenary_sub(&["start"]), Recog::NotAgent);
+        assert!(deny_text("catenary start").contains("host CLI hooks"));
     }
 
     // ---- Foreign regime unaffected ----

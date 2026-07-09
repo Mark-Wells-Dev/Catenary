@@ -613,6 +613,96 @@ pub struct Session {
     diagnostics_in_flight: std::sync::atomic::AtomicBool,
 }
 
+/// A daemon-less `grep`/`glob` pair, backed by an empty, never-spawned
+/// [`LspClientManager`] (bug 80, leg 4).
+///
+/// Built by [`Session::daemon_less_search`] so the CLI can run the daemon's own
+/// search pipeline in-process when the daemon is down, producing output
+/// byte-identical to a daemon-served answer with no language-server coverage.
+pub struct DaemonlessSearch {
+    /// The grep server, LSP-manager-empty.
+    pub grep: GrepServer,
+    /// The glob server, LSP-manager-empty.
+    pub glob: GlobServer,
+}
+
+impl DaemonlessSearch {
+    /// Builds a daemon-less search pair — the `grep` and `glob` servers wired to
+    /// an empty, never-spawned [`LspClientManager`] — for the CLI to run
+    /// in-process when the daemon is down (bug 80, leg 4).
+    ///
+    /// Catenary is one binary: the search pipeline (walk, gitignore semantics,
+    /// pattern compilation, exclude handling, output rendering) is library code.
+    /// This constructs the *exact same* [`GrepServer`]/[`GlobServer`] the daemon
+    /// serves, but with no LSP manager backing — so `execute` takes the
+    /// uncovered-file rendering path the daemon already uses for a tree no
+    /// language server covers, and the stdout is byte-identical to a
+    /// daemon-served answer with no coverage.
+    ///
+    /// Unlike [`Session::new`], this performs **no** logging activation, opens
+    /// **no** JSONL firehose sink, and mirrors **no** snapshot — a throwaway CLI
+    /// process must not write telemetry or spawn servers. There are no roots: the
+    /// CLI resolves paths against `cwd`, and an empty root set means every hit is
+    /// uncovered — the honest daemon-less mode.
+    #[must_use]
+    pub fn from_config(config: Config) -> Self {
+        let config = Arc::new(config);
+        let logging = LoggingServer::new();
+
+        let classification = super::filesystem_manager::ClassificationTables::from_config(&config);
+        let fs_manager = Arc::new(FilesystemManager::with_classification(classification));
+
+        // No symbol index: without an LSP manager nothing populates it, and a
+        // never-populated index yields no `#scope` anchors and no outlines —
+        // exactly the uncovered render. Skipping it keeps the CLI process lean.
+        let symbol_index = None;
+
+        let glob_config = config
+            .tools
+            .as_ref()
+            .map_or_else(crate::config::GlobConfig::default, |t| t.glob.clone());
+        let outline_suppress = compile_outline_suppress(&glob_config.outline_suppress);
+
+        let client_manager = Arc::new(LspClientManager::new(config, logging, fs_manager.clone()));
+
+        Self {
+            grep: GrepServer {
+                client_manager: client_manager.clone(),
+                fs_manager: fs_manager.clone(),
+                symbol_index: symbol_index.clone(),
+            },
+            glob: GlobServer {
+                client_manager,
+                fs_manager,
+                symbol_index,
+                outline_suppress,
+            },
+        }
+    }
+}
+
+/// Compiles glob-outline-suppression patterns into matchers.
+///
+/// A basename pattern (no `/`) is prefixed with `**/` for depth-independent
+/// matching; a path pattern is used verbatim. Uncompilable patterns are
+/// dropped. Shared by [`Session::new`], [`Session::new_for_daemon`], and
+/// [`Session::daemon_less_search`] so the three constructions never drift.
+fn compile_outline_suppress(patterns: &[String]) -> Vec<globset::GlobMatcher> {
+    patterns
+        .iter()
+        .filter_map(|pat| {
+            let effective = if pat.contains('/') {
+                pat.clone()
+            } else {
+                format!("**/{pat}")
+            };
+            globset::Glob::new(&effective)
+                .ok()
+                .map(|g| g.compile_matcher())
+        })
+        .collect()
+}
+
 impl Session {
     /// Creates a new `Session`, constructing all internal dependencies.
     ///
@@ -710,20 +800,7 @@ impl Session {
             fs_manager: fs_manager.clone(),
             symbol_index: symbol_index.clone(),
         };
-        let outline_suppress: Vec<globset::GlobMatcher> = glob_config
-            .outline_suppress
-            .iter()
-            .filter_map(|pat| {
-                let effective = if pat.contains('/') {
-                    pat.clone()
-                } else {
-                    format!("**/{pat}")
-                };
-                globset::Glob::new(&effective)
-                    .ok()
-                    .map(|g| g.compile_matcher())
-            })
-            .collect();
+        let outline_suppress = compile_outline_suppress(&glob_config.outline_suppress);
         let glob = GlobServer {
             client_manager: client_manager.clone(),
             fs_manager: fs_manager.clone(),
@@ -776,20 +853,7 @@ impl Session {
             .as_ref()
             .map_or_else(crate::config::GlobConfig::default, |t| t.glob.clone());
 
-        let outline_suppress: Vec<globset::GlobMatcher> = glob_config
-            .outline_suppress
-            .iter()
-            .filter_map(|pat| {
-                let effective = if pat.contains('/') {
-                    pat.clone()
-                } else {
-                    format!("**/{pat}")
-                };
-                globset::Glob::new(&effective)
-                    .ok()
-                    .map(|g| g.compile_matcher())
-            })
-            .collect();
+        let outline_suppress = compile_outline_suppress(&glob_config.outline_suppress);
 
         Self {
             config: primary.config.clone(),

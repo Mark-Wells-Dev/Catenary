@@ -108,3 +108,56 @@ fn client_fallback_allows_allowlisted_command() -> Result<()> {
     );
     Ok(())
 }
+
+/// Bug 80, leg 3 (confirm-intentional): the command filter kept enforcing
+/// correctly with **no daemon** during the outage — a killed daemon must not
+/// make the shell surface fail open *or* closed. This drives the real
+/// `catenary start` → `catenary stop` lifecycle so the daemon was genuinely up
+/// then died (the bug-80 sighting), then exercises the client-side fallback: a
+/// non-allowlisted command is still denied, and an allowlisted one still passes.
+#[test]
+fn command_filter_enforces_after_daemon_death() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("tempdir path")?;
+
+    // Bring a daemon up, then stop it — the daemon was up and died.
+    let start = {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+        isolate_env(&mut cmd, root);
+        cmd.arg("start");
+        cmd.output().context("run catenary start")?
+    };
+    assert!(
+        start.status.success(),
+        "catenary start must exit 0, stderr:\n{}",
+        String::from_utf8_lossy(&start.stderr),
+    );
+    let stop = {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+        isolate_env(&mut cmd, root);
+        cmd.args(["stop", "--force"]);
+        cmd.output().context("run catenary stop")?
+    };
+    assert!(
+        stop.status.success(),
+        "catenary stop must exit 0, stderr:\n{}",
+        String::from_utf8_lossy(&stop.stderr),
+    );
+
+    // Never fail-open: a non-allowlisted command is still denied daemon-less.
+    let denied = run_client_hook(root, "cargo build")?;
+    let decision = parse_decision(&denied)
+        .context("non-allowlisted command should deny even after daemon death")?;
+    assert_eq!(
+        decision, "deny",
+        "filter must still deny daemon-less after a daemon death, got: {denied}",
+    );
+
+    // Never fail-closed: an allowlisted command still passes daemon-less.
+    let allowed = run_client_hook(root, "git status")?;
+    assert!(
+        parse_decision(&allowed).is_none(),
+        "filter must still allow daemon-less after a daemon death, got: {allowed}",
+    );
+    Ok(())
+}
