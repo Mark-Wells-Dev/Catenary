@@ -52,12 +52,20 @@ jobs:
       - uses: actions/checkout@v5
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
       - run: cargo build --bins --tests --features mockls
       # Full suite: unit + tests/ integration (mockls-driven, no real
       # servers). The few real-server cases are #[ignore]'d and skip by
       # default; they run locally via `make test-ignored` and in the
       # conformance harness.
-      - run: cargo test --no-fail-fast --features mockls
+      #
+      # nextest, matching `make check`'s harness: process-per-test. Raw
+      # `cargo test` runs all lib tests as THREADS of one process, where
+      # process-global test instrumentation (e.g. the bug-78 guard's
+      # SCAN_BYTES counter) is contaminated by concurrent tests — the
+      # run-29042647606 ubuntu false failure. nextest makes that
+      # impossible and is the harness every local bar already uses.
+      - run: cargo nextest run --workspace --features mockls --no-fail-fast
 
   build:
     name: Build (${{ matrix.os }})
