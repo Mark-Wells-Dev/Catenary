@@ -155,10 +155,29 @@ impl WorktreeWatcher {
     /// watched once. Idempotent: re-registering the same contributor refreshes its
     /// path and does not double-count the parent.
     ///
+    /// The worktree path is **canonicalized** before it is stored and its parent
+    /// watched: the OS delete event a watch delivers must string-equal the stored
+    /// path ([`matching_contributor`]), and the two backends report event paths
+    /// differently under a symlinked prefix. macOS `FSEvents` resolves symlinks in
+    /// every reported path (`$TMPDIR` = `/var/folders/…` → `/private/var/…`), so a
+    /// watch registered on a *symlinked* parent would receive *canonical* event
+    /// paths that never match the symlinked stored spelling — the delete is never
+    /// reaped. Watching the canonical parent makes both inotify (which reports
+    /// paths relative to the actually-watched dir) and `FSEvents` deliver canonical
+    /// event paths that match the canonical stored path. This also aligns the
+    /// watcher with the daemon convention that tracked roots are canonical (the
+    /// mount site already passes a canonical worktree path). A path that cannot
+    /// canonicalize (already deleted) keeps its spelling — the mount site reaps it
+    /// immediately in that race.
+    ///
     /// Best-effort — a failure to add the OS watch is logged at `debug` and
     /// swallowed; the hourly GC remains the backstop. Returns whether the OS watch
     /// is in place for this contributor.
     pub fn register(&self, contributor: &str, worktree: &Path) -> bool {
+        let worktree = worktree
+            .canonicalize()
+            .unwrap_or_else(|_| worktree.to_path_buf());
+        let worktree = worktree.as_path();
         let Some(parent) = worktree.parent().map(Path::to_path_buf) else {
             debug!(
                 source = Source::DaemonDispatch.as_str(),
@@ -320,6 +339,20 @@ impl WorktreeWatcher {
             .unwrap_or_else(PoisonError::into_inner)
             .contributors
             .contains_key(contributor)
+    }
+
+    /// Returns the stored (canonicalized) watched path for a contributor, if any
+    /// (test helper). Lets a regression assert `register` canonicalized the path
+    /// on every backend, not only where the OS event path exposes the mismatch.
+    #[cfg(test)]
+    #[must_use]
+    pub fn watched_path(&self, contributor: &str) -> Option<PathBuf> {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contributors
+            .get(contributor)
+            .cloned()
     }
 
     /// Returns the number of distinct parent dirs currently watched (test helper).
@@ -492,6 +525,72 @@ mod tests {
         assert!(
             got.is_some(),
             "expected a deletion event for the cache-dir worktree within the deadline",
+        );
+    }
+
+    #[test]
+    fn deletion_emits_through_symlinked_parent() {
+        // macOS path-canonicalization regression. `register` is handed a worktree
+        // whose parent is reached through a SYMLINK — the shape of a Darwin
+        // `$TMPDIR` (`/var/folders/…` → `/private/var/…`). Pre-fix, the watch stored
+        // the symlinked spelling and watched the symlinked parent; macOS FSEvents
+        // reports canonical event paths, so the delete never matched the stored
+        // path and the reap never fired (the 5s-deadline timeout in CI). Post-fix,
+        // `register` canonicalizes, so the watched parent and stored path are
+        // canonical and the (canonical) delete event matches.
+        //
+        // Reproduces on macOS directly; on Linux inotify reports paths relative to
+        // the actually-watched dir, so canonicalizing the parent makes the event
+        // canonical here too — exercising the fix in-process without a symlinked
+        // `TMPDIR`. The symlink is built inside the default tempdir (no
+        // `set_var`/env dependence).
+        use std::os::unix::fs as unix_fs;
+
+        let (watcher, mut rx) = WorktreeWatcher::new().expect("create watcher");
+        let base = tempfile::tempdir().expect("tempdir");
+        let real = base.path().join("real");
+        let link = base.path().join("link");
+        std::fs::create_dir_all(&real).expect("mkdir real");
+        unix_fs::symlink(&real, &link).expect("symlink link -> real");
+
+        // The worktree is reached through the symlinked `link/` parent.
+        let wt = link.join("agent-sym");
+        std::fs::create_dir_all(&wt).expect("mkdir wt via symlink");
+        let key = format!("worktree:s1:{}", wt.display());
+
+        assert!(
+            watcher.register(&key, &wt),
+            "the watch registers for a symlink-reached worktree path",
+        );
+
+        // Load-bearing on every backend (not only macOS): `register` must have
+        // stored the CANONICAL path, resolving the `link/` symlink to `real/`.
+        // This is what makes the (canonical) OS delete event match; it also pins
+        // the fix on Linux, where the event path alone cannot expose the mismatch.
+        let stored = watcher.watched_path(&key).expect("registered path");
+        let wt_canon = wt.canonicalize().expect("canonicalize wt");
+        assert_eq!(
+            stored, wt_canon,
+            "register must store the canonical worktree path (symlink resolved)",
+        );
+
+        std::fs::remove_dir_all(&wt).expect("rm wt");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut got: Option<WorktreeDeleted> = None;
+        while std::time::Instant::now() < deadline {
+            if let Ok(ev) = rx.try_recv()
+                && ev.contributor == key
+            {
+                got = Some(ev);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            got.is_some(),
+            "expected a deletion event for the symlink-reached worktree within the \
+             deadline (canonicalized registration matches the canonical event path)",
         );
     }
 

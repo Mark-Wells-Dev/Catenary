@@ -89,7 +89,10 @@ fn run_hook(home: &Path, payload: &Value) -> std::process::Output {
 
 #[test]
 fn worktree_create_makes_out_of_tree_worktree_and_prints_path() {
-    let home = tempfile::tempdir().expect("home tempdir");
+    // Canonical home: the daemon prints a canonical worktree path, so the
+    // `xdg_state_home(home.path())`-derived `agents` prefix must be canonical too
+    // (macOS symlinked-tempdir class).
+    let home = common::canonical_tempdir().expect("home tempdir");
     let repo = home.path().join("repo");
     init_repo(&repo);
 

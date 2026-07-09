@@ -260,7 +260,17 @@ mod tests {
     #[test]
     fn test_read_outside_root_fails() -> Result<()> {
         let (_dir, validator) = setup_workspace()?;
-        let result = validator.validate_read(Path::new("/etc/hostname"));
+        // The out-of-root path must EXIST (so it canonicalizes and reaches the
+        // roots check) yet be outside every workspace root — asserting on the
+        // "outside workspace roots" branch, not the "does not exist" one. A real
+        // file in a separate tempdir satisfies both on every platform; a fixed
+        // system path like `/etc/hostname` does not (absent on macOS, where
+        // `canonicalize` fails with ENOENT and the error reads "does not exist").
+        let outside_dir = TempDir::new().map_err(|e| anyhow!("{e}"))?;
+        let outside_file = outside_dir.path().join("outside.txt");
+        fs::write(&outside_file, "outside")?;
+
+        let result = validator.validate_read(&outside_file);
         assert!(result.is_err());
         let err = result.expect_err("expected error").to_string();
         assert!(

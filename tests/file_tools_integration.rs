@@ -33,7 +33,7 @@ fn spawn_with_real_lsp(lsp_arg: &str, root: &str) -> Result<BridgeProcess> {
 
 #[test]
 fn test_glob_directory_basic() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::create_dir_all(dir.path().join("src"))?;
     std::fs::write(dir.path().join("Cargo.toml"), "[package]")?;
     std::fs::write(dir.path().join("src/main.rs"), "fn main() {}")?;
@@ -56,8 +56,8 @@ fn test_glob_directory_basic() -> Result<()> {
 
 #[test]
 fn test_glob_outside_root() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let outside = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
+    let outside = common::canonical_tempdir()?;
     std::fs::write(outside.path().join("hello.txt"), "hi")?;
 
     let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
@@ -87,7 +87,7 @@ fn test_glob_outside_root() -> Result<()> {
 
 #[test]
 fn test_tools_list_returns_method_not_found() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
     bridge.initialize()?;
@@ -111,8 +111,8 @@ fn test_tools_list_returns_method_not_found() -> Result<()> {
 fn test_glob_directory_symlink() -> Result<()> {
     use std::os::unix::fs as unix_fs;
 
-    let dir = tempfile::tempdir()?;
-    let outside = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
+    let outside = common::canonical_tempdir()?;
 
     std::fs::write(outside.path().join("secret.txt"), "secret")?;
 
@@ -140,7 +140,7 @@ fn test_glob_directory_symlink() -> Result<()> {
 
 #[test]
 fn test_glob_file_header() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let script = dir.path().join(format!("types.{MOCK_LANG_A}"));
     std::fs::write(
         &script,
@@ -174,7 +174,7 @@ fn test_glob_file_header() -> Result<()> {
 
 #[test]
 fn test_glob_line_counts() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join("three.txt"), "line1\nline2\nline3\n")?;
     std::fs::write(dir.path().join("one.txt"), "single\n")?;
 
@@ -208,7 +208,7 @@ fn test_glob_line_counts() -> Result<()> {
 
 #[test]
 fn test_glob_include_hidden() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join("visible.txt"), "content")?;
     std::fs::write(dir.path().join(".hidden"), "secret")?;
 
@@ -247,7 +247,7 @@ fn test_glob_include_hidden() -> Result<()> {
 /// Grep with a broad glob should still exclude hidden files by default.
 #[test]
 fn test_grep_broad_glob_excludes_hidden() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join(".secret"), "password123\n")?;
     std::fs::write(dir.path().join("visible.txt"), "password123\n")?;
 
@@ -271,7 +271,7 @@ fn test_grep_broad_glob_excludes_hidden() -> Result<()> {
 /// without `include_hidden`.
 #[test]
 fn test_glob_explicit_hidden_matches() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join(".gitignore"), "target/\n")?;
     std::fs::write(dir.path().join("README.md"), "hello")?;
 
@@ -288,7 +288,7 @@ fn test_glob_explicit_hidden_matches() -> Result<()> {
 
 #[test]
 fn test_glob_include_gitignored() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     // Initialize git repo
     Command::new("git")
@@ -345,7 +345,7 @@ fn test_glob_include_gitignored() -> Result<()> {
 /// it unquoted.
 #[test]
 fn test_glob_quoted_pattern_expands_daemon_side() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::create_dir_all(dir.path().join("src/inner"))?;
     std::fs::write(dir.path().join("src/main.rs"), "fn main() {}")?;
     std::fs::write(dir.path().join("src/inner/lib.rs"), "fn lib() {}")?;
@@ -375,7 +375,7 @@ fn test_glob_quoted_pattern_expands_daemon_side() -> Result<()> {
 /// `no_match_patterns` field, rendered CLI-side) — never an error.
 #[test]
 fn test_glob_quoted_pattern_zero_match_is_empty() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join("only.txt"), "x")?;
 
     let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
@@ -394,7 +394,7 @@ fn test_glob_quoted_pattern_zero_match_is_empty() -> Result<()> {
 /// `| head`-truncated view still shows the true count (misc 121).
 #[test]
 fn test_glob_pattern_opens_with_match_count_header() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::create_dir_all(dir.path().join("src/inner"))?;
     std::fs::write(dir.path().join("src/main.rs"), "fn main() {}")?;
     std::fs::write(dir.path().join("src/inner/lib.rs"), "fn lib() {}")?;
@@ -423,7 +423,7 @@ fn test_glob_pattern_opens_with_match_count_header() -> Result<()> {
 /// A pattern with exactly one match uses singular grammar: `1 file matches`.
 #[test]
 fn test_glob_pattern_header_singular_for_one_match() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::create_dir(dir.path().join("src"))?;
     std::fs::write(dir.path().join("src/only.rs"), "fn only() {}")?;
     std::fs::write(dir.path().join("src/notes.txt"), "notes")?;
@@ -443,7 +443,7 @@ fn test_glob_pattern_header_singular_for_one_match() -> Result<()> {
 /// Multiple pattern arguments each get their own header, in argument order.
 #[test]
 fn test_glob_multiple_patterns_each_get_a_header() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join("a.rs"), "fn a() {}")?;
     std::fs::write(dir.path().join("b.txt"), "b")?;
 
@@ -477,7 +477,7 @@ fn test_glob_multiple_patterns_each_get_a_header() -> Result<()> {
 /// **pattern** arguments earn one; a directory shows its own structure).
 #[test]
 fn test_glob_directory_argument_has_no_match_header() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join("main.rs"), "fn main() {}")?;
 
     let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
@@ -499,7 +499,7 @@ fn test_glob_directory_argument_has_no_match_header() -> Result<()> {
 /// scopes the search to the files it matches.
 #[test]
 fn test_grep_quoted_pattern_path_scopes_search() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join("a.rs"), "let needle = 1;")?;
     std::fs::write(dir.path().join("b.txt"), "needle in text")?;
 
@@ -522,7 +522,7 @@ fn test_grep_quoted_pattern_path_scopes_search() -> Result<()> {
 /// NOT silently fall back to a cwd-wide search.
 #[test]
 fn test_grep_path_glob_zero_files_does_not_search_cwd() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join("a.rs"), "let needle = 1;")?;
 
     let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
@@ -546,7 +546,7 @@ fn test_grep_path_glob_zero_files_does_not_search_cwd() -> Result<()> {
 /// strip-to-ripgrep contract.
 #[test]
 fn test_grep_files_with_matches_lists_paths() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join("a.rs"), "let needle = 1;")?;
     std::fs::write(dir.path().join("b.rs"), "needle again")?;
     std::fs::write(dir.path().join("c.rs"), "nothing here")?;
@@ -574,7 +574,7 @@ fn test_grep_files_with_matches_lists_paths() -> Result<()> {
 /// shape as match lines — each becomes its own self-contained line.
 #[test]
 fn test_grep_context_renders_in_line_format() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join("f.rs"), "before\nthe needle line\nafter\n")?;
 
     let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
@@ -605,7 +605,7 @@ fn test_grep_context_renders_in_line_format() -> Result<()> {
 /// `-g`/`--glob` is a positive file filter on a directory (cwd) walk.
 #[test]
 fn test_grep_glob_filter_restricts_files() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join("a.rs"), "let needle = 1;")?;
     std::fs::write(dir.path().join("b.txt"), "needle in text")?;
 
@@ -628,7 +628,7 @@ fn test_grep_glob_filter_restricts_files() -> Result<()> {
 /// with an uppercase letter is sensitive; `-i` forces insensitive.
 #[test]
 fn test_grep_smart_case_default_and_overrides() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(
         dir.path().join("f.rs"),
         "let Needle = 1;\nlet needle = 2;\n",
@@ -674,7 +674,7 @@ fn test_grep_smart_case_default_and_overrides() -> Result<()> {
 /// `-v`/`--invert-match` selects non-matching lines, rendered in the line format.
 #[test]
 fn test_grep_invert_selects_non_matching() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join("f.rs"), "keep one\ndrop needle\nkeep two\n")?;
 
     let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
@@ -701,7 +701,7 @@ fn test_grep_invert_selects_non_matching() -> Result<()> {
 
 #[test]
 fn test_glob_tier3_bucketed() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     // Create many files with separator-based names to exceed budget.
     for i in 0..30 {
@@ -741,7 +741,7 @@ fn test_glob_tier3_bucketed() -> Result<()> {
 
 #[test]
 fn test_glob_tier2_file_listing() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::create_dir(dir.path().join("src"))?;
     std::fs::write(dir.path().join("main.rs"), "fn main() {}")?;
     std::fs::write(dir.path().join("lib.rs"), "pub mod lib;")?;
@@ -771,7 +771,7 @@ fn test_glob_tier2_file_listing() -> Result<()> {
 
 #[test]
 fn test_glob_bucket_drill() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     // Create files with a shared prefix.
     for i in 0..5 {
@@ -819,7 +819,7 @@ fn test_glob_bucket_drill() -> Result<()> {
 
 #[test]
 fn test_glob_directories_count_against_budget() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     // Create many directories that eat into the budget.
     for i in 0..60 {
@@ -853,7 +853,7 @@ fn test_glob_directories_count_against_budget() -> Result<()> {
 
 #[test]
 fn test_glob_separator_bucketing() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     // Create files with underscore separators.
     for i in 0..5 {
@@ -920,7 +920,7 @@ fn test_glob_separator_bucketing() -> Result<()> {
 #[test]
 #[ignore = "requires lua-language-server"]
 fn test_lua_glob_file_outline() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let lua_file = dir.path().join("helpers.lua");
     std::fs::write(
         &lua_file,
@@ -970,7 +970,7 @@ fn test_lua_glob_file_outline() -> Result<()> {
 #[test]
 #[ignore = "requires lua-language-server"]
 fn test_lua_glob_pattern() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     // Mimic the chezmoi conky structure
     let lua_dir = dir.path().join("conky/lua");
@@ -1038,7 +1038,7 @@ fn test_lua_glob_pattern() -> Result<()> {
 #[test]
 #[ignore = "requires lua-language-server"]
 fn test_lua_glob_directory() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     std::fs::write(
         dir.path().join("init.lua"),
@@ -1111,7 +1111,7 @@ fn gen_mock_content(n: usize) -> String {
 
 #[test]
 fn test_glob_enrich_always_includes_small_files() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     // A larger file and a one-line file. The old `outline_threshold` gate is
     // gone (enrich always), so BOTH are outlined regardless of size.
     std::fs::write(
@@ -1154,7 +1154,7 @@ fn test_glob_enrich_always_includes_small_files() -> Result<()> {
 
 #[test]
 fn test_glob_small_files_outlined_no_kind_label() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     // Small files (well under the old default threshold of 200). Enrich always:
     // they are outlined now, and the outline never carries a `<Kind>` label.
     std::fs::write(
@@ -1182,7 +1182,7 @@ fn test_glob_small_files_outlined_no_kind_label() -> Result<()> {
 
 #[test]
 fn test_glob_dir_prints_complete_listing() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     // Several outlined files: the complete listing prints, every file's full
     // outline (decision 025 — no line budget, no truncation).
     for f in 0..5 {
@@ -1233,7 +1233,7 @@ fn test_glob_dir_prints_complete_listing() -> Result<()> {
 
 #[test]
 fn test_glob_outline_suppress() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(
         dir.path().join(format!("big.{MOCK_EXT}")),
         "fn alpha\nfn beta\n\n\n\n\n\n\n\n\n",
@@ -1264,7 +1264,7 @@ fn test_glob_outline_suppress() -> Result<()> {
 
 #[test]
 fn test_glob_full_expansion_nested_children() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     // A file with nested definitions: Outer { contains inner }; leaf is
     // top-level. Full expansion shows each node on its own indented line — the
     // old `/`-collapse marker (a container shown as `Outer {/`) is gone.
@@ -1318,7 +1318,7 @@ fn test_glob_full_expansion_nested_children() -> Result<()> {
 
 #[test]
 fn test_glob_single_file_map() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let file = dir.path().join("tiny.mock");
     // Small file — single files bypass threshold.
     std::fs::write(&file, "fn alpha\nstruct Beta\n")?;
@@ -1354,7 +1354,7 @@ fn test_glob_single_file_map() -> Result<()> {
 
 #[test]
 fn test_glob_single_file_denied() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let file = dir.path().join(format!("denied.{MOCK_EXT}"));
     std::fs::write(&file, "fn alpha\nstruct Beta\n")?;
 
@@ -1381,7 +1381,7 @@ fn test_glob_single_file_denied() -> Result<()> {
 fn test_glob_symlink_broken() -> Result<()> {
     use std::os::unix::fs as unix_fs;
 
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     unix_fs::symlink(
         dir.path().join("nonexistent.txt"),
         dir.path().join("broken_link.txt"),
@@ -1407,7 +1407,7 @@ fn test_glob_symlink_broken() -> Result<()> {
 fn test_glob_symlink_valid() -> Result<()> {
     use std::os::unix::fs as unix_fs;
 
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let target = dir.path().join("real_file.txt");
     std::fs::write(&target, "line one\nline two\nline three\n")?;
 
@@ -1436,7 +1436,7 @@ fn test_glob_symlink_valid() -> Result<()> {
 
 #[test]
 fn test_glob_maps_deny_partial() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let assets = dir.path().join("test_assets");
     std::fs::create_dir_all(&assets)?;
 
@@ -1481,7 +1481,7 @@ fn test_glob_maps_deny_partial() -> Result<()> {
 
 #[test]
 fn test_glob_bounding_ranges() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     // Multiple files with identical symbol names/kinds but different line spans.
     // alpha is at different positions in each file.
@@ -1545,7 +1545,7 @@ fn test_glob_bounding_ranges() -> Result<()> {
 
 #[test]
 fn test_glob_snapshot_flag() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(
         dir.path().join("handler.catenary_snapshot_5.rs"),
         "old content",
@@ -1578,7 +1578,7 @@ fn test_glob_snapshot_flag() -> Result<()> {
 
 #[test]
 fn test_glob_gitignored_flag() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     std::process::Command::new("git")
         .args(["init"])
@@ -1617,7 +1617,7 @@ fn test_glob_gitignored_flag() -> Result<()> {
 
 #[test]
 fn test_glob_composing_flags() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     std::process::Command::new("git")
         .args(["init"])
@@ -1662,7 +1662,7 @@ fn test_glob_composing_flags() -> Result<()> {
 
 #[test]
 fn test_glob_prints_complete_outline() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let file = dir.path().join(format!("huge.{MOCK_EXT}"));
     // A large single-file outline: it prints in full (decision 025 — no budget,
     // no spill), including the last symbols.
@@ -1701,7 +1701,7 @@ fn test_glob_prints_complete_outline() -> Result<()> {
 
 #[test]
 fn test_glob_no_grammar() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     // Large file but no grammar installed.
     let content = (0..300).fold(String::new(), |mut s, i| {
         use std::fmt::Write;
@@ -1759,7 +1759,7 @@ fn test_glob_lists_every_item() -> Result<()> {
 
 #[test]
 fn test_glob_structure_dedup() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     // Multiple files with identical symbol sets crossing threshold.
     let content = "fn alpha\nstruct Beta\n\n\n\n\n\n\n\n\n";
     for i in 0..5 {
@@ -1806,7 +1806,7 @@ fn test_glob_structure_dedup() -> Result<()> {
 
 #[test]
 fn test_glob_dedup_mixed() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     // Shared structure files.
     let shared = "fn alpha\nstruct Beta\n\n\n\n\n\n\n\n\n";
     for i in 0..3 {
@@ -1856,7 +1856,7 @@ fn test_glob_dedup_mixed() -> Result<()> {
 
 #[test]
 fn test_glob_absolute_dir_no_cwd_header() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join("hello.txt"), "hi\n")?;
     std::fs::create_dir(dir.path().join("sub"))?;
 
@@ -1881,7 +1881,7 @@ fn test_glob_absolute_dir_no_cwd_header() -> Result<()> {
 
 #[test]
 fn test_glob_absolute_dir_indented_entries() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join("alpha.txt"), "a\n")?;
     std::fs::write(dir.path().join("beta.txt"), "b\n")?;
     std::fs::create_dir(dir.path().join("sub"))?;
@@ -1906,7 +1906,7 @@ fn test_glob_absolute_dir_indented_entries() -> Result<()> {
 
 #[test]
 fn test_glob_absolute_file_no_cwd_header() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let file_path = dir.path().join("readme.txt");
     std::fs::write(&file_path, "hello world\n")?;
 
@@ -1927,7 +1927,7 @@ fn test_glob_absolute_file_no_cwd_header() -> Result<()> {
 
 #[test]
 fn test_grep_no_glob_cwd_scoped() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join("hello.txt"), "needle in haystack\n")?;
 
     let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
@@ -1951,7 +1951,7 @@ fn test_grep_no_glob_cwd_scoped() -> Result<()> {
 /// Grep with a relative glob (resolved against cwd) should find matches.
 #[test]
 fn test_grep_relative_glob_finds_matches() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let sub = dir.path().join("src");
     std::fs::create_dir(&sub)?;
     std::fs::write(sub.join("main.rs"), "fn cwd_target() {}\n")?;
@@ -1972,7 +1972,7 @@ fn test_grep_relative_glob_finds_matches() -> Result<()> {
 /// from both arms, separated by a newline.
 #[test]
 fn test_grep_alternation_both_arms_present() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join("a.txt"), "alpha_unique_arm\n")?;
     std::fs::write(dir.path().join("b.txt"), "beta_unique_arm\n")?;
 
@@ -2006,8 +2006,8 @@ fn test_grep_alternation_both_arms_present() -> Result<()> {
 /// appear when cwd points to the first root.
 #[test]
 fn test_grep_cwd_scoping_prevents_cross_root() -> Result<()> {
-    let dir_a = tempfile::tempdir()?;
-    let dir_b = tempfile::tempdir()?;
+    let dir_a = common::canonical_tempdir()?;
+    let dir_b = common::canonical_tempdir()?;
 
     std::fs::write(dir_a.path().join("a.txt"), "unique_cross_root_a\n")?;
     std::fs::write(dir_b.path().join("b.txt"), "unique_cross_root_b\n")?;
@@ -2047,7 +2047,7 @@ fn test_grep_cwd_scoping_prevents_cross_root() -> Result<()> {
 /// gitignore-aware walker.
 #[test]
 fn grep_relative_path_arg_anchors_at_cwd_subdir() -> Result<()> {
-    let root = tempfile::tempdir()?;
+    let root = common::canonical_tempdir()?;
     let sub = root.path().join("sub");
     std::fs::create_dir(&sub)?;
     // Same needle at the root and under the subdirectory; only the
@@ -2082,7 +2082,7 @@ fn grep_relative_path_arg_anchors_at_cwd_subdir() -> Result<()> {
 /// relative pattern lists only the cwd subdirectory's files, not the root's.
 #[test]
 fn glob_relative_path_arg_anchors_at_cwd_subdir() -> Result<()> {
-    let root = tempfile::tempdir()?;
+    let root = common::canonical_tempdir()?;
     let sub = root.path().join("sub");
     std::fs::create_dir(&sub)?;
     std::fs::write(root.path().join("outer_marker.rs"), "// root\n")?;
@@ -2115,7 +2115,7 @@ fn glob_relative_path_arg_anchors_at_cwd_subdir() -> Result<()> {
 /// root wins over the enclosing one (bug 69's nested-worktree instance).
 #[test]
 fn glob_relative_path_arg_prefers_cwd_over_enclosing_root() -> Result<()> {
-    let outer = tempfile::tempdir()?;
+    let outer = common::canonical_tempdir()?;
     let inner = outer.path().join("inner");
     std::fs::create_dir(&inner)?;
     std::fs::write(outer.path().join("outer_marker.rs"), "// outer\n")?;
@@ -2151,8 +2151,8 @@ fn glob_relative_path_arg_prefers_cwd_over_enclosing_root() -> Result<()> {
 /// warning header and returns only matches from that directory.
 #[test]
 fn test_grep_outside_roots_lsp_warning() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    let outside = tempfile::tempdir()?;
+    let root = common::canonical_tempdir()?;
+    let outside = common::canonical_tempdir()?;
 
     std::fs::write(root.path().join("in_root.txt"), "shared_needle\n")?;
     std::fs::write(outside.path().join("outside.txt"), "shared_needle\n")?;
@@ -2190,8 +2190,8 @@ fn test_grep_outside_roots_lsp_warning() -> Result<()> {
 /// warning header.
 #[test]
 fn test_glob_outside_roots_lsp_warning() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    let outside = tempfile::tempdir()?;
+    let root = common::canonical_tempdir()?;
+    let outside = common::canonical_tempdir()?;
 
     std::fs::write(root.path().join("in_root.txt"), "hello\n")?;
     std::fs::write(outside.path().join("outside.txt"), "hello\n")?;
@@ -2234,8 +2234,8 @@ fn test_glob_outside_roots_lsp_warning() -> Result<()> {
 /// decision 019.
 #[test]
 fn dot_grep_scopes_to_cwd_root_not_another() -> Result<()> {
-    let repo = tempfile::tempdir()?;
-    let probe = tempfile::tempdir()?;
+    let repo = common::canonical_tempdir()?;
+    let probe = common::canonical_tempdir()?;
 
     // Same needle in both roots; only the repo's hit must surface.
     std::fs::write(
@@ -2279,9 +2279,9 @@ fn dot_grep_scopes_to_cwd_root_not_another() -> Result<()> {
 /// (bug 31, decision 019).
 #[test]
 fn dot_grep_cwd_outside_roots_is_labeled() -> Result<()> {
-    let repo = tempfile::tempdir()?;
-    let probe = tempfile::tempdir()?;
-    let outside = tempfile::tempdir()?;
+    let repo = common::canonical_tempdir()?;
+    let probe = common::canonical_tempdir()?;
+    let outside = common::canonical_tempdir()?;
 
     // The registered roots hold the needle; the searched (outside) cwd holds
     // its own distinct copy. Only the outside copy must surface.
@@ -2328,8 +2328,8 @@ fn dot_grep_cwd_outside_roots_is_labeled() -> Result<()> {
 /// must surface and the probe's must not.
 #[test]
 fn dot_grep_lsp_not_ready_uses_correct_root() -> Result<()> {
-    let repo = tempfile::tempdir()?;
-    let probe = tempfile::tempdir()?;
+    let repo = common::canonical_tempdir()?;
+    let probe = common::canonical_tempdir()?;
 
     std::fs::write(
         repo.path().join(format!("src.{MOCK_LANG_A}")),
@@ -2368,7 +2368,7 @@ fn dot_grep_lsp_not_ready_uses_correct_root() -> Result<()> {
 /// resolution and the walker's per-entry file decision.
 #[test]
 fn grep_named_present_file_never_zeros() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let file = dir.path().join("present.rs");
     std::fs::write(&file, "let named_present_needle = 1;\n")?;
 
@@ -2403,7 +2403,7 @@ fn grep_named_present_file_never_zeros() -> Result<()> {
 /// enumerated just because it raced the rename window.
 #[test]
 fn grep_atomic_rename_in_workflow_returns_match() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
     bridge.initialize()?;
@@ -2439,7 +2439,7 @@ fn grep_atomic_rename_in_workflow_returns_match() -> Result<()> {
 /// does (bug 73).
 #[test]
 fn glob_exclude_pattern_matches_named_dir_parity() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::create_dir(dir.path().join("src"))?;
     std::fs::write(dir.path().join("src/a.rs"), "fn a() {}")?;
     std::fs::write(dir.path().join("src/b.rs"), "fn b() {}")?;
@@ -2472,7 +2472,7 @@ fn glob_exclude_pattern_matches_named_dir_parity() -> Result<()> {
 /// reports the surviving cardinality, not the pre-exclude match total (bug 73).
 #[test]
 fn glob_exclude_pattern_count_matches_listing() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::create_dir(dir.path().join("src"))?;
     std::fs::write(dir.path().join("src/a.rs"), "fn a() {}")?;
     std::fs::write(dir.path().join("src/b.rs"), "fn b() {}")?;
@@ -2507,7 +2507,7 @@ fn glob_exclude_pattern_count_matches_listing() -> Result<()> {
 /// surface — the exclude is targeted, not absent (bug 73).
 #[test]
 fn glob_exclude_pattern_drops_git_contents() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::create_dir_all(dir.path().join(".git/hooks"))?;
     std::fs::write(dir.path().join(".git/COMMIT_EDITMSG"), "wip")?;
     std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n")?;
@@ -2552,7 +2552,7 @@ fn glob_exclude_pattern_drops_git_contents() -> Result<()> {
 /// output — it must not silently vanish (bug 73).
 #[test]
 fn glob_exclude_pattern_all_excluded_reports_no_match() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::create_dir(dir.path().join("src"))?;
     std::fs::write(dir.path().join("src/a.rs"), "fn a() {}")?;
     std::fs::write(dir.path().join("src/b.rs"), "fn b() {}")?;
@@ -2594,7 +2594,7 @@ fn glob_exclude_pattern_all_excluded_reports_no_match() -> Result<()> {
 /// fix (bug 73) must not disturb grep's already-working exclude.
 #[test]
 fn grep_exclude_pattern_still_excludes() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join("code.rs"), "let needle = 1;\n")?;
     std::fs::write(dir.path().join("notes.txt"), "needle here\n")?;
 

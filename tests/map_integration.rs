@@ -35,7 +35,7 @@ fn spawn_bridge_multi_root(roots: &[&str], lsp_args: Option<&str>) -> Result<Bri
 
 #[test]
 fn test_glob_directory_basic() -> Result<()> {
-    let temp = tempfile::tempdir()?;
+    let temp = common::canonical_tempdir()?;
     std::fs::write(temp.path().join("file1.txt"), "content")?;
     std::fs::create_dir(temp.path().join("subdir"))?;
     std::fs::write(temp.path().join("subdir/file2.rs"), "fn main() {}")?;
@@ -61,7 +61,7 @@ fn test_glob_directory_basic() -> Result<()> {
 
 #[test]
 fn test_glob_directory_symbols() -> Result<()> {
-    let temp = tempfile::tempdir()?;
+    let temp = common::canonical_tempdir()?;
     let script = temp.path().join(format!("types.{MOCK_LANG_A}"));
     std::fs::write(&script, "struct Config\nenum Mode\nconst MAX_SIZE\n")?;
 
@@ -91,7 +91,7 @@ fn test_glob_directory_symbols() -> Result<()> {
 /// header with line count is shown.
 #[test]
 fn test_glob_file_outline() -> Result<()> {
-    let temp = tempfile::tempdir()?;
+    let temp = common::canonical_tempdir()?;
     let script = temp.path().join(format!("types.{MOCK_LANG_A}"));
     std::fs::write(
         &script,
@@ -131,7 +131,7 @@ fn test_glob_file_outline() -> Result<()> {
 /// outline (the reported symptom: deleted/renamed symbols still listed).
 #[test]
 fn test_glob_outline_refreshed_after_host_edit() -> Result<()> {
-    let temp = tempfile::tempdir()?;
+    let temp = common::canonical_tempdir()?;
     let script = temp.path().join(format!("types.{MOCK_LANG_A}"));
     std::fs::write(&script, "struct OldName\nfn keep_me\n")?;
 
@@ -177,7 +177,7 @@ fn test_glob_outline_refreshed_after_host_edit() -> Result<()> {
 /// threading from server → `ResultCache::put` against future regressions.
 #[test]
 fn test_glob_multipage_cache_invalidates_on_host_edit() -> Result<()> {
-    let temp = tempfile::tempdir()?;
+    let temp = common::canonical_tempdir()?;
     // Enough files that the listing spans multiple pages (glob budget is 2000).
     for i in 0..150 {
         std::fs::write(temp.path().join(format!("file_{i:04}.txt")), "only\n")?;
@@ -230,7 +230,7 @@ fn test_glob_multipage_cache_invalidates_on_host_edit() -> Result<()> {
 /// entry is added, and the cache re-stats it on `get`.
 #[test]
 fn test_glob_multipage_cache_invalidates_on_file_added() -> Result<()> {
-    let temp = tempfile::tempdir()?;
+    let temp = common::canonical_tempdir()?;
     for i in 0..150 {
         std::fs::write(temp.path().join(format!("file_{i:04}.txt")), "only\n")?;
     }
@@ -267,8 +267,8 @@ fn test_glob_multipage_cache_invalidates_on_file_added() -> Result<()> {
 #[test]
 fn test_glob_directory_explicit_path() -> Result<()> {
     // When an explicit path is given, even in multi-root mode, only that path is shown
-    let dir_a = tempfile::tempdir()?;
-    let dir_b = tempfile::tempdir()?;
+    let dir_a = common::canonical_tempdir()?;
+    let dir_b = common::canonical_tempdir()?;
 
     std::fs::write(dir_a.path().join("only_a.txt"), "a")?;
     std::fs::write(dir_b.path().join("only_b.txt"), "b")?;

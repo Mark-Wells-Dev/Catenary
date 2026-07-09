@@ -25,7 +25,7 @@ const MOCK_LANG_B: &str = "d5apI";
 
 #[test]
 fn test_mcp_initialize() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn(&[&lsp], dir.path().to_str().context("dir")?)?;
 
@@ -62,7 +62,7 @@ fn test_mcp_initialize() -> Result<()> {
 
 #[test]
 fn test_mcp_tools_list_returns_method_not_found() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn(&[&lsp], dir.path().to_str().context("dir")?)?;
     bridge.initialize()?;
@@ -83,7 +83,7 @@ fn test_mcp_tools_list_returns_method_not_found() -> Result<()> {
 
 #[test]
 fn test_mcp_tools_call_returns_method_not_found() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn(&[&lsp], dir.path().to_str().context("dir")?)?;
     bridge.initialize()?;
@@ -108,7 +108,7 @@ fn test_mcp_tools_call_returns_method_not_found() -> Result<()> {
 
 #[test]
 fn test_mcp_ping() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn(&[&lsp], dir.path().to_str().context("dir")?)?;
     bridge.initialize()?;
@@ -129,8 +129,8 @@ fn test_mcp_ping() -> Result<()> {
 #[test]
 fn test_multi_root_find_symbol() -> Result<()> {
     // Create two roots with unique function names
-    let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
-    let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
+    let dir_a = common::canonical_tempdir().context("Failed to create temp dir A")?;
+    let dir_b = common::canonical_tempdir().context("Failed to create temp dir B")?;
 
     let script_a = dir_a.path().join(format!("alpha.{MOCK_LANG_A}"));
     std::fs::write(&script_a, "function alpha_func()\nalpha_func\n")?;
@@ -172,8 +172,8 @@ fn test_multi_root_find_symbol() -> Result<()> {
 #[test]
 fn test_multi_root_glob_file() -> Result<()> {
     // Create two roots with different outline symbols
-    let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
-    let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
+    let dir_a = common::canonical_tempdir().context("Failed to create temp dir A")?;
+    let dir_b = common::canonical_tempdir().context("Failed to create temp dir B")?;
 
     let script_a = dir_a.path().join(format!("syms_a.{MOCK_LANG_A}"));
     std::fs::write(&script_a, "struct AlphaType\nenum BetaMode\n")?;
@@ -220,8 +220,8 @@ fn test_multi_root_glob_file() -> Result<()> {
 /// query.
 #[test]
 fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
-    let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
-    let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
+    let dir_a = common::canonical_tempdir().context("Failed to create temp dir A")?;
+    let dir_b = common::canonical_tempdir().context("Failed to create temp dir B")?;
 
     let script_a = dir_a.path().join(format!("funcs_a.{MOCK_LANG_A}"));
     std::fs::write(
@@ -306,7 +306,7 @@ fn test_sync_roots_restart_no_workspace_folders() -> Result<()> {
 
 #[test]
 fn test_roots_list_after_initialize() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("dir")?;
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
@@ -334,7 +334,7 @@ fn test_roots_list_after_initialize() -> Result<()> {
 
 #[test]
 fn test_roots_list_changed_notification() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("dir")?;
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
@@ -393,7 +393,7 @@ fn test_roots_list_changed_notification() -> Result<()> {
 
 #[test]
 fn test_no_roots_request_without_capability() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
     let mut bridge = BridgeProcess::spawn(&[&lsp], dir.path().to_str().context("dir")?)?;
 
@@ -437,8 +437,8 @@ fn test_mockls_sync_roots_across_profiles() -> Result<()> {
     ];
 
     for (name, flags) in profiles {
-        let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
-        let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
+        let dir_a = common::canonical_tempdir().context("Failed to create temp dir A")?;
+        let dir_b = common::canonical_tempdir().context("Failed to create temp dir B")?;
 
         let script_a = dir_a.path().join(format!("funcs_a.{MOCK_LANG_A}"));
         std::fs::write(&script_a, "fn unique_root_a_func()\nunique_root_a_func\n")?;
@@ -512,8 +512,8 @@ fn test_mockls_sync_roots_across_profiles() -> Result<()> {
 /// fallback must transition the server back to `Ready`.
 #[test]
 fn test_mockls_sync_roots_no_progress_no_hang() -> Result<()> {
-    let dir_a = tempfile::tempdir().context("Failed to create temp dir A")?;
-    let dir_b = tempfile::tempdir().context("Failed to create temp dir B")?;
+    let dir_a = common::canonical_tempdir().context("Failed to create temp dir A")?;
+    let dir_b = common::canonical_tempdir().context("Failed to create temp dir B")?;
 
     let file_a = dir_a.path().join(format!("funcs_a.{MOCK_LANG_A}"));
     std::fs::write(&file_a, "fn hello()\nhello\n")?;
@@ -581,7 +581,7 @@ fn test_mockls_sync_roots_no_progress_no_hang() -> Result<()> {
 #[test]
 fn test_mockls_multiplexing() -> Result<()> {
     // Spawn two mockls instances as different languages
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     let shell_file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&shell_file, "fn greet()\ngreet\n")?;
@@ -622,7 +622,7 @@ fn test_mockls_multiplexing() -> Result<()> {
 /// advertise `textDocumentSync.save` (Gap 2 negative case).
 #[test]
 fn test_mockls_did_save_not_sent_without_capability() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
     let test_file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&test_file, "echo hello\n")?;
@@ -656,7 +656,7 @@ fn test_mockls_did_save_not_sent_without_capability() -> Result<()> {
 /// `textDocumentSync.save` (Gap 2 positive case).
 #[test]
 fn test_mockls_did_save_sent_with_capability() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
     let test_file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&test_file, "echo hello\n")?;
@@ -690,7 +690,7 @@ fn test_mockls_did_save_sent_with_capability() -> Result<()> {
 /// atom (bug 47: `prepareRename` gates enrichment, never membership).
 #[test]
 fn test_search_graceful_degradation() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let test_file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&test_file, "fn greet()\ngreet\n")?;
 
@@ -739,11 +739,11 @@ fn test_search_graceful_degradation() -> Result<()> {
 /// failure detection, but grep degrades gracefully via ripgrep.
 #[test]
 fn test_wait_ready_failure_detection() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let test_file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&test_file, "echo hello\n")?;
 
-    let dir2 = tempfile::tempdir()?;
+    let dir2 = common::canonical_tempdir()?;
 
     let lsp = mockls_lsp_arg(
         MOCK_LANG_A,
@@ -809,7 +809,7 @@ fn test_wait_ready_failure_detection() -> Result<()> {
 /// server responds to requests after the CPU burn finishes.
 #[test]
 fn test_warmup_observation() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let test_file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&test_file, "fn my_function()\nmy_function\n")?;
 
@@ -842,7 +842,7 @@ fn test_warmup_observation() -> Result<()> {
 /// ripgrep; with it, LSP workspace symbols appear in the `## Symbols` section.
 #[test]
 fn test_search_symbols_with_scan_roots() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let test_file = dir.path().join(format!("greeter.{MOCK_LANG_A}"));
     std::fs::write(&test_file, "fn greet()\ngreet\n")?;
 
@@ -868,7 +868,7 @@ fn test_search_symbols_with_scan_roots() -> Result<()> {
 /// Verifies classified output for two symbols found via alternation.
 #[test]
 fn test_grep_per_symbol_output() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     let file_a = dir.path().join(format!("mod_a.{MOCK_LANG_A}"));
     std::fs::write(&file_a, "fn load_config()\nload_config\n")?;
@@ -909,7 +909,7 @@ fn test_grep_per_symbol_output() -> Result<()> {
 /// Verifies that grep finds symbols via ripgrep + prepareRename (no grammar).
 #[test]
 fn test_grep_resolve_provider() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     let test_file = dir.path().join(format!("resolve.{MOCK_LANG_A}"));
     std::fs::write(&test_file, "fn resolve_me()\nresolve_me\n")?;
@@ -937,7 +937,7 @@ fn test_grep_resolve_provider() -> Result<()> {
 /// `pattern: "alpha_func|beta_func"` should find both files in a single root.
 #[test]
 fn test_grep_alternation() -> Result<()> {
-    let dir = tempfile::tempdir().context("Failed to create temp dir")?;
+    let dir = common::canonical_tempdir().context("Failed to create temp dir")?;
 
     let script_a = dir.path().join(format!("alpha.{MOCK_LANG_A}"));
     std::fs::write(&script_a, "function alpha_func()\nalpha_func\n")?;
@@ -1040,7 +1040,7 @@ fn test_grep_enrichment_threshold_broad() -> Result<()> {
 /// should be grouped under `# matched_text` headings when queried with alternation.
 #[test]
 fn test_grep_rg_only_groups_by_matched_string() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     // Create files with no symbol definitions — just plain text
     let file_a = dir.path().join(format!("notes.{MOCK_LANG_A}"));
@@ -1092,7 +1092,7 @@ fn test_grep_rg_only_groups_by_matched_string() -> Result<()> {
 /// heading receive the correct rg hits, not all dumped under the first one.
 #[test]
 fn test_grep_alternation_routes_non_code_hits() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     // File with a symbol definition for "compute" and a plain mention of "render"
     let file_a = dir.path().join(format!("engine.{MOCK_LANG_A}"));
@@ -1138,7 +1138,7 @@ fn test_grep_alternation_routes_non_code_hits() -> Result<()> {
 /// heading with two `##` sub-headings, each showing their own references.
 #[test]
 fn test_grep_two_defs_same_name_per_heading_refs() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     let file_a = dir.path().join(format!("impl_a.{MOCK_LANG_A}"));
     std::fs::write(&file_a, "fn process()\nprocess\n")?;
@@ -1176,7 +1176,7 @@ fn test_grep_two_defs_same_name_per_heading_refs() -> Result<()> {
 /// per-query lookup combined with `--resolve-provider` so results need resolve.
 #[test]
 fn test_grep_resolve_fallback_path() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     let test_file = dir.path().join(format!("fallback.{MOCK_LANG_A}"));
     std::fs::write(&test_file, "fn resolve_fallback()\nresolve_fallback\n")?;
@@ -1208,7 +1208,7 @@ fn test_grep_resolve_fallback_path() -> Result<()> {
 /// produces a single `#` heading with `##` sub-headings from each server.
 #[test]
 fn test_grep_cross_server_same_symbol() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     let file_a = dir.path().join(format!("shared.{MOCK_LANG_A}"));
     std::fs::write(&file_a, "fn cross_server_fn()\ncross_server_fn\n")?;
@@ -1246,7 +1246,7 @@ fn test_grep_cross_server_same_symbol() -> Result<()> {
 /// listing the enclosing caller name.
 #[test]
 fn test_grep_enrichment_incoming_calls() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     let test_file = dir.path().join(format!("calls.{MOCK_LANG_A}"));
     std::fs::write(&test_file, "fn callee_fn()\nfn caller_fn()\n  callee_fn\n")?;
@@ -1274,7 +1274,7 @@ fn test_grep_enrichment_incoming_calls() -> Result<()> {
 /// Verifies that enrichment for a type with implementors runs without error.
 #[test]
 fn test_grep_enrichment_implementations() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     // mockls `handle_implementation` returns `implements`-based implementors;
     // `Hello implements Greeter`, so enrichment for `Greeter` exercises the
@@ -1304,7 +1304,7 @@ fn test_grep_enrichment_implementations() -> Result<()> {
 /// Verifies that enrichment for types with subtypes runs without error.
 #[test]
 fn test_grep_enrichment_subtypes() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     let test_file = dir.path().join(format!("types.{MOCK_LANG_A}"));
     std::fs::write(
@@ -1332,7 +1332,7 @@ fn test_grep_enrichment_subtypes() -> Result<()> {
 /// and enclosing scope. No bootstrap or workspace/symbol needed.
 #[test]
 fn test_symbol_index_finds_methods() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // Struct with a method inside it — documentSymbol should find the
@@ -1368,7 +1368,7 @@ fn test_symbol_index_finds_methods() -> Result<()> {
 /// prepareRename path (no symbol index data) (prepareRename) identifies symbols.
 #[test]
 fn test_grep_basic_hits() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let file = dir.path().join(format!("greet.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn say_hello()\nsay_hello\n")?;
 
@@ -1395,7 +1395,7 @@ fn test_grep_basic_hits() -> Result<()> {
 /// Grep with `glob` scoping — only matching files appear.
 #[test]
 fn test_grep_glob_scoping() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let src_dir = dir.path().join("src");
     std::fs::create_dir(&src_dir)?;
     let file_a = src_dir.join(format!("a.{MOCK_LANG_A}"));
@@ -1436,7 +1436,7 @@ fn test_grep_glob_scoping() -> Result<()> {
 /// Grep with `exclude` — test files excluded from matches.
 #[test]
 fn test_grep_exclude() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let file_a = dir.path().join(format!("main.{MOCK_LANG_A}"));
     std::fs::write(&file_a, "fn excl_func()\nexcl_func\n")?;
     let file_b = dir.path().join(format!("test_main.{MOCK_LANG_A}"));
@@ -1474,7 +1474,7 @@ fn test_grep_exclude() -> Result<()> {
 /// `foo|bar` pattern produces two independent result sections.
 #[test]
 fn test_grep_alternation_split() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let file_a = dir.path().join(format!("alt_a.{MOCK_LANG_A}"));
     std::fs::write(&file_a, "fn alt_alpha()\nalt_alpha\n")?;
     let file_b = dir.path().join(format!("alt_b.{MOCK_LANG_A}"));
@@ -1502,7 +1502,7 @@ fn test_grep_alternation_split() -> Result<()> {
 /// `(foo|bar)_baz` pattern is a single result section (not split).
 #[test]
 fn test_grep_alternation_nested() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let file = dir.path().join(format!("nested.{MOCK_LANG_A}"));
     std::fs::write(
         &file,
@@ -1533,7 +1533,7 @@ fn test_grep_alternation_nested() -> Result<()> {
 /// the keyword hit as a definition.
 #[test]
 fn test_grep_keyword_hit_returned_as_reference() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let file = dir.path().join(format!("kw.{MOCK_LANG_A}"));
     std::fs::write(&file, "struct MyType\n")?;
 
@@ -1557,7 +1557,7 @@ fn test_grep_keyword_hit_returned_as_reference() -> Result<()> {
 /// Definitions render as full-source-line atoms — no `<Kind>` labels.
 #[test]
 fn test_grep_kind_brackets() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // File with matching language extension so documentSymbol populates the index
@@ -1594,7 +1594,7 @@ fn test_grep_kind_brackets() -> Result<()> {
 /// Uses the mock grammar's brace-delimited block syntax: `fn outer { target }`.
 #[test]
 fn test_grep_reference_enclosing() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // fn outer spans lines 0-2, "target" on line 1 is enclosed by it
@@ -1631,7 +1631,7 @@ fn test_grep_reference_enclosing() -> Result<()> {
 /// since 08a — defensive maps with LSP symbols added in 08b).
 #[test]
 fn test_glob_parent_id_threading() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let test_file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&test_file, "fn hello()\nhello\n")?;
 
@@ -1659,7 +1659,7 @@ fn test_glob_parent_id_threading() -> Result<()> {
 /// Name grouping: definitions with enclosing structures and spans.
 #[test]
 fn test_grep_name_grouping() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // Create multiple .mock files with definitions and references
@@ -1713,7 +1713,7 @@ fn test_grep_name_grouping() -> Result<()> {
 /// Basic grep: definition and reference lines with line numbers.
 #[test]
 fn test_grep_basic_output() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let file = dir.path().join(format!("data.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn say_hello()\nsay_hello\n")?;
 
@@ -1744,7 +1744,7 @@ fn test_grep_basic_output() -> Result<()> {
 /// daemon to prove the count never touches the symbol pipeline.
 #[test]
 fn test_grep_count_reports_totals() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(
         dir.path().join("data.txt"),
         "say_hello here\nand say_hello again\nunrelated line\n",
@@ -1784,7 +1784,7 @@ fn test_grep_count_reports_totals() -> Result<()> {
 /// `rg -c 'a|b'`.
 #[test]
 fn test_grep_count_alternation_counts_lines_once() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     std::fs::write(
         dir.path().join("data.txt"),
         "foo bar\nfoo only\nbar only\nnothing\n",
@@ -1812,7 +1812,7 @@ fn test_grep_count_alternation_counts_lines_once() -> Result<()> {
 /// Narrow pattern: definition renders as a full-source-line atom.
 #[test]
 fn test_grep_narrow_pattern() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     let file = dir.path().join(format!("narrow.{MOCK_LANG_A}"));
@@ -1842,7 +1842,7 @@ fn test_grep_narrow_pattern() -> Result<()> {
 /// number, no `:start-end` range.
 #[test]
 fn test_grep_single_line_structure() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // Single-line definition (no brace block)
@@ -1872,7 +1872,7 @@ fn test_grep_single_line_structure() -> Result<()> {
 /// No blank line separators between name groups.
 #[test]
 fn test_grep_no_blank_lines() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     let file = dir.path().join(format!("multi.{MOCK_LANG_A}"));
@@ -1957,7 +1957,7 @@ fn test_grep_prepare_rename_priority_chain() -> Result<()> {
 /// Enrichment runs via the pipeline.
 #[test]
 fn test_enrich_ungated_function() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     // callee_fn defined on L0, caller_fn defined on L1, caller_fn calls callee_fn on L2
     let file = dir.path().join(format!("func.{MOCK_LANG_A}"));
@@ -1983,7 +1983,7 @@ fn test_enrich_ungated_function() -> Result<()> {
 /// Uses the prepareRename path (no symbol index data).
 #[test]
 fn test_enrich_ungated_type() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     let file = dir.path().join(format!("types.{MOCK_LANG_A}"));
     std::fs::write(
@@ -2011,7 +2011,7 @@ fn test_enrich_ungated_type() -> Result<()> {
 /// with recognized declaration keywords.
 #[test]
 fn test_enrich_symbol_index_path() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // File with matching language extension
@@ -2042,7 +2042,7 @@ fn test_enrich_symbol_index_path() -> Result<()> {
 /// so the symbol index classifies the hit. Enrichment proceeds.
 #[test]
 fn test_enrich_prepare_rename_symbol() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     let file = dir.path().join(format!("sym.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn enrichable_sym\nenrichable_sym\n")?;
@@ -2074,7 +2074,7 @@ fn test_enrich_prepare_rename_symbol() -> Result<()> {
 /// definition, and `prepareRename` returning null no longer drops it.
 #[test]
 fn test_enrich_prepare_rename_keyword() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     // File with a function definition — `documentSymbol` reports `my_symbol`
     // at line 0. A grep for `^fn ` hits the `fn` keyword position, not the name.
@@ -2103,7 +2103,7 @@ fn test_enrich_prepare_rename_keyword() -> Result<()> {
 /// filtered out. `prepare_rename_check` gates enrichment only.
 #[test]
 fn test_keyword_no_grammar_returned_as_reference() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     // File with no declaration-keyword-at-line-start patterns, so mockls's
     // `documentSymbol` returns empty → the symbol index has no data for this
@@ -2146,7 +2146,7 @@ fn test_keyword_no_grammar_returned_as_reference() -> Result<()> {
 /// not themselves symbols.
 #[test]
 fn test_grep_prose_body_text_not_dropped() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     let file = dir.path().join(format!("notes.{MOCK_LANG_A}"));
@@ -2184,7 +2184,7 @@ fn test_grep_prose_body_text_not_dropped() -> Result<()> {
 /// (refs, impls) via `enrich_at_position`.
 #[test]
 fn test_enrich_prepare_rename_path() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     // No `fn`/`struct`/etc. at line start → mockls returns empty
     // documentSymbol → symbol index empty → prepareRename path.
@@ -2219,7 +2219,7 @@ fn test_enrich_prepare_rename_path() -> Result<()> {
 /// when the declaration line contains @deprecated.
 #[test]
 fn test_enrich_deprecated_type_edge() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     let file = dir.path().join(format!("depr.{MOCK_LANG_A}"));
     std::fs::write(
@@ -2256,7 +2256,7 @@ fn test_enrich_deprecated_type_edge() -> Result<()> {
 /// names called within the body.
 #[test]
 fn test_enrich_outgoing_calls() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     // helper_a and helper_b defined, then main_fn calls them
     let file = dir.path().join(format!("out.{MOCK_LANG_A}"));
@@ -2290,7 +2290,7 @@ fn test_enrich_outgoing_calls() -> Result<()> {
 /// enrichment methods caused mockls to lose pre-indexed state.
 #[test]
 fn test_grep_grammar_path_calls() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     let file = dir.path().join(format!("gpcalls.{MOCK_LANG_A}"));
@@ -2316,7 +2316,7 @@ fn test_grep_grammar_path_calls() -> Result<()> {
 /// Enriched: `calls:` section with outgoing-call edge atoms (full source lines).
 #[test]
 fn test_grep_enriched() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // callee defined first, then caller with callee in body.
@@ -2359,7 +2359,7 @@ fn test_grep_enriched() -> Result<()> {
 /// enriched output. The first call populates the cache; the second hits it.
 #[test]
 fn test_grep_enrichment_cache_hit() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     let file = dir.path().join(format!("cache.{MOCK_LANG_A}"));
@@ -2399,7 +2399,7 @@ fn test_grep_enrichment_cache_hit() -> Result<()> {
 /// `documentSymbol` instead of serving the pre-edit name.
 #[test]
 fn test_grep_enclosing_label_refreshed_after_diagnostics() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // `outer_old` is a function definition on line 1.
@@ -2455,7 +2455,7 @@ fn bump_mtime(path: &std::path::Path) -> Result<()> {
 /// `grep` between a host edit and the next diagnostics served stale rows).
 #[test]
 fn test_grep_enclosing_label_refreshed_after_host_edit() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // `outer_old` is a function definition on line 1.
@@ -2503,7 +2503,7 @@ fn test_grep_enclosing_label_refreshed_after_host_edit() -> Result<()> {
 /// and the OS bumps a directory's mtime when a file is added to it.
 #[test]
 fn test_grep_multipage_cache_invalidates_on_file_added() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // One file with many reference matches → a multi-page result (grep budget
@@ -2563,7 +2563,7 @@ fn test_grep_multipage_cache_invalidates_on_file_added() -> Result<()> {
 /// Type hierarchy: subtypes section present for interface pattern.
 #[test]
 fn test_grep_type_hierarchy() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // Use `struct` for both — the mock grammar only supports fn/struct.
@@ -2601,7 +2601,7 @@ fn test_grep_type_hierarchy() -> Result<()> {
 /// atom — no `<Kind>` labels and no `/`-separated scope path.
 #[test]
 fn test_grep_path_syntax() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // Nested function inside struct — formerly exercised `/`-separated scope path
@@ -2632,7 +2632,7 @@ fn test_grep_path_syntax() -> Result<()> {
 /// Refs: lines ascending within file for same-file references.
 #[test]
 fn test_grep_refs_sort() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // Symbol defined on L0, referenced on L2 and L4 (same file).
@@ -2674,7 +2674,7 @@ fn test_grep_refs_sort() -> Result<()> {
 /// Outgoing calls sorted alphabetically.
 #[test]
 fn test_grep_outgoing_calls_sorted() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // main calls beta and alpha — should appear alpha before beta in calls:
@@ -2705,7 +2705,7 @@ fn test_grep_outgoing_calls_sorted() -> Result<()> {
 /// full-source-line atom — no Catenary-added deprecation tag.
 #[test]
 fn test_grep_deprecated() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // Use `struct` for both — the mock grammar only supports fn/struct.
@@ -2797,7 +2797,7 @@ fn test_grep_paged_integration() -> Result<()> {
 /// Fish-eye: rich symbol (with calls) gets full format, lean gets single line.
 #[test]
 fn test_grep_fish_eye() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // rich_fn calls lean_fn. Pattern targets only rich_fn.
@@ -2827,7 +2827,7 @@ fn test_grep_fish_eye() -> Result<()> {
 /// Property order: calls → impls → supertypes → subtypes → refs.
 #[test]
 fn test_grep_property_order() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // Function with calls and refs
@@ -2859,7 +2859,7 @@ fn test_grep_property_order() -> Result<()> {
 /// Name grouping: bare name at depth 0, definitions indented below.
 #[test]
 fn test_grep_enriched_name_grouping() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     let file = dir.path().join(format!("group.{MOCK_LANG_A}"));
@@ -2893,7 +2893,7 @@ fn test_grep_enriched_name_grouping() -> Result<()> {
 /// Cross-definition dedup: impl suppressed when listed in struct's impls.
 #[test]
 fn test_grep_cross_def_dedup() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // struct + impl block matching the same name. mockls routes implementation
@@ -2928,7 +2928,7 @@ fn test_grep_cross_def_dedup() -> Result<()> {
 /// Uses prepareRename path (no symbol index data) so mockls has all documents open for enrichment.
 #[test]
 fn test_grep_refs_dedup_labeled() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     // struct defined, then a reference on L1. mockls routes implementation
     // to references, so the same line may appear in both impls and refs.
@@ -2976,7 +2976,7 @@ fn test_grep_refs_dedup_labeled() -> Result<()> {
 /// Uses prepareRename path (no symbol index data) for reliable enrichment.
 #[test]
 fn test_grep_incoming_calls_merge() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     // target defined on L0, caller on L1, caller calls target on L2
     let file = dir.path().join(format!("incoming.{MOCK_LANG_A}"));
@@ -3020,7 +3020,7 @@ fn test_grep_incoming_calls_merge() -> Result<()> {
 /// `Drawable` surfaces its implementor `Sprite`.
 #[test]
 fn test_grep_impls_structure() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
 
     let file = dir.path().join(format!("impls.{MOCK_LANG_A}"));
     std::fs::write(
@@ -3055,7 +3055,7 @@ fn test_grep_impls_structure() -> Result<()> {
 /// Single-line ref: atoms carry a single `:LINE`, never a `:start-end` range.
 #[test]
 fn test_grep_single_line_ref() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     // Single-line function defined on L0, referenced on L1 inside another fn.
@@ -3098,7 +3098,7 @@ fn test_grep_single_line_ref() -> Result<()> {
 /// cancellation). Verifies the bridge still responds to ping afterward.
 #[test]
 fn test_mcp_cancel_nonexistent_is_noop() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let root = dir.path().to_str().context("root path")?;
 
     let lsp = mockls_lsp_arg(MOCK_LANG_A, "");

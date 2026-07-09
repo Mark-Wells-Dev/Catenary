@@ -333,12 +333,28 @@ impl HookRouter {
         // mode and the root lock — parallel first-edits all succeed and none can
         // reject the others (race-free by construction).
         if is_edit_tool(tool_name) {
-            if file_path.is_some_and(|p| !self.session.covered_for_diagnostics(Path::new(p))) {
+            // Canonicalize the edit path (when it exists) BEFORE the coverage check
+            // and the guardrail: roots are canonical, so a symlinked-prefix path
+            // (macOS `$TMPDIR` → `/private/var/…`) would otherwise fail both the
+            // roots prefix test — an in-root edit mis-classed as uncovered, so the
+            // gate lets it flow free without entering editing mode — and the
+            // guardrail's `resolve_root`, silently skipping the cross-session lock.
+            // Matches the accumulation path (`handle_file_accumulation`). A
+            // not-yet-existing edit target keeps its spelling.
+            let canonical = file_path.map(|p| {
+                Path::new(p)
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(p))
+            });
+            if canonical
+                .as_deref()
+                .is_some_and(|p| !self.session.covered_for_diagnostics(p))
+            {
                 return None;
             }
             // Cross-session guardrail before claiming the root: if another
             // session is editing it, deny without entering editing mode.
-            if let Some(deny) = self.acquire_editing_guardrail(file_path) {
+            if let Some(deny) = self.acquire_editing_guardrail(canonical.as_deref()) {
                 return Some(deny);
             }
             // The first covered edit implicitly enters editing mode. `Ok` means
@@ -479,11 +495,12 @@ impl HookRouter {
     /// for this session, or there is no guardrail / no resolvable root).
     /// Locks are acquired lazily per-root, so only roots with actual edits
     /// are locked.
-    fn acquire_editing_guardrail(&self, file_path: Option<&str>) -> Option<HookResult> {
+    /// `file_path` must already be canonicalized by the caller (roots are
+    /// canonical, so `resolve_root` needs a canonical path to match) — see
+    /// [`Self::handle_enforce_editing`].
+    fn acquire_editing_guardrail(&self, file_path: Option<&Path>) -> Option<HookResult> {
         if let Some(guardrail) = &self.session.editing_guardrail
-            && let Some(root) = file_path
-                .map(Path::new)
-                .and_then(|p| self.session.resolve_root(p))
+            && let Some(root) = file_path.and_then(|p| self.session.resolve_root(p))
             && let Err(msg) = guardrail.try_acquire(&root, &self.session.instance_id)
         {
             return Some(HookResult::Deny(msg));
@@ -511,7 +528,20 @@ impl HookRouter {
         // Only accumulate files a diagnostic feeder covers whose root has not
         // suppressed the diagnostics surface — files without coverage (or in a
         // `disable_diag` root) have nothing to report in done_editing.
-        let path = Path::new(file_path);
+        //
+        // Canonicalize the edit path (when it exists) BEFORE the coverage check:
+        // roots are canonical (the daemon canonicalizes `CATENARY_ROOTS` and every
+        // ephemeral mount), but the host passes the file path verbatim. On a
+        // symlinked-tempdir host (macOS `$TMPDIR` → `/private/var/…`, or any
+        // symlinked prefix) the two spellings differ, so the un-canonicalized path
+        // would fail the roots prefix check and a genuinely covered edit would be
+        // mis-filed as out-of-root. Canonicalizing here compares canonical-to-
+        // canonical and stores the canonical path in the batch, matching the
+        // convention `ensure_ephemeral_mounts` already follows. A not-yet-existing
+        // path keeps its spelling (canonicalize can't resolve it).
+        let raw = Path::new(file_path);
+        let owned = raw.canonicalize().unwrap_or_else(|_| raw.to_path_buf());
+        let path = owned.as_path();
         if self.session.covered_for_diagnostics(path) {
             // A covered edit entered editing mode in `handle_enforce_editing`
             // (an allowed, non-guardrail-denied covered edit always does), so
@@ -594,12 +624,17 @@ impl HookRouter {
         let mut started = self.session.editing.is_editing(session_id, agent_id);
         let mut filtered = 0usize;
         for path in writes {
-            if self.session.covered_for_diagnostics(path) {
+            // Canonicalize (when it exists) before the coverage check so a
+            // symlinked prefix does not mis-file a covered write as out-of-root —
+            // the same canonical-to-canonical alignment `handle_file_accumulation`
+            // applies. A not-yet-created write target keeps its spelling.
+            let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if self.session.covered_for_diagnostics(&path) {
                 if !started {
                     let _ = self.session.editing.start_editing(session_id, agent_id);
                     started = true;
                 }
-                self.record_covered_write(path, session_id, agent_id, "wrote");
+                self.record_covered_write(&path, session_id, agent_id, "wrote");
             } else {
                 filtered += 1;
             }

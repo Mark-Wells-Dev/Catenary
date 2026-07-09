@@ -57,7 +57,10 @@ const MOCK_LANG_S: &str = "z9Qw7";
 /// this guard pins it green.
 #[test]
 fn ws31_review_r1_scoped_grep_no_spurious_delete() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    // Canonical tempdir: the daemon's coherence-walk URIs are canonical, so the
+    // `dir.path()`-derived expected URIs must be too (macOS symlinked-tempdir
+    // class; a symlinked `TMPDIR` on Linux reproduces it).
+    let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
 
     let a = dir.path().join("a");
@@ -164,7 +167,10 @@ fn ws31_review_r1_incomplete_observation_not_reaped() -> Result<()> {
     }
 
     // DEFAULT tempdir() → /tmp (tmpfs), which populates d_type. See precondition.
-    let dir = tempfile::tempdir()?;
+    // Canonicalized so the `dir.path()`-derived expected URIs match the daemon's
+    // canonical coherence-walk URIs (macOS symlinked-tempdir class). `/tmp` is
+    // already canonical on Linux, so the tmpfs/`d_type` precondition is preserved.
+    let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
 
     let sub = dir.path().join("sub");
@@ -618,7 +624,9 @@ fn ws31_review_r4_eviction_witnessed_via_request_count() -> Result<()> {
 /// GREEN today.
 #[test]
 fn ws31_review_r4_second_walk_emits_empty_changeset() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    // Canonical tempdir so the `dir.path()`-derived expected URIs match the
+    // daemon's canonical coherence-walk URIs (macOS symlinked-tempdir class).
+    let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
     std::fs::write(dir.path().join(format!("a.{MOCK_LANG}")), "needle\n")?;
     std::fs::write(dir.path().join(format!("b.{MOCK_LANG}")), "other\n")?;
@@ -888,7 +896,9 @@ fn ws31_review_r4_covering_watchers_subdir_scope() -> Result<()> {
 /// routed `Deleted` IS recorded in the log.
 #[test]
 fn ws31_review_c4_edited_then_deleted_drives_exclude() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    // Canonical tempdir so the `dir.path()`-derived expected URIs match the
+    // daemon's canonical coherence-walk URIs (macOS symlinked-tempdir class).
+    let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
     let live = dir.path().join(format!("live.{MOCK_LANG}"));
     let gone = dir.path().join(format!("gone.{MOCK_LANG}"));
@@ -1098,7 +1108,10 @@ fn ws31_review_d_diagnostics_stat_miss_not_reaped() -> Result<()> {
     }
 
     // DEFAULT tempdir() → tmpfs, which populates d_type. See precondition.
-    let dir = tempfile::tempdir()?;
+    // Canonicalized so the `dir.path()`-derived expected URIs match the daemon's
+    // canonical coherence-walk URIs (macOS symlinked-tempdir class); `/tmp` is
+    // already canonical on Linux, so the tmpfs/`d_type` precondition holds.
+    let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
 
     let sub = dir.path().join("sub");

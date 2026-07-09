@@ -35,7 +35,7 @@ const MOCK_LANG_B: &str = "d5apI";
 /// once as `Changed` (`FileChangeType` 2). The first walk *is* the snapshot.
 #[test]
 fn first_walk_sends_full_candidate_set() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
     std::fs::write(dir.path().join(format!("a.{MOCK_LANG_A}")), "needle\n")?;
     std::fs::write(dir.path().join(format!("b.{MOCK_LANG_A}")), "other\n")?;
@@ -81,7 +81,7 @@ fn first_walk_sends_full_candidate_set() -> Result<()> {
 /// (the bug-38 no-repeat property).
 #[test]
 fn second_walk_sends_only_delta() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
     std::fs::write(dir.path().join(format!("a.{MOCK_LANG_A}")), "needle\n")?;
 
@@ -144,7 +144,7 @@ fn second_walk_sends_only_delta() -> Result<()> {
 /// gets nothing on the second walk.
 #[test]
 fn external_change_routed_to_matching_server_only() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let log_a = dir.path().join("notifications_a.jsonl");
     let log_b = dir.path().join("notifications_b.jsonl");
     let changed = dir.path().join(format!("watched.{MOCK_LANG_A}"));
@@ -226,7 +226,7 @@ fn external_change_routed_to_matching_server_only() -> Result<()> {
 /// baseline (the first walk's cold snapshot is always `Changed`).
 #[test]
 fn created_file_routed_with_created_wire_type() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let log_create = dir.path().join("notifications_create.jsonl");
     let log_change = dir.path().join("notifications_change.jsonl");
     // Seed with one existing file so the first grep has a match. It is modified on
@@ -316,7 +316,7 @@ fn created_file_routed_with_created_wire_type() -> Result<()> {
 /// suppressed for a Create-only server.
 #[test]
 fn changed_file_routed_with_changed_wire_type() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let log_change = dir.path().join("notifications_change.jsonl");
     let log_create = dir.path().join("notifications_create.jsonl");
     let existing = dir.path().join(format!("existing.{MOCK_LANG_A}"));
@@ -402,7 +402,7 @@ fn changed_file_routed_with_changed_wire_type() -> Result<()> {
 /// file rides the nudge. The edited files are NOT in the changed-set nudge.
 #[test]
 fn diagnostics_excludes_edited_set() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
     let edited = dir.path().join(format!("edited.{MOCK_LANG_A}"));
     let external = dir.path().join(format!("external.{MOCK_LANG_A}"));
@@ -462,7 +462,7 @@ fn diagnostics_excludes_edited_set() -> Result<()> {
 /// covering server is registered.
 #[test]
 fn count_grep_does_no_coherence_walk() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
     let a = dir.path().join(format!("a.{MOCK_LANG_A}"));
     std::fs::write(&a, "needle\n")?;
@@ -526,7 +526,7 @@ fn count_grep_does_no_coherence_walk() -> Result<()> {
 /// watch, so a coherence walk would route nothing.
 #[test]
 fn no_lsp_query_no_nudge() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
     std::fs::write(dir.path().join(format!("a.{MOCK_LANG_A}")), "needle\n")?;
 
@@ -567,7 +567,7 @@ fn no_lsp_query_no_nudge() -> Result<()> {
 /// server receives `Deleted` (wire `FileChangeType` 3) for the gone file.
 #[test]
 fn enriched_grep_full_walk_reaps_deletion() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
     let keep = dir.path().join(format!("keep.{MOCK_LANG_A}"));
     let gone = dir.path().join(format!("gone.{MOCK_LANG_A}"));
@@ -612,7 +612,7 @@ fn enriched_grep_full_walk_reaps_deletion() -> Result<()> {
 /// (not in the edited-set) is reaped as `Deleted` (wire `FileChangeType` 3).
 #[test]
 fn diagnostics_full_walk_reaps_deletion() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
     let edited = dir.path().join(format!("edited.{MOCK_LANG_A}"));
     let gone = dir.path().join(format!("gone.{MOCK_LANG_A}"));
@@ -662,7 +662,7 @@ fn diagnostics_full_walk_reaps_deletion() -> Result<()> {
 /// walk reaps the gone file as `Deleted` (wire `FileChangeType` 3).
 #[test]
 fn delete_only_watcher_reaps_deletion() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
     // `keep` survives so the post-deletion grep still matches a file under the
     // root, running the full walk that reaps `gone`.
@@ -730,7 +730,7 @@ fn delete_only_watcher_reaps_deletion() -> Result<()> {
 /// changed is routed.
 #[test]
 fn glob_scoped_adds_but_never_reaps() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
     // `sub/` holds the globbed file; `outside.*` lives at the root, out of the
     // `sub/` glob pattern.
@@ -796,7 +796,7 @@ fn glob_scoped_adds_but_never_reaps() -> Result<()> {
 /// outline.
 #[test]
 fn glob_routes_changed_then_queries_outline() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
     let file = dir.path().join(format!("outline.{MOCK_LANG_A}"));
     std::fs::write(&file, "fn original() {}\n")?;

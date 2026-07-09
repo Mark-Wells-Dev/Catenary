@@ -104,6 +104,31 @@ pub fn keep_for_triage(dir: &mut tempfile::TempDir) {
     }
 }
 
+/// A [`tempfile::tempdir`] whose `path()` is already **canonical**.
+///
+/// The daemon canonicalizes every root it tracks (`CATENARY_ROOTS`, ephemeral
+/// mounts, worktree mounts — see `RootTracker` and `ensure_ephemeral_mounts`),
+/// so every path and `file://` URI it emits is canonical. A plain
+/// `tempfile::tempdir()` roots under `$TMPDIR`, which on macOS is a symlink
+/// (`/var/folders/…` → `/private/var/folders/…`); its `path()` is then the
+/// *symlinked* spelling. A test that derives roots, file paths, or expected URIs
+/// from that symlinked `path()` and compares them against the daemon's canonical
+/// output never matches — the whole macOS path-canonicalization failure class.
+///
+/// Creating the tempdir inside a canonicalized base makes `path()` canonical, so
+/// every `dir.path().join(…)` / `dir.path().display()` downstream lines up with
+/// the daemon with no per-site changes. On a non-symlinked host this is
+/// identical to `tempfile::tempdir()` (canonicalizing an already-canonical base
+/// is a no-op), so it is a permanent regression guard, not a macOS-only branch:
+/// running the suite under a symlinked `TMPDIR` on Linux reproduces — and now
+/// passes — the same class.
+pub fn canonical_tempdir() -> Result<tempfile::TempDir> {
+    let base = std::env::temp_dir()
+        .canonicalize()
+        .context("canonicalize temp base")?;
+    tempfile::tempdir_in(base).context("create canonical tempdir")
+}
+
 /// The `XDG_CONFIG_HOME` subdir [`isolate_env`] configures under `root`.
 ///
 /// `config_sources()` resolves user config at
