@@ -33,9 +33,10 @@ use serde_json::{Value, json};
 /// homes the JSONL firehose (`db::cache_dir()`).
 ///
 /// Also sets the `CATENARY_STATE_DIR` / `CATENARY_RUNTIME_DIR` /
-/// `CATENARY_CACHE_DIR` overrides to the same subdirs — the portable leg of
-/// the isolation. The `dirs` crate honors the XDG vars only on Linux; on
-/// macOS they are inert and the overrides carry the whole isolation.
+/// `CATENARY_CACHE_DIR` / `CATENARY_CONFIG_DIR` overrides to the same subdirs
+/// — the portable leg of the isolation. The `dirs` crate honors the XDG vars
+/// only on Linux; on macOS they are inert and the overrides carry the whole
+/// isolation.
 ///
 /// Clears all `CATENARY_*` env vars that could leak from the user's
 /// shell and override test-specific settings. Clears `PATH` so built-in
@@ -72,17 +73,18 @@ pub fn isolate_env(cmd: &mut Command, root: &str) {
     }
     // The XDG vars above only isolate on Linux: the `dirs` crate ignores them
     // on macOS (`state_dir`/`runtime_dir` return `None` there; `cache_dir` is
-    // `~/Library/Caches`), so a mac subprocess would fall back to the REAL
-    // `~/Library/Application Support` — every parallel test sharing one state
-    // dir, one socket path, one daemon (the run-29042647606 mass failure).
-    // `paths.rs` resolves the `CATENARY_*_DIR` overrides *first* on every
-    // platform, so setting them to the same subdirs makes the isolation
-    // portable. Must come after the clearing loop (the loop would strip them);
-    // the values match the XDG vars, so Linux resolution is bit-identical and
-    // the distinct-bases mislocation detector is preserved.
+    // `~/Library/Caches`; `config_dir` is `~/Library/Application Support`), so
+    // a mac subprocess would fall back to the REAL user directories — every
+    // parallel test sharing one state dir, one socket path, one daemon (the
+    // run-29042647606 mass failure). `paths.rs` resolves the `CATENARY_*_DIR`
+    // overrides *first* on every platform, so setting them to the same subdirs
+    // makes the isolation portable. Must come after the clearing loop (the loop
+    // would strip them); the values match the XDG vars, so Linux resolution is
+    // bit-identical and the distinct-bases mislocation detector is preserved.
     cmd.env("CATENARY_STATE_DIR", xdg_state_home(root));
     cmd.env("CATENARY_RUNTIME_DIR", xdg_runtime_dir(root));
     cmd.env("CATENARY_CACHE_DIR", xdg_cache_home(root));
+    cmd.env("CATENARY_CONFIG_DIR", xdg_config_home(root));
 }
 
 /// CI triage escape hatch: with `CATENARY_CONFORMANCE_KEEP` set in the

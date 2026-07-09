@@ -61,14 +61,15 @@ impl ConfigLayer {
     ///
     /// # Errors
     ///
-    /// Returns an error if the user config directory cannot be resolved.
+    /// Currently infallible — [`crate::paths::config_dir`] always resolves
+    /// (env override → platform dir → durable fallback), so the old
+    /// no-config-directory failure is unreachable. The `Result` is kept for
+    /// call-site stability (`?` chains) and for future layers that may fail.
     pub fn resolve_path(&self) -> Result<PathBuf> {
         match self {
-            Self::User => {
-                let dir = dirs::config_dir()
-                    .context("no user config directory (set XDG_CONFIG_HOME or HOME)")?;
-                Ok(dir.join("catenary").join("config.toml"))
-            }
+            Self::User => Ok(crate::paths::config_dir()
+                .join("catenary")
+                .join("config.toml")),
             Self::Project(root) => Ok(root.join(".catenary.toml")),
             Self::File(path) => Ok(path.clone()),
         }

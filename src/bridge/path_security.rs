@@ -177,8 +177,10 @@ impl PathValidator {
         let mut paths = Vec::new();
 
         // User config: ~/.config/catenary/config.toml
-        if let Some(config_dir) = dirs::config_dir() {
-            let user_config = config_dir.join("catenary").join("config.toml");
+        {
+            let user_config = crate::paths::config_dir()
+                .join("catenary")
+                .join("config.toml");
             if let Ok(canonical) = user_config.canonicalize() {
                 paths.push(canonical);
             }

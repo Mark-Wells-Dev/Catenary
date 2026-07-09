@@ -157,8 +157,10 @@ pub fn config_sources() -> Vec<PathBuf> {
     let mut sources: Vec<PathBuf> = Vec::new();
 
     // 1. User config directory (~/.config/catenary/config.toml)
-    if let Some(config_dir) = dirs::config_dir() {
-        let config_path = config_dir.join("catenary").join("config.toml");
+    {
+        let config_path = crate::paths::config_dir()
+            .join("catenary")
+            .join("config.toml");
         if config_path.exists() {
             sources.push(config_path);
         }

@@ -209,7 +209,7 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
     render_findings(out, &filter_findings, show_diff);
 
     // Actionable suggestions at the very bottom so they aren't buried.
-    let suggestions = collect_suggestions(&config, dirs::config_dir());
+    let suggestions = collect_suggestions(&config, Some(crate::paths::config_dir()));
     if !suggestions.is_empty() {
         let _ = out.writeln(format_args!(""));
         let _ = out.writeln(format_args!("{}:", out.colors.bold("Suggestions")));
@@ -601,7 +601,7 @@ fn user_config_path_in(config_base: Option<PathBuf>) -> Option<PathBuf> {
 
 /// Collect actionable suggestions based on current config state.
 ///
-/// `config_base` is the platform config directory (from `dirs::config_dir()`).
+/// `config_base` is the platform config directory (from [`crate::paths::config_dir`]).
 fn collect_suggestions(
     config: &crate::config::Config,
     config_base: Option<PathBuf>,

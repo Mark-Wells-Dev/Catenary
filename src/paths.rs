@@ -52,6 +52,30 @@ pub fn runtime_dir() -> PathBuf {
         .unwrap_or_else(state_dir)
 }
 
+/// Resolve the Catenary config base directory.
+///
+/// The base directory that *holds* the `catenary/` subdirectory — callers
+/// join `catenary/config.toml` (or similar) to reach actual config files.
+/// Note the distinction between `CATENARY_CONFIG_DIR` (this resolver — the
+/// base directory) and `CATENARY_CONFIG` (a separate mechanism that names an
+/// explicit config *file* appended as an additional layer after the user
+/// layer; it injects but does not suppress).
+///
+/// Resolution order:
+/// 1. `CATENARY_CONFIG_DIR` environment variable (cross-platform override).
+/// 2. `dirs::config_dir()` (`XDG_CONFIG_HOME` on Linux).
+/// 3. [`state_dir`] as a fallback when no config dir is configured. The
+///    state directory is durable (survives reboots), which matches the
+///    durability expectation for a user config file; `/tmp` would lose the
+///    config on reboot, making the fallback useless in practice.
+#[must_use]
+pub fn config_dir() -> PathBuf {
+    std::env::var_os("CATENARY_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(dirs::config_dir)
+        .unwrap_or_else(state_dir)
+}
+
 /// Resolve the Catenary cache directory.
 ///
 /// Home for the regenerable JSONL telemetry firehose — safe to delete, never
