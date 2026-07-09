@@ -29,81 +29,116 @@
 # entries (clangd, lattice, lua-language-server, rust-analyzer) record config-conformance
 # only and are structurally unofferable (no recipe). Host-riding provisions
 # carry their verbatim `--version` line — honest, if verbose.
+#
+# Full-matrix blessing: 2026-07-09, from run 28987704409 at 87ff482 — 18/18
+# green, the entire matrix post-sql-ls drop. First run where every server
+# conformed: elm-language-server on a cold ELM_HOME (ungrandfathered), gopls
+# with diagnosticsDelay enforced-absent, ruby-lsp with GEM_HOME provisioned.
+
+[blessed.ansible-language-server]
+version = "26.6.0"
+platform = "linux-x86_64"
+date = "2026-07-09"
+tier = "verified-on-linux"
 
 [blessed.bash-language-server]
 version = "5.6.0"
 platform = "linux-x86_64"
-date = "2026-07-08"
+date = "2026-07-09"
 tier = "verified-on-linux"
 
 [blessed.clangd]
 version = "Ubuntu clangd version 18.1.3 (1ubuntu1)"
 platform = "linux-x86_64"
-date = "2026-07-08"
+date = "2026-07-09"
 tier = "verified-on-linux"
 
 [blessed.docker-langserver]
 version = "0.15.0"
 platform = "linux-x86_64"
-date = "2026-07-08"
+date = "2026-07-09"
+tier = "verified-on-linux"
+
+[blessed.elm-language-server]
+version = "2.8.0"
+platform = "linux-x86_64"
+date = "2026-07-09"
+tier = "verified-on-linux"
+
+[blessed.gopls]
+version = "v0.22.0"
+platform = "linux-x86_64"
+date = "2026-07-09"
 tier = "verified-on-linux"
 
 [blessed.intelephense]
 version = "1.18.5"
 platform = "linux-x86_64"
-date = "2026-07-08"
+date = "2026-07-09"
 tier = "verified-on-linux"
 
 [blessed.lattice]
 version = "0.4.0"
 platform = "linux-x86_64"
-date = "2026-07-08"
+date = "2026-07-09"
 tier = "verified-on-linux"
 
 [blessed.lua-language-server]
 version = "3.18.2"
 platform = "linux-x86_64"
-date = "2026-07-08"
+date = "2026-07-09"
 tier = "verified-on-linux"
 
 [blessed.pyright-langserver]
 version = "1.1.411"
 platform = "linux-x86_64"
-date = "2026-07-08"
+date = "2026-07-09"
+tier = "verified-on-linux"
+
+[blessed.ruby-lsp]
+version = "0.26.10"
+platform = "linux-x86_64"
+date = "2026-07-09"
 tier = "verified-on-linux"
 
 [blessed.rust-analyzer]
 version = "rust-analyzer 1.95.0 (5980761 2026-04-14)"
 platform = "linux-x86_64"
-date = "2026-07-08"
+date = "2026-07-09"
 tier = "verified-on-linux"
 
 [blessed.svelteserver]
 version = "0.18.3"
 platform = "linux-x86_64"
-date = "2026-07-08"
+date = "2026-07-09"
 tier = "verified-on-linux"
 
 [blessed.taplo]
 version = "0.10.0"
 platform = "linux-x86_64"
-date = "2026-07-08"
+date = "2026-07-09"
 tier = "verified-on-linux"
 
 [blessed.vscode-css-language-server]
 version = "4.10.0"
 platform = "linux-x86_64"
-date = "2026-07-08"
+date = "2026-07-09"
+tier = "verified-on-linux"
+
+[blessed.vscode-html-language-server]
+version = "4.10.0"
+platform = "linux-x86_64"
+date = "2026-07-09"
 tier = "verified-on-linux"
 
 [blessed.vscode-json-language-server]
 version = "4.10.0"
 platform = "linux-x86_64"
-date = "2026-07-08"
+date = "2026-07-09"
 tier = "verified-on-linux"
 
 [blessed.yaml-language-server]
 version = "1.23.0"
 platform = "linux-x86_64"
-date = "2026-07-08"
+date = "2026-07-09"
 tier = "verified-on-linux"
