@@ -23,7 +23,18 @@
 //! The payload carries **no** instruction to run `catenary primer` or
 //! `catenary commands` — inlining the content is the whole point. The `--help`
 //! breadcrumbs are point-of-use depth, not a teaching pointer.
+//!
+//! The rendering is additionally keyed by an optional **declared client**
+//! ([`HostFormat`], misc 177): a client whose installed hook set registers the
+//! `WorktreeCreate` hook (today Claude Code) gets the misc-146
+//! isolated-subagents mention extended into the "Dispatching isolated work"
+//! section, which teaches `isolation: "worktree"` subagent dispatch. The
+//! identity is always declared — the `catenary primer <client>` positional or
+//! the hook definition's `--format` — never sniffed from a host name at
+//! runtime (maintainer ruling: hooks are hand-crafted per host and there is no
+//! standardized hook protocol to auto-detect against).
 
+use crate::cli::HostFormat;
 use crate::cli::commands::{render_command_lines, resolve_commands_for_cwd};
 
 /// Prefix-identifiable header line.
@@ -79,6 +90,40 @@ Navigate through Catenary
   plain pass over the stream — complete matches, no enrichment — so matches
   come back with no source coverage.";
 
+/// The misc-146 isolated-subagents mention, byte-exact as it appears inside
+/// [`INVARIANTS`] — the anchor block [`invariants_for`] swaps out for clients
+/// whose installed hook set carries `WorktreeCreate`. A test pins that the
+/// anchor occurs in [`INVARIANTS`] exactly once, so the swap can never
+/// silently no-op or over-fire.
+const ISOLATED_SUBAGENTS_MENTION: &str = "\
+Work in isolated subagents
+  Coverage is automatic — you never manage roots. Two agents in one workspace
+  step on each other and, sharing its language server, break settle detection.";
+
+/// The client-keyed "Dispatching isolated work" section (misc 177).
+///
+/// Replaces [`ISOLATED_SUBAGENTS_MENTION`] for clients whose installed hook
+/// set registers `WorktreeCreate` — it absorbs the mention (its opening
+/// capability facts survive verbatim, so isolation is never taught twice) and
+/// adds the dispatch flow: the host's `isolation: "worktree"` fires the
+/// `WorktreeCreate` hook, which runs the worktree add itself, relocates the
+/// root out of the repo, and anchors the subagent — where a hand-run
+/// `catenary worktree add` anchors nothing. Capability voice throughout: it
+/// states what each flow does, never what is forbidden.
+const DISPATCH_ISOLATED_WORK: &str = "\
+Dispatching isolated work
+  Coverage is automatic — you never manage roots. Two agents in one workspace
+  step on each other and, sharing its language server, break settle detection.
+  Dispatch isolated work with the Agent/Task tool's `isolation: \"worktree\"` —
+  Catenary's WorktreeCreate hook creates the worktree itself, relocates it
+  outside the repo (so language servers pick up no recursive roots), and
+  anchors the subagent's workspace there. Hand-running `catenary worktree add`
+  for an agent skips that anchoring — the agent stays pinned to the main tree
+  and its file access prompts against the wrong workspace. Review and clean up
+  with `catenary worktree diff` and `catenary worktree land` (WorktreeRemove
+  never fires — a known upstream Claude Code bug, so `land`/`rm` is the
+  cleanup path).";
+
 /// Tier 3 — compact flag synopses. Long forms only, natural clusters
 /// brace-collapsed; only the two flags that need disambiguation (`--glob` vs
 /// the PATH positional, `--type` as a ripgrep file-type) carry a gloss. Each
@@ -121,14 +166,52 @@ const DAEMON_STALENESS_NOTE: &str = "note: the serving daemon runs an older buil
     this CLI — its behavior may predate the current docs, so treat observations as \
     potentially stale";
 
+/// Whether the declared client's installed hook set registers the
+/// `WorktreeCreate` hook — the capability the "Dispatching isolated work"
+/// section teaches (misc 177).
+///
+/// The identity is declared, never sniffed (maintainer ruling): it travels
+/// with the hook definition (`--format=claude`) or the `catenary primer
+/// <client>` positional, so whatever host executes that hooks.json carries the
+/// registration it is taught, by construction. Today only Claude Code's
+/// shipped hook set (`plugins/catenary/hooks/hooks.json`) registers
+/// `WorktreeCreate`; Antigravity's and OpenCode's do not.
+const fn hook_set_has_worktree_create(client: Option<HostFormat>) -> bool {
+    matches!(client, Some(HostFormat::Claude))
+}
+
+/// The invariants tier for the declared client.
+///
+/// A client whose hook set carries `WorktreeCreate` gets the misc-146
+/// isolated-subagents mention replaced by [`DISPATCH_ISOLATED_WORK`] — the
+/// section absorbs the mention, so the payload never teaches isolation twice.
+/// Every other rendering (the bare primer, OpenCode, Antigravity, the
+/// fallbacks) keeps [`INVARIANTS`] verbatim, byte-identical to the client-less
+/// payload.
+fn invariants_for(client: Option<HostFormat>) -> std::borrow::Cow<'static, str> {
+    if hook_set_has_worktree_create(client) {
+        std::borrow::Cow::Owned(
+            INVARIANTS.replace(ISOLATED_SUBAGENTS_MENTION, DISPATCH_ISOLATED_WORK),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(INVARIANTS)
+    }
+}
+
 /// Assemble the payload body from an already-resolved commands surface.
 ///
 /// Pure: the config IO lives in [`payload_body`]. Split out so the tiers can
 /// be pinned against a fixture surface without touching `Config::load()`.
 /// `resolved` and `build_tools` are the live surface (or `None` / empty when
-/// no `[commands]` section applies).
+/// no `[commands]` section applies); `client` is the declared client identity
+/// keying client-specific teaching ([`invariants_for`], misc 177) — `None`
+/// renders the client-neutral payload.
 #[must_use]
-fn render(resolved: Option<&crate::config::ResolvedCommands>, build_tools: &[String]) -> String {
+fn render(
+    resolved: Option<&crate::config::ResolvedCommands>,
+    build_tools: &[String],
+    client: Option<HostFormat>,
+) -> String {
     let mut s = String::with_capacity(3072);
     s.push_str(HEADER);
     s.push_str("\n\n");
@@ -144,8 +227,8 @@ fn render(resolved: Option<&crate::config::ResolvedCommands>, build_tools: &[Str
     }
     s.push('\n');
 
-    // Tier 2 — the invariants.
-    s.push_str(INVARIANTS);
+    // Tier 2 — the invariants, keyed by the declared client.
+    s.push_str(&invariants_for(client));
     s.push_str("\n\n");
 
     // Tier 3 — the flag synopses.
@@ -168,52 +251,59 @@ fn with_staleness_note(stale: bool, body: String) -> String {
     }
 }
 
-/// Render the shared teaching payload body.
+/// Render the shared teaching payload body for the declared client.
 ///
-/// The single source printed by `catenary primer` and inlined verbatim into
-/// the `SessionStart` `additionalContext`. The commands-surface tier is
-/// resolved live via [`resolve_commands_for_cwd`]; a config-load failure is
-/// degraded to an empty surface rather than propagated, so a hook never breaks
-/// the host's flow.
+/// The single source printed by `catenary primer` (whose optional positional
+/// declares the client) and inlined verbatim into the `SessionStart`
+/// `additionalContext` (whose `--format` declares it) — one rendering, keyed
+/// by the declared identity, so the section can never fork between surfaces.
+/// The commands-surface tier is resolved live via [`resolve_commands_for_cwd`];
+/// a config-load failure is degraded to an empty surface rather than
+/// propagated, so a hook never breaks the host's flow.
 ///
 /// Pure prevention content — the daemon-staleness note is *not* part of this
 /// body; it is prepended at the host-emission boundary by [`emitted_payload`],
 /// so this stays deterministic for structural tests and independent of the
 /// running daemon.
 #[must_use]
-pub fn payload_body() -> String {
+pub fn payload_body(client: Option<HostFormat>) -> String {
     let (resolved, build_tools) = resolve_commands_for_cwd().unwrap_or_default();
-    render(resolved.as_ref(), &build_tools)
+    render(resolved.as_ref(), &build_tools, client)
 }
 
 /// Render the `SubagentStart` variant of the teaching payload.
 ///
-/// The same [`payload_body`] with the per-agent debt line appended, so the
-/// body is a clean prefix of the subagent payload. Like [`payload_body`], this
+/// The client-neutral [`payload_body`] with the per-agent debt line appended,
+/// so the body is a clean prefix of the subagent payload. Deliberately
+/// client-less: the `SubagentStart` surface teaches the *worker*, which does
+/// not dispatch isolated work itself, so the misc-177 dispatch section stays
+/// out and the misc-146 mention rides as-is. Like [`payload_body`], this
 /// carries no staleness note — [`emitted_subagent_payload`] adds it at the
 /// emission boundary.
 #[must_use]
 pub fn subagent_payload() -> String {
-    let mut s = payload_body();
+    let mut s = payload_body(None);
     s.push_str("\n\n");
     s.push_str(SUBAGENT_DEBT);
     s
 }
 
-/// The teaching payload as emitted to a host — [`payload_body`] with the
-/// daemon-staleness note prepended when the serving daemon runs a different
-/// build than this CLI (teaching-surface ticket 05).
+/// The teaching payload as emitted to a host for the declared client.
+///
+/// [`payload_body`] with the daemon-staleness note prepended when the serving
+/// daemon runs a different build than this CLI (teaching-surface ticket 05).
 ///
 /// This is what every session-start surface emits: `catenary primer`, the Claude
 /// `SessionStart` `additionalContext`, and the raw OpenCode payload all render
-/// from this one function, so the note is byte-equal across them — part of the
-/// payload, not a per-host fork. The staleness signal reuses the `catenary
-/// version` `tool/version` probe ([`crate::cli::version::daemon_is_stale`]); a
-/// current daemon adds no line (zero cost), and an unreachable or unresponsive
-/// daemon is left to the existing degraded-payload path with no second warning.
+/// from this one function (each passing its declared client), so the note is
+/// byte-equal across them — part of the payload, not a per-host fork. The
+/// staleness signal reuses the `catenary version` `tool/version` probe
+/// ([`crate::cli::version::daemon_is_stale`]); a current daemon adds no line
+/// (zero cost), and an unreachable or unresponsive daemon is left to the
+/// existing degraded-payload path with no second warning.
 #[must_use]
-pub fn emitted_payload() -> String {
-    with_staleness_note(crate::cli::version::daemon_is_stale(), payload_body())
+pub fn emitted_payload(client: Option<HostFormat>) -> String {
+    with_staleness_note(crate::cli::version::daemon_is_stale(), payload_body(client))
 }
 
 /// The `SubagentStart` variant as emitted to a host — [`emitted_payload`] with
@@ -319,7 +409,7 @@ pub fn context_file_body() -> String {
         .and_then(|c| c.resolved_commands);
     with_staleness_note(
         crate::cli::version::daemon_is_stale(),
-        render(resolved.as_ref(), &[]),
+        render(resolved.as_ref(), &[], Some(HostFormat::Antigravity)),
     )
 }
 
@@ -403,7 +493,7 @@ mod tests {
 
     #[test]
     fn payload_carries_the_invariants() {
-        let body = render(Some(&fixture_surface()), &[]);
+        let body = render(Some(&fixture_surface()), &[], None);
         for needle in [
             "The edit→diagnostics loop",
             "per-file receipt",
@@ -425,7 +515,7 @@ mod tests {
     #[test]
     fn payload_carries_the_write_model_line() {
         // Tier 1 closes with the write-model line when the surface is active.
-        let body = render(Some(&fixture_surface()), &[]);
+        let body = render(Some(&fixture_surface()), &[], None);
         assert!(
             body.contains("Writes resolve-or-deny"),
             "write-model line absent: {body}"
@@ -467,10 +557,17 @@ mod tests {
             guidance,
             ..ResolvedCommands::default()
         };
-        let denies_body = render(Some(&denies), &["make".to_string()]);
+        let denies_body = render(Some(&denies), &["make".to_string()], None);
         // A deny-nothing surface (the fixture: no guidance, no git deny).
-        let neutral_body = render(Some(&fixture_surface()), &["make".to_string()]);
-        for body in [&denies_body, &neutral_body] {
+        let neutral_body = render(Some(&fixture_surface()), &["make".to_string()], None);
+        // The Claude render carries the misc-177 dispatch section — it must
+        // survive the same capability-voice bar as the bare payload.
+        let claude_body = render(
+            Some(&fixture_surface()),
+            &["make".to_string()],
+            Some(HostFormat::Claude),
+        );
+        for body in [&denies_body, &neutral_body, &claude_body] {
             // Capability voice present.
             assert!(
                 body.contains("`catenary grep` and `catenary glob` are the navigation tools."),
@@ -530,7 +627,7 @@ mod tests {
         // In their place the primer carries one informative mention: work in
         // isolated subagents (the shared-language-server settle-detection gotcha),
         // stated as a capability fact, not an instruction to manage roots.
-        let body = render(Some(&fixture_surface()), &["make".to_string()]);
+        let body = render(Some(&fixture_surface()), &["make".to_string()], None);
         for instruction in ["catenary pin", "catenary unpin", "catenary roots"] {
             assert!(
                 !body.contains(instruction),
@@ -552,11 +649,154 @@ mod tests {
         );
     }
 
+    // ── Client-keyed dispatch teaching (misc 177) ────────────────────────
+
+    #[test]
+    fn dispatch_anchor_is_pinned_in_the_invariants() {
+        // `invariants_for` swaps the misc-146 mention for the dispatch section
+        // by anchor replacement — the anchor must appear in INVARIANTS
+        // byte-exact, exactly once, or the swap silently no-ops (or over-fires).
+        assert_eq!(
+            INVARIANTS.matches(ISOLATED_SUBAGENTS_MENTION).count(),
+            1,
+            "the isolated-subagents mention must anchor the invariants exactly once"
+        );
+    }
+
+    #[test]
+    fn bare_payload_keeps_the_misc_146_mention_and_no_dispatch_section() {
+        // No declared client → the client-neutral payload, byte-identical to
+        // the pre-misc-177 rendering: the misc-146 mention stays as-is and the
+        // dispatch section is absent.
+        let body = render(Some(&fixture_surface()), &["make".to_string()], None);
+        assert!(
+            body.contains(ISOLATED_SUBAGENTS_MENTION),
+            "bare payload keeps the isolated-subagents mention verbatim: {body}"
+        );
+        assert!(
+            !body.contains("Dispatching isolated work"),
+            "bare payload must not carry the dispatch section: {body}"
+        );
+        assert!(
+            !body.contains("isolation: \"worktree\""),
+            "bare payload must not teach worktree dispatch: {body}"
+        );
+    }
+
+    #[test]
+    fn claude_payload_carries_the_dispatch_section() {
+        // A declared client whose installed hook set registers WorktreeCreate
+        // (Claude Code) gets the dispatch teaching: the isolation flag, the
+        // hook's anchoring, the hand-run gap, the review/cleanup commands, and
+        // the WorktreeRemove-never-fires cleanup note.
+        let body = render(
+            Some(&fixture_surface()),
+            &["make".to_string()],
+            Some(HostFormat::Claude),
+        );
+        for needle in [
+            "Dispatching isolated work",
+            "isolation: \"worktree\"",
+            "WorktreeCreate hook creates the worktree itself",
+            "catenary worktree add",
+            "catenary worktree diff",
+            "catenary worktree land",
+            "WorktreeRemove\n  never fires",
+        ] {
+            assert!(
+                body.contains(needle),
+                "dispatch section missing {needle:?}: {body}"
+            );
+        }
+        // The section absorbs the misc-146 mention: its capability facts
+        // survive under the new heading, and the old heading is gone, so the
+        // payload never teaches isolation twice.
+        assert!(
+            !body.contains("Work in isolated subagents"),
+            "the dispatch section must absorb the misc-146 mention, not duplicate it: {body}"
+        );
+        assert!(
+            body.contains("settle detection"),
+            "the misc-146 settle-detection gotcha survives the absorption: {body}"
+        );
+        assert!(
+            body.contains("never manage roots"),
+            "the misc-146 coverage-is-automatic fact survives the absorption: {body}"
+        );
+    }
+
+    #[test]
+    fn dispatch_section_is_capability_voiced() {
+        // The section states what each flow does — dispatch anchors, a
+        // hand-run skips the anchoring — never a prohibition (the primer's
+        // capability-voice ruling, teach 13).
+        let lowered = DISPATCH_ISOLATED_WORK.to_lowercase();
+        for policy in [
+            "denied",
+            "forbidden",
+            "never run",
+            "never hand-run",
+            "do not",
+            "don't",
+            "must not",
+            "bypass",
+        ] {
+            assert!(
+                !lowered.contains(policy),
+                "dispatch section asserts policy ({policy:?}): {DISPATCH_ISOLATED_WORK}"
+            );
+        }
+    }
+
+    #[test]
+    fn clients_without_worktree_create_keep_the_bare_payload() {
+        // Only a hook set that registers WorktreeCreate keys the section —
+        // OpenCode's and Antigravity's do not (yet), so their declared
+        // identities render byte-identical to the client-neutral payload.
+        let bare = render(Some(&fixture_surface()), &["make".to_string()], None);
+        for client in [HostFormat::OpenCode, HostFormat::Antigravity] {
+            assert_eq!(
+                render(
+                    Some(&fixture_surface()),
+                    &["make".to_string()],
+                    Some(client)
+                ),
+                bare,
+                "{client:?} must render the bare payload until its hook set carries WorktreeCreate"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_section_stays_tight() {
+        // Size guard for the client-keyed delta: the section replaces the
+        // misc-146 mention and must stay one tight block (~100–200 tokens),
+        // not a second primer.
+        let bare = render(Some(&fixture_surface()), &["make".to_string()], None)
+            .chars()
+            .count();
+        let claude = render(
+            Some(&fixture_surface()),
+            &["make".to_string()],
+            Some(HostFormat::Claude),
+        )
+        .chars()
+        .count();
+        let delta = claude
+            .checked_sub(bare)
+            .expect("the claude payload extends the bare payload");
+        assert!(
+            (200..=900).contains(&delta),
+            "dispatch delta is {delta} chars (~{} tokens); expected a tight section",
+            delta / 4
+        );
+    }
+
     #[test]
     fn allow_surface_reflects_the_live_config() {
         // The configured command name appears — the surface is projected from
         // the resolved config, not a hardcoded list.
-        let body = render(Some(&fixture_surface()), &["make".to_string()]);
+        let body = render(Some(&fixture_surface()), &["make".to_string()], None);
         assert!(
             body.contains("distinctivecmd"),
             "allow surface not sourced from config: {body}"
@@ -573,7 +813,7 @@ mod tests {
         // `catenary primer` or `catenary commands`. (The commands surface
         // content itself is inlined, so we assert the absence of the
         // instruction-to-run subcommands, not the bare word "commands".)
-        let body = render(Some(&fixture_surface()), &[]);
+        let body = render(Some(&fixture_surface()), &[], None);
         assert!(
             !body.contains("catenary primer"),
             "payload points at `catenary primer`: {body}"
@@ -590,7 +830,7 @@ mod tests {
 
     #[test]
     fn payload_carries_help_breadcrumbs() {
-        let body = render(Some(&fixture_surface()), &[]);
+        let body = render(Some(&fixture_surface()), &[], None);
         assert!(
             body.contains("full: catenary grep --help"),
             "grep --help breadcrumb absent: {body}"
@@ -605,7 +845,7 @@ mod tests {
     fn no_retired_output_language() {
         // Decision 025 retired budgets / valves / spill files; the payload must
         // not resurrect that vocabulary (output is complete).
-        let body = render(Some(&fixture_surface()), &[]);
+        let body = render(Some(&fixture_surface()), &[], None);
         for retired in ["spill", "line budget", "valve", "paged"] {
             assert!(
                 !body.to_lowercase().contains(retired),
@@ -616,7 +856,7 @@ mod tests {
 
     #[test]
     fn subagent_payload_extends_the_body_with_the_per_agent_line() {
-        let body = render(Some(&fixture_surface()), &[]);
+        let body = render(Some(&fixture_surface()), &[], None);
         // The subagent variant is the body plus the per-agent debt line; the
         // body is a clean prefix (payload_body resolves live config, so compare
         // structurally rather than byte-for-byte against the fixture render).
@@ -643,7 +883,7 @@ mod tests {
     #[test]
     fn subagent_payload_body_is_a_prefix() {
         // Live variant: `subagent_payload` == `payload_body` + the debt line.
-        let body = payload_body();
+        let body = payload_body(None);
         let sub = subagent_payload();
         assert!(
             sub.starts_with(&body),
@@ -704,7 +944,7 @@ mod tests {
         let expected = format!("{HEADER}\n\n{INVARIANTS}\n\n{FLAG_SYNOPSES}");
         assert_eq!(fb, expected);
         // The live payload shares the same invariants / synopses source.
-        let live = render(Some(&fixture_surface()), &["make".to_string()]);
+        let live = render(Some(&fixture_surface()), &["make".to_string()], None);
         assert!(
             live.contains(INVARIANTS),
             "live payload lost the invariants"
@@ -720,7 +960,7 @@ mod tests {
         // A stale daemon prepends the note as the payload's opening line, set off
         // from the header by a blank line, with the full original body preserved
         // verbatim after it — the line is part of the payload, not a fork.
-        let body = render(Some(&fixture_surface()), &["make".to_string()]);
+        let body = render(Some(&fixture_surface()), &["make".to_string()], None);
         let noted = with_staleness_note(true, body.clone());
         assert!(
             noted.starts_with(DAEMON_STALENESS_NOTE),
@@ -765,7 +1005,7 @@ mod tests {
         // debt line; the emitted body is a clean prefix, so when the daemon is
         // stale the note stays the opening line for the subagent surface too.
         // Deterministic: both derive from the same daemon observation.
-        let body = emitted_payload();
+        let body = emitted_payload(None);
         let sub = emitted_subagent_payload();
         assert!(
             sub.starts_with(&body),
@@ -786,7 +1026,7 @@ mod tests {
     fn no_staleness_note_leaves_the_body_untouched() {
         // The common case: a current (or unreachable) daemon adds nothing — no
         // line, zero cost.
-        let body = render(Some(&fixture_surface()), &["make".to_string()]);
+        let body = render(Some(&fixture_surface()), &["make".to_string()], None);
         assert_eq!(
             with_staleness_note(false, body.clone()),
             body,
@@ -837,17 +1077,21 @@ mod tests {
         // build tools get different payloads — but the context render passes an
         // empty build set, so it is byte-identical regardless of cwd.
         let surface = fixture_surface();
-        let session_a = render(Some(&surface), &["make".to_string()]);
-        let session_b = render(Some(&surface), &["bazel".to_string()]);
+        let session_a = render(Some(&surface), &["make".to_string()], None);
+        let session_b = render(Some(&surface), &["bazel".to_string()], None);
         assert_ne!(
             session_a, session_b,
             "live payloads differ by the cwd build tool"
         );
 
-        // The context render (empty build set) is the workspace-invariant body:
-        // no cwd input, so identical for every session.
-        let ctx = render(Some(&surface), &[]);
-        assert_eq!(ctx, render(Some(&surface), &[]));
+        // The context render (empty build set, the declared Antigravity client
+        // as in `context_file_body`) is the workspace-invariant body: no cwd
+        // input, so identical for every session.
+        let ctx = render(Some(&surface), &[], Some(HostFormat::Antigravity));
+        assert_eq!(
+            ctx,
+            render(Some(&surface), &[], Some(HostFormat::Antigravity))
+        );
         assert!(
             !ctx.contains("Build tool:"),
             "context body must omit the per-session cwd build tool: {ctx}"
@@ -994,7 +1238,7 @@ mod tests {
         // being dropped or doubled (a ~1000-char swing) still does. Rendered
         // against a minimal active fixture surface — a large real allowlist grows
         // Tier 1 further, which is expected and unbounded here.
-        let chars = render(Some(&fixture_surface()), &["make".to_string()])
+        let chars = render(Some(&fixture_surface()), &["make".to_string()], None)
             .chars()
             .count();
         assert!(

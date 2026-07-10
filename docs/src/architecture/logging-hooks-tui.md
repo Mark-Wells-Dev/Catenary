@@ -203,6 +203,15 @@ content inlined. One module, `src/cli/teaching.rs`, is the single source: the
 `teaching::payload_body()`, so the on-demand command and the pushed hook
 context can never drift.
 
+The rendering is keyed by an optional **declared client**: `catenary primer
+<client>` (e.g. `catenary primer claude`) and the hook definitions' `--format`
+flag declare the identity — never sniffed from a host name, since hooks are
+hand-crafted per host and there is no standardized hook protocol to
+auto-detect against. A client whose installed hook set registers the
+`WorktreeCreate` hook (today Claude Code) gets a "Dispatching isolated work"
+section teaching `isolation: "worktree"` subagent dispatch; bare
+`catenary primer` prints the client-neutral payload.
+
 The payload has three tiers (~600–800 tokens): the **live commands surface**
 (the allow / pipeline / deny surface resolved from the config at emission time,
 rendered by the same machinery `catenary commands` prints, closing with the

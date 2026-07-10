@@ -54,9 +54,14 @@ fn session_start_should_announce(source: Option<&str>) -> bool {
 /// carry it). Claude Code reads the `hookSpecificOutput.additionalContext` field
 /// at `SessionStart`; Antigravity and OpenCode use other channels. Computed only
 /// when it will be used, so the config-load IO is skipped on the withhold paths.
+///
+/// The `--format` flag on the hook definition is the declared client identity
+/// (misc 177), so the payload is keyed by it — Claude's hook set carries
+/// `WorktreeCreate`, so its payload teaches worktree-isolated dispatch.
 #[must_use]
 fn session_start_context(announce: bool, format: HostFormat) -> Option<String> {
-    (announce && matches!(format, HostFormat::Claude)).then(crate::cli::teaching::emitted_payload)
+    (announce && matches!(format, HostFormat::Claude))
+        .then(|| crate::cli::teaching::emitted_payload(Some(format)))
 }
 
 /// Append the cross-session lingering-worktree line (misc 151 D-2) to a
@@ -102,15 +107,16 @@ fn cross_session_orphan_line(agents_root: &std::path::Path) -> Option<String> {
 /// The raw stdout body emitted by `catenary hook session-start
 /// --format=opencode`.
 ///
-/// The live teaching payload verbatim — the same SSOT body as `catenary primer`
-/// and the Claude `SessionStart` `additionalContext` — for the OpenCode plugin
-/// to write into its runtime-regenerated instructions file. Not a JSON
-/// envelope: the plugin captures stdout as the file's content, so this is the
-/// bare payload text (unlike the Claude/Antigravity structured
-/// responses).
+/// The live teaching payload verbatim — the same SSOT rendering as `catenary
+/// primer` and the Claude `SessionStart` `additionalContext`, keyed by the
+/// declared OpenCode identity (whose hook set carries no `WorktreeCreate`, so
+/// it matches the client-neutral payload) — for the OpenCode plugin to write
+/// into its runtime-regenerated instructions file. Not a JSON envelope: the
+/// plugin captures stdout as the file's content, so this is the bare payload
+/// text (unlike the Claude/Antigravity structured responses).
 #[must_use]
 fn opencode_session_start_body() -> String {
-    crate::cli::teaching::emitted_payload()
+    crate::cli::teaching::emitted_payload(Some(HostFormat::OpenCode))
 }
 
 /// Build the Antigravity `PreInvocation` output that injects `payload` as a
@@ -2305,6 +2311,23 @@ mod tests {
             ctx.contains("The edit→diagnostics loop"),
             "payload body should be inlined: {ctx}",
         );
+        // The declared Claude identity keys the misc-177 dispatch section —
+        // Claude's installed hook set registers WorktreeCreate.
+        assert!(
+            ctx.contains("Dispatching isolated work"),
+            "Claude session-start payload should teach worktree dispatch: {ctx}"
+        );
+        assert!(
+            ctx.contains("isolation: \"worktree\""),
+            "Claude session-start payload should name the isolation flag: {ctx}"
+        );
+        // Byte-equal to `catenary primer claude` — one rendering, keyed by the
+        // declared client, used by both surfaces.
+        assert_eq!(
+            ctx,
+            crate::cli::teaching::emitted_payload(Some(HostFormat::Claude)),
+            "session-start payload must be the SSOT claude rendering"
+        );
         // No pointer to the on-demand commands — the content is inlined.
         assert!(!ctx.contains("catenary primer"), "no primer pointer: {ctx}");
     }
@@ -2326,10 +2349,20 @@ mod tests {
     fn opencode_session_start_body_is_the_raw_ssot_payload() {
         let body = opencode_session_start_body();
         // Payload parity with the SSOT: byte-equal to the shared emitted payload
-        // (the same source `catenary primer` and the Claude additionalContext
-        // render from — including the daemon-staleness note under the same
-        // condition), so the OpenCode instructions file cannot drift.
-        assert_eq!(body, crate::cli::teaching::emitted_payload());
+        // keyed by the declared OpenCode identity (the same source `catenary
+        // primer` and the Claude additionalContext render from — including the
+        // daemon-staleness note under the same condition), so the OpenCode
+        // instructions file cannot drift.
+        assert_eq!(
+            body,
+            crate::cli::teaching::emitted_payload(Some(HostFormat::OpenCode))
+        );
+        // OpenCode's hook set carries no WorktreeCreate (yet), so its payload
+        // stays the client-neutral one — no misc-177 dispatch section.
+        assert!(
+            !body.contains("Dispatching isolated work"),
+            "opencode body must not carry the dispatch section: {body}"
+        );
         // Emitter output shape: raw text, not the Claude structured-output
         // envelope — the plugin writes stdout verbatim into its instructions
         // file.
@@ -2454,6 +2487,17 @@ mod tests {
         assert!(
             ctx.contains("your diagnostic debt is tracked per-agent"),
             "per-agent debt line present: {ctx}",
+        );
+        // Deliberately client-neutral (misc 177): the worker does not dispatch
+        // isolated work itself, so the dispatch section stays out and the
+        // misc-146 mention rides as-is.
+        assert!(
+            !ctx.contains("Dispatching isolated work"),
+            "subagent payload must not carry the dispatch section: {ctx}"
+        );
+        assert!(
+            ctx.contains("Work in isolated subagents"),
+            "subagent payload keeps the misc-146 mention: {ctx}"
         );
     }
 

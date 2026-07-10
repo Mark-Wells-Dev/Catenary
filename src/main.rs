@@ -37,7 +37,14 @@ struct Args {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Overview of Catenary's workflow and commands.
-    Primer,
+    Primer {
+        /// Declared client identity (e.g. `claude`) — keys client-specific
+        /// teaching to that host's installed hook set (misc 177); omitted, the
+        /// client-neutral payload prints. Declared, never auto-detected: hooks
+        /// are hand-crafted per host and there is no standardized hook
+        /// protocol to sniff against.
+        client: Option<HostFormat>,
+    },
 
     /// Search for a pattern with LSP-enriched results.
     ///
@@ -652,9 +659,9 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Some(Command::Primer) => {
+        Some(Command::Primer { client }) => {
             let mut out = cli::Output::stdout(false);
-            run_primer(&mut out);
+            run_primer(&mut out, client);
             Ok(())
         }
         #[cfg(unix)]
@@ -1176,8 +1183,13 @@ fn render_search_outcome(
 /// the allow / pipeline / deny surface is always this session's actual one, and
 /// a daemon-staleness note is prepended when the serving daemon runs a
 /// different build than this CLI.
-fn run_primer(out: &mut cli::Output) {
-    let _ = out.writeln(format_args!("{}", cli::teaching::emitted_payload()));
+///
+/// `client` is the declared client identity (`catenary primer claude`, misc
+/// 177): a client whose installed hook set registers `WorktreeCreate` gets the
+/// "Dispatching isolated work" section; bare `catenary primer` prints the
+/// client-neutral payload, byte-identical to before the parameter existed.
+fn run_primer(out: &mut cli::Output, client: Option<HostFormat>) {
+    let _ = out.writeln(format_args!("{}", cli::teaching::emitted_payload(client)));
 }
 
 /// Builds a standard tokio multi-thread runtime.
@@ -3403,7 +3415,26 @@ mod tests {
         use clap::Parser;
         let args = Args::try_parse_from(["catenary", "primer"]);
         let args = args.expect("primer should parse");
-        assert!(matches!(args.command, Some(Command::Primer)));
+        assert!(matches!(
+            args.command,
+            Some(Command::Primer { client: None })
+        ));
+    }
+
+    #[test]
+    fn test_cli_primer_with_declared_client() {
+        // misc 177: the optional positional declares the client identity —
+        // `catenary primer claude` — using the same `--format` vocabulary the
+        // hook definitions declare with.
+        use clap::Parser;
+        let args = Args::try_parse_from(["catenary", "primer", "claude"]);
+        let args = args.expect("primer with a client should parse");
+        assert!(matches!(
+            args.command,
+            Some(Command::Primer {
+                client: Some(HostFormat::Claude)
+            })
+        ));
     }
 
     #[test]
@@ -3413,7 +3444,7 @@ mod tests {
         // `Output::buffer` proves the handler writes via `Output` (not raw
         // `println!`).
         let mut out = cli::Output::buffer(80);
-        run_primer(&mut out);
+        run_primer(&mut out, None);
         let text = out.into_string();
 
         // The invariants tier.
@@ -3447,11 +3478,43 @@ mod tests {
         // newline `writeln` adds. Deterministic regardless of daemon staleness:
         // both sides observe the same daemon state, so they agree.
         let mut out = cli::Output::buffer(80);
-        run_primer(&mut out);
+        run_primer(&mut out, None);
         let printed = out.into_string();
         assert_eq!(
             printed.trim_end_matches('\n'),
-            cli::teaching::emitted_payload()
+            cli::teaching::emitted_payload(None)
+        );
+    }
+
+    #[test]
+    fn primer_claude_carries_the_dispatch_section() {
+        // misc 177: `catenary primer claude` renders the SSOT payload keyed by
+        // the declared Claude identity — the same rendering the Claude
+        // SessionStart hook inlines — which carries the "Dispatching isolated
+        // work" section. Bare `catenary primer` stays client-neutral.
+        let mut out = cli::Output::buffer(80);
+        run_primer(&mut out, Some(HostFormat::Claude));
+        let claude = out.into_string();
+        assert!(
+            claude.contains("Dispatching isolated work"),
+            "primer claude should teach worktree dispatch: {claude}"
+        );
+        assert!(
+            claude.contains("isolation: \"worktree\""),
+            "primer claude should name the isolation flag: {claude}"
+        );
+        assert_eq!(
+            claude.trim_end_matches('\n'),
+            cli::teaching::emitted_payload(Some(HostFormat::Claude)),
+            "primer claude must be the SSOT claude rendering"
+        );
+
+        let mut out = cli::Output::buffer(80);
+        run_primer(&mut out, None);
+        let bare = out.into_string();
+        assert!(
+            !bare.contains("Dispatching isolated work"),
+            "bare primer must not carry the dispatch section: {bare}"
         );
     }
 
@@ -3461,7 +3524,7 @@ mod tests {
         // pointer — and the retired `editing` / `sed` subcommands must not
         // appear in agent-facing guidance.
         let mut out = cli::Output::buffer(80);
-        run_primer(&mut out);
+        run_primer(&mut out, None);
         let text = out.into_string();
         for retired in [
             "catenary editing",
@@ -3512,7 +3575,7 @@ mod tests {
     fn primer_teaches_glob_pattern_form() {
         // The pattern teaching is carried in the payload's invariants tier.
         let mut out = cli::Output::buffer(80);
-        run_primer(&mut out);
+        run_primer(&mut out, None);
         let text = out.into_string();
         assert!(
             text.contains("catenary glob 'src/**/*.rs'"),
