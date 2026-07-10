@@ -2787,16 +2787,37 @@ mod tests {
         extract_messages(&data)
     }
 
-    fn run_server_wait(args: Args, input: &[u8], wait_ms: u64) -> Vec<Value> {
+    /// Like `run_server_with`, but for servers whose output finishes on a
+    /// background thread after the input drains (progress simulators,
+    /// flycheck): polls the captured output until `done` accepts the parsed
+    /// messages, then returns them. `deadline` bounds only a genuinely
+    /// missing message — the poll returns at the first satisfaction, so a
+    /// healthy run pays the thread's actual latency. (The predecessor slept
+    /// a guessed fixed window and false-failed on slow CI runners whenever
+    /// the thread missed it.)
+    fn run_server_until(
+        args: Args,
+        input: &[u8],
+        done: impl Fn(&[Value]) -> bool,
+        deadline: Duration,
+    ) -> Vec<Value> {
         let (writer, buf) = buffer_writer();
         let mut server = MockServer::new(args, writer);
         let mut reader = Cursor::new(input.to_vec());
         server.run(&mut reader);
-        std::thread::sleep(Duration::from_millis(wait_ms));
-        let data = buf
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        extract_messages(&data)
+        let start = std::time::Instant::now();
+        loop {
+            let messages = {
+                let data = buf
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                extract_messages(&data)
+            };
+            if done(&messages) || start.elapsed() >= deadline {
+                return messages;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn initialize_request(id: u64) -> String {
@@ -3041,7 +3062,29 @@ mod tests {
         input.extend(frame(&initialized));
         input.extend(frame(&shutdown_request(2)));
 
-        let messages = run_server_wait(args, &input, 250);
+        // The predicate mirrors the assertions below: wait until everything
+        // asserted has arrived (or the deadline turns a missing message into
+        // a loud failure with the partial capture).
+        let messages = run_server_until(
+            args,
+            &input,
+            |messages| {
+                let create = messages.iter().any(|m| {
+                    m.get("method").and_then(Value::as_str)
+                        == Some("window/workDoneProgress/create")
+                });
+                let begin = messages.iter().any(|m| {
+                    m.get("method").and_then(Value::as_str) == Some("$/progress")
+                        && m["params"]["value"]["kind"] == "begin"
+                });
+                let end = messages.iter().any(|m| {
+                    m.get("method").and_then(Value::as_str) == Some("$/progress")
+                        && m["params"]["value"]["kind"] == "end"
+                });
+                create && begin && end
+            },
+            Duration::from_secs(10),
+        );
 
         let has_create = messages.iter().any(|m| {
             m.get("method").and_then(Value::as_str) == Some("window/workDoneProgress/create")
@@ -5020,7 +5063,30 @@ const PI: f64
         input.extend(frame(&did_change_notification(uri, "fn world\n", 2)));
         input.extend(frame(&shutdown_request(2)));
 
-        let messages = run_server_wait(args, &input, 300);
+        // The predicate mirrors the assertions below: wait until everything
+        // asserted has arrived (or the deadline turns a missing message into
+        // a loud failure with the partial capture).
+        let messages = run_server_until(
+            args,
+            &input,
+            |messages| {
+                let create = messages.iter().any(|m| {
+                    m.get("method").and_then(Value::as_str)
+                        == Some("window/workDoneProgress/create")
+                });
+                let begin = messages.iter().any(|m| {
+                    m.get("method").and_then(Value::as_str) == Some("$/progress")
+                        && m["params"]["value"]["kind"] == "begin"
+                        && m["params"]["value"]["title"] == "Checking"
+                });
+                let end = messages.iter().any(|m| {
+                    m.get("method").and_then(Value::as_str) == Some("$/progress")
+                        && m["params"]["value"]["kind"] == "end"
+                });
+                create && begin && end
+            },
+            Duration::from_secs(10),
+        );
 
         let has_create = messages.iter().any(|m| {
             m.get("method").and_then(Value::as_str) == Some("window/workDoneProgress/create")
@@ -5104,8 +5170,29 @@ const PI: f64
         input.extend(frame(&did_save_notification(uri)));
         input.extend(frame(&shutdown_request(2)));
 
-        // Wait for the flycheck thread to complete
-        let messages = run_server_wait(args, &input, 500);
+        // The predicate mirrors the assertions below: wait until the
+        // flycheck thread's output has arrived (or the deadline turns a
+        // missing message into a loud failure with the partial capture).
+        let messages = run_server_until(
+            args,
+            &input,
+            |messages| {
+                let diags = messages
+                    .iter()
+                    .filter(|m| {
+                        m.get("method").and_then(Value::as_str)
+                            == Some("textDocument/publishDiagnostics")
+                    })
+                    .count();
+                let begin = messages.iter().any(|m| {
+                    m.get("method").and_then(Value::as_str) == Some("$/progress")
+                        && m["params"]["value"]["kind"] == "begin"
+                        && m["params"]["value"]["title"] == "Flycheck"
+                });
+                diags >= 2 && begin
+            },
+            Duration::from_secs(10),
+        );
 
         // didOpen publishes one, flycheck publishes another
         let diag_count = messages
