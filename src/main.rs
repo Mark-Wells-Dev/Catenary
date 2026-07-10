@@ -550,6 +550,138 @@ enum HookCommand {
         #[arg(long, value_enum)]
         format: HostFormat,
     },
+    // ── Reserved no-op shims ──────────────────────────────────────────
+    // The full Claude Code hook-event surface is registered in hooks.json
+    // (maintainer ruling, pre-v2) so future behavioral changes land in the
+    // binary without another hooks.json churn. Events with no behavior yet
+    // terminate in `cli::hooks::run_reserved_shim` — drain stdin, exit 0,
+    // no daemon, no output. Observability wiring is post-v2.
+    /// `Setup`: reserved no-op shim (observability wiring post-v2).
+    #[command(name = "setup")]
+    Setup {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `UserPromptSubmit`: reserved no-op shim (observability wiring post-v2).
+    #[command(name = "user-prompt-submit")]
+    UserPromptSubmit {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `UserPromptExpansion`: reserved no-op shim (observability wiring post-v2).
+    #[command(name = "user-prompt-expansion")]
+    UserPromptExpansion {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `PermissionDenied`: reserved no-op shim (observability wiring post-v2).
+    #[command(name = "permission-denied")]
+    PermissionDenied {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `PostToolUse`: reserved no-op shim (observability wiring post-v2).
+    #[command(name = "post-tool-use")]
+    PostToolUse {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `PostToolUseFailure`: reserved no-op shim (observability wiring post-v2).
+    #[command(name = "post-tool-use-failure")]
+    PostToolUseFailure {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `Notification`: reserved no-op shim (observability wiring post-v2).
+    #[command(name = "notification")]
+    Notification {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `TaskCreated`: reserved no-op shim (observability wiring post-v2).
+    #[command(name = "task-created")]
+    TaskCreated {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `TaskCompleted`: reserved no-op shim (observability wiring post-v2).
+    #[command(name = "task-completed")]
+    TaskCompleted {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `StopFailure`: reserved no-op shim (observability wiring post-v2).
+    #[command(name = "stop-failure")]
+    StopFailure {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `TeammateIdle`: reserved no-op shim (observability wiring post-v2).
+    #[command(name = "teammate-idle")]
+    TeammateIdle {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `InstructionsLoaded`: reserved no-op shim (observability wiring post-v2).
+    #[command(name = "instructions-loaded")]
+    InstructionsLoaded {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `ConfigChange`: reserved no-op shim (observability wiring post-v2).
+    #[command(name = "config-change")]
+    ConfigChange {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `CwdChanged`: reserved no-op shim (observability wiring post-v2).
+    #[command(name = "cwd-changed")]
+    CwdChanged {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `PreCompact`: reserved no-op shim (observability wiring post-v2).
+    #[command(name = "pre-compact")]
+    PreCompact {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `PostCompact`: reserved no-op shim (observability wiring post-v2).
+    #[command(name = "post-compact")]
+    PostCompact {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `Elicitation`: reserved no-op shim (observability wiring post-v2).
+    #[command(name = "elicitation")]
+    Elicitation {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
+    /// `ElicitationResult`: reserved no-op shim (observability wiring post-v2).
+    #[command(name = "elicitation-result")]
+    ElicitationResult {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
 }
 
 /// Host targets for the install command.
@@ -970,6 +1102,27 @@ fn main() -> Result<()> {
                 HookCommand::PermissionRequest { format } => {
                     cli::hooks::run_permission_request(format);
                 }
+                // Reserved no-op shims (full-surface registration, pre-v2
+                // ruling): drain stdin, exit 0 — no daemon connection, no
+                // output. Observability wiring is post-v2.
+                HookCommand::Setup { .. }
+                | HookCommand::UserPromptSubmit { .. }
+                | HookCommand::UserPromptExpansion { .. }
+                | HookCommand::PermissionDenied { .. }
+                | HookCommand::PostToolUse { .. }
+                | HookCommand::PostToolUseFailure { .. }
+                | HookCommand::Notification { .. }
+                | HookCommand::TaskCreated { .. }
+                | HookCommand::TaskCompleted { .. }
+                | HookCommand::StopFailure { .. }
+                | HookCommand::TeammateIdle { .. }
+                | HookCommand::InstructionsLoaded { .. }
+                | HookCommand::ConfigChange { .. }
+                | HookCommand::CwdChanged { .. }
+                | HookCommand::PreCompact { .. }
+                | HookCommand::PostCompact { .. }
+                | HookCommand::Elicitation { .. }
+                | HookCommand::ElicitationResult { .. } => cli::hooks::run_reserved_shim(),
             }
             Ok(())
         }
@@ -2768,6 +2921,115 @@ mod tests {
                 format: HostFormat::OpenCode
             }
         ));
+    }
+
+    #[test]
+    fn test_cli_hook_reserved_shims_parse() {
+        use clap::Parser;
+        // The reserved no-op shims (full-surface registration, pre-v2 ruling):
+        // every kebab-named event must parse as a `catenary hook` subcommand
+        // with the house `--format` flag.
+        const RESERVED_SHIMS: [&str; 18] = [
+            "setup",
+            "user-prompt-submit",
+            "user-prompt-expansion",
+            "permission-denied",
+            "post-tool-use",
+            "post-tool-use-failure",
+            "notification",
+            "task-created",
+            "task-completed",
+            "stop-failure",
+            "teammate-idle",
+            "instructions-loaded",
+            "config-change",
+            "cwd-changed",
+            "pre-compact",
+            "post-compact",
+            "elicitation",
+            "elicitation-result",
+        ];
+        for name in RESERVED_SHIMS {
+            let args = Args::try_parse_from(["catenary", "hook", name, "--format=claude"]);
+            let args = args.expect("reserved hook shim should parse");
+            assert!(
+                matches!(args.command, Some(Command::Hook { .. })),
+                "`catenary hook {name}` did not parse as a Hook command"
+            );
+        }
+    }
+
+    /// Collect every `"command"` string from `{"type": "command", …}` hook
+    /// objects anywhere in a hooks.json tree. Shape-agnostic (recursive walk),
+    /// so it covers both the Claude layout (`hooks` → event → registrations →
+    /// `hooks` array) and the Antigravity layout (named groups with bare or
+    /// matcher-nested entries).
+    fn collect_hook_commands(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.get("type").and_then(serde_json::Value::as_str) == Some("command")
+                    && let Some(cmd) = map.get("command").and_then(serde_json::Value::as_str)
+                {
+                    out.push(cmd.to_owned());
+                }
+                for v in map.values() {
+                    collect_hook_commands(v, out);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for v in arr {
+                    collect_hook_commands(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every hook registration in an embedded hooks.json must parse as a
+    /// `catenary hook …` invocation — a registration can never point at a
+    /// subcommand the CLI does not have (full-surface registration, pre-v2).
+    fn assert_hook_registrations_parse(embedded: &str, label: &str) {
+        use clap::Parser;
+        let json: serde_json::Value =
+            serde_json::from_str(embedded).expect("embedded hooks.json is valid JSON");
+        let mut commands = Vec::new();
+        collect_hook_commands(&json, &mut commands);
+        assert!(
+            !commands.is_empty(),
+            "{label}: no hook commands found in embedded hooks.json"
+        );
+        for registered in &commands {
+            let argv: Vec<&str> = registered.split_whitespace().collect();
+            let parsed = Args::try_parse_from(&argv);
+            assert!(
+                parsed.is_ok(),
+                "{label}: registered command {registered:?} does not parse: {:?}",
+                parsed.err()
+            );
+            assert!(
+                matches!(
+                    parsed.expect("parse result checked above").command,
+                    Some(Command::Hook { .. })
+                ),
+                "{label}: registered command {registered:?} is not a `catenary hook` invocation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_claude_hooks_json_registrations_all_parse() {
+        assert_hook_registrations_parse(
+            include_str!("../plugins/catenary/hooks/hooks.json"),
+            "Claude Code",
+        );
+    }
+
+    #[test]
+    fn test_antigravity_hooks_json_registrations_all_parse() {
+        assert_hook_registrations_parse(
+            include_str!("../plugins/catenary-antigravity/hooks.json"),
+            "Antigravity",
+        );
     }
 
     #[test]

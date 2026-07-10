@@ -17,6 +17,8 @@
 //! - `run_session_start` — clear stale editing state (`SessionStart`)
 //! - `run_pre_invocation` — first-sighting teaching injection (Antigravity
 //!   `PreInvocation`)
+//! - `run_reserved_shim` — every event registered ahead of its behavior
+//!   (full-surface registration, pre-v2): drain stdin, exit 0
 
 #![allow(
     clippy::print_stdout,
@@ -817,6 +819,35 @@ pub fn run_permission_request(format: HostFormat) {
     let _ = ipc_exchange(stream, &request);
 }
 
+/// Reserved no-op shim shared by every hook event registered ahead of its
+/// behavior (full-surface registration, pre-v2 maintainer ruling).
+///
+/// The entire Claude Code hook-event surface is wired in `hooks.json` so
+/// future behavioral changes land in the binary — which the host already
+/// invokes — without another hooks.json churn (each hooks.json change is a
+/// stale transition requiring `catenary install claude`, because the host runs
+/// hooks from a frozen cache copy). Events with no behavior yet terminate
+/// here: drain stdin to EOF and drop it (the host writes the event payload to
+/// the hook's stdin — exiting without draining risks a host-side EPIPE), then
+/// return silently. Hard constraints, since this runs on every event
+/// occurrence: no daemon connection, no output on stdout/stderr, no logging,
+/// and success even on malformed or empty stdin. Observability wiring is
+/// post-v2.
+pub fn run_reserved_shim() {
+    drain_hook_stdin(std::io::stdin().lock());
+}
+
+/// Read a hook payload stream to EOF and discard it, returning the number of
+/// bytes drained.
+///
+/// A byte-level copy into [`std::io::sink`]: the payload's content is
+/// irrelevant — garbage and invalid UTF-8 drain exactly like well-formed JSON;
+/// only reaching EOF matters. Read errors are swallowed (yielding the bytes
+/// drained before the error): the shim's contract is silent success.
+fn drain_hook_stdin(mut reader: impl std::io::Read) -> u64 {
+    std::io::copy(&mut reader, &mut std::io::sink()).unwrap_or(0)
+}
+
 /// Create an out-of-tree agent worktree (`WorktreeCreate` hook handler).
 ///
 /// Unlike every other hook — which fail *open* so the host CLI's flow is never
@@ -1534,6 +1565,32 @@ mod tests {
         // Other hosts have no `additionalContext` field; nothing is emitted.
         assert!(format_additional_context("x", "Stop", HostFormat::Antigravity).is_empty());
         assert!(format_additional_context("x", "Stop", HostFormat::OpenCode).is_empty());
+    }
+
+    // ── Reserved-shim drain tests ───────────────────────────────────
+
+    #[test]
+    fn drain_hook_stdin_consumes_well_formed_json_to_eof() {
+        // The shim's whole job: read the host's payload to EOF (no host-side
+        // EPIPE) and drop it. The byte count proves full consumption.
+        let payload = br#"{"session_id":"s1","hook_event_name":"PostToolUse","cwd":"/tmp"}"#;
+        assert_eq!(
+            drain_hook_stdin(std::io::Cursor::new(&payload[..])),
+            payload.len() as u64,
+        );
+    }
+
+    #[test]
+    fn drain_hook_stdin_consumes_garbage_and_empty_input() {
+        // Malformed JSON, invalid UTF-8, and empty stdin all drain cleanly —
+        // the shim succeeds regardless of payload content.
+        let garbage: &[u8] = &[0xFF, 0xFE, b'{', 0x00, b'x'];
+        assert_eq!(drain_hook_stdin(std::io::Cursor::new(garbage)), 5);
+        assert_eq!(
+            drain_hook_stdin(std::io::Cursor::new(&b"not json at all"[..])),
+            15,
+        );
+        assert_eq!(drain_hook_stdin(std::io::Cursor::new(&b""[..])), 0);
     }
 
     // ── extract_shell_command tests ─────────────────────────────────
