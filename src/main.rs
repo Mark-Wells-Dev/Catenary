@@ -3096,12 +3096,55 @@ mod tests {
                 "missing-binary hint lacks {needle:?}: {session_start}"
             );
         }
-        // Only SessionStart carries the fallback — every other registration
-        // stays a bare invocation (one teaching surface, no per-event noise).
-        let with_fallback = commands.iter().filter(|c| c.contains("||")).count();
+        // Only SessionStart carries the teaching fallback — one teaching
+        // surface, no per-event noise.
+        let with_teach = commands
+            .iter()
+            .filter(|c| c.contains("systemMessage"))
+            .count();
         assert_eq!(
-            with_fallback, 1,
-            "exactly one registration (SessionStart) carries the fallback"
+            with_teach, 1,
+            "exactly one registration (SessionStart) carries the teaching fallback"
+        );
+    }
+
+    #[test]
+    fn reserved_registrations_fail_open_on_version_skew() {
+        // New-hooks/old-binary skew (a refreshed plugin cache ahead of the
+        // installed binary — live-sighted 2026-07-10): clap answers an
+        // unrecognized subcommand with exit 2, which Claude Code reads as a
+        // deliberate hook BLOCK on blocking-capable events — a stale binary
+        // bricked prompt submission. Reserved shims never deliberately block,
+        // so their registrations fail open at the REGISTRATION layer:
+        // `|| true` (Claude; silence is its empty answer). Behavioral
+        // registrations (pre-tool, session-start, …) exist in every shipped
+        // binary and may deliberately block — they carry no such tail.
+        let embedded = include_str!("../plugins/catenary/hooks/hooks.json");
+        let json: serde_json::Value =
+            serde_json::from_str(embedded).expect("embedded hooks.json is valid JSON");
+        let mut commands = Vec::new();
+        collect_hook_commands(&json, &mut commands);
+        let fail_open = commands.iter().filter(|c| c.ends_with("|| true")).count();
+        assert_eq!(
+            fail_open, 18,
+            "every reserved Claude registration fails open on version skew"
+        );
+
+        // Antigravity's dialect is JSON-in/JSON-out, so its reserved
+        // registrations answer the documented empty object on skew instead
+        // of silence.
+        let embedded = include_str!("../plugins/catenary-antigravity/hooks.json");
+        let json: serde_json::Value =
+            serde_json::from_str(embedded).expect("embedded hooks.json is valid JSON");
+        let mut commands = Vec::new();
+        collect_hook_commands(&json, &mut commands);
+        let fail_open = commands
+            .iter()
+            .filter(|c| c.ends_with("|| printf '%s' '{}'"))
+            .count();
+        assert_eq!(
+            fail_open, 2,
+            "both reserved Antigravity registrations answer {{}} on version skew"
         );
     }
 
