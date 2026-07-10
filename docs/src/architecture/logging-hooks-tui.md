@@ -227,7 +227,7 @@ live in host-specific JSON files:
 
 | Host CLI | Hook file | Events |
 |----------|-----------|--------|
-| Claude Code | `plugins/catenary/hooks/hooks.json` | `SessionStart`, `PreToolUse`, `Stop`, `SubagentStop`, `SessionEnd`, `SubagentStart`, `WorktreeRemove`, `WorktreeCreate` |
+| Claude Code | `plugins/catenary/hooks/hooks.json` | `SessionStart`, `PreToolUse`, `Stop`, `SubagentStop`, `SessionEnd`, `SubagentStart`, `WorktreeRemove`, `WorktreeCreate`, `PermissionRequest` |
 | Antigravity CLI | `plugins/catenary-antigravity/hooks.json` | `PreInvocation`, `PreToolUse`, `Stop` |
 
 The `PreToolUse` hook handles both editing state enforcement and command

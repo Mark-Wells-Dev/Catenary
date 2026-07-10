@@ -5,13 +5,34 @@
 - [Rust toolchain](https://rustup.rs/)
 - Language servers for the languages you want to use (see [Language Servers](lsp/README.md))
 
+## Platforms
+
+Catenary ships prebuilt binaries for **Linux x86_64**, **macOS arm64** (Apple
+silicon), and **Windows x86_64**. There is **no Intel-mac binary** — the
+installer refuses Intel Macs and points you at a source build. Any platform with
+a Rust toolchain can build from source.
+
 ## Install Catenary
+
+**Prebuilt binary (Linux / macOS arm64 / Windows):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/TwoWells/Catenary/main/install.sh | sh
+```
+
+The script detects your platform, downloads the matching release asset
+(`catenary-linux-amd64`, `catenary-macos-arm64`, or
+`catenary-windows-amd64.exe`), and installs it to `/usr/local/bin` (override
+with `CATENARY_INSTALL_DIR`). Once installed, `catenary update` self-updates the
+binary in place.
+
+**From crates.io (any platform with a Rust toolchain):**
 
 ```bash
 cargo install catenary-mcp
 ```
 
-To build from source instead:
+**From source:**
 
 ```bash
 cargo install --git https://github.com/TwoWells/Catenary catenary-mcp
