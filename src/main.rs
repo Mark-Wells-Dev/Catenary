@@ -3087,7 +3087,7 @@ mod tests {
             "osascript",
             "\"systemMessage\"",
             "command -v brew",
-            "brew install twowells/catenary/catenary",
+            "brew install twowells/tap/catenary",
             "install.sh | sh",
             "start a new session",
         ] {
