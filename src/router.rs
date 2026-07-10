@@ -3061,9 +3061,11 @@ fn get_or_create_router(
 ///
 /// `filtered_roots` carries the distinct enclosing project roots of those
 /// filtered edits (walk repository markers up from each). When non-empty the note names
-/// them — "no language servers running for `~/Projects/Lattice`" — pointing at
+/// them — "(roots: `~/Projects/Lattice`)" — pointing at
 /// what a `catenary pin` would mount (ephemeral-roots ticket 01); when
-/// empty (no detectable root) it falls back to the plain count.
+/// empty (no detectable root) it falls back to the plain count. The wording is
+/// past-tense event language — the edits *were* outside tracked roots *when
+/// made*, not a claim the roots currently have no servers (bug 170).
 #[cfg(unix)]
 fn with_out_of_roots_note(
     output: String,
@@ -3073,10 +3075,19 @@ fn with_out_of_roots_note(
     if filtered == 0 {
         return output;
     }
-    let plural = if filtered == 1 { "" } else { "s" };
+    // Past-tense event language: each record is an edit that WAS outside
+    // tracked roots when it was made, not a claim about the roots' current
+    // state. Batch-scoped and honest — a present-tense "no servers running
+    // for X" contradicts its own receipt when the same root is diagnosed in
+    // the same run, and names dead roots as if live (bug 170).
+    let (verb, plural) = if filtered == 1 {
+        ("was", "")
+    } else {
+        ("were", "s")
+    };
     let note = if filtered_roots.is_empty() {
         format!(
-            "({filtered} edit{plural} outside tracked roots \u{2014} not checked; see `catenary roots -h`)",
+            "({filtered} edit{plural} {verb} outside tracked roots when made \u{2014} not checked; see `catenary roots -h`)",
         )
     } else {
         let named = filtered_roots
@@ -3085,7 +3096,7 @@ fn with_out_of_roots_note(
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "({filtered} edit{plural} outside tracked roots \u{2014} no language servers running for {named}; see `catenary roots -h`)",
+            "({filtered} edit{plural} {verb} outside tracked roots when made (roots: {named}) \u{2014} not checked; see `catenary roots -h`)",
         )
     };
     if output.is_empty() {
@@ -7939,17 +7950,17 @@ mod tests {
         let mixed = with_out_of_roots_note(covered.to_string(), 2, &no_roots);
         assert!(mixed.starts_with(&format!("{covered}\n")), "got: {mixed}");
         assert!(
-            mixed.contains("2 edits outside tracked roots"),
+            mixed.contains("2 edits were outside tracked roots when made"),
             "got: {mixed}"
         );
         assert!(mixed.contains("not checked"), "got: {mixed}");
 
         // All-uncovered batch with no detectable roots: the plain note stands
-        // alone, no stray leading newline.
+        // alone, no stray leading newline. Past-tense event wording (bug 170).
         let alone = with_out_of_roots_note(String::new(), 1, &no_roots);
         assert_eq!(
             alone,
-            "(1 edit outside tracked roots \u{2014} not checked; see `catenary roots -h`)",
+            "(1 edit was outside tracked roots when made \u{2014} not checked; see `catenary roots -h`)",
         );
     }
 
@@ -7958,13 +7969,18 @@ mod tests {
         use std::collections::BTreeSet;
 
         // When the tracking carries the enclosing project root(s), the bare-run
-        // note names them (root-aware wording, ephemeral-roots ticket 01)
-        // instead of the plain count.
+        // note names them (root-aware wording, ephemeral-roots ticket 01). The
+        // wording is past-tense event language — it names the roots the edits
+        // were outside, not a live "no servers running" claim (bug 170).
         let roots = BTreeSet::from([PathBuf::from("/home/dev/Projects/Lattice")]);
         let note = with_out_of_roots_note(String::new(), 1, &roots);
         assert!(
-            note.contains("no language servers running for "),
-            "root-aware wording: {note}"
+            note.contains("was outside tracked roots when made"),
+            "past-tense event wording: {note}"
+        );
+        assert!(
+            note.contains("(roots: "),
+            "root-aware wording names the roots: {note}"
         );
         assert!(
             note.contains("Projects/Lattice"),
@@ -7975,8 +7991,8 @@ mod tests {
             "points at the mount command: {note}"
         );
         assert!(
-            !note.contains("not checked"),
-            "the plain-count wording is replaced, not appended: {note}"
+            !note.contains("no language servers running"),
+            "the present-tense live-state claim is gone (bug 170): {note}"
         );
     }
 

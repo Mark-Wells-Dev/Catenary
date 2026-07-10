@@ -344,6 +344,45 @@ pub fn duplicate_extension_findings(config: &Config) -> Vec<Finding> {
         .collect()
 }
 
+/// Leftover-launcher-args findings — a `[lsp.server.<key>]` whose `args`
+/// contain the key itself.
+///
+/// The retired `command` field (misc 162) took a launcher and its `args` — e.g.
+/// `command = "rustup"`, `args = ["run", "stable", "rust-analyzer"]`. The
+/// migration teaching error forces `command` out, but `args` are free-form and
+/// stay, so the daemon spawns `rust-analyzer run stable rust-analyzer` — the
+/// server key with arguments written FOR the retired launcher — and the server
+/// dies on the unknown arguments with nothing pointing at the config (bug 94).
+///
+/// The one known shape (`args` containing the server key) catches the real case
+/// with zero false-positive cost; args are legitimately free-form, so this is a
+/// [`Severity::Suggestion`], not an error.
+#[must_use]
+pub fn leftover_launcher_args_findings(config: &Config) -> Vec<Finding> {
+    let mut names: Vec<&String> = config
+        .server
+        .iter()
+        .filter(|(name, def)| def.args.iter().any(|arg| arg == name.as_str()))
+        .map(|(name, _)| name)
+        .collect();
+    names.sort_unstable();
+    names
+        .into_iter()
+        .map(|name| {
+            Finding::new(
+                FindingCode::ConfigLeftoverLauncherArgs,
+                Severity::Suggestion,
+                format!(
+                    "[lsp.server.{name}] args contain '{name}' — this looks like \
+                     launcher arguments left behind when the retired `command` field \
+                     was removed (misc 162). The daemon now spawns '{name}' directly, \
+                     so these args are passed to it. Drop the leftover launcher args"
+                ),
+            )
+        })
+        .collect()
+}
+
 /// Rewrite a config-load error for doctor's own render.
 ///
 /// The migration walker's rename guidance prints directly above the error in
@@ -738,5 +777,50 @@ mod tests {
         let path = tmp.path().join(".catenary.toml");
         fs::write(&path, "[commands]\nbuild = [\"make\"]\n").expect("write project config");
         assert!(ignored_enforcement_findings(&path).is_empty());
+    }
+
+    // ── leftover launcher args (bug 94) ─────────────────────────────
+
+    #[test]
+    fn leftover_launcher_args_flags_key_in_own_args() {
+        // The exact pre-162 shape: rust-analyzer carrying the retired launcher's
+        // `args = ["run", "stable", "rust-analyzer"]` — the key names itself.
+        let mut config = Config::default();
+        config.server.insert(
+            "rust-analyzer".to_string(),
+            crate::config::ServerDef {
+                args: vec![
+                    "run".to_string(),
+                    "stable".to_string(),
+                    "rust-analyzer".to_string(),
+                ],
+                ..Default::default()
+            },
+        );
+
+        let findings = leftover_launcher_args_findings(&config);
+        let finding = findings.first().expect("one finding");
+        assert_eq!(finding.code, FindingCode::ConfigLeftoverLauncherArgs);
+        assert_eq!(finding.severity, Severity::Suggestion);
+        assert!(
+            finding.message.contains("[lsp.server.rust-analyzer]")
+                && finding.message.contains("misc 162"),
+            "names the server and the migration: {}",
+            finding.message,
+        );
+    }
+
+    #[test]
+    fn leftover_launcher_args_silent_for_ordinary_args() {
+        // Free-form args that do not name the key are legitimate — no finding.
+        let mut config = Config::default();
+        config.server.insert(
+            "rust-analyzer".to_string(),
+            crate::config::ServerDef {
+                args: vec!["--log-file".to_string(), "/tmp/ra.log".to_string()],
+                ..Default::default()
+            },
+        );
+        assert!(leftover_launcher_args_findings(&config).is_empty());
     }
 }

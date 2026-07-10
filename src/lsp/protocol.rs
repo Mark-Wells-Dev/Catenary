@@ -291,7 +291,7 @@ impl FramePump {
                     let dump_len = self.buffer.len().min(128);
                     warn!(
                         server = self.server_name.as_str(),
-                        source = "lsp.protocol",
+                        source = crate::source::Source::LspProtocol.as_str(),
                         scope_root = self.scope_root.as_deref(),
                         "malformed LSP message from {}, resynchronizing: {e}",
                         self.server_name,

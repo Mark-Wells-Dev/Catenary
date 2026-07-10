@@ -28,6 +28,8 @@
 //! - `logging` — forwarded server window messages (`window/logMessage`,
 //!   `window/showMessage`)
 //! - `parse` — parsing and deserialization
+//! - `protocol` — wire-framing faults (malformed message, resync, byte
+//!   accounting)
 //! - `stderr` — raw server process stderr output
 //! - `validation` — semantic correctness checks
 
@@ -55,6 +57,9 @@ pub enum Source {
     LspDispatch,
     /// LSP server spawn, init, crash, recovery, and shutdown.
     LspLifecycle,
+    /// LSP wire-framing faults (malformed message, resync, byte-conservation
+    /// divergence) surfaced by the frame pump.
+    LspProtocol,
     /// Forwarded LSP server window messages (`window/logMessage` and
     /// `window/showMessage`). Firehose-only — the notification sinks exclude
     /// this source by origin, so server chatter never reaches the user queue
@@ -80,6 +85,7 @@ impl Source {
             Self::LoggingFirehose => "logging.firehose",
             Self::LspDispatch => "lsp.dispatch",
             Self::LspLifecycle => "lsp.lifecycle",
+            Self::LspProtocol => "lsp.protocol",
             Self::LspLogging => "lsp.logging",
             Self::LspStderr => "lsp.stderr",
             Self::McpDispatch => "mcp.dispatch",
@@ -107,6 +113,7 @@ impl FromStr for Source {
             "logging.firehose" => Ok(Self::LoggingFirehose),
             "lsp.dispatch" => Ok(Self::LspDispatch),
             "lsp.lifecycle" => Ok(Self::LspLifecycle),
+            "lsp.protocol" => Ok(Self::LspProtocol),
             "lsp.logging" => Ok(Self::LspLogging),
             "lsp.stderr" => Ok(Self::LspStderr),
             "mcp.dispatch" => Ok(Self::McpDispatch),
@@ -150,6 +157,7 @@ mod tests {
             Source::LoggingFirehose,
             Source::LspDispatch,
             Source::LspLifecycle,
+            Source::LspProtocol,
             Source::LspLogging,
             Source::LspStderr,
             Source::McpDispatch,

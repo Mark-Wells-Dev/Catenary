@@ -1724,8 +1724,20 @@ async fn run_grep(
 
     // stdin mode: no paths + a readable piped/redirected stream. A plain
     // ripgrep pass over the stream, same flags, no enrichment, no daemon.
+    //
+    // A zero-byte pipe (`ssh -n`, most agent-harness shell tools) is a readable
+    // stream that yields nothing, so a naive stdin-mode dispatch greps an empty
+    // stream: no results, exit 0 — indistinguishable from a legitimate no-match,
+    // the worst wrong for a search tool an agent trusts (misc 174). Read the
+    // stream first: only genuine stream input (any bytes) stays in stdin mode;
+    // an empty stream falls through to the cwd filesystem search, matching the
+    // TTY case (which `is_readable_stdin` already sends there).
     if paths.is_empty() && is_readable_stdin() {
-        return run_grep_stdin(out, &pattern, &flags, count);
+        let buffered = read_stdin_bytes()?;
+        if !buffered.is_empty() {
+            return run_grep_stdin(out, &buffered, &pattern, &flags, count);
+        }
+        // Empty stream: fall through to the cwd filesystem search below.
     }
 
     let cwd = std::env::current_dir().context("cannot determine working directory")?;
@@ -1801,6 +1813,28 @@ fn is_readable_stdin() -> bool {
     ft.is_fifo() || ft.is_socket() || ft.is_file()
 }
 
+/// Reads all of stdin into a buffer.
+///
+/// Buffering (rather than streaming `stdin.lock()` straight into the searcher)
+/// lets the caller distinguish a genuine stream from a zero-byte pipe before
+/// committing to stdin mode (misc 174): an empty buffer means the "readable"
+/// stream carried nothing and the search should fall back to the filesystem.
+/// Grep inputs are agent-scale, so holding the stream in memory is fine.
+///
+/// # Errors
+///
+/// Returns an error if the stream cannot be read.
+#[cfg(unix)]
+fn read_stdin_bytes() -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .lock()
+        .read_to_end(&mut buf)
+        .context("read stdin stream")?;
+    Ok(buf)
+}
+
 /// stdin mode: a plain ripgrep pass over the piped stream.
 ///
 /// No daemon, no enrichment, no `#scope` — a stream has no file or LSP context.
@@ -1809,20 +1843,24 @@ fn is_readable_stdin() -> bool {
 /// input)` when the stream matched (the GNU `grep -l` convention for a nameless
 /// stream); `--count` prints the matching-line tally.
 ///
+/// Takes the already-buffered stream bytes so the caller can gate on a zero-byte
+/// pipe (misc 174) before reaching here — this path only runs for genuine
+/// (non-empty) stream input.
+///
 /// # Errors
 ///
-/// Returns an error if the pattern is invalid or the stream cannot be read.
+/// Returns an error if the pattern is invalid or the search fails.
 #[cfg(unix)]
 fn run_grep_stdin(
     out: &mut cli::Output,
+    input: &[u8],
     pattern: &str,
     flags: &catenary_mcp::bridge::GrepFlags,
     count: bool,
 ) -> Result<()> {
     use catenary_mcp::bridge::{StreamOutcome, grep_stream};
 
-    let stdin = std::io::stdin();
-    let outcome = grep_stream(stdin.lock(), pattern, flags, count)?;
+    let outcome = grep_stream(input, pattern, flags, count)?;
     match outcome {
         StreamOutcome::Count(n) => {
             let _ = out.writeln(format_args!("{n} matches"));
@@ -4114,5 +4152,69 @@ mod tests {
             out.into_string().trim().is_empty(),
             "a faulted run prints no receipt (and no [no edited files] sentinel)",
         );
+    }
+
+    // ── grep zero-byte-pipe foot-gun (misc 174) ───────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_stdin_zero_byte_stream_is_the_fallback_gate() {
+        // The dispatch peels off the empty stream by its emptiness — a zero-byte
+        // pipe buffers to nothing, so `run_grep` falls through to the cwd
+        // filesystem search instead of silently greping an empty stream (misc
+        // 174). Genuine (non-empty) stream input stays in stdin mode.
+        let empty: &[u8] = b"";
+        assert!(
+            empty.is_empty(),
+            "a zero-byte pipe buffers empty → filesystem fallback",
+        );
+        let genuine: &[u8] = b"hello\n";
+        assert!(
+            !genuine.is_empty(),
+            "any bytes → genuine stream mode, unchanged",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_stdin_over_buffered_bytes_matches_lines() {
+        // Genuine stream mode survives the buffer refactor: a non-empty byte
+        // buffer produces the same plain-ripgrep line output as before, with no
+        // enrichment. This is the path a real (non-empty) pipe reaches.
+        let flags = catenary_mcp::bridge::GrepFlags::default();
+        let mut out = cli::Output::buffer(80);
+        run_grep_stdin(&mut out, b"alpha\nbeta\ngamma\n", "beta", &flags, false)
+            .expect("stream search succeeds");
+        let rendered = out.into_string();
+        assert!(
+            rendered.contains("beta"),
+            "matched line renders: {rendered}"
+        );
+        assert!(
+            !rendered.contains("alpha") && !rendered.contains("gamma"),
+            "non-matching lines are excluded: {rendered}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_stdin_over_buffered_bytes_counts_and_lists() {
+        let flags = catenary_mcp::bridge::GrepFlags::default();
+
+        // --count over the buffer tallies matching lines.
+        let mut out = cli::Output::buffer(80);
+        run_grep_stdin(&mut out, b"a\nba\nc\na\n", "a", &flags, true)
+            .expect("count search succeeds");
+        assert!(out.into_string().contains("3 matches"));
+
+        // -l over a buffer that matched prints the nameless-stream marker.
+        let list_flags = catenary_mcp::bridge::GrepFlags {
+            files_with_matches: true,
+            ..Default::default()
+        };
+        let mut out = cli::Output::buffer(80);
+        run_grep_stdin(&mut out, b"needle\n", "needle", &list_flags, false)
+            .expect("files-with-matches search succeeds");
+        assert!(out.into_string().contains("(standard input)"));
     }
 }

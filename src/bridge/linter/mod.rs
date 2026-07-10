@@ -179,6 +179,13 @@ async fn run_linter(
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    // The diagnostics pipeline carries no CancellationToken; its only
+    // cancellation is the future drop on cancel-on-disconnect. Without this
+    // tokio lets the child outlive the dropped future, so an in-flight lint
+    // over the whole batch keeps running detached with its output going
+    // nowhere (bug 98). kill_on_drop ties the subprocess lifetime to this
+    // future so the disconnect stops it.
+    cmd.kill_on_drop(true);
 
     let output = match cmd.output().await {
         Ok(output) => output,

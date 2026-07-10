@@ -138,6 +138,9 @@ pub enum FindingCode {
     ConfigUnreferencedServer,
     /// An extension claimed by two `[lsp.language.*]` entries.
     ConfigDuplicateExtension,
+    /// A `[lsp.server.<key>]` whose `args` contain the server key itself — the
+    /// leftover-launcher shape from a pre-162 `command`+`args` pair (bug 94).
+    ConfigLeftoverLauncherArgs,
     /// A project `.catenary.toml` using a removed bare `lsp`/`enabled` toggle.
     ProjectRemovedToggle,
     /// A project `.catenary.toml` that fails to load.
@@ -209,6 +212,7 @@ impl FindingCode {
             Self::ConfigValidationError => "config-validation-error",
             Self::ConfigUnreferencedServer => "config-unreferenced-server",
             Self::ConfigDuplicateExtension => "config-duplicate-extension",
+            Self::ConfigLeftoverLauncherArgs => "config-leftover-launcher-args",
             Self::ProjectRemovedToggle => "project-removed-toggle",
             Self::ProjectLoadError => "project-load-error",
             Self::ProjectSummary => "project-summary",
