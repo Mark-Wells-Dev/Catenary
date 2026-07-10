@@ -19,6 +19,8 @@ pub mod manager;
 pub(crate) mod params;
 /// LSP message protocol definitions.
 pub mod protocol;
+/// Spawn-time rust-toolchain pin resolution (misc 176 / bug 92).
+pub mod rust_toolchain;
 /// Server profile: init-time capabilities and runtime observations.
 pub(crate) mod server;
 /// Engine-internal per-server behavior casing (capability shaping, shipped levers).

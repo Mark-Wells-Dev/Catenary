@@ -17,6 +17,7 @@ use crate::logging::LoggingServer;
 use crate::lsp::LspClient;
 use crate::lsp::glob::{self, LspGlob};
 use crate::lsp::instance_key::{InstanceKey, Scope};
+use crate::lsp::rust_toolchain;
 use crate::lsp::server::LspServer;
 use crate::lsp::settle::{IdleDetector, SettleResult, await_idle};
 use crate::lsp::state::{ServerLifecycle, ServerStatus};
@@ -1249,14 +1250,57 @@ impl LspClientManager {
             .map(|s: &String| s.as_str())
             .collect();
         let root_str = root.display().to_string();
+
+        // Rust-toolchain pin resolution (misc 176 / bug 92). When the rust
+        // engine is spawned through the bare `rust-analyzer` proxy key, ask
+        // rustup to resolve this root's active toolchain and rewrite the spawn
+        // to run through `rustup run <toolchain> …` — so both rust-analyzer AND
+        // the flycheck `cargo`/`rustc` it spawns honor the project pin on every
+        // layout (proxied or not). Resolution failure, no rustup on PATH, or a
+        // `path` override all fall through to the unchanged spawn below.
+        // Owned buffers here outlive the borrowed `spawn` arguments.
+        let wrap = if rust_toolchain::should_wrap(server_name, program) {
+            rust_toolchain::resolve_active_toolchain(root)
+                .map(|toolchain| rust_toolchain::wrap_spawn(program, &args, &toolchain))
+        } else {
+            None
+        };
+        let (spawn_program, spawn_args, spawn_env): (&str, Vec<&str>, Option<HashMap<_, _>>) =
+            if let Some(wrap) = &wrap {
+                info!(
+                    source = Source::LspLifecycle.as_str(),
+                    server = server_name,
+                    scope_root = %root.display(),
+                    toolchain = %wrap.toolchain,
+                    "rust-toolchain: spawning rust-analyzer through `rustup run {}`",
+                    wrap.toolchain,
+                );
+                // Overlay `RUSTUP_TOOLCHAIN` under the configured env: a user's
+                // explicit env value wins on key conflict (ServerDef::env
+                // semantics), so an operator can still override the toolchain.
+                let mut env = wrap.env.clone();
+                if let Some(cfg_env) = server_def.env.as_ref() {
+                    for (k, v) in cfg_env {
+                        env.insert(k.clone(), v.clone());
+                    }
+                }
+                (
+                    wrap.program.as_str(),
+                    wrap.args.iter().map(String::as_str).collect(),
+                    Some(env),
+                )
+            } else {
+                (program, args, server_def.env.clone())
+            };
+
         let mut client = LspClient::spawn(
-            program,
-            &args,
+            spawn_program,
+            &spawn_args,
             lang,
             server_name,
             self.logging.clone(),
             server_def.settings.clone(),
-            server_def.env.as_ref(),
+            spawn_env.as_ref(),
             &root_str,
         )?;
 
