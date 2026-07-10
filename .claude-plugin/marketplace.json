@@ -10,7 +10,7 @@
     {
       "name": "catenary",
       "description": "Enforced code intelligence for AI coding agents — a curated, LSP-backed command surface (grep, glob, sed, diagnostics) the agent can't route around",
-      "version": "1.6.1",
+      "version": "2.0.0",
       "author": {
         "name": "Mark Wells Dev",
         "email": "contact@markwells.dev"
