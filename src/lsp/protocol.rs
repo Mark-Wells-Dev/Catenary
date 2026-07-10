@@ -186,8 +186,14 @@ pub fn try_parse_frame(buffer: &mut BytesMut) -> Result<Option<Frame>> {
 /// data and resynchronize with the next LSP message boundary. Scans forward
 /// from byte 1 (byte 0 belongs to the current broken message) for a
 /// case-insensitive `Content-Length:` prefix. If found, the buffer is
-/// advanced to that position. If no valid header is found, the entire
-/// buffer is cleared.
+/// advanced to that position. If no full header is found, everything is
+/// discarded EXCEPT a trailing case-insensitive prefix of the needle: a
+/// read boundary can land mid-`Content-Length:`, and that tail may be the
+/// next real frame's header still arriving — clearing it destroys the frame
+/// (CI-found proptest counterexample: `\r\n\r\n` garbage completes a bogus
+/// header block while the next header's first byte sits at the buffer
+/// tail). The kept tail is capped at `buffer.len() - 1`, so resync always
+/// discards at least one byte and always makes progress.
 ///
 /// Returns the number of bytes discarded — the resync path's own
 /// consumption claim, verified by the [`FramePump`] conservation check.
@@ -203,9 +209,20 @@ pub fn resync_to_next_message(buffer: &mut BytesMut) -> usize {
             return i;
         }
     }
-    // No subsequent header found — discard everything.
-    let discarded = buffer.len();
-    buffer.clear();
+    // No full header found — keep the longest tail that could still grow
+    // into one, discard the rest.
+    let max_tail = needle.len().min(buffer.len().saturating_sub(1));
+    let keep = (1..=max_tail)
+        .rev()
+        .find(|&len| {
+            buffer[buffer.len() - len..]
+                .iter()
+                .zip(needle.iter())
+                .all(|(a, b)| a.to_ascii_lowercase() == *b)
+        })
+        .unwrap_or(0);
+    let discarded = buffer.len() - keep;
+    buffer.advance(discarded);
     discarded
 }
 
@@ -837,6 +854,52 @@ mod tests {
             &buffer[..],
             &b"cContent-Length: 11\r\n\r\n{\"after\":2}"[..]
         );
+    }
+
+    #[test]
+    fn resync_preserves_partial_header_prefix_at_buffer_tail() {
+        // CI-minimized from `resync_true_garbage_between_frames_keeps_both_
+        // frames` (run 29065557035; seed pinned in proptest-regressions):
+        // garbage `\r\n\r\n` + colons completes a bogus EMPTY header block, so
+        // the parser bails and resyncs while the next frame's header is only
+        // partially arrived. The old resync cleared the whole buffer on
+        // no-needle-found — destroying the partial `Content-Length:` prefix,
+        // and with it the next healthy frame (the orphaned header remainder
+        // then failed and cleared the body too). Resync must keep a trailing
+        // needle prefix; sweep EVERY split so the hazard is pinned at every
+        // read boundary, not just the CI-found one.
+        let before = r#"{"before":1}"#.to_string();
+        let after = r#"{"after":2}"#.to_string();
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&frame(&before));
+        stream.extend_from_slice(b"\r\n\r\n:::::::::");
+        stream.extend_from_slice(&frame(&after));
+
+        for split in 1..stream.len() {
+            let got = drive_reader(&stream, &[split]);
+            assert_eq!(
+                got,
+                vec![before.clone(), after.clone()],
+                "split {split} lost a frame to the resync clear"
+            );
+        }
+    }
+
+    #[test]
+    fn resync_keeps_a_trailing_content_length_prefix() {
+        // The tail-keep semantics directly: no full needle in the buffer, but
+        // the tail is a case-insensitive prefix of `content-length:` — resync
+        // discards everything before it and reports exactly that count.
+        let mut buffer = BytesMut::from(&b"\r\n\r\n::junk::Content-Le"[..]);
+        let discarded = resync_to_next_message(&mut buffer);
+        assert_eq!(&buffer[..], b"Content-Le");
+        assert_eq!(discarded, b"\r\n\r\n::junk::".len());
+
+        // And progress is guaranteed even when the WHOLE buffer (from byte 1)
+        // is a needle prefix: the keep is capped at len - 1.
+        let mut buffer = BytesMut::from(&b"content-le"[..]);
+        let discarded = resync_to_next_message(&mut buffer);
+        assert!(discarded >= 1, "resync must always discard at least a byte");
     }
 
     #[test]
