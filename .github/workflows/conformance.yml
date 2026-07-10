@@ -605,7 +605,12 @@ jobs:
         if: matrix.kind == 'homebrew'
         run: |
           set -euo pipefail
-          brew install "${{ matrix.formula }}"
+          # --overwrite: a dependency's link step can collide with the runner
+          # image's preinstalled kegs (run 29089146722: vscode-langservers-
+          # extracted failed on `Could not symlink bin/openssl`). The runner is
+          # ephemeral — clobbering its preinstalled links is safe and keeps a
+          # brew-infra collision from reading as a conformance red.
+          brew install --overwrite "${{ matrix.formula }}"
           # A keg-only formula (llvm → clangd) links nothing into
           # $(brew --prefix)/bin; `bin` names the launcher within the keg,
           # and the server key IS the executable (misc 162), so the
