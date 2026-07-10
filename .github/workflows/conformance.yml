@@ -17,6 +17,15 @@ name: Conformance
 # EMITS a candidate blessed-manifest as a build artifact (server → conformed
 # version / platform / date); nothing is pushed — the maintainer blesses by
 # committing the conformed entries in the reviewed PR.
+#
+# Platform dimension (misc 164): the matrix runs per-platform. Linux jobs ride
+# the recipes + ci-provision pins; the macOS leg (macos-latest = Apple silicon
+# only, maintainer ruling — macOS 27 is arm-exclusive) rides
+# defaults/ci-provision-macos.toml, the Homebrew-provisionable subset, with
+# every non-provisionable server carrying an explicit skip note there. Each
+# platform builds its own harness: cargo bakes absolute paths at compile time
+# and the checkout roots differ (/home/runner vs /Users/runner), so the Linux
+# artifact cannot serve a macOS job.
 
 "on":
   pull_request:
@@ -24,6 +33,7 @@ name: Conformance
     paths:
       - "defaults/recipes.toml"
       - "defaults/ci-provision.toml"
+      - "defaults/ci-provision-macos.toml"
       - "defaults/servers.toml"
       - "defaults/languages.toml"
       - "tests/fixtures/conformance/**"
@@ -47,6 +57,8 @@ jobs:
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
       empty: ${{ steps.gen.outputs.empty }}
+      matrix_macos: ${{ steps.gen.outputs.matrix_macos }}
+      empty_macos: ${{ steps.gen.outputs.empty_macos }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -64,9 +76,10 @@ jobs:
           if [ -n "$base" ]; then
             changed="$(git diff --name-only "$base" "${{ github.sha }}")"
             echo "changed files:"; echo "$changed"
-            # Only the two pin files are diff-scopeable; any other changed file
-            # (a fixture, the harness, servers/languages) may affect any server.
-            pins='^defaults/(recipes|ci-provision)\.toml$'
+            # Only the three pin files are diff-scopeable; any other changed
+            # file (a fixture, the harness, servers/languages) may affect any
+            # server.
+            pins='^defaults/(recipes|ci-provision|ci-provision-macos)\.toml$'
             if echo "$changed" | grep -qvE "$pins"; then
               scope_full=1
             else
@@ -74,25 +87,40 @@ jobs:
             fi
           fi
           if [ "$scope_full" -eq 0 ]; then
-            # Diff-scope BOTH sources against their base. A file that did not
+            # Diff-scope EVERY source against its base. A file that did not
             # change compares equal to its base → zero jobs from it, so a
             # recipes-only edit still scopes to changed recipes (and vice
-            # versa).
+            # versa). A base that predates ci-provision-macos.toml gets an
+            # empty base file, so every macOS stanza reads as changed.
             git show "$base:defaults/recipes.toml" > /tmp/base-recipes.toml
             git show "$base:defaults/ci-provision.toml" > /tmp/base-prov.toml
+            git show "$base:defaults/ci-provision-macos.toml" \
+              > /tmp/base-prov-macos.toml || : > /tmp/base-prov-macos.toml
             matrix="$(python3 tools/conformance_matrix.py \
               --base-recipes /tmp/base-recipes.toml \
               --base-provision /tmp/base-prov.toml)"
+            matrix_macos="$(python3 tools/conformance_matrix.py \
+              --platform macos \
+              --base-macos-provision /tmp/base-prov-macos.toml)"
           else
             matrix="$(python3 tools/conformance_matrix.py)"
+            matrix_macos="$(python3 tools/conformance_matrix.py \
+              --platform macos)"
           fi
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "matrix_macos=$matrix_macos" >> "$GITHUB_OUTPUT"
           njobs='import json,sys; print(len(json.load(sys.stdin)["include"]))'
           count="$(printf '%s' "$matrix" | python3 -c "$njobs")"
           if [ "$count" -eq 0 ]; then
             echo "empty=true" >> "$GITHUB_OUTPUT"
           else
             echo "empty=false" >> "$GITHUB_OUTPUT"
+          fi
+          count_macos="$(printf '%s' "$matrix_macos" | python3 -c "$njobs")"
+          if [ "$count_macos" -eq 0 ]; then
+            echo "empty_macos=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "empty_macos=false" >> "$GITHUB_OUTPUT"
           fi
 
   # Build the harness + catenary binaries ONCE; every matrix job downloads
@@ -128,6 +156,40 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: conformance-dist
+          path: dist
+          retention-days: 1
+
+  # macOS twin of the build-once job (misc 164). It cannot reuse the Linux
+  # artifact: a macOS runner checks out to /Users/runner/work/<repo>/<repo>
+  # (not /home/runner/...) and needs Mach-O binaries, so the harness compiles
+  # once per platform, at that platform's baked paths.
+  build-macos:
+    name: Build harness once (macOS)
+    needs: discover
+    if: needs.discover.outputs.empty_macos != 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile harness and binaries
+        run: |
+          set -euo pipefail
+          cargo test --test conformance_harness --features mockls \
+            --no-run --message-format=json > cargo-build.jsonl
+          exe="$(jq -r 'select(.reason=="compiler-artifact")
+            | select(.target.name=="conformance_harness")
+            | .executable // empty' cargo-build.jsonl | tail -n1)"
+          test -n "$exe"
+          mkdir -p dist/target/debug
+          cp "$exe" dist/conformance_harness
+          cp target/debug/catenary dist/target/debug/catenary
+          if [ -f target/debug/mockls ]; then
+            cp target/debug/mockls dist/target/debug/mockls
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: conformance-dist-macos
           path: dist
           retention-days: 1
 
@@ -442,6 +504,167 @@ jobs:
           path: blessed/${{ matrix.server }}.toml
           retention-days: 7
 
+  # The macOS leg (misc 164): the Homebrew-provisionable subset of the Linux
+  # matrix, on Apple silicon only. Servers with no viable brew path carry an
+  # explicit `skip` stanza in defaults/ci-provision-macos.toml, so this matrix
+  # is honest about what it does not prove. "Clear" on macOS inherits the
+  # Linux legs' honest-red semantics (e.g. the misc 156 cold-bootstrap
+  # ruling), not a literal all-green.
+  conform-macos:
+    name: "Conform ${{ matrix.server }} (macOS)"
+    needs: [discover, build-macos]
+    if: needs.discover.outputs.empty_macos != 'true'
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix_macos) }}
+    env:
+      # One explicit `brew update` in the validate step fetches current
+      # formula metadata; per-command auto-update would re-pay that cost on
+      # every brew invocation.
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@v5
+      # No rustup step: unlike the Linux leg there are no toolchain-riding
+      # provisions here — the whole leg is Homebrew, and no compile happens.
+
+      - name: Fetch prebuilt harness
+        uses: actions/download-artifact@v8
+        with:
+          name: conformance-dist-macos
+          path: dist
+
+      - name: Install prebuilt binaries at their baked paths
+        run: |
+          set -euo pipefail
+          mkdir -p target/debug
+          cp dist/target/debug/* target/debug/
+          chmod +x target/debug/* dist/conformance_harness
+
+      # Bottle downloads dominate provisioning time; the cache key rides the
+      # pin file so a stanza edit refreshes it.
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: "brew-${{ matrix.server }}-\
+            ${{ hashFiles('defaults/ci-provision-macos.toml') }}"
+          restore-keys: |
+            brew-${{ matrix.server }}-
+
+      # Blind-iteration aid (misc 164): a wrong or renamed formula name fails
+      # HERE, as a provisioning error with the resolved version echoed —
+      # never as a mysterious conformance red downstream.
+      - name: Validate formula (${{ matrix.formula }})
+        run: |
+          set -euo pipefail
+          brew update --quiet
+          brew info --json=v2 "${{ matrix.formula }}" \
+            | jq -r '.formulae[0] | "\(.name) \(.versions.stable)"'
+
+      # Same contract as the Linux leg: a server whose diagnostics come from
+      # an external tool gets it provisioned so the intentional diagnostic
+      # can publish — via brew, the macOS provisioning surface throughout.
+      # NO ELM_HOME pre-warm, same maintainer ruling as the Linux leg
+      # (misc 156): the cold-bootstrap behavior is conformance's to see.
+      - name: Provision diagnostic dependencies
+        run: |
+          set -euo pipefail
+          case "${{ matrix.server }}" in
+            bash-language-server) brew install shellcheck ;;
+            elm-language-server)  brew install elm ;;
+            *) echo "no extra diagnostic dependency for ${{ matrix.server }}" ;;
+          esac
+
+      - name: Install server via Homebrew (${{ matrix.formula }})
+        run: |
+          set -euo pipefail
+          brew install "${{ matrix.formula }}"
+          # A keg-only formula (llvm → clangd) links nothing into
+          # $(brew --prefix)/bin; `bin` names the launcher within the keg,
+          # and the server key IS the executable (misc 162), so the
+          # symlink's basename is the shipped command.
+          if [ -n "${{ matrix.bin }}" ]; then
+            src="$(brew --prefix "${{ matrix.formula }}")/${{ matrix.bin }}"
+            test -x "$src"
+            bindir="$HOME/.local/bin"; mkdir -p "$bindir"
+            ln -sf "$src" "$bindir/${{ matrix.server }}"
+            echo "$bindir" >> "$GITHUB_PATH"
+          fi
+
+      # The resolved binary and its version land in the step log, so a
+      # provisioning miss reads as a provisioning miss.
+      - name: Echo provisioned binary
+        run: |
+          set -euo pipefail
+          which "${{ matrix.server }}"
+          "${{ matrix.server }}" --version || true
+          brew list --versions "${{ matrix.formula }}"
+
+      - name: Run conformance harness (${{ matrix.server }})
+        env:
+          CATENARY_CONFORMANCE: ${{ matrix.server }}
+          # Same rationale as the Linux leg: pin the harness tempdirs
+          # somewhere uploadable and keep them past Drop/panic-unwind.
+          # RUNNER_TEMP on macOS is under /Users/runner/work/_temp, which
+          # also sidesteps the /var → /private/var symlink class the ticket
+          # flags for tempdir-canonicalization bugs.
+          TMPDIR: ${{ runner.temp }}/conformance
+          CATENARY_CONFORMANCE_KEEP: "1"
+        run: |
+          mkdir -p "$TMPDIR"
+          ./dist/conformance_harness conformance_selected_server
+
+      # BSD find/tar accept the same -print0 / --null -T - contract as the
+      # GNU pair on the Linux leg; the tarball stays immune to any filename
+      # characters (the `daemon:<uuid>` colon, bug 86).
+      - name: Bundle triage logs (failure only)
+        if: failure()
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/conformance" 2>/dev/null || exit 0
+          find . \( -name 'daemon.log' -o -name '*.jsonl' \
+            -o -name 'bridge_stderr*.log' \) -print0 \
+            | tar -czf "$RUNNER_TEMP/triage.tgz" --null -T -
+
+      - name: Upload triage logs (failure only)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: triage-macos-${{ matrix.server }}
+          path: ${{ runner.temp }}/triage.tgz
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Emit blessed entry
+        run: |
+          set -euo pipefail
+          mkdir -p blessed
+          # A homebrew stanza carries no version pin (homebrew-core cannot
+          # install a historical version — see ci-provision-macos.toml), so
+          # the honest pin record is the formula version that actually
+          # conformed.
+          ver="$(brew list --versions "${{ matrix.formula }}" \
+            | head -1 | awk '{print $2}')"
+          test -n "$ver"
+          cat > "blessed/${{ matrix.server }}.toml" <<EOF
+          [blessed.${{ matrix.server }}]
+          version = "$ver"
+          platform = "macos-arm64"
+          date = "$(date -u +%Y-%m-%d)"
+          tier = "verified-on-macos"
+          EOF
+          cat "blessed/${{ matrix.server }}.toml"
+
+      - name: Upload blessed entry
+        uses: actions/upload-artifact@v7
+        with:
+          # `macos-blessed-*` is disjoint from the Linux `blessed-*` pattern,
+          # so neither bless job downloads the other platform's entries.
+          name: macos-blessed-${{ matrix.server }}
+          path: blessed/${{ matrix.server }}.toml
+          retention-days: 7
+
   bless:
     name: Assemble blessed-manifest
     needs: [discover, conform]
@@ -494,4 +717,58 @@ jobs:
         with:
           name: candidate-blessed-manifest
           path: candidate-blessed-manifest.toml
+          retention-days: 30
+
+  bless-macos:
+    name: Assemble blessed-manifest (macOS)
+    needs: [discover, conform-macos]
+    # Same partial-matrix semantics as the Linux bless: a red server simply
+    # has no entry to download, so whatever conformed still yields its
+    # candidate manifest. Skip only on cancellation or an empty macOS matrix.
+    if: ${{ !cancelled() && needs.discover.outputs.empty_macos != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download conformed entries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: macos-blessed-*
+          path: entries
+          merge-multiple: true
+
+      - name: Assemble candidate manifest
+        run: |
+          set -euo pipefail
+          # The macOS candidate is a SEPARATE file from the Linux one: the
+          # committed manifest keys one [blessed.<server>] row per server, so
+          # a second platform's rows cannot merge into it without a schema
+          # decision. The maintainer blesses macOS rows by committing this
+          # file (same [blessed.*] shape, platform = "macos-arm64") wherever
+          # that decision lands — nothing is pushed automatically.
+          out=candidate-blessed-manifest-macos.toml
+          sed -n '/^#/p' defaults/blessed-manifest.toml > "$out"
+          echo >> "$out"
+          for f in $(find entries -name '*.toml' | sort); do
+            cat "$f" >> "$out"
+            echo >> "$out"
+          done
+          # shellcheck disable=SC2016 # literal markdown backticks, no expansion
+          {
+            echo '## Candidate blessed-manifest (macOS, this run)';
+            echo '';
+            echo 'macOS rows are a separate candidate file — nothing is';
+            echo 'pushed automatically; the maintainer blesses by committing';
+            echo 'them (platform = "macos-arm64").';
+            echo '';
+            echo '```toml';
+            cat "$out";
+            echo '```';
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload candidate manifest
+        uses: actions/upload-artifact@v7
+        with:
+          name: candidate-blessed-manifest-macos
+          path: candidate-blessed-manifest-macos.toml
           retention-days: 30

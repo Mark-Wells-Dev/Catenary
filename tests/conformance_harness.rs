@@ -804,3 +804,83 @@ fn matrix_and_cases_have_no_drift() {
          non-pending recipe/provision, so the matrix never installs them: {orphan_case:?}"
     );
 }
+
+/// The macOS platform leg's honesty guard (misc 164):
+/// `defaults/ci-provision-macos.toml` must PARTITION the Linux-conformed set.
+/// Every server the Linux matrix conforms appears there exactly once — either
+/// brew-provisioned (`kind = "homebrew"` + `formula`) or an explicit
+/// `skip = true` with an honest `note` — so a server the macOS matrix does not
+/// prove is never silently absent, and no stanza names a server the Linux
+/// matrix does not run. `tools/conformance_matrix.py --platform macos` applies
+/// the identical check in the discover job, so the guard and the CI matrix
+/// agree by construction (the drift-guard idiom above). Every macOS-provisioned
+/// server has a `CASES` entry for free: this set is a subset of the conformed
+/// set, which [`matrix_and_cases_have_no_drift`] already covers.
+#[test]
+fn macos_provisioning_partitions_the_conformed_set() {
+    use std::collections::BTreeSet;
+
+    use catenary_mcp::recipes::{conformed_server_names, default_provisioning, default_recipes};
+
+    let doc: toml::Value = toml::from_str(include_str!("../defaults/ci-provision-macos.toml"))
+        .expect("ci-provision-macos.toml parses");
+    let stanzas = doc
+        .get("provision")
+        .and_then(toml::Value::as_table)
+        .expect("a [provision.*] table");
+
+    let recipes = default_recipes().expect("default recipes parse");
+    let provisions = default_provisioning().expect("default provisioning parse");
+    let conformed: BTreeSet<String> = conformed_server_names(&recipes, &provisions)
+        .into_iter()
+        .collect();
+    let macos: BTreeSet<String> = stanzas.keys().cloned().collect();
+
+    let silently_absent: Vec<&String> = conformed.difference(&macos).collect();
+    assert!(
+        silently_absent.is_empty(),
+        "macOS platform drift: these Linux-conformed servers are silently absent from \
+         defaults/ci-provision-macos.toml (add a homebrew stanza, or an explicit \
+         `skip = true` with a note): {silently_absent:?}"
+    );
+    let orphans: Vec<&String> = macos.difference(&conformed).collect();
+    assert!(
+        orphans.is_empty(),
+        "macOS platform drift: these ci-provision-macos.toml stanzas name servers the \
+         Linux matrix does not conform: {orphans:?}"
+    );
+
+    for (name, stanza) in stanzas {
+        let stanza = stanza.as_table().expect("stanza is a table");
+        let skip = stanza
+            .get("skip")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false);
+        if skip {
+            let note = stanza
+                .get("note")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("");
+            assert!(
+                !note.trim().is_empty(),
+                "macOS skip for `{name}` carries no honest `note` — an exclusion must \
+                 state why there is no viable brew provisioning path"
+            );
+        } else {
+            assert_eq!(
+                stanza.get("kind").and_then(toml::Value::as_str),
+                Some("homebrew"),
+                "macOS provision `{name}` must be `kind = \"homebrew\"` — the macOS leg \
+                 provisions via Homebrew only (maintainer ruling, misc 164)"
+            );
+            let formula = stanza
+                .get("formula")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("");
+            assert!(
+                !formula.trim().is_empty(),
+                "macOS provision `{name}` names no `formula`"
+            );
+        }
+    }
+}

@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: bench bench-test build-release check conformance deny fuzz machete mdbook mockgrep mockglob mdgrep mdglob refresh-recipes registry-selftest rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish tag-current
+.PHONY: bench bench-test build-release check conformance conformance-matrix deny fuzz machete mdbook mockgrep mockglob mdgrep mdglob refresh-recipes registry-selftest rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -241,6 +241,16 @@ conformance:
 	@$(if $(CONFORMANCE),CATENARY_CONFORMANCE=$(CONFORMANCE),) \
 	 cargo nextest run --workspace --features mockls --no-fail-fast --status-level all \
 	   -E 'binary(conformance_harness)'
+
+# Print a conformance CI matrix exactly as the discover job generates it
+# (stdout is the JSON; stderr carries the job census and skip annotations) —
+# the local pre-flight for pin-file edits. PLATFORM=macos emits the Homebrew
+# leg (misc 164), including its partition validation against the
+# Linux-conformed set; the default is the Linux matrix.
+#   make conformance-matrix
+#   make conformance-matrix PLATFORM=macos
+conformance-matrix:
+	@python3 tools/conformance_matrix.py $(if $(PLATFORM),--platform $(PLATFORM),)
 
 # Re-resolve, re-hash, and rewrite the CI-internal install-recipe pins in
 # defaults/recipes.toml, then show the reviewable diff. This PREPARES a pin bump

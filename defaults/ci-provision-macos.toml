@@ -1,0 +1,144 @@
+# macOS (Apple silicon) CI provisioning — the platform dimension of the
+# conformance matrix (misc 164). NOT install recipes, NOT user-visible, NOT
+# offerable — the same CI-internal boundary as defaults/ci-provision.toml.
+#
+# The Linux pins stay authoritative for Linux and live untouched in
+# defaults/recipes.toml + defaults/ci-provision.toml; this file is the ONE
+# per-server provisioning story for the macOS leg of
+# .github/workflows/conformance.yml (`conform-macos`), which runs on
+# `macos-latest` = arm64 ONLY (maintainer ruling 2026-07-09: Apple announced
+# macOS 27 is Apple-silicon-exclusive, so there is no Intel leg to build).
+#
+# Server set (maintainer ruling): the Homebrew-provisionable subset of the
+# Linux conformance matrix. Every server the Linux matrix conforms appears
+# here EXACTLY once — either provisioned or explicitly skipped — so a server
+# the macOS matrix does not prove is never silently absent. The partition is
+# enforced twice from the same data: `tools/conformance_matrix.py --platform
+# macos` (the discover job fails loudly) and the
+# `macos_provisioning_partitions_the_conformed_set` guard in
+# tests/conformance_harness.rs (fails `make check`).
+#
+# Fields:
+#   kind      always "homebrew" — the macOS leg provisions via Homebrew only.
+#   formula   the homebrew-core formula name.
+#   bin       (optional) launcher path within the formula's keg, for a
+#             keg-only formula that links nothing into $(brew --prefix)/bin
+#             (llvm → bin/clangd). The workflow symlinks it onto PATH under
+#             the server key, which IS the executable (misc 162).
+#   skip      true when the server has no viable brew provisioning path; the
+#             stanza is an explicit, honest annotation, not a provision.
+#   note      the reason for a skip, or residual risk on a provision.
+#
+# PIN STRATEGY (recorded honestly): homebrew-core cannot install a historical
+# formula version — `brew install <formula>` resolves homebrew-core HEAD, and
+# `brew pin` only freezes a version already installed on a host. So, exactly
+# like the Linux host-riding kinds (rustup-component, system-apt), a homebrew
+# stanza carries NO version pin: brew's own bottle sha256 verification covers
+# integrity, and the version that actually conformed is captured from the
+# installed formula into the candidate blessed entry (platform =
+# "macos-arm64"), which is the durable pin record.
+#
+# Formula names were mapped from each server's Linux pin on 2026-07-09. Names
+# that could not be confirmed against homebrew-core from the authoring
+# environment are marked `# UNVERIFIED:` for resolution against the first CI
+# run — a wrong name fails the macOS leg's `Validate formula` step loudly,
+# never as a mysterious conformance red.
+
+# ── Linux npm tranche → homebrew-core formulae ───────────────────────
+
+[provision.bash-language-server]
+kind = "homebrew"
+formula = "bash-language-server"
+note = "diagnostics come from shellcheck; the macOS job provisions it via brew too."
+
+[provision.yaml-language-server]
+kind = "homebrew"
+formula = "yaml-language-server"
+
+# One vscode-langservers-extracted formula carries all three conformed
+# servers, mirroring the one-npm-package/three-recipes shape on Linux.
+# UNVERIFIED: formula name assumed present in homebrew-core.
+[provision.vscode-json-language-server]
+kind = "homebrew"
+formula = "vscode-langservers-extracted"
+
+[provision.vscode-css-language-server]
+kind = "homebrew"
+formula = "vscode-langservers-extracted"
+
+[provision.vscode-html-language-server]
+kind = "homebrew"
+formula = "vscode-langservers-extracted"
+
+# UNVERIFIED: that the pyright formula links the `pyright-langserver`
+# launcher alongside `pyright` (the npm package ships both binaries).
+[provision.pyright-langserver]
+kind = "homebrew"
+formula = "pyright"
+
+[provision.intelephense]
+skip = true
+note = "no homebrew-core formula: intelephense is a proprietary-licensed npm package, which homebrew-core does not carry. macOS coverage would need the npm recipe reused on macOS — maintainer ruling pending on whether the macOS leg may use non-brew kinds."
+
+# UNVERIFIED: absence of a svelte-language-server formula in homebrew-core.
+[provision.svelteserver]
+skip = true
+note = "no homebrew-core formula found for svelte-language-server from the authoring environment. macOS coverage would need the npm recipe reused on macOS — maintainer ruling pending on whether the macOS leg may use non-brew kinds."
+
+# UNVERIFIED: the elm-language-server formula name, and an arm64 bottle for
+# the `elm` compiler dependency (provisioned by the workflow's
+# diagnostic-dependencies step, mirroring the Linux leg's compiler fetch).
+[provision.elm-language-server]
+kind = "homebrew"
+formula = "elm-language-server"
+note = "the elm compiler is provisioned via the brew `elm` formula: the Linux leg's pinned GitHub release binary ships no arm64 macOS asset. Cold-ELM_HOME bootstrap conformed on Linux (2026-07-09 full-matrix blessing) and inherits the same no-pre-warm ruling here (misc 156)."
+
+# UNVERIFIED: formula name (low confidence) — if homebrew-core carries no
+# dockerfile-language-server, flip this stanza to an explicit skip.
+[provision.docker-langserver]
+kind = "homebrew"
+formula = "dockerfile-language-server"
+
+# UNVERIFIED: absence of an ansible-language-server formula in homebrew-core
+# (ansible and ansible-lint are in core; the language server is not).
+[provision.ansible-language-server]
+skip = true
+note = "no homebrew-core formula found for @ansible/ansible-language-server from the authoring environment. macOS coverage would need the npm recipe reused on macOS — maintainer ruling pending on whether the macOS leg may use non-brew kinds."
+
+# ── Linux cargo / go tranches → homebrew-core formulae ───────────────
+
+[provision.taplo]
+kind = "homebrew"
+formula = "taplo"
+
+[provision.gopls]
+kind = "homebrew"
+formula = "gopls"
+note = "gopls shells out to the host `go` toolchain at analysis time; the macos-latest image ships one."
+
+# ── Linux ci-provision.toml twins ────────────────────────────────────
+
+[provision.rust-analyzer]
+kind = "homebrew"
+formula = "rust-analyzer"
+note = "brew's standalone binary, not the rustup component — no proxy-shim indirection on this leg (the misc 162 PATH dance is Linux-matrix-only)."
+
+[provision.clangd]
+kind = "homebrew"
+formula = "llvm"
+bin = "bin/clangd"
+note = "llvm is keg-only (macOS ships its own toolchain), so nothing lands on PATH by default; `bin` names the launcher and the workflow symlinks it in as `clangd`. The llvm bottle is heavy but is the leanest core formula that carries clangd."
+
+[provision.lua-language-server]
+kind = "homebrew"
+formula = "lua-language-server"
+
+[provision.lattice]
+skip = true
+note = "no homebrew formula (the maintainer's own repo, not in homebrew-core). The Linux cargo-git-locked kind is platform-neutral and could carry it on macOS unchanged — maintainer ruling pending on whether the macOS leg may use non-brew kinds; skipped rather than silently absent until then."
+
+# UNVERIFIED: formula name assumed present in homebrew-core.
+[provision.ruby-lsp]
+kind = "homebrew"
+formula = "ruby-lsp"
+note = "the formula carries its own ruby dependency, so the Linux leg's GEM_HOME/GEM_PATH provisioning (user-gem dirs vs isolate_env's XDG re-pointing) is expected not to apply; first-run triage confirms."
