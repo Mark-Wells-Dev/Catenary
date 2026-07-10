@@ -647,3 +647,108 @@ fn correlation_end_to_end() -> Result<()> {
 
     Ok(())
 }
+
+// ── Hookless CLI surface (bug 100) ─────────────────────────────────
+//
+// The documented CLI-only story: a live daemon, but no PreToolUse hook ever
+// stages the diagnostics handoff. Bare `catenary diagnostics` is a fault (no
+// hooked session armed a gate, so there is no debt to pay); scoped
+// `catenary diagnostics <path…>` serves on-demand diagnostics without one.
+
+/// Runs the `catenary` binary with `subargs`, isolated to `state_home`, and
+/// returns `(stdout, stderr, exit_code)`.
+fn run_cli(state_home: &str, subargs: &[&str]) -> Result<(String, String, Option<i32>)> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    common::isolate_env(&mut cmd, state_home);
+    cmd.args(subargs)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = cmd.output().context("run catenary binary")?;
+    Ok((
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code(),
+    ))
+}
+
+/// Bug 100 ruling 1, CLI level: hookless bare `catenary diagnostics` exits 2
+/// with the teaching message on stderr and nothing on stdout — replacing the
+/// old exit-0 "handoff expired" text that read like a trustworthy empty
+/// receipt for a run that never happened.
+#[test]
+fn hookless_bare_diagnostics_cli_exits_2_with_teaching_text() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+
+    let mut bridge = BridgeProcess::spawn_in_state(state_home, |_cmd| {})?;
+    bridge.initialize()?;
+    let _ = wait_for_ipc_socket(state_home);
+
+    let (stdout, stderr, code) = run_cli(state_home, &["diagnostics"])?;
+
+    assert_eq!(
+        code,
+        Some(2),
+        "hookless bare diagnostics is a fault\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("hooked session"),
+        "stderr must teach the correct next step, got:\n{stderr}",
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "a faulted run prints no receipt on stdout, got:\n{stdout}",
+    );
+    Ok(())
+}
+
+/// Bug 100 ruling 2, CLI level: hookless scoped `catenary diagnostics <path…>`
+/// serves on-demand diagnostics — for an explicit file and for a directory
+/// argument (the `catenary diagnostics .` shape) — with exit 0 and a real
+/// receipt, no handoff required.
+#[test]
+fn hookless_scoped_diagnostics_cli_serves_receipt() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+
+    let root = tempfile::tempdir()?;
+    let root_str = root.path().to_str().context("root path")?;
+    let file = root.path().join(format!("lint.{MOCK_LANG}"));
+    std::fs::write(&file, "code\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG, "");
+    let mut bridge = BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_SERVERS", &lsp);
+        cmd.env("CATENARY_ROOTS", root_str);
+    })?;
+    bridge.initialize()?;
+    let _ = wait_for_ipc_socket(state_home);
+
+    // Scoped file — no hook, no prepare, no editing session.
+    let file_arg = file.to_str().context("file arg")?;
+    let (stdout, stderr, code) = run_cli(state_home, &["diagnostics", file_arg])?;
+    assert_eq!(
+        code,
+        Some(0),
+        "hookless scoped diagnostics completes\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    assert!(
+        stdout.contains("mock diagnostic"),
+        "the receipt carries the served diagnostics, got:\n{stdout}",
+    );
+
+    // Scoped directory — served hookless through the same scope router as the
+    // hooked form (fan-out over the root's covered files).
+    let (stdout, stderr, code) = run_cli(state_home, &["diagnostics", root_str])?;
+    assert_eq!(
+        code,
+        Some(0),
+        "hookless scoped directory diagnostics completes\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    assert!(
+        stdout.contains("mock diagnostic"),
+        "the directory receipt carries the served diagnostics, got:\n{stdout}",
+    );
+    Ok(())
+}

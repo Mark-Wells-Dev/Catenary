@@ -201,6 +201,15 @@ catenary diagnostics src/ lib.rs     # a scoped set (relative to cwd)
 catenary diagnostics .               # the whole workspace root
 ```
 
+**Bare pays a gate; scoped needs none.** The bare form pays the edit gate a
+hooked session arms — on a hookless box (a plain shell, a script, CI) there
+is no hook, no gate, and no edited set, so a bare run is a fault: exit `2`
+with a message pointing at the scoped form. Scoped runs name their files
+explicitly — a file, a directory, or `.` — and are served identically with
+or without a hooked session (the on-demand lint surface for CLI-only use);
+inside a hooked session a scoped run additionally pays the named files'
+editing debt.
+
 **Whole-root scope (`.`).** Naming a directory lints every covered file
 beneath it; naming a whole tracked workspace root (`.`) lints the entire
 project. When the covering language server advertises whole-workspace pull
@@ -239,7 +248,8 @@ says why (`path does not exist`, or that it is outside every mounted root).
 as its **own step** (no pipes, no `&&`/`;` chaining), and read the result.
 **The exit code is a trust signal, not a lint result:** it exits `0`
 whenever the run completed — clean *or* dirty — and `2` only on a genuine
-fault (no daemon, IPC failure). It never exits `1`, so a run that found
+fault (no daemon, IPC failure, a bare run with no hooked session to pay).
+It never exits `1`, so a run that found
 errors is not mistaken for a failed call — read the receipt for the
 errors, not the exit code. (Whether a run is labeled "dirty" is tunable
 via `diagnostics_severity` in [Configuration](configuration.md#diagnostics),

@@ -172,27 +172,32 @@ enum Command {
 
     /// Print diagnostics for the files you've edited, or lint the named paths.
     ///
-    /// Bare — runs the LSP diagnostics pipeline over every file edited since
-    /// the last run and prints a per-file receipt: each diagnosed file is
-    /// listed, with its errors and warnings beneath it or `[clean]` beside it
-    /// when the file is clean, then clears the set (`[no edited files]` for an
-    /// empty set). With paths — diagnoses exactly those files (on-demand lint)
-    /// and pays their editing debt, dropping them from the gate; the gate stays
-    /// armed while any edited file remains unpaid. Paying is *diagnosing*, not
-    /// fixing — a file's debt is cleared by looking at it, clean or dirty.
-    /// Exits `0` whenever the run completed — clean *or* dirty — and `2` only
-    /// on a genuine fault (no daemon, IPC failure); it never exits `1`, so a
-    /// dirty result is not misread as a failed call. Editing begins implicitly
-    /// on the first edit — there is no separate start step. Invoke via the
-    /// host's shell tool.
+    /// Bare — inside a hooked session, runs the LSP diagnostics pipeline over
+    /// every file edited since the last run and prints a per-file receipt:
+    /// each diagnosed file is listed, with its errors and warnings beneath it
+    /// or `[clean]` beside it when the file is clean, then clears the set
+    /// (`[no edited files]` for an empty set). The bare form pays the edit
+    /// gate a hooked session arms; without one there is no gate and no edited
+    /// set, so a bare run is a fault. With paths — diagnoses exactly those
+    /// files or directories (on-demand lint), hooked session or not, and pays
+    /// their editing debt when one is owed, dropping them from the gate; the
+    /// gate stays armed while any edited file remains unpaid. Paying is
+    /// *diagnosing*, not fixing — a file's debt is cleared by looking at it,
+    /// clean or dirty. Exits `0` whenever the run completed — clean *or*
+    /// dirty — and `2` only on a genuine fault (no daemon, IPC failure, a bare
+    /// run with no hooked session); it never exits `1`, so a dirty result is
+    /// not misread as a failed call. Editing begins implicitly on the first
+    /// edit — there is no separate start step. Invoke via the host's shell
+    /// tool.
     Diagnostics {
         /// File or directory path(s) to diagnose. Omit to report the whole
         /// edited set.
         ///
         /// Relative paths resolve against the current working directory. A
-        /// named path is diagnosed and its editing debt paid — dropped from the
-        /// gate — whether or not it was edited; a path outside the edited set is
-        /// simply linted and pays nothing.
+        /// named path is diagnosed whether or not it was edited — no hooked
+        /// session required — and any editing debt it carries is paid, dropping
+        /// it from the gate; a path outside the edited set is simply linted and
+        /// pays nothing.
         #[arg(name = "PATH")]
         paths: Vec<String>,
     },
@@ -2218,6 +2223,12 @@ struct DiagnosticsResponse {
     /// a silent exit. Absent on a pre-fix daemon → defaults to 0.
     #[serde(default)]
     covered: usize,
+    /// Daemon-detected fault (bug 100): a bare run with no staged handoff —
+    /// no hooked session armed a gate, or the prepare's TTL blew — so the run
+    /// never happened. Present → the CLI surfaces the message on stderr and
+    /// exits `2` instead of printing a receipt-shaped success.
+    #[serde(default)]
+    error: Option<String>,
 }
 
 /// Implements `catenary diagnostics [paths…]`: prints diagnostics for the
@@ -2225,20 +2236,24 @@ struct DiagnosticsResponse {
 /// editing debt.
 ///
 /// Connects to the daemon's IPC socket and sends `tool/editing-stop` (the
-/// internal handoff method name is unchanged by the user-facing rename). The
-/// `PreToolUse` hook has already prepared the handoff — this command retrieves
-/// the diagnostics and prints the per-file receipt. When `paths` is non-empty,
-/// they ride the request's `files` param: the daemon diagnoses exactly those and
-/// flips their gate flags on delivery (scoped). Relative paths resolve against
-/// the CLI's cwd before dispatch — the daemon runs under a different cwd —
-/// matching how `grep`/`glob` forward paths. Success (clean *or* dirty) returns
-/// `Ok(())`, which the dispatcher maps to exit `0`.
+/// internal handoff method name is unchanged by the user-facing rename). In a
+/// hooked session the `PreToolUse` hook has already prepared the handoff — the
+/// bare form retrieves the batch and prints the per-file receipt. When `paths`
+/// is non-empty, they ride the request's `files` param: the daemon diagnoses
+/// exactly those, with no handoff required (bug 100 — the hookless on-demand
+/// form), and flips their gate flags on delivery when a hooked session staged
+/// one. A bare run with no staged handoff is a daemon-detected fault (there is
+/// no gate to pay). Relative paths resolve against the CLI's cwd before
+/// dispatch — the daemon runs under a different cwd — matching how
+/// `grep`/`glob` forward paths. Success (clean *or* dirty) returns `Ok(())`,
+/// which the dispatcher maps to exit `0`.
 ///
 /// # Errors
 ///
 /// Returns an error (mapped to fault exit `2`) if no daemon is running, the
-/// IPC fails, the working directory can't be resolved, or the response is
-/// malformed.
+/// IPC fails, the working directory can't be resolved, the response is
+/// malformed, or the daemon reports a fault (a bare run with no staged
+/// handoff).
 #[cfg(unix)]
 async fn run_done_editing(out: &mut cli::Output, paths: &[String]) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -2301,12 +2316,19 @@ async fn run_done_editing(out: &mut cli::Output, paths: &[String]) -> Result<()>
 ///
 /// # Errors
 ///
-/// Returns an error if the response is not valid JSON — a malformed response is
-/// a fault (mapped to exit `2`).
+/// Returns an error if the response is not valid JSON, or if the daemon
+/// reported a fault in the envelope's `error` field (bug 100: a bare run with
+/// no staged handoff). Both map to exit `2`.
 #[cfg(unix)]
 fn emit_diagnostics_response(out: &mut cli::Output, response: &str) -> Result<()> {
     let parsed: DiagnosticsResponse = serde_json::from_str(response.trim())
         .context("invalid diagnostics response from daemon")?;
+
+    // A daemon-detected fault: the run never happened, so there is no receipt
+    // to print — surface the teaching message as the error (stderr + exit 2).
+    if let Some(message) = parsed.error {
+        anyhow::bail!("{message}");
+    }
 
     let trimmed = parsed.output.trim();
     if trimmed.is_empty() {
@@ -4069,5 +4091,28 @@ mod tests {
         // not silently treated as a completed run.
         let mut out = cli::Output::buffer(80);
         assert!(emit_diagnostics_response(&mut out, "not json").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_error_envelope_is_fault_with_teaching_text() {
+        // Bug 100: the daemon answers a bare run with no staged handoff with a
+        // fault envelope. The CLI surfaces the teaching message as the error
+        // (dispatcher → stderr + exit 2) and prints no receipt — the run never
+        // happened, so there is nothing trustworthy to put on stdout.
+        let mut out = cli::Output::buffer(80);
+        let err = emit_diagnostics_response(
+            &mut out,
+            r#"{"status":"error","error":"no diagnostics run staged — bare `catenary diagnostics` pays the edit gate inside a hooked session","covered":0}"#,
+        )
+        .expect_err("a fault envelope maps to Err → exit 2");
+        assert!(
+            err.to_string().contains("hooked session"),
+            "the fault message reaches the agent verbatim, got: {err:#}",
+        );
+        assert!(
+            out.into_string().trim().is_empty(),
+            "a faulted run prints no receipt (and no [no edited files] sentinel)",
+        );
     }
 }

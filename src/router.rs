@@ -5160,24 +5160,53 @@ async fn handle_hook_dispatch(
         // whether clean or dirty — the clean/dirty distinction lives in the
         // per-file receipt (`output`), where clean files carry `[clean]` and
         // dirty files their diagnostics. Faults (no daemon, IPC/parse failure)
-        // are detected CLI-side and exit `2`. `covered` is the count of covered
-        // files in the handoff: it lets the CLI print `[no edited files]` for a
-        // genuinely empty set (covered == 0, empty receipt).
-        let (dirty, output, covered) =
-            if let Some((files, filtered, filtered_roots, session_id, _, _, _)) = handoff {
-                // A scoped pull diagnoses exactly the named paths; the bare form
-                // re-diagnoses the whole batch snapshot (delivered files included).
-                // The accumulation-time `filtered` count (files skipped for lack of
-                // coverage) applies only to the bare form — a scoped pull names files
-                // explicitly, so an uncovered named file renders its own out-of-scope
-                // line in the receipt and the accumulation note is suppressed.
-                // Clone `scoped_files` for the pipeline — the originals are needed
-                // after the match to flip exactly the named files on delivery.
-                let (diag_files, filtered, filtered_roots) = if scoped {
-                    (scoped_files.clone(), 0, std::collections::BTreeSet::new())
-                } else {
-                    (files, filtered, filtered_roots)
-                };
+        // are detected CLI-side and exit `2`; a bare consume against an empty
+        // slot is a daemon-detected fault carried in the envelope's `error`
+        // field (bug 100). `covered` is the count of covered files in the
+        // handoff: it lets the CLI print `[no edited files]` for a genuinely
+        // empty set (covered == 0, empty receipt).
+        //
+        // Resolve the run's file set and session identity. A scoped pull
+        // diagnoses exactly the named paths; the bare form re-diagnoses the
+        // whole batch snapshot (delivered files included). The
+        // accumulation-time `filtered` count (files skipped for lack of
+        // coverage) applies only to the bare form — a scoped pull names files
+        // explicitly, so an uncovered named file renders its own out-of-scope
+        // line in the receipt and the accumulation note is suppressed. Clone
+        // `scoped_files` for the pipeline — the originals are needed after the
+        // response write to flip exactly the named files on delivery.
+        //
+        // A scoped pull against an EMPTY slot is the hookless on-demand form
+        // (bug 100): no hook staged a prepare, but the request names its files,
+        // so the run is constructed without a handoff snapshot. There is no
+        // debt to pay — `flip_keys` is `None`, so nothing is marked delivered
+        // and the editing guardrail is untouched. Session identity falls back
+        // to `"default"`, the same convention the hook dispatch applies to
+        // requests that carry no `session_id`. A BARE consume against an empty
+        // slot resolves to `None` and is answered with the fault envelope
+        // below.
+        let run = match handoff {
+            Some((files, filtered, filtered_roots, session_id, _, _, _)) => Some(if scoped {
+                (
+                    scoped_files.clone(),
+                    0,
+                    std::collections::BTreeSet::new(),
+                    session_id,
+                )
+            } else {
+                (files, filtered, filtered_roots, session_id)
+            }),
+            None if scoped => Some((
+                scoped_files.clone(),
+                0,
+                std::collections::BTreeSet::new(),
+                "default".to_string(),
+            )),
+            None => None,
+        };
+
+        let (dirty, output, covered, fault) =
+            if let Some((diag_files, filtered, filtered_roots, session_id)) = run {
                 let covered = diag_files.len();
                 if diag_files.is_empty() {
                     // Nothing covered to diagnose — the note (if any) stands alone.
@@ -5195,6 +5224,7 @@ async fn handle_hook_dispatch(
                         false,
                         with_out_of_roots_note(String::new(), filtered, &filtered_roots),
                         covered,
+                        None,
                     )
                 } else {
                     // Ephemeral mount (ticket 02): any diagnosed file outside
@@ -5280,14 +5310,29 @@ async fn handle_hook_dispatch(
                         outcome.dirty,
                         with_out_of_roots_note(outcome.output, filtered, &filtered_roots),
                         covered,
+                        None,
                     )
                 }
             } else {
-                // Handoff slot was empty — timeout expired or double-consume.
+                // Bare consume against an empty slot (bug 100): with no hook
+                // there is no gate and no debt, so the run is a misuse, not a
+                // completed-empty run. A hooked prepare whose TTL blew is the
+                // same shape — the run never happened, so a fault is more
+                // honest than the old exit-0 "handoff expired" text, which read
+                // like a trustworthy empty receipt. A user mistake, not a
+                // daemon health finding: the fault rides the envelope (CLI →
+                // stderr + exit 2) and stays out of the `warn!`/`error!`
+                // surfaces.
                 (
                     false,
-                    "diagnostics handoff expired — no files available".to_string(),
+                    String::new(),
                     0,
+                    Some(
+                        "no diagnostics run staged — bare `catenary diagnostics` pays the edit \
+                         gate inside a hooked session; use `catenary diagnostics <path…>` to \
+                         diagnose named files or directories on demand"
+                            .to_string(),
+                    ),
                 )
             };
 
@@ -5296,7 +5341,7 @@ async fn handle_hook_dispatch(
             "cli",
             &method,
             Some(&scope_id),
-            &output,
+            fault.as_deref().unwrap_or(&output),
             "outgoing hook response",
         );
 
@@ -5306,12 +5351,26 @@ async fn handle_hook_dispatch(
         // 01) — it is retained for telemetry. `covered` (the diagnosed file
         // count — the scoped paths, or the whole batch for a bare pull) lets the
         // CLI print `[no edited files]` for a genuinely empty set (covered == 0,
-        // empty receipt; scoped pulls are always non-empty).
-        let envelope = serde_json::json!({
-            "status": if dirty { "dirty" } else { "clean" },
-            "output": output,
-            "covered": covered,
-        });
+        // empty receipt; scoped pulls are always non-empty). A fault (bare
+        // consume, empty slot — bug 100) carries `status: "error"` plus the
+        // `error` message instead of a receipt; the CLI maps it to stderr +
+        // exit 2 rather than printing a receipt-shaped success.
+        let envelope = fault.as_ref().map_or_else(
+            || {
+                serde_json::json!({
+                    "status": if dirty { "dirty" } else { "clean" },
+                    "output": output,
+                    "covered": covered,
+                })
+            },
+            |message| {
+                serde_json::json!({
+                    "status": "error",
+                    "error": message,
+                    "covered": covered,
+                })
+            },
+        );
         let mut payload = serde_json::to_vec(&envelope)?;
         payload.push(b'\n');
         writer.write_all(&payload).await?;
@@ -8037,6 +8096,11 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// Bug 100 ruling 1: a bare consume against an empty slot — no hook ever
+    /// staged a prepare (hookless box), or the prepare's TTL blew — is a fault,
+    /// not a completed-empty run. The envelope carries `status: "error"` and a
+    /// teaching `error` message the CLI maps to stderr + exit 2, replacing the
+    /// old exit-0 "handoff expired" text that read like an empty receipt.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn done_editing_handoff_expired() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -8052,9 +8116,20 @@ mod tests {
         // Call done-editing/run without preparing a handoff.
         let req = serde_json::json!({"method": "tool/editing-stop"});
         let response = hook_roundtrip_full(&ipc_path, &req).await;
+        let parsed: serde_json::Value =
+            serde_json::from_str(response.trim()).expect("consume response is JSON");
+        assert_eq!(
+            parsed.get("status").and_then(serde_json::Value::as_str),
+            Some("error"),
+            "a bare consume on an empty slot is a fault envelope, got: {response}",
+        );
+        let message = parsed
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("fault envelope carries an error message");
         assert!(
-            response.contains("handoff expired"),
-            "expected handoff expired message, got: {response}",
+            message.contains("hooked session") && message.contains("catenary diagnostics"),
+            "the fault teaches the correct next step, got: {message}",
         );
 
         shutdown.cancel();
@@ -9073,9 +9148,11 @@ mod tests {
         shutdown.cancel();
     }
 
-    /// ws37 ticket 02 (under the misc-141 batch model): a scoped consume whose
-    /// handoff was never prepared (a faulted/denied round-trip) is an expired
-    /// slot — it flips nothing, leaving the batch intact and armed.
+    /// Bug 100 ruling 2: a scoped consume whose handoff was never prepared (a
+    /// hookless box, or a faulted/denied round-trip) is the on-demand form —
+    /// the named paths are diagnosed and the receipt served. But with no
+    /// handoff there are no flip keys: nothing is marked delivered, so the
+    /// batch stays intact and the gate armed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scoped_diagnostics_without_handoff_leaves_debt_intact() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -9108,16 +9185,24 @@ mod tests {
                 .record_covered_edit(Some("sess-1"), "", file_a.clone());
         }
 
-        // Consume WITHOUT a prepared handoff: the slot is empty (expired), so no
-        // flip keys are captured and the batch is left untouched.
+        // Consume WITHOUT a prepared handoff: the run is served hookless (bug
+        // 100) — a real receipt, not a fault — but no flip keys are captured,
+        // so the batch is left untouched.
         let consume = serde_json::json!({
             "method": "tool/editing-stop",
             "files": [file_a.to_string_lossy()],
         });
         let response = hook_roundtrip_full(&ipc_path, &consume).await;
+        let parsed: serde_json::Value =
+            serde_json::from_str(response.trim()).expect("consume response is JSON");
         assert!(
-            response.contains("handoff expired"),
-            "a scoped consume with no staged handoff is an expired slot, got: {response}",
+            parsed.get("error").is_none(),
+            "a hookless scoped pull serves the run, not a fault, got: {response}",
+        );
+        assert_eq!(
+            parsed.get("covered").and_then(serde_json::Value::as_u64),
+            Some(1),
+            "the hookless scoped pull diagnoses exactly the named path, got: {response}",
         );
 
         {
@@ -9128,13 +9213,73 @@ mod tests {
             assert_eq!(
                 router.session.editing.files(Some("sess-1"), ""),
                 vec![file_a.clone()],
-                "a faulted scoped call flips nothing — the batch is intact",
+                "a hookless scoped pull flips nothing — the batch is intact",
             );
             assert!(
                 router.session.editing.has_undelivered(Some("sess-1"), ""),
-                "the batch stays armed after a faulted scoped call",
+                "the batch stays armed after a hookless scoped pull",
             );
         }
+
+        shutdown.cancel();
+    }
+
+    /// Bug 100 ruling 2, directory parity: a scoped `catenary diagnostics`
+    /// with a directory argument (the `.` shape after CLI cwd-resolution)
+    /// behaves identically hooked and hookless — the directory rides the same
+    /// `process_files_batched` scope router either way, so the receipt and
+    /// covered count match; only the debt flip differs, and only when hooked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hookless_scoped_directory_matches_hooked_scoped() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let scope_dir = dir.path().join("proj");
+        std::fs::create_dir(&scope_dir).expect("create scope dir");
+        std::fs::write(scope_dir.join("a.rs"), "fn a() {}\n").expect("write file");
+
+        let consume = serde_json::json!({
+            "method": "tool/editing-stop",
+            "files": [scope_dir.to_string_lossy()],
+        });
+
+        // Hooked run: the PreToolUse hook stages the prepare first.
+        let prepare = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &prepare).await;
+        let hooked = hook_roundtrip_full(&ipc_path, &consume).await;
+
+        // Hookless run: the same argument against the now-empty slot.
+        let hookless = hook_roundtrip_full(&ipc_path, &consume).await;
+
+        let hooked: serde_json::Value =
+            serde_json::from_str(hooked.trim()).expect("hooked response is JSON");
+        let hookless: serde_json::Value =
+            serde_json::from_str(hookless.trim()).expect("hookless response is JSON");
+        assert!(
+            hookless.get("error").is_none(),
+            "a hookless scoped directory pull serves the run, not a fault, got: {hookless}",
+        );
+        assert_eq!(
+            hooked.get("output"),
+            hookless.get("output"),
+            "hookless scoped receipt must match the hooked receipt for the same directory",
+        );
+        assert_eq!(
+            hooked.get("covered"),
+            hookless.get("covered"),
+            "hookless covered count must match the hooked count for the same directory",
+        );
 
         shutdown.cancel();
     }
@@ -9216,11 +9361,15 @@ mod tests {
             "first consume should succeed, got: {response1}",
         );
 
-        // Second consume should see expired slot.
+        // Second bare consume sees the empty slot — a fault envelope (bug 100),
+        // not a receipt-shaped success.
         let response2 = hook_roundtrip_full(&ipc_path, &req).await;
-        assert!(
-            response2.contains("handoff expired"),
-            "second consume should see expired slot, got: {response2}",
+        let parsed: serde_json::Value =
+            serde_json::from_str(response2.trim()).expect("second consume response is JSON");
+        assert_eq!(
+            parsed.get("status").and_then(serde_json::Value::as_str),
+            Some("error"),
+            "second consume should see the empty-slot fault, got: {response2}",
         );
 
         shutdown.cancel();
