@@ -64,7 +64,7 @@ mockls = []
 fuzzing = ["dep:brush-parser"]
 
 [dependencies]
-catenary-proc = { path = "crates/catenary-proc", version = "0.1.0" }
+catenary-proc = { path = "crates/catenary-proc", version = "0.2.0" }
 anyhow = "1.0.100"
 # `brush-parser` is the bash-fidelity reference parse for the differential oracle
 # (tokenizer ticket 05). It is **optional** and only activated by the `fuzzing`

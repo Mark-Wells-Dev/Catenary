@@ -41,6 +41,16 @@ fn asset_name() -> Option<&'static str> {
     }
 }
 
+/// Whether a binary path lives inside a Homebrew keg (`…/Cellar/…`).
+///
+/// Covers every brew layout — `/opt/homebrew` (Apple silicon), `/usr/local`
+/// (Intel-era), `/home/linuxbrew/.linuxbrew` — all keep kegs under a `Cellar`
+/// directory. The caller canonicalizes first, so brew's `bin/catenary`
+/// symlink into the keg is seen as the keg path it resolves to.
+fn is_brew_keg(path: &std::path::Path) -> bool {
+    path.components().any(|c| c.as_os_str() == "Cellar")
+}
+
 /// Parses a version string into `(major, minor, patch)`.
 ///
 /// Handles plain semver (`1.6.1`) and git-describe suffixes
@@ -210,6 +220,22 @@ pub fn run_update(out: &mut Output, check: bool, force: bool) -> Result<()> {
         return Ok(());
     }
 
+    // A Homebrew-installed binary belongs to brew: swapping a file inside the
+    // Cellar leaves brew's bookkeeping pointing at content it did not install,
+    // and a later `brew upgrade` silently steps the user back to the formula
+    // version. Defer to the package manager instead of racing it.
+    let current_exe = std::env::current_exe().context("cannot determine current binary path")?;
+    if is_brew_keg(
+        &current_exe
+            .canonicalize()
+            .unwrap_or_else(|_| current_exe.clone()),
+    ) {
+        let _ = out.writeln(format_args!(
+            "installed via Homebrew — update with: brew upgrade twowells/tap/catenary",
+        ));
+        return Ok(());
+    }
+
     // Resolve asset URL
     let Some(url) = &release.asset_url else {
         let name = asset_name().unwrap_or("unknown");
@@ -221,7 +247,6 @@ pub fn run_update(out: &mut Output, check: bool, force: bool) -> Result<()> {
 
     // Download to a temp file in the same directory as the current binary
     // (same filesystem ensures atomic rename).
-    let current_exe = std::env::current_exe().context("cannot determine current binary path")?;
     let dir = current_exe
         .parent()
         .context("current binary has no parent directory")?;
@@ -281,6 +306,32 @@ pub fn run_update(out: &mut Output, check: bool, force: bool) -> Result<()> {
 )]
 mod tests {
     use super::*;
+
+    // ── Homebrew keg detection ─────────────────────────────────────
+
+    #[test]
+    fn brew_keg_paths_are_detected_across_layouts() {
+        // Every brew layout keeps kegs under a `Cellar` dir; a `catenary
+        // update` from inside one must defer to `brew upgrade` instead of
+        // swapping a file brew believes it owns.
+        for keg in [
+            "/opt/homebrew/Cellar/catenary/2.0.1/bin/catenary",
+            "/usr/local/Cellar/catenary/2.0.1/bin/catenary",
+            "/home/linuxbrew/.linuxbrew/Cellar/catenary/2.0.1/bin/catenary",
+        ] {
+            assert!(is_brew_keg(std::path::Path::new(keg)), "keg: {keg}");
+        }
+        for not_keg in [
+            "/usr/local/bin/catenary",
+            "/home/mark/.local/bin/catenary",
+            "/home/mark/Cellarium/catenary",
+        ] {
+            assert!(
+                !is_brew_keg(std::path::Path::new(not_keg)),
+                "not a keg: {not_keg}"
+            );
+        }
+    }
 
     // ── Version parsing ────────────────────────────────────────────
 
