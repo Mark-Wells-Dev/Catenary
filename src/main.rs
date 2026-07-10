@@ -1063,6 +1063,20 @@ fn compress_home(path: &Path) -> String {
     path.display().to_string()
 }
 
+/// Whether a search's scope was anchored at the invoking cwd: no path
+/// arguments at all (a cwd-scoped search — pathless grep binds to the cwd,
+/// bug 31), or at least one relative path/pattern argument, which the request
+/// builder (`GrepRequest::to_params`) joins to the cwd before the daemon
+/// expands it.
+///
+/// Missing-path arguments count as "had arguments": a search whose only
+/// arguments were missing plain paths never queried, so its body is empty and
+/// the zero-result arm prints the `cwd:` anchor unconditionally.
+fn cwd_anchored(paths: &SearchPaths) -> bool {
+    (paths.forward.is_empty() && paths.missing.is_empty())
+        || paths.forward.iter().any(|p| p.is_relative())
+}
+
 /// Joins the forwarded path arguments for the `searched:` echo line.
 fn forward_display(paths: &SearchPaths) -> String {
     paths
@@ -1076,8 +1090,16 @@ fn forward_display(paths: &SearchPaths) -> String {
 /// Renders a search command's outcome under the three-outcome, always-exit-0
 /// contract (`bugs/13`).
 ///
-/// - **Results** — `daemon_output` non-empty → printed verbatim; the daemon
-///   prepends its own cwd/root anchor.
+/// - **Results** — `daemon_output` non-empty → printed verbatim. A grep whose
+///   scope was anchored at the cwd (pathless, or at least one relative
+///   path/pattern argument) prints the `cwd:` anchor line first — grep hits
+///   under the cwd render cwd-relative, so without the anchor an agent whose
+///   shell cwd is not the tree it believes it is searching reads another
+///   tree's matches as its own, undetectably (misc 172: a worktree worker's
+///   relative globs resolved against the main checkout and that tree's
+///   unedited content came back looking like stale post-edit results).
+///   Absolute-only scopes stay byte-identical. Glob is exempt: its listing
+///   already renders absolute paths, which disclose the scope on their own.
 /// - **Empty** — `queried` ran but nothing came back → the cwd anchor is
 ///   always printed (the only signal distinguishing "ran here, found nothing"
 ///   from "did not run"). For grep, the zero-result echo follows: `no matches
@@ -1120,6 +1142,13 @@ fn render_search_outcome(
             }
         }
     } else {
+        // The scope-disclosure anchor for cwd-anchored grep results (misc 172).
+        // The zero-result arm above prints `cwd:` unconditionally; the match
+        // arm must be equally honest whenever the scope derived from the cwd,
+        // or wrong-cwd results are indistinguishable from right-cwd ones.
+        if matches!(kind, SearchKind::Grep { .. }) && cwd_anchored(paths) {
+            let _ = out.writeln(format_args!("cwd: {}", compress_home(cwd)));
+        }
         let _ = out.writeln(format_args!("{body}"));
     }
     // Per-argument glob no-match report — fired whether or not the body was
@@ -3944,6 +3973,101 @@ mod tests {
             },
         );
         assert!(text.contains("alternation"), "BRE hint shown: {text}");
+    }
+
+    // ── misc 172: cwd-anchored results disclose their scope ─────────
+
+    #[test]
+    fn render_grep_results_relative_scope_prints_cwd_anchor() {
+        // The misc-172 sighting shape: a relative glob resolved against the
+        // shell cwd. Hits render cwd-relative, so the anchor line is the only
+        // way an agent can see WHICH tree the matches came from.
+        let paths = SearchPaths {
+            forward: vec![PathBuf::from("src/**/*.rs")],
+            missing: vec![],
+        };
+        let text = render(
+            paths,
+            "src/paths.rs:181:    dirs::config_dir()",
+            true,
+            SearchKind::Grep {
+                pattern: "dirs::config_dir".to_string(),
+                bre_alternation: false,
+            },
+        );
+        assert!(
+            text.starts_with("cwd: /tmp/work\n"),
+            "relative-scope results must open with the cwd anchor: {text}"
+        );
+        assert!(text.contains("dirs::config_dir()"), "{text}");
+    }
+
+    #[test]
+    fn render_grep_results_pathless_scope_prints_cwd_anchor() {
+        // A pathless grep binds to the cwd (bug 31) — same disclosure duty.
+        let paths = SearchPaths {
+            forward: vec![],
+            missing: vec![],
+        };
+        let text = render(
+            paths,
+            "src/main.rs:1:fn main() {}",
+            true,
+            SearchKind::Grep {
+                pattern: "fn main".to_string(),
+                bre_alternation: false,
+            },
+        );
+        assert!(
+            text.starts_with("cwd: /tmp/work\n"),
+            "pathless results must open with the cwd anchor: {text}"
+        );
+    }
+
+    #[test]
+    fn render_grep_results_absolute_scope_stays_byte_identical() {
+        // Absolute-only scopes derive nothing from the cwd: no anchor, and the
+        // body passes through byte-identically (no churn for the recommended
+        // absolute-path workflow).
+        let paths = SearchPaths {
+            forward: vec![PathBuf::from("/abs/tree/src")],
+            missing: vec![],
+        };
+        let text = render(
+            paths,
+            "probe.rs:3:    let marker = 1;",
+            true,
+            SearchKind::Grep {
+                pattern: "marker".to_string(),
+                bre_alternation: false,
+            },
+        );
+        assert_eq!(
+            text, "probe.rs:3:    let marker = 1;\n",
+            "absolute-scope results must not grow an anchor line"
+        );
+    }
+
+    #[test]
+    fn render_glob_results_never_grow_a_cwd_anchor() {
+        // Glob listings render absolute paths — the scope is already
+        // disclosed per line, so the anchor stays grep-only.
+        let paths = SearchPaths {
+            forward: vec![PathBuf::from("src/**/*.rs")],
+            missing: vec![],
+        };
+        let text = render(
+            paths,
+            "/abs/tree/src/main.rs  (10 lines)",
+            true,
+            SearchKind::Glob {
+                no_match_patterns: vec![],
+            },
+        );
+        assert_eq!(
+            text, "/abs/tree/src/main.rs  (10 lines)\n",
+            "glob results must pass through unchanged"
+        );
     }
 
     #[test]
