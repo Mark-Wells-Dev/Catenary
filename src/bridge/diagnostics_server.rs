@@ -1389,16 +1389,17 @@ impl DiagnosticsServer {
                 // empty is never second-guessed by an off-spec probe (misc 153).
                 Some(diags) => diags,
                 // Never heard AND the server advertises the pull model: ask it
-                // the way it asked to be asked. Unchanged.
+                // the way it asked to be asked.
                 None if client.supports_pull_diagnostics() => {
-                    match client.pull_diagnostics(uri).await {
+                    let pulled = match client.pull_diagnostics(uri).await {
                         Ok(diags) => diags,
                         Err(e) => {
                             client.server().downgrade_pull_diagnostics();
                             debug!("pull diagnostics failed, downgraded: {e}");
                             Vec::new()
                         }
-                    }
+                    };
+                    reconsult_push_after_empty_pull(&client, uri, pulled)
                 }
                 // Never heard, pull suppressed by engine casing (misc 157): the
                 // server is push-first by design (rust-analyzer) and must never be
@@ -1412,7 +1413,10 @@ impl DiagnosticsServer {
                 // false `[clean]` for a fast publisher whose first publish the
                 // settle-then-collect pipeline cleared (bug 74). Errors map to
                 // empty, so a genuinely silent push-only server is unchanged.
-                None => client.try_pull_diagnostics(uri).await,
+                None => {
+                    let pulled = client.try_pull_diagnostics(uri).await;
+                    reconsult_push_after_empty_pull(&client, uri, pulled)
+                }
             };
 
             // Apply per-server min_severity filter before quick-fix
@@ -1969,6 +1973,30 @@ fn render_diagnostic_code(code: Option<&Value>) -> String {
         )
     })
     .unwrap_or_default()
+}
+
+/// Resolves an empty pull against the push cache one more time (bug 99).
+///
+/// The pull's round-trip is a wait the settle phase never granted this
+/// server: a debouncing push-only server (the incident's brew
+/// lua-language-server publishes ~270 ms after `didSave` while settle sees
+/// idle at 60 ms) can publish while the pull is in flight, and the reader
+/// dispatches that publish into the push cache strictly before it resolves
+/// the pull's response. Evidence in hand outranks the probe's nothing —
+/// rendering `[clean]` over a cached truthful publish falsifies the receipt.
+/// A non-empty pull is returned as-is (one source per file, misc 153), and a
+/// still-empty cache keeps the pull's honest empty.
+fn reconsult_push_after_empty_pull(
+    client: &LspClient,
+    uri: &str,
+    pulled: Vec<Value>,
+) -> Vec<Value> {
+    if pulled.is_empty()
+        && let Some(published) = client.get_diagnostics(uri)
+    {
+        return published;
+    }
+    pulled
 }
 
 /// Renders one LSP-shaped diagnostic into a [`DiagEntry`], or `None` when the

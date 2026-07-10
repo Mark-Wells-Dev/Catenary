@@ -82,6 +82,20 @@ struct Args {
     #[arg(long)]
     fail_pull: bool,
 
+    /// On `textDocument/diagnostic`: FIRST publish the file's diagnostics as
+    /// a push notification, THEN answer the request itself with `-32601`
+    /// (method not found). Models the bug-99 incident wire order — a
+    /// debouncing push-only server (brew lua-language-server) whose publish
+    /// lands during the daemon's best-effort pull round-trip, followed by the
+    /// pull's rejection. Both writes go through the locked writer in
+    /// sequence, so the daemon's reader is GUARANTEED to dispatch the publish
+    /// into the push cache before the error response resolves the pull.
+    /// Pair with `--no-push-diagnostics` so the cache is empty at retrieval
+    /// (forcing the pull) — the receipt must then carry the pushed
+    /// diagnostic, not `[clean]`.
+    #[arg(long)]
+    publish_then_reject_pull: bool,
+
     /// Reject `textDocument/documentSymbol` with `-32601` (method not found),
     /// mimicking a server that implements no document-symbol support
     /// (`sql-language-server`, `cmake-language-server`). Used to test that the
@@ -670,6 +684,30 @@ impl MockServer {
             }
             "typeHierarchy/subtypes" => self.handle_type_hierarchy_subtypes(&request.params),
             "textDocument/diagnostic" => {
+                if self.args.publish_then_reject_pull {
+                    // Bug-99 incident wire order: the truthful publish enters
+                    // the pipe strictly before the pull's rejection, so the
+                    // daemon's sequential reader caches it before the pull
+                    // future resolves.
+                    let uri = request
+                        .params
+                        .get("textDocument")
+                        .and_then(|td| td.get("uri"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    self.publish_diagnostics(&uri);
+                    self.send_response(&Response {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: None,
+                        error: Some(RpcError {
+                            code: -32601,
+                            message: "textDocument/diagnostic".to_string(),
+                        }),
+                    });
+                    return;
+                }
                 if self.args.fail_pull {
                     self.send_response(&Response {
                         jsonrpc: "2.0".to_string(),
@@ -2717,6 +2755,7 @@ mod tests {
             no_push_diagnostics: false,
             push_empty: false,
             pull_diagnostics: false,
+            publish_then_reject_pull: false,
             workspace_diagnostics: false,
             fail_pull: false,
             reject_document_symbol: false,

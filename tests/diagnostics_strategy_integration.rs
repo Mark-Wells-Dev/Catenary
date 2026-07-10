@@ -669,6 +669,45 @@ fn never_heard_draws_one_best_effort_probe() -> Result<()> {
     Ok(())
 }
 
+/// A publish racing the best-effort pull must reach the receipt (bug 99).
+///
+/// Byte-exact model of the first live macOS conformance run's
+/// lua-language-server incident (run 29067405830): a debouncing push-only
+/// server publishes its diagnostics while the daemon's best-effort pull is
+/// in flight, then rejects the pull with `-32601`. mockls
+/// `--publish-then-reject-pull` writes exactly that wire order — publish
+/// first, rejection second — so the sequential reader is GUARANTEED to have
+/// cached the publish before the pull future resolves. Pre-fix, the pull's
+/// empty result was final and the receipt falsified `[clean]` over evidence
+/// in hand; the fix re-consults the push cache after an empty pull.
+#[test]
+fn publish_racing_the_pull_reaches_the_receipt() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    // --no-push-diagnostics keeps the cache empty at retrieval (never-heard),
+    // forcing the best-effort pull that the racing publish then overtakes.
+    let mut bridge = spawn_mockls(
+        &["--no-push-diagnostics", "--publish-then-reject-pull"],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+    assert!(
+        text.contains("mock diagnostic"),
+        "the publish that raced the rejected pull is evidence in hand — the \
+         receipt must carry it, not render [clean] (bug 99). Got: {text}"
+    );
+    assert!(
+        !text.contains("[clean]"),
+        "a receipt over a cached truthful publish must not be [clean]. Got: {text}"
+    );
+
+    Ok(())
+}
+
 /// Heard-empty: an explicit empty publish is evidence — no probe (misc 153).
 ///
 /// mockls with `--push-empty` publishes `"diagnostics": []` on `didOpen` — the
