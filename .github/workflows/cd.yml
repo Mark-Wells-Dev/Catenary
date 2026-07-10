@@ -76,11 +76,29 @@ jobs:
           cd target/${{ matrix.target }}/release
           cp ${{ matrix.artifact_name }} ../../../${{ matrix.asset_name }}
 
+      # A .sha256 sidecar per asset (`<name>.sha256`, `sha256sum -c`-able
+      # format) so downstream pinners — the homebrew-tap bump automation, the
+      # pkgbuilds watcher — read the hash instead of downloading and hashing
+      # the asset. macOS runners have no sha256sum; shasum -a 256 emits the
+      # identical format.
+      - name: Write sha256 sidecar
+        shell: bash
+        run: |
+          asset="${{ matrix.asset_name }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
+          cat "$asset.sha256"
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset_name }}
-          path: ${{ matrix.asset_name }}
+          path: |
+            ${{ matrix.asset_name }}
+            ${{ matrix.asset_name }}.sha256
 
   create-release:
     name: Create Release
