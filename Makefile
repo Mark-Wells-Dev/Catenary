@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: bench bench-test build-release check conformance conformance-matrix deny fuzz machete mdbook mockgrep mockglob mdgrep mdglob refresh-recipes registry-selftest rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish tag-current
+.PHONY: bench bench-test build-release check conformance conformance-matrix deny fuzz install machete mdbook mockgrep mockglob mdgrep mdglob refresh-recipes registry-selftest rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish publish-check tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -410,6 +410,17 @@ rustgrep:
 
 rustglob:
 	$(call iso_run,$(RUST_REPO_HOME),$(RUST_REPO_ENV),glob '$(RUST_REPO_DIR)/**/*.$(RUST_REPO_EXT)')
+
+# Install the working tree's binary onto PATH — the maintainer's nightly
+# distribution channel (`cargo install --path .`), as a target so the ritual
+# is one word and never skipped (the v2 release day ran an entire session
+# against a 30-commit-stale binary and daemon because the raw form was).
+# Prints both versions afterward: the running daemon keeps serving the OLD
+# build until bounced, and the version pair makes the skew visible.
+install:
+	@cargo install --path . --locked
+	@catenary version
+	@echo "If the daemon lags the CLI: catenary stop && catenary start (live sessions reconnect; each needs /mcp)"
 
 # Verify we're in a good state for release
 pre-release-check:
