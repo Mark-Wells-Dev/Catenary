@@ -3996,6 +3996,24 @@ pub async fn run_glob_daemon_less(req: &GlobRequest) -> Result<GlobResponse> {
     })
 }
 
+/// Races `pipeline` against client disconnect (bug 24): resolves `Some(outcome)`
+/// when the pipeline completes first, `None` when the client's read half
+/// completes first (EOF, error, or any stray byte — a well-behaved client
+/// sends nothing after its request). The losing pipeline future is dropped.
+#[cfg(unix)]
+async fn race_against_disconnect<T>(
+    pipeline: impl std::future::Future<Output = T>,
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> Option<T> {
+    use tokio::io::AsyncReadExt;
+
+    let mut probe = [0u8; 1];
+    tokio::select! {
+        outcome = pipeline => Some(outcome),
+        _ = reader.read(&mut probe) => None,
+    }
+}
+
 /// Handles a single hook connection with session-aware dispatch.
 ///
 /// Reads the JSON request, extracts `session_id` for routing, looks up
@@ -4704,32 +4722,34 @@ async fn handle_hook_dispatch(
 
         // Race grep execution against client disconnect so a killed
         // CLI process doesn't leave the pipeline running indefinitely.
-        let cancel_on_disconnect = cancel.clone();
-        let outcome = tokio::select! {
-            result = ctx.primary.grep.execute(&params, Some(&parent_id), &cancel).instrument(span.clone()) => result,
-            () = async {
-                use tokio::io::AsyncReadExt;
-                let mut buf = [0u8; 1];
-                let _ = buf_reader.read(&mut buf).await;
-                cancel_on_disconnect.cancel();
-            } => {
-                debug!(
-                    source = Source::DaemonDispatch.as_str(),
-                    "grep client disconnected — query cancelled",
+        let raced = race_against_disconnect(
+            ctx.primary
+                .grep
+                .execute(&params, Some(&parent_id), &cancel)
+                .instrument(span.clone()),
+            &mut buf_reader,
+        )
+        .await;
+        let Some(outcome) = raced else {
+            // The token reaches walk internals that dropping the execute
+            // future alone cannot stop.
+            cancel.cancel();
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                "grep client disconnected — query cancelled",
+            );
+            span.in_scope(|| {
+                emit_hook_event(
+                    tracing::Level::INFO,
+                    "cli",
+                    &method,
+                    Some(&parent_id),
+                    "client disconnected",
+                    "outgoing hook response",
                 );
-                span.in_scope(|| {
-                    emit_hook_event(
-                        tracing::Level::INFO,
-                        "cli",
-                        &method,
-                        Some(&parent_id),
-                        "client disconnected",
-                        "outgoing hook response",
-                    );
-                });
-                // The dropped `ShapedOutput` (if any) unlinks its spool.
-                return Ok(());
-            }
+            });
+            // The dropped `ShapedOutput` (if any) unlinks its spool.
+            return Ok(());
         };
 
         // The walk is done — free the permit so a queued search can proceed
@@ -4860,62 +4880,66 @@ async fn handle_hook_dispatch(
 
         // Race glob execution against client disconnect so a killed
         // CLI process doesn't leave the pipeline running indefinitely.
-        let cancel_on_disconnect = cancel.clone();
-        let response = tokio::select! {
-            result = ctx.primary.glob.execute(&params, Some(&parent_id), &cancel).instrument(span.clone()) => {
-                match result {
-                    Ok(GlobOutcome::Rendered { output, no_match_indices }) => {
-                        // Map each zero-match index back to the argument's
-                        // ORIGINAL spelling. `to_params` resolves `glob_req.paths`
-                        // to the absolute `params.paths` 1:1 in order, so the
-                        // index the glob pipeline reports lines up with
-                        // `glob_req.paths` — showing what the agent typed, the
-                        // way `path does not exist` does (misc 118).
-                        let no_match_patterns = no_match_indices
-                            .into_iter()
-                            .filter_map(|i| glob_req.paths.get(i))
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .collect();
-                        GlobResponse {
-                            output,
-                            paths: None,
-                            no_match_patterns,
-                        }
-                    }
-                    Ok(GlobOutcome::Count { paths }) => GlobResponse {
-                        output: String::new(),
-                        paths: Some(paths),
-                        no_match_patterns: Vec::new(),
-                    },
-                    Err(e) => GlobResponse {
-                        output: format!("glob error: {e}"),
-                        paths: None,
-                        no_match_patterns: Vec::new(),
-                    },
+        let raced = race_against_disconnect(
+            ctx.primary
+                .glob
+                .execute(&params, Some(&parent_id), &cancel)
+                .instrument(span.clone()),
+            &mut buf_reader,
+        )
+        .await;
+        let Some(result) = raced else {
+            // The token reaches walk internals that dropping the execute
+            // future alone cannot stop.
+            cancel.cancel();
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                "glob client disconnected — query cancelled",
+            );
+            span.in_scope(|| {
+                emit_hook_event(
+                    tracing::Level::INFO,
+                    "cli",
+                    &method,
+                    Some(&parent_id),
+                    "client disconnected",
+                    "outgoing hook response",
+                );
+            });
+            return Ok(());
+        };
+        let response = match result {
+            Ok(GlobOutcome::Rendered {
+                output,
+                no_match_indices,
+            }) => {
+                // Map each zero-match index back to the argument's
+                // ORIGINAL spelling. `to_params` resolves `glob_req.paths`
+                // to the absolute `params.paths` 1:1 in order, so the
+                // index the glob pipeline reports lines up with
+                // `glob_req.paths` — showing what the agent typed, the
+                // way `path does not exist` does (misc 118).
+                let no_match_patterns = no_match_indices
+                    .into_iter()
+                    .filter_map(|i| glob_req.paths.get(i))
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                GlobResponse {
+                    output,
+                    paths: None,
+                    no_match_patterns,
                 }
             }
-            () = async {
-                use tokio::io::AsyncReadExt;
-                let mut buf = [0u8; 1];
-                let _ = buf_reader.read(&mut buf).await;
-                cancel_on_disconnect.cancel();
-            } => {
-                debug!(
-                    source = Source::DaemonDispatch.as_str(),
-                    "glob client disconnected — query cancelled",
-                );
-                span.in_scope(|| {
-                    emit_hook_event(
-                        tracing::Level::INFO,
-                        "cli",
-                        &method,
-                        Some(&parent_id),
-                        "client disconnected",
-                        "outgoing hook response",
-                    );
-                });
-                return Ok(());
-            }
+            Ok(GlobOutcome::Count { paths }) => GlobResponse {
+                output: String::new(),
+                paths: Some(paths),
+                no_match_patterns: Vec::new(),
+            },
+            Err(e) => GlobResponse {
+                output: format!("glob error: {e}"),
+                paths: None,
+                no_match_patterns: Vec::new(),
+            },
         };
 
         let mut payload = serde_json::to_vec(&response)?;
@@ -5198,39 +5222,36 @@ async fn handle_hook_dispatch(
                     // Race the diagnostics pipeline against client disconnect. If the
                     // `catenary diagnostics` process is killed mid-settle (e.g. the host
                     // tool-call timeout fires while a server sits in a `$/progress`
-                    // bracket), the socket closes, the read below returns EOF, and we
-                    // drop the pipeline future instead of leaving a settle wait pinned on
+                    // bracket), the socket closes, the probe reads EOF, and we drop the
+                    // pipeline future instead of leaving a settle wait pinned on
                     // a Busy server (bug 24). Mirrors the grep/glob cancel-on-disconnect
                     // path. The dropped batch self-heals: `open_document_on` sends
                     // `didChange` (not a duplicate `didOpen`) for an already-open doc.
-                    let outcome = tokio::select! {
-                        outcome = ctx
-                            .primary
+                    let raced = race_against_disconnect(
+                        ctx.primary
                             .diagnostics
-                            .process_files_batched(&diag_files, Some(&scope_id)) => outcome,
-                        () = async {
-                            use tokio::io::AsyncReadExt;
-                            let mut probe = [0u8; 1];
-                            let _ = buf_reader.read(&mut probe).await;
-                        } => {
-                            if let Some(s) = &board_session {
-                                s.set_diagnostics_in_flight(false);
-                            }
-                            debug!(
-                                source = Source::DaemonDispatch.as_str(),
-                                session_id = %session_id,
-                                "diagnostics client disconnected — pipeline cancelled",
-                            );
-                            emit_hook_event(
-                                tracing::Level::INFO,
-                                "cli",
-                                &method,
-                                Some(&scope_id),
-                                "client disconnected",
-                                "outgoing hook response",
-                            );
-                            return Ok(());
+                            .process_files_batched(&diag_files, Some(&scope_id)),
+                        &mut buf_reader,
+                    )
+                    .await;
+                    let Some(outcome) = raced else {
+                        if let Some(s) = &board_session {
+                            s.set_diagnostics_in_flight(false);
                         }
+                        debug!(
+                            source = Source::DaemonDispatch.as_str(),
+                            session_id = %session_id,
+                            "diagnostics client disconnected — pipeline cancelled",
+                        );
+                        emit_hook_event(
+                            tracing::Level::INFO,
+                            "cli",
+                            &method,
+                            Some(&scope_id),
+                            "client disconnected",
+                            "outgoing hook response",
+                        );
+                        return Ok(());
                     };
                     if let Some(s) = &board_session {
                         s.set_diagnostics_in_flight(false);
@@ -8559,25 +8580,36 @@ mod tests {
     }
 
     /// misc 141 / bug 60: an undelivered bare run leaves the batch's flags false
-    /// and the gate armed. Modeled as computed-but-undelivered — the client
-    /// half-closes its write side, so the daemon's disconnect-cancel select
-    /// (bug 24) fires and no response reaches it, deterministically avoiding the
-    /// flip. The batch survives, and the next bare run re-serves it in full.
+    /// and the gate armed. Deterministic by protocol, not scheduling (bug 90):
+    /// the consume request is written WITHOUT its trailing newline and the
+    /// socket is then fully closed, so the daemon's `read_line` framing can
+    /// only complete at EOF — the handler cannot start until the client's close
+    /// has retired. From there no schedule can deliver: the disconnect probe
+    /// (bug 24) reads an immediate EOF, and if the pipeline branch wins the
+    /// race anyway, the response `write_all` lands on a fully closed peer
+    /// (EPIPE) and returns early — the flip is gated on that write. This models
+    /// the real bug-60 kill shape (a dead process closes both directions), not
+    /// a half-open socket no production client presents. The batch survives,
+    /// and the next bare run re-serves it in full.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn undelivered_run_leaves_flags_false_and_gate_armed() {
-        // Send a request and half-close the write side without reading — the
-        // daemon reads EOF on its cancel probe and returns before writing any
-        // response (bug 24), so delivery never happens.
-        async fn send_and_halfclose(ipc_path: &Path, request: &serde_json::Value) {
+        // Write the request with no trailing newline, then fully close the
+        // socket (both directions). EOF is the request terminator, so the
+        // daemon observes the request only after the close has retired.
+        //
+        // Degradation guard: if request framing ever rejects unterminated
+        // lines, this consume errors without taking the staged handoff, and
+        // the recovery prepare below blocks on the handoff permit until
+        // `HANDOFF_TIMEOUT` — the test goes visibly slow rather than silently
+        // meaningless.
+        async fn send_unterminated_and_close(ipc_path: &Path, request: &serde_json::Value) {
             use tokio::io::AsyncWriteExt;
-            let stream = tokio::net::UnixStream::connect(ipc_path)
+            let mut stream = tokio::net::UnixStream::connect(ipc_path)
                 .await
                 .expect("connect to IPC socket");
-            let (_read, mut write) = stream.into_split();
-            let mut payload = serde_json::to_string(request).expect("serialize");
-            payload.push('\n');
-            write.write_all(payload.as_bytes()).await.expect("write");
-            write.shutdown().await.expect("shutdown write half");
+            let payload = serde_json::to_string(request).expect("serialize");
+            stream.write_all(payload.as_bytes()).await.expect("write");
+            drop(stream);
         }
 
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -8611,15 +8643,16 @@ mod tests {
                 .record_covered_edit(Some("sess-1"), "", file_a.clone());
         }
 
-        // Prepare, then run a consume whose client half-closes: the disconnect-
-        // cancel path fires, so the batch's flag never flips.
+        // Prepare, then run a consume whose client is already fully closed by
+        // the time the daemon sees the request: no schedule can deliver a
+        // response, so the batch's flag never flips.
         let prepare = serde_json::json!({
             "method": "pre-tool/editing-stop",
             "agent_id": "",
             "session_id": "sess-1"
         });
         let _ = hook_roundtrip(&ipc_path, &prepare).await;
-        send_and_halfclose(
+        send_unterminated_and_close(
             &ipc_path,
             &serde_json::json!({"method": "tool/editing-stop"}),
         )
@@ -8658,6 +8691,69 @@ mod tests {
         );
 
         shutdown.cancel();
+    }
+
+    // ── race_against_disconnect (bug 24 regression guards) ─────────
+    //
+    // Each test makes exactly ONE branch completable, so the outcome carries
+    // no timing or scheduling assumption. `tokio::io::duplex` stands in for
+    // the connection: dropping one end is the disconnect (EOF on the probe);
+    // holding it open and silent starves the probe forever.
+
+    /// bug 24: a gone client resolves the race as a disconnect. The pipeline
+    /// is `pending()` — the probe's EOF read is the only completable branch.
+    #[tokio::test]
+    async fn race_against_disconnect_resolves_none_when_client_is_gone() {
+        let (client, mut daemon_side) = tokio::io::duplex(8);
+        drop(client);
+        let outcome = race_against_disconnect(std::future::pending::<()>(), &mut daemon_side).await;
+        assert!(
+            outcome.is_none(),
+            "a closed peer must resolve the race as a disconnect"
+        );
+    }
+
+    /// bug 24: a completed pipeline resolves `Some` while the client holds the
+    /// socket open and silent — the probe read is never completable.
+    #[tokio::test]
+    async fn race_against_disconnect_resolves_pipeline_outcome_when_client_holds() {
+        let (_client, mut daemon_side) = tokio::io::duplex(8);
+        let outcome = race_against_disconnect(std::future::ready(42), &mut daemon_side).await;
+        assert_eq!(
+            outcome,
+            Some(42),
+            "a ready pipeline must win while the client holds the socket open"
+        );
+    }
+
+    /// bug 24: the losing pipeline future is dropped, not leaked — client gone
+    /// means the daemon-side wait terminates.
+    #[tokio::test]
+    async fn race_against_disconnect_drops_the_losing_pipeline() {
+        use std::sync::atomic::AtomicBool;
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = DropFlag(Arc::clone(&dropped));
+        let pipeline = async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+        };
+
+        let (client, mut daemon_side) = tokio::io::duplex(8);
+        drop(client);
+        let outcome = race_against_disconnect(pipeline, &mut daemon_side).await;
+        assert!(outcome.is_none(), "the disconnect arm must win");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the losing pipeline future must be dropped on disconnect"
+        );
     }
 
     /// misc 141: two `(session_id, agent_id)` pairs never share a batch. Each
