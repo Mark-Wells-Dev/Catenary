@@ -40,8 +40,14 @@ pub fn claude_hooks_findings() -> Vec<Finding> {
             "Claude Code hooks: cannot determine home directory",
         )];
     };
-    let home = PathBuf::from(home_str);
+    claude_hooks_findings_at(&PathBuf::from(home_str))
+}
 
+/// [`claude_hooks_findings`] against an explicit home directory.
+///
+/// Split out so tests can exercise the stale/ok branches against a temp
+/// layout without mutating `HOME` (env mutation is `unsafe` in edition 2024).
+fn claude_hooks_findings_at(home: &Path) -> Vec<Finding> {
     let plugins_file = home.join(".claude/plugins/installed_plugins.json");
     let Ok(plugins_json) = std::fs::read_to_string(&plugins_file) else {
         return vec![not_installed("Claude Code hooks")];
@@ -78,7 +84,7 @@ pub fn claude_hooks_findings() -> Vec<Finding> {
     };
     let install_path = PathBuf::from(install_path_str);
 
-    let source_type = read_marketplace_source(&home);
+    let source_type = read_marketplace_source(home);
     let version_display = source_type
         .as_deref()
         .map_or_else(|| version.to_string(), |src| format!("{version} ({src})"));
@@ -106,8 +112,14 @@ pub fn claude_hooks_findings() -> Vec<Finding> {
                 format!("Claude Code hooks are stale (v{version_display})"),
             )
             .with_fix_it(
-                "Reinstall: claude plugin uninstall catenary@catenary && \
-                 claude plugin install catenary@catenary",
+                // Not the bare `claude plugin uninstall && install` sequence:
+                // Claude Code caches marketplace content by plugin version, so
+                // for an unchanged version a bare reinstall re-copies the OLD
+                // hooks. `catenary install claude` refreshes the marketplace
+                // first (see `cli::install::claude_ensure_marketplace`).
+                "Run: catenary install claude (refreshes the marketplace cache, \
+                 then reinstalls — a bare plugin reinstall can re-copy the stale \
+                 cached content)",
             )
             .with_diff(StaleDiff {
                 installed: pretty_json(&installed),
@@ -552,6 +564,69 @@ mod tests {
         assert_eq!(finding.code, FindingCode::InstructionsStale);
         assert_eq!(finding.severity, Severity::Error);
         assert!(finding.diff.is_some(), "stale rules carry a diff");
+    }
+
+    // ── claude hooks staleness ──────────────────────────────────────
+
+    /// Lay out a fake `~/.claude/plugins` install: a version-keyed cache dir
+    /// holding `hooks_content` and an `installed_plugins.json` pointing at it.
+    fn write_claude_plugin_layout(home: &Path, hooks_content: &str) {
+        let cache = home.join(".claude/plugins/cache/catenary/catenary/1.6.1");
+        fs::create_dir_all(cache.join("hooks")).expect("create plugin cache dir");
+        fs::write(cache.join("hooks/hooks.json"), hooks_content).expect("write cached hooks");
+        let installed = serde_json::json!({
+            "version": 2,
+            "plugins": {
+                "catenary@catenary": [{
+                    "scope": "user",
+                    "installPath": cache.to_string_lossy(),
+                    "version": "1.6.1",
+                }],
+            },
+        });
+        fs::write(
+            home.join(".claude/plugins/installed_plugins.json"),
+            serde_json::to_string_pretty(&installed).expect("serialize installed_plugins"),
+        )
+        .expect("write installed_plugins.json");
+    }
+
+    #[test]
+    fn claude_hooks_matching_cache_reads_ok() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_claude_plugin_layout(home.path(), CLAUDE_HOOKS_EXPECTED);
+
+        let findings = claude_hooks_findings_at(home.path());
+        let finding = findings.first().expect("one finding");
+        assert_eq!(finding.code, FindingCode::HooksOk);
+    }
+
+    #[test]
+    fn claude_hooks_stale_fix_it_names_catenary_install() {
+        // The version-keyed plugin cache freezes hooks at install time; when
+        // the shipped set moves on, the fix-it must name `catenary install
+        // claude` — which refreshes the marketplace before reinstalling — and
+        // NOT the bare `claude plugin uninstall && install` sequence, which
+        // re-copies the stale version-cached marketplace content (see
+        // `cli::install::claude_ensure_marketplace`).
+        let home = tempfile::tempdir().expect("tempdir");
+        write_claude_plugin_layout(home.path(), r#"{"hooks":{}}"#);
+
+        let findings = claude_hooks_findings_at(home.path());
+        let finding = findings.first().expect("one finding");
+        assert_eq!(finding.code, FindingCode::HooksStale);
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(finding.diff.is_some(), "stale hooks carry a diff");
+        let fix_it = finding.fix_it.as_deref().expect("stale hooks carry fix-it");
+        assert!(
+            fix_it.contains("catenary install claude"),
+            "fix-it names the marketplace-refreshing reinstall: {fix_it}",
+        );
+        assert!(
+            !fix_it.starts_with("Reinstall: claude plugin uninstall"),
+            "fix-it must not lead with the bare reinstall known to re-copy \
+             stale cached content: {fix_it}",
+        );
     }
 
     // ── command filter status ───────────────────────────────────────
