@@ -21,6 +21,14 @@ detect_platform() {
         *)             echo "Unsupported architecture: $arch" >&2; exit 1 ;;
     esac
 
+    # No Intel-mac asset is published (arm-only ruling: macOS 27 is
+    # Apple-silicon-exclusive; the shipped surface matches the proven one).
+    if [ "$os_name" = "macos" ] && [ "$arch_name" = "amd64" ]; then
+        echo "Unsupported platform: Intel Macs. Catenary ships Apple-silicon" >&2
+        echo "macOS binaries only; build from source if you need Intel." >&2
+        exit 1
+    fi
+
     echo "catenary-${os_name}-${arch_name}"
 }
 

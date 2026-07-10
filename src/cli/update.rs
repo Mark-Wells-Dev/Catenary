@@ -24,10 +24,14 @@ struct ReleaseInfo {
 }
 
 /// Returns the expected asset name for the current platform.
+///
+/// Intel macOS resolves to `None` deliberately: no `catenary-macos-amd64`
+/// asset is published (misc-164 arm-only ruling — the macOS proof surface
+/// is Apple-silicon-only, and the shipped surface matches the proven one),
+/// so an Intel Mac gets the honest no-prebuilt-binary path, not a 404.
 fn asset_name() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Some("catenary-linux-amd64"),
-        ("macos", "x86_64") => Some("catenary-macos-amd64"),
         ("macos", "aarch64") => Some("catenary-macos-arm64"),
         ("windows", "x86_64") => Some("catenary-windows-amd64.exe"),
         _ => None,
@@ -345,7 +349,9 @@ mod tests {
         if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
             assert_eq!(name, Some("catenary-linux-amd64"));
         } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
-            assert_eq!(name, Some("catenary-macos-amd64"));
+            // No Intel-mac asset is published (misc-164 arm-only ruling):
+            // Intel macOS must take the no-prebuilt-binary path.
+            assert_eq!(name, None);
         } else if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
             assert_eq!(name, Some("catenary-macos-arm64"));
         }
