@@ -1,11 +1,16 @@
 ---
 # CD — on a vX.Y.Z tag push:
-#   1. build-release   cross-platform binaries (Linux / macOS arm64 /
-#                      Windows). No Intel-mac asset: the macOS proof
-#                      surface (CI test leg, conformance, on-device smoke)
-#                      is arm64-only per the misc-164 arm-only ruling —
+#   1. build-release   cross-platform binaries (Linux / macOS arm64).
+#                      No Intel-mac asset: the macOS proof surface (CI
+#                      test leg, conformance, on-device smoke) is
+#                      arm64-only per the misc-164 arm-only ruling —
 #                      macOS 27 is Apple-silicon-exclusive — and the
-#                      shipped surface must match the proven one.
+#                      shipped surface must match the proven one. No
+#                      Windows asset (v2.0.0 ruling, same principle):
+#                      nothing in CI compiles Windows, catenary-mcp's
+#                      transport is Unix-socket-bound, and the v2.0.0
+#                      tag build proved it doesn't even build — Windows
+#                      returns post-v2 behind the port.
 #   2. create-release  cut a GitHub Release with the binaries attached
 #   3. publish-crate   publish to crates.io via Trusted Publishing (OIDC — no
 #                      stored token): catenary-proc, then catenary-mcp
@@ -53,10 +58,6 @@ jobs:
             target: aarch64-apple-darwin
             artifact_name: catenary
             asset_name: catenary-macos-arm64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: catenary.exe
-            asset_name: catenary-windows-amd64.exe
 
     steps:
       - uses: actions/checkout@v5

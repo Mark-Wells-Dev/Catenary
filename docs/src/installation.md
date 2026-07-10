@@ -7,24 +7,30 @@
 
 ## Platforms
 
-Catenary ships prebuilt binaries for **Linux x86_64**, **macOS arm64** (Apple
-silicon), and **Windows x86_64**. There is **no Intel-mac binary** — the
-installer refuses Intel Macs and points you at a source build. Any platform with
-a Rust toolchain can build from source.
+Catenary ships prebuilt binaries for **Linux x86_64** and **macOS arm64**
+(Apple silicon). There is **no Intel-mac binary** — the installer refuses
+Intel Macs and points you at a source build — and **no Windows binary**:
+the daemon's transport is Unix-socket-bound today, so Windows support
+returns after the port rather than shipping unverified.
 
 ## Install Catenary
 
-**Prebuilt binary (Linux / macOS arm64 / Windows):**
+**Homebrew (macOS and Linux):**
+
+```bash
+brew install twowells/tap/catenary
+```
+
+**Prebuilt binary (Linux / macOS arm64):**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/TwoWells/Catenary/main/install.sh | sh
 ```
 
 The script detects your platform, downloads the matching release asset
-(`catenary-linux-amd64`, `catenary-macos-arm64`, or
-`catenary-windows-amd64.exe`), and installs it to `/usr/local/bin` (override
-with `CATENARY_INSTALL_DIR`). Once installed, `catenary update` self-updates the
-binary in place.
+(`catenary-linux-amd64` or `catenary-macos-arm64`), and installs it to
+`/usr/local/bin` (override with `CATENARY_INSTALL_DIR`). Once installed,
+`catenary update` self-updates the binary in place.
 
 **From crates.io (any platform with a Rust toolchain):**
 

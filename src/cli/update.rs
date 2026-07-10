@@ -29,11 +29,14 @@ struct ReleaseInfo {
 /// asset is published (misc-164 arm-only ruling — the macOS proof surface
 /// is Apple-silicon-only, and the shipped surface matches the proven one),
 /// so an Intel Mac gets the honest no-prebuilt-binary path, not a 404.
+/// Windows likewise (v2.0.0 ruling, same principle): nothing in CI compiles
+/// Windows and the MCP transport is Unix-socket-bound — the v2.0.0 tag build
+/// proved the crate does not build there. The platform returns post-v2
+/// behind the port.
 fn asset_name() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Some("catenary-linux-amd64"),
         ("macos", "aarch64") => Some("catenary-macos-arm64"),
-        ("windows", "x86_64") => Some("catenary-windows-amd64.exe"),
         _ => None,
     }
 }

@@ -120,6 +120,20 @@ reached through four decoupled surfaces:
 
 ### 1. Install
 
+**Homebrew (macOS and Linux):**
+
+```bash
+brew install twowells/tap/catenary
+```
+
+**Prebuilt binary (Linux x86_64 / macOS arm64):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/TwoWells/Catenary/main/install.sh | sh
+```
+
+**From source (any platform with a Rust toolchain):**
+
 ```bash
 cargo install catenary-mcp
 ```
@@ -127,6 +141,12 @@ cargo install catenary-mcp
 The `catenary` binary must be on your `PATH` before configuring any
 client. Plugins and extensions provide hooks and the MCP declaration but
 **do not include the binary** — this step is required.
+
+> **Upgrading from 1.x?** Every breaking change in 2.0 is to user
+> configuration — read the
+> [migration guide](https://twowells.github.io/Catenary/stable/migrating-to-2.0.html)
+> before upgrading, and run `catenary doctor` after: it flags each stale
+> config form with the exact rename.
 
 ### 2. Configure language servers
 
