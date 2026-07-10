@@ -210,6 +210,104 @@ fn dir_has_marker(dir: &Path, markers: &[String], compiled_markers: &[LspGlob]) 
     false
 }
 
+/// Maximum strikes before a server instance is benched (misc 167).
+///
+/// The counter is clamped to `[0, MAX_SERVER_STRIKES]`; at the cap the
+/// instance is out — no further demand-driven revives until the daemon
+/// restarts or the root is retired and remounted (both reset the ledger).
+const MAX_SERVER_STRIKES: u8 = 3;
+
+/// One instance's standing on the strike ledger (misc 167).
+///
+/// `+1` per failure observation (a crash while up, a revive spawn failure, a
+/// revive `initialize` failure), `−1` per served request (a delivered
+/// diagnostic / symbol / response — real work only; spawning and initializing
+/// earn no credit, so a spawn-then-die-before-serving loop must climb).
+/// Activity-driven, never a wall clock — the settle-monitor doctrine.
+#[derive(Debug, Default, Clone, Copy)]
+struct StrikeEntry {
+    /// Current strikes, clamped to `[0, MAX_SERVER_STRIKES]`.
+    strikes: u8,
+    /// Whether the instance ever completed a served request — the terminal
+    /// label's cause axis: struck out with zero successes is *broken*
+    /// (config / environment), with prior successes *unstable* (crashes).
+    ever_served: bool,
+}
+
+/// How a dead server instance will behave on future demand (misc 167).
+///
+/// Derived from the strike ledger; drives both the revive gate and the
+/// honest receipt wording for files the instance owed a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviveVerdict {
+    /// Below the strike cap: the next demand that routes here attempts a
+    /// revive through the normal spawn/initialize path.
+    Revivable,
+    /// Struck out with zero served requests ever — spawn/initialize never
+    /// got it to serve. Fix the server (config / environment); no revives
+    /// until the daemon restarts or the root remounts.
+    BenchedNeverStarted,
+    /// Struck out after previously serving — repeated crashes exhausted the
+    /// strikes. No revives until the daemon restarts or the root remounts.
+    BenchedUnstable,
+}
+
+/// Derives a ledger entry's verdict: benched at the strike cap, with the
+/// `ever_served` axis choosing the terminal cause (misc 167 — "hit 3 with
+/// zero successes" is *broken*, "hit 3 with prior successes" is *unstable*).
+const fn verdict_of(entry: StrikeEntry) -> ReviveVerdict {
+    if entry.strikes < MAX_SERVER_STRIKES {
+        ReviveVerdict::Revivable
+    } else if entry.ever_served {
+        ReviveVerdict::BenchedUnstable
+    } else {
+        ReviveVerdict::BenchedNeverStarted
+    }
+}
+
+/// Emits the single strike-out health finding (`warn!` — a TUI health
+/// finding, not a desktop interrupt: the bug-79 escape keeps the session
+/// unblocked, so a strike-out is actionable but never urgent).
+///
+/// Only called on the cap crossing, so `verdict` is never `Revivable`.
+fn warn_bench_once(key: &InstanceKey, verdict: ReviveVerdict) {
+    let cause = if verdict == ReviveVerdict::BenchedNeverStarted {
+        "never started (spawn/initialize failed repeatedly)"
+    } else {
+        "gave up after repeated crashes"
+    };
+    warn!(
+        source = Source::LspLifecycle.as_str(),
+        language = key.language_id.as_str(),
+        server = key.server.as_str(),
+        scope_root = key.scope.root_path().map(|p| p.display().to_string()),
+        "Language server struck out: {} — {cause}. No further revive \
+         attempts for this root until the daemon restarts or the root \
+         remounts; run `catenary doctor {}` for the spawn transcript.",
+        key.server,
+        key.server,
+    );
+}
+
+impl ReviveVerdict {
+    /// Whether the verdict permits a demand-driven revive.
+    #[must_use]
+    pub const fn is_revivable(self) -> bool {
+        matches!(self, Self::Revivable)
+    }
+
+    /// The short benched-cause label mirrored to the `state.json` board
+    /// (`None` while revivable).
+    #[must_use]
+    pub const fn bench_label(self) -> Option<&'static str> {
+        match self {
+            Self::Revivable => None,
+            Self::BenchedNeverStarted => Some("never started"),
+            Self::BenchedUnstable => Some("unstable"),
+        }
+    }
+}
+
 /// Manages the lifecycle of LSP clients, document state, and language detection.
 ///
 /// Single authority for LSP server spawning, caching, shutdown, and document
@@ -218,6 +316,15 @@ fn dir_has_marker(dir: &Path, markers: &[String], compiled_markers: &[LspGlob]) 
 pub struct LspClientManager {
     config: Arc<Config>,
     clients: Mutex<HashMap<InstanceKey, Arc<Mutex<LspClient>>>>,
+    /// The per-instance strike ledger (misc 167): the activity-driven revive
+    /// gate. Keyed by the full `(language, server, root)` instance key and
+    /// held OUTSIDE the client map so it survives tombstone removal and
+    /// respawn — the whole point is remembering failures across instances.
+    /// Cleared per-root on retirement (bug 93: a retired root's servers must
+    /// not revive, and a remount starts fresh) and implicitly on daemon
+    /// restart. `std::sync::Mutex`: tiny critical sections, never held
+    /// across `await`.
+    strikes: std::sync::Mutex<HashMap<InstanceKey, StrikeEntry>>,
     /// Negative cache for single-file server initialization failures.
     /// Contains `(language_id, server_name)` pairs where the server is
     /// configured with `single_file = true` but rejected null-workspace
@@ -251,6 +358,7 @@ impl LspClientManager {
         Self {
             config,
             clients: Mutex::new(HashMap::new()),
+            strikes: std::sync::Mutex::new(HashMap::new()),
             single_file_failures: std::sync::Mutex::new(HashSet::new()),
             marker_cache: std::sync::Mutex::new(HashMap::new()),
             logging,
@@ -280,6 +388,134 @@ impl LspClientManager {
     /// Returns a reference to the configuration.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    // ── Strike ledger (misc 167) ─────────────────────────────────────
+
+    /// Records one failure observation (`+1`) for an instance: a crash while
+    /// up, a revive spawn failure, or a revive `initialize` failure.
+    ///
+    /// Clamped at [`MAX_SERVER_STRIKES`]. Crossing the cap benches the
+    /// instance and emits a single `warn!()` — a TUI health finding, not a
+    /// desktop interrupt: the bug-79 escape keeps the session unblocked
+    /// (the gate still pays with an honest receipt), so a strike-out is
+    /// actionable but never urgent.
+    fn record_server_strike(&self, key: &InstanceKey) {
+        let mut ledger = self
+            .strikes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = ledger.entry(key.clone()).or_default();
+        let before = entry.strikes;
+        entry.strikes = entry.strikes.saturating_add(1).min(MAX_SERVER_STRIKES);
+        let strikes = entry.strikes;
+        let verdict = verdict_of(*entry);
+        drop(ledger);
+        // First crossing only — a repeat failure at the cap is clamped, so
+        // `before < MAX` cannot re-fire the finding.
+        let crossed = before < MAX_SERVER_STRIKES && strikes == MAX_SERVER_STRIKES;
+        debug!(
+            source = Source::LspLifecycle.as_str(),
+            server = key.server.as_str(),
+            scope_root = key.scope.root_path().map(|p| p.display().to_string()),
+            "Strike {strikes}/{MAX_SERVER_STRIKES} recorded for {key}",
+        );
+        if crossed {
+            warn_bench_once(key, verdict);
+        }
+        self.mirror_strikes(key, strikes, verdict);
+    }
+
+    /// Records one served request (`−1`) for an instance — a delivered
+    /// diagnostic / symbol / response. Real work only: the spawn path and
+    /// the eager health probe never call this, so only demand-side serving
+    /// pays the counter down.
+    pub fn record_server_service(&self, key: &InstanceKey) {
+        let mut ledger = self
+            .strikes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = ledger.get_mut(key) else {
+            // No failure history: nothing to pay down, keep the ledger
+            // sparse (the common healthy server never allocates).
+            return;
+        };
+        let before = entry.strikes;
+        entry.strikes = entry.strikes.saturating_sub(1);
+        entry.ever_served = true;
+        let strikes = entry.strikes;
+        let verdict = verdict_of(*entry);
+        drop(ledger);
+        if before != strikes {
+            debug!(
+                source = Source::LspLifecycle.as_str(),
+                server = key.server.as_str(),
+                "Served work pays a strike down: {strikes}/{MAX_SERVER_STRIKES} for {key}",
+            );
+            self.mirror_strikes(key, strikes, verdict);
+        }
+    }
+
+    /// The instance's current [`ReviveVerdict`] from the strike ledger.
+    ///
+    /// An instance the ledger has never seen is [`ReviveVerdict::Revivable`].
+    pub fn revive_verdict(&self, key: &InstanceKey) -> ReviveVerdict {
+        let ledger = self
+            .strikes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ledger
+            .get(key)
+            .copied()
+            .map_or(ReviveVerdict::Revivable, verdict_of)
+    }
+
+    /// Whether the ledger holds any failure history for the instance —
+    /// the "a configured server has been failing here" signal that keeps the
+    /// receipt honest even when no tombstone client survives (a spawn-fail
+    /// class instance never enters the client map).
+    fn strikes_recorded(&self, key: &InstanceKey) -> bool {
+        let ledger = self
+            .strikes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ledger.get(key).is_some_and(|e| e.strikes > 0)
+    }
+
+    /// Mirrors the instance's ledger standing onto the `state.json` board so
+    /// the TUI/doctor health surfaces can read it. No-op without a wired
+    /// snapshot (doctor / test contexts).
+    fn mirror_strikes(&self, key: &InstanceKey, strikes: u8, verdict: ReviveVerdict) {
+        if let Some(writer) = &self.snapshot {
+            writer.update_strikes(key, strikes, verdict.bench_label());
+        }
+    }
+
+    /// Drops ledger entries scoped to a retired root: retirement is the
+    /// operator/idle-cycle reset (bug 93 — a retired root's servers must not
+    /// revive, and a later remount starts with a clean slate).
+    fn clear_strikes_for_root(&self, root: &Path) {
+        self.strikes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|k, _| k.scope.root_path() != Some(root));
+    }
+
+    /// Drops one instance's ledger entry (an intentional shutdown/restart is
+    /// not failure history).
+    fn clear_strikes(&self, key: &InstanceKey) {
+        self.strikes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
+    }
+
+    /// Drops the whole ledger (daemon shutdown; restart resets to zero).
+    fn clear_all_strikes(&self) {
+        self.strikes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// Extracts `CommandsConfig` from each tracked root's project config.
@@ -884,8 +1120,41 @@ impl LspClientManager {
     /// Returns an empty Vec when no server matches. On empty result,
     /// emits a `debug!()` with the file path.
     ///
+    /// A dead per-root instance on a still-live root is not skipped forever
+    /// (misc 167): the lookup collects it as a revive candidate, attempts one
+    /// strike-gated [`Self::revive_server`] pass, and re-runs the lookup so a
+    /// revived server answers this very demand. A benched instance
+    /// ([`ReviveVerdict`]) stays down — its tombstone remains as evidence for
+    /// the diagnostics degradation surface. A retired root never reaches the
+    /// revive pass: retirement removes its instances from the map and clears
+    /// its ledger entries (bug 93).
+    ///
     /// Does not block on server readiness — callers must call
     /// `wait_ready_for_path` or `wait_ready_all` before invoking.
+    pub async fn get_servers(
+        &self,
+        path: &Path,
+        capability: fn(&LspServer) -> bool,
+        method: Option<DispatchMethod>,
+    ) -> Vec<Arc<Mutex<LspClient>>> {
+        let mut revive_attempted = false;
+        loop {
+            let (result, dead) = self.collect_servers(path, capability, method).await;
+            if dead.is_empty() || revive_attempted {
+                return result;
+            }
+            revive_attempted = true;
+            for key in dead {
+                // Best-effort: a failed or gated revive leaves the binding
+                // skipped on the second pass, exactly as before misc 167.
+                let _ = self.revive_server(&key).await;
+            }
+        }
+    }
+
+    /// One lookup pass for [`Self::get_servers`]: the matching live clients in
+    /// priority order, plus the instance keys of dead-but-present per-root
+    /// instances the demand routed to (the misc 167 revive candidates).
     #[allow(
         clippy::significant_drop_tightening,
         reason = "clients lock held across async iteration for consistent snapshot"
@@ -894,19 +1163,19 @@ impl LspClientManager {
         clippy::too_many_lines,
         reason = "workspace folder fallback adds branches but logic is linear"
     )]
-    pub async fn get_servers(
+    async fn collect_servers(
         &self,
         path: &Path,
         capability: fn(&LspServer) -> bool,
         method: Option<DispatchMethod>,
-    ) -> Vec<Arc<Mutex<LspClient>>> {
+    ) -> (Vec<Arc<Mutex<LspClient>>>, Vec<InstanceKey>) {
         // Detect language: primary (FilesystemManager) then fallback (raw extension).
         let Some(lang_id) = self.fs.language_id(path).or_else(|| {
             path.extension()
                 .and_then(|e| e.to_str())
                 .map(str::to_string)
         }) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
 
         // Resolve owning workspace root. If unrooted, fall through to
@@ -915,12 +1184,13 @@ impl LspClientManager {
             // Tiers 1–2: rooted file lookup. Resolve the binding per-root so a
             // project `[lsp.language.*]` rebinding decides dispatch.
             let Some(lang_config) = self.effective_language(&root, &lang_id) else {
-                return Vec::new();
+                return (Vec::new(), Vec::new());
             };
             // Resolve marker root once for all servers in this language.
             let resolved = self.resolve_server_root(path, &lang_id, &root);
             let clients = self.clients.lock().await;
             let mut result = Vec::new();
+            let mut dead: Vec<InstanceKey> = Vec::new();
 
             for binding in lang_config.servers() {
                 let skip = |reason: &str| {
@@ -976,7 +1246,13 @@ impl LspClientManager {
                     continue;
                 };
                 let locked = client.lock().await;
-                if !locked.is_alive() {
+                if !locked.is_alive() || locked.lifecycle().is_terminal() {
+                    // Dead-but-present on a live root: a misc 167 revive
+                    // candidate (the terminal-but-lingering `Failed` class
+                    // included — a fresh spawn renegotiates capabilities).
+                    if let Some(key) = locked.server().key() {
+                        dead.push(key);
+                    }
                     skip("server not alive");
                     continue;
                 }
@@ -997,13 +1273,15 @@ impl LspClientManager {
                 );
             }
 
-            return result;
+            return (result, dead);
         }
 
         // Tier 3: single-file servers for unrooted files. Unrooted ⇒ no project
-        // layer to consult, so the binding resolves globally.
+        // layer to consult, so the binding resolves globally. Out of misc 167
+        // scope: single-file instances keep their own negative cache and are
+        // never revive candidates.
         let Some(lang_config) = self.config.resolve_language(&lang_id) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let mut result = Vec::new();
         for binding in lang_config.servers() {
@@ -1030,7 +1308,7 @@ impl LspClientManager {
             result.push(client);
         }
 
-        result
+        (result, Vec::new())
     }
 
     /// Waits for every server bound to this path's language binding.
@@ -1199,6 +1477,30 @@ impl LspClientManager {
             anyhow::bail!("root gone — retired: {}", root.display());
         }
 
+        // The strike gate (misc 167): a benched instance is out — every spawn
+        // path (first spawn, demand revive, `ensure_clients_for_paths` retry)
+        // funnels through here, so the bench holds no matter which surface
+        // asks. Cleared by root retirement or daemon restart. A retired root
+        // never reaches this point (the gone-root bail above and the ledger
+        // clear in `shutdown_root_instances` both precede it).
+        let ledger_key = InstanceKey::new(
+            lang.to_string(),
+            server_name.to_string(),
+            Scope::Root(root.to_path_buf()),
+        );
+        if !self.revive_verdict(&ledger_key).is_revivable() {
+            debug!(
+                source = Source::LspLifecycle.as_str(),
+                server = server_name,
+                scope_root = %root.display(),
+                "Not spawning {server_name}: struck out (misc 167)",
+            );
+            anyhow::bail!(
+                "{server_name} ({lang}) struck out after repeated failures — \
+                 benched until daemon restart or root remount"
+            );
+        }
+
         let server_def = if project_scoped {
             self.effective_server_def(server_name, root)
                 .ok_or_else(|| {
@@ -1293,7 +1595,7 @@ impl LspClientManager {
                 (program, args, server_def.env.clone())
             };
 
-        let mut client = LspClient::spawn(
+        let mut client = match LspClient::spawn(
             spawn_program,
             &spawn_args,
             lang,
@@ -1302,7 +1604,16 @@ impl LspClientManager {
             server_def.settings.clone(),
             spawn_env.as_ref(),
             &root_str,
-        )?;
+        ) {
+            Ok(client) => client,
+            Err(e) => {
+                // A spawn that won't start is a failure observation (misc
+                // 167): `+1`, so a binary that can never come up racks its
+                // three strikes across a few cheap failed spawns and benches.
+                self.record_server_strike(&ledger_key);
+                return Err(e);
+            }
+        };
 
         // Set scope before initialize so the reader loop has it for
         // all protocol messages, including the init exchange itself.
@@ -1342,10 +1653,17 @@ impl LspClientManager {
             // rejecting init, so the file degrades with an `unavailable:`
             // banner instead of reading as `[no LSP coverage]`.
             client.server().set_lifecycle(ServerLifecycle::Failed);
+            // A failed `initialize` is a failure observation (misc 167):
+            // `+1`, charged here — so mark the tombstone as already charged,
+            // keeping the demand-side revive from double-counting the same
+            // death when it later finds this instance.
+            self.record_server_strike(&ledger_key);
+            client.mark_death_strike_counted();
             // Tombstone: insert the dead client so `find_instance` returns
             // `Some` on subsequent calls.  `ensure_clients_for_paths` skips
             // bindings that already have an entry (dead or alive), and
-            // `ensure_server` bails with "is dead" — stopping the retry loop.
+            // `ensure_server` bails with "is dead" — the retry path is the
+            // strike-gated demand revive (`get_servers`, misc 167).
             clients.insert(key, Arc::new(Mutex::new(client)));
             return Err(e);
         }
@@ -1566,7 +1884,9 @@ impl LspClientManager {
     ///
     /// Looks up an existing `Scope::Root(root)` instance. On miss,
     /// spawns a new per-root instance. Dead servers are left as
-    /// tombstones — a server that crashes will not be restarted.
+    /// tombstones — this path does not restart them; a crashed server
+    /// is revived on demand through the strike-gated
+    /// [`Self::revive_server`] (misc 167), which `get_servers` drives.
     /// Intentional restarts (e.g. after `sync_roots`) go through
     /// [`Self::shutdown_instance`] which removes the entry so a fresh
     /// spawn can occur.
@@ -1721,7 +2041,17 @@ impl LspClientManager {
     /// unavailable, so it is excluded (it stays `[no LSP coverage]`). Unrooted
     /// files (tier-3 single-file servers) are out of scope here and yield an
     /// empty result.
-    pub async fn unavailable_diagnostic_servers(&self, path: &Path) -> Vec<String> {
+    ///
+    /// Each name is paired with its [`ReviveVerdict`] from the strike ledger
+    /// (misc 167), so the receipt can distinguish "dead, will retry on
+    /// demand" from "struck out". A binding with **no** surviving instance
+    /// but recorded strikes (the spawn-fail class, which never enters the
+    /// client map) is included too — a server that keeps failing to spawn is
+    /// a degradation, never a silent `[no LSP coverage]`.
+    pub async fn unavailable_diagnostic_servers(
+        &self,
+        path: &Path,
+    ) -> Vec<(String, ReviveVerdict)> {
         let Some(lang_id) = self.fs.language_id(path).or_else(|| {
             path.extension()
                 .and_then(|e| e.to_str())
@@ -1757,43 +2087,97 @@ impl LspClientManager {
                 instance = find_instance(&clients, &lang_id, &binding.name, &root);
             }
             let Some(client) = instance else {
+                // No tombstone survives a spawn failure; the ledger still
+                // remembers (misc 167), so the receipt stays honest. Mirror
+                // the instance lookup: marker root first, workspace root as
+                // the fallback.
+                let ledger_key = [resolved.as_path(), root.as_path()]
+                    .into_iter()
+                    .map(|r| {
+                        InstanceKey::new(
+                            lang_id.clone(),
+                            binding.name.clone(),
+                            Scope::Root(r.to_path_buf()),
+                        )
+                    })
+                    .find(|k| self.strikes_recorded(k));
+                if let Some(key) = ledger_key {
+                    names.push((binding.name.clone(), self.revive_verdict(&key)));
+                }
                 continue;
             };
             let locked = client.lock().await;
             let dead = !locked.is_alive() || locked.lifecycle().is_terminal();
+            let key = locked.server().key();
             drop(locked);
             if dead {
-                names.push(binding.name.clone());
+                let verdict = key.map_or(ReviveVerdict::Revivable, |k| self.revive_verdict(&k));
+                names.push((binding.name.clone(), verdict));
             }
         }
         drop(clients);
         names
     }
 
-    /// Respawns a dead per-root diagnostic server instance for in-run recovery
-    /// (decision 027 — the gate may stall, never wedge).
+    /// Revives a dead per-root instance on demand — the strike-gated respawn
+    /// path (misc 167; grew out of decision 027's in-run diagnostics
+    /// recovery, which routes through here too).
     ///
-    /// Removes the dead tombstone (which `find_instance` would otherwise keep
-    /// returning, bailing "is dead") and spawns a fresh instance through the
-    /// normal spawn/initialize path — bounded by the same spawn and initialize
-    /// budgets as a first spawn, so a single bounded stall replaces an
-    /// unbounded wait. Returns the fresh, live client on success, or `None`
-    /// when the respawn or its initialize fails (the caller degrades: no
-    /// further attempts this run).
+    /// Sequence:
     ///
-    /// Only `Scope::Root` instances are respawnable here — the per-file
-    /// fan-out's server groups are all root-scoped; a `SingleFile` key returns
-    /// `None`. A still-alive removed process is shut down first so it is never
-    /// leaked.
-    pub async fn respawn_diagnostic_server(
-        &self,
-        key: &InstanceKey,
-    ) -> Option<Arc<Mutex<LspClient>>> {
+    /// 1. **Charge the observed death** (`+1`) exactly once per instance: a
+    ///    tombstone found dead here is one crash observation; the per-client
+    ///    `death_strike_counted` flag dedupes repeat demands against the same
+    ///    tombstone, and an `initialize`-failure tombstone arrives already
+    ///    charged from the spawn path.
+    /// 2. **Consult the gate**: a benched instance ([`ReviveVerdict`]) is not
+    ///    revived — the tombstone stays on the map as evidence, so the
+    ///    diagnostics degradation surface keeps naming it honestly.
+    /// 3. **Respawn**: remove the tombstone (shutting down a still-alive
+    ///    lingering process so it is never leaked) and spawn a fresh instance
+    ///    through the normal spawn/initialize path, bounded by the same spawn
+    ///    and initialize budgets as a first spawn. A failed respawn records
+    ///    its own strike inside [`Self::spawn_inner`].
+    ///
+    /// Returns the fresh, live client on success, or `None` when the revive
+    /// is gated or fails (the caller degrades: no further attempts this run —
+    /// the next demand retries, strikes permitting).
+    ///
+    /// Only `Scope::Root` instances are revivable — the per-file fan-out's
+    /// server groups are all root-scoped; a `SingleFile` key returns `None`.
+    pub async fn revive_server(&self, key: &InstanceKey) -> Option<Arc<Mutex<LspClient>>> {
         let root = key.scope.root_path()?.to_path_buf();
 
-        // Remove the tombstone under a tight lock, then shut down any lingering
-        // process outside it (a dead tombstone needs no shutdown; a still-alive
-        // one is closed so it is never leaked).
+        // Leg 1: charge the observed death (once per instance).
+        let existing = self.clients.lock().await.get(key).cloned();
+        if let Some(existing) = existing {
+            let mut client = existing.lock().await;
+            let is_dead = !client.is_alive() || client.lifecycle().is_terminal();
+            let charge = is_dead && !client.death_strike_counted();
+            if charge {
+                client.mark_death_strike_counted();
+            }
+            drop(client);
+            if charge {
+                self.record_server_strike(key);
+            }
+        }
+
+        // Leg 2: the gate. Benched ⇒ no revive, tombstone retained.
+        if !self.revive_verdict(key).is_revivable() {
+            debug!(
+                source = Source::LspLifecycle.as_str(),
+                server = key.server.as_str(),
+                scope_root = %root.display(),
+                "Not reviving {}: struck out (misc 167)",
+                key.server,
+            );
+            return None;
+        }
+
+        // Leg 3: remove the tombstone under a tight lock, then shut down any
+        // lingering process outside it (a dead tombstone needs no shutdown; a
+        // still-alive one is closed so it is never leaked).
         let removed = self.clients.lock().await.remove(key);
         if let Some(old) = removed {
             let mut old = old.lock().await;
@@ -1813,7 +2197,7 @@ impl LspClientManager {
                     source = Source::LspLifecycle.as_str(),
                     server = key.server.as_str(),
                     scope_root = %root.display(),
-                    "Respawned {} for in-run diagnostics recovery",
+                    "Revived {} on demand",
                     key.server,
                 );
                 Some(client)
@@ -1823,7 +2207,7 @@ impl LspClientManager {
                     source = Source::LspLifecycle.as_str(),
                     server = key.server.as_str(),
                     scope_root = %root.display(),
-                    "Diagnostics recovery respawn failed: {e}",
+                    "Demand revive failed: {e}",
                 );
                 None
             }
@@ -2286,6 +2670,9 @@ impl LspClientManager {
             if let Some(writer) = &self.snapshot {
                 writer.remove_server(key);
             }
+            // An intentional shutdown is not failure history (misc 167): a
+            // deliberate restart starts with a clean strike slate.
+            self.clear_strikes(key);
         }
     }
 
@@ -2332,6 +2719,12 @@ impl LspClientManager {
                 }
             }
         }
+        drop(clients);
+        // Retirement resets the strike ledger for the root (misc 167 / bug
+        // 93): the retired root's servers must not revive — their instances
+        // just left the map, so no demand can find them — and a later remount
+        // starts with a clean slate.
+        self.clear_strikes_for_root(root);
     }
 
     /// Shuts down all single-file server instances and clears the
@@ -2573,6 +2966,10 @@ impl LspClientManager {
                 }
             }
         }
+        drop(clients);
+        // Daemon shutdown resets the ledger (misc 167): a restart is the
+        // ticket's "restart resets S to 0".
+        self.clear_all_strikes();
     }
 
     /// Installs (or replaces) a single root's project config, preserving the
@@ -4263,24 +4660,308 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_servers_dead_server_skipped() -> Result<()> {
+    async fn test_get_servers_revives_dead_server_on_demand() -> Result<()> {
+        // misc 167: a server killed while up leaves its tombstone on the map;
+        // the next demand that routes to it revives it (the pkill-then-
+        // diagnose live-fire shape). Before misc 167 this returned empty
+        // forever ("skipped: server not alive").
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_string_lossy().to_string();
         let manager = LspClientManager::new(
             mockls_config(),
             test_logging(),
-            test_fs_with_roots(&["/tmp"]),
+            test_fs_with_roots(&[&root]),
         );
 
         let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
-        // Kill the server
+        // Kill the server (the tombstone stays in the map).
         client.lock().await.shutdown().await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let path = PathBuf::from(format!("/tmp/test.{MOCK_LANG_A}"));
+        let path = dir.path().join(format!("test.{MOCK_LANG_A}"));
         let servers = manager
             .get_servers(&path, LspServer::supports_document_symbols, None)
             .await;
-        assert!(servers.is_empty(), "dead server should be skipped");
+        assert_eq!(servers.len(), 1, "the dead server is revived on demand");
+        let revived = servers.first().expect("one revived server");
+        assert!(
+            revived.lock().await.is_alive(),
+            "the revived instance is live"
+        );
+        assert!(
+            !Arc::ptr_eq(&client, revived),
+            "a fresh instance answers, not the tombstone"
+        );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_servers_benches_after_three_crash_strikes() -> Result<()> {
+        // misc 167: each observed death charges +1 with no served work to
+        // offset it; the third death benches the instance — demand stops
+        // reviving, the tombstone stays as evidence, and no further spawn
+        // occurs (strikes-exhaust-honestly).
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_string_lossy().to_string();
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&[&root]),
+        );
+        let path = dir.path().join(format!("test.{MOCK_LANG_A}"));
+
+        let mut current = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        for round in 1..=2u8 {
+            current.lock().await.shutdown().await?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let servers = manager
+                .get_servers(&path, LspServer::supports_document_symbols, None)
+                .await;
+            assert_eq!(servers.len(), 1, "strike {round}: still revivable");
+            current = servers.into_iter().next().expect("revived instance");
+        }
+
+        // Third death: the demand charges the third strike and benches.
+        current.lock().await.shutdown().await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let servers = manager
+            .get_servers(&path, LspServer::supports_document_symbols, None)
+            .await;
+        assert!(servers.is_empty(), "three strikes: benched, no revive");
+
+        // The tombstone is retained as evidence, and a repeat demand does not
+        // respawn behind the bench (same Arc across calls).
+        let clients = manager.clients().await;
+        assert_eq!(clients.len(), 1, "the benched tombstone is retained");
+        let tombstone = clients.values().next().expect("tombstone").clone();
+        let again = manager
+            .get_servers(&path, LspServer::supports_document_symbols, None)
+            .await;
+        assert!(again.is_empty(), "benched stays benched");
+        let clients_again = manager.clients().await;
+        let tombstone_again = clients_again.values().next().expect("tombstone").clone();
+        assert!(
+            Arc::ptr_eq(&tombstone, &tombstone_again),
+            "no respawn behind the bench"
+        );
+
+        // The unavailable surface names the benched server with the ticket's
+        // terminal cause: it crashed with zero served requests, so the label
+        // axis reads "never started".
+        let unavailable = manager.unavailable_diagnostic_servers(&path).await;
+        assert_eq!(unavailable.len(), 1, "the benched server is named");
+        assert_eq!(unavailable[0].1, ReviveVerdict::BenchedNeverStarted);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_retired_root_stays_dead_no_revive() -> Result<()> {
+        // bug 93 guard: retirement removes the root's instances and clears
+        // its ledger — later demand never revives (or spawns) for it.
+        let dir = tempfile::tempdir()?;
+        let root_path = dir.path().to_path_buf();
+        let root = root_path.to_string_lossy().to_string();
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&[&root]),
+        );
+
+        let _ = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        assert_eq!(manager.clients().await.len(), 1);
+
+        // Retire the root.
+        let removed = manager.sync_roots(rich(&[])).await?;
+        assert_eq!(removed, vec![root_path.clone()]);
+        assert!(
+            manager.clients().await.is_empty(),
+            "retirement shuts the root's instances down"
+        );
+
+        let path = root_path.join(format!("test.{MOCK_LANG_A}"));
+        let servers = manager
+            .get_servers(&path, LspServer::supports_document_symbols, None)
+            .await;
+        assert!(servers.is_empty(), "no server answers for a retired root");
+        assert!(
+            manager.clients().await.is_empty(),
+            "no revive or spawn happens for a retired root"
+        );
+        Ok(())
+    }
+
+    /// Config whose mockls rejects `initialize` (the julia/r
+    /// dies-at-handshake class) — every spawn attempt fails init.
+    fn mockls_failing_init_config() -> Arc<Config> {
+        let bin = mockls_bin();
+        let server_name = format!("mockls-{MOCK_LANG_A}");
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                path: Some(bin.to_string_lossy().to_string()),
+                args: vec![
+                    MOCK_LANG_A.to_string(),
+                    "--fail-on".to_string(),
+                    "initialize".to_string(),
+                ],
+                ..ServerDef::default()
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new(server_name)]),
+                ..LanguageConfig::default()
+            },
+        );
+        Arc::new(Config {
+            language,
+            server,
+            ..test_config_raw()
+        })
+    }
+
+    #[tokio::test]
+    async fn test_init_failing_server_benches_after_three_attempts() -> Result<()> {
+        // misc 167 "broken = benched" subsumption: a server that cannot
+        // initialize racks +1 per failed attempt with no served work, reaches
+        // the cap in three cheap failures, and is benched with the
+        // `never started` terminal cause.
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_string_lossy().to_string();
+        let manager = LspClientManager::new(
+            mockls_failing_init_config(),
+            test_logging(),
+            test_fs_with_roots(&[&root]),
+        );
+        let path = dir.path().join(format!("test.{MOCK_LANG_A}"));
+
+        // Attempt 1 (first spawn): init fails → strike 1, charged tombstone.
+        assert!(
+            ensure_first_server(&manager, MOCK_LANG_A).await.is_err(),
+            "the handshake-rejecting server fails its first spawn"
+        );
+        // Attempts 2 and 3 (demand revives): init fails again → strikes 2, 3.
+        for round in 2..=3u8 {
+            let servers = manager
+                .get_servers(&path, LspServer::supports_document_symbols, None)
+                .await;
+            assert!(servers.is_empty(), "attempt {round} fails init");
+        }
+
+        // Benched: the tombstone Arc stays identical across further demand —
+        // no fourth spawn attempt.
+        let tombstone = manager
+            .clients()
+            .await
+            .values()
+            .next()
+            .cloned()
+            .expect("a failed-init tombstone is retained");
+        let servers = manager
+            .get_servers(&path, LspServer::supports_document_symbols, None)
+            .await;
+        assert!(servers.is_empty(), "benched: no revive");
+        let tombstone_again = manager
+            .clients()
+            .await
+            .values()
+            .next()
+            .cloned()
+            .expect("tombstone retained");
+        assert!(
+            Arc::ptr_eq(&tombstone, &tombstone_again),
+            "no spawn once benched"
+        );
+
+        // Honest surface: named with the never-started terminal cause.
+        let unavailable = manager.unavailable_diagnostic_servers(&path).await;
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].1, ReviveVerdict::BenchedNeverStarted);
+        Ok(())
+    }
+
+    #[test]
+    fn strike_ledger_decays_on_service_and_labels_unstable() {
+        // misc 167 unit: served work pays a strike down (activity-driven
+        // decay), and a cap reached AFTER serving carries the `unstable`
+        // cause, not `never started`.
+        let manager = LspClientManager::new(test_config(), test_logging(), test_fs());
+        let key = InstanceKey::new(
+            "rust".to_string(),
+            "ra".to_string(),
+            Scope::Root(PathBuf::from("/p")),
+        );
+        assert!(manager.revive_verdict(&key).is_revivable());
+
+        manager.record_server_strike(&key);
+        manager.record_server_strike(&key);
+        assert!(
+            manager.revive_verdict(&key).is_revivable(),
+            "two strikes: still revivable"
+        );
+
+        manager.record_server_service(&key);
+        manager.record_server_strike(&key);
+        assert!(
+            manager.revive_verdict(&key).is_revivable(),
+            "the served credit kept it below the cap"
+        );
+
+        manager.record_server_strike(&key);
+        assert_eq!(
+            manager.revive_verdict(&key),
+            ReviveVerdict::BenchedUnstable,
+            "served before striking out: unstable, not never-started"
+        );
+
+        // The counter clamps at the cap; service on a fresh key is a no-op
+        // (the ledger stays sparse for healthy servers).
+        manager.record_server_strike(&key);
+        assert_eq!(manager.revive_verdict(&key), ReviveVerdict::BenchedUnstable);
+        let fresh = InstanceKey::new(
+            "rust".to_string(),
+            "ra".to_string(),
+            Scope::Root(PathBuf::from("/q")),
+        );
+        manager.record_server_service(&fresh);
+        assert!(manager.revive_verdict(&fresh).is_revivable());
+        assert!(!manager.strikes_recorded(&fresh), "no entry allocated");
+    }
+
+    #[test]
+    fn strike_ledger_clears_for_retired_root_only() {
+        // misc 167 / bug 93: retirement clears the retired root's entries —
+        // a remount starts fresh — while other roots keep their history.
+        let manager = LspClientManager::new(test_config(), test_logging(), test_fs());
+        let key_a = InstanceKey::new(
+            "rust".to_string(),
+            "ra".to_string(),
+            Scope::Root(PathBuf::from("/a")),
+        );
+        let key_b = InstanceKey::new(
+            "rust".to_string(),
+            "ra".to_string(),
+            Scope::Root(PathBuf::from("/b")),
+        );
+        for _ in 0..3 {
+            manager.record_server_strike(&key_a);
+            manager.record_server_strike(&key_b);
+        }
+        assert!(!manager.revive_verdict(&key_a).is_revivable());
+        assert!(!manager.revive_verdict(&key_b).is_revivable());
+
+        manager.clear_strikes_for_root(Path::new("/a"));
+        assert!(
+            manager.revive_verdict(&key_a).is_revivable(),
+            "the retired root's slate is clean"
+        );
+        assert!(
+            !manager.revive_verdict(&key_b).is_revivable(),
+            "the other root keeps its bench"
+        );
     }
 
     #[tokio::test]

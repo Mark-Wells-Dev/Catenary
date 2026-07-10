@@ -462,6 +462,49 @@ fn broken_finding(name: &str, class: ServerClass, status: &ServerStatus) -> Find
     }
 }
 
+/// Strike-ledger findings from the live server board (misc 167): one
+/// [`Severity::Warning`] per struck-out (benched) server, deduplicated by
+/// server name.
+///
+/// The shared derivation both renderers read — doctor from the `state.json`
+/// snapshot it already opens for the activity ledger, the TUI from its
+/// snapshot feed — so "struck out — needs attention" never diverges across
+/// the two. A benched server is impaired-but-recoverable state (the bug-79
+/// escape keeps sessions unblocked), hence Warning, not Fatal: demand revives
+/// are suspended until the daemon restarts or the root remounts.
+#[must_use]
+pub fn strike_findings(servers: &[crate::state_snapshot::ServerEntry]) -> Vec<Finding> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut findings = Vec::new();
+    for entry in servers {
+        let Some(cause) = entry.benched.as_deref() else {
+            continue;
+        };
+        if !seen.insert(entry.server.as_str()) {
+            continue;
+        }
+        let detail = if cause == "never started" {
+            "never started (spawn/initialize failed repeatedly)"
+        } else {
+            "gave up after repeated crashes"
+        };
+        findings.push(
+            Finding::new(
+                FindingCode::ServerRoutedBroken,
+                Severity::Warning,
+                format!("{}: struck out — {detail}; revives suspended", entry.server),
+            )
+            .with_fix_it(format!(
+                "Run `catenary doctor {}` for the spawn/initialize transcript. \
+                 Restart the daemon (`catenary stop`, then `catenary start`) or \
+                 remount the root to re-arm revives.",
+                entry.server,
+            )),
+        );
+    }
+    findings
+}
+
 /// Default per-server timeout for the initialize probe (5 minutes).
 ///
 /// Julia's `LanguageServer.jl` compiles on first run and can take minutes
@@ -854,6 +897,47 @@ mod tests {
     #[test]
     fn probe_timeout_default_is_five_minutes() {
         assert_eq!(probe_timeout(), Duration::from_mins(5));
+    }
+
+    #[test]
+    fn strike_findings_warn_per_benched_server_deduped() {
+        // misc 167: one Warning per struck-out server (deduplicated across
+        // roots), the cause distinguishing broken-config from instability;
+        // healthy or merely-striking servers produce nothing.
+        let entry = |server: &str, benched: Option<&str>| crate::state_snapshot::ServerEntry {
+            id: format!("{server}@/p"),
+            server: server.to_string(),
+            benched: benched.map(str::to_string),
+            ..Default::default()
+        };
+        let servers = vec![
+            entry("ra", Some("never started")),
+            entry("ra", Some("never started")), // a second root: deduped
+            entry("gopls", Some("unstable")),
+            entry("lua-ls", None), // not benched: silent
+        ];
+        let findings = strike_findings(&servers);
+        assert_eq!(findings.len(), 2, "one finding per benched server");
+
+        let ra = &findings[0];
+        assert_eq!(ra.code, FindingCode::ServerRoutedBroken);
+        assert_eq!(ra.severity, Severity::Warning);
+        assert!(ra.message.starts_with("ra: struck out"), "{}", ra.message);
+        assert!(ra.message.contains("never started"), "{}", ra.message);
+
+        let gopls = &findings[1];
+        assert!(
+            gopls.message.contains("gave up after repeated crashes"),
+            "{}",
+            gopls.message,
+        );
+        assert!(
+            gopls
+                .fix_it
+                .as_deref()
+                .expect("a bench carries a fix-it")
+                .contains("catenary doctor gopls"),
+        );
     }
 
     #[test]

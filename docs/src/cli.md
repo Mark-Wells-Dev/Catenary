@@ -171,14 +171,24 @@ batch starts a new one. When a file's
 server dies before answering — mid-run, or by failing to start at all —
 Catenary makes **one bounded, in-run attempt** to respawn it and re-run the
 remainder (a slight stall, never an unbounded wait); if that fails, coverage
-has **degraded**. Coverage is *effective, not nominal*: a server that cannot
-be brought back means its files owe nothing for this run — the same class as
-a file no server covers, because the gap is Catenary's to close, never
-yours. Such a file is neither clean nor dirty; it is listed as `[unverified
-— <server> returned no result]` — or `[unverified — <server> stuck]` when
-process-state evidence types the server as wedged (respawn-dead, or init-hung so
-its tick-budgeted `initialize` failed): "stuck" is a claim about the process,
-made only on the evidence, so an armed gate is **always payable** — a stuck
+has **degraded** for this run. A dead server is not abandoned: the next
+demand that routes to it (a diagnose or query) **revives it**, bounded by a
+per-server **strike counter** — each failure (a crash while up, a failed
+respawn, a failed `initialize`) is a strike, each served result pays one
+back, and at three strikes the server is **benched**: no further revives
+until the daemon restarts or the root is remounted, so a crash-looping
+server never flaps unbounded. Coverage is *effective, not nominal*: a server
+that cannot be brought back means its files owe nothing for this run — the
+same class as a file no server covers, because the gap is Catenary's to
+close, never yours. Such a file is neither clean nor dirty; it is listed as
+`[unverified — <server> returned no result]` — or `[unverified — <server>
+stuck; will retry on demand]` when process-state evidence types the server
+as wedged (respawn-dead, or init-hung so its tick-budgeted `initialize`
+failed): "stuck" is a claim about the process, made only on the evidence. A
+benched server's files carry the terminal cause instead: `[broken — <server>
+never started]` (it struck out without ever serving — config or environment;
+fix the server) or `[unstable — <server> gave up after repeated crashes]`.
+Every state pays: an armed gate is **always payable** — a stuck or benched
 server yields an honest receipt rather than a silent hang, and paying is
 diagnosing, not fixing. The receipt **opens with a top-line
 banner naming the unavailable server** (`unavailable: <server>`) so degraded

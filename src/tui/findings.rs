@@ -366,6 +366,20 @@ fn live_server_findings(snapshot: &Snapshot) -> Vec<OwnedFinding> {
             });
         }
     }
+
+    // Struck-out (benched) servers — the strike ledger's terminal state
+    // (misc 167). Shared derivation with doctor (`health::servers`), so the
+    // two renderers never diverge.
+    for finding in crate::health::servers::strike_findings(&snapshot.servers) {
+        let owner = finding
+            .message
+            .split(':')
+            .next()
+            .map(str::trim)
+            .map_or(Owner::Global, |name| Owner::Server(name.to_string()));
+        out.push(OwnedFinding { finding, owner });
+    }
+
     out
 }
 

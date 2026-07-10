@@ -193,14 +193,49 @@ struct UnverifiedEntry {
     /// The diagnostic server(s) assigned to the file that produced no result,
     /// joined for display (e.g. `rust-analyzer`).
     server: String,
-    /// Whether process-state evidence types the owing server as **stuck** — a
-    /// terminal lifecycle (respawn-dead after the one in-run recovery attempt,
-    /// or init-hung so the tick-budgeted `initialize` failed it) rather than a
-    /// merely silent server (misc 160 leg 1 / bug 79). Drives the receipt
-    /// wording: `[unverified — <server> stuck]` vs `returned no result`. The
-    /// gate escape is the render's honesty, not a semantic change — either way
-    /// the receipt returns and the debt is paid ("paying is diagnosing").
-    stuck: bool,
+    /// Why the file went unverified — drives the receipt wording (misc 160
+    /// leg 1 / bug 79; strike states misc 167). The gate escape is the
+    /// render's honesty, not a semantic change — every cause returns the
+    /// receipt and pays the debt ("paying is diagnosing").
+    cause: UnverifiedCause,
+}
+
+/// The typed cause behind an unverified receipt line, softest first.
+///
+/// The ordering is load-bearing: a file owed by several servers renders the
+/// **softest** cause among them (`min`) — "stuck" or "benched" are claims
+/// about a process, made only when every owing server earns them (a single
+/// still-alive owner that merely returned nothing keeps `Silent`'s wording,
+/// misc 160 leg 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum UnverifiedCause {
+    /// The owing server was alive and simply produced nothing:
+    /// `[unverified — <server> returned no result]`.
+    Silent,
+    /// Process-state evidence types the owing server as stuck (respawn-dead /
+    /// init-hung) with strikes remaining, so the next demand retries
+    /// (misc 167): `[unverified — <server> stuck; will retry on demand]`.
+    Stuck,
+    /// Struck out with zero served requests ever (misc 167):
+    /// `[broken — <server> never started]`.
+    BenchedBroken,
+    /// Struck out after previously serving (misc 167):
+    /// `[unstable — <server> gave up after repeated crashes]`.
+    BenchedUnstable,
+}
+
+impl UnverifiedCause {
+    /// Maps the manager's strike-ledger verdict onto the receipt cause for a
+    /// server whose unavailability is already established (dead tombstone or
+    /// respawn-dead) — never `Silent`.
+    const fn from_verdict(verdict: crate::lsp::manager::ReviveVerdict) -> Self {
+        use crate::lsp::manager::ReviveVerdict;
+        match verdict {
+            ReviveVerdict::Revivable => Self::Stuck,
+            ReviveVerdict::BenchedNeverStarted => Self::BenchedBroken,
+            ReviveVerdict::BenchedUnstable => Self::BenchedUnstable,
+        }
+    }
 }
 
 /// Classification outcome for a single file in the batch pipeline.
@@ -372,7 +407,7 @@ impl DiagnosticsServer {
         Vec<UncoveredEntry>,
         Vec<OutOfScopeEntry>,
         BTreeMap<String, BTreeSet<String>>,
-        BTreeSet<String>,
+        BTreeMap<String, UnverifiedCause>,
     ) {
         if files.is_empty() {
             return (
@@ -380,7 +415,7 @@ impl DiagnosticsServer {
                 Vec::new(),
                 Vec::new(),
                 BTreeMap::new(),
-                BTreeSet::new(),
+                BTreeMap::new(),
             );
         }
 
@@ -411,12 +446,14 @@ impl DiagnosticsServer {
         let mut path_servers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
         // Diagnostic servers whose lifecycle is terminal — process-state evidence
-        // they are **stuck** (respawn-dead or init-hung), not merely silent. A
-        // `NoResults` file owned entirely by stuck servers renders
-        // `[unverified — <server> stuck]`; the escape pays the gate by returning
-        // the honest receipt (misc 160 leg 1 / bug 79). Seeded here with the
-        // pre-batch dead tombstones; the mid-run recovery adds respawn-deaths.
-        let mut stuck_servers: BTreeSet<String> = BTreeSet::new();
+        // they are **stuck** (respawn-dead or init-hung), not merely silent,
+        // each typed with its strike-ledger cause (misc 167): still revivable
+        // renders `[unverified — <server> stuck; will retry on demand]`,
+        // struck out renders the terminal `[broken — …]` / `[unstable — …]`
+        // labels. Either way the escape pays the gate by returning the honest
+        // receipt (misc 160 leg 1 / bug 79). Seeded here with the pre-batch
+        // dead tombstones; the mid-run recovery adds respawn-deaths.
+        let mut stuck_servers: BTreeMap<String, UnverifiedCause> = BTreeMap::new();
 
         let validator = self.path_validator.read().await;
         for file in files {
@@ -492,12 +529,14 @@ impl DiagnosticsServer {
                 } else {
                     let key = canonical.to_string_lossy().to_string();
                     let entry = path_servers.entry(key).or_default();
-                    for name in dead_servers {
+                    for (name, verdict) in dead_servers {
                         // A dead tombstone before the batch even ran is a
                         // terminal-lifecycle server (`unavailable_diagnostic_servers`
-                        // returns only `is_terminal()`/not-alive instances): the
-                        // init-hung / dies-at-`initialize` class, typed stuck.
-                        stuck_servers.insert(name.clone());
+                        // returns only `is_terminal()`/not-alive instances or
+                        // strike-recorded spawn failures): typed with its
+                        // strike-ledger verdict (misc 167) — stuck-but-
+                        // revivable vs benched.
+                        stuck_servers.insert(name.clone(), UnverifiedCause::from_verdict(verdict));
                         entry.insert(name);
                     }
                     canonical_paths.push(canonical);
@@ -597,10 +636,17 @@ impl DiagnosticsServer {
                 .run_server_batch_with_recovery(client_mutex, paths, parent_id, feeds)
                 .await
             {
-                // The server ended terminal with an unretrieved remainder and the
-                // one bounded respawn could not revive it (respawn-dead) — typed
-                // stuck, so its `NoResults` files render `[unverified — … stuck]`.
-                stuck_servers.insert(name.clone());
+                // The server ended terminal with an unretrieved remainder and
+                // the one bounded respawn could not revive it this run
+                // (respawn-dead) — typed with its strike-ledger verdict
+                // (misc 167): stuck-but-retried-next-demand, or benched.
+                let verdict = {
+                    let key = client_mutex.lock().await.server().key();
+                    key.map_or(crate::lsp::manager::ReviveVerdict::Revivable, |k| {
+                        self.client_manager.revive_verdict(&k)
+                    })
+                };
+                stuck_servers.insert(name.clone(), UnverifiedCause::from_verdict(verdict));
             }
         }
 
@@ -786,6 +832,7 @@ impl DiagnosticsServer {
                 version: client.server_version().map(str::to_string),
                 language_id: client.language().to_string(),
             });
+            let served_key = client.server().key();
             let reports = match client.workspace_diagnostics().await {
                 Ok(reports) => reports,
                 Err(e) => {
@@ -797,6 +844,12 @@ impl DiagnosticsServer {
                 }
             };
             drop(client);
+
+            // A completed `workspace/diagnostic` is one served request —
+            // strike-ledger credit (misc 167).
+            if let Some(key) = &served_key {
+                self.client_manager.record_server_service(key);
+            }
 
             for (uri, diagnostics) in reports {
                 let Some(path) = uri_to_pathbuf(&uri) else {
@@ -938,8 +991,11 @@ impl DiagnosticsServer {
     /// a named path (bug 58 / ephemeral-roots ticket 01).
     ///
     /// `stuck_servers` names the diagnostic servers process-state evidence types
-    /// as terminally wedged (respawn-dead / init-hung) — a `NoResults` file owed
-    /// entirely by them renders `[unverified — <server> stuck]` (misc 160 leg 1).
+    /// as terminally wedged (respawn-dead / init-hung), each with its typed
+    /// cause (misc 160 leg 1 / misc 167) — a `NoResults` file owed entirely by
+    /// them renders the cause's wording: `[unverified — <server> stuck; will
+    /// retry on demand]` while revivable, or the terminal `[broken — …]` /
+    /// `[unstable — …]` labels once struck out.
     #[allow(
         clippy::too_many_arguments,
         reason = "one linear renderer over the distinct receipt inputs (covered paths, results, uncovered, out-of-scope, per-file servers, stuck servers, collapse flag)"
@@ -951,7 +1007,7 @@ impl DiagnosticsServer {
         uncovered: &[UncoveredEntry],
         out_of_scope: &[OutOfScopeEntry],
         path_servers: &BTreeMap<String, BTreeSet<String>>,
-        stuck_servers: &BTreeSet<String>,
+        stuck_servers: &BTreeMap<String, UnverifiedCause>,
         collapse_clean: bool,
     ) -> DiagnosticsOutcome {
         let mut diag_files: Vec<DiagnosticFile> = Vec::new();
@@ -998,18 +1054,27 @@ impl DiagnosticsServer {
                             .map(String::as_str)
                             .collect::<Vec<_>>()
                             .join(", ");
-                        // Stuck iff every owing server is process-state-terminal
-                        // (respawn-dead / init-hung). A single still-alive owner
-                        // that merely returned nothing keeps the softer "returned
-                        // no result" wording — "stuck" is a claim about the
-                        // process, made only on the evidence (misc 160 leg 1).
-                        let stuck = !servers.is_empty()
-                            && servers.iter().all(|s| stuck_servers.contains(s));
+                        // The file's cause is the SOFTEST among its owing
+                        // servers (`min`): "stuck" / "benched" are claims
+                        // about a process, made only when every owing server
+                        // earns them — a single still-alive owner that merely
+                        // returned nothing keeps the softer "returned no
+                        // result" wording (misc 160 leg 1 / misc 167).
+                        let cause = servers
+                            .iter()
+                            .map(|s| {
+                                stuck_servers
+                                    .get(s)
+                                    .copied()
+                                    .unwrap_or(UnverifiedCause::Silent)
+                            })
+                            .min()
+                            .unwrap_or(UnverifiedCause::Silent);
                         unverified_files.push(UnverifiedEntry {
                             display,
                             root,
                             server,
-                            stuck,
+                            cause,
                         });
                     }
                 }
@@ -1089,11 +1154,13 @@ impl DiagnosticsServer {
     /// as-is — that is not an unavailability, and a respawn would not change it.
     ///
     /// Returns `true` when the server is **respawn-dead**: it died (terminal
-    /// lifecycle) with a non-empty unretrieved remainder and the one bounded
-    /// respawn could not revive it — process-state evidence the server is stuck,
-    /// so its `NoResults` files earn the `[unverified — <server> stuck]` wording
-    /// (misc 160 leg 1). Returns `false` for a clean run, an alive server, or a
-    /// respawn that recovered the whole remainder.
+    /// lifecycle) with a non-empty unretrieved remainder and the one bounded,
+    /// strike-gated revive could not bring it back this run — process-state
+    /// evidence the server is stuck, so its `NoResults` files earn the typed
+    /// unverified wording (`stuck; will retry on demand`, or the terminal
+    /// benched labels — misc 160 leg 1 / misc 167). Returns `false` for a
+    /// clean run, an alive server, or a revive that recovered the whole
+    /// remainder.
     async fn run_server_batch_with_recovery(
         &self,
         client_mutex: &Arc<Mutex<LspClient>>,
@@ -1128,10 +1195,11 @@ impl DiagnosticsServer {
             return true;
         };
 
-        // One bounded respawn + re-run of the remainder. Any file still
-        // unretrieved afterwards stays `NoResults` (degrade — no further
-        // attempts this run).
-        if let Some(fresh) = self.client_manager.respawn_diagnostic_server(&key).await {
+        // One bounded, strike-gated revive + re-run of the remainder (misc
+        // 167). Any file still unretrieved afterwards stays `NoResults`
+        // (degrade — no further attempts this run; the next demand retries,
+        // strikes permitting).
+        if let Some(fresh) = self.client_manager.revive_server(&key).await {
             self.run_server_batch(&fresh, &remainder, parent_id, feeds)
                 .await;
             // Respawn-dead iff any of the remainder is *still* unretrieved after
@@ -1393,6 +1461,9 @@ impl DiagnosticsServer {
         let server_version = client.server_version().map(str::to_string);
         let lang_id = client.language().to_string();
         let has_code_actions = client.supports_code_action();
+        // Strike-ledger credit target (misc 167): each file this retrieval
+        // records is one delivered diagnostic verdict — served work.
+        let served_key = client.server().key();
 
         let ctx = Arc::new(FeederContext {
             command: server_command,
@@ -1532,6 +1603,14 @@ impl DiagnosticsServer {
                     enclosing: enclosing_symbols.get(i).cloned().flatten(),
                     ctx: Arc::clone(&ctx),
                 });
+            }
+
+            // Served work pays the strike counter down (misc 167): one
+            // delivered per-file verdict (clean or dirty) is one completed
+            // request. Spawn/initialize and the eager probe earn nothing —
+            // only this demand-side delivery does.
+            if let Some(key) = &served_key {
+                self.client_manager.record_server_service(key);
             }
         }
     }
@@ -2403,14 +2482,28 @@ fn render_out_of_scope(entries: &[OutOfScopeEntry]) -> String {
     out
 }
 
-/// The trailing clause of an `[unverified — <server> …]` receipt line.
+/// The bracketed label of an unverified receipt line (without the brackets).
 ///
-/// `stuck` when process-state evidence types the owing server as terminally
-/// wedged (respawn-dead / init-hung, misc 160 leg 1) — the gate-escape wording,
-/// distinguishing a stuck process from a server that was alive and simply
-/// produced nothing.
-const fn unverified_reason(stuck: bool) -> &'static str {
-    if stuck { "stuck" } else { "returned no result" }
+/// One label per [`UnverifiedCause`]: the gate-escape wording distinguishes a
+/// stuck process from a server that was alive and simply produced nothing
+/// (misc 160 leg 1), and the strike ledger's terminal states carry the
+/// ticket's cause-distinguishing labels (misc 167) — `broken` (config /
+/// environment: fix the server) vs `unstable` (instability, not config).
+fn unverified_label(server: &str, cause: UnverifiedCause) -> String {
+    match cause {
+        UnverifiedCause::Silent => {
+            format!("unverified \u{2014} {server} returned no result")
+        }
+        UnverifiedCause::Stuck => {
+            format!("unverified \u{2014} {server} stuck; will retry on demand")
+        }
+        UnverifiedCause::BenchedBroken => {
+            format!("broken \u{2014} {server} never started")
+        }
+        UnverifiedCause::BenchedUnstable => {
+            format!("unstable \u{2014} {server} gave up after repeated crashes")
+        }
+    }
 }
 
 /// Formats the per-file receipt.
@@ -2455,7 +2548,8 @@ fn format_diagnostics(
 
     let mut root_diag: BTreeMap<&PathBuf, Vec<(&str, &[DiagEntry])>> = BTreeMap::new();
     let mut root_clean: BTreeMap<&PathBuf, Vec<&str>> = BTreeMap::new();
-    let mut root_unverified: BTreeMap<&PathBuf, Vec<(&str, &str, bool)>> = BTreeMap::new();
+    let mut root_unverified: BTreeMap<&PathBuf, Vec<(&str, &str, UnverifiedCause)>> =
+        BTreeMap::new();
     let mut root_uncovered: BTreeMap<&PathBuf, Vec<&str>> = BTreeMap::new();
 
     for df in diag_files {
@@ -2471,7 +2565,7 @@ fn format_diagnostics(
         root_unverified
             .entry(&ue.root)
             .or_default()
-            .push((&ue.display, &ue.server, ue.stuck));
+            .push((&ue.display, &ue.server, ue.cause));
     }
     for ue in uncovered {
         root_uncovered
@@ -2518,12 +2612,12 @@ fn format_diagnostics(
                 }
             }
             if let Some(unv_files) = root_unverified.get(root) {
-                for (display, server, stuck) in unv_files {
+                for (display, server, cause) in unv_files {
                     _ = writeln!(
                         output,
-                        "{} [unverified \u{2014} {server} {}]",
+                        "{} [{}]",
                         root.join(display).display(),
-                        unverified_reason(*stuck),
+                        unverified_label(server, *cause),
                     );
                 }
             }
@@ -2566,12 +2660,8 @@ fn format_diagnostics(
                     let plural = if n == 1 { "" } else { "s" };
                     _ = writeln!(output, "\t{n} file{plural} unverified");
                 } else {
-                    for (display, server, stuck) in unv_files {
-                        _ = writeln!(
-                            output,
-                            "\t{display} [unverified \u{2014} {server} {}]",
-                            unverified_reason(*stuck),
-                        );
+                    for (display, server, cause) in unv_files {
+                        _ = writeln!(output, "\t{display} [{}]", unverified_label(server, *cause));
                     }
                 }
             }
@@ -2966,23 +3056,28 @@ mod tests {
 
     /// Build a `returned no result` [`UnverifiedEntry`] (test ergonomics).
     fn ue(display: &str, root: &str, server: &str) -> UnverifiedEntry {
-        UnverifiedEntry {
-            display: display.to_string(),
-            root: PathBuf::from(root),
-            server: server.to_string(),
-            stuck: false,
-        }
+        ue_cause(display, root, server, UnverifiedCause::Silent)
     }
 
     /// Build a **stuck** [`UnverifiedEntry`] — the gate-escape wording (misc 160
     /// leg 1): process-state evidence types the owing server as terminally
-    /// wedged.
+    /// wedged, strikes remaining (misc 167).
     fn ue_stuck(display: &str, root: &str, server: &str) -> UnverifiedEntry {
+        ue_cause(display, root, server, UnverifiedCause::Stuck)
+    }
+
+    /// Build an [`UnverifiedEntry`] with an explicit cause (misc 167).
+    fn ue_cause(
+        display: &str,
+        root: &str,
+        server: &str,
+        cause: UnverifiedCause,
+    ) -> UnverifiedEntry {
         UnverifiedEntry {
             display: display.to_string(),
             root: PathBuf::from(root),
             server: server.to_string(),
-            stuck: true,
+            cause,
         }
     }
 
@@ -3007,15 +3102,17 @@ mod tests {
     fn format_stuck_server_says_stuck_not_returned_no_result() {
         // The gate escape (misc 160 leg 1): a file whose owing server is
         // process-state-terminal (respawn-dead / init-hung) renders
-        // `[unverified — <server> stuck]`, distinguishing a wedged process from
-        // an alive-but-silent server. The banner still names it; the gate is
+        // `[unverified — <server> stuck; will retry on demand]` (misc 167 —
+        // the strike gate retries dead servers on demand, so "stuck" is no
+        // longer permanent), distinguishing a wedged process from an
+        // alive-but-silent server. The banner still names it; the gate is
         // still paid (the receipt returns non-empty).
         let unverified = vec![ue_stuck("file.rs", "/test", "rust-analyzer")];
         let output = format_diagnostics(&[], &[], &[], &unverified, false);
         assert_eq!(
             output.trim(),
             "unavailable: rust-analyzer\n\
-             /test/file.rs [unverified \u{2014} rust-analyzer stuck]",
+             /test/file.rs [unverified \u{2014} rust-analyzer stuck; will retry on demand]",
             "output: {output}"
         );
         assert!(
@@ -3035,13 +3132,67 @@ mod tests {
         ];
         let output = format_diagnostics(&[], &[], &[], &unverified, false);
         assert!(
-            output.contains("\tsrc/a.rs [unverified \u{2014} rust-analyzer stuck]"),
+            output.contains(
+                "\tsrc/a.rs [unverified \u{2014} rust-analyzer stuck; will retry on demand]"
+            ),
             "output: {output}"
         );
         assert!(
             output.contains("\tsrc/b.rs [unverified \u{2014} gopls returned no result]"),
             "output: {output}"
         );
+    }
+
+    #[test]
+    fn format_benched_broken_renders_ticket_label() {
+        // Struck out with zero successes ever (misc 167): the terminal label
+        // names the cause — config/environment, fix the server. The banner
+        // still opens the receipt and the gate is still paid.
+        let unverified = vec![ue_cause(
+            "file.rs",
+            "/test",
+            "rust-analyzer",
+            UnverifiedCause::BenchedBroken,
+        )];
+        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        assert_eq!(
+            output.trim(),
+            "unavailable: rust-analyzer\n\
+             /test/file.rs [broken \u{2014} rust-analyzer never started]",
+            "output: {output}"
+        );
+    }
+
+    #[test]
+    fn format_benched_unstable_renders_ticket_label() {
+        // Struck out with prior successes (misc 167): instability, not config.
+        let unverified = vec![ue_cause(
+            "file.rs",
+            "/test",
+            "rust-analyzer",
+            UnverifiedCause::BenchedUnstable,
+        )];
+        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        assert_eq!(
+            output.trim(),
+            "unavailable: rust-analyzer\n\
+             /test/file.rs [unstable \u{2014} rust-analyzer gave up after repeated crashes]",
+            "output: {output}"
+        );
+    }
+
+    #[test]
+    fn unverified_cause_min_keeps_the_softest_claim() {
+        // A file owed by several servers renders the softest cause among them:
+        // one alive-but-silent owner keeps the `Silent` wording even when the
+        // other is benched (misc 160 leg 1 / misc 167).
+        assert!(UnverifiedCause::Silent < UnverifiedCause::Stuck);
+        assert!(UnverifiedCause::Stuck < UnverifiedCause::BenchedBroken);
+        assert!(UnverifiedCause::BenchedBroken < UnverifiedCause::BenchedUnstable);
+        let softest = [UnverifiedCause::BenchedUnstable, UnverifiedCause::Silent]
+            .into_iter()
+            .min();
+        assert_eq!(softest, Some(UnverifiedCause::Silent));
     }
 
     #[test]

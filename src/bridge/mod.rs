@@ -219,6 +219,12 @@ pub(super) async fn ensure_symbols(
         let Ok(response) = server.lock().await.document_symbols(&uri).await else {
             continue;
         };
+        // A delivered symbol response is served work — strike-ledger credit
+        // (misc 167).
+        let served_key = server.lock().await.server().key();
+        if let Some(key) = &served_key {
+            client_manager.record_server_service(key);
+        }
         if let Ok(idx) = idx_arc.lock() {
             let _ = idx.populate_from_document_symbols(path, &response);
         }

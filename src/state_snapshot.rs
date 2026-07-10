@@ -57,7 +57,9 @@ use crate::lsp::{InstanceKey, ServerLifecycle};
 ///   defaults the field to an empty list. Later additive additions on the same
 ///   schema (tui-rework 14): [`SessionStatus::Working`] (the gate-paid status),
 ///   plus per-subagent `status`/`last_seen` on [`Subagent`] — each defaults on a
-///   reader predating it, so no schema bump is warranted.
+///   reader predating it, so no schema bump is warranted. Misc 167 adds
+///   server-entry `strikes`/`benched` (the demand-revive strike ledger) the
+///   same way: serde-additive, defaulting to `0`/`None` on older readers.
 const SCHEMA: u32 = 3;
 
 /// Default coalescing window for non-urgent flushes.
@@ -234,6 +236,27 @@ pub struct ServerEntry {
     /// and cleared together on recovery. `None` while covering normally.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,
+    /// The demand-driven revive gate's strike count (misc 167): failure
+    /// observations (`+1`) minus served work (`−1`), clamped to `[0, 3]`.
+    /// Carried across re-registration like `respawns`, so the board mirrors
+    /// the daemon ledger rather than rebirthing at zero.
+    #[serde(skip_serializing_if = "u8_is_zero")]
+    pub strikes: u8,
+    /// Set when the server struck out (three strikes): the terminal cause —
+    /// `"never started"` (no request ever served) or `"unstable"` (served,
+    /// then crashed repeatedly). `None` while demand revives are permitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub benched: Option<String>,
+}
+
+/// `skip_serializing_if` helper: keep a zero strike count out of the JSON so
+/// pre-misc-167 snapshots and healthy entries render byte-identically.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes by reference"
+)]
+const fn u8_is_zero(n: &u8) -> bool {
+    *n == 0
 }
 
 /// Host CLI client identity for a session board entry.
@@ -607,12 +630,18 @@ impl SnapshotState {
     /// rebirths as a healthy young one (the crash-loop blindspot).
     fn register_server(&mut self, key: &InstanceKey, started_at: &str) {
         let id = server_id(key);
-        let (respawns, last_died_at) = self.servers.get(&id).map_or((0, None), |prev| {
-            (
-                prev.respawns.saturating_add(1),
-                prev.died_at.clone().or_else(|| prev.last_died_at.clone()),
-            )
-        });
+        let (respawns, last_died_at, strikes, benched) =
+            self.servers.get(&id).map_or((0, None, 0, None), |prev| {
+                (
+                    prev.respawns.saturating_add(1),
+                    prev.died_at.clone().or_else(|| prev.last_died_at.clone()),
+                    // The strike ledger survives respawn (misc 167): mirror
+                    // it forward like the crash history rather than
+                    // rebirthing the entry at zero.
+                    prev.strikes,
+                    prev.benched.clone(),
+                )
+            });
         let entry = ServerEntry {
             id: id.clone(),
             language: key.language_id.clone(),
@@ -633,6 +662,8 @@ impl SnapshotState {
             last_died_at,
             degraded_since: None,
             degraded_reason: None,
+            strikes,
+            benched,
         };
         self.servers.insert(id, entry);
     }
@@ -698,8 +729,20 @@ impl SnapshotState {
                 last_died_at: None,
                 degraded_since: None,
                 degraded_reason: None,
+                strikes: 0,
+                benched: None,
             }
         })
+    }
+
+    /// Mirrors an instance's strike-ledger standing (misc 167). Returns
+    /// whether anything changed.
+    fn update_strikes(&mut self, key: &InstanceKey, strikes: u8, benched: Option<&str>) -> bool {
+        let entry = self.ensure_entry(key);
+        let changed = entry.strikes != strikes || entry.benched.as_deref() != benched;
+        entry.strikes = strikes;
+        entry.benched = benched.map(str::to_string);
+        changed
     }
 
     /// Applies a lifecycle transition. Resets `state_since` only when the
@@ -1106,6 +1149,20 @@ impl SnapshotWriter {
         self.inner.notify.notify_one();
     }
 
+    /// Mirrors an instance's strike-ledger standing (misc 167, coalesced
+    /// flush): the current strike count and — once benched — the terminal
+    /// cause label the health surfaces render. Creates the entry when a
+    /// spawn-fail-class instance never registered.
+    pub fn update_strikes(&self, key: &InstanceKey, strikes: u8, benched: Option<&str>) {
+        {
+            let mut state = self.inner.lock_state();
+            if state.update_strikes(key, strikes, benched) {
+                state.dirty = true;
+            }
+        }
+        self.inner.notify.notify_one();
+    }
+
     /// Clears a server's degradation state on recovery (coalesced flush).
     /// No-op when the entry is absent or was not degraded.
     pub fn clear_degraded(&self, id: &str) {
@@ -1495,6 +1552,8 @@ mod tests {
                     last_died_at: None,
                     degraded_since: None,
                     degraded_reason: None,
+                    strikes: 0,
+                    benched: None,
                 },
             );
         }
@@ -1507,6 +1566,34 @@ mod tests {
         assert_eq!(dead_count, MAX_DEAD_SERVERS);
         // The very first dead server (oldest died_at) is gone.
         assert!(!state.servers.contains_key("dead-0@/p"));
+    }
+
+    #[test]
+    fn update_strikes_mirrors_ledger_and_survives_respawn() {
+        // misc 167: the board mirrors the strike ledger, carries it across
+        // re-registration (like `respawns`), and reports no change on a
+        // same-value write (no dirty churn).
+        let mut state = fresh_state();
+        let key = root_key("ra", "/p");
+        state.register_server(&key, "t0");
+
+        assert!(state.update_strikes(&key, 2, None));
+        assert_eq!(state.servers[&server_id(&key)].strikes, 2);
+        assert!(state.servers[&server_id(&key)].benched.is_none());
+
+        // A respawn (re-registration) carries the standing forward.
+        state.register_server(&key, "t1");
+        assert_eq!(state.servers[&server_id(&key)].strikes, 2);
+
+        // The benched label lands with the cap.
+        assert!(state.update_strikes(&key, 3, Some("unstable")));
+        assert_eq!(
+            state.servers[&server_id(&key)].benched.as_deref(),
+            Some("unstable"),
+        );
+
+        // Idempotent write: nothing changed, nothing reported.
+        assert!(!state.update_strikes(&key, 3, Some("unstable")));
     }
 
     #[test]

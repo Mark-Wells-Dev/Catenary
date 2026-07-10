@@ -61,6 +61,13 @@ pub struct LspClient {
     /// The root from `initialize` is NOT included here (it's implicit).
     /// Dropped with the instance on shutdown.
     added_workspace_folders: HashSet<PathBuf>,
+    /// Whether this instance's death has been charged to the manager's strike
+    /// ledger (misc 167). One instance is one death: the demand-side revive
+    /// charges `+1` the first time it observes the instance dead and sets
+    /// this, so a tombstone that stays on the map (a benched server) is never
+    /// charged twice. The spawn path sets it directly for an
+    /// `initialize`-failure tombstone, which is charged at spawn time.
+    death_strike_counted: bool,
 }
 
 impl LspClient {
@@ -203,9 +210,22 @@ impl LspClient {
                 cancel: CancellationToken::new(),
                 open_documents: HashMap::new(),
                 added_workspace_folders: HashSet::new(),
+                death_strike_counted: false,
             },
             child_stderr,
         ))
+    }
+
+    /// Whether this instance's death has been charged to the strike ledger
+    /// (misc 167). See the field docs.
+    #[must_use]
+    pub const fn death_strike_counted(&self) -> bool {
+        self.death_strike_counted
+    }
+
+    /// Marks this instance's death as charged to the strike ledger (misc 167).
+    pub const fn mark_death_strike_counted(&mut self) {
+        self.death_strike_counted = true;
     }
 
     /// Spawns a background task that reads stderr line-by-line and emits
