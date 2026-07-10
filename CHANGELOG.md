@@ -9,6 +9,32 @@ Per-release binaries and auto-generated commit notes are published on the
 file records the curated highlights and, for major releases, the migration
 guidance.
 
+## [2.0.2] - 2026-07-10
+
+### Fixed
+
+- **Language servers can no longer outlive their root.** A request racing a
+  root's idle expiry could respawn the root's full server set just after
+  teardown; the orphaned set — invisible to every subsequent root sync — then
+  sat resident (a rust-analyzer holds gigabytes) until the daemon restarted.
+  Two guards close it: an on-demand spawn is refused when no installed root
+  covers its scope, and every root sync sweeps any per-root instance whose
+  scope no current root covers — including instances scoped under a removed
+  ancestor root, a second leak the old exact-match diff missed.
+- **`catenary stop` tells the truth about live sessions.** The post-stop
+  message warned that connected sessions must reconnect via `/mcp`; in fact
+  bridges respawn the daemon and replay their sessions on their own. The note
+  now says so (the one exception — a session whose binary was swapped under
+  it — is named).
+
+### Added
+
+- **`.sha256` sidecars beside every release asset.** Starting with this
+  release, every published binary carries a sidecar checksum file, so
+  downloads are verifiable without digging digests out of the GitHub API.
+- **`make install`** — the from-source channel as one word: a locked
+  `cargo install --path .` plus a version report and the daemon-bounce hint.
+
 ## [2.0.1] - 2026-07-10
 
 Release plumbing for 2.0.0, same day.
