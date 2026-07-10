@@ -4,7 +4,6 @@
 //! Transport layer: process lifecycle, reader loop, request/response correlation.
 
 use anyhow::{Context, Result, anyhow};
-use bytes::BytesMut;
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -12,7 +11,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdin, Command};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::protocol::category::{lsp_category, lsp_category_level, window_message_level};
@@ -189,17 +188,19 @@ pub struct Connection {
     _logging: LoggingServer,
     server_name: String,
     monitor: std::sync::Mutex<Option<catenary_proc::ProcessMonitor>>,
-    /// Write end of the stdout pipe, for injecting drain sentinels.
+    /// Barrier channel to the reader loop, for [`Self::drain`].
     ///
-    /// Created at spawn time by `os_pipe::pipe()` and `try_clone()`.
-    /// One copy goes to the child as its stdout; this copy stays with
-    /// [`Connection`] so [`Self::drain`] can write a sentinel response
-    /// that the reader loop picks up in FIFO order.
+    /// Each message is the ack sender for one drain request: the reader
+    /// loop, on receipt, consumes the stdout pipe until it is momentarily
+    /// empty (dispatching every complete frame) and then acks.
     ///
-    /// Wrapped in `Arc` so the child-exit task can close it when the
-    /// server dies — necessary because the extra write fd would
-    /// otherwise prevent EOF detection on the reader loop.
-    drain_writer: Arc<std::sync::Mutex<Option<os_pipe::PipeWriter>>>,
+    /// This replaces the sentinel design that caused the bug-95 incident:
+    /// drain used to WRITE a synthetic response frame into the child's
+    /// stdout pipe through a kept write-end clone. A pipe with two writers
+    /// has no frame atomicity — the sentinel could land between a server
+    /// frame's header write and body write and corrupt both messages. The
+    /// server process is now the pipe's only writer.
+    drain_tx: mpsc::UnboundedSender<oneshot::Sender<()>>,
     /// Signals the child-exit task to kill the server process.
     /// Fired in [`Drop`] so the task can call [`Child::start_kill`].
     kill_token: CancellationToken,
@@ -230,13 +231,13 @@ impl Connection {
         server_name: &str,
         scope_root: &str,
     ) -> Result<(Self, Option<ChildStderr>)> {
-        // Create the stdout pipe ourselves so we can keep the write end
-        // for drain sentinel injection. The child gets one copy of the
-        // write end (as its stdout); we keep the other for `drain()`.
+        // Create the stdout pipe ourselves (os_pipe on all platforms; the
+        // async conversion differs per OS — see `to_async_reader`). The
+        // child's stdout fd is the pipe's ONLY writer: the daemon must
+        // never write into the reader's pipe (bug 95 — an injected frame
+        // can land between a server frame's header and body writes and
+        // corrupt the stream).
         let (pipe_reader, pipe_writer) = os_pipe::pipe().context("Failed to create stdout pipe")?;
-        let drain_writer = pipe_writer
-            .try_clone()
-            .context("Failed to clone stdout pipe writer")?;
 
         let mut cmd = Command::new(program);
         cmd.args(args)
@@ -279,6 +280,8 @@ impl Connection {
 
         let weak_server = Arc::downgrade(server);
 
+        let (drain_tx, drain_rx) = mpsc::unbounded_channel();
+
         let reader_handle = tokio::spawn(Self::reader_loop(
             stdin.clone(),
             pending.clone(),
@@ -288,16 +291,15 @@ impl Connection {
             logging.clone(),
             server_name.to_string(),
             scope_root.to_string(),
+            drain_rx,
         ));
 
-        let drain_writer = Arc::new(std::sync::Mutex::new(Some(drain_writer)));
-
         // Background task: owns the Child handle. Waits for either
-        // natural exit or a kill signal (from Drop), then closes the
-        // drain write end so the reader loop sees EOF.
+        // natural exit or a kill signal (from Drop). The child's stdout
+        // fd is the pipe's only write end, so its exit is the reader
+        // loop's EOF — no daemon-side fd to close.
         let kill_token = CancellationToken::new();
         {
-            let drain_for_close = drain_writer.clone();
             let kill = kill_token.clone();
             let exit_server_name = server_name.to_string();
             let exit_scope_root = scope_root.to_string();
@@ -333,9 +335,6 @@ impl Connection {
                         let _ = child.start_kill();
                     }
                 }
-                *drain_for_close
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             });
         }
 
@@ -351,7 +350,7 @@ impl Connection {
                 _logging: logging,
                 server_name: server_name.to_string(),
                 monitor: std::sync::Mutex::new(monitor),
-                drain_writer,
+                drain_tx,
                 kill_token,
                 _reader_handle: reader_handle,
             },
@@ -575,65 +574,33 @@ impl Connection {
     /// Ensures all bytes currently in the stdout pipe have been read
     /// and dispatched by the reader loop.
     ///
-    /// Writes a synthetic JSON-RPC response into the pipe's write end
-    /// (kept from spawn time) with a unique request ID. A matching
-    /// oneshot is registered in `pending` beforehand. Because the pipe
-    /// is FIFO, the reader loop must process every preceding byte —
-    /// including any final `publishDiagnostics` notifications from the
-    /// server — before it reaches the sentinel.
+    /// Sends a barrier request over the reader loop's control channel.
+    /// The reader consumes and dispatches complete frames until a read
+    /// poll reports the pipe momentarily empty, then acks. Pipe writes
+    /// are visible to the read end as soon as `write` returns, so every
+    /// byte the server wrote before this call — including any final
+    /// `publishDiagnostics` — has been processed when the ack arrives.
+    /// A trailing *partial* frame (server mid-write at barrier time)
+    /// stays buffered: by definition it was not fully written before
+    /// the call.
     ///
-    /// Returns `Ok(())` when the sentinel has been consumed. Fails if
-    /// the pipe write end is unavailable (server already dropped) or the
-    /// reader loop has exited.
+    /// History (bug 95): drain used to WRITE a sentinel frame into the
+    /// child's stdout pipe through a kept write-end clone. Two writers
+    /// on one pipe have no frame atomicity — the sentinel could land
+    /// between a server frame's header write and body write, corrupting
+    /// both messages and stranding the caller (the captured incident).
+    /// Nothing may ever write into the reader's pipe.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the reader loop has exited.
     pub async fn drain(&self) -> Result<()> {
-        let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
-
-        // Register the oneshot BEFORE writing the sentinel so the
-        // reader loop finds the entry when it processes the response.
         let (tx, rx) = oneshot::channel();
-        {
-            let mut pending = self.pending.lock().await;
-            pending.insert(
-                id.clone(),
-                PendingRequest {
-                    method: "drain".to_string(),
-                    parent_id: None,
-                    sender: tx,
-                },
-            );
-        }
-
-        let response = super::protocol::ResponseMessage {
-            jsonrpc: "2.0".to_string(),
-            id: Some(id.clone()),
-            result: Some(serde_json::Value::Null),
-            error: None,
-        };
-        let body = serde_json::to_string(&response)?;
-        let msg = format!("Content-Length: {}\r\n\r\n{body}", body.len());
-
-        // Write the sentinel. The payload is <200 bytes into a 64 KB
-        // kernel pipe buffer — the write syscall cannot block. The
-        // std::sync::Mutex guard is dropped before the await below.
-        let write_ok = {
-            use std::io::Write;
-            let mut guard = self
-                .drain_writer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.as_mut().is_some_and(|writer| {
-                writer.write_all(msg.as_bytes()).is_ok() && writer.flush().is_ok()
-            })
-        };
-
-        if !write_ok {
-            self.pending.lock().await.remove(&id);
-            return Err(anyhow!("drain: stdout pipe write end unavailable"));
-        }
-
-        // Wait for the reader loop to process the sentinel.
+        self.drain_tx
+            .send(tx)
+            .map_err(|_| anyhow!("drain: reader loop closed"))?;
         rx.await
-            .map_err(|_| anyhow!("drain: reader loop closed before processing sentinel"))?;
+            .map_err(|_| anyhow!("drain: reader loop closed before processing barrier"))?;
         Ok(())
     }
 
@@ -661,8 +628,14 @@ impl Connection {
     }
 
     /// Background task that reads LSP messages and routes them.
+    ///
+    /// Framing (buffer, parse/resync, byte-conservation audit) lives in
+    /// [`protocol::FramePump`] — the pump the fragmentation property tests
+    /// drive directly, so the tested code IS the production code (bug 95).
+    /// This loop owns only the I/O: read chunks, feed the pump, dispatch
+    /// each framing-valid body, and serve [`Connection::drain`] barrier
+    /// requests from the control channel.
     #[allow(
-        clippy::too_many_lines,
         clippy::too_many_arguments,
         reason = "Internal task requires sequential message parsing and dispatch"
     )]
@@ -675,6 +648,7 @@ impl Connection {
         _logging: LoggingServer,
         server_name: String,
         scope_root: String,
+        mut drain_rx: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
     ) {
         let scope_root_opt = if scope_root.is_empty() {
             None
@@ -683,240 +657,94 @@ impl Connection {
         };
         let scope_root_ref = scope_root_opt.as_deref();
         let mut reader = BufReader::new(stdout);
-        let mut buffer = BytesMut::with_capacity(8192);
+        let mut pump = protocol::FramePump::new(server_name.clone(), scope_root_opt.clone());
+        let mut temp = [0u8; 4096];
+        let mut drain_open = true;
 
-        loop {
-            // Read more data into buffer
-            let mut temp = [0u8; 4096];
-            match reader.read(&mut temp).await {
-                Ok(0) => {
-                    debug!("LSP stdout closed");
-                    break;
+        'outer: loop {
+            tokio::select! {
+                cmd = drain_rx.recv(), if drain_open => {
+                    let Some(ack) = cmd else {
+                        // Every Connection sender is gone — stop polling the
+                        // closed channel, keep serving the pipe until EOF.
+                        drain_open = false;
+                        continue;
+                    };
+                    // Barrier: consume until the pipe is momentarily empty,
+                    // dispatching every complete frame, then ack. All bytes
+                    // written before the barrier request are already visible
+                    // to the read end, so they are processed before the ack.
+                    let mut ack = Some(ack);
+                    loop {
+                        match read_now(&mut reader, &mut temp).await {
+                            None => break, // pipe momentarily empty
+                            Some(Ok(0)) => {
+                                if let Some(a) = ack.take() {
+                                    let _ = a.send(());
+                                }
+                                debug!("LSP stdout closed");
+                                break 'outer;
+                            }
+                            Some(Ok(n)) => {
+                                pump_and_dispatch(
+                                    &mut pump,
+                                    &temp[..n],
+                                    &stdin,
+                                    &pending,
+                                    &server,
+                                    &server_name,
+                                    scope_root_ref,
+                                )
+                                .await;
+                            }
+                            Some(Err(e)) => {
+                                // Drop the ack unfired: the caller gets an
+                                // error, not a false barrier.
+                                drop(ack.take());
+                                info!(
+                                    source = "lsp.lifecycle",
+                                    server = server_name.as_str(),
+                                    scope_root = scope_root_ref,
+                                    "Error reading from LSP stdout: {e}",
+                                );
+                                break 'outer;
+                            }
+                        }
+                    }
+                    if let Some(a) = ack.take() {
+                        let _ = a.send(());
+                    }
                 }
-                Ok(n) => {
-                    buffer.extend_from_slice(&temp[..n]);
-                }
-                Err(e) => {
-                    info!(
-                        source = "lsp.lifecycle",
-                        server = server_name.as_str(),
-                        scope_root = scope_root_ref,
-                        "Error reading from LSP stdout: {e}",
-                    );
-                    break;
+                result = reader.read(&mut temp) => {
+                    match result {
+                        Ok(0) => {
+                            debug!("LSP stdout closed");
+                            break;
+                        }
+                        Ok(n) => {
+                            pump_and_dispatch(
+                                &mut pump,
+                                &temp[..n],
+                                &stdin,
+                                &pending,
+                                &server,
+                                &server_name,
+                                scope_root_ref,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            info!(
+                                source = "lsp.lifecycle",
+                                server = server_name.as_str(),
+                                scope_root = scope_root_ref,
+                                "Error reading from LSP stdout: {e}",
+                            );
+                            break;
+                        }
+                    }
                 }
             }
-
-            // Try to parse complete messages
-            loop {
-                match protocol::try_parse_message(&mut buffer) {
-                    Ok(None) => break, // Need more data
-                    Err(e) => {
-                        let dump_len = buffer.len().min(128);
-                        warn!(
-                            server = server_name.as_str(),
-                            source = "lsp.protocol",
-                            scope_root = scope_root_ref,
-                            "malformed LSP message from {server_name}, \
-                             resynchronizing: {e}"
-                        );
-                        debug!(
-                            server = server_name.as_str(),
-                            buffer_len = buffer.len(),
-                            "buffer head (hex): {:02x?}",
-                            &buffer[..dump_len]
-                        );
-                        protocol::resync_to_next_message(&mut buffer);
-                    }
-                    Ok(Some(message_str)) => {
-                        let value: serde_json::Value = match serde_json::from_str(&message_str) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                // A framing-valid message whose body is not JSON
-                                // is DROPPED — and a dropped frame can strand a
-                                // pipeline waiting on a response (bug 95). Make
-                                // it a health finding, not a silent debug line.
-                                let preview: String = message_str.chars().take(96).collect();
-                                warn!(
-                                    server = server_name.as_str(),
-                                    source = crate::source::Source::LspDispatch.as_str(),
-                                    scope_root = scope_root_ref,
-                                    byte_len = message_str.len(),
-                                    body_preview = preview.as_str(),
-                                    "dropping framing-valid but non-JSON LSP \
-                                     message from {server_name}: {e}"
-                                );
-                                continue;
-                            }
-                        };
-
-                        // Upgrade weak reference — if LspServer is gone, exit
-                        let Some(server) = server.upgrade() else {
-                            debug!("LspServer dropped, reader loop exiting");
-                            break;
-                        };
-
-                        let sr = scope_root_str(&server);
-                        let sr_ref = sr.as_deref();
-
-                        // Check message type
-                        if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
-                            // Request or Notification
-                            if let Some(id) = value.get("id") {
-                                // Server Request — always debug (server-initiated plumbing)
-                                debug!("Received server request: {} (id: {})", method, id);
-                                let exchange_id = uuid::Uuid::new_v4().to_string();
-                                emit_lsp_event(
-                                    tracing::Level::DEBUG,
-                                    &server_name,
-                                    method,
-                                    Some(&exchange_id),
-                                    sr_ref,
-                                    None,
-                                    &value.to_string(),
-                                    "incoming server request",
-                                );
-
-                                let request_id = serde_json::from_value(id.clone())
-                                    .unwrap_or(RequestId::Number(0));
-
-                                let params =
-                                    value.get("params").unwrap_or(&serde_json::Value::Null);
-
-                                let response = match server.on_request(method, params) {
-                                    Ok(result) => ResponseMessage {
-                                        jsonrpc: "2.0".to_string(),
-                                        id: Some(request_id),
-                                        result: Some(result),
-                                        error: None,
-                                    },
-                                    Err(e) => ResponseMessage {
-                                        jsonrpc: "2.0".to_string(),
-                                        id: Some(request_id),
-                                        result: None,
-                                        error: Some(ResponseError {
-                                            code: e.code,
-                                            message: e.message,
-                                            data: None,
-                                        }),
-                                    },
-                                };
-
-                                // Log outbound response (same level as request)
-                                if let Ok(response_json) = serde_json::to_value(&response) {
-                                    emit_lsp_event(
-                                        tracing::Level::DEBUG,
-                                        &server_name,
-                                        method,
-                                        Some(&exchange_id),
-                                        sr_ref,
-                                        None,
-                                        &response_json.to_string(),
-                                        "outgoing server response",
-                                    );
-                                }
-
-                                if let Ok(body) = serde_json::to_string(&response) {
-                                    let header = format!("Content-Length: {}\r\n\r\n", body.len());
-                                    let mut stdin_guard = stdin.lock().await;
-                                    if let Err(e) = stdin_guard.write_all(header.as_bytes()).await {
-                                        debug!("Failed to write response header: {}", e);
-                                    } else if let Err(e) =
-                                        stdin_guard.write_all(body.as_bytes()).await
-                                    {
-                                        debug!("Failed to write response body: {}", e);
-                                    } else if let Err(e) = stdin_guard.flush().await {
-                                        debug!("Failed to flush response: {}", e);
-                                    }
-                                }
-                            } else {
-                                // Notification — level and source determined by method.
-                                let (notif_level, source) = match method {
-                                    // Server-forwarded window messages carry the
-                                    // `lsp.logging` source so the notification sinks
-                                    // exclude them by origin (misc 125): server chatter
-                                    // is firehose-only, never promoted to the user
-                                    // queue, regardless of mapped severity. logMessage
-                                    // stays at info; showMessage keeps its type-mapped
-                                    // level so the firehose/TUI record its true severity.
-                                    "window/logMessage" => (
-                                        tracing::Level::INFO,
-                                        Some(crate::source::Source::LspLogging.as_str()),
-                                    ),
-                                    "window/showMessage" => {
-                                        let msg_type = value
-                                            .get("params")
-                                            .and_then(|p| p.get("type"))
-                                            .and_then(serde_json::Value::as_u64);
-                                        (
-                                            window_message_level(msg_type),
-                                            Some(crate::source::Source::LspLogging.as_str()),
-                                        )
-                                    }
-                                    _ => (lsp_category_level(lsp_category(method)), None),
-                                };
-                                let msg = match method {
-                                    "window/logMessage" | "window/showMessage" => {
-                                        let text = value
-                                            .get("params")
-                                            .and_then(|p| p.get("message"))
-                                            .and_then(serde_json::Value::as_str)
-                                            .unwrap_or("(no message)");
-                                        format!("{server_name}: {text}")
-                                    }
-                                    _ => format!("{server_name}: {method}"),
-                                };
-                                if !suppresses_firehose(method, &value) {
-                                    emit_lsp_event(
-                                        notif_level,
-                                        &server_name,
-                                        method,
-                                        None,
-                                        sr_ref,
-                                        source,
-                                        &value.to_string(),
-                                        &msg,
-                                    );
-                                }
-                                let params =
-                                    value.get("params").unwrap_or(&serde_json::Value::Null);
-                                server.on_notification(method, params);
-                            }
-                        } else if value.get("id").is_some() {
-                            // Response — match the level of the outgoing request
-                            if let Ok(response) =
-                                serde_json::from_value::<ResponseMessage>(value.clone())
-                                && let Some(id) = &response.id
-                            {
-                                let mut pending = pending.lock().await;
-                                if let Some(req) = pending.remove(id) {
-                                    // Drain sentinels are internal markers, not
-                                    // LSP traffic — skip protocol logging.
-                                    if req.method != "drain" {
-                                        let resp_level =
-                                            lsp_category_level(lsp_category(&req.method));
-                                        emit_lsp_event(
-                                            resp_level,
-                                            &server_name,
-                                            &req.method,
-                                            req.parent_id.as_deref(),
-                                            sr_ref,
-                                            None,
-                                            &value.to_string(),
-                                            "incoming response",
-                                        );
-                                    }
-                                    let _ = req.sender.send(response);
-                                } else {
-                                    debug!("Received response for unknown request id: {:?}", id);
-                                }
-                            }
-                        } else {
-                            debug!("Unknown message format: {}", message_str);
-                        }
-                    } // Ok(Some)
-                } // match
-            } // loop
         }
 
         // Mark server as dead and trigger shutdown cleanup
@@ -933,15 +761,240 @@ impl Connection {
     }
 }
 
+/// Feeds one read chunk to the framing pump and dispatches every complete
+/// frame it yields, stopping early if the [`LspServer`] is gone.
+async fn pump_and_dispatch(
+    pump: &mut protocol::FramePump,
+    chunk: &[u8],
+    stdin: &Arc<Mutex<ChildStdin>>,
+    pending: &Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
+    server: &Weak<LspServer>,
+    server_name: &str,
+    scope_root_ref: Option<&str>,
+) {
+    for body in pump.ingest(chunk) {
+        if !dispatch_message(stdin, pending, server, server_name, scope_root_ref, body).await {
+            break;
+        }
+    }
+}
+
+/// Polls one read without waiting: `None` when no data is immediately
+/// available (the pipe is momentarily empty), otherwise the read result.
+/// Used by the reader loop's drain barrier.
+async fn read_now<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+) -> Option<std::io::Result<usize>> {
+    std::future::poll_fn(|cx| {
+        let mut rb = tokio::io::ReadBuf::new(&mut buf[..]);
+        match std::pin::Pin::new(&mut *reader).poll_read(cx, &mut rb) {
+            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Some(Ok(rb.filled().len()))),
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Some(Err(e))),
+            std::task::Poll::Pending => std::task::Poll::Ready(None),
+        }
+    })
+    .await
+}
+
+/// Dispatches one framing-valid message body from the reader pump: JSON
+/// parse (loud-drop on failure — bug 95), then request / notification /
+/// response routing. Returns `false` when the [`LspServer`] is gone and the
+/// reader should stop dispatching.
+#[allow(
+    clippy::too_many_lines,
+    reason = "sequential message routing, extracted verbatim from reader_loop"
+)]
+async fn dispatch_message(
+    stdin: &Arc<Mutex<ChildStdin>>,
+    pending: &Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
+    server: &Weak<LspServer>,
+    server_name: &str,
+    scope_root_ref: Option<&str>,
+    message_str: String,
+) -> bool {
+    let value: serde_json::Value = match serde_json::from_str(&message_str) {
+        Ok(v) => v,
+        Err(e) => {
+            // A framing-valid message whose body is not JSON
+            // is DROPPED — and a dropped frame can strand a
+            // pipeline waiting on a response (bug 95). Make
+            // it a health finding, not a silent debug line.
+            let preview: String = message_str.chars().take(96).collect();
+            warn!(
+                server = server_name,
+                source = crate::source::Source::LspDispatch.as_str(),
+                scope_root = scope_root_ref,
+                byte_len = message_str.len(),
+                body_preview = preview.as_str(),
+                "dropping framing-valid but non-JSON LSP \
+                 message from {server_name}: {e}"
+            );
+            return true;
+        }
+    };
+
+    // Upgrade weak reference — if LspServer is gone, stop dispatching
+    let Some(server) = server.upgrade() else {
+        debug!("LspServer dropped, reader loop exiting");
+        return false;
+    };
+
+    let sr = scope_root_str(&server);
+    let sr_ref = sr.as_deref();
+
+    // Check message type
+    if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
+        // Request or Notification
+        if let Some(id) = value.get("id") {
+            // Server Request — always debug (server-initiated plumbing)
+            debug!("Received server request: {} (id: {})", method, id);
+            let exchange_id = uuid::Uuid::new_v4().to_string();
+            emit_lsp_event(
+                tracing::Level::DEBUG,
+                server_name,
+                method,
+                Some(&exchange_id),
+                sr_ref,
+                None,
+                &value.to_string(),
+                "incoming server request",
+            );
+
+            let request_id = serde_json::from_value(id.clone()).unwrap_or(RequestId::Number(0));
+
+            let params = value.get("params").unwrap_or(&serde_json::Value::Null);
+
+            let response = match server.on_request(method, params) {
+                Ok(result) => ResponseMessage {
+                    jsonrpc: "2.0".to_string(),
+                    id: Some(request_id),
+                    result: Some(result),
+                    error: None,
+                },
+                Err(e) => ResponseMessage {
+                    jsonrpc: "2.0".to_string(),
+                    id: Some(request_id),
+                    result: None,
+                    error: Some(ResponseError {
+                        code: e.code,
+                        message: e.message,
+                        data: None,
+                    }),
+                },
+            };
+
+            // Log outbound response (same level as request)
+            if let Ok(response_json) = serde_json::to_value(&response) {
+                emit_lsp_event(
+                    tracing::Level::DEBUG,
+                    server_name,
+                    method,
+                    Some(&exchange_id),
+                    sr_ref,
+                    None,
+                    &response_json.to_string(),
+                    "outgoing server response",
+                );
+            }
+
+            if let Ok(body) = serde_json::to_string(&response) {
+                let header = format!("Content-Length: {}\r\n\r\n", body.len());
+                let mut stdin_guard = stdin.lock().await;
+                if let Err(e) = stdin_guard.write_all(header.as_bytes()).await {
+                    debug!("Failed to write response header: {}", e);
+                } else if let Err(e) = stdin_guard.write_all(body.as_bytes()).await {
+                    debug!("Failed to write response body: {}", e);
+                } else if let Err(e) = stdin_guard.flush().await {
+                    debug!("Failed to flush response: {}", e);
+                }
+            }
+        } else {
+            // Notification — level and source determined by method.
+            let (notif_level, source) = match method {
+                // Server-forwarded window messages carry the
+                // `lsp.logging` source so the notification sinks
+                // exclude them by origin (misc 125): server chatter
+                // is firehose-only, never promoted to the user
+                // queue, regardless of mapped severity. logMessage
+                // stays at info; showMessage keeps its type-mapped
+                // level so the firehose/TUI record its true severity.
+                "window/logMessage" => (
+                    tracing::Level::INFO,
+                    Some(crate::source::Source::LspLogging.as_str()),
+                ),
+                "window/showMessage" => {
+                    let msg_type = value
+                        .get("params")
+                        .and_then(|p| p.get("type"))
+                        .and_then(serde_json::Value::as_u64);
+                    (
+                        window_message_level(msg_type),
+                        Some(crate::source::Source::LspLogging.as_str()),
+                    )
+                }
+                _ => (lsp_category_level(lsp_category(method)), None),
+            };
+            let msg = match method {
+                "window/logMessage" | "window/showMessage" => {
+                    let text = value
+                        .get("params")
+                        .and_then(|p| p.get("message"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("(no message)");
+                    format!("{server_name}: {text}")
+                }
+                _ => format!("{server_name}: {method}"),
+            };
+            if !suppresses_firehose(method, &value) {
+                emit_lsp_event(
+                    notif_level,
+                    server_name,
+                    method,
+                    None,
+                    sr_ref,
+                    source,
+                    &value.to_string(),
+                    &msg,
+                );
+            }
+            let params = value.get("params").unwrap_or(&serde_json::Value::Null);
+            server.on_notification(method, params);
+        }
+    } else if value.get("id").is_some() {
+        // Response — match the level of the outgoing request
+        if let Ok(response) = serde_json::from_value::<ResponseMessage>(value.clone())
+            && let Some(id) = &response.id
+        {
+            let mut pending = pending.lock().await;
+            if let Some(req) = pending.remove(id) {
+                let resp_level = lsp_category_level(lsp_category(&req.method));
+                emit_lsp_event(
+                    resp_level,
+                    server_name,
+                    &req.method,
+                    req.parent_id.as_deref(),
+                    sr_ref,
+                    None,
+                    &value.to_string(),
+                    "incoming response",
+                );
+                let _ = req.sender.send(response);
+            } else {
+                debug!("Received response for unknown request id: {:?}", id);
+            }
+        }
+    } else {
+        debug!("Unknown message format: {}", message_str);
+    }
+    true
+}
+
 impl Drop for Connection {
     fn drop(&mut self) {
-        // Close the drain write end so the reader loop sees EOF.
-        *self
-            .drain_writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         // Signal the child-exit task to kill the server process.
-        // The task calls `start_kill()` on the Child it owns.
+        // The task calls `start_kill()` on the Child it owns. The child's
+        // exit closes the pipe's only write end, so the reader sees EOF.
         self.kill_token.cancel();
         // Synchronous fallback: if the runtime is shutting down and
         // the task can't run, kill by PID directly.

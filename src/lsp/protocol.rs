@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use bytes::{Buf, BytesMut};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, error, warn};
 
 const fn default_null() -> serde_json::Value {
     serde_json::Value::Null
@@ -91,6 +92,20 @@ impl From<i64> for RequestId {
     }
 }
 
+/// A framing-valid message extracted from the wire buffer.
+///
+/// `wire_len` is the total number of buffer bytes the frame consumed
+/// (header block through body end), computed from the frame's own
+/// `Content-Length` arithmetic — the independent consumption claim the
+/// [`FramePump`] byte-conservation check verifies against.
+#[derive(Debug)]
+pub struct Frame {
+    /// The message body (header block stripped).
+    pub body: String,
+    /// Total wire bytes consumed: header block length + `Content-Length`.
+    pub wire_len: usize,
+}
+
 /// Helper to parse the Content-Length header and body from a buffer.
 ///
 /// # Errors
@@ -100,6 +115,17 @@ impl From<i64> for RequestId {
 /// - Content-Length is invalid or missing.
 /// - The body is not valid UTF-8.
 pub fn try_parse_message(buffer: &mut BytesMut) -> Result<Option<String>> {
+    Ok(try_parse_frame(buffer)?.map(|frame| frame.body))
+}
+
+/// Like [`try_parse_message`], but also reports the frame's wire length —
+/// the byte count the parse consumed, per its own header arithmetic.
+///
+/// # Errors
+///
+/// Same contract as [`try_parse_message`]; on error the buffer is left
+/// unchanged for [`resync_to_next_message`].
+pub fn try_parse_frame(buffer: &mut BytesMut) -> Result<Option<Frame>> {
     let mut headers_end = None;
     let mut content_length = None;
 
@@ -144,7 +170,10 @@ pub fn try_parse_message(buffer: &mut BytesMut) -> Result<Option<String>> {
                 .context("Failed to parse message body as UTF-8")?
                 .to_string();
             buffer.advance(total_len);
-            return Ok(Some(message));
+            return Ok(Some(Frame {
+                body: message,
+                wire_len: total_len,
+            }));
         }
     }
 
@@ -159,7 +188,10 @@ pub fn try_parse_message(buffer: &mut BytesMut) -> Result<Option<String>> {
 /// case-insensitive `Content-Length:` prefix. If found, the buffer is
 /// advanced to that position. If no valid header is found, the entire
 /// buffer is cleared.
-pub fn resync_to_next_message(buffer: &mut BytesMut) {
+///
+/// Returns the number of bytes discarded — the resync path's own
+/// consumption claim, verified by the [`FramePump`] conservation check.
+pub fn resync_to_next_message(buffer: &mut BytesMut) -> usize {
     let needle = b"content-length:";
     for i in 1..=buffer.len().saturating_sub(needle.len()) {
         if buffer[i..i + needle.len()]
@@ -168,11 +200,151 @@ pub fn resync_to_next_message(buffer: &mut BytesMut) {
             .all(|(a, b)| a.to_ascii_lowercase() == *b)
         {
             buffer.advance(i);
-            return;
+            return i;
         }
     }
     // No subsequent header found — discard everything.
+    let discarded = buffer.len();
     buffer.clear();
+    discarded
+}
+
+/// The reader's framing pump: buffer, parse/resync drain loop, and a
+/// byte-conservation audit.
+///
+/// Extracted from `reader_loop` so the *actual* production pump — not a
+/// test replica — sits under the fragmentation property tests (bug 95).
+///
+/// Every byte handed to [`ingest`](Self::ingest) must end up in exactly one
+/// of three places: consumed by a parsed frame (per the frame's own
+/// `Content-Length` arithmetic), consumed by resync (per the resync scan's
+/// own count), or still buffered awaiting more data. The pump cross-checks
+/// that identity — `total_bytes_read == total_bytes_accounted + buffered` —
+/// after every drain step. A divergence means the reader lost or duplicated
+/// bytes; it emits one `error!` (the interrupt is earned: a reader that
+/// drops bytes silently corrupts every downstream pipeline) with both
+/// counters, then resyncs and re-trues the accounting rather than continue
+/// silently.
+pub struct FramePump {
+    server_name: String,
+    scope_root: Option<String>,
+    buffer: BytesMut,
+    /// Total bytes ever appended by `ingest`.
+    total_read: u64,
+    /// Total bytes accounted as consumed (parsed frames + resync discards).
+    total_accounted: u64,
+    /// Conservation violations detected (each emitted one `error!`).
+    divergences: u64,
+}
+
+impl FramePump {
+    /// Creates a pump for one server connection. `server_name` and
+    /// `scope_root` tag the pump's tracing events.
+    #[must_use]
+    pub fn new(server_name: String, scope_root: Option<String>) -> Self {
+        Self {
+            server_name,
+            scope_root,
+            buffer: BytesMut::with_capacity(8192),
+            total_read: 0,
+            total_accounted: 0,
+            divergences: 0,
+        }
+    }
+
+    /// Appends one read chunk and drains every complete message.
+    ///
+    /// Returns the framing-valid message bodies in wire order. Framing
+    /// errors are logged and resynced past, exactly as the reader loop
+    /// always has; the byte-conservation identity is checked after every
+    /// drain step.
+    pub fn ingest(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.total_read += chunk.len() as u64;
+        self.buffer.extend_from_slice(chunk);
+
+        let mut out = Vec::new();
+        loop {
+            match try_parse_frame(&mut self.buffer) {
+                Ok(None) => break, // Need more data
+                Ok(Some(frame)) => {
+                    self.total_accounted += frame.wire_len as u64;
+                    out.push(frame.body);
+                }
+                Err(e) => {
+                    let dump_len = self.buffer.len().min(128);
+                    warn!(
+                        server = self.server_name.as_str(),
+                        source = "lsp.protocol",
+                        scope_root = self.scope_root.as_deref(),
+                        "malformed LSP message from {}, resynchronizing: {e}",
+                        self.server_name,
+                    );
+                    debug!(
+                        server = self.server_name.as_str(),
+                        buffer_len = self.buffer.len(),
+                        "buffer head (hex): {:02x?}",
+                        &self.buffer[..dump_len]
+                    );
+                    self.total_accounted += resync_to_next_message(&mut self.buffer) as u64;
+                }
+            }
+            self.check_conservation();
+        }
+        self.check_conservation();
+        out
+    }
+
+    /// Verifies the byte-conservation identity and recovers on divergence.
+    ///
+    /// `total_bytes_read` must equal `total_bytes_accounted` plus the bytes
+    /// still buffered. On divergence: one `error!` with both counters, the
+    /// delta, and the buffer length; then resync past whatever the buffer
+    /// currently holds and re-true the accounting so a single fault reports
+    /// once instead of on every subsequent iteration.
+    fn check_conservation(&mut self) {
+        let accounted = self.total_accounted + self.buffer.len() as u64;
+        if accounted == self.total_read {
+            return;
+        }
+        self.divergences += 1;
+        let delta = i128::from(self.total_read) - i128::from(accounted);
+        error!(
+            server = self.server_name.as_str(),
+            source = crate::source::Source::LspDispatch.as_str(),
+            scope_root = self.scope_root.as_deref(),
+            total_bytes_read = self.total_read,
+            total_bytes_accounted = accounted,
+            delta,
+            buffer_len = self.buffer.len(),
+            "LSP reader byte-conservation violated for {}: bytes were lost or \
+             double-consumed on the stdout pipe; resynchronizing",
+            self.server_name,
+        );
+        resync_to_next_message(&mut self.buffer);
+        self.total_accounted = self.total_read.saturating_sub(self.buffer.len() as u64);
+    }
+}
+
+#[cfg(test)]
+impl FramePump {
+    /// Number of conservation violations detected so far.
+    pub(crate) const fn divergences(&self) -> u64 {
+        self.divergences
+    }
+
+    /// Bytes currently buffered awaiting more data.
+    pub(crate) fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Test-only fault injection: silently discard one buffered byte
+    /// without accounting for it — simulates a byte-conservation bug so
+    /// tests can prove the divergence check fires.
+    pub(crate) fn lose_one_buffered_byte_for_test(&mut self) {
+        if !self.buffer.is_empty() {
+            self.buffer.advance(1);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -194,17 +366,17 @@ mod tests {
         v
     }
 
-    /// Drive the exact framing path `reader_loop` runs: feed `stream` to a
-    /// `BytesMut` one read-chunk at a time (chunk boundaries at `cut_points`),
-    /// and after each chunk drain every complete message with the same
-    /// `try_parse_message` / `resync_to_next_message` loop the reader uses.
+    /// Drive the REAL framing pump `reader_loop` runs — [`FramePump`], not a
+    /// replica (bug 95): feed `stream` one read-chunk at a time (chunk
+    /// boundaries at `cut_points`) through [`FramePump::ingest`], exactly as
+    /// the reader does per `read()`.
     ///
-    /// Returns the ordered list of message bodies the framing layer emitted
-    /// (`Ok(Some(_))`) — i.e. what the reader would hand to the JSON parse.
-    /// This is the reader's buffer reassembly under an adversarial partition of
-    /// the byte stream (bug 95).
+    /// Returns the ordered list of message bodies the framing layer emitted —
+    /// i.e. what the reader would hand to the JSON parse. This is the reader's
+    /// buffer reassembly under an adversarial partition of the byte stream,
+    /// with the byte-conservation audit armed (any divergence fails the test).
     fn drive_reader(stream: &[u8], cut_points: &[usize]) -> Vec<String> {
-        let mut buffer = BytesMut::with_capacity(64);
+        let mut pump = FramePump::new("test-server".to_string(), None);
         let mut out = Vec::new();
         let mut pos = 0usize;
 
@@ -222,17 +394,14 @@ mod tests {
             if cut < pos {
                 continue;
             }
-            buffer.extend_from_slice(&stream[pos..cut]);
+            out.extend(pump.ingest(&stream[pos..cut]));
             pos = cut;
-            // Drain exactly as reader_loop's inner loop does.
-            loop {
-                match try_parse_message(&mut buffer) {
-                    Ok(None) => break,
-                    Err(_) => resync_to_next_message(&mut buffer),
-                    Ok(Some(message)) => out.push(message),
-                }
-            }
         }
+        assert_eq!(
+            pump.divergences(),
+            0,
+            "the pump's byte-conservation audit diverged while reassembling a stream"
+        );
         out
     }
 
@@ -731,6 +900,148 @@ mod tests {
                 "the reader dispatched a non-JSON body (the incident): {body:?}"
             );
         }
+    }
+
+    // --- The captured incident, reconstructed byte-for-byte (bug 95 settle) ---
+
+    #[test]
+    fn incident_95_drain_sentinel_injected_between_header_and_body() {
+        // Byte-exact reconstruction of the captured incident
+        // (bugs/evidence/95/victim-tmpTQGNWt, 2026-07-09 20:10:24.698Z).
+        //
+        // The daemon held a clone of the server's stdout pipe write end and
+        // `Connection::drain()` injected a sentinel response frame into it
+        // after every settle. mockls writes each frame through
+        // `std::io::Stdout` — a `LineWriter` — so the header (ending in
+        // `\r\n\r\n`) flushes as one pipe write and the body lands in a
+        // SECOND write at `flush()`. Under 3x full-suite load, the
+        // post-didSave settle's sentinel landed exactly in that gap:
+        //
+        //   [begin header: "Content-Length: 135\r\n\r\n"]   <- mockls syscall 1
+        //   [sentinel frame: 60 bytes, id 8]                <- daemon drain()
+        //   [begin body: 135 bytes]                         <- mockls syscall 2
+        //
+        // The reader then parsed a framing-VALID message: Content-Length 135
+        // sliced the sentinel frame (60 bytes) plus the first 75 bytes of the
+        // begin body. Its first byte is `C` — serde_json fails with exactly
+        // the incident's `expected value at line 1 column 1`. The sentinel
+        // response was destroyed (drain()'s oneshot never resolved — the
+        // diagnostics pipeline parked forever, so round 2 sent no codeAction)
+        // and the `$/progress` begin was destroyed (no progress evidence).
+        // The leftover begin-body tail then glued onto the next frame's
+        // header; pre-c1dcd11 that returned Ok(None) forever — the 57 s of
+        // total wire silence. Post-c1dcd11 the reader resyncs and recovers
+        // every subsequent frame, as this test also pins.
+        //
+        // The fix removes the second writer entirely: drain() is now a
+        // reader-side barrier over a control channel and NOTHING but the
+        // server process writes to the reader's pipe.
+        let begin_body = r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"mockls-flycheck","value":{"kind":"begin","percentage":0,"title":"Flycheck"}}}"#;
+        assert_eq!(begin_body.len(), 135, "the incident's begin-frame length");
+        // The drain sentinel the daemon wrote at 24.698 (id 8: the eighth
+        // Connection request/drain id of the victim connection's lifetime).
+        let sentinel_body = r#"{"jsonrpc":"2.0","id":8,"result":null}"#;
+        let sentinel_frame = frame(sentinel_body);
+        assert_eq!(
+            sentinel_frame.len(),
+            60,
+            "the incident's sentinel frame length"
+        );
+        // The two frames mockls wrote after the begin (never parsed in the
+        // incident; the wire shard ends at the create id:2 reply).
+        let publish_body = r#"{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"diagnostics":[{"message":"mockls: mock diagnostic (2 lines)","range":{"end":{"character":1,"line":0},"start":{"character":0,"line":0}},"severity":2,"source":"mockls"}],"uri":"file:///home/mark/.claude/tmp/.tmppeL1L2/test.yX4Za","version":1}}"#;
+        let end_body = r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"mockls-flycheck","value":{"kind":"end","message":"Flycheck complete"}}}"#;
+
+        let mut stream = Vec::new();
+        stream
+            .extend_from_slice(format!("Content-Length: {}\r\n\r\n", begin_body.len()).as_bytes());
+        stream.extend_from_slice(&sentinel_frame);
+        stream.extend_from_slice(begin_body.as_bytes());
+        stream.extend_from_slice(&frame(publish_body));
+        stream.extend_from_slice(&frame(end_body));
+
+        // The wire interleaving fixed the damage; the reader's read
+        // fragmentation must not change it. Sweep every single read boundary
+        // (plus the unfragmented stream) and assert the identical outcome.
+        let mut splits: Vec<Vec<usize>> = vec![vec![]];
+        splits.extend((1..stream.len()).map(|s| vec![s]));
+        for cuts in splits {
+            let emitted = drive_reader(&stream, &cuts);
+            assert_eq!(
+                emitted.len(),
+                3,
+                "split {cuts:?}: expected [composite garbage, publish, end]"
+            );
+
+            // Frame 1: the incident's framing-valid garbage body.
+            let garbage = &emitted[0];
+            assert_eq!(garbage.len(), 135, "split {cuts:?}: Content-Length slice");
+            assert!(
+                garbage.starts_with("Content-Length: 38\r\n\r\n"),
+                "split {cuts:?}: the slice must begin with the sentinel's header"
+            );
+            let err = serde_json::from_str::<serde_json::Value>(garbage)
+                .expect_err("the composite slice is not JSON");
+            assert!(
+                err.to_string()
+                    .starts_with("expected value at line 1 column 1"),
+                "split {cuts:?}: expected the incident's exact serde error, got: {err}"
+            );
+
+            // The sentinel response and the begin notification are destroyed
+            // (the incident's real loss); everything after is recovered.
+            assert_eq!(emitted[1], publish_body, "split {cuts:?}");
+            assert_eq!(emitted[2], end_body, "split {cuts:?}");
+        }
+    }
+
+    // --- Byte-conservation audit (bug 95 settle, task 4) ---
+
+    #[test]
+    fn conservation_divergence_fires_once_and_recovers() {
+        use crate::logging::test_support::{query_all_messages, setup_logging};
+
+        let (_logging, recorder, _guard) = setup_logging();
+
+        let first = frame(r#"{"first":1}"#);
+        let second_body = r#"{"second":2}"#.to_string();
+        let second = frame(&second_body);
+
+        let mut pump = FramePump::new("test-server".to_string(), None);
+
+        // Feed half of frame 1 so bytes sit buffered, then simulate a
+        // conservation bug: one buffered byte vanishes unaccounted.
+        let half = first.len() / 2;
+        assert!(pump.ingest(&first[..half]).is_empty());
+        assert!(pump.buffered_len() > 0);
+        pump.lose_one_buffered_byte_for_test();
+
+        // The next ingest must detect the divergence (read != accounted +
+        // buffered), emit ONE error!, resync, and re-true the accounting.
+        let _ = pump.ingest(&first[half..]);
+        assert_eq!(pump.divergences(), 1, "divergence must be detected");
+
+        // Recovery: a subsequent valid frame parses normally with no
+        // further divergence reports.
+        let got = pump.ingest(&second);
+        assert_eq!(got, vec![second_body]);
+        assert_eq!(
+            pump.divergences(),
+            1,
+            "a single fault must report once, not on every iteration"
+        );
+
+        let errors: Vec<_> = query_all_messages(&recorder)
+            .into_iter()
+            .filter(|m| m.level == "error")
+            .collect();
+        assert_eq!(errors.len(), 1, "exactly one error! for one divergence");
+        assert_eq!(errors[0].server, "test-server");
+        assert!(
+            errors[0].payload.contains("total_bytes_read"),
+            "the error must carry the counters, got: {}",
+            errors[0].payload
+        );
     }
 
     proptest! {

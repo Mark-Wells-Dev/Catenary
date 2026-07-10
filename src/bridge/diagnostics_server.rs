@@ -1635,10 +1635,13 @@ async fn settle_after(
 /// be in the kernel pipe buffer — the `write` syscall completed (so
 /// CPU shows idle) but the reader loop hasn't processed the bytes yet.
 ///
-/// Injects a sentinel response into the pipe's write end (kept from
-/// spawn time) and waits for the reader loop to deliver it. FIFO pipe
-/// ordering guarantees that every preceding byte — including any final
-/// `publishDiagnostics` — has been processed when the sentinel arrives.
+/// Requests a reader-side barrier (`Connection::drain`): the reader
+/// loop consumes and dispatches frames until the pipe is momentarily
+/// empty, then acks — so every byte the server wrote before this call,
+/// including any final `publishDiagnostics`, has been processed. (The
+/// former design injected a sentinel frame into the pipe's write end;
+/// a second writer on the pipe corrupted mid-write server frames —
+/// the bug-95 incident.)
 ///
 /// Without this, `retrieve_diagnostics` can read stale diagnostics
 /// from an intermediate analysis phase (e.g., rust-analyzer's
