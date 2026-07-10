@@ -85,6 +85,14 @@ pub fn isolate_env(cmd: &mut Command, root: &str) {
     cmd.env("CATENARY_RUNTIME_DIR", xdg_runtime_dir(root));
     cmd.env("CATENARY_CACHE_DIR", xdg_cache_home(root));
     cmd.env("CATENARY_CONFIG_DIR", xdg_config_home(root));
+    // Suppress the desktop-notification sink (misc 179): test daemons resolve
+    // `$HOME` (which isolate_env does not redirect) and so read the user's
+    // REAL `~/.claude` plugin cache — whenever the dev tree's hooks.json
+    // diverges from the installed copy, every daemon start fires the
+    // stale-hooks `error!()` and a real desktop notification, storming the
+    // maintainer's desktop once per daemon-spawning test. `CATENARY_NOTIFY=0`
+    // is the sink's own suppression knob; must come after the clearing loop.
+    cmd.env("CATENARY_NOTIFY", "0");
 }
 
 /// CI triage escape hatch: with `CATENARY_CONFORMANCE_KEEP` set in the
