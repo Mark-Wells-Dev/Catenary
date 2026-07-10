@@ -1020,10 +1020,11 @@ impl LspClientManager {
     /// roots get new `Scope::Root` instances spawned for languages
     /// that already have active instances.
     ///
-    /// Returns the set of removed roots (old set − new set) so the caller can
-    /// react to removal without recomputing the diff — `Session::sync_roots`
-    /// uses it as the single source of truth for evicting per-root
-    /// `SymbolIndex` entries (bug #36).
+    /// Returns every root whose per-root state was dropped: the set diff
+    /// (old set − new set) plus any orphaned instance scope no new root
+    /// covers (misc 183) — so the caller can react to removal without
+    /// recomputing the diff. `Session::sync_roots` uses it as the single
+    /// source of truth for evicting per-root `SymbolIndex` entries (bug #36).
     ///
     /// `new_roots` are config-complete [`Root`]s (loaded at birth by the
     /// tracker, ticket 00a): installing them via `fs.set_roots_rich` makes each
@@ -1059,48 +1060,99 @@ impl LspClientManager {
         // (ticket 00a).
         self.fs.set_roots_rich(new_roots);
 
-        if to_add.is_empty() && to_remove.is_empty() {
+        // Reconcile actual instances against the new set, not just the
+        // bookkeeping diff (misc 183): an instance whose scope no new root
+        // covers was spawned while its root was uninstalled (a request racing
+        // the expiry sweep) or sits under a removed ancestor — either way the
+        // set diff can never name it again, and it would hold its server
+        // processes until daemon restart. Sweeping here restores the invariant
+        // at every sync: no installed root ⇒ no per-root instances.
+        let orphaned = self.orphaned_root_scopes(&new_paths, &to_remove).await;
+
+        if to_add.is_empty() && to_remove.is_empty() && orphaned.is_empty() {
             return Ok(to_remove);
         }
 
         info!(
-            "Syncing roots: {} added, {} removed",
+            "Syncing roots: {} added, {} removed, {} orphaned",
             to_add.len(),
-            to_remove.len()
+            to_remove.len(),
+            orphaned.len(),
         );
 
-        // Clear marker cache — root boundaries changed.
-        self.marker_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+        let set_changed = !to_add.is_empty() || !to_remove.is_empty();
+        if set_changed {
+            // Clear marker cache — root boundaries changed. (An orphan-only
+            // sweep leaves the boundaries alone, so the cache stays.)
+            self.marker_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
 
         // Removed roots dropped their config + classification with the
         // `set_roots_rich` swap above; here drop the path-keyed caches that are
         // NOT folded onto `Root` so removed-root entries don't accumulate (a
         // leak) and a later re-mount diffs against a fresh baseline (cold-start
-        // full set).
-        for removed in &to_remove {
+        // full set). Orphaned scopes get the same cleanup — their entries are
+        // exactly as unreachable.
+        for removed in to_remove.iter().chain(orphaned.iter()) {
             self.fs.remove_root_baseline(removed);
         }
 
-        // Shut down per-root instances for removed roots.
-        for removed in &to_remove {
+        // Shut down per-root instances for removed roots and orphaned scopes.
+        for removed in to_remove.iter().chain(orphaned.iter()) {
             self.shutdown_root_instances(removed).await;
         }
 
-        // Shut down single-file servers and clear the cache — root
-        // changes may have brought previously-unrooted files into scope
-        // of per-root instances. Single-file servers are lazily
-        // re-spawned on the next request if still needed.
-        self.shutdown_single_file_instances().await;
+        if set_changed {
+            // Shut down single-file servers and clear the cache — root
+            // changes may have brought previously-unrooted files into scope
+            // of per-root instances. Single-file servers are lazily
+            // re-spawned on the next request if still needed.
+            self.shutdown_single_file_instances().await;
+        }
 
         // Spawn instances for added roots.
         if !to_add.is_empty() {
             self.spawn_for_added_roots(&to_add).await;
         }
 
-        Ok(to_remove)
+        // Removed and orphaned both left tracked state; hand the caller the
+        // union so per-root cache eviction (bug #36) covers orphans too.
+        let mut dropped = to_remove;
+        dropped.extend(orphaned);
+        Ok(dropped)
+    }
+
+    /// Distinct `Scope::Root` scope paths among live instances that no root
+    /// in `new_paths` covers (component-prefix), excluding those `to_remove`
+    /// already names (the set diff orders their shutdown).
+    ///
+    /// These are misc-183 orphans: instances spawned for a root that was
+    /// concurrently uninstalled, or scoped under a removed ancestor root —
+    /// shapes the old−new set diff structurally cannot see.
+    async fn orphaned_root_scopes(
+        &self,
+        new_paths: &[PathBuf],
+        to_remove: &[PathBuf],
+    ) -> Vec<PathBuf> {
+        let clients = self.clients.lock().await;
+        let mut orphaned: Vec<PathBuf> = clients
+            .keys()
+            .filter_map(|k| match &k.scope {
+                Scope::Root(r)
+                    if !new_paths.iter().any(|p| r.starts_with(p)) && !to_remove.contains(r) =>
+                {
+                    Some(r.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        drop(clients);
+        orphaned.sort_unstable();
+        orphaned.dedup();
+        orphaned
     }
 
     /// Returns clients for a file path, filtered by capability,
@@ -1916,8 +1968,23 @@ impl LspClientManager {
             }
         }
 
-        // Miss — spawn with correct scope (spawn_inner handles its
-        // own double-check).
+        // Miss — spawn only for a path some installed root covers
+        // (misc 183). A request can race a root's teardown: resolution
+        // saw the root installed, the expiry sweep then removed it and
+        // shut its instances down, and a spawn here would recreate the
+        // server set for a root no sync diff will ever name again — a
+        // permanent orphan holding its processes until daemon restart.
+        // Bailing degrades just this request (decision 027: coverage
+        // loss, not a wedge); the next query re-mounts and respawns.
+        if self.fs.resolve_root(root).is_none() {
+            anyhow::bail!(
+                "no installed root covers '{}'; refusing per-root spawn of '{server_name}' ({lang})",
+                root.display()
+            );
+        }
+
+        // Spawn with correct scope (spawn_inner handles its own
+        // double-check).
         let (_key, client) = self
             .spawn_inner(server_name, lang, root, project_scoped)
             .await?;
@@ -3466,6 +3533,91 @@ mod tests {
         assert!(
             has_language(&manager.clients().await, MOCK_LANG_A),
             "Scope::Root(/tmp) instance should remain when /tmp is still a root"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ensure_server_refuses_uncovered_root() -> Result<()> {
+        // misc 183: a spawn racing a root's teardown must not recreate
+        // instances for an uninstalled root — the sync diff could never name
+        // them again, leaking the server set until daemon restart.
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+        let binding = manager
+            .config()
+            .resolve_language(MOCK_LANG_A)
+            .expect("config")
+            .servers()[0]
+            .name
+            .clone();
+
+        let Err(err) = manager
+            .ensure_server(MOCK_LANG_A, &binding, Path::new("/var"))
+            .await
+        else {
+            anyhow::bail!("spawn for an uncovered root must be refused")
+        };
+        assert!(
+            err.to_string().contains("no installed root covers"),
+            "unexpected refusal message: {err}"
+        );
+        assert!(
+            manager.clients().await.is_empty(),
+            "a refused spawn must leave no instance behind"
+        );
+
+        // A nested scope under an installed root is covered — marker roots
+        // inside a tracked project are legitimate per-root scopes.
+        let nested = tempfile::Builder::new()
+            .tempdir_in("/tmp")
+            .expect("tempdir under /tmp");
+        manager
+            .ensure_server(MOCK_LANG_A, &binding, nested.path())
+            .await?;
+        assert_eq!(manager.clients().await.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_roots_sweeps_orphaned_instances() -> Result<()> {
+        // misc 183 shape: an instance spawned while its root was installed
+        // survives the root's uninstall when the removal bypassed the sync
+        // diff (a request racing the expiry sweep). The next sync must sweep
+        // it even though the set diff is empty, and report it so per-root
+        // caches evict (bug #36).
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp", "/var"]),
+        );
+        let binding = manager
+            .config()
+            .resolve_language(MOCK_LANG_A)
+            .expect("config")
+            .servers()[0]
+            .name
+            .clone();
+        manager
+            .ensure_server(MOCK_LANG_A, &binding, Path::new("/var"))
+            .await?;
+        assert!(has_language(&manager.clients().await, MOCK_LANG_A));
+
+        // Simulate the race: /var leaves the installed set without a sync.
+        manager.fs.set_roots(vec![PathBuf::from("/tmp")]);
+
+        // A same-set sync: to_add and to_remove are both empty, yet the
+        // orphaned /var instance must be swept and reported.
+        let dropped = manager.sync_roots(rich(&["/tmp"])).await?;
+        assert_eq!(dropped, vec![PathBuf::from("/var")]);
+        assert!(
+            !has_language(&manager.clients().await, MOCK_LANG_A),
+            "orphaned per-root instance must be shut down by the reconcile"
         );
 
         Ok(())
