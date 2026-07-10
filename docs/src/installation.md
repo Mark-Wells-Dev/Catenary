@@ -21,6 +21,11 @@ returns after the port rather than shipping unverified.
 brew install twowells/tap/catenary
 ```
 
+> Switching from a `cargo install` (the previously recommended path)?
+> Run `cargo uninstall catenary-mcp` first — `~/.cargo/bin` usually
+> precedes brew's bin dir on `PATH`, so the stale binary keeps
+> answering otherwise.
+
 **Prebuilt binary (Linux / macOS arm64):**
 
 ```bash
