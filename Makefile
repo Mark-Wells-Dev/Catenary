@@ -420,7 +420,7 @@ rustglob:
 install:
 	@cargo install --path . --locked
 	@catenary version
-	@echo "If the daemon lags the CLI: catenary stop && catenary start (live sessions reconnect; each needs /mcp)"
+	@echo "If the daemon lags the CLI: catenary stop (live bridges respawn the daemon and replay their sessions; a session whose binary was swapped under it may need /mcp)"
 
 # Verify we're in a good state for release
 pre-release-check:

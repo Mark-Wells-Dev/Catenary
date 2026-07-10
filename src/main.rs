@@ -1753,7 +1753,8 @@ fn run_start(out: &mut cli::Output) -> Result<()> {
 /// asked to confirm *before* the kill — declining exits `0` with the daemon
 /// still running (feedback 08 finding 3). `force` (`--force`) and a
 /// non-interactive stdin (scripts, the documented upgrade flow) skip straight
-/// to the stop; the post-stop reconnect warning is unchanged.
+/// to the stop; the post-stop note (bridges respawn and reconnect on their
+/// own — bug 80) prints either way.
 ///
 /// # Errors
 ///
@@ -1796,20 +1797,28 @@ async fn run_stop(out: &mut cli::Output, force: bool) -> Result<()> {
 
     let _ = out.writeln(format_args!("Daemon stopped"));
 
-    // The shutdown ack reports how many bridges were connected. Each was
-    // proxying stdin↔daemon-socket and exits when the socket closes, so the
-    // host marks that MCP server failed. A plain host restart does NOT
-    // relaunch it — only a `/mcp` reconnect re-runs the bridge and respawns
-    // the daemon. Warn so the loss isn't silent.
+    // The shutdown ack reports how many bridges were connected. Each bridge's
+    // reader sees the socket close and runs the bug-80 reconnect: respawn the
+    // daemon (connect_or_start), replay the captured initialize, resume — the
+    // host↔bridge stdio link never breaks, so no `/mcp` is needed and a
+    // deliberate stop with live sessions is really a bounce. Note it so the
+    // brief blip isn't mysterious.
     let connections = serde_json::from_str::<serde_json::Value>(line.trim())
         .ok()
         .and_then(|v| v.get("connections").and_then(serde_json::Value::as_u64))
         .unwrap_or(0);
     if connections > 0 {
         let plural = if connections == 1 { "" } else { "s" };
+        // Bug 80's reconnect-aware proxy made this a bounce, not a strand:
+        // each live bridge respawns the daemon and replays its session on
+        // its own — no `/mcp` needed. The exception is a binary swapped
+        // under a running bridge (`current_exe` reads `… (deleted)` after
+        // the rename, so the respawn execs a dead path — misc 182); only
+        // then does a session need `/mcp`.
         let _ = out.writeln(format_args!(
-            "warning: {connections} connected session{plural} will lose Catenary tooling — \
-             each needs a `/mcp` reconnect (a host restart alone won't respawn the daemon)",
+            "note: {connections} connected session{plural} will respawn the daemon and \
+             reconnect on their own (a swapped binary is the exception — those sessions \
+             need `/mcp`)",
         ));
     }
     Ok(())
