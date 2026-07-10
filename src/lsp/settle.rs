@@ -32,7 +32,11 @@ use crate::source::Source;
 // ── Constants ────────────────────────────────────────────────────────
 
 /// Polling interval for tree walks (validated by profiling).
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+///
+/// Shared with the diagnostics retrieval evidence bar
+/// (`await_publish_evidence`) so its quiet-sample accounting runs at the
+/// same cadence as the settle loop it extends.
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Poll-sample count after which an unsettled wait is *evidence-backed long*
 /// and earns a heartbeat note (misc 160 leg 3 / bug 78 + 79 rider).
@@ -310,7 +314,11 @@ pub async fn await_idle(
 /// process runnable or blocked (the same pending-work ground truth
 /// [`IdleDetector::check`] gates idle on). A `true` here means "still working";
 /// a `false` across a long wait is the wedged signature.
-fn tree_working(snapshot: &catenary_proc::TreeSnapshot) -> bool {
+///
+/// Also consumed by the diagnostics retrieval evidence bar: activity extends
+/// its publish wait (work-based doctrine), only quiet samples consume its
+/// dead-air budget.
+pub(crate) fn tree_working(snapshot: &catenary_proc::TreeSnapshot) -> bool {
     snapshot.samples.iter().any(|ts| {
         ts.delta_pfc > 0 || ts.delta_utime > 0 || ts.delta_stime > 0 || is_pending_work(ts.state)
     })

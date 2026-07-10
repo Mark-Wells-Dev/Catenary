@@ -708,6 +708,150 @@ fn publish_racing_the_pull_reaches_the_receipt() -> Result<()> {
     Ok(())
 }
 
+/// A publish landing AFTER the rejected probe resolves must still reach the
+/// receipt — the bug-99 residual, the yaml-language-server incident shape
+/// (run 29068921605, WITH the bug-99 re-consult fix in place).
+///
+/// mockls models the victim exactly: publishes only on `didSave`
+/// (`--diagnostics-on-save --advertise-save`), ~300 ms after it
+/// (`--diagnostics-delay 300` — the silent debounce, no progress bracket, no
+/// CPU: a sleeping timer thread the settle activity model cannot see), and
+/// answers the best-effort probe with `-32601` (`--reject-pull` — no pull
+/// support at all).
+///
+/// Call 1 is first contact: the server has never published on this
+/// connection, so the retrieval evidence bar is unarmed and the receipt may
+/// render the stated first-contact residual (not asserted). Its delayed
+/// publish then lands, making the server demonstrably push. Call 2 is the
+/// incident: never-heard at settle, but the bar is now armed — retrieval must
+/// hold until the debounced publish arrives and the receipt must carry the
+/// diagnostic, where pre-fix it falsified `[clean]`.
+#[test]
+fn delayed_publish_after_settle_reaches_the_receipt() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let logs = tempfile::tempdir()?;
+    let rlog = logs.path().join("requests.jsonl");
+    let rlog_arg = rlog.to_str().context("rlog path")?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mut bridge = spawn_mockls(
+        &[
+            "--diagnostics-on-save",
+            "--advertise-save",
+            "--diagnostics-delay",
+            "300",
+            "--reject-pull",
+            "--request-log",
+            rlog_arg,
+        ],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    // First contact — seeds the push evidence. The delayed publish lands
+    // ~300 ms after this call's didSave; give it time to be dispatched so
+    // call 2's evidence bar is deterministically armed.
+    let _first = bridge.call_diagnostics(file.to_str().context("path")?)?;
+    std::thread::sleep(Duration::from_millis(600));
+
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+    assert!(
+        text.contains("mock diagnostic"),
+        "a demonstrated-push server's debounced publish must be waited for \
+         and reach the receipt (bug 99 residual). Got: {text}"
+    );
+    assert!(
+        !text.contains("[clean]"),
+        "the receipt must not render [clean] over a pending publish. Got: {text}"
+    );
+
+    // The evidence bar heard the publish, so the second call never needed the
+    // probe — at most first contact's one rejected probe appears in the log.
+    let rlog_text = read_merged_log(&rlog);
+    assert!(
+        count_request_method(&rlog_text, "textDocument/diagnostic") <= 1,
+        "once the evidence bar hears the publish, no probe fires; log:\n{rlog_text}"
+    );
+
+    Ok(())
+}
+
+/// When the evidence bar expires with no publish and the probe goes
+/// unanswered, the file renders `[unverified — … returned no result]`,
+/// never `[clean]` — the honest resolution of the bar's own residual.
+///
+/// mockls with `--publish-once --diagnostics-on-save` publishes on the first
+/// `didSave` only — a push server that never re-publishes an unchanged
+/// document (the bug-74 shape) — and `--reject-pull` answers the probe with
+/// `-32601`, so on the second run there is NO evidence channel at all:
+/// never-heard, no publish coming, probe rejected. The bare receipt's trust
+/// contract (`[clean]` means evidenced-clean) demands the unverified line
+/// here; the pre-bar pipeline rendered absence as `[clean]`. (Gating the one
+/// publish on `didSave` keeps it out of the daemon's spawn-time eager health
+/// probe, whose `didOpen`/`didClose` of the same file would otherwise consume
+/// it before the batch's clear-then-open.)
+#[test]
+fn expired_evidence_renders_unverified_not_clean() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let logs = tempfile::tempdir()?;
+    let rlog = logs.path().join("requests.jsonl");
+    let rlog_arg = rlog.to_str().context("rlog path")?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mut bridge = spawn_mockls(
+        &[
+            "--publish-once",
+            "--diagnostics-on-save",
+            "--advertise-save",
+            "--reject-pull",
+            "--request-log",
+            rlog_arg,
+        ],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    // Call 1: the single publish fires on the batch's didSave — heard,
+    // reported, and the server is now demonstrably push.
+    let first = bridge.call_diagnostics(file.to_str().context("path")?)?;
+    assert!(
+        first.contains("mock diagnostic"),
+        "first contact hears the one publish. Got: {first}"
+    );
+
+    // Call 2: never-heard, bar armed, no publish ever comes (publish-once),
+    // probe rejected. The dead-air budget drains and the file must resolve
+    // unverified — an honest no-verdict — not an absence-of-evidence [clean].
+    let second = bridge.call_diagnostics(file.to_str().context("path")?)?;
+    assert!(
+        second.contains("[unverified") && second.contains("returned no result"),
+        "an expired evidence bar with a rejected probe renders the unverified \
+         line. Got: {second}"
+    );
+    assert!(
+        !second.contains("[clean]"),
+        "no evidence means no [clean] — the trust contract is absolute. Got: {second}"
+    );
+    assert!(
+        !second.contains("stuck"),
+        "the server is alive and merely silent — 'stuck' is a process-state \
+         claim (misc 160) and must not appear. Got: {second}"
+    );
+
+    // The probe was still attempted (it could have been the evidence) —
+    // exactly once, on the second call.
+    let rlog_text = read_merged_log(&rlog);
+    assert_eq!(
+        count_request_method(&rlog_text, "textDocument/diagnostic"),
+        1,
+        "the expired bar still draws the one best-effort probe; log:\n{rlog_text}"
+    );
+
+    Ok(())
+}
+
 /// Heard-empty: an explicit empty publish is evidence — no probe (misc 153).
 ///
 /// mockls with `--push-empty` publishes `"diagnostics": []` on `didOpen` — the

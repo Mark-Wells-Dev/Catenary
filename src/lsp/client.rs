@@ -891,12 +891,19 @@ impl LspClient {
     /// capability. When the push cache is empty (the fast-publisher's first
     /// publish was cleared before the batch reopened the file and it did not
     /// re-publish an unchanged document — bug 74), asking the server directly is
-    /// the authoritative way to learn the truth. A server that does not
-    /// implement the request answers with an error, which maps to an empty
-    /// result — the same outcome as not pulling, so a genuinely push-only
-    /// server sees no change in reported diagnostics. Never called when the push
+    /// the authoritative way to learn the truth. Never called when the push
     /// cache already holds diagnostics, so it can never double-report.
-    pub async fn try_pull_diagnostics(&self, uri: &str) -> Vec<Value> {
+    ///
+    /// Returns `Some(diagnostics)` when the server **answered** the request —
+    /// evidence computed on demand, even when the set is empty — and `None`
+    /// when it rejected or failed it (`-32601` and friends), which is *not*
+    /// evidence of anything. The caller decides how an unanswered probe
+    /// resolves (the retrieval evidence bar, bug 99 residual / misc 156);
+    /// a genuinely push-only silent server still verifies clean through it.
+    /// An answered probe is also recorded on the server
+    /// ([`LspServer::has_answered_probe`]) as a working on-demand evidence
+    /// channel.
+    pub async fn try_pull_diagnostics(&self, uri: &str) -> Option<Vec<Value>> {
         match self
             .request(
                 "textDocument/diagnostic",
@@ -904,10 +911,13 @@ impl LspClient {
             )
             .await
         {
-            Ok(result) => super::extract::document_diagnostic_report(&result),
+            Ok(result) => {
+                self.server.note_probe_answered();
+                Some(super::extract::document_diagnostic_report(&result))
+            }
             Err(e) => {
-                debug!("best-effort pull returned no diagnostics: {e}");
-                Vec::new()
+                debug!("best-effort pull went unanswered: {e}");
+                None
             }
         }
     }

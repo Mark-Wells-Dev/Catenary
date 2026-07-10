@@ -4,15 +4,17 @@
 //! Diagnostics pipeline for PostToolUse hook requests.
 //!
 //! Handles file-change notifications: path resolution, LSP client lookup,
-//! document open/change, idle detection, diagnostics retrieval (push cache
-//! first, pull fallback), severity filtering, noise filtering, quick-fix
-//! collection, and compact formatting.
+//! document open/change, idle detection, the retrieval evidence bar
+//! ([`await_publish_evidence`] — a never-heard file on a demonstrated-push
+//! server may not render `[clean]` until its publish arrives), diagnostics
+//! retrieval (push cache first, pull fallback), severity filtering, noise
+//! filtering, quick-fix collection, and compact formatting.
 
 use super::filesystem_manager::{FilesystemManager, observe_mtime};
 use super::linter::DiagnosticFeeder;
 use super::path_security::PathValidator;
 use crate::lsp::server::LspServer;
-use crate::lsp::settle::{IdleDetector, SettleResult, await_idle};
+use crate::lsp::settle::{IdleDetector, POLL_INTERVAL, SettleResult, await_idle, tree_working};
 use crate::lsp::state::ServerLifecycle;
 use crate::lsp::{LspClient, LspClientManager, WalkBreadth};
 use crate::symbol_index::SymbolIndex;
@@ -1146,8 +1148,9 @@ impl DiagnosticsServer {
 
     /// Runs the batched diagnostics lifecycle on a single server.
     ///
-    /// Opens all files, settles, runs health probe if needed,
-    /// sends didSave, settles again, retrieves diagnostics per file,
+    /// Opens all files, settles, runs health probe if needed, sends
+    /// didSave, settles again, holds the retrieval evidence bar
+    /// ([`await_publish_evidence`]), retrieves diagnostics per file,
     /// and closes all files. Cleanup runs once regardless of
     /// bail-outs.
     async fn run_server_batch(
@@ -1194,7 +1197,18 @@ impl DiagnosticsServer {
             let server = client_mutex.lock().await.server().clone();
             drain_pipe(&server).await;
 
-            self.retrieve_diagnostics(client_mutex, &opened, feeds)
+            // Retrieval evidence bar (bug 99 residual / bug 101 / misc 156).
+            // The activity-based settle cannot see work that has not started:
+            // a silent diagnostic debounce timer (no CPU, no children, no
+            // progress bracket) samples as idle while the publish the didSave
+            // will produce is still pending. For never-heard files on a server
+            // that has demonstrably pushed on this connection — and has no
+            // working request channel to ask instead — hold retrieval until
+            // that publish lands. URIs whose evidence never arrives come back
+            // in `evidence_expired` and must not render `[clean]`.
+            let evidence_expired = await_publish_evidence(client_mutex, &opened).await;
+
+            self.retrieve_diagnostics(client_mutex, &opened, feeds, &evidence_expired)
                 .await;
         }
 
@@ -1358,12 +1372,19 @@ impl DiagnosticsServer {
     /// it is hoisted to the per-file cross-feeder pass (ticket 02) so one policy
     /// reconciles every feeder's findings together. Every opened file is recorded
     /// (even with zero diagnostics) so the clean-vs-no-results distinction
-    /// survives the merge.
+    /// survives the merge — with one deliberate exception: a URI in
+    /// `evidence_expired` (the retrieval evidence bar armed for it and its
+    /// publish never arrived, [`await_publish_evidence`]) whose best-effort
+    /// probe also goes unanswered is **not** recorded, so it resolves
+    /// [`FileOutcome::NoResults`] and renders the honest
+    /// `[unverified — <server> returned no result]` line instead of an
+    /// absence-of-evidence `[clean]` (bug 99 residual / misc 156).
     async fn retrieve_diagnostics(
         &self,
         client_mutex: &Arc<Mutex<LspClient>>,
         opened_uris: &[(PathBuf, String)],
         feeds: &mut BTreeMap<String, FileFeed>,
+        evidence_expired: &HashSet<String>,
     ) {
         let client = client_mutex.lock().await;
 
@@ -1405,17 +1426,48 @@ impl DiagnosticsServer {
                 // server is push-first by design (rust-analyzer) and must never be
                 // sent `textDocument/diagnostic`, not even the best-effort probe —
                 // its native pushes are the sole channel. Never-heard resolves the
-                // same as a genuinely silent push-only server.
+                // same as a genuinely silent push-only server — even when the
+                // evidence bar armed and expired for this URI. That is a stated
+                // residual (bug 99 residual / misc 156): rust-analyzer does not
+                // re-publish an unchanged result, so a repeat-clean file is
+                // routinely never-heard here and forcing `[unverified]` would
+                // misfire on every such run. The bar's wait above still holds
+                // retrieval through any late reaction it can observe (bug 101's
+                // didSave-mediated window); a publish silent past the dead-air
+                // budget with no process activity remains invisible.
                 None if client.server().pull_suppressed() => Vec::new(),
                 // Never heard and no advertised pull capability. Some servers
                 // still answer `textDocument/diagnostic` on demand without
                 // advertising it (lattice): ask directly rather than report a
                 // false `[clean]` for a fast publisher whose first publish the
-                // settle-then-collect pipeline cleared (bug 74). Errors map to
-                // empty, so a genuinely silent push-only server is unchanged.
+                // settle-then-collect pipeline cleared (bug 74).
                 None => {
-                    let pulled = client.try_pull_diagnostics(uri).await;
-                    reconsult_push_after_empty_pull(&client, uri, pulled)
+                    match client.try_pull_diagnostics(uri).await {
+                        // The server ANSWERED the probe — evidence computed on
+                        // demand, even when empty. A publish that raced the
+                        // probe still outranks an empty answer (bug 99; one
+                        // source per file, misc 153).
+                        Some(pulled) => reconsult_push_after_empty_pull(&client, uri, pulled),
+                        // The probe went unanswered (`-32601` and friends) —
+                        // that is not evidence of anything. Re-consult the push
+                        // cache: a publish that landed during the round-trip is
+                        // evidence in hand (bug 99).
+                        None => match client.get_diagnostics(uri) {
+                            Some(published) => published,
+                            // No publish, no answered probe. If the evidence
+                            // bar armed for this URI and expired, the pipeline
+                            // has NO evidence the server reacted — the file
+                            // must not render `[clean]`. Skip recording so it
+                            // resolves `NoResults` → the honest
+                            // `[unverified — <server> returned no result]`.
+                            None if evidence_expired.contains(uri) => continue,
+                            // Bar unarmed (the server never pushed on this
+                            // connection): the misc-153 silent-server contract
+                            // holds — the probe was the one best effort and
+                            // absence resolves clean.
+                            None => Vec::new(),
+                        },
+                    }
                 }
             };
 
@@ -1654,6 +1706,171 @@ async fn drain_pipe(server: &LspServer) {
     if let Err(e) = server.drain().await {
         debug!("drain_pipe: {e}");
     }
+}
+
+/// Dead-air budget for the retrieval evidence bar, in settle-cadence poll
+/// samples ([`POLL_INTERVAL`], 50 ms): the amount of *observed quiet* —
+/// samples with no CPU/page-fault delta, no pending-work scheduler state, and
+/// no open progress bracket — [`await_publish_evidence`] tolerates before
+/// concluding a demonstrated-push server has nothing to say for a batch's
+/// never-heard files.
+///
+/// A work count over quiet samples, never elapsed wall-clock time (the
+/// declared, evidence-anchored floor form the contention doctrine exempts):
+/// activity never consumes it, so a server visibly reacting late — a flycheck
+/// child spawning after settle sampled idle, bug 101's window — extends the
+/// wait for exactly as long as the reaction lasts, unbounded, the same stance
+/// the settle loop takes (bug 24/28). Only dead air drains it.
+///
+/// Anchoring: the pure-debounce dead zone the incidents measured is ~270 ms
+/// (lua-language-server, conformance run 29067405830) to ~300-400 ms
+/// (yaml-language-server, run 29068921605) of scheduler-invisible timer sleep
+/// between the didSave and the publish. 30 quiet samples ≈ 1.5 s of observed
+/// dead air ≥ 3.7× the worst measured zone — margin for slower debouncers —
+/// while keeping the fallback (the bug-74 best-effort probe) reachable
+/// without pathological latency for a push server that will never re-publish
+/// an unchanged document.
+const DEBOUNCE_DEAD_ZONE_SAMPLES: u32 = 30;
+
+/// Holds retrieval until a demonstrated-push server's publishes arrive for
+/// the batch's never-heard URIs, or the dead-air budget drains — the
+/// retrieval evidence bar (bug 99 residual / bug 101 / misc 156).
+///
+/// The activity-based settle cannot see work that has not started (a silent
+/// debounce timer, VFS latency), so "settled + cache empty" is absence of
+/// evidence, not evidence of clean. The bar arms only when the incident
+/// signature is complete:
+///
+/// - at least one opened URI is **never-heard** after the post-didSave settle
+///   and drain (no cached publish, not even an empty one);
+/// - the server **has published** on this connection
+///   ([`LspServer::has_ever_published`]) — it is demonstrably a push server,
+///   so the didOpen/didSave it just received will produce a publish
+///   (possibly empty — the heard-empty clean, misc 153);
+/// - it advertises **no pull channel** and has **never answered a probe**
+///   ([`LspServer::has_answered_probe`]) — a working request channel is
+///   per-file evidence on demand, so no wait is owed where one exists.
+///
+/// A server that has never pushed is left untouched to the misc-153
+/// silent-server contract downstream (one best-effort probe → clean).
+///
+/// The wait wakes on every publish ([`LspServer::diagnostics_notify`]
+/// registered before each cache re-check, so no publish is missed) and never
+/// consumes budget while the server shows work — an open `Busy` bracket or a
+/// working tree ([`tree_working`]). Only quiet samples drain
+/// [`DEBOUNCE_DEAD_ZONE_SAMPLES`]. Liveness is owned by cancel-on-disconnect
+/// exactly as for the settle loop (bug 24): a server that works forever
+/// without publishing holds this wait just as it would have held settle.
+///
+/// Returns the URIs still never-heard after the budget drained (following a
+/// final reader-side drain + re-check, so a publish written inside the last
+/// poll window is not dropped). The caller must not let those render
+/// `[clean]` from absence. An empty set means every URI was heard or the bar
+/// never armed.
+async fn await_publish_evidence(
+    client_mutex: &Arc<Mutex<LspClient>>,
+    opened_uris: &[(PathBuf, String)],
+) -> HashSet<String> {
+    let (server, server_name, mut pending) = {
+        let client = client_mutex.lock().await;
+        // An advertised pull provider is asked directly at retrieval — the
+        // pull response is its own per-file evidence.
+        if client.supports_pull_diagnostics() {
+            return HashSet::new();
+        }
+        let pending: HashSet<String> = opened_uris
+            .iter()
+            .filter(|(_, uri)| client.get_diagnostics(uri).is_none())
+            .map(|(_, uri)| uri.clone())
+            .collect();
+        (
+            client.server().clone(),
+            client.server_name().to_string(),
+            pending,
+        )
+    };
+
+    if pending.is_empty() || !server.has_ever_published() || server.has_answered_probe() {
+        return HashSet::new();
+    }
+
+    debug!(
+        server = %server_name,
+        pending = pending.len(),
+        "evidence bar armed: never-heard files on a demonstrated-push server",
+    );
+
+    let mut quiet_samples: u32 = 0;
+    loop {
+        // Register the publish wakeup BEFORE re-checking the cache so a
+        // publish dispatched between the check and the select is never missed.
+        let notified = server.diagnostics_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        retain_unheard(&server, &mut pending);
+        if pending.is_empty() {
+            debug!(server = %server_name, "evidence bar: all publishes heard");
+            return HashSet::new();
+        }
+        // A terminal server produces no more publishes; the recovery path
+        // (run_server_batch_with_recovery) owns what happens next.
+        if server.lifecycle().is_terminal() {
+            return pending;
+        }
+        if quiet_samples >= DEBOUNCE_DEAD_ZONE_SAMPLES {
+            break;
+        }
+
+        tokio::select! {
+            () = &mut notified => continue,
+            () = tokio::time::sleep(POLL_INTERVAL) => {}
+        }
+
+        // Work accounting: an open progress bracket or a working tree is the
+        // server still reacting — the budget is untouched (work-based; never
+        // cap observed work). Only a quiet sample drains it.
+        if matches!(server.lifecycle(), ServerLifecycle::Busy(_)) {
+            continue;
+        }
+        let sampler = Arc::clone(&server);
+        match tokio::task::spawn_blocking(move || sampler.sample_tree())
+            .await
+            .ok()
+            .flatten()
+        {
+            // Tree gone — the root died; the terminal check above and the
+            // recovery path own it.
+            None => return pending,
+            Some(snapshot) if tree_working(&snapshot) => {}
+            Some(_) => quiet_samples = quiet_samples.saturating_add(1),
+        }
+    }
+
+    // Budget drained with unheard URIs. One reader-side barrier + final
+    // re-check: a publish whose bytes were written inside the last poll
+    // window may not have been dispatched yet.
+    drain_pipe(&server).await;
+    retain_unheard(&server, &mut pending);
+    if !pending.is_empty() {
+        debug!(
+            server = %server_name,
+            pending = pending.len(),
+            quiet_samples,
+            "evidence bar expired: publish never arrived",
+        );
+    }
+    pending
+}
+
+/// Drops every URI the server's push cache now holds an entry for (heard —
+/// including heard-empty) from `pending`, leaving only the still-never-heard.
+fn retain_unheard(server: &LspServer, pending: &mut HashSet<String>) {
+    let cache = server
+        .diagnostics
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pending.retain(|uri| !cache.contains_key(uri));
 }
 
 /// Stat-walks a workspace root, returning every regular file as a

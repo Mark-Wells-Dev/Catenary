@@ -190,6 +190,20 @@ pub struct LspServer {
 
     // ── Observation flags ─────────────────────────────────────────
     pub(crate) publishes_version: Arc<AtomicBool>,
+    /// Set on the first `textDocument/publishDiagnostics` heard on this
+    /// connection — runtime evidence the server is a *push*-diagnostics
+    /// server. Arms the retrieval evidence bar: once a server has
+    /// demonstrably pushed, a never-heard file may not render `[clean]`
+    /// until the pipeline has evidence the server reacted to the batch's
+    /// `didOpen`/`didSave` (bug 99 residual / bug 101 / misc 156). Resets
+    /// with the connection (a fresh spawn is a fresh `LspServer`).
+    ever_published: AtomicBool,
+    /// Set on the first *successful* best-effort `textDocument/diagnostic`
+    /// probe answer. An answered probe is a working on-demand evidence
+    /// channel (the bug-74 lattice shape: no advertised `diagnosticProvider`,
+    /// but the request is served) — retrieval can always ask directly, so
+    /// the publish-evidence wait is unnecessary for such a server.
+    probe_answered: AtomicBool,
 
     // ── Identity ──────────────────────────────────────────────────
     /// Language identifier (known at spawn time, immutable).
@@ -268,6 +282,8 @@ impl LspServer {
             state_notify: Arc::new(Notify::new()),
             ever_busy: AtomicBool::new(false),
             publishes_version: Arc::new(AtomicBool::new(false)),
+            ever_published: AtomicBool::new(false),
+            probe_answered: AtomicBool::new(false),
             language_id,
             server_name,
             scope: OnceLock::new(),
@@ -444,6 +460,35 @@ impl LspServer {
     /// [`super::server_behavior::ServerProfile::suppresses_pull_diagnostics`].
     pub const fn pull_suppressed(&self) -> bool {
         self.pull_suppressed
+    }
+
+    /// Returns whether any `textDocument/publishDiagnostics` has been heard on
+    /// this connection — runtime evidence the server is a push server.
+    ///
+    /// Arms the retrieval evidence bar (bug 99 residual / misc 156): a server
+    /// that has demonstrably pushed will react to a `didOpen`/`didSave` with a
+    /// publish (possibly empty — heard-empty clean), so a never-heard file is
+    /// not rendered `[clean]` from mere absence while that reaction may still
+    /// be pending in a silent debounce.
+    pub(crate) fn has_ever_published(&self) -> bool {
+        self.ever_published.load(Ordering::SeqCst)
+    }
+
+    /// Returns whether a best-effort `textDocument/diagnostic` probe has ever
+    /// been *answered* (not rejected) on this connection.
+    ///
+    /// An answered probe is a working on-demand evidence channel — the bug-74
+    /// lattice shape — so retrieval can always ask the server directly and the
+    /// publish-evidence wait is unnecessary.
+    pub(crate) fn has_answered_probe(&self) -> bool {
+        self.probe_answered.load(Ordering::SeqCst)
+    }
+
+    /// Records that a best-effort `textDocument/diagnostic` probe was answered.
+    ///
+    /// See [`Self::has_answered_probe`].
+    pub(crate) fn note_probe_answered(&self) {
+        self.probe_answered.store(true, Ordering::SeqCst);
     }
 
     /// Returns whether the server supports whole-workspace pull diagnostics.
@@ -793,6 +838,11 @@ impl LspServer {
                 if version.is_some() && !self.publishes_version.swap(true, Ordering::SeqCst) {
                     self.capability_notify.notify_waiters();
                 }
+
+                // Any publish on this connection is proof of push capability —
+                // it arms the retrieval evidence bar for never-heard files
+                // (bug 99 residual / misc 156).
+                self.ever_published.store(true, Ordering::SeqCst);
 
                 let mut cache = self
                     .diagnostics
@@ -1763,6 +1813,10 @@ mod tests {
     #[test]
     fn publish_diagnostics_updates_cache_and_generation() {
         let server = test_server();
+        assert!(
+            !server.has_ever_published(),
+            "a fresh connection has heard no publish"
+        );
 
         server.on_notification(
             "textDocument/publishDiagnostics",
@@ -1782,6 +1836,9 @@ mod tests {
         let generations = server.diagnostics_generation.lock().expect("lock");
         assert_eq!(generations.get("file:///test.rs").copied(), Some(1));
         drop(generations);
+
+        // Any publish arms the retrieval evidence bar (bug 99 residual).
+        assert!(server.has_ever_published());
     }
 
     #[test]
@@ -2275,6 +2332,8 @@ mod tests {
             }),
         );
         assert!(!server.publishes_version.load(Ordering::SeqCst));
+        // …but even an unversioned, empty publish is push evidence.
+        assert!(server.has_ever_published());
     }
 
     #[tokio::test]

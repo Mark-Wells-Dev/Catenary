@@ -104,6 +104,24 @@ struct Args {
     #[arg(long)]
     reject_document_symbol: bool,
 
+    /// Reject `textDocument/diagnostic` with `-32601` (method not found) —
+    /// a push-only server with no pull support at all (lua-language-server,
+    /// yaml-language-server). Unlike `--fail-pull` (an internal error from an
+    /// implemented method) this models the method being absent — the wire
+    /// shape the bug-99-family incidents' best-effort probes hit.
+    #[arg(long)]
+    reject_pull: bool,
+
+    /// Publish diagnostics at most once per process: the first
+    /// didOpen/didChange/didSave publish fires, every later one is
+    /// suppressed. Models a push server that does not re-publish an
+    /// unchanged document (the bug-74 shape) but — unlike lattice — also
+    /// answers no pull (pair with `--reject-pull`), so a reopened file stays
+    /// never-heard forever and the retrieval evidence bar must resolve it
+    /// honestly (expiry → `[unverified]`, never `[clean]`).
+    #[arg(long)]
+    publish_once: bool,
+
     /// Only publish diagnostics on `didSave`, not `didOpen`/`didChange`.
     #[arg(long)]
     diagnostics_on_save: bool,
@@ -408,6 +426,10 @@ struct MockServer {
     /// tests). Always `true` when `--die-once-file` is unset; when set, `true`
     /// only for the process that created the marker (the first life).
     die_armed: bool,
+    /// Whether a `--publish-once` publish has already fired (or been
+    /// scheduled, for delayed publishes). Atomic because
+    /// `publish_diagnostics` takes `&self`.
+    published_once: AtomicBool,
 }
 
 impl MockServer {
@@ -460,6 +482,7 @@ impl MockServer {
             definition_failed_once: false,
             workspace_roots: Vec::new(),
             die_armed,
+            published_once: AtomicBool::new(false),
         }
     }
 
@@ -704,6 +727,23 @@ impl MockServer {
                         error: Some(RpcError {
                             code: -32601,
                             message: "textDocument/diagnostic".to_string(),
+                        }),
+                    });
+                    return;
+                }
+                if self.args.reject_pull {
+                    // A push-only server with no pull implementation at all:
+                    // method not found, no side effects (the bug-99-family
+                    // probe shape — lua/yaml-language-server).
+                    self.send_response(&Response {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: None,
+                        error: Some(RpcError {
+                            code: -32601,
+                            message: "mockls: method not found: textDocument/diagnostic \
+                                      (--reject-pull)"
+                                .to_string(),
                         }),
                     });
                     return;
@@ -1949,6 +1989,12 @@ impl MockServer {
     }
 
     fn publish_diagnostics(&self, uri: &str) {
+        // `--publish-once`: only the first publish (or its delayed
+        // scheduling) fires per process — a push server that never
+        // re-publishes an unchanged document.
+        if self.args.publish_once && self.published_once.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let delay = self.args.diagnostics_delay;
         let uri_owned = uri.to_string();
         let writer = self.writer.clone();
@@ -2759,6 +2805,8 @@ mod tests {
             workspace_diagnostics: false,
             fail_pull: false,
             reject_document_symbol: false,
+            reject_pull: false,
+            publish_once: false,
             diagnostics_on_save: false,
             drop_after: None,
             hang_on: vec![],
