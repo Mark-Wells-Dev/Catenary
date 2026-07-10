@@ -18,14 +18,19 @@ name: Conformance
 # version / platform / date); nothing is pushed — the maintainer blesses by
 # committing the conformed entries in the reviewed PR.
 #
-# Platform dimension (misc 164): the matrix runs per-platform. Linux jobs ride
-# the recipes + ci-provision pins; the macOS leg (macos-latest = Apple silicon
-# only, maintainer ruling — macOS 27 is arm-exclusive) rides
-# defaults/ci-provision-macos.toml, the Homebrew-provisionable subset, with
-# every non-provisionable server carrying an explicit skip note there. Each
+# Platform dimension (misc 164): the matrix runs per-platform, and the SAME
+# server list blesses on both. Linux jobs ride the recipes + ci-provision pins;
+# the macOS leg (macos-latest = Apple silicon only, maintainer ruling — macOS 27
+# is arm-exclusive) rides defaults/ci-provision-macos.toml. That leg is
+# brew-primary, but a server with no homebrew-core formula rides its
+# platform-neutral Linux kind, REFERENCED not re-pinned (a `linux-recipe` reuses
+# the Linux npm recipe; `linux-provision` reuses the Linux cargo-git-locked
+# provision), so a Linux pin bump cannot silently diverge — zero skips. Each
 # platform builds its own harness: cargo bakes absolute paths at compile time
 # and the checkout roots differ (/home/runner vs /Users/runner), so the Linux
-# artifact cannot serve a macOS job.
+# artifact cannot serve a macOS job. Blessed rows are platform-qualified
+# (`[blessed.<server>.<platform>]`), so both platforms' candidate rows merge
+# into the ONE committed defaults/blessed-manifest.toml.
 
 "on":
   pull_request:
@@ -488,8 +493,10 @@ jobs:
               *) ver="unknown" ;;
             esac
           fi
+          # Platform-qualified row (misc 164): the linux-x86_64 rows share the
+          # ONE committed blessed-manifest.toml with the macos-arm64 rows.
           cat > "blessed/${{ matrix.server }}.toml" <<EOF
-          [blessed.${{ matrix.server }}]
+          [blessed.${{ matrix.server }}.linux-x86_64]
           version = "$ver"
           platform = "linux-x86_64"
           date = "$(date -u +%Y-%m-%d)"
@@ -504,12 +511,15 @@ jobs:
           path: blessed/${{ matrix.server }}.toml
           retention-days: 7
 
-  # The macOS leg (misc 164): the Homebrew-provisionable subset of the Linux
-  # matrix, on Apple silicon only. Servers with no viable brew path carry an
-  # explicit `skip` stanza in defaults/ci-provision-macos.toml, so this matrix
-  # is honest about what it does not prove. "Clear" on macOS inherits the
-  # Linux legs' honest-red semantics (e.g. the misc 156 cold-bootstrap
-  # ruling), not a literal all-green.
+  # The macOS leg (misc 164): the FULL Linux conformance set, on Apple silicon
+  # only — the same server list blesses on both platforms (maintainer ruling
+  # 2026-07-10). Brew-primary, with a server that has no homebrew-core formula
+  # riding its platform-neutral Linux kind, referenced from
+  # defaults/ci-provision-macos.toml (a `linux-recipe` reuses the Linux npm
+  # recipe; `linux-provision` reuses the Linux cargo-git-locked provision), so
+  # there are zero skips. "Clear" on macOS inherits the Linux legs' honest-red
+  # semantics (e.g. the misc 156 cold-bootstrap ruling), not a literal
+  # all-green.
   conform-macos:
     name: "Conform ${{ matrix.server }} (macOS)"
     needs: [discover, build-macos]
@@ -525,8 +535,18 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: "1"
     steps:
       - uses: actions/checkout@v5
-      # No rustup step: unlike the Linux leg there are no toolchain-riding
-      # provisions here — the whole leg is Homebrew, and no compile happens.
+
+      # The leg is brew-primary, but a server with no homebrew-core formula
+      # rides its platform-neutral Linux kind (misc 164, maintainer ruling
+      # 2026-07-10): `linux-recipe` reuses the Linux npm recipe,
+      # `linux-provision` reuses the Linux cargo-git-locked provision. Only the
+      # cargo-git build (`lattice`) needs a toolchain; brew-only and npm jobs
+      # skip this step, so no compile happens on them.
+      - name: Provision Rust toolchain (cargo-git-locked source build)
+        # `prov_kind` is empty on brew/npm jobs, so only a cargo-git build
+        # (lattice) pulls a toolchain — brew-only and npm jobs skip it.
+        if: matrix.prov_kind == 'cargo-git-locked'
+        run: rustup show
 
       - name: Fetch prebuilt harness
         uses: actions/download-artifact@v8
@@ -542,8 +562,9 @@ jobs:
           chmod +x target/debug/* dist/conformance_harness
 
       # Bottle downloads dominate provisioning time; the cache key rides the
-      # pin file so a stanza edit refreshes it.
+      # pin file so a stanza edit refreshes it. Homebrew jobs only.
       - name: Cache Homebrew downloads
+        if: matrix.kind == 'homebrew'
         uses: actions/cache@v4
         with:
           path: ~/Library/Caches/Homebrew
@@ -554,8 +575,9 @@ jobs:
 
       # Blind-iteration aid (misc 164): a wrong or renamed formula name fails
       # HERE, as a provisioning error with the resolved version echoed —
-      # never as a mysterious conformance red downstream.
+      # never as a mysterious conformance red downstream. Homebrew jobs only.
       - name: Validate formula (${{ matrix.formula }})
+        if: matrix.kind == 'homebrew'
         run: |
           set -euo pipefail
           brew update --quiet
@@ -564,19 +586,23 @@ jobs:
 
       # Same contract as the Linux leg: a server whose diagnostics come from
       # an external tool gets it provisioned so the intentional diagnostic
-      # can publish — via brew, the macOS provisioning surface throughout.
+      # can publish — via brew, the macOS provisioning surface throughout
+      # (elm-language-server and ansible-language-server ride their Linux npm
+      # recipe, but their linter/compiler deps still come from brew).
       # NO ELM_HOME pre-warm, same maintainer ruling as the Linux leg
       # (misc 156): the cold-bootstrap behavior is conformance's to see.
       - name: Provision diagnostic dependencies
         run: |
           set -euo pipefail
           case "${{ matrix.server }}" in
-            bash-language-server) brew install shellcheck ;;
-            elm-language-server)  brew install elm ;;
+            bash-language-server)     brew install shellcheck ;;
+            elm-language-server)      brew install elm ;;
+            ansible-language-server)  brew install ansible-lint ;;
             *) echo "no extra diagnostic dependency for ${{ matrix.server }}" ;;
           esac
 
       - name: Install server via Homebrew (${{ matrix.formula }})
+        if: matrix.kind == 'homebrew'
         run: |
           set -euo pipefail
           brew install "${{ matrix.formula }}"
@@ -592,14 +618,68 @@ jobs:
             echo "$bindir" >> "$GITHUB_PATH"
           fi
 
+      # A neutral-kind `linux-recipe` server: install the pinned npm version by
+      # the SAME mechanics as the Linux leg (fetch the exact tarball, verify OUR
+      # pinned sha512, install the verified artifact with --ignore-scripts). The
+      # macos-latest image ships node. The generator resolved the package /
+      # version / hash from the referenced Linux recipe, so a Linux pin bump
+      # flows through here with no second pin to maintain.
+      - name: Install pinned server (linux-recipe ${{ matrix.server }})
+        if: matrix.kind == 'linux-recipe'
+        run: |
+          set -euo pipefail
+          case "${{ matrix.ecosystem }}" in
+            npm)
+              pkg="${{ matrix.package }}@${{ matrix.version }}"
+              want="${{ matrix.hash }}"
+              tarball="$(npm view "$pkg" dist.tarball)"
+              curl -sSL "$tarball" -o pkg.tgz
+              # BSD base64 (macOS) wraps at 76 cols and has no -w0; strip any
+              # newline so the 88-char SRI digest compares as one line.
+              raw="$(openssl dgst -sha512 -binary pkg.tgz | base64)"
+              actual="sha512-$(printf '%s' "$raw" | tr -d '\n')"
+              if [ -n "$want" ] && [ "$actual" != "$want" ]; then
+                echo "integrity mismatch for $pkg"
+                echo "  expected $want"
+                echo "  actual   $actual"
+                exit 1
+              fi
+              npm install -g --ignore-scripts ./pkg.tgz
+              ;;
+            *)
+              echo "unsupported linux-recipe ecosystem: ${{ matrix.ecosystem }}"
+              exit 1 ;;
+          esac
+
+      # A neutral-kind `linux-provision` server: reuse the referenced Linux
+      # provision's mechanics. The lattice dogfood is `cargo-git-locked` — a
+      # reproducible source build pinned to an exact commit with --locked. The
+      # generator resolved git / rev / version from the referenced Linux stanza.
+      - name: Provision server (linux-provision ${{ matrix.server }})
+        if: matrix.kind == 'linux-provision'
+        run: |
+          set -euo pipefail
+          case "${{ matrix.prov_kind }}" in
+            cargo-git-locked)
+              cargo install --git "${{ matrix.git }}" --locked \
+                --rev "${{ matrix.rev }}" "${{ matrix.server }}"
+              ;;
+            *)
+              echo "unsupported linux-provision kind: ${{ matrix.prov_kind }}"
+              exit 1 ;;
+          esac
+
       # The resolved binary and its version land in the step log, so a
-      # provisioning miss reads as a provisioning miss.
+      # provisioning miss reads as a provisioning miss. `brew list` runs only
+      # for a homebrew job (a neutral-kind job has no formula).
       - name: Echo provisioned binary
         run: |
           set -euo pipefail
           which "${{ matrix.server }}"
           "${{ matrix.server }}" --version || true
-          brew list --versions "${{ matrix.formula }}"
+          if [ "${{ matrix.kind }}" = "homebrew" ]; then
+            brew list --versions "${{ matrix.formula }}"
+          fi
 
       - name: Run conformance harness (${{ matrix.server }})
         env:
@@ -640,15 +720,23 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p blessed
-          # A homebrew stanza carries no version pin (homebrew-core cannot
-          # install a historical version — see ci-provision-macos.toml), so
-          # the honest pin record is the formula version that actually
-          # conformed.
-          ver="$(brew list --versions "${{ matrix.formula }}" \
-            | head -1 | awk '{print $2}')"
+          # The honest pin record depends on the kind. A homebrew stanza carries
+          # no version pin (homebrew-core cannot install a historical version —
+          # see ci-provision-macos.toml), so the conformed version is captured
+          # from the installed formula. A neutral-kind stanza rides the
+          # referenced Linux pin, so its conformed version IS that pin
+          # (matrix.version), recorded exactly.
+          if [ "${{ matrix.kind }}" = "homebrew" ]; then
+            ver="$(brew list --versions "${{ matrix.formula }}" \
+              | head -1 | awk '{print $2}')"
+          else
+            ver="${{ matrix.version }}"
+          fi
           test -n "$ver"
+          # Platform-qualified row (misc 164): the macos-arm64 rows land in the
+          # ONE committed blessed-manifest.toml alongside the linux-x86_64 rows.
           cat > "blessed/${{ matrix.server }}.toml" <<EOF
-          [blessed.${{ matrix.server }}]
+          [blessed.${{ matrix.server }}.macos-arm64]
           version = "$ver"
           platform = "macos-arm64"
           date = "$(date -u +%Y-%m-%d)"
@@ -688,10 +776,13 @@ jobs:
         run: |
           set -euo pipefail
           # Start from the committed manifest's header comment, then append
-          # every entry that conformed green this run. This is a CANDIDATE
-          # artifact for review — nothing is pushed; the maintainer blesses
-          # by committing the conformed entries into
-          # defaults/blessed-manifest.toml in the PR.
+          # every entry that conformed green this run. Each row is now
+          # platform-qualified (`[blessed.<server>.linux-x86_64]`; misc 164), so
+          # a macOS `macos-arm64` row for the same server is a distinct table
+          # path — the two platforms' candidate rows merge into the ONE
+          # blessed-manifest.toml with no schema decision. This is a CANDIDATE
+          # artifact for review — nothing is pushed; the maintainer blesses by
+          # committing the conformed rows into defaults/blessed-manifest.toml.
           out=candidate-blessed-manifest.toml
           sed -n '/^#/p' defaults/blessed-manifest.toml > "$out"
           echo >> "$out"
@@ -701,11 +792,12 @@ jobs:
           done
           # shellcheck disable=SC2016 # literal markdown backticks, no expansion
           {
-            echo '## Candidate blessed-manifest (this run)';
+            echo '## Candidate blessed-manifest — Linux rows (this run)';
             echo '';
-            echo 'Copy the conformed entries below into';
+            echo 'Copy the conformed `linux-x86_64` rows below into';
             echo '`defaults/blessed-manifest.toml` to bless them — nothing';
-            echo 'is pushed automatically.';
+            echo 'is pushed automatically. macOS `macos-arm64` rows arrive in';
+            echo 'the bless-macos job and merge into the SAME file.';
             echo '';
             echo '```toml';
             cat "$out";
@@ -737,38 +829,38 @@ jobs:
           path: entries
           merge-multiple: true
 
-      - name: Assemble candidate manifest
+      - name: Assemble candidate macOS rows
         run: |
           set -euo pipefail
-          # The macOS candidate is a SEPARATE file from the Linux one: the
-          # committed manifest keys one [blessed.<server>] row per server, so
-          # a second platform's rows cannot merge into it without a schema
-          # decision. The maintainer blesses macOS rows by committing this
-          # file (same [blessed.*] shape, platform = "macos-arm64") wherever
-          # that decision lands — nothing is pushed automatically.
-          out=candidate-blessed-manifest-macos.toml
-          sed -n '/^#/p' defaults/blessed-manifest.toml > "$out"
-          echo >> "$out"
+          # macOS rows now merge into the ONE committed blessed-manifest.toml:
+          # rows are platform-qualified (`[blessed.<server>.macos-arm64]`;
+          # misc 164), a distinct table path from the same server's
+          # linux-x86_64 row, so no schema decision is needed. This candidate
+          # carries JUST the macos-arm64 rows (no header — the file already has
+          # one) for the maintainer to append alongside the Linux rows; nothing
+          # is pushed automatically.
+          out=candidate-blessed-rows-macos.toml
+          : > "$out"
           for f in $(find entries -name '*.toml' | sort); do
             cat "$f" >> "$out"
             echo >> "$out"
           done
           # shellcheck disable=SC2016 # literal markdown backticks, no expansion
           {
-            echo '## Candidate blessed-manifest (macOS, this run)';
+            echo '## Candidate blessed-manifest — macOS rows (this run)';
             echo '';
-            echo 'macOS rows are a separate candidate file — nothing is';
-            echo 'pushed automatically; the maintainer blesses by committing';
-            echo 'them (platform = "macos-arm64").';
+            echo 'Append the conformed `macos-arm64` rows below into';
+            echo '`defaults/blessed-manifest.toml` (the SAME file the Linux';
+            echo 'rows land in) to bless them — nothing is pushed.';
             echo '';
             echo '```toml';
             cat "$out";
             echo '```';
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload candidate manifest
+      - name: Upload candidate macOS rows
         uses: actions/upload-artifact@v7
         with:
-          name: candidate-blessed-manifest-macos
-          path: candidate-blessed-manifest-macos.toml
+          name: candidate-blessed-rows-macos
+          path: candidate-blessed-rows-macos.toml
           retention-days: 30

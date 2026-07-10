@@ -3,12 +3,16 @@
 # ever allowed to consult (the suggestion/fix-it surface ships later, in
 # tickets 03/06); recipe DRAFTS (defaults/recipes.toml) never appear here.
 #
-# Format — one `[blessed.<server>]` per conformed server, keyed by the same
-# canonical name as `defaults/servers.toml`:
+# Format — one `[blessed.<server>.<platform>]` per conformed (server, platform),
+# keyed by the same canonical server name as `defaults/servers.toml` and a
+# platform token (`linux-x86_64`, `macos-arm64`). Rows are platform-qualified
+# (misc 164): the same server list blesses on both platforms, so a server carries
+# one row per platform it conformed on, and this ONE committed manifest holds
+# both — there is no per-platform manifest file.
 #
-#   [blessed.<server>]
+#   [blessed.<server>.<platform>]
 #   version  = "1.2.3"            # the exact version that conformed
-#   platform = "linux-x86_64"     # where the conformance job ran
+#   platform = "linux-x86_64"     # where the conformance job ran (= the row key)
 #   date     = "2026-07-07"       # ISO date the green job landed
 #   tier     = "verified-on-linux"  # honesty tier (initial tier; expands on
 #                                    # sightings, decision-030 style)
@@ -34,110 +38,117 @@
 # green, the entire matrix post-sql-ls drop. First run where every server
 # conformed: elm-language-server on a cold ELM_HOME (ungrandfathered), gopls
 # with diagnosticsDelay enforced-absent, ruby-lsp with GEM_HOME provisioned.
+#
+# Platform-qualified rows (misc 164, 2026-07-10): the row key gained a platform
+# segment (`[blessed.<server>.<platform>]`) so the macOS leg's `macos-arm64`
+# rows land in this same file alongside the Linux `linux-x86_64` rows. The 18
+# rows below are the mechanical migration of the full-matrix blessing above —
+# every field unchanged, the header re-qualified. macOS rows are appended by
+# committing the macos bless job's candidate entries.
 
-[blessed.ansible-language-server]
+[blessed.ansible-language-server.linux-x86_64]
 version = "26.6.0"
 platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
-[blessed.bash-language-server]
+[blessed.bash-language-server.linux-x86_64]
 version = "5.6.0"
 platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
-[blessed.clangd]
+[blessed.clangd.linux-x86_64]
 version = "Ubuntu clangd version 18.1.3 (1ubuntu1)"
 platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
-[blessed.docker-langserver]
+[blessed.docker-langserver.linux-x86_64]
 version = "0.15.0"
 platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
-[blessed.elm-language-server]
+[blessed.elm-language-server.linux-x86_64]
 version = "2.8.0"
 platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
-[blessed.gopls]
+[blessed.gopls.linux-x86_64]
 version = "v0.22.0"
 platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
-[blessed.intelephense]
+[blessed.intelephense.linux-x86_64]
 version = "1.18.5"
 platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
-[blessed.lattice]
+[blessed.lattice.linux-x86_64]
 version = "0.4.0"
 platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
-[blessed.lua-language-server]
+[blessed.lua-language-server.linux-x86_64]
 version = "3.18.2"
 platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
-[blessed.pyright-langserver]
+[blessed.pyright-langserver.linux-x86_64]
 version = "1.1.411"
 platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
-[blessed.ruby-lsp]
+[blessed.ruby-lsp.linux-x86_64]
 version = "0.26.10"
 platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
-[blessed.rust-analyzer]
+[blessed.rust-analyzer.linux-x86_64]
 version = "rust-analyzer 1.95.0 (5980761 2026-04-14)"
 platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
-[blessed.svelteserver]
+[blessed.svelteserver.linux-x86_64]
 version = "0.18.3"
 platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
-[blessed.taplo]
+[blessed.taplo.linux-x86_64]
 version = "0.10.0"
 platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
-[blessed.vscode-css-language-server]
+[blessed.vscode-css-language-server.linux-x86_64]
 version = "4.10.0"
 platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
-[blessed.vscode-html-language-server]
+[blessed.vscode-html-language-server.linux-x86_64]
 version = "4.10.0"
 platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
-[blessed.vscode-json-language-server]
+[blessed.vscode-json-language-server.linux-x86_64]
 version = "4.10.0"
 platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
-[blessed.yaml-language-server]
+[blessed.yaml-language-server.linux-x86_64]
 version = "1.23.0"
 platform = "linux-x86_64"
 date = "2026-07-09"

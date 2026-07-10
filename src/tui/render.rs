@@ -1704,8 +1704,9 @@ mod tests {
             runtime: None,
         };
         let mut manifest = BlessedManifest::default();
-        manifest.blessed.insert(
-            "taplo".to_string(),
+        let mut per_platform = std::collections::BTreeMap::new();
+        per_platform.insert(
+            "linux-x86_64".to_string(),
             BlessedEntry {
                 version: "0.10.0".to_string(),
                 platform: "linux-x86_64".to_string(),
@@ -1713,6 +1714,7 @@ mod tests {
                 tier: None,
             },
         );
+        manifest.blessed.insert("taplo".to_string(), per_platform);
         let blessed = BlessedRecipe::resolve("taplo", &recipe, &manifest).expect("blessed");
         let plan = InstallPlan::resolve(&blessed).expect("plan");
         let state = InstallState::new("taplo".to_string(), Ok(plan));

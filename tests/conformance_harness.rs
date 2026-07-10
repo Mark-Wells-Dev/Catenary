@@ -808,14 +808,16 @@ fn matrix_and_cases_have_no_drift() {
 /// The macOS platform leg's honesty guard (misc 164):
 /// `defaults/ci-provision-macos.toml` must PARTITION the Linux-conformed set.
 /// Every server the Linux matrix conforms appears there exactly once — either
-/// brew-provisioned (`kind = "homebrew"` + `formula`) or an explicit
-/// `skip = true` with an honest `note` — so a server the macOS matrix does not
-/// prove is never silently absent, and no stanza names a server the Linux
-/// matrix does not run. `tools/conformance_matrix.py --platform macos` applies
-/// the identical check in the discover job, so the guard and the CI matrix
-/// agree by construction (the drift-guard idiom above). Every macOS-provisioned
-/// server has a `CASES` entry for free: this set is a subset of the conformed
-/// set, which [`matrix_and_cases_have_no_drift`] already covers.
+/// brew-provisioned (`kind = "homebrew"` + `formula`), a neutral-kind reference
+/// (`linux-recipe` / `linux-provision`) that resolves against the Linux source,
+/// or an explicit `skip = true` with an honest `note` — so a server the macOS
+/// matrix does not prove is never silently absent, and no stanza names a server
+/// the Linux matrix does not run. `tools/conformance_matrix.py --platform macos`
+/// applies the identical check in the discover job, so the guard and the CI
+/// matrix agree by construction (the drift-guard idiom above). Every
+/// macOS-provisioned server has a `CASES` entry for free: this set is a subset
+/// of the conformed set, which [`matrix_and_cases_have_no_drift`] already
+/// covers.
 #[test]
 fn macos_provisioning_partitions_the_conformed_set() {
     use std::collections::BTreeSet;
@@ -840,8 +842,9 @@ fn macos_provisioning_partitions_the_conformed_set() {
     assert!(
         silently_absent.is_empty(),
         "macOS platform drift: these Linux-conformed servers are silently absent from \
-         defaults/ci-provision-macos.toml (add a homebrew stanza, or an explicit \
-         `skip = true` with a note): {silently_absent:?}"
+         defaults/ci-provision-macos.toml (add a homebrew stanza, a \
+         linux-recipe/linux-provision reference, or an explicit `skip = true` with a \
+         note): {silently_absent:?}"
     );
     let orphans: Vec<&String> = macos.difference(&conformed).collect();
     assert!(
@@ -864,23 +867,43 @@ fn macos_provisioning_partitions_the_conformed_set() {
             assert!(
                 !note.trim().is_empty(),
                 "macOS skip for `{name}` carries no honest `note` — an exclusion must \
-                 state why there is no viable brew provisioning path"
+                 state why there is no viable provisioning path"
             );
-        } else {
-            assert_eq!(
-                stanza.get("kind").and_then(toml::Value::as_str),
-                Some("homebrew"),
-                "macOS provision `{name}` must be `kind = \"homebrew\"` — the macOS leg \
-                 provisions via Homebrew only (maintainer ruling, misc 164)"
-            );
-            let formula = stanza
-                .get("formula")
-                .and_then(toml::Value::as_str)
-                .unwrap_or("");
-            assert!(
-                !formula.trim().is_empty(),
-                "macOS provision `{name}` names no `formula`"
-            );
+            continue;
+        }
+        let kind = stanza.get("kind").and_then(toml::Value::as_str);
+        assert!(
+            matches!(kind, Some("homebrew" | "linux-recipe" | "linux-provision")),
+            "macOS provision `{name}` has kind `{kind:?}` — must be one of \
+             \"homebrew\" / \"linux-recipe\" / \"linux-provision\" (maintainer ruling, \
+             misc 164)"
+        );
+        match kind {
+            Some("homebrew") => {
+                let formula = stanza
+                    .get("formula")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or("");
+                assert!(
+                    !formula.trim().is_empty(),
+                    "macOS provision `{name}` names no `formula`"
+                );
+            }
+            // A neutral-kind stanza REFERENCES this server's Linux source so a
+            // Linux pin bump cannot diverge; the reference is the stanza key.
+            Some("linux-recipe") => assert!(
+                recipes.contains_key(name),
+                "macOS provision `{name}` is `linux-recipe` but names no recipe in \
+                 defaults/recipes.toml"
+            ),
+            // The only remaining valid kind (the assert above ruled out any
+            // other), so no catch-all `panic!` arm is needed (`clippy::panic` is
+            // denied in this test file).
+            _ => assert!(
+                provisions.contains_key(name),
+                "macOS provision `{name}` is `linux-provision` but names no stanza in \
+                 defaults/ci-provision.toml"
+            ),
         }
     }
 }

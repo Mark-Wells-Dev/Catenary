@@ -111,8 +111,8 @@ const FETCHED_AT_FILE: &str = "fetched_at";
 /// The registry payload: the recipes and the blessed-manifest, together.
 ///
 /// On the wire this is a single TOML document with `[recipe.<name>]` and
-/// `[blessed.<name>]` tables — the two data sets [`crate::recipes`] ships as
-/// separate embedded files, bundled into one signed artifact.
+/// `[blessed.<name>.<platform>]` tables — the two data sets [`crate::recipes`]
+/// ships as separate embedded files, bundled into one signed artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryPayload {
     /// CI-internal install recipes keyed by canonical server name.
@@ -185,13 +185,17 @@ pub fn seed_payload() -> Result<RegistryPayload> {
 
 // ── payload parsing ──────────────────────────────────────────────────
 
-/// Parse target for the combined registry document (`[recipe.*]` + `[blessed.*]`).
+/// Parse target for the combined registry document (`[recipe.*]` +
+/// `[blessed.*.<platform>]`).
+///
+/// Blessed rows are platform-qualified (server → platform → entry; misc 164),
+/// matching [`crate::recipes::BlessedManifest`].
 #[derive(Debug, Default, serde::Deserialize)]
 struct RegistryDoc {
     #[serde(default)]
     recipe: BTreeMap<String, InstallRecipe>,
     #[serde(default)]
-    blessed: BTreeMap<String, BlessedEntry>,
+    blessed: BTreeMap<String, BTreeMap<String, BlessedEntry>>,
 }
 
 /// Parse a signed registry payload's bytes into a [`RegistryPayload`].
@@ -634,14 +638,14 @@ mod tests {
         key.sign(payload).to_bytes().to_vec()
     }
 
-    /// A payload document with one recipe and one blessed entry.
+    /// A payload document with one recipe and one platform-qualified blessed row.
     const SAMPLE: &str = "[recipe.taplo]\n\
                           ecosystem = \"cargo\"\n\
                           package = \"taplo-cli\"\n\
                           version = \"0.10.0\"\n\
                           tier = \"cargo-locked\"\n\
                           draft = true\n\n\
-                          [blessed.taplo]\n\
+                          [blessed.taplo.linux-x86_64]\n\
                           version = \"0.10.0\"\n\
                           platform = \"linux-x86_64\"\n\
                           date = \"2026-07-07\"\n";
@@ -718,7 +722,10 @@ mod tests {
         let payload = parse_payload(SAMPLE.as_bytes()).expect("sample parses");
         assert!(payload.recipes.contains_key("taplo"));
         assert!(payload.manifest.blessed.contains_key("taplo"));
-        assert_eq!(payload.manifest.blessed["taplo"].version, "0.10.0");
+        assert_eq!(
+            payload.manifest.blessed["taplo"]["linux-x86_64"].version,
+            "0.10.0"
+        );
     }
 
     #[test]
@@ -936,7 +943,7 @@ mod tests {
         #[derive(serde::Serialize)]
         struct Doc<'a> {
             recipe: &'a BTreeMap<String, InstallRecipe>,
-            blessed: &'a BTreeMap<String, BlessedEntry>,
+            blessed: &'a BTreeMap<String, BTreeMap<String, BlessedEntry>>,
         }
         let seed = seed_payload().expect("seed");
         let text = toml::to_string(&Doc {

@@ -1255,8 +1255,9 @@ mod tests {
 
     fn blessed_manifest(server: &str, version: &str) -> BlessedManifest {
         let mut m = BlessedManifest::default();
-        m.blessed.insert(
-            server.to_string(),
+        let mut per_platform = BTreeMap::new();
+        per_platform.insert(
+            "linux-x86_64".to_string(),
             BlessedEntry {
                 version: version.to_string(),
                 platform: "linux-x86_64".to_string(),
@@ -1264,6 +1265,7 @@ mod tests {
                 tier: None,
             },
         );
+        m.blessed.insert(server.to_string(), per_platform);
         m
     }
 

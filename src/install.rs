@@ -77,20 +77,19 @@ impl BlessedRecipe {
     /// Resolve a blessed recipe for `server`, or `None` when the blessing gate is
     /// not satisfied.
     ///
-    /// Returns `Some` only when `manifest` carries a `[blessed.<server>]` entry
-    /// whose `version` equals `recipe.version`. Any other case — no entry, or an
-    /// entry pinning a different version than the recipe — yields `None`, so the
-    /// action is never offered for an unblessed or drifted recipe.
+    /// Returns `Some` only when `manifest` carries a `[blessed.<server>.<platform>]`
+    /// entry — on ANY platform — whose `version` equals `recipe.version`. Any other
+    /// case — no entry, or every entry pinning a different version than the recipe
+    /// — yields `None`, so the action is never offered for an unblessed or drifted
+    /// recipe. Offerability is version-matched, not platform-matched (misc 164): a
+    /// pin that conformed on any platform clears the gate.
     #[must_use]
     pub fn resolve(
         server: &str,
         recipe: &InstallRecipe,
         manifest: &BlessedManifest,
     ) -> Option<Self> {
-        let blessed = manifest.blessed.get(server)?;
-        if blessed.version != recipe.version {
-            return None;
-        }
+        let blessed = manifest.entry_at_version(server, &recipe.version)?;
         Some(Self {
             server: server.to_owned(),
             recipe: recipe.clone(),
@@ -929,8 +928,9 @@ mod tests {
 
     fn manifest(server: &str, version: &str) -> BlessedManifest {
         let mut m = BlessedManifest::default();
-        m.blessed.insert(
-            server.to_owned(),
+        let mut per_platform = std::collections::BTreeMap::new();
+        per_platform.insert(
+            "linux-x86_64".to_owned(),
             BlessedEntry {
                 version: version.to_owned(),
                 platform: "linux-x86_64".to_owned(),
@@ -938,6 +938,7 @@ mod tests {
                 tier: Some("verified-on-linux".to_owned()),
             },
         );
+        m.blessed.insert(server.to_owned(), per_platform);
         m
     }
 

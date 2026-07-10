@@ -592,26 +592,58 @@ pub fn conformance_exempt_names(
     from_recipes.chain(from_provisions).collect()
 }
 
-/// One blessed server entry: a server that passed the CI conformance gate.
+/// One blessed server entry: a server that passed the CI conformance gate on one
+/// platform.
+///
+/// Rows are platform-qualified (`[blessed.<server>.<platform>]`; misc 164): the
+/// same server list blesses on Linux and macOS, so a server can carry one entry
+/// per platform it conformed on. The [`Self::platform`] field is redundant with
+/// the row's platform key and kept as the row's self-description (the CI emit
+/// jobs write it verbatim).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlessedEntry {
     /// The exact version that conformed.
     pub version: String,
-    /// The platform the conformance job ran on (e.g. `linux-x86_64`).
+    /// The platform the conformance job ran on (e.g. `linux-x86_64`,
+    /// `macos-arm64`) — equal to the row's platform key.
     pub platform: String,
     /// The ISO-8601 date the conformance job passed.
     pub date: String,
-    /// The honesty tier of the claim (initial tier: `verified-on-linux`).
+    /// The honesty tier of the claim (e.g. `verified-on-linux`,
+    /// `verified-on-macos`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
 }
 
-/// The committed blessed-manifest: server → conformed record.
+/// The committed blessed-manifest: server → platform → conformed record.
+///
+/// Rows are platform-qualified (`[blessed.<server>.<platform>]`; misc 164), so
+/// one server may carry an entry per platform it conformed on (e.g. a
+/// `linux-x86_64` and a `macos-arm64` row). The one committed manifest holds both
+/// platforms — there is no per-platform manifest file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlessedManifest {
-    /// Blessed entries keyed by canonical server name.
+    /// Blessed entries keyed by canonical server name, then by platform token.
     #[serde(default)]
-    pub blessed: BTreeMap<String, BlessedEntry>,
+    pub blessed: BTreeMap<String, BTreeMap<String, BlessedEntry>>,
+}
+
+impl BlessedManifest {
+    /// A blessed entry for `server` at exactly `version`, on any platform, or
+    /// `None`.
+    ///
+    /// Offerability is version-matched, not platform-matched: a recipe pin that
+    /// conformed on *any* platform clears the blessing gate (misc 164 — the same
+    /// server list blesses on both platforms). When several platform rows share
+    /// the version, the first by platform-key order is returned (deterministic;
+    /// the entries differ only in `platform`/`date`/`tier`, all honest).
+    #[must_use]
+    pub fn entry_at_version(&self, server: &str, version: &str) -> Option<&BlessedEntry> {
+        self.blessed
+            .get(server)?
+            .values()
+            .find(|entry| entry.version == version)
+    }
 }
 
 /// Parse a blessed-manifest TOML document.
@@ -773,11 +805,19 @@ mod tests {
             "manifest round-trips"
         );
         // Every present entry (if any) carries the required fields — enforced by
-        // the type, asserted here for the honesty tier.
-        for (name, entry) in &manifest.blessed {
-            assert!(!entry.version.is_empty(), "`{name}` version");
-            assert!(!entry.platform.is_empty(), "`{name}` platform");
-            assert!(!entry.date.is_empty(), "`{name}` date");
+        // the type, asserted here for the honesty tier. Rows are
+        // platform-qualified (server → platform → entry; misc 164), and each
+        // entry's `platform` field equals its row's platform key.
+        for (name, per_platform) in &manifest.blessed {
+            for (platform, entry) in per_platform {
+                assert!(!entry.version.is_empty(), "`{name}` [{platform}] version");
+                assert!(!entry.platform.is_empty(), "`{name}` [{platform}] platform");
+                assert!(!entry.date.is_empty(), "`{name}` [{platform}] date");
+                assert_eq!(
+                    &entry.platform, platform,
+                    "`{name}` row key must equal its `platform` field"
+                );
+            }
         }
     }
 

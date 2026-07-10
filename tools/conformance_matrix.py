@@ -22,17 +22,25 @@ mechanically — never invented) is SKIPPED with a stderr note: it cannot be
 installed, so emitting it would create a guaranteed-red job that blocks blessing.
 
 The platform dimension (misc 164): `--platform linux` (the default) emits the
-matrix above; `--platform macos` emits the Homebrew leg from
-`defaults/ci-provision-macos.toml` instead:
+matrix above; `--platform macos` emits the macOS leg from
+`defaults/ci-provision-macos.toml` instead. The macOS leg is brew-primary, but a
+server with no homebrew-core formula rides its platform-neutral Linux kind,
+REFERENCED (not re-pinned) so a Linux pin bump cannot diverge — the generator
+resolves the reference against recipes.toml / ci-provision.toml when emitting the
+entry:
 
-    macos:     { server, source, kind, formula, bin }
+    macos homebrew:        { server, source, kind, formula, bin }
+    macos linux-recipe:    { server, source, kind, ecosystem, package, version,
+                             hash }
+    macos linux-provision: { server, source, kind, prov_kind, git, rev, version }
 
 Before emitting, the macOS file is validated as a PARTITION of the
 Linux-conformed set: every server the Linux matrix conforms appears exactly once
-— either `kind = "homebrew"` + `formula`, or an explicit `skip = true` with a
-`note` — so a server the macOS matrix does not prove is never silently absent.
-A violation exits nonzero (the discover job fails loudly); skips are reported on
-stderr. The identical check gates `make check`
+— `kind = "homebrew"` + `formula`, a `linux-recipe` / `linux-provision`
+reference that resolves against the Linux source, or an explicit `skip = true`
+with a `note` — so a server the macOS matrix does not prove is never silently
+absent. A violation exits nonzero (the discover job fails loudly); skips are
+reported on stderr. The identical check gates `make check`
 (tests/conformance_harness.rs `macos_provisioning_partitions_the_conformed_set`).
 
 Scoping (a recipe/provision-touching PR need not re-conform every server):
@@ -117,15 +125,62 @@ def provision_entry(name: str, prov: dict) -> dict:
     }
 
 
-def macos_entry(name: str, prov: dict) -> dict:
-    """One macOS matrix entry (always `source = provision`, `kind = homebrew`)."""
-    return {
+# The three macOS provisioning kinds (misc 164). `homebrew` provisions via a
+# homebrew-core formula; the two neutral kinds REFERENCE this server's Linux
+# source so a Linux pin bump flows through without a second pin to maintain.
+MACOS_HOMEBREW = "homebrew"
+MACOS_LINUX_RECIPE = "linux-recipe"
+MACOS_LINUX_PROVISION = "linux-provision"
+MACOS_KINDS = frozenset({MACOS_HOMEBREW, MACOS_LINUX_RECIPE, MACOS_LINUX_PROVISION})
+
+
+def macos_entry(
+    name: str,
+    prov: dict,
+    recipes: dict[str, dict],
+    provisions: dict[str, dict],
+) -> dict:
+    """One macOS matrix entry.
+
+    A `homebrew` stanza carries the formula/bin directly. A `linux-recipe` or
+    `linux-provision` stanza carries no pin of its own — the reference is this
+    server's key — so the fields the conform-macos install step needs are
+    RESOLVED here from the Linux source (defaults/recipes.toml for a recipe,
+    defaults/ci-provision.toml for a provision). Every key is present (empty
+    where a kind does not use it) so a `matrix.<field>` reference never errors on
+    a job of the other kind, mirroring the Linux matrix.
+    """
+    kind = prov.get("kind", "")
+    entry = {
         "server": name,
         "source": "provision",
-        "kind": prov.get("kind", ""),
-        "formula": prov.get("formula", ""),
-        "bin": prov.get("bin", ""),
+        "kind": kind,
+        "formula": "",
+        "bin": "",
+        "ecosystem": "",
+        "package": "",
+        "version": "",
+        "hash": "",
+        "prov_kind": "",
+        "git": "",
+        "rev": "",
     }
+    if kind == MACOS_HOMEBREW:
+        entry["formula"] = prov.get("formula", "")
+        entry["bin"] = prov.get("bin", "")
+    elif kind == MACOS_LINUX_RECIPE:
+        recipe = recipes[name]
+        entry["ecosystem"] = recipe.get("ecosystem", "")
+        entry["package"] = recipe.get("package", "")
+        entry["version"] = recipe.get("version", "")
+        entry["hash"] = recipe.get("hash", "")
+    elif kind == MACOS_LINUX_PROVISION:
+        source = provisions[name]
+        entry["prov_kind"] = source.get("kind", "")
+        entry["git"] = source.get("git", "")
+        entry["rev"] = source.get("rev", "")
+        entry["version"] = source.get("version", "")
+    return entry
 
 
 def conformed_names(recipes: dict[str, dict], provisions: dict[str, dict]) -> set[str]:
@@ -141,19 +196,27 @@ def conformed_names(recipes: dict[str, dict], provisions: dict[str, dict]) -> se
     return conformed
 
 
-def validate_macos(macos: dict[str, dict], conformed: set[str]) -> list[str]:
+def validate_macos(
+    macos: dict[str, dict],
+    conformed: set[str],
+    recipes: dict[str, dict],
+    provisions: dict[str, dict],
+) -> list[str]:
     """Partition errors: the macOS file must cover the Linux-conformed set exactly.
 
-    Every Linux-conformed server appears exactly once — either provisioned
-    (`kind = "homebrew"` + `formula`) or an explicit `skip = true` with a `note`
-    — so a server the macOS matrix does not prove is never silently absent
-    (misc 164). Mirrors the `make check` guard in tests/conformance_harness.rs.
+    Every Linux-conformed server appears exactly once — brew-provisioned
+    (`kind = "homebrew"` + `formula`), a `linux-recipe` / `linux-provision`
+    reference that resolves against the Linux source, or an explicit
+    `skip = true` with a `note` — so a server the macOS matrix does not prove is
+    never silently absent (misc 164). Mirrors the `make check` guard in
+    tests/conformance_harness.rs.
     """
     errors = []
     for name in sorted(conformed - set(macos)):
         errors.append(
             f"macOS provisioning is silently missing `{name}` — add a homebrew "
-            f"stanza or an explicit `skip = true` with a note"
+            f"stanza, a linux-recipe/linux-provision reference, or an explicit "
+            f"`skip = true` with a note"
         )
     for name in sorted(set(macos) - conformed):
         errors.append(
@@ -164,11 +227,27 @@ def validate_macos(macos: dict[str, dict], conformed: set[str]) -> list[str]:
         if prov.get("skip"):
             if not str(prov.get("note", "")).strip():
                 errors.append(f"macOS skip for `{name}` carries no honest `note`")
-        else:
-            if prov.get("kind") != "homebrew":
-                errors.append(f'macOS provision `{name}` must be kind = "homebrew"')
+            continue
+        kind = prov.get("kind")
+        if kind not in MACOS_KINDS:
+            errors.append(
+                f'macOS provision `{name}` has kind `{kind}` — must be one of '
+                f'"homebrew" / "linux-recipe" / "linux-provision"'
+            )
+        elif kind == MACOS_HOMEBREW:
             if not str(prov.get("formula", "")).strip():
                 errors.append(f"macOS provision `{name}` names no `formula`")
+        elif kind == MACOS_LINUX_RECIPE:
+            if name not in recipes:
+                errors.append(
+                    f"macOS provision `{name}` is `linux-recipe` but names no "
+                    f"recipe in defaults/recipes.toml"
+                )
+        elif kind == MACOS_LINUX_PROVISION and name not in provisions:
+            errors.append(
+                f"macOS provision `{name}` is `linux-provision` but names no "
+                f"stanza in defaults/ci-provision.toml"
+            )
     return errors
 
 
@@ -211,7 +290,9 @@ def main() -> int:
 
     if args.platform == "macos":
         macos = _load(args.macos_provision, "provision")
-        errors = validate_macos(macos, conformed_names(recipes, provisions))
+        errors = validate_macos(
+            macos, conformed_names(recipes, provisions), recipes, provisions
+        )
         if errors:
             for error in errors:
                 print(f"error: {error}", file=sys.stderr)
@@ -226,10 +307,13 @@ def main() -> int:
             if prov.get("skip"):
                 skipped.append((name, str(prov.get("note", "")).strip()))
                 continue
-            include.append(macos_entry(name, prov))
+            include.append(macos_entry(name, prov, recipes, provisions))
         print(json.dumps({"include": include}))
+        brew_jobs = sum(1 for e in include if e["kind"] == MACOS_HOMEBREW)
+        neutral_jobs = len(include) - brew_jobs
         print(
-            f"macOS conformance matrix: {len(include)} job(s) (homebrew)",
+            f"macOS conformance matrix: {len(include)} job(s) "
+            f"({brew_jobs} homebrew, {neutral_jobs} linux-reference)",
             file=sys.stderr,
         )
         for name, note in skipped:
