@@ -361,6 +361,64 @@ fn test_diagnostics_flycheck_multi_round() -> Result<()> {
     Ok(())
 }
 
+/// A straggler flycheck publish from round 1 landing after round 2's
+/// clear-then-open must not overwrite round 2's fresh evidence — the bug-101
+/// heard-stale leg surfacing in-house (the macOS `flycheck_multi_round`
+/// failure, CI run 29091745917: round 2's receipt carried round 1's
+/// line count).
+///
+/// mockls `--flycheck-publish-on-next-open` withholds each didSave-triggered
+/// flycheck publish until the NEXT `didOpen`, writing it immediately after
+/// that open's native publish — the wire-pinned model of an in-flight
+/// round-1 publish (computed against round-1 content, carrying round-1's
+/// document version) landing post-clear and post-open on a loaded runner.
+/// Round 2's own flycheck publish is withheld the same way (no further
+/// didOpen comes), so retrieval reads exactly what the race left in the
+/// cache — no timing anywhere. Pre-fix, the straggler overwrote the fresh
+/// native publish, read as "heard", and the receipt carried "(1 lines)";
+/// the publish staleness gate (publish version < the version last sent for
+/// the URI ⇒ straggler, dropped) keeps the fresh 2-line evidence.
+#[test]
+fn stale_flycheck_publish_from_previous_round_is_gated() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mockc_bin = env!("CARGO_BIN_EXE_mockc");
+    let mut bridge = spawn_mockls(
+        &[
+            "--publish-version",
+            "--advertise-save",
+            "--flycheck-command",
+            mockc_bin,
+            "--flycheck-publish-on-next-open",
+        ],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    // Round 1: opens the 1-line file; its flycheck publish is parked.
+    let _ = bridge.call_diagnostics(file.to_str().context("path")?)?;
+
+    // Rewrite to 2 lines; round 2's didOpen releases the parked round-1
+    // publish right after its own fresh native publish.
+    std::fs::write(&file, "echo changed\necho line3\n")?;
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+
+    assert!(
+        text.contains("mock diagnostic") && text.contains("2 lines"),
+        "round 2's receipt must carry the fresh 2-line evidence, not the \
+         straggler round-1 publish (bug 101 heard-stale leg). Got: {text}"
+    );
+    assert!(
+        !text.contains("(1 lines)"),
+        "the stale round-1 publish must be version-gated, never cached over \
+         fresh evidence. Got: {text}"
+    );
+
+    Ok(())
+}
+
 /// Bug 28: the settle must hold while a flycheck child burns CPU **without** an
 /// open `$/progress` bracket, then report the diagnostic the child publishes.
 ///

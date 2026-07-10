@@ -53,8 +53,16 @@ pub struct LspClient {
     /// Tracks which documents are open on this client and their current
     /// version number. Each client maintains independent versions so
     /// that multi-server dispatch gives each server a clean monotonic
-    /// sequence starting at 1.
+    /// sequence.
     open_documents: HashMap<String, i32>,
+    /// Monotonic per-URI version floor, surviving close/reopen (unlike
+    /// `open_documents`, whose entry drops on close). A reopen issues
+    /// `floor + 1` rather than restarting at 1, so a straggler publish from
+    /// a previous open — an in-flight flycheck result crossing a
+    /// diagnostics-round boundary (bug 101, heard-stale leg) — carries a
+    /// provably older version than the current round's `didOpen`, and the
+    /// publish staleness gate ([`LspServer::note_doc_version`]) drops it.
+    version_floor: HashMap<String, i32>,
     /// Workspace folders added via `didChangeWorkspaceFolders` after
     /// initialization. Tracked for deduplication — repeated
     /// `ensure_clients_for_paths` calls don't re-send additions.
@@ -209,6 +217,7 @@ impl LspClient {
                 parent_id: None,
                 cancel: CancellationToken::new(),
                 open_documents: HashMap::new(),
+                version_floor: HashMap::new(),
                 added_workspace_folders: HashSet::new(),
                 death_strike_counted: false,
             },
@@ -509,6 +518,9 @@ impl LspClient {
         version: i32,
         text: &str,
     ) -> Result<()> {
+        // Arm the publish staleness gate before the notification can produce
+        // a publish (bug 101, heard-stale leg).
+        self.server.note_doc_version(uri, version);
         self.notify(
             "textDocument/didOpen",
             params::did_open(uri, language_id, version, text),
@@ -522,6 +534,9 @@ impl LspClient {
     ///
     /// Returns an error if the notification fails.
     pub async fn did_change(&self, uri: &str, version: i32, text: &str) -> Result<()> {
+        // Arm the publish staleness gate before the notification can produce
+        // a publish (bug 101, heard-stale leg).
+        self.server.note_doc_version(uri, version);
         self.notify(
             "textDocument/didChange",
             params::did_change(uri, version, text),
@@ -1063,21 +1078,28 @@ impl LspClient {
 
     /// Registers an open and returns `(first_open, version)`.
     ///
-    /// First open returns `(true, 1)` — caller sends `didOpen`.
+    /// First open returns `(true, floor + 1)` — caller sends `didOpen`.
     /// Subsequent opens increment the version and return `(false, version)`
-    /// — caller sends `didChange`.
+    /// — caller sends `didChange`. Versions are monotonic per URI across
+    /// close/reopen (the floor survives [`Self::close_tracked_document`]),
+    /// so the publish staleness gate can tell a previous open's straggler
+    /// publish from this open's evidence (bug 101, heard-stale leg).
     pub fn open_document(&mut self, uri: &str) -> (bool, i32) {
         use std::collections::hash_map::Entry;
-        match self.open_documents.entry(uri.to_string()) {
+        let floor = self.version_floor.get(uri).copied().unwrap_or(0);
+        let (first, version) = match self.open_documents.entry(uri.to_string()) {
             Entry::Occupied(mut e) => {
                 *e.get_mut() += 1;
                 (false, *e.get())
             }
             Entry::Vacant(e) => {
-                e.insert(1);
-                (true, 1)
+                let version = floor.saturating_add(1);
+                e.insert(version);
+                (true, version)
             }
-        }
+        };
+        self.version_floor.insert(uri.to_string(), version);
+        (first, version)
     }
 
     /// Closes a document while the caller holds the lock.
@@ -1408,6 +1430,38 @@ mod tests {
         let (first, version) = client.open_document("file:///b.rs");
         assert!(first, "first open of different URI should return true");
         assert_eq!(version, 1);
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reopen_after_close_continues_version_sequence() -> Result<()> {
+        // Versions are monotonic per URI ACROSS close/reopen (bug 101,
+        // heard-stale leg): a reopen issues floor + 1, never restarts at 1,
+        // so a straggler publish from the previous open carries a provably
+        // older version than the current round's didOpen and the publish
+        // staleness gate can drop it.
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+
+        let (first, version) = client.open_document("file:///a.rs");
+        assert!(first);
+        assert_eq!(version, 1);
+        let (first, version) = client.open_document("file:///a.rs");
+        assert!(!first);
+        assert_eq!(version, 2);
+
+        client.close_tracked_document("file:///a.rs").await;
+        assert!(!client.is_document_open("file:///a.rs"));
+
+        // Reopen: a fresh didOpen (first == true) but the version continues
+        // the sequence rather than restarting at 1.
+        let (first, version) = client.open_document("file:///a.rs");
+        assert!(first, "reopen after close is a fresh didOpen");
+        assert_eq!(
+            version, 3,
+            "the version floor survives close — reopen continues the sequence"
+        );
 
         client.shutdown().await?;
         Ok(())

@@ -172,6 +172,13 @@ pub struct LspServer {
     pub(crate) diagnostics: DiagnosticsCache,
     pub(crate) diagnostics_generation: Arc<Mutex<HashMap<String, u64>>>,
     pub(crate) diagnostics_notify: Arc<Notify>,
+    /// Latest document version this side has sent per URI
+    /// (`didOpen`/`didChange`), monotonic across close/reopen — the
+    /// reference point for the publish staleness gate (bug 101, heard-stale
+    /// leg): a version-carrying `publishDiagnostics` computed against an
+    /// older version than the one last sent is a straggler from a previous
+    /// round, and caching it would overwrite fresher evidence.
+    doc_versions: Mutex<HashMap<String, i32>>,
 
     // ── Capability discovery ──────────────────────────────────────
     pub(crate) capability_notify: Arc<Notify>,
@@ -275,6 +282,7 @@ impl LspServer {
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
             diagnostics_generation: Arc::new(Mutex::new(HashMap::new())),
             diagnostics_notify: Arc::new(Notify::new()),
+            doc_versions: Mutex::new(HashMap::new()),
             capability_notify: Arc::new(Notify::new()),
             progress: Arc::new(Mutex::new(ProgressTracker::new())),
             progress_notify: Arc::new(Notify::new()),
@@ -813,6 +821,30 @@ impl LspServer {
             .map(catenary_proc::TreeMonitor::sample)
     }
 
+    // ── Document versions (publish staleness gate) ────────────────
+
+    /// Records the latest document version sent to the server for `uri`
+    /// (`didOpen`/`didChange`) — the reference point for the publish
+    /// staleness gate (bug 101, heard-stale leg). Callers issue versions
+    /// monotonically per URI across close/reopen
+    /// ([`super::client::LspClient::open_document`]), so "older than this"
+    /// identifies a straggler from a previous round.
+    pub(crate) fn note_doc_version(&self, uri: &str, version: i32) {
+        self.doc_versions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(uri.to_string(), version);
+    }
+
+    /// The latest document version sent for `uri`, if any.
+    fn doc_version(&self, uri: &str) -> Option<i32> {
+        self.doc_versions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(uri)
+            .copied()
+    }
+
     // ── Dispatch methods (moved from ServerInbox) ─────────────────
 
     /// Handles a server notification (no response needed).
@@ -841,8 +873,29 @@ impl LspServer {
 
                 // Any publish on this connection is proof of push capability —
                 // it arms the retrieval evidence bar for never-heard files
-                // (bug 99 residual / misc 156).
+                // (bug 99 residual / misc 156). A stale publish (below) still
+                // counts: staleness disqualifies the content, not the channel.
                 self.ever_published.store(true, Ordering::SeqCst);
+
+                // Publish staleness gate (bug 101, heard-stale leg): a publish
+                // computed against an OLDER document version than the one last
+                // sent for this URI is a straggler from a previous round —
+                // e.g. an in-flight flycheck result for content that has since
+                // been rewritten, landing after the next round's
+                // clear-then-open. Caching it would overwrite fresher evidence
+                // and read as "heard" for content the server never analyzed,
+                // so the receipt would carry the stale shape (the macOS
+                // flycheck_multi_round incident, CI run 29091745917). Dropped
+                // before the cache; version-less publishes are untouched.
+                if let (Some(published), Some(current)) = (version, self.doc_version(uri))
+                    && published < current
+                {
+                    debug!(
+                        "Dropping stale publishDiagnostics for {uri}: \
+                         version {published} < current {current}",
+                    );
+                    return;
+                }
 
                 let mut cache = self
                     .diagnostics
@@ -1839,6 +1892,77 @@ mod tests {
 
         // Any publish arms the retrieval evidence bar (bug 99 residual).
         assert!(server.has_ever_published());
+    }
+
+    #[test]
+    fn stale_versioned_publish_is_gated_fresh_survives() {
+        // The publish staleness gate (bug 101, heard-stale leg): a publish
+        // carrying an older version than the one last sent for the URI is a
+        // straggler from a previous round — dropped before the cache, so it
+        // can never overwrite fresher evidence or read as "heard" for
+        // content the server never analyzed. It still proves push
+        // capability (`has_ever_published`).
+        let server = test_server();
+        let uri = "file:///test.rs";
+        server.note_doc_version(uri, 2);
+
+        // Fresh publish (version matches the last-sent version): cached.
+        server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({
+                "uri": uri,
+                "version": 2,
+                "diagnostics": [{"message": "fresh", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}}]
+            }),
+        );
+
+        // Straggler from the previous round (version 1 < 2): dropped.
+        server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({
+                "uri": uri,
+                "version": 1,
+                "diagnostics": [{"message": "stale", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}}]
+            }),
+        );
+
+        let cache = server.diagnostics.lock().expect("lock");
+        let (version, diags) = cache.get(uri).expect("fresh entry survives");
+        assert_eq!(*version, Some(2), "the fresh publish's version is kept");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0]["message"], "fresh",
+            "the straggler must not overwrite the fresh evidence"
+        );
+        drop(cache);
+
+        // The generation bumped once — the straggler never reached the cache.
+        let generations = server.diagnostics_generation.lock().expect("lock");
+        assert_eq!(generations.get(uri).copied(), Some(1));
+        drop(generations);
+
+        // Staleness disqualifies the content, not the channel.
+        assert!(server.has_ever_published());
+    }
+
+    #[test]
+    fn versionless_publish_is_never_gated() {
+        // Version-less publishes (most servers) carry no staleness evidence
+        // — the gate must not touch them even when a version was sent.
+        let server = test_server();
+        let uri = "file:///test.rs";
+        server.note_doc_version(uri, 5);
+
+        server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({
+                "uri": uri,
+                "diagnostics": [{"message": "no version", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}}]
+            }),
+        );
+
+        let cached = server.diagnostics.lock().expect("lock").contains_key(uri);
+        assert!(cached, "a version-less publish is cached as before");
     }
 
     #[test]

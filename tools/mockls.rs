@@ -244,6 +244,18 @@ struct Args {
     #[arg(long)]
     flycheck_no_progress: bool,
 
+    /// Withhold each flycheck publish until the NEXT `textDocument/didOpen`,
+    /// writing it immediately after that open's own native publish (bug 101,
+    /// heard-stale leg — the macOS `flycheck_multi_round` incident, CI run
+    /// 29091745917). Pins the racing shape deterministically: a round-1
+    /// flycheck publish — computed against round-1 content, carrying round-1's
+    /// version — lands after round 2's clear-then-open and after round 2's
+    /// fresh native publish, exactly where a loaded runner's in-flight
+    /// straggler lands. Both writes happen on the main loop thread, so the
+    /// wire order (fresh first, straggler second) needs no timing at all.
+    #[arg(long)]
+    flycheck_publish_on_next_open: bool,
+
     /// Scan workspace roots on initialize and workspace folder changes.
     /// Indexes all text files into `documents`, making them visible to
     /// `workspace/symbol` without a prior `didOpen`.
@@ -399,6 +411,18 @@ impl Write for SharedVecWriter {
     }
 }
 
+/// A flycheck publish withheld by `--flycheck-publish-on-next-open`,
+/// captured at `didSave` time and released on the next `didOpen` — the
+/// pinned model of an in-flight straggler publish crossing a
+/// diagnostics-round boundary (bug 101, heard-stale leg).
+struct PendingPublish {
+    uri: String,
+    version: Option<i32>,
+    line_count: usize,
+    open_count: Option<usize>,
+    extra: Vec<Value>,
+}
+
 /// Shared state for the mock server.
 struct MockServer {
     args: Args,
@@ -430,6 +454,10 @@ struct MockServer {
     /// scheduled, for delayed publishes). Atomic because
     /// `publish_diagnostics` takes `&self`.
     published_once: AtomicBool,
+    /// Flycheck publishes parked by `--flycheck-publish-on-next-open`,
+    /// pushed by the flycheck thread and drained by the main loop on the
+    /// next `didOpen`. Shared with the flycheck thread via `Arc`.
+    pending_flycheck_publishes: Arc<Mutex<Vec<PendingPublish>>>,
 }
 
 impl MockServer {
@@ -483,6 +511,7 @@ impl MockServer {
             workspace_roots: Vec::new(),
             die_armed,
             published_once: AtomicBool::new(false),
+            pending_flycheck_publishes: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -868,6 +897,11 @@ impl MockServer {
                         }
                     }
                 }
+                // Release publishes parked by `--flycheck-publish-on-next-open`
+                // AFTER this open's native publish (same thread, so the wire
+                // order is pinned: fresh first, straggler second — bug 101,
+                // heard-stale leg).
+                self.flush_pending_flycheck_publishes();
             }
             "textDocument/didChange" => {
                 if let Some(td) = params.get("textDocument") {
@@ -2160,6 +2194,28 @@ impl MockServer {
         });
     }
 
+    /// Drains and writes the flycheck publishes parked by
+    /// `--flycheck-publish-on-next-open`. Called from the main loop's
+    /// `didOpen` handler after the native publish, so the straggler is
+    /// wire-ordered after the fresh evidence (bug 101, heard-stale leg).
+    fn flush_pending_flycheck_publishes(&self) {
+        let parked: Vec<PendingPublish> = match self.pending_flycheck_publishes.lock() {
+            Ok(mut queue) => queue.drain(..).collect(),
+            Err(_) => return,
+        };
+        for publish in parked {
+            send_diagnostics_notification(
+                &self.writer,
+                &publish.uri,
+                publish.version,
+                publish.line_count,
+                publish.open_count,
+                &publish.extra,
+                false,
+            );
+        }
+    }
+
     /// Simulates flycheck: progress Begin → spawn subprocess → wait →
     /// publish diagnostics → progress End. Runs in a background thread
     /// so the main message loop stays responsive.
@@ -2172,6 +2228,8 @@ impl MockServer {
         let publish_version = self.args.publish_version;
         let flycheck_ticks = self.args.flycheck_ticks;
         let no_progress = self.args.flycheck_no_progress;
+        let withhold = self.args.flycheck_publish_on_next_open;
+        let pending = Arc::clone(&self.pending_flycheck_publishes);
         let line_count = self.documents.get(uri).map_or(0, |c| c.lines().count());
         let open_count = if self.args.report_open_count {
             Some(self.documents.len())
@@ -2233,9 +2291,24 @@ impl MockServer {
 
             // Publish diagnostics after subprocess completes
             if !no_diagnostics {
-                send_diagnostics_notification(
-                    &writer, &uri_owned, version, line_count, open_count, &extra, false,
-                );
+                if withhold {
+                    // `--flycheck-publish-on-next-open`: park the publish;
+                    // the main loop writes it right after the next didOpen's
+                    // native publish (bug 101, heard-stale leg).
+                    if let Ok(mut queue) = pending.lock() {
+                        queue.push(PendingPublish {
+                            uri: uri_owned,
+                            version,
+                            line_count,
+                            open_count,
+                            extra,
+                        });
+                    }
+                } else {
+                    send_diagnostics_notification(
+                        &writer, &uri_owned, version, line_count, open_count, &extra, false,
+                    );
+                }
             }
 
             std::thread::sleep(Duration::from_millis(50));
@@ -2828,6 +2901,7 @@ mod tests {
             log_init_params: None,
             flycheck_ticks: None,
             flycheck_no_progress: false,
+            flycheck_publish_on_next_open: false,
             scan_roots: false,
             no_code_actions: false,
             no_rename: false,
