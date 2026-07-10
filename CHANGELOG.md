@@ -9,7 +9,7 @@ Per-release binaries and auto-generated commit notes are published on the
 file records the curated highlights and, for major releases, the migration
 guidance.
 
-## [2.0.0] - 2026-06-08
+## [2.0.0] - 2026-07-10
 
 2.0.0 stabilizes Catenary as a multi-surface intelligence router: a single
 per-host daemon manages a shared pool of language servers and exposes them
@@ -62,6 +62,51 @@ upgrading.
 
 ### Added
 
+- **macOS on Apple silicon is a supported, conformance-verified
+  platform.** The CI test matrix and the conformance matrix both run a
+  macOS leg to the same green bar as Linux — 18/18 servers on both
+  platforms — with the blessed-server manifest now platform-keyed
+  (`[blessed.<server>.<platform>]`) so a verified row names the platform
+  that earned it: brew-primary provisioning covers the macOS legs, and
+  platform-neutral rows (npm, pip) *reference* the Linux pins rather
+  than duplicating them. Apple silicon only: macOS 27 is
+  Apple-silicon-exclusive (WWDC 2026), so no Intel asset ships and
+  `install.sh` says so instead of installing a binary with no future.
+- **rust-analyzer honors the project's `rust-toolchain.toml` at
+  spawn.** The daemon resolves the root's active toolchain
+  (`rustup show active-toolchain`, cwd = the root) and wraps the spawn
+  in `rustup run <toolchain>`, so proxy-less rustup layouts — Homebrew's
+  rustup ships no `~/.cargo/bin` proxies — stop silently analyzing with
+  the wrong toolchain. Only the bare `rust-analyzer` server key wraps;
+  explicit paths and custom configs are untouched, and a config-set
+  `RUSTUP_TOOLCHAIN` wins on conflict.
+- **The full hook-event surface ships registered.** Claude Code's
+  hooks.json registers 27 of the 30 documented events; events without
+  behavior yet terminate in a reserved no-op shim (drain stdin, exit 0,
+  no daemon), so future features land in the binary without another
+  hooks.json change — every such change is a stale transition, because
+  hosts execute hooks from a frozen, version-keyed plugin cache.
+  Antigravity registers its full five-event surface, answering its
+  JSON-in/JSON-out dialect's empty object. And a marketplace plugin
+  install without the binary now teaches instead of failing opaquely:
+  `SessionStart` answers a `systemMessage` carrying the install
+  one-liner, plus a best-effort desktop notification.
+- **The primer takes a declared client — `catenary primer <client>`.**
+  Hook definitions are hand-crafted per host, so the `SessionStart` hook
+  passes the identity it was installed with; nothing is sniffed from a
+  host name at runtime. A client whose installed hook set carries
+  `WorktreeCreate` (Claude Code) is taught worktree-isolated dispatch:
+  the Agent tool's `isolation: "worktree"` anchors the subagent — the
+  hook creates the worktree and relocates it outside the repo — where a
+  hand-run `catenary worktree add` anchors nothing; `catenary worktree
+  diff` / `land` review and clean up.
+- **Language servers earn revival — and benching.** A per-server strike
+  ledger charges spawn failures, init failures, and crashes, credits
+  served results, and benches a server at three strikes with an honest
+  receipt label (`[broken — never started]`, `[unstable — gave up after
+  repeated crashes]`) instead of a silent respawn loop. The session
+  board and `catenary doctor` surface strikes and benchings; a daemon
+  restart or root retirement clears the slate.
 - **`catenary start` — the missing daemon-lifecycle verb.** The
   counterpart to `stop`: brings the daemon up through the same
   single-instance start path the bridge init uses, idempotently (a
@@ -880,6 +925,36 @@ upgrading.
 
 ### Fixed
 
+- **Diagnostics receipts can no longer render `[clean]` without
+  evidence.** The settle detector's blind spot — a server that
+  acknowledged the save but had not yet *started* analyzing (an internal
+  debounce, a flycheck not yet spawned) — let retrieval answer from a
+  pre-edit cache: a falsified clean at the product's core. Retrieval now
+  waits for publish evidence: a server that has ever published and has
+  not answered for this round arms a work-counted quiet window, and
+  expiry renders `[unverified — returned no result]`, never clean. Two
+  siblings fixed with it: a publish racing the best-effort pull is
+  re-consulted from the cache instead of ignored, and a straggler
+  publish from a *previous* round is version-gated — document versions
+  are now monotonic across close/reopen, so an in-flight stale result
+  can neither overwrite fresh evidence nor read as heard.
+- **The LSP reader no longer risks corrupting its own pipe.** A drain
+  sentinel injected into the server's stdout stream made the daemon the
+  second writer on a pipe it was reading — replaced by a reader-side
+  barrier, guarded by a byte-conservation invariant
+  (`total_read == accounted + buffered`) and a resync that preserves a
+  partially-arrived next-frame header, so one framing error can no
+  longer destroy the next healthy frame.
+- **Hookless `catenary diagnostics` answers honestly.** On a host
+  without hooks, bare invocation with nothing staged is a teaching error
+  (exit 2) naming the scoped form; `catenary diagnostics <path…>` (and
+  `.`) serves the named files with no gate debt to pay. Hooked sessions
+  are unchanged — scoped still pays the debt there.
+- **Doctor's stale-hooks fix-it recommends the command that works.**
+  It used to name the bare plugin reinstall — which re-copies the stale
+  version-cached marketplace content; it now says `catenary install
+  claude`. The Antigravity staleness probe also reads the real install
+  path now (the old probe pointed at a dead path and never fired).
 - **An armed diagnostics gate is never unpayable: a stuck server yields
   an honest receipt, and long settles are observable.** Armed gate +
   one wedged server could lock an agent out of every shell command with
