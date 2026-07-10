@@ -9,6 +9,32 @@ Per-release binaries and auto-generated commit notes are published on the
 file records the curated highlights and, for major releases, the migration
 guidance.
 
+## [2.0.1] - 2026-07-10
+
+Release plumbing for 2.0.0, same day.
+
+### Fixed
+
+- **crates.io publishing works again.** `catenary-proc` bumps to 0.2.0: its
+  API had grown under a frozen, already-published 0.1.1, so `catenary-mcp`'s
+  publish-time verify — which resolves the *published* proc, not the local
+  one — could not compile, and the 2.0.0 crates.io publish failed (the GitHub
+  release was unaffected). A new `make publish-check` gate in
+  `pre-release-check` catches the class before any tag exists.
+- **`catenary update` defers to Homebrew for keg-installed binaries.** A
+  brew-installed catenary (any layout — the keg lives under a `Cellar` dir)
+  now answers `brew upgrade twowells/tap/catenary` instead of swapping a file
+  brew believes it owns.
+
+### Removed
+
+- **The Windows asset.** The 2.0.0 tag build was the first Windows compile
+  since 1.6.1 and proved `catenary-mcp` no longer builds there (the transport
+  is Unix-socket-bound). The shipped surface matches the proven one — the
+  Intel-mac precedent — so no `catenary-windows-amd64.exe` ships; `catenary
+  update` on Windows gets the honest no-prebuilt-binary path. Windows returns
+  behind the transport port.
+
 ## [2.0.0] - 2026-07-10
 
 2.0.0 stabilizes Catenary as a multi-surface intelligence router: a single

@@ -430,7 +430,36 @@ pre-release-check:
 		echo "Error: Local main is not up to date with origin/main."; \
 		exit 1; \
 	fi
+	@$(MAKE) publish-check
 	@echo "Prerequisites OK."
+
+# Verify the crates will publish cleanly BEFORE any tag exists (the v2.0.0
+# crates.io failure: catenary-proc's API grew under a frozen, already-published
+# version, so catenary-mcp's publish-time verify — which resolves the PUBLISHED
+# proc, not the local one — could not compile; the tag-bound publish job was
+# the first place reality could object). Two modes, keyed on whether the local
+# catenary-proc version already exists in the crates.io index:
+#   already published  ->  catenary-mcp must verify against the INDEX
+#                          (cargo publish --dry-run), because the release will
+#                          not publish a new proc first
+#   new version        ->  the release publishes proc first, so the pair is
+#                          verified TOGETHER against the local packaged crates
+#                          (cargo package --workspace) — an index dry-run here
+#                          would false-positive on every legitimate proc bump
+publish-check:
+	@echo "Verifying crates publish cleanly..."
+	@proc_ver=$$(grep -m1 '^version' crates/catenary-proc/Cargo.toml | cut -d'"' -f2); \
+	if curl -fsSL https://index.crates.io/ca/te/catenary-proc | grep -q "\"vers\":\"$$proc_ver\""; then \
+		echo "catenary-proc $$proc_ver is already published — verifying catenary-mcp against the index..."; \
+		if ! cargo publish --dry-run -p catenary-mcp; then \
+			echo "Error: catenary-mcp does not build against the PUBLISHED catenary-proc $$proc_ver."; \
+			echo "Bump catenary-proc's version and the workspace dep spec so the release publishes it first."; \
+			exit 1; \
+		fi; \
+	else \
+		echo "catenary-proc $$proc_ver is new — verifying the workspace package set together..."; \
+		cargo package --workspace; \
+	fi
 
 # Bump version in all files
 bump-version:
