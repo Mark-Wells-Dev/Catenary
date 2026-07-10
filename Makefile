@@ -495,11 +495,15 @@ release-minor: pre-release-check next-minor
 release-major: pre-release-check next-major
 	@$(MAKE) release V=$(V)
 
-# Push tags — CD workflow handles builds, releases, and crates.io publishing.
-# Requires: release commit + tag already created (via make release-*)
+# Push the release — CD workflow handles builds, releases, and crates.io
+# publishing. Requires: release commit + tag already created (via make
+# release-*). Pushes only the CURRENT version's tag: `git push --tags` tried
+# to re-push every historical tag and exited nonzero on ancient local tags
+# whose objects differ from the remote's — after the pushes that mattered had
+# already succeeded (v2.0.0 release papercut).
 publish:
 	@echo "Pushing to origin..."
-	@git push && git push --tags
+	@git push && git push origin "v$(CURRENT_VERSION)"
 	@echo ""
 	@echo "Release v$(CURRENT_VERSION) pushed. CD workflow will build and publish."
 
