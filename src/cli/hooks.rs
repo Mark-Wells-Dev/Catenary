@@ -822,19 +822,25 @@ pub fn run_permission_request(format: HostFormat) {
 /// Reserved no-op shim shared by every hook event registered ahead of its
 /// behavior (full-surface registration, pre-v2 maintainer ruling).
 ///
-/// The entire Claude Code hook-event surface is wired in `hooks.json` so
+/// The entire hook-event surface of each host is wired in its hooks.json so
 /// future behavioral changes land in the binary — which the host already
 /// invokes — without another hooks.json churn (each hooks.json change is a
-/// stale transition requiring `catenary install claude`, because the host runs
+/// stale transition requiring `catenary install <host>`, because the host runs
 /// hooks from a frozen cache copy). Events with no behavior yet terminate
 /// here: drain stdin to EOF and drop it (the host writes the event payload to
 /// the hook's stdin — exiting without draining risks a host-side EPIPE), then
-/// return silently. Hard constraints, since this runs on every event
-/// occurrence: no daemon connection, no output on stdout/stderr, no logging,
-/// and success even on malformed or empty stdin. Observability wiring is
-/// post-v2.
-pub fn run_reserved_shim() {
+/// answer in the host's dialect: Claude Code tolerates silence, so its shims
+/// emit nothing; Antigravity's contract is JSON-in/JSON-out ("hooks … should
+/// return output via stdout as JSON"), so its shims answer the documented
+/// empty object `{}`. Hard constraints, since this runs on every event
+/// occurrence: no daemon connection, no logging, no output beyond the
+/// dialect's empty answer, and success even on malformed or empty stdin.
+/// Observability wiring is post-v2.
+pub fn run_reserved_shim(format: HostFormat) {
     drain_hook_stdin(std::io::stdin().lock());
+    if matches!(format, HostFormat::Antigravity) {
+        print!("{{}}");
+    }
 }
 
 /// Read a hook payload stream to EOF and discard it, returning the number of

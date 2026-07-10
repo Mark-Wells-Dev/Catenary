@@ -23,5 +23,24 @@
         "command": "catenary hook post-agent --format=antigravity"
       }
     ]
+  },
+  "catenary-reserved": {
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "catenary hook post-tool-use --format=antigravity"
+          }
+        ]
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "catenary hook post-invocation --format=antigravity"
+      }
+    ]
   }
 }

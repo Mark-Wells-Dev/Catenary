@@ -598,6 +598,14 @@ enum HookCommand {
         #[arg(long, value_enum)]
         format: HostFormat,
     },
+    /// `PostInvocation` (Antigravity — fires after tool calls finish):
+    /// reserved no-op shim (observability wiring post-v2).
+    #[command(name = "post-invocation")]
+    PostInvocation {
+        /// Output format: "claude" or "antigravity".
+        #[arg(long, value_enum)]
+        format: HostFormat,
+    },
     /// `Notification`: reserved no-op shim (observability wiring post-v2).
     #[command(name = "notification")]
     Notification {
@@ -1103,26 +1111,31 @@ fn main() -> Result<()> {
                     cli::hooks::run_permission_request(format);
                 }
                 // Reserved no-op shims (full-surface registration, pre-v2
-                // ruling): drain stdin, exit 0 — no daemon connection, no
-                // output. Observability wiring is post-v2.
-                HookCommand::Setup { .. }
-                | HookCommand::UserPromptSubmit { .. }
-                | HookCommand::UserPromptExpansion { .. }
-                | HookCommand::PermissionDenied { .. }
-                | HookCommand::PostToolUse { .. }
-                | HookCommand::PostToolUseFailure { .. }
-                | HookCommand::Notification { .. }
-                | HookCommand::TaskCreated { .. }
-                | HookCommand::TaskCompleted { .. }
-                | HookCommand::StopFailure { .. }
-                | HookCommand::TeammateIdle { .. }
-                | HookCommand::InstructionsLoaded { .. }
-                | HookCommand::ConfigChange { .. }
-                | HookCommand::CwdChanged { .. }
-                | HookCommand::PreCompact { .. }
-                | HookCommand::PostCompact { .. }
-                | HookCommand::Elicitation { .. }
-                | HookCommand::ElicitationResult { .. } => cli::hooks::run_reserved_shim(),
+                // ruling): drain stdin, exit 0 — no daemon connection; the
+                // only output is the host dialect's empty answer (Antigravity
+                // gets `{}`, Claude gets silence). Observability wiring is
+                // post-v2.
+                HookCommand::Setup { format }
+                | HookCommand::UserPromptSubmit { format }
+                | HookCommand::UserPromptExpansion { format }
+                | HookCommand::PermissionDenied { format }
+                | HookCommand::PostToolUse { format }
+                | HookCommand::PostToolUseFailure { format }
+                | HookCommand::PostInvocation { format }
+                | HookCommand::Notification { format }
+                | HookCommand::TaskCreated { format }
+                | HookCommand::TaskCompleted { format }
+                | HookCommand::StopFailure { format }
+                | HookCommand::TeammateIdle { format }
+                | HookCommand::InstructionsLoaded { format }
+                | HookCommand::ConfigChange { format }
+                | HookCommand::CwdChanged { format }
+                | HookCommand::PreCompact { format }
+                | HookCommand::PostCompact { format }
+                | HookCommand::Elicitation { format }
+                | HookCommand::ElicitationResult { format } => {
+                    cli::hooks::run_reserved_shim(format);
+                }
             }
             Ok(())
         }
@@ -2701,8 +2714,12 @@ fn check_stale_hooks() {
         check_host("Claude Code", "claude", &hooks_path, CLAUDE_HOOKS_EXPECTED);
     }
 
-    // Antigravity CLI: hooks at ~/.antigravity/hooks.json
-    let antigravity_hooks = home.join(".antigravity/hooks.json");
+    // Antigravity: the plugin dir is the install location (`catenary install
+    // antigravity` writes it; `detect_antigravity` and the context-file
+    // rewrite resolve the same path). The old `~/.antigravity/hooks.json`
+    // probe was a dead path — the not-found arm silently skipped it, so
+    // Antigravity staleness was never actually checked.
+    let antigravity_hooks = home.join(".gemini/config/plugins/catenary/hooks.json");
     check_host(
         "Antigravity CLI",
         "antigravity",
@@ -2929,10 +2946,11 @@ mod tests {
         // The reserved no-op shims (full-surface registration, pre-v2 ruling):
         // every kebab-named event must parse as a `catenary hook` subcommand
         // with the house `--format` flag.
-        const RESERVED_SHIMS: [&str; 18] = [
+        const RESERVED_SHIMS: [&str; 19] = [
             "setup",
             "user-prompt-submit",
             "user-prompt-expansion",
+            "post-invocation",
             "permission-denied",
             "post-tool-use",
             "post-tool-use-failure",
@@ -2988,6 +3006,11 @@ mod tests {
     /// Every hook registration in an embedded hooks.json must parse as a
     /// `catenary hook …` invocation — a registration can never point at a
     /// subcommand the CLI does not have (full-surface registration, pre-v2).
+    ///
+    /// A registration may carry a `|| …` shell fallback after the invocation
+    /// (the `SessionStart` missing-binary bootstrap hint): only the leading
+    /// `catenary hook …` leg is parsed; the fallback is the shell's, not the
+    /// CLI's.
     fn assert_hook_registrations_parse(embedded: &str, label: &str) {
         use clap::Parser;
         let json: serde_json::Value =
@@ -2999,7 +3022,12 @@ mod tests {
             "{label}: no hook commands found in embedded hooks.json"
         );
         for registered in &commands {
-            let argv: Vec<&str> = registered.split_whitespace().collect();
+            let invocation = registered
+                .split("||")
+                .next()
+                .expect("split always yields a first segment")
+                .trim();
+            let argv: Vec<&str> = invocation.split_whitespace().collect();
             let parsed = Args::try_parse_from(&argv);
             assert!(
                 parsed.is_ok(),
@@ -3029,6 +3057,49 @@ mod tests {
         assert_hook_registrations_parse(
             include_str!("../plugins/catenary-antigravity/hooks.json"),
             "Antigravity",
+        );
+    }
+
+    #[test]
+    fn claude_session_start_carries_the_missing_binary_hint() {
+        // A marketplace install without the binary must not fail opaquely:
+        // the SessionStart registration carries a shell fallback that fires
+        // only when the `catenary` invocation itself cannot run
+        // (command-not-found — the hook handler is fail-open and exits 0
+        // whenever the binary exists), answering with a `systemMessage`
+        // teaching the install one-liner plus a best-effort desktop
+        // notification (notify-send, then osascript). The fallback is a
+        // hint, not a bootstrap — the sha256-pinned download-on-first-run
+        // leg is post-release by construction (the pins for a release's
+        // assets cannot exist in the tree the tag points at).
+        let embedded = include_str!("../plugins/catenary/hooks/hooks.json");
+        let json: serde_json::Value =
+            serde_json::from_str(embedded).expect("embedded hooks.json is valid JSON");
+        let mut commands = Vec::new();
+        collect_hook_commands(&json, &mut commands);
+        let session_start = commands
+            .iter()
+            .find(|c| c.contains("session-start"))
+            .expect("SessionStart is registered");
+        for needle in [
+            "|| {",
+            "notify-send",
+            "osascript",
+            "\"systemMessage\"",
+            "install.sh | sh",
+            "start a new session",
+        ] {
+            assert!(
+                session_start.contains(needle),
+                "missing-binary hint lacks {needle:?}: {session_start}"
+            );
+        }
+        // Only SessionStart carries the fallback — every other registration
+        // stays a bare invocation (one teaching surface, no per-event noise).
+        let with_fallback = commands.iter().filter(|c| c.contains("||")).count();
+        assert_eq!(
+            with_fallback, 1,
+            "exactly one registration (SessionStart) carries the fallback"
         );
     }
 

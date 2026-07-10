@@ -11,7 +11,8 @@
 //!
 //! Every event registered ahead of its behavior terminates in
 //! `cli::hooks::run_reserved_shim`, whose contract is: drain stdin to EOF,
-//! print nothing on stdout or stderr, and exit 0 — on well-formed JSON and on
+//! answer in the host dialect's empty form (Claude: silence; Antigravity: the
+//! documented empty object `{}`), and exit 0 — on well-formed JSON and on
 //! garbage alike, with no daemon anywhere in sight (these tests spawn no
 //! bridge; an isolated environment has no socket to reach).
 
@@ -24,12 +25,13 @@ use anyhow::{Context, Result};
 
 use common::isolate_env;
 
-/// Spawn `catenary hook <event> --format=claude` in an isolated environment,
+/// Spawn `catenary hook <event> --format=<format>` in an isolated environment,
 /// feed it `stdin_bytes`, and collect its output.
-fn run_shim(root: &str, event: &str, stdin_bytes: &[u8]) -> Result<Output> {
+fn run_shim(root: &str, event: &str, format: &str, stdin_bytes: &[u8]) -> Result<Output> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     isolate_env(&mut cmd, root);
-    cmd.args(["hook", event, "--format=claude"]);
+    let format_flag = format!("--format={format}");
+    cmd.args(["hook", event, format_flag.as_str()]);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -56,7 +58,7 @@ fn reserved_shims_exit_zero_silently() -> Result<()> {
 
     for event in ["setup", "post-tool-use", "notification", "pre-compact"] {
         for stdin_bytes in [json, garbage, empty] {
-            let out = run_shim(root, event, stdin_bytes)?;
+            let out = run_shim(root, event, "claude", stdin_bytes)?;
             assert!(
                 out.status.success(),
                 "hook {event} must exit 0 (stderr: {})",
@@ -66,6 +68,41 @@ fn reserved_shims_exit_zero_silently() -> Result<()> {
                 out.stdout.is_empty(),
                 "hook {event} must print nothing on stdout (got: {})",
                 String::from_utf8_lossy(&out.stdout),
+            );
+            assert!(
+                out.stderr.is_empty(),
+                "hook {event} must print nothing on stderr (got: {})",
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The Antigravity dialect: its hook contract is JSON-in/JSON-out, so the
+/// same shims answer the documented empty object `{}` on stdout (and nothing
+/// else) — for its two reserved events, on every stdin shape.
+#[test]
+fn antigravity_shims_answer_the_empty_object() -> Result<()> {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path().to_str().expect("tempdir path");
+
+    let json: &[u8] = br#"{"stepIdx":5,"error":"","conversationId":"c1"}"#;
+    let garbage: &[u8] = &[0xFF, 0xFE, b'{', 0x00, b'x'];
+    let empty: &[u8] = b"";
+
+    for event in ["post-tool-use", "post-invocation"] {
+        for stdin_bytes in [json, garbage, empty] {
+            let out = run_shim(root, event, "antigravity", stdin_bytes)?;
+            assert!(
+                out.status.success(),
+                "hook {event} must exit 0 (stderr: {})",
+                String::from_utf8_lossy(&out.stderr),
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "{}",
+                "hook {event} must answer the empty object",
             );
             assert!(
                 out.stderr.is_empty(),
