@@ -52,6 +52,16 @@ fn is_bash_tool(tool_name: &str) -> bool {
     matches!(tool_name, "Bash" | "run_command" | "bash")
 }
 
+/// The display name the skipped-edits note uses for an in-root file no feeder
+/// covers (misc 173): its final path component, falling back to the full path
+/// when there is none.
+fn skipped_display_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
 /// Filesystem-manipulation commands allowed during editing mode.
 ///
 /// These commands modify the filesystem without producing code changes that
@@ -554,25 +564,44 @@ impl HookRouter {
             if self.session.editing.is_editing(session_id, agent_id) {
                 self.record_covered_write(path, session_id, agent_id, "edited");
             }
+        } else if self.session.is_within_roots(path) {
+            // In-root but no covering feeder (misc 173): a different predicate
+            // from out-of-roots — the root IS tracked; the file's type just has
+            // no configured server or linter (`Makefile`, `.txt`, logs).
+            // Recorded in its own bucket with the file's display name so the
+            // bare-run note names what went unchecked instead of claiming the
+            // edit was outside a root it then prints. Same standalone
+            // semantics as the outside leg: the entry is created when needed,
+            // holds no files, and never trips the gate.
+            self.session.editing.record_uncovered_edit(
+                session_id,
+                agent_id,
+                skipped_display_name(path),
+            );
+            debug!(
+                source = Source::HookDispatch.as_str(),
+                file = file_path,
+                "file skipped (in-root, no covering feeder)",
+            );
         } else {
-            // Out-of-root / uncovered edit: `handle_enforce_editing` let it flow
+            // Out-of-root edit: `handle_enforce_editing` let it flow
             // free WITHOUT entering editing mode, so a *standalone* one (no
             // covered edit alongside it) leaves no editing entry for the old
-            // `increment_filtered` to bump — that gap is why a bare `catenary
+            // increment to bump — that gap is why a bare `catenary
             // diagnostics` after only out-of-root edits lied with
             // `[no edited files]` (bug 58 / ephemeral-roots ticket 01).
-            // `record_filtered_edit` creates the entry when needed and carries
+            // `record_outside_edit` creates the entry when needed and carries
             // the enclosing project root (walk repository markers up) for the
             // root-aware note. The entry holds no files, so it never trips the gate and is
             // cleared silently at stop if never diagnosed.
             let root = crate::companions::enclosing_worktree_root(path);
             self.session
                 .editing
-                .record_filtered_edit(session_id, agent_id, root);
+                .record_outside_edit(session_id, agent_id, root);
             debug!(
                 source = Source::HookDispatch.as_str(),
                 file = file_path,
-                "file filtered (no LSP coverage)",
+                "file skipped (outside tracked roots)",
             );
         }
         None
@@ -627,7 +656,8 @@ impl HookRouter {
         agent_id: &str,
     ) {
         let mut started = self.session.editing.is_editing(session_id, agent_id);
-        let mut filtered = 0usize;
+        let mut outside = 0usize;
+        let mut uncovered: Vec<String> = Vec::new();
         for path in writes {
             // Canonicalize (when it exists) before the coverage check so a
             // symlinked prefix does not mis-file a covered write as out-of-root —
@@ -640,20 +670,27 @@ impl HookRouter {
                     started = true;
                 }
                 self.record_covered_write(&path, session_id, agent_id, "wrote");
+            } else if self.session.is_within_roots(&path) {
+                // In-root, no covering feeder (misc 173) — its own bucket,
+                // named, so the note doesn't misattribute it to root coverage.
+                uncovered.push(skipped_display_name(&path));
             } else {
-                filtered += 1;
+                outside += 1;
             }
         }
-        // `increment_filtered` is a no-op until the agent's editing entry
-        // exists, so buffer the count and apply it only once a covered write
-        // has started the entry — independent of write ordering. A command whose
-        // targets are all uncovered starts no entry and reports no filtered
-        // count: there is nothing to drain for this agent.
+        // The skip records are no-ops until the agent's editing entry exists,
+        // so buffer them and apply only once a covered write has started the
+        // entry — independent of write ordering. A command whose targets are
+        // all skipped starts no entry and reports no skipped counts: there is
+        // nothing to drain for this agent.
         if started {
-            for _ in 0..filtered {
+            for _ in 0..outside {
+                self.session.editing.increment_outside(session_id, agent_id);
+            }
+            for name in uncovered {
                 self.session
                     .editing
-                    .increment_filtered(session_id, agent_id);
+                    .record_uncovered_edit(session_id, agent_id, name);
             }
         }
     }
@@ -1157,9 +1194,9 @@ mod tests {
             "uncovered file not accumulated"
         );
         assert_eq!(
-            router.session.editing.filtered(None, ""),
+            router.session.editing.skipped(None, "").outside,
             1,
-            "the standalone out-of-root edit is counted as filtered (bug 58)"
+            "the standalone out-of-root edit is counted as outside (bug 58)"
         );
     }
 
@@ -1183,17 +1220,21 @@ mod tests {
         let _ = router.session.editing.start_editing(None, "");
 
         // File outside workspace roots — should not be accumulated
-        // but should increment filtered counter.
+        // but should land in the outside bucket.
         router.handle_file_accumulation("/outside/some/file.rs", None, "", Some("Edit"));
         let files = router.session.editing.files(None, "");
         assert!(
             files.is_empty(),
             "out-of-root file should not be accumulated"
         );
+        let skipped = router.session.editing.skipped(None, "");
         assert_eq!(
-            router.session.editing.filtered(None, ""),
-            1,
-            "out-of-root edit should increment filtered"
+            skipped.outside, 1,
+            "out-of-root edit should count as outside"
+        );
+        assert_eq!(
+            skipped.uncovered, 0,
+            "out-of-root edit must not land in the in-root uncovered bucket"
         );
     }
 
@@ -2240,7 +2281,8 @@ mod tests {
     fn dispatch_shell_write_mixed_covers_only_the_covered_target() {
         // A command writing both a covered source and an uncovered artifact
         // (`sed -i … src/main.rs && … > out.txt`) accumulates only the covered
-        // target; the uncovered one is filtered, and the debt still gates.
+        // target; the uncovered in-root one lands in the named uncovered
+        // bucket (misc 173), and the debt still gates.
         let (router, root) = test_router_with_root();
         let covered = PathBuf::from(format!("{}/src/main.rs", root.display()));
         let uncovered = PathBuf::from(format!("{}/out.txt", root.display()));
@@ -2262,10 +2304,19 @@ mod tests {
             vec![covered],
             "only the covered target accumulated"
         );
+        let skipped = router.session.editing.skipped(None, "");
         assert_eq!(
-            router.session.editing.filtered(None, ""),
-            1,
-            "the uncovered target is counted as filtered"
+            skipped.uncovered, 1,
+            "the in-root uncovered target lands in the uncovered bucket"
+        );
+        assert!(
+            skipped.uncovered_files.contains("out.txt"),
+            "the uncovered target is recorded by name, got {:?}",
+            skipped.uncovered_files
+        );
+        assert_eq!(
+            skipped.outside, 0,
+            "an in-root artifact is NOT outside tracked roots (misc 173)"
         );
     }
 
@@ -2346,10 +2397,19 @@ mod tests {
             files.is_empty(),
             "non-served in-root edit must not be accumulated"
         );
+        let skipped = router.session.editing.skipped(None, "");
         assert_eq!(
-            router.session.editing.filtered(None, ""),
-            1,
-            "non-served in-root edit should increment the filtered counter"
+            skipped.uncovered, 1,
+            "non-served in-root edit lands in the uncovered bucket"
+        );
+        assert!(
+            skipped.uncovered_files.contains("notes.txt"),
+            "the uncovered file is recorded by name, got {:?}",
+            skipped.uncovered_files
+        );
+        assert_eq!(
+            skipped.outside, 0,
+            "an in-root edit is NOT outside tracked roots (misc 173)"
         );
         router.session.editing.done_editing(None, "");
 

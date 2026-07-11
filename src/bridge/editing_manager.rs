@@ -59,27 +59,55 @@ struct BatchFile {
 /// death the debt is dropped, never spooled (maintainer ruling, bug 79): a fresh
 /// daemon disarms the gate so an unstable daemon cannot lock a session out.
 ///
-/// Holds the covered batch alongside the count of files skipped during
-/// accumulation because they lacked LSP coverage (outside tracked roots), so a
-/// per-agent read reports the requesting agent's own skipped-no-coverage count,
-/// never another agent's (bug 37). Uncovered edits carry no flag: they never
+/// Holds the covered batch alongside the [`SkippedEdits`] buckets — edits
+/// skipped during accumulation because no diagnostic feeder covers them — so a
+/// per-agent read reports the requesting agent's own skipped counts,
+/// never another agent's (bug 37). Skipped edits carry no flag: they never
 /// join the batch and never discard it (bug 58 note behavior unchanged).
 #[derive(Default)]
 struct EditingState {
     /// The current batch: covered files, each with a `delivered` flag.
     files: Vec<BatchFile>,
-    /// Files skipped during accumulation for lack of LSP coverage.
-    filtered: usize,
-    /// Distinct enclosing project roots of the filtered (out-of-root) edits,
-    /// for the root-aware bare-run note (ephemeral-roots ticket 01 / bug 58).
-    /// Empty when a filtered edit had no detectable enclosing project root.
-    filtered_roots: BTreeSet<PathBuf>,
+    /// Edits skipped during accumulation, split by predicate (misc 173).
+    skipped: SkippedEdits,
+}
+
+/// Edits skipped during batch accumulation, split by the two distinct
+/// predicates a receipt must not conflate (misc 173).
+///
+/// Root-containment and feeder-coverage are different facts: an in-root
+/// `Makefile` has no covering server but is NOT outside tracked roots.
+/// Rendering both buckets through one "outside tracked roots" line taught the
+/// wrong lesson — the note named the containing root in the same parenthesis
+/// that claimed the edit was outside it. The buckets ride the diagnostics
+/// handoff and render as two distinct advisory lines on the bare-run receipt.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkippedEdits {
+    /// Edits made outside every tracked workspace root.
+    pub outside: usize,
+    /// Distinct enclosing project roots of the outside edits (walk repository
+    /// markers up from each path), for the root-aware note (ephemeral-roots
+    /// ticket 01 / bug 58). Empty when no outside edit had a detectable root.
+    pub outside_roots: BTreeSet<PathBuf>,
+    /// In-root edits no diagnostic feeder (server or linter) covers.
+    pub uncovered: usize,
+    /// Distinct display names (file names) of the uncovered in-root files, so
+    /// the note can name what went unchecked ("(Makefile)").
+    pub uncovered_files: BTreeSet<String>,
+}
+
+impl SkippedEdits {
+    /// `true` when both buckets are empty — nothing skipped, no note to render.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.outside == 0 && self.uncovered == 0
+    }
 }
 
 impl EditingState {
     /// Whether the batch is complete: non-empty and every file delivered.
     ///
-    /// An empty batch (no covered files — e.g. a filtered-only entry) is *not*
+    /// An empty batch (no covered files — e.g. a skipped-only entry) is *not*
     /// complete, so the next covered edit joins it rather than discarding it.
     fn is_complete(&self) -> bool {
         !self.files.is_empty() && self.files.iter().all(|f| f.delivered)
@@ -239,41 +267,23 @@ impl EditingManager {
             .unwrap_or_default()
     }
 
-    /// Returns the count of files skipped during accumulation for lack of LSP
-    /// coverage, without draining the editing state.
+    /// Returns a snapshot of the agent's skipped-edits buckets (misc 173)
+    /// without draining the editing state.
     ///
     /// Companion to [`files`](Self::files): together they let the
     /// `pre-tool/editing-stop` prepare hook *snapshot* the accumulated set —
-    /// file list plus filtered count — into the handoff without clearing the
-    /// accumulator. The clear is deferred to the consume step (drain-on-consume,
+    /// batch files plus skip buckets — into the handoff without clearing the
+    /// accumulator. The clear is deferred to delivery (drain-on-consume,
     /// bug 32), so a failed `catenary diagnostics` attempt that never consumes
     /// leaves the set intact for a retry.
     #[must_use]
-    pub fn filtered(&self, session_id: Option<&str>, agent_id: &str) -> usize {
+    pub fn skipped(&self, session_id: Option<&str>, agent_id: &str) -> SkippedEdits {
         let key = editing_key(session_id, agent_id);
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
-            .map_or(0, |state| state.filtered)
-    }
-
-    /// Returns the distinct enclosing project roots of the agent's filtered
-    /// (out-of-root) edits, without draining the editing state.
-    ///
-    /// Companion to [`filtered`](Self::filtered): the `pre-tool/editing-stop`
-    /// prepare hook snapshots both into the handoff so a bare `catenary
-    /// diagnostics` can name the roots that have no language servers running
-    /// (ephemeral-roots ticket 01 / bug 58). Empty when no filtered edit
-    /// carried a detectable enclosing root.
-    #[must_use]
-    pub fn filtered_roots(&self, session_id: Option<&str>, agent_id: &str) -> BTreeSet<PathBuf> {
-        let key = editing_key(session_id, agent_id);
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-            .map(|state| state.filtered_roots.clone())
+            .map(|state| state.skipped.clone())
             .unwrap_or_default()
     }
 
@@ -287,9 +297,9 @@ impl EditingManager {
     ///   present. The iteration extends.
     /// - **Batch complete** (non-empty, all flags true): the batch is discarded
     ///   and a new one starts with just this file. The flat discard rule — no
-    ///   inside/outside distinction. The out-of-coverage note metadata rides
-    ///   through the discard (a filtered edit is not part of the covered batch),
-    ///   so an unreported out-of-root edit is not silently dropped.
+    ///   inside/outside distinction. The skipped-edits note metadata rides
+    ///   through the discard (a skipped edit is not part of the covered batch),
+    ///   so an unreported skipped edit is not silently dropped.
     ///
     /// A no-op if the agent is not in editing mode — the accumulation path only
     /// calls this for an agent already known to be editing (the entry exists).
@@ -303,7 +313,7 @@ impl EditingManager {
         {
             if entry.is_complete() {
                 // Post-completion covered edit: discard the batch, start a new one
-                // with this file (the filtered note metadata is preserved).
+                // with this file (unreported skipped-note metadata is preserved).
                 entry.files.clear();
                 entry.files.push(BatchFile {
                     path,
@@ -327,6 +337,14 @@ impl EditingManager {
     /// on a successful response delivery every file's flag flips true. Called
     /// only *after* the socket write succeeds — a failed write leaves the flags
     /// false and the gate armed. A no-op if the agent has no batch.
+    ///
+    /// A bare delivery also hands the skipped-edits note to the client (the
+    /// receipt renders both buckets), so the report debt is paid: the buckets
+    /// reset here, otherwise one skipped edit would ride every later receipt
+    /// for the rest of the session (misc 173). Scoped delivery
+    /// ([`mark_delivered`](Self::mark_delivered)) suppresses the note and
+    /// leaves the buckets intact — still unreported, they survive to the next
+    /// bare run.
     pub fn mark_delivered_all(&self, session_id: Option<&str>, agent_id: &str) {
         let key = editing_key(session_id, agent_id);
         if let Some(entry) = self
@@ -338,6 +356,7 @@ impl EditingManager {
             for file in &mut entry.files {
                 file.delivered = true;
             }
+            entry.skipped = SkippedEdits::default();
         }
     }
 
@@ -375,14 +394,14 @@ impl EditingManager {
         state.remove(&key);
     }
 
-    /// Records that a file was skipped during accumulation because it
-    /// lacked LSP coverage (outside tracked workspace roots).
+    /// Records that a shell write was skipped during accumulation because it
+    /// landed outside every tracked workspace root.
     ///
     /// Counted per `(session_id, agent_id)` so the drain reports the
     /// requesting agent's own skipped count (bug 37). A no-op if the agent
     /// is not in editing mode — the accumulation path only calls this for an
     /// agent already known to be editing.
-    pub fn increment_filtered(&self, session_id: Option<&str>, agent_id: &str) {
+    pub fn increment_outside(&self, session_id: Option<&str>, agent_id: &str) {
         let key = editing_key(session_id, agent_id);
         if let Some(entry) = self
             .state
@@ -390,14 +409,14 @@ impl EditingManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_mut(&key)
         {
-            entry.filtered += 1;
+            entry.skipped.outside += 1;
         }
     }
 
-    /// Records a filtered (out-of-root / uncovered) edit for an agent,
+    /// Records an edit made outside every tracked workspace root,
     /// **creating** the editing entry if none exists yet.
     ///
-    /// Unlike [`increment_filtered`](Self::increment_filtered) — a no-op until an
+    /// Unlike [`increment_outside`](Self::increment_outside) — a no-op until an
     /// editing entry exists — this ensures a *standalone* out-of-root edit (one
     /// with no covering edit alongside it to open the entry) is still counted, so
     /// a later bare `catenary diagnostics` surfaces it instead of the bare
@@ -405,10 +424,10 @@ impl EditingManager {
     /// creates carries no files, so it never trips the boundary block and is
     /// silently cleared at the agent's stop if never diagnosed.
     ///
-    /// `root` is the filtered edit's enclosing project root when detectable
+    /// `root` is the edit's enclosing project root when detectable
     /// (walk `.git` up from the path), recorded for the root-aware note; `None`
     /// only bumps the count.
-    pub fn record_filtered_edit(
+    pub fn record_outside_edit(
         &self,
         session_id: Option<&str>,
         agent_id: &str,
@@ -420,10 +439,33 @@ impl EditingManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = state.entry(key).or_default();
-        entry.filtered += 1;
+        entry.skipped.outside += 1;
         if let Some(root) = root {
-            entry.filtered_roots.insert(root);
+            entry.skipped.outside_roots.insert(root);
         }
+        drop(state);
+    }
+
+    /// Records an in-root edit no diagnostic feeder covers (misc 173),
+    /// **creating** the editing entry if none exists yet.
+    ///
+    /// The sibling of [`record_outside_edit`](Self::record_outside_edit) for
+    /// the other skip predicate: the file IS under a tracked root, but no
+    /// server or linter covers it (`Makefile`, `.txt`, logs). Recording the
+    /// file's display `name` lets the bare-run note say what went unchecked
+    /// instead of misattributing the skip to root containment. Standalone
+    /// semantics match `record_outside_edit`: the entry it creates carries no
+    /// files, never trips the boundary block, and is silently cleared at the
+    /// agent's stop if never diagnosed.
+    pub fn record_uncovered_edit(&self, session_id: Option<&str>, agent_id: &str, name: String) {
+        let key = editing_key(session_id, agent_id);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state.entry(key).or_default();
+        entry.skipped.uncovered += 1;
+        entry.skipped.uncovered_files.insert(name);
         drop(state);
     }
 
@@ -581,83 +623,154 @@ mod tests {
     }
 
     #[test]
-    fn filtered_reads_count_without_mutating() {
+    fn skipped_reads_buckets_without_mutating() {
         let em = EditingManager::new();
         em.start_editing(None, "").expect("start");
         em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
-        em.increment_filtered(None, "");
-        em.increment_filtered(None, "");
+        em.increment_outside(None, "");
+        em.increment_outside(None, "");
 
-        assert_eq!(em.filtered(None, ""), 2);
-        // Reading the filtered count must not touch the batch.
+        assert_eq!(em.skipped(None, "").outside, 2);
+        // Reading the skipped buckets must not touch the batch.
         assert!(
             em.has_files(None, ""),
-            "filtered() must not mutate the batch"
+            "skipped() must not mutate the batch"
         );
         // It remains readable on a repeat call (no consume).
-        assert_eq!(em.filtered(None, ""), 2);
+        assert_eq!(em.skipped(None, "").outside, 2);
     }
 
     #[test]
-    fn filtered_zero_when_not_editing() {
+    fn skipped_empty_when_not_editing() {
         let em = EditingManager::new();
-        assert_eq!(em.filtered(None, "ghost"), 0);
+        assert!(em.skipped(None, "ghost").is_empty());
     }
 
     #[test]
-    fn record_filtered_edit_creates_entry_when_standalone() {
+    fn record_outside_edit_creates_entry_when_standalone() {
         // The bug-58 case: an out-of-root edit arrives with no covered edit
-        // alongside it, so no editing entry exists yet. `increment_filtered`
-        // would be a no-op; `record_filtered_edit` creates the entry so the
+        // alongside it, so no editing entry exists yet. `increment_outside`
+        // would be a no-op; `record_outside_edit` creates the entry so the
         // count survives to the next bare `catenary diagnostics`.
         let em = EditingManager::new();
-        assert!(
-            !em.is_editing(None, ""),
-            "no entry before the filtered edit"
-        );
-        em.record_filtered_edit(None, "", Some(PathBuf::from("/home/dev/Lattice")));
+        assert!(!em.is_editing(None, ""), "no entry before the outside edit");
+        em.record_outside_edit(None, "", Some(PathBuf::from("/home/dev/Lattice")));
         assert_eq!(
-            em.filtered(None, ""),
+            em.skipped(None, "").outside,
             1,
             "count survives with no prior entry"
         );
-        // The filtered-only entry carries no files, so it never trips the gate.
+        // The skipped-only entry carries no files, so it never trips the gate.
         assert!(
             !em.has_files(None, ""),
-            "a filtered-only entry has no covered files"
+            "a skipped-only entry has no covered files"
         );
         assert_eq!(
-            em.filtered_roots(None, ""),
+            em.skipped(None, "").outside_roots,
             BTreeSet::from([PathBuf::from("/home/dev/Lattice")]),
             "the enclosing root rides along for root-aware wording"
         );
     }
 
     #[test]
-    fn record_filtered_edit_without_root_only_counts() {
+    fn record_outside_edit_without_root_only_counts() {
         // No detectable enclosing root → the count bumps but no root is named.
         let em = EditingManager::new();
-        em.record_filtered_edit(None, "", None);
-        em.record_filtered_edit(None, "", None);
-        assert_eq!(em.filtered(None, ""), 2);
+        em.record_outside_edit(None, "", None);
+        em.record_outside_edit(None, "", None);
+        assert_eq!(em.skipped(None, "").outside, 2);
         assert!(
-            em.filtered_roots(None, "").is_empty(),
+            em.skipped(None, "").outside_roots.is_empty(),
             "no root recorded when none was detectable"
         );
     }
 
     #[test]
-    fn record_filtered_edit_dedups_roots() {
-        // Several filtered edits under one project name the root once.
+    fn record_outside_edit_dedups_roots() {
+        // Several outside edits under one project name the root once.
         let em = EditingManager::new();
         let root = PathBuf::from("/home/dev/Lattice");
-        em.record_filtered_edit(None, "", Some(root.clone()));
-        em.record_filtered_edit(None, "", Some(root.clone()));
-        assert_eq!(em.filtered(None, ""), 2, "every filtered edit counts");
+        em.record_outside_edit(None, "", Some(root.clone()));
+        em.record_outside_edit(None, "", Some(root.clone()));
+        assert_eq!(em.skipped(None, "").outside, 2, "every outside edit counts");
         assert_eq!(
-            em.filtered_roots(None, ""),
+            em.skipped(None, "").outside_roots,
             BTreeSet::from([root]),
             "the distinct root is named once"
+        );
+    }
+
+    #[test]
+    fn record_uncovered_edit_creates_entry_and_names_files() {
+        // Misc 173: an in-root edit no feeder covers lands in its OWN bucket —
+        // distinct from outside-roots — carrying the file's display name so
+        // the note can say what went unchecked. Standalone semantics match
+        // `record_outside_edit`: the entry is created, holds no files, and
+        // never trips the gate.
+        let em = EditingManager::new();
+        assert!(!em.is_editing(None, ""), "no entry before the edit");
+        em.record_uncovered_edit(None, "", "Makefile".to_string());
+        em.record_uncovered_edit(None, "", "Makefile".to_string());
+        em.record_uncovered_edit(None, "", "notes.txt".to_string());
+
+        let skipped = em.skipped(None, "");
+        assert_eq!(skipped.uncovered, 3, "every uncovered edit counts");
+        assert_eq!(
+            skipped.uncovered_files,
+            BTreeSet::from(["Makefile".to_string(), "notes.txt".to_string()]),
+            "distinct display names, deduplicated"
+        );
+        assert_eq!(
+            skipped.outside, 0,
+            "in-root uncovered edits never land in the outside bucket"
+        );
+        assert!(
+            !em.has_files(None, ""),
+            "an uncovered-only entry has no covered files — it never gates"
+        );
+    }
+
+    #[test]
+    fn bare_delivery_clears_skipped_buckets() {
+        // Misc 173 sibling: the bare receipt renders the skipped-edits note,
+        // paying the report debt — so delivery must reset the buckets. Before
+        // the fix nothing cleared them, and one outside edit rode every later
+        // receipt for the rest of the session (8+ paid batches observed).
+        let em = EditingManager::new();
+        em.record_outside_edit(None, "", Some(PathBuf::from("/home/dev/other")));
+        em.record_uncovered_edit(None, "", "Makefile".to_string());
+        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"));
+
+        // The bare run delivers the receipt (note included) — buckets reset.
+        em.mark_delivered_all(None, "");
+        assert!(
+            em.skipped(None, "").is_empty(),
+            "bare delivery pays the note debt — the buckets must clear"
+        );
+
+        // A fresh covered-only batch afterwards carries NO stale trailer.
+        em.record_covered_edit(None, "", PathBuf::from("/src/b.rs"));
+        em.mark_delivered_all(None, "");
+        assert!(
+            em.skipped(None, "").is_empty(),
+            "a later clean batch must not resurrect the skipped note"
+        );
+    }
+
+    #[test]
+    fn scoped_delivery_keeps_skipped_buckets() {
+        // A scoped pull suppresses the note (it names files explicitly), so
+        // the skip record is still unreported: it must survive to the next
+        // bare run rather than vanish silently.
+        let em = EditingManager::new();
+        em.record_outside_edit(None, "", None);
+        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"));
+
+        em.mark_delivered(None, "", &[PathBuf::from("/src/a.rs")]);
+        assert_eq!(
+            em.skipped(None, "").outside,
+            1,
+            "scoped delivery renders no note — the bucket stays for the next bare run"
         );
     }
 
@@ -745,23 +858,23 @@ mod tests {
 
     #[test]
     fn empty_batch_is_not_complete_so_covered_edit_joins() {
-        // A filtered-only entry (no covered files) is not a *complete* batch, so
+        // A skipped-only entry (no covered files) is not a *complete* batch, so
         // the first covered edit joins it rather than discarding it — the
-        // filtered metadata survives to the next bare run.
+        // skipped metadata survives to the next bare run.
         let em = EditingManager::new();
-        em.record_filtered_edit(None, "", Some(PathBuf::from("/home/dev/Lattice")));
+        em.record_outside_edit(None, "", Some(PathBuf::from("/home/dev/Lattice")));
         assert!(!em.has_files(None, ""), "no covered files yet");
 
         em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"));
         assert_eq!(
             em.files(None, ""),
             vec![PathBuf::from("/src/a.rs")],
-            "the covered edit joins the filtered-only entry"
+            "the covered edit joins the skipped-only entry"
         );
         assert_eq!(
-            em.filtered(None, ""),
+            em.skipped(None, "").outside,
             1,
-            "the filtered count survives the join"
+            "the outside count survives the join"
         );
     }
 
@@ -898,9 +1011,14 @@ mod tests {
         em.record_covered_edit(Some("S"), "subA", PathBuf::from("/a.rs"));
         em.record_covered_edit(Some("S"), "", PathBuf::from("/b.rs"));
         // Distinct skipped-no-coverage counts per agent.
-        em.increment_filtered(Some("S"), "subA");
-        em.increment_filtered(Some("S"), "subA");
-        em.increment_filtered(Some("S"), "");
+        em.increment_outside(Some("S"), "subA");
+        em.increment_outside(Some("S"), "subA");
+        em.increment_outside(Some("S"), "");
+        assert_eq!(
+            em.skipped(Some("S"), "subA").outside,
+            2,
+            "outside count attributed to subA, not shared"
+        );
 
         // Deliver only the subagent's batch (its bare diagnostics run).
         em.mark_delivered_all(Some("S"), "subA");
@@ -908,10 +1026,9 @@ mod tests {
             !em.has_undelivered(Some("S"), "subA"),
             "subA's gate disarms after its delivery"
         );
-        assert_eq!(
-            em.filtered(Some("S"), "subA"),
-            2,
-            "filtered attributed to subA, not shared"
+        assert!(
+            em.skipped(Some("S"), "subA").is_empty(),
+            "subA's bare delivery pays its own note debt (misc 173)"
         );
 
         // The main agent's batch is untouched — still armed.
@@ -925,9 +1042,9 @@ mod tests {
             "main agent's batch survives subA's delivery (bug 37)"
         );
         assert_eq!(
-            em.filtered(Some("S"), ""),
+            em.skipped(Some("S"), "").outside,
             1,
-            "main agent keeps its own filtered count"
+            "main agent keeps its own skipped count"
         );
     }
 

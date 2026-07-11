@@ -155,15 +155,22 @@ fn test_batch_uncovered_file() -> Result<()> {
     );
     // The no-server file is gated out of accumulation (bug 44): it has no
     // configured server, so it never reaches the diagnostics batch and is not
-    // rendered per-file. It is still accounted for in the unchecked-edit count
-    // so the batch is not a silent, lying one.
+    // rendered per-file. It is still accounted for — by name — in the
+    // no-covering-server note (misc 173) so the batch is not a silent, lying
+    // one, and the note never claims "outside tracked roots" for a file
+    // inside the served root.
     assert!(
-        !text.contains("zzz_no_server"),
+        !text.contains("mystery.zzz_no_server:"),
         "No-server file must not be accumulated into per-file diagnostics. Got:\n{text}"
     );
     assert!(
-        text.contains("1 edit") && text.contains("not checked"),
-        "No-server file should be reported as an unchecked edit. Got:\n{text}"
+        text.contains("1 edit had no covering server when made (mystery.zzz_no_server)")
+            && text.contains("not checked"),
+        "No-server file should be reported as an unchecked edit, by name. Got:\n{text}"
+    );
+    assert!(
+        !text.contains("outside tracked roots"),
+        "An in-root no-server file must not be misattributed to root coverage (misc 173). Got:\n{text}"
     );
 
     Ok(())

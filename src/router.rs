@@ -21,6 +21,7 @@ use tracing::{Instrument, debug, error, info, warn};
 
 use crate::bridge::EditingGuardrail;
 use crate::bridge::HookRouter;
+use crate::bridge::editing_manager::SkippedEdits;
 use crate::bridge::filesystem_manager::Root;
 use crate::bridge::session::Session;
 use crate::bridge::{GlobOutcome, GrepFlags, GrepOutcome, GrepSkips, HunkChunk, ShapedOutput};
@@ -867,13 +868,10 @@ enum HandoffPayload {
         /// The batch's files snapshotted from the editing session (delivered
         /// ones included — a bare pull re-diagnoses the whole batch).
         files: Vec<PathBuf>,
-        /// Number of files skipped because they were outside tracked workspace
-        /// roots (no LSP coverage).
-        filtered: usize,
-        /// Distinct enclosing project roots of those filtered edits, for the
-        /// root-aware bare-run note (ephemeral-roots ticket 01 / bug 58). Empty
-        /// when no filtered edit had a detectable enclosing root.
-        filtered_roots: std::collections::BTreeSet<PathBuf>,
+        /// Edits skipped at accumulation time, split by predicate (misc 173):
+        /// outside tracked roots vs in-root with no covering feeder. The
+        /// bare-run receipt renders each bucket as its own advisory line.
+        skipped: SkippedEdits,
         /// Host session id (from the staging hook). The bare `catenary
         /// diagnostics` process is identity-less, so the session id rides the
         /// handoff — the daemon looks the session up to flip its batch.
@@ -3047,62 +3045,94 @@ fn get_or_create_router(
     router
 }
 
-/// Appends the "outside tracked roots" advisory to a diagnostics `output`
-/// when `filtered` edits were dropped for lack of LSP coverage.
+/// Appends the skipped-edits advisories to a diagnostics `output` when edits
+/// were dropped from the batch at accumulation time.
 ///
 /// This keeps the diagnostics batch honest. A mixed batch — some edited
 /// files covered, some not — otherwise renders results for the covered
 /// files alone, with no signal that the rest went unchecked; a silent,
 /// incomplete batch is the "lying batch" the editing workflow exists to
-/// avoid. The all-uncovered case (empty `output`, `filtered > 0`) reduces
-/// to the note alone — so a bare `catenary diagnostics` after only out-of-root
+/// avoid. The all-skipped case (empty `output`, non-empty `skipped`) reduces
+/// to the notes alone — so a bare `catenary diagnostics` after only skipped
 /// edits never renders the bare `[no edited files]` lie (bug 58). Returns
-/// `output` unchanged when nothing was filtered.
+/// `output` unchanged when nothing was skipped.
 ///
-/// `filtered_roots` carries the distinct enclosing project roots of those
-/// filtered edits (walk repository markers up from each). When non-empty the note names
-/// them — "(roots: `~/Projects/Lattice`)" — pointing at
-/// what a `catenary pin` would mount (ephemeral-roots ticket 01); when
-/// empty (no detectable root) it falls back to the plain count. The wording is
-/// past-tense event language — the edits *were* outside tracked roots *when
-/// made*, not a claim the roots currently have no servers (bug 170).
+/// The two buckets are different predicates and render as two distinct lines
+/// (misc 173) — collapsing them claimed "outside tracked roots" for an in-root
+/// `Makefile` while naming its containing root in the same parenthesis:
+///
+/// - **In-root, no covering feeder** (`skipped.uncovered`): the root is
+///   tracked, but no server or linter covers the file (`Makefile`, `.txt`,
+///   logs). The note names the files — "(2 edits had no covering server when
+///   made (Makefile) — not checked)" — so it teaches what went unchecked.
+/// - **Outside tracked roots** (`skipped.outside`): `skipped.outside_roots`
+///   carries the distinct enclosing project roots of those edits (walk
+///   repository markers up from each). When non-empty the note names them —
+///   "(roots: `~/Projects/Lattice`)" — pointing at what a `catenary pin`
+///   would mount (ephemeral-roots ticket 01); when empty (no detectable
+///   root) it falls back to the plain count.
+///
+/// Both wordings are past-tense event language — the edits *were* outside /
+/// *had* no covering server *when made*, not a claim about current server
+/// state (bug 170).
 #[cfg(unix)]
-fn with_out_of_roots_note(
-    output: String,
-    filtered: usize,
-    filtered_roots: &std::collections::BTreeSet<PathBuf>,
-) -> String {
-    if filtered == 0 {
+fn with_skipped_edits_note(output: String, skipped: &SkippedEdits) -> String {
+    if skipped.is_empty() {
         return output;
     }
-    // Past-tense event language: each record is an edit that WAS outside
-    // tracked roots when it was made, not a claim about the roots' current
-    // state. Batch-scoped and honest — a present-tense "no servers running
-    // for X" contradicts its own receipt when the same root is diagnosed in
-    // the same run, and names dead roots as if live (bug 170).
-    let (verb, plural) = if filtered == 1 {
-        ("was", "")
-    } else {
-        ("were", "s")
-    };
-    let note = if filtered_roots.is_empty() {
-        format!(
-            "({filtered} edit{plural} {verb} outside tracked roots when made \u{2014} not checked; see `catenary roots -h`)",
-        )
-    } else {
-        let named = filtered_roots
-            .iter()
-            .map(|root| crate::bridge::compress_home(root))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "({filtered} edit{plural} {verb} outside tracked roots when made (roots: {named}) \u{2014} not checked; see `catenary roots -h`)",
-        )
-    };
+    let mut notes: Vec<String> = Vec::new();
+    if skipped.uncovered > 0 {
+        let count = skipped.uncovered;
+        let plural = if count == 1 { "" } else { "s" };
+        if skipped.uncovered_files.is_empty() {
+            notes.push(format!(
+                "({count} edit{plural} had no covering server when made \u{2014} not checked)",
+            ));
+        } else {
+            let named = skipped
+                .uncovered_files
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            notes.push(format!(
+                "({count} edit{plural} had no covering server when made ({named}) \u{2014} not checked)",
+            ));
+        }
+    }
+    if skipped.outside > 0 {
+        // Past-tense event language: each record is an edit that WAS outside
+        // tracked roots when it was made, not a claim about the roots' current
+        // state. Batch-scoped and honest — a present-tense "no servers running
+        // for X" contradicts its own receipt when the same root is diagnosed in
+        // the same run, and names dead roots as if live (bug 170).
+        let count = skipped.outside;
+        let (verb, plural) = if count == 1 {
+            ("was", "")
+        } else {
+            ("were", "s")
+        };
+        if skipped.outside_roots.is_empty() {
+            notes.push(format!(
+                "({count} edit{plural} {verb} outside tracked roots when made \u{2014} not checked; see `catenary roots -h`)",
+            ));
+        } else {
+            let named = skipped
+                .outside_roots
+                .iter()
+                .map(|root| crate::bridge::compress_home(root))
+                .collect::<Vec<_>>()
+                .join(", ");
+            notes.push(format!(
+                "({count} edit{plural} {verb} outside tracked roots when made (roots: {named}) \u{2014} not checked; see `catenary roots -h`)",
+            ));
+        }
+    }
+    let notes = notes.join("\n");
     if output.is_empty() {
-        note
+        notes
     } else {
-        format!("{output}\n{note}")
+        format!("{output}\n{notes}")
     }
 }
 
@@ -5015,18 +5045,15 @@ async fn handle_hook_dispatch(
         // were, ready for a retry. The `editing_session`/`agent_id` key rides the
         // handoff so the consume step flips exactly this bucket.
         let files = router.session.editing.files(editing_session, &agent_id);
-        let filtered = router.session.editing.filtered(editing_session, &agent_id);
-        let filtered_roots = router
-            .session
-            .editing
-            .filtered_roots(editing_session, &agent_id);
+        let skipped = router.session.editing.skipped(editing_session, &agent_id);
 
         debug!(
             source = Source::DaemonDispatch.as_str(),
             session_id = %session_id,
             agent_id = %agent_id,
             file_count = files.len(),
-            filtered,
+            skipped_outside = skipped.outside,
+            skipped_uncovered = skipped.uncovered,
             "diagnostics: snapshotted batch from EditingManager (flip deferred to delivery)",
         );
 
@@ -5052,8 +5079,7 @@ async fn handle_hook_dispatch(
                 parent_id: handoff_parent_id,
                 payload: HandoffPayload::Diagnostics {
                     files,
-                    filtered,
-                    filtered_roots,
+                    skipped,
                     session_id: session_id.clone(),
                     editing_session: editing_session.map(str::to_string),
                     agent_id: agent_id.clone(),
@@ -5119,16 +5145,14 @@ async fn handle_hook_dispatch(
         let handoff = ctx.handoff.consume(HandoffKey::Diagnostics).map(|h| {
             let HandoffPayload::Diagnostics {
                 files,
-                filtered,
-                filtered_roots,
+                skipped,
                 session_id,
                 editing_session,
                 agent_id,
             } = h.payload;
             (
                 files,
-                filtered,
-                filtered_roots,
+                skipped,
                 session_id,
                 editing_session,
                 agent_id,
@@ -5146,7 +5170,7 @@ async fn handle_hook_dispatch(
         // consume request itself carries no session identity).
         let flip_keys: Option<(String, Option<String>, String)> = handoff
             .as_ref()
-            .map(|h| (h.3.clone(), h.4.clone(), h.5.clone()));
+            .map(|h| (h.2.clone(), h.3.clone(), h.4.clone()));
 
         // Extract scope_id early so we can emit the incoming hook
         // event before running the diagnostics pipeline. This ensures
@@ -5154,7 +5178,7 @@ async fn handle_hook_dispatch(
         // parent_id group, making it the scope header in the TUI
         // (matching the grep/glob pattern).
         let scope_id = match &handoff {
-            Some((_, _, _, _, _, _, parent_id)) => parent_id.clone(),
+            Some((_, _, _, _, _, parent_id)) => parent_id.clone(),
             None => uuid::Uuid::new_v4().to_string(),
         };
 
@@ -5180,10 +5204,10 @@ async fn handle_hook_dispatch(
         // Resolve the run's file set and session identity. A scoped pull
         // diagnoses exactly the named paths; the bare form re-diagnoses the
         // whole batch snapshot (delivered files included). The
-        // accumulation-time `filtered` count (files skipped for lack of
-        // coverage) applies only to the bare form — a scoped pull names files
+        // accumulation-time `skipped` buckets (edits skipped for lack of
+        // coverage) apply only to the bare form — a scoped pull names files
         // explicitly, so an uncovered named file renders its own out-of-scope
-        // line in the receipt and the accumulation note is suppressed. Clone
+        // line in the receipt and the accumulation notes are suppressed. Clone
         // `scoped_files` for the pipeline — the originals are needed after the
         // response write to flip exactly the named files on delivery.
         //
@@ -5197,155 +5221,148 @@ async fn handle_hook_dispatch(
         // slot resolves to `None` and is answered with the fault envelope
         // below.
         let run = match handoff {
-            Some((files, filtered, filtered_roots, session_id, _, _, _)) => Some(if scoped {
-                (
-                    scoped_files.clone(),
-                    0,
-                    std::collections::BTreeSet::new(),
-                    session_id,
-                )
+            Some((files, skipped, session_id, _, _, _)) => Some(if scoped {
+                (scoped_files.clone(), SkippedEdits::default(), session_id)
             } else {
-                (files, filtered, filtered_roots, session_id)
+                (files, skipped, session_id)
             }),
             None if scoped => Some((
                 scoped_files.clone(),
-                0,
-                std::collections::BTreeSet::new(),
+                SkippedEdits::default(),
                 "default".to_string(),
             )),
             None => None,
         };
 
-        let (dirty, output, covered, fault) =
-            if let Some((diag_files, filtered, filtered_roots, session_id)) = run {
-                let covered = diag_files.len();
-                if diag_files.is_empty() {
-                    // Nothing covered to diagnose — the note (if any) stands alone.
-                    // If edits were made but none had LSP coverage, the editing
-                    // session still ended: record an `editing_done` milestone so the
-                    // activity ring shows the transition (ticket 08).
-                    if filtered > 0 {
-                        ctx.primary.record_milestone(
-                            crate::state_snapshot::MilestoneKind::EditingDone,
-                            "editing done · no covered files",
-                            Some(session_id.clone()),
-                        );
-                    }
-                    (
-                        false,
-                        with_out_of_roots_note(String::new(), filtered, &filtered_roots),
-                        covered,
-                        None,
-                    )
-                } else {
-                    // Ephemeral mount (ticket 02): any diagnosed file outside
-                    // every mounted root mounts its enclosing project root so the
-                    // fresh server can diagnose it — the mounting query pays the
-                    // spawn/index. Covers a scoped `catenary diagnostics <path>`
-                    // on an out-of-root file, and a bare drain whose debt lives
-                    // under a since-expired ephemeral root (re-mount = activity,
-                    // refreshing its clock). Runs before the pipeline so
-                    // `process_files_batched` sees the file as covered.
-                    ensure_ephemeral_mounts(&ctx, &diag_files, Instant::now(), &session_id).await;
-                    // Reflect the run on the session board: status → diagnostics
-                    // for its duration, then record the result as last_action
-                    // (observability ticket 05). Clone the session Arc and drop the
-                    // registry lock before the await.
-                    let board_session = ctx
-                        .sessions
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .get(&session_id)
-                        .map(|e| e.router.session.clone());
-                    if let Some(s) = &board_session {
-                        s.set_diagnostics_in_flight(true);
-                    }
-                    // Race the diagnostics pipeline against client disconnect. If the
-                    // `catenary diagnostics` process is killed mid-settle (e.g. the host
-                    // tool-call timeout fires while a server sits in a `$/progress`
-                    // bracket), the socket closes, the probe reads EOF, and we drop the
-                    // pipeline future instead of leaving a settle wait pinned on
-                    // a Busy server (bug 24). Mirrors the grep/glob cancel-on-disconnect
-                    // path. The dropped batch self-heals: `open_document_on` sends
-                    // `didChange` (not a duplicate `didOpen`) for an already-open doc.
-                    let raced = race_against_disconnect(
-                        ctx.primary
-                            .diagnostics
-                            .process_files_batched(&diag_files, Some(&scope_id)),
-                        &mut buf_reader,
-                    )
-                    .await;
-                    let Some(outcome) = raced else {
-                        if let Some(s) = &board_session {
-                            s.set_diagnostics_in_flight(false);
-                        }
-                        debug!(
-                            source = Source::DaemonDispatch.as_str(),
-                            session_id = %session_id,
-                            "diagnostics client disconnected — pipeline cancelled",
-                        );
-                        emit_hook_event(
-                            tracing::Level::INFO,
-                            "cli",
-                            &method,
-                            Some(&scope_id),
-                            "client disconnected",
-                            "outgoing hook response",
-                        );
-                        return Ok(());
-                    };
-                    if let Some(s) = &board_session {
-                        s.set_diagnostics_in_flight(false);
-                        s.set_last_action(format!(
-                            "diagnostics: {} errors, {} warnings",
-                            outcome.errors, outcome.warnings
-                        ));
-                    }
-                    // Promote the completed run to the activity ring with the result
-                    // counts and the covered-file count (ticket 08). Emitted via the
-                    // primary's shared snapshot writer so it lands even if the session
-                    // already left the registry.
+        let (dirty, output, covered, fault) = if let Some((diag_files, skipped, session_id)) = run {
+            let covered = diag_files.len();
+            if diag_files.is_empty() {
+                // Nothing covered to diagnose — the notes (if any) stand alone.
+                // If edits were made but none had feeder coverage, the editing
+                // session still ended: record an `editing_done` milestone so the
+                // activity ring shows the transition (ticket 08).
+                if !skipped.is_empty() {
                     ctx.primary.record_milestone(
-                        crate::state_snapshot::MilestoneKind::Diagnostics,
-                        format!(
-                            "{} errors, {} warnings · {} files",
-                            outcome.errors,
-                            outcome.warnings,
-                            diag_files.len()
-                        ),
+                        crate::state_snapshot::MilestoneKind::EditingDone,
+                        "editing done · no covered files",
                         Some(session_id.clone()),
                     );
-                    // Surface any filtered edits alongside the covered-file results,
-                    // so a mixed batch never silently hides the unchecked files.
-                    (
-                        outcome.dirty,
-                        with_out_of_roots_note(outcome.output, filtered, &filtered_roots),
-                        covered,
-                        None,
-                    )
                 }
-            } else {
-                // Bare consume against an empty slot (bug 100): with no hook
-                // there is no gate and no debt, so the run is a misuse, not a
-                // completed-empty run. A hooked prepare whose TTL blew is the
-                // same shape — the run never happened, so a fault is more
-                // honest than the old exit-0 "handoff expired" text, which read
-                // like a trustworthy empty receipt. A user mistake, not a
-                // daemon health finding: the fault rides the envelope (CLI →
-                // stderr + exit 2) and stays out of the `warn!`/`error!`
-                // surfaces.
                 (
                     false,
-                    String::new(),
-                    0,
-                    Some(
-                        "no diagnostics run staged — bare `catenary diagnostics` pays the edit \
+                    with_skipped_edits_note(String::new(), &skipped),
+                    covered,
+                    None,
+                )
+            } else {
+                // Ephemeral mount (ticket 02): any diagnosed file outside
+                // every mounted root mounts its enclosing project root so the
+                // fresh server can diagnose it — the mounting query pays the
+                // spawn/index. Covers a scoped `catenary diagnostics <path>`
+                // on an out-of-root file, and a bare drain whose debt lives
+                // under a since-expired ephemeral root (re-mount = activity,
+                // refreshing its clock). Runs before the pipeline so
+                // `process_files_batched` sees the file as covered.
+                ensure_ephemeral_mounts(&ctx, &diag_files, Instant::now(), &session_id).await;
+                // Reflect the run on the session board: status → diagnostics
+                // for its duration, then record the result as last_action
+                // (observability ticket 05). Clone the session Arc and drop the
+                // registry lock before the await.
+                let board_session = ctx
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&session_id)
+                    .map(|e| e.router.session.clone());
+                if let Some(s) = &board_session {
+                    s.set_diagnostics_in_flight(true);
+                }
+                // Race the diagnostics pipeline against client disconnect. If the
+                // `catenary diagnostics` process is killed mid-settle (e.g. the host
+                // tool-call timeout fires while a server sits in a `$/progress`
+                // bracket), the socket closes, the probe reads EOF, and we drop the
+                // pipeline future instead of leaving a settle wait pinned on
+                // a Busy server (bug 24). Mirrors the grep/glob cancel-on-disconnect
+                // path. The dropped batch self-heals: `open_document_on` sends
+                // `didChange` (not a duplicate `didOpen`) for an already-open doc.
+                let raced = race_against_disconnect(
+                    ctx.primary
+                        .diagnostics
+                        .process_files_batched(&diag_files, Some(&scope_id)),
+                    &mut buf_reader,
+                )
+                .await;
+                let Some(outcome) = raced else {
+                    if let Some(s) = &board_session {
+                        s.set_diagnostics_in_flight(false);
+                    }
+                    debug!(
+                        source = Source::DaemonDispatch.as_str(),
+                        session_id = %session_id,
+                        "diagnostics client disconnected — pipeline cancelled",
+                    );
+                    emit_hook_event(
+                        tracing::Level::INFO,
+                        "cli",
+                        &method,
+                        Some(&scope_id),
+                        "client disconnected",
+                        "outgoing hook response",
+                    );
+                    return Ok(());
+                };
+                if let Some(s) = &board_session {
+                    s.set_diagnostics_in_flight(false);
+                    s.set_last_action(format!(
+                        "diagnostics: {} errors, {} warnings",
+                        outcome.errors, outcome.warnings
+                    ));
+                }
+                // Promote the completed run to the activity ring with the result
+                // counts and the covered-file count (ticket 08). Emitted via the
+                // primary's shared snapshot writer so it lands even if the session
+                // already left the registry.
+                ctx.primary.record_milestone(
+                    crate::state_snapshot::MilestoneKind::Diagnostics,
+                    format!(
+                        "{} errors, {} warnings · {} files",
+                        outcome.errors,
+                        outcome.warnings,
+                        diag_files.len()
+                    ),
+                    Some(session_id.clone()),
+                );
+                // Surface any skipped edits alongside the covered-file results,
+                // so a mixed batch never silently hides the unchecked files.
+                (
+                    outcome.dirty,
+                    with_skipped_edits_note(outcome.output, &skipped),
+                    covered,
+                    None,
+                )
+            }
+        } else {
+            // Bare consume against an empty slot (bug 100): with no hook
+            // there is no gate and no debt, so the run is a misuse, not a
+            // completed-empty run. A hooked prepare whose TTL blew is the
+            // same shape — the run never happened, so a fault is more
+            // honest than the old exit-0 "handoff expired" text, which read
+            // like a trustworthy empty receipt. A user mistake, not a
+            // daemon health finding: the fault rides the envelope (CLI →
+            // stderr + exit 2) and stays out of the `warn!`/`error!`
+            // surfaces.
+            (
+                false,
+                String::new(),
+                0,
+                Some(
+                    "no diagnostics run staged — bare `catenary diagnostics` pays the edit \
                          gate inside a hooked session; use `catenary diagnostics <path…>` to \
                          diagnose named files or directories on demand"
-                            .to_string(),
-                    ),
-                )
-            };
+                        .to_string(),
+                ),
+            )
+        };
 
         emit_hook_event(
             tracing::Level::INFO,
@@ -7966,22 +7983,23 @@ mod tests {
 
     #[test]
     fn out_of_roots_note_appended_to_mixed_batch() {
-        use std::collections::BTreeSet;
-
         // A dirty covered-file receipt (the note-appension is orthogonal to how
         // clean/dirty files render in the receipt itself).
         let covered = "src/main.rs:\n\t:1:1 [error] e: boom";
-        let no_roots = BTreeSet::new();
 
-        // Nothing filtered → output is untouched.
+        // Nothing skipped → output is untouched.
         assert_eq!(
-            with_out_of_roots_note(covered.to_string(), 0, &no_roots),
+            with_skipped_edits_note(covered.to_string(), &SkippedEdits::default()),
             covered
         );
 
         // Mixed batch: the covered-file results are preserved and the note
         // is appended so the unchecked edits are not silently hidden.
-        let mixed = with_out_of_roots_note(covered.to_string(), 2, &no_roots);
+        let outside_two = SkippedEdits {
+            outside: 2,
+            ..SkippedEdits::default()
+        };
+        let mixed = with_skipped_edits_note(covered.to_string(), &outside_two);
         assert!(mixed.starts_with(&format!("{covered}\n")), "got: {mixed}");
         assert!(
             mixed.contains("2 edits were outside tracked roots when made"),
@@ -7989,9 +8007,13 @@ mod tests {
         );
         assert!(mixed.contains("not checked"), "got: {mixed}");
 
-        // All-uncovered batch with no detectable roots: the plain note stands
+        // All-skipped batch with no detectable roots: the plain note stands
         // alone, no stray leading newline. Past-tense event wording (bug 170).
-        let alone = with_out_of_roots_note(String::new(), 1, &no_roots);
+        let outside_one = SkippedEdits {
+            outside: 1,
+            ..SkippedEdits::default()
+        };
+        let alone = with_skipped_edits_note(String::new(), &outside_one);
         assert_eq!(
             alone,
             "(1 edit was outside tracked roots when made \u{2014} not checked; see `catenary roots -h`)",
@@ -8006,8 +8028,12 @@ mod tests {
         // note names them (root-aware wording, ephemeral-roots ticket 01). The
         // wording is past-tense event language — it names the roots the edits
         // were outside, not a live "no servers running" claim (bug 170).
-        let roots = BTreeSet::from([PathBuf::from("/home/dev/Projects/Lattice")]);
-        let note = with_out_of_roots_note(String::new(), 1, &roots);
+        let skipped = SkippedEdits {
+            outside: 1,
+            outside_roots: BTreeSet::from([PathBuf::from("/home/dev/Projects/Lattice")]),
+            ..SkippedEdits::default()
+        };
+        let note = with_skipped_edits_note(String::new(), &skipped);
         assert!(
             note.contains("was outside tracked roots when made"),
             "past-tense event wording: {note}"
@@ -8027,6 +8053,81 @@ mod tests {
         assert!(
             !note.contains("no language servers running"),
             "the present-tense live-state claim is gone (bug 170): {note}"
+        );
+    }
+
+    #[test]
+    fn no_covering_server_note_names_files() {
+        use std::collections::BTreeSet;
+
+        // Misc 173: an in-root edit no feeder covers renders its OWN line —
+        // naming the files — and never the out-of-roots claim. This is the
+        // Makefile reproducer: the old note said "outside tracked roots
+        // (roots: ~/Projects/Catenary)" for a file INSIDE that root.
+        let skipped = SkippedEdits {
+            uncovered: 1,
+            uncovered_files: BTreeSet::from(["Makefile".to_string()]),
+            ..SkippedEdits::default()
+        };
+        let note = with_skipped_edits_note(String::new(), &skipped);
+        assert_eq!(
+            note,
+            "(1 edit had no covering server when made (Makefile) \u{2014} not checked)",
+        );
+        assert!(
+            !note.contains("outside tracked roots"),
+            "an in-root uncovered edit must not claim out-of-roots: {note}"
+        );
+
+        // Plural form, several distinct names — sorted, comma-joined.
+        let skipped = SkippedEdits {
+            uncovered: 3,
+            uncovered_files: BTreeSet::from(["Makefile".to_string(), "notes.txt".to_string()]),
+            ..SkippedEdits::default()
+        };
+        let note = with_skipped_edits_note(String::new(), &skipped);
+        assert!(
+            note.contains("3 edits had no covering server when made (Makefile, notes.txt)"),
+            "got: {note}"
+        );
+    }
+
+    #[test]
+    fn skipped_note_renders_both_buckets_distinctly() {
+        use std::collections::BTreeSet;
+
+        // A batch mixing both skip predicates renders two distinct lines
+        // (misc 173): the in-root uncovered files by name, the outside edits
+        // by root — never one conflated claim.
+        let covered = "src/main.rs [clean]";
+        let skipped = SkippedEdits {
+            outside: 2,
+            outside_roots: BTreeSet::from([PathBuf::from("/home/dev/Projects/homelab")]),
+            uncovered: 1,
+            uncovered_files: BTreeSet::from(["Makefile".to_string()]),
+        };
+        let receipt = with_skipped_edits_note(covered.to_string(), &skipped);
+        assert!(
+            receipt.starts_with(&format!("{covered}\n")),
+            "covered receipt preserved: {receipt}"
+        );
+        assert!(
+            receipt.contains("1 edit had no covering server when made (Makefile)"),
+            "the uncovered bucket renders its own named line: {receipt}"
+        );
+        assert!(
+            receipt.contains("2 edits were outside tracked roots when made (roots: "),
+            "the outside bucket keeps the root-aware wording: {receipt}"
+        );
+        let uncovered_pos = receipt
+            .find("had no covering server")
+            .expect("uncovered line present");
+        let outside_pos = receipt
+            .find("outside tracked roots")
+            .expect("outside line present");
+        assert!(
+            uncovered_pos < outside_pos,
+            "in-root note renders before the outside note: {receipt}"
         );
     }
 
@@ -8089,10 +8190,10 @@ mod tests {
         // Bug 58 regression: an out-of-root edit that arrives with NO covered
         // edit alongside it (no prior `editing-start`, no in-root edit to open
         // the editing entry) used to vanish — `handle_enforce_editing` let it
-        // flow free without entering editing mode, and `increment_filtered` was
-        // then a no-op because no entry existed. A later bare `catenary
-        // diagnostics` saw `filtered == 0` and lied with `[no edited files]`.
-        // `record_filtered_edit` now creates the entry so the filtered note
+        // flow free without entering editing mode, and the skipped-count bump
+        // was then a no-op because no entry existed. A later bare `catenary
+        // diagnostics` saw no skipped edits and lied with `[no edited files]`.
+        // `record_outside_edit` now creates the entry so the skipped note
         // survives.
         let dir = tempfile::tempdir().expect("create tempdir");
         let ipc_path = ipc_socket_in(dir.path());
@@ -8141,6 +8242,133 @@ mod tests {
         assert!(
             !output.trim().is_empty(),
             "output must carry the filtered note, not empty (→ CLI [no edited files]): {response}",
+        );
+
+        shutdown.cancel();
+    }
+
+    /// Misc 173 reproducer: an edit INSIDE a tracked root whose file no feeder
+    /// covers (the Catenary `Makefile`) must render the no-covering-server
+    /// note naming the file — never "outside tracked roots", which the old
+    /// conflated note claimed while printing the containing root in the same
+    /// parenthesis.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn done_editing_handoff_in_root_uncovered_names_file() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        // A registered workspace root, so the edited file is IN-root; its
+        // type (Makefile — no extension, no configured server) is uncovered.
+        let root = dir.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("create workspace dir");
+        let manager = Arc::new(bind_with_session_roots(dir.path(), vec![root.clone()]));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Edit the in-root Makefile — no feeder covers it.
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "Edit",
+            "file_path": root.join("Makefile").display().to_string(),
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &req).await;
+
+        // Prepare + run bare diagnostics.
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let line = hook_roundtrip(&ipc_path, &req).await;
+        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
+
+        let req = serde_json::json!({"method": "tool/editing-stop"});
+        let response = hook_roundtrip_full(&ipc_path, &req).await;
+        assert!(
+            response.contains("had no covering server"),
+            "in-root uncovered edit renders the no-covering-server note, got: {response}",
+        );
+        assert!(
+            response.contains("Makefile"),
+            "the note names the uncovered file, got: {response}",
+        );
+        assert!(
+            !response.contains("outside tracked roots"),
+            "an in-root edit must not be misattributed to root coverage (misc 173), got: {response}",
+        );
+
+        shutdown.cancel();
+    }
+
+    /// Misc 173 sibling: the skipped-edits note clears once a bare receipt
+    /// delivers it. One outside edit, pay the batch, then a fresh bare run
+    /// must carry NO trailer — before the fix the bucket never cleared and
+    /// the note rode every later receipt for the rest of the session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn skipped_note_clears_once_paid() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // One out-of-root edit.
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "Edit",
+            "file_path": "/outside/some/file.rs",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &req).await;
+
+        // First bare run: the note is delivered — the debt is paid.
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let line = hook_roundtrip(&ipc_path, &req).await;
+        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
+        let req = serde_json::json!({"method": "tool/editing-stop"});
+        let response = hook_roundtrip_full(&ipc_path, &req).await;
+        assert!(
+            response.contains("outside tracked roots"),
+            "the first receipt carries the note, got: {response}",
+        );
+
+        // Second bare run, no further edits: the paid note must NOT repeat.
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let line = hook_roundtrip(&ipc_path, &req).await;
+        assert!(
+            line.contains("ok"),
+            "re-prepare should succeed, got: {line}"
+        );
+        let req = serde_json::json!({"method": "tool/editing-stop"});
+        let response = hook_roundtrip_full(&ipc_path, &req).await;
+        let parsed: serde_json::Value =
+            serde_json::from_str(response.trim()).expect("valid diagnostics envelope");
+        let output = parsed["output"].as_str().unwrap_or_default();
+        assert!(
+            !output.contains("outside tracked roots"),
+            "a paid note must not ride the next receipt (misc 173), got: {response}",
+        );
+        assert_eq!(
+            output, "",
+            "nothing new was edited or skipped — the receipt is empty, got: {response}",
         );
 
         shutdown.cancel();
@@ -9479,10 +9707,14 @@ mod tests {
                 parent_id: "scope-1".to_string(),
                 payload: HandoffPayload::Diagnostics {
                     files: vec![PathBuf::from("/tmp/a.rs")],
-                    filtered: 2,
-                    filtered_roots: std::collections::BTreeSet::from([PathBuf::from(
-                        "/home/dev/Lattice",
-                    )]),
+                    skipped: SkippedEdits {
+                        outside: 2,
+                        outside_roots: std::collections::BTreeSet::from([PathBuf::from(
+                            "/home/dev/Lattice",
+                        )]),
+                        uncovered: 1,
+                        uncovered_files: std::collections::BTreeSet::from(["Makefile".to_string()]),
+                    },
                     session_id: "sess-1".to_string(),
                     editing_session: Some("sess-1".to_string()),
                     agent_id: String::new(),
@@ -9497,17 +9729,21 @@ mod tests {
         assert_eq!(consumed.parent_id, "scope-1");
         let HandoffPayload::Diagnostics {
             files,
-            filtered,
-            filtered_roots,
+            skipped,
             session_id,
             editing_session,
             agent_id,
         } = &consumed.payload;
         assert_eq!(files, &vec![PathBuf::from("/tmp/a.rs")]);
-        assert_eq!(*filtered, 2);
+        assert_eq!(skipped.outside, 2);
         assert_eq!(
-            filtered_roots,
-            &std::collections::BTreeSet::from([PathBuf::from("/home/dev/Lattice")])
+            skipped.outside_roots,
+            std::collections::BTreeSet::from([PathBuf::from("/home/dev/Lattice")])
+        );
+        assert_eq!(skipped.uncovered, 1);
+        assert_eq!(
+            skipped.uncovered_files,
+            std::collections::BTreeSet::from(["Makefile".to_string()])
         );
         assert_eq!(session_id, "sess-1");
         assert_eq!(editing_session.as_deref(), Some("sess-1"));
@@ -9549,8 +9785,7 @@ mod tests {
                 parent_id: "x".to_string(),
                 payload: HandoffPayload::Diagnostics {
                     files: Vec::new(),
-                    filtered: 0,
-                    filtered_roots: std::collections::BTreeSet::new(),
+                    skipped: SkippedEdits::default(),
                     session_id: "x".to_string(),
                     editing_session: Some("x".to_string()),
                     agent_id: String::new(),
