@@ -154,6 +154,14 @@ pub struct LspServer {
     /// [`super::server_behavior::ServerProfile::suppresses_pull_diagnostics`],
     /// immutable thereafter.
     pull_suppressed: bool,
+    /// Engine-internal casing: the server contractually publishes diagnostics
+    /// for every opened document (misc 187). Arms the retrieval evidence bar by
+    /// declaration, before this connection has demonstrated a publish
+    /// ([`Self::has_ever_published`] resets on every respawn). Set once at
+    /// construction from
+    /// [`super::server_behavior::ServerProfile::declares_push`], immutable
+    /// thereafter.
+    declares_push: bool,
     supports_workspace_diagnostics: OnceLock<bool>,
     supports_text_document_sync: OnceLock<bool>,
     supports_definition: OnceLock<bool>,
@@ -259,13 +267,14 @@ impl LspServer {
     /// to populate capability fields.
     #[must_use]
     pub fn new(language_id: String, server_name: String, settings: Option<Value>) -> Self {
-        let pull_suppressed =
-            super::server_behavior::ServerProfile::for_server(server_name.as_str())
-                .suppresses_pull_diagnostics();
+        let profile = super::server_behavior::ServerProfile::for_server(server_name.as_str());
+        let pull_suppressed = profile.suppresses_pull_diagnostics();
+        let declares_push = profile.declares_push();
         Self {
             capabilities: OnceLock::new(),
             supports_pull_diagnostics: AtomicBool::new(false),
             pull_suppressed,
+            declares_push,
             supports_workspace_diagnostics: OnceLock::new(),
             supports_text_document_sync: OnceLock::new(),
             supports_definition: OnceLock::new(),
@@ -468,6 +477,18 @@ impl LspServer {
     /// [`super::server_behavior::ServerProfile::suppresses_pull_diagnostics`].
     pub const fn pull_suppressed(&self) -> bool {
         self.pull_suppressed
+    }
+
+    /// Returns whether this server is cased as a contractual push publisher.
+    ///
+    /// Engine-internal per-server casing (misc 187): a declared-push server
+    /// publishes diagnostics for every opened document — a publish on every
+    /// `didOpen`, an explicit `[]` for clean — so the retrieval evidence bar
+    /// arms on the declaration alone, before this connection has heard a single
+    /// publish. Set once at construction; see
+    /// [`super::server_behavior::ServerProfile::declares_push`].
+    pub(crate) const fn declares_push(&self) -> bool {
+        self.declares_push
     }
 
     /// Returns whether any `textDocument/publishDiagnostics` has been heard on
@@ -1508,6 +1529,23 @@ mod tests {
         assert!(!server.pull_suppressed());
         server.set_capabilities(json!({ "diagnosticProvider": {} }));
         assert!(server.supports_pull_diagnostics());
+    }
+
+    #[test]
+    fn declared_push_server_carries_declaration_before_any_publish() {
+        // lattice is cased declared-push (misc 187): the declaration is
+        // construction-time state, present on a fresh connection with zero
+        // publishes heard — exactly the window where per-connection
+        // demonstration (`has_ever_published`) cannot arm the evidence bar.
+        let server = LspServer::new("markdown".to_string(), "lattice".to_string(), None);
+        assert!(server.declares_push());
+        assert!(!server.has_ever_published());
+    }
+
+    #[test]
+    fn uncased_server_does_not_declare_push() {
+        let server = LspServer::new("go".to_string(), "gopls".to_string(), None);
+        assert!(!server.declares_push());
     }
 
     #[test]

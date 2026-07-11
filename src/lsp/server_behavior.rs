@@ -22,7 +22,7 @@
 //! 82: discipline knowledge is "not something I want to be 'configurable' by the
 //! user but set on a case by case basis").
 //!
-//! Two conformance invariants are cased today:
+//! Three conformance invariants are cased today:
 //!
 //! - **rust-analyzer** — [`ServerProfile::suppresses_pull_diagnostics`]. Catenary
 //!   is push-first for the Rust family: RA suppressing native pushes when the
@@ -51,6 +51,13 @@
 //!   `[lsp.server.gopls]` replaces the shipped default wholesale (no field merge —
 //!   see `test_builtin_no_merge`), which would silently drop them; and because
 //!   they must win over a user who sets them otherwise.
+//! - **lattice** — [`ServerProfile::declares_push`] (misc 187). Its publish
+//!   contract is pinned cross-repo (misc 153 / Lattice ticket 16 / its decision
+//!   022): a publish on **every** `didOpen`, including unchanged files, with an
+//!   explicit `[]` for clean. The retrieval evidence bar arms on this
+//!   declaration even before the connection's first publish, closing the
+//!   first-run false-`[clean]` window that per-connection demonstration
+//!   (`has_ever_published`) reopens on every respawn and daemon bounce.
 
 use serde_json::{Value, json};
 
@@ -76,6 +83,12 @@ pub struct ServerProfile {
     /// the user/forced merge, so no config layer can deliver them and the
     /// server's own built-in default is the only value that ever applies.
     forbidden_initialization_options: &'static [&'static str],
+    /// When set, the server **contractually publishes** diagnostics for every
+    /// opened document — a publish on every `didOpen` (including unchanged
+    /// files), an explicit `[]` for clean. The retrieval evidence bar arms on
+    /// this declaration alone, before the connection has demonstrated a single
+    /// publish (misc 187).
+    declares_push: bool,
 }
 
 impl ServerProfile {
@@ -95,6 +108,18 @@ impl ServerProfile {
     #[must_use]
     pub const fn suppresses_pull_diagnostics(&self) -> bool {
         self.suppress_pull_diagnostics
+    }
+
+    /// Whether this server contractually publishes diagnostics for every opened
+    /// document (misc 187).
+    ///
+    /// A `true` profile arms the retrieval evidence bar from turn zero of a
+    /// fresh connection — declaration-OR-demonstration — so a declared push
+    /// server's never-heard files render the honest `[unverified]` instead of a
+    /// probe-backed `[clean]` while its first publish is still in flight.
+    #[must_use]
+    pub const fn declares_push(&self) -> bool {
+        self.declares_push
     }
 
     /// Applies the profile's client-capability shaping to a built `capabilities`
@@ -150,6 +175,7 @@ fn profile(server_name: &str) -> ServerProfile {
             suppress_pull_diagnostics: true,
             forced_initialization_options: None,
             forbidden_initialization_options: &[],
+            declares_push: false,
         },
         "gopls" => ServerProfile {
             suppress_pull_diagnostics: false,
@@ -166,6 +192,19 @@ fn profile(server_name: &str) -> ServerProfile {
             // natural user reasoning that reintroduces the false-clean. Only
             // gopls's own default may apply.
             forbidden_initialization_options: &["diagnosticsDelay"],
+            declares_push: false,
+        },
+        // Declared push (misc 187): lattice's contract — pinned cross-repo in
+        // misc 153 / Lattice ticket 16 / its decision 022 and re-verified
+        // behaviorally per re-pin by the conformance matrix — is a publish on
+        // EVERY didOpen, unchanged files included, explicit `[]` for clean.
+        // Other push servers (marksman, taplo, …) join only with conformance
+        // evidence in hand.
+        "lattice" => ServerProfile {
+            suppress_pull_diagnostics: false,
+            forced_initialization_options: None,
+            forbidden_initialization_options: &[],
+            declares_push: true,
         },
         _ => ServerProfile::default(),
     }
@@ -197,6 +236,30 @@ mod tests {
             assert!(
                 !ServerProfile::for_server(name).suppresses_pull_diagnostics(),
                 "{name} must not suppress pull",
+            );
+        }
+    }
+
+    #[test]
+    fn lattice_declares_push() {
+        // The misc-153 / Lattice-16 publish contract, carried as a conformance
+        // invariant (misc 187): the evidence bar arms on it from turn zero.
+        assert!(ServerProfile::for_server("lattice").declares_push());
+    }
+
+    #[test]
+    fn other_servers_do_not_declare_push() {
+        for name in [
+            "rust-analyzer",
+            "gopls",
+            "marksman",
+            "taplo",
+            "clangd",
+            "yX4Za",
+        ] {
+            assert!(
+                !ServerProfile::for_server(name).declares_push(),
+                "{name} must not declare push without conformance evidence",
             );
         }
     }

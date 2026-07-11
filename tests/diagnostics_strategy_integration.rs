@@ -988,6 +988,122 @@ fn heard_dirty_push_wins_no_pull() -> Result<()> {
     Ok(())
 }
 
+// ─── Declared push (misc 187) ─────────────────────────────────────────
+
+/// A declared-push server arms the retrieval evidence bar on a FRESH
+/// connection with zero prior publishes (misc 187).
+///
+/// The server is registered under the name `lattice`, whose conformance
+/// profile carries the publish contract (`declares_push`), but the binary is
+/// a silent mockls: it never publishes (`--no-push-diagnostics`), advertises
+/// no `diagnosticProvider`, and rejects the best-effort probe with `-32601`
+/// (`--reject-pull`). This is exactly the first-run window the declaration
+/// closes: per-connection demonstration (`has_ever_published`) is false, so
+/// pre-187 the bar could not arm and the file rendered a false `[clean]`
+/// from absence. With the declaration the bar arms from turn zero, the
+/// dead-air budget drains with no publish, the rejected probe is no
+/// evidence, and the file resolves to the honest
+/// `[unverified — … returned no result]`.
+#[test]
+fn declared_push_server_arms_bar_with_zero_prior_publishes() -> Result<()> {
+    let logs = tempfile::tempdir()?;
+    let rlog = logs.path().join("requests.jsonl");
+    let rlog_arg = rlog.to_str().context("rlog path")?.to_string();
+    let mockls_bin = env!("CARGO_BIN_EXE_mockls");
+    let mut bridge = BridgeProcess::spawn_with_config(|root| {
+        std::fs::write(root.join(format!("test.{MOCK_LANG_A}")), "echo hello\n")?;
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[lsp.server.lattice]\n\
+                 path = \"{mockls_bin}\"\n\
+                 args = [\"{MOCK_LANG_A}\", \"--log-pid-suffix\", \"--no-push-diagnostics\", \
+                 \"--reject-pull\", \"--request-log\", \"{rlog_arg}\"]\n\n\
+                 [lsp.language.{MOCK_LANG_A}]\n\
+                 servers = [\"lattice\"]\n"
+            ),
+        )?;
+        Ok(config_path)
+    })?;
+    bridge.initialize()?;
+
+    let file = bridge.root_path().join(format!("test.{MOCK_LANG_A}"));
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+
+    assert!(
+        text.contains("[unverified") && text.contains("returned no result"),
+        "a declared-push server that stays silent must resolve unverified even \
+         on a fresh connection with zero prior publishes (misc 187). Got: {text}"
+    );
+    assert!(
+        !text.contains("[clean]"),
+        "the first-run false-[clean] window is exactly what the declaration \
+         closes. Got: {text}"
+    );
+
+    // The probe was still attempted (it could have been the evidence) —
+    // exactly once — and its rejection did not disarm the bar.
+    let rlog_text = read_merged_log(&rlog);
+    assert_eq!(
+        count_request_method(&rlog_text, "textDocument/diagnostic"),
+        1,
+        "the expired bar still draws the one best-effort probe; log:\n{rlog_text}"
+    );
+
+    Ok(())
+}
+
+/// The undeclared twin of
+/// [`declared_push_server_arms_bar_with_zero_prior_publishes`]: the SAME
+/// silent mockls (never publishes, no advertised pull, probe rejected with
+/// `-32601`) under its ordinary uncased server name leaves the bar unarmed,
+/// and the misc-153 silent-server contract resolves the file — one
+/// best-effort probe, `[clean]`. Identical wire behavior to the declared
+/// test; the only variable is the profile declaration, isolating it as what
+/// arms the bar.
+#[test]
+fn undeclared_silent_server_still_resolves_clean() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let logs = tempfile::tempdir()?;
+    let rlog = logs.path().join("requests.jsonl");
+    let rlog_arg = rlog.to_str().context("rlog path")?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mut bridge = spawn_mockls(
+        &[
+            "--no-push-diagnostics",
+            "--reject-pull",
+            "--request-log",
+            rlog_arg,
+        ],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+    assert!(
+        text.contains("[clean]"),
+        "an undeclared silent server resolves clean per the misc-153 contract \
+         (bar unarmed, one best-effort probe). Got: {text}"
+    );
+    assert!(
+        !text.contains("[unverified"),
+        "no declaration and no demonstration means no bar — absence resolves \
+         clean, not unverified. Got: {text}"
+    );
+
+    let rlog_text = read_merged_log(&rlog);
+    assert_eq!(
+        count_request_method(&rlog_text, "textDocument/diagnostic"),
+        1,
+        "a never-heard file draws exactly one best-effort pull; log:\n{rlog_text}"
+    );
+
+    Ok(())
+}
+
 // ─── Multi-server diagnostics ─────────────────────────────────────────
 
 /// Two servers with diagnostics enabled: output contains diagnostics from

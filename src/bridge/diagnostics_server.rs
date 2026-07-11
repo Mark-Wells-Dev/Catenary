@@ -1508,9 +1508,11 @@ impl DiagnosticsServer {
                 // budget with no process activity remains invisible.
                 None if client.server().pull_suppressed() => Vec::new(),
                 // Never heard and no advertised pull capability. Some servers
-                // still answer `textDocument/diagnostic` on demand without
-                // advertising it (lattice): ask directly rather than report a
-                // false `[clean]` for a fast publisher whose first publish the
+                // answer `textDocument/diagnostic` on demand without
+                // advertising it (the bug-74 shape — lattice did at the time,
+                // before going push-only; today it rejects the probe with
+                // `-32601`): ask directly rather than report a false `[clean]`
+                // for a fast publisher whose first publish the
                 // settle-then-collect pipeline cleared (bug 74).
                 None => {
                     match client.try_pull_diagnostics(uri).await {
@@ -1791,8 +1793,8 @@ async fn drain_pipe(server: &LspServer) {
 /// samples ([`POLL_INTERVAL`], 50 ms): the amount of *observed quiet* —
 /// samples with no CPU/page-fault delta, no pending-work scheduler state, and
 /// no open progress bracket — [`await_publish_evidence`] tolerates before
-/// concluding a demonstrated-push server has nothing to say for a batch's
-/// never-heard files.
+/// concluding a declared- or demonstrated-push server has nothing to say for a
+/// batch's never-heard files.
 ///
 /// A work count over quiet samples, never elapsed wall-clock time (the
 /// declared, evidence-anchored floor form the contention doctrine exempts):
@@ -1811,9 +1813,10 @@ async fn drain_pipe(server: &LspServer) {
 /// an unchanged document.
 const DEBOUNCE_DEAD_ZONE_SAMPLES: u32 = 30;
 
-/// Holds retrieval until a demonstrated-push server's publishes arrive for
-/// the batch's never-heard URIs, or the dead-air budget drains — the
-/// retrieval evidence bar (bug 99 residual / bug 101 / misc 156).
+/// Holds retrieval until a declared- or demonstrated-push server's publishes
+/// arrive for the batch's never-heard URIs, or the dead-air budget drains —
+/// the retrieval evidence bar (bug 99 residual / bug 101 / misc 156 / misc
+/// 187).
 ///
 /// The activity-based settle cannot see work that has not started (a silent
 /// debounce timer, VFS latency), so "settled + cache empty" is absence of
@@ -1822,16 +1825,22 @@ const DEBOUNCE_DEAD_ZONE_SAMPLES: u32 = 30;
 ///
 /// - at least one opened URI is **never-heard** after the post-didSave settle
 ///   and drain (no cached publish, not even an empty one);
-/// - the server **has published** on this connection
-///   ([`LspServer::has_ever_published`]) — it is demonstrably a push server,
-///   so the didOpen/didSave it just received will produce a publish
-///   (possibly empty — the heard-empty clean, misc 153);
+/// - the server is a push server by **declaration OR demonstration**: either
+///   its conformance profile carries the publish contract
+///   ([`LspServer::declares_push`] — a publish on every didOpen, explicit
+///   `[]` for clean, misc 187) or it **has published** on this connection
+///   ([`LspServer::has_ever_published`]). Either way, the didOpen/didSave it
+///   just received will produce a publish (possibly empty — the heard-empty
+///   clean, misc 153). Demonstration alone left a first-run false-`[clean]`
+///   window on every fresh connection, since `has_ever_published` resets with
+///   the connection; the declaration closes it from turn zero;
 /// - it advertises **no pull channel** and has **never answered a probe**
 ///   ([`LspServer::has_answered_probe`]) — a working request channel is
 ///   per-file evidence on demand, so no wait is owed where one exists.
 ///
-/// A server that has never pushed is left untouched to the misc-153
-/// silent-server contract downstream (one best-effort probe → clean).
+/// A server that neither declares push nor has ever pushed is left untouched
+/// to the misc-153 silent-server contract downstream (one best-effort probe →
+/// clean).
 ///
 /// The wait wakes on every publish ([`LspServer::diagnostics_notify`]
 /// registered before each cache re-check, so no publish is missed) and never
@@ -1869,14 +1878,22 @@ async fn await_publish_evidence(
         )
     };
 
-    if pending.is_empty() || !server.has_ever_published() || server.has_answered_probe() {
+    // Declaration OR demonstration (misc 187): a declared-push server arms the
+    // bar even before this connection's first publish — `has_ever_published`
+    // is per-connection state that resets on every respawn and daemon bounce,
+    // which is exactly the first-run false-`[clean]` window the declaration
+    // closes.
+    if pending.is_empty()
+        || !(server.declares_push() || server.has_ever_published())
+        || server.has_answered_probe()
+    {
         return HashSet::new();
     }
 
     debug!(
         server = %server_name,
         pending = pending.len(),
-        "evidence bar armed: never-heard files on a demonstrated-push server",
+        "evidence bar armed: never-heard files on a declared- or demonstrated-push server",
     );
 
     let mut quiet_samples: u32 = 0;

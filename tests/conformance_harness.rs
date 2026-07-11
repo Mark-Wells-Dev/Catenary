@@ -677,6 +677,83 @@ fn conformance_vscode_json() -> Result<()> {
     sentinel("vscode-json-language-server")
 }
 
+// ── Declared-push behavioral leg (misc 187) ───────────────────────────
+
+/// Pins the lattice `declares_push` profile declaration (misc 187) to the
+/// live binary: a cold server publishes for EVERY `didOpen` — an explicit
+/// (possibly empty) publish for a clean file, a non-empty publish for a
+/// dirty one (the misc-153 / Lattice-16 / decision-022 contract). A lattice
+/// that drifts fails this re-pin, not the user's receipts at runtime — the
+/// asymmetry that makes carrying the declaration in code safe.
+///
+/// The observable is the product receipt, which under the declaration is
+/// itself the proof: lattice advertises no pull channel and rejects the
+/// best-effort probe (`-32601`, 7 days of firehose evidence), and the
+/// declared-push evidence bar arms from turn zero of the fresh connection —
+/// so `[clean]` can only be rendered over a heard publish (the explicit
+/// `[]`), never over absence; silence resolves `[unverified — …]` and fails.
+///
+/// Contention doctrine: no sleeps, no tight bounds — both legs ride the
+/// harness's wall-bounded settle machinery, and the evidence bar's own
+/// dead-air budget is the only wait for the publish.
+#[test]
+fn conformance_lattice_declared_push() -> Result<()> {
+    if !on_path("lattice") {
+        eprintln!("conformance: skipping `lattice` declared-push — binary not on PATH");
+        return Ok(());
+    }
+
+    // The checked-in markdown fixture supplies the dirty file; the clean file
+    // is written beside it in the throwaway copy (nothing dangles).
+    let case = lookup("lattice").context("no conformance case for `lattice`")?;
+    let mut root = tempfile::tempdir().context("create fixture root")?;
+    common::keep_for_triage(&mut root);
+    copy_dir(&fixture_dir(case), root.path())?;
+    let clean = root.path().join("clean.md");
+    std::fs::write(
+        &clean,
+        "# Clean fixture\n\nNothing in this document dangles.\n",
+    )
+    .context("write clean fixture")?;
+    let dirty = root.path().join(case.file);
+
+    let mut bridge = BridgeProcess::spawn_conformance(root.path())?;
+    bridge.initialize()?;
+
+    // Cold server, didOpen a clean file: the explicit (possibly empty)
+    // publish must arrive.
+    let receipt = run_settle_diagnostics(&bridge, &clean, CONFORMANCE_WALL_BOUND)
+        .context("declared-push clean leg")?;
+    assert!(
+        !receipt.contains("[unverified"),
+        "no publish arrived for the clean didOpen — the declared-push contract \
+         (publish on every didOpen, explicit [] for clean) has drifted:\n{receipt}"
+    );
+    assert!(
+        receipt.contains("[clean]"),
+        "the clean didOpen must resolve to a publish-backed [clean]:\n{receipt}"
+    );
+
+    // Same connection, didOpen a dirty file: a non-empty publish must arrive.
+    let receipt = run_settle_diagnostics(&bridge, &dirty, CONFORMANCE_WALL_BOUND)
+        .context("declared-push dirty leg")?;
+    assert!(
+        !receipt.contains("[clean]") && !receipt.contains("[unverified"),
+        "the dirty didOpen must produce a non-empty publish:\n{receipt}"
+    );
+    assert!(
+        receipt.contains("broken.md"),
+        "the dirty receipt must diagnose the fixture file:\n{receipt}"
+    );
+
+    bridge
+        .shutdown_clean(SHUTDOWN_GRACE)
+        .context("clean shutdown for `lattice` declared-push")?;
+
+    eprintln!("conformance: `lattice` declared-push PASSED");
+    Ok(())
+}
+
 // ── tui-rework 10 coverage sentinel (skip-if-binary-missing) ──────────
 //
 // clangd is a common, apt-provisioned server that publishes a hard parse error
