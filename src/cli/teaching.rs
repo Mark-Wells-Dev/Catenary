@@ -176,7 +176,11 @@ const DAEMON_STALENESS_NOTE: &str = "note: the serving daemon runs an older buil
 /// registration it is taught, by construction. Today only Claude Code's
 /// shipped hook set (`plugins/catenary/hooks/hooks.json`) registers
 /// `WorktreeCreate`; Antigravity's and OpenCode's do not.
-const fn hook_set_has_worktree_create(client: Option<HostFormat>) -> bool {
+///
+/// Shared with the command filter (misc 177): the same predicate that keys the
+/// primer's "Dispatching isolated work" section keys the agent-side
+/// `catenary worktree add` dispatch denial, so the two surfaces can never skew.
+pub(crate) const fn hook_set_has_worktree_create(client: Option<HostFormat>) -> bool {
     matches!(client, Some(HostFormat::Claude))
 }
 

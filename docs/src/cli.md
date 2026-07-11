@@ -370,6 +370,15 @@ catenary worktree rm <path>               # remove a worktree
 A dirty worktree is never removed automatically: unlanded work is always kept
 until you land or explicitly remove it.
 
+> **Agent surface:** on hosts whose installed hook set registers the
+> `WorktreeCreate` hook (today Claude Code), agent-side `catenary worktree add`
+> is denied with a teaching message — the sanctioned way for an agent to get an
+> isolated worktree is dispatching a subagent with the Agent/Task tool's
+> `isolation: "worktree"`, which creates, relocates, and anchors the worktree
+> itself. A hand-run add anchors nothing, leaving the subagent pinned to the
+> main tree. The cleanup verbs (`diff`, `land`, `rm`) stay available, and human
+> terminal use is unaffected — hooks only filter agent tool calls.
+
 ### `catenary doctor`
 
 Verify language servers and hook installation. See [Installation](installation.md#verify).

@@ -58,6 +58,7 @@ pub mod oracle;
 /// denies with a teaching message.
 pub mod resolver;
 
+use crate::cli::HostFormat;
 use crate::config::ResolvedCommands;
 
 /// Device sinks that are never file writes when they appear as redirect
@@ -665,10 +666,18 @@ enum Sub {
     /// no handoff, output is complete and client-owned, so it chains and pipes
     /// like `query`.
     WorktreeLs,
-    /// `catenary worktree add` / `catenary worktree rm` — the durable-worktree
-    /// lifecycle verbs (misc 151). Bare-only lifecycle: each mutates the on-disk
-    /// worktree set and must run as the sole command.
-    WorktreeAddRm,
+    /// `catenary worktree add` — the durable-worktree creation verb (misc 151).
+    /// Bare-only lifecycle: it mutates the on-disk worktree set and must run as
+    /// the sole command. On clients whose installed hook set registers
+    /// `WorktreeCreate` it is denied outright with a dispatch teaching
+    /// (misc 177): the hook-driven `isolation: "worktree"` flow creates,
+    /// relocates, and anchors the worktree — a hand-run add anchors nothing.
+    WorktreeAdd,
+    /// `catenary worktree rm` — the durable-worktree removal verb (misc 151)
+    /// and, with `land`, the sanctioned cleanup path (`WorktreeRemove` never
+    /// fires upstream). Bare-only lifecycle: it mutates the on-disk worktree
+    /// set and must run as the sole command.
+    WorktreeRm,
     /// `catenary worktree diff` — the complete worktree-vs-HEAD diff (misc 158).
     /// Search-class: no handoff, complete client-owned output (a `git apply`
     /// patch), so it chains and pipes like `grep`/`glob`.
@@ -695,7 +704,8 @@ impl Sub {
             | Self::Unpin
             | Self::Primer
             | Self::Commands
-            | Self::WorktreeAddRm
+            | Self::WorktreeAdd
+            | Self::WorktreeRm
             | Self::WorktreeLand => CatenaryClass::Lifecycle,
         }
     }
@@ -717,7 +727,8 @@ impl Sub {
             Self::Primer => "primer",
             Self::Commands => "commands",
             Self::WorktreeLs => "worktree ls",
-            Self::WorktreeAddRm => "worktree add/rm",
+            Self::WorktreeAdd => "worktree add",
+            Self::WorktreeRm => "worktree rm",
             Self::WorktreeDiff => "worktree diff",
             Self::WorktreeLand => "worktree land",
         }
@@ -760,10 +771,12 @@ fn recognize_catenary_sub(rest: &[&str]) -> Recog {
         (Some("pin"), _) => Recog::Agent(Sub::Pin),
         (Some("unpin"), _) => Recog::Agent(Sub::Unpin),
         // `worktree ls` is Search-class (pipe-friendly registry view); `worktree
-        // add`/`rm` are bare-only lifecycle verbs (misc 151). Split before the
-        // bare-word arms so the two-word forms are matched exactly.
+        // add`/`rm` are bare-only lifecycle verbs (misc 151), recognized apart so
+        // `add` alone can take the client-keyed dispatch deny (misc 177). Split
+        // before the bare-word arms so the two-word forms are matched exactly.
         (Some("worktree"), Some("ls")) => Recog::Agent(Sub::WorktreeLs),
-        (Some("worktree"), Some("add" | "rm")) => Recog::Agent(Sub::WorktreeAddRm),
+        (Some("worktree"), Some("add")) => Recog::Agent(Sub::WorktreeAdd),
+        (Some("worktree"), Some("rm")) => Recog::Agent(Sub::WorktreeRm),
         // `worktree diff` is Search-class (a complete `git apply` patch on
         // stdout, pipe-friendly); `worktree land` is a bare-only lifecycle verb
         // that writes the diff into the owning repo (misc 158). Split before the
@@ -894,8 +907,18 @@ struct CatenaryScan {
 /// on a handoff command is a bare-only violation. The retired `catenary sed` /
 /// `editing stop` tokens get a teaching redirect; unrecognized or non-agent
 /// subcommands are denied.
+///
+/// `client` is the declared client identity (the `--format=<client>` the hook
+/// definition carries — declared, never sniffed, exactly like the primer's
+/// client keying). When the declared client's installed hook set registers
+/// `WorktreeCreate`, `catenary worktree add` is denied in any form with the
+/// dispatch teaching (misc 177): the sanctioned flow is the Agent/Task tool's
+/// `isolation: "worktree"`, whose hook creates, relocates, and anchors the
+/// worktree — a hand-run add anchors nothing. `None` (no declared client — the
+/// daemon-side boundary classifier, tests) keeps `worktree add` a plain
+/// bare-only lifecycle verb.
 #[must_use]
-pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
+pub fn analyze_catenary_command(cmd: &str, client: Option<HostFormat>) -> CatenaryAction {
     // The parse strips heredoc bodies, `#` comments, and `\`-newline joins, and
     // segments on the real list/pipe operators quote-faithfully — so a `catenary`
     // word inside a quoted argument or comment never reaches command position.
@@ -940,6 +963,23 @@ pub fn analyze_catenary_command(cmd: &str) -> CatenaryAction {
         .any(|o| matches!(o.recog, Recog::Agent(Sub::RootsAddRm)))
     {
         return CatenaryAction::Deny(roots_add_rm_retired_denial());
+    }
+
+    // Agent-side `catenary worktree add` is structurally unavailable on clients
+    // whose installed hook set registers `WorktreeCreate` (misc 177): the
+    // sanctioned dispatch flow is the Agent/Task tool's `isolation: "worktree"`,
+    // whose hook creates, relocates, and anchors the worktree — a hand-run add
+    // anchors nothing (the misc-172 mislocation class). Catch it in any form,
+    // before the output-ownership and bare-only denials, so the agent always
+    // learns the dispatch flow rather than a generic complaint. Operator
+    // hand-runs are untouched — humans at terminals are unfiltered.
+    if crate::cli::teaching::hook_set_has_worktree_create(client)
+        && scan
+            .occs
+            .iter()
+            .any(|o| matches!(o.recog, Recog::Agent(Sub::WorktreeAdd)))
+    {
+        return CatenaryAction::Deny(worktree_add_dispatch_denial());
     }
 
     // First occurrence with a per-command problem wins (document order).
@@ -1011,7 +1051,8 @@ const fn occ_needs_isolation(occ: &CatenaryOcc) -> bool {
             | Sub::Unpin
             | Sub::Primer
             | Sub::Commands
-            | Sub::WorktreeAddRm
+            | Sub::WorktreeAdd
+            | Sub::WorktreeRm
             | Sub::WorktreeLand,
         ) => true,
         // search (grep/glob/query/worktree ls/diff), the subcommand-less global
@@ -1227,7 +1268,8 @@ fn stdin_denial(sub: Sub) -> Option<String> {
         | Sub::Unpin
         | Sub::Primer
         | Sub::Commands
-        | Sub::WorktreeAddRm
+        | Sub::WorktreeAdd
+        | Sub::WorktreeRm
         | Sub::WorktreeLand => Some(format!(
             "`catenary {}` takes no stdin — run it bare.",
             sub.label()
@@ -1311,8 +1353,32 @@ fn bare_only_denial(subs: &[Sub]) -> String {
 fn git_worktree_teaching() -> String {
     "`git worktree` isn't allowed — use `catenary worktree` instead: `catenary \
      worktree ls` to list, `catenary worktree add <branch> [path]` to create a \
-     durable checkout, `catenary worktree rm <path>` to remove one. Catenary \
-     owns worktree placement and disposal (misc 144/151)."
+     durable checkout, `catenary worktree rm <path>` to remove one. To dispatch \
+     isolated agent work, use the Agent/Task tool's `isolation: \"worktree\"` — \
+     never a hand-run add (misc 177). Catenary owns worktree placement and \
+     disposal (misc 144/151)."
+        .to_string()
+}
+
+/// Client-keyed teaching denial for agent-side `catenary worktree add` on
+/// clients whose installed hook set registers `WorktreeCreate` (misc 177).
+///
+/// On such hosts the sanctioned dispatch flow is the Agent/Task tool's
+/// `isolation: "worktree"` — the `WorktreeCreate` hook creates the worktree
+/// itself, relocates it outside the repo, and anchors the subagent's workspace
+/// there. A hand-run add skips that anchoring: the subagent stays pinned to the
+/// main tree and its file access prompts against the wrong workspace (the
+/// misc-172 mislocation class). The teaching mirrors the primer's "Dispatching
+/// isolated work" section. Humans at terminals are unfiltered, so operator
+/// hand-runs are untouched.
+fn worktree_add_dispatch_denial() -> String {
+    "Don't hand-run `catenary worktree add` to dispatch agent work — dispatch \
+     with the Agent/Task tool's `isolation: \"worktree\"` instead: Catenary's \
+     WorktreeCreate hook creates the worktree itself, relocates it outside the \
+     repo, and anchors the subagent's workspace there. A hand-run add skips \
+     that anchoring — the agent stays pinned to the main tree and its file \
+     access prompts against the wrong workspace. Review and clean up with \
+     `catenary worktree diff` and `catenary worktree land`."
         .to_string()
 }
 
@@ -2190,6 +2256,13 @@ mod tests {
             assert!(
                 msg.contains("catenary worktree"),
                 "`{cmd}` denial must point at catenary worktree, got: {msg}",
+            );
+            // misc 177: the pointer also teaches the dispatch flow, so a
+            // WorktreeCreate client is never bounced from this message into
+            // the `catenary worktree add` dispatch deny.
+            assert!(
+                msg.contains("isolation: \"worktree\""),
+                "`{cmd}` denial must teach isolation dispatch, got: {msg}",
             );
         }
     }
@@ -4065,7 +4138,7 @@ mod tests {
     /// substring assertions below fail with a readable message instead of
     /// panicking).
     fn deny_text(cmd: &str) -> String {
-        match analyze_catenary_command(cmd) {
+        match analyze_catenary_command(cmd, None) {
             CatenaryAction::Deny(m) => m,
             _ => String::new(),
         }
@@ -4076,11 +4149,11 @@ mod tests {
     #[test]
     fn matcher_accepts_bare_search() {
         assert_eq!(
-            analyze_catenary_command("catenary grep \"p\" src"),
+            analyze_catenary_command("catenary grep \"p\" src", None),
             CatenaryAction::Allow { has_foreign: false },
         );
         assert_eq!(
-            analyze_catenary_command("catenary glob src"),
+            analyze_catenary_command("catenary glob src", None),
             CatenaryAction::Allow { has_foreign: false },
         );
     }
@@ -4096,7 +4169,7 @@ mod tests {
             "catenary commands",
         ] {
             assert_eq!(
-                analyze_catenary_command(cmd),
+                analyze_catenary_command(cmd, None),
                 CatenaryAction::Allow { has_foreign: false },
                 "{cmd} should be a bare allow",
             );
@@ -4150,14 +4223,14 @@ mod tests {
         // handoff, like `roots`).
         assert!(
             matches!(
-                analyze_catenary_command("cd /repo && catenary pin ."),
+                analyze_catenary_command("cd /repo && catenary pin .", None),
                 CatenaryAction::Deny(_),
             ),
             "pin must be the sole command",
         );
         assert!(
             matches!(
-                analyze_catenary_command("catenary unpin /p | tee log"),
+                analyze_catenary_command("catenary unpin /p | tee log", None),
                 CatenaryAction::Deny(_),
             ),
             "unpin must not pipe out",
@@ -4169,11 +4242,11 @@ mod tests {
         // `catenary worktree ls` is Search-class (misc 151): pipe-friendly,
         // chainable, no isolation.
         assert_eq!(
-            analyze_catenary_command("catenary worktree ls"),
+            analyze_catenary_command("catenary worktree ls", None),
             CatenaryAction::Allow { has_foreign: false },
         );
         assert_eq!(
-            analyze_catenary_command("catenary worktree ls | grep feat"),
+            analyze_catenary_command("catenary worktree ls | grep feat", None),
             CatenaryAction::Allow { has_foreign: true },
             "worktree ls pipes into a downstream filter",
         );
@@ -4181,13 +4254,16 @@ mod tests {
 
     #[test]
     fn worktree_add_rm_are_bare_only_lifecycle() {
-        // `add`/`rm` mutate the on-disk worktree set: bare-only lifecycle.
+        // `add`/`rm` mutate the on-disk worktree set: bare-only lifecycle. With
+        // no declared client (or one whose hook set lacks WorktreeCreate, below)
+        // `add` stays a plain lifecycle verb — the dispatch deny (misc 177) is
+        // client-keyed.
         for cmd in [
             "catenary worktree add feature/auth",
             "catenary worktree rm /some/path",
         ] {
             assert_eq!(
-                analyze_catenary_command(cmd),
+                analyze_catenary_command(cmd, None),
                 CatenaryAction::Allow { has_foreign: false },
                 "{cmd} should be a bare allow",
             );
@@ -4195,18 +4271,83 @@ mod tests {
         // Chained or piped → bare-only violation.
         assert!(
             matches!(
-                analyze_catenary_command("cd /repo && catenary worktree add topic"),
+                analyze_catenary_command("cd /repo && catenary worktree add topic", None),
                 CatenaryAction::Deny(_),
             ),
             "worktree add must be the sole command",
         );
         assert!(
             matches!(
-                analyze_catenary_command("catenary worktree rm /p | tee log"),
+                analyze_catenary_command("catenary worktree rm /p | tee log", None),
                 CatenaryAction::Deny(_),
             ),
             "worktree rm must not pipe out",
         );
+    }
+
+    #[test]
+    fn worktree_add_denied_with_dispatch_teaching_for_worktree_create_clients() {
+        // misc 177: on a client whose installed hook set registers
+        // WorktreeCreate (today Claude Code), agent-side `worktree add` is
+        // denied in ANY form — bare, path-prefixed, chained, piped, wrapped —
+        // and the teaching always names the sanctioned dispatch flow, never a
+        // generic bare-only complaint.
+        for cmd in [
+            "catenary worktree add feature/auth",
+            "/usr/local/bin/catenary worktree add topic",
+            "cd /repo && catenary worktree add topic",
+            "catenary worktree add topic | tee log",
+            "echo $(catenary worktree add topic)",
+        ] {
+            let msg = match analyze_catenary_command(cmd, Some(HostFormat::Claude)) {
+                CatenaryAction::Deny(m) => m,
+                _ => String::new(),
+            };
+            assert!(
+                !msg.is_empty(),
+                "{cmd} must be denied for a WorktreeCreate client",
+            );
+            assert!(
+                msg.contains("isolation: \"worktree\"")
+                    && msg.contains("WorktreeCreate")
+                    && msg.contains("worktree diff")
+                    && msg.contains("worktree land"),
+                "{cmd} must teach the dispatch flow and the cleanup verbs, got: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_cleanup_verbs_survive_the_dispatch_deny() {
+        // The deny is surgical (misc 177): `rm` and `land` are the sanctioned
+        // cleanup path (WorktreeRemove never fires upstream), and `ls`/`diff`
+        // are reads — all stay available to WorktreeCreate clients.
+        for cmd in [
+            "catenary worktree rm /some/path",
+            "catenary worktree land /wt",
+            "catenary worktree ls",
+            "catenary worktree diff /wt",
+        ] {
+            assert_eq!(
+                analyze_catenary_command(cmd, Some(HostFormat::Claude)),
+                CatenaryAction::Allow { has_foreign: false },
+                "{cmd} must stay allowed for a WorktreeCreate client",
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_add_stays_lifecycle_for_clients_without_worktree_create() {
+        // Only a hook set that registers WorktreeCreate keys the deny —
+        // Antigravity and OpenCode keep the plain bare-only lifecycle verb (a
+        // hand-run add is their only worktree path).
+        for client in [HostFormat::Antigravity, HostFormat::OpenCode] {
+            assert_eq!(
+                analyze_catenary_command("catenary worktree add feature/auth", Some(client)),
+                CatenaryAction::Allow { has_foreign: false },
+                "{client:?} must keep worktree add until its hook set carries WorktreeCreate",
+            );
+        }
     }
 
     #[test]
@@ -4215,16 +4356,16 @@ mod tests {
         // complete client-owned output (a `git apply` patch), so it pipes and
         // chains like `grep`/`glob`.
         assert_eq!(
-            analyze_catenary_command("catenary worktree diff /wt"),
+            analyze_catenary_command("catenary worktree diff /wt", None),
             CatenaryAction::Allow { has_foreign: false },
         );
         assert_eq!(
-            analyze_catenary_command("catenary worktree diff /wt | git apply -"),
+            analyze_catenary_command("catenary worktree diff /wt | git apply -", None),
             CatenaryAction::Allow { has_foreign: true },
             "worktree diff pipes into a downstream git apply",
         );
         assert_eq!(
-            analyze_catenary_command("catenary worktree diff /wt --name-only | sort"),
+            analyze_catenary_command("catenary worktree diff /wt --name-only | sort", None),
             CatenaryAction::Allow { has_foreign: true },
             "--name-only pipes into a downstream filter",
         );
@@ -4235,26 +4376,26 @@ mod tests {
         // `land` writes the diff into the owning repo and removes the worktree:
         // bare-only lifecycle (misc 158).
         assert_eq!(
-            analyze_catenary_command("catenary worktree land /wt"),
+            analyze_catenary_command("catenary worktree land /wt", None),
             CatenaryAction::Allow { has_foreign: false },
             "a bare land is allowed",
         );
         assert_eq!(
-            analyze_catenary_command("catenary worktree land /wt --keep"),
+            analyze_catenary_command("catenary worktree land /wt --keep", None),
             CatenaryAction::Allow { has_foreign: false },
             "--keep is still a bare allow",
         );
         // Chained or piped → bare-only violation.
         assert!(
             matches!(
-                analyze_catenary_command("cd /repo && catenary worktree land /wt"),
+                analyze_catenary_command("cd /repo && catenary worktree land /wt", None),
                 CatenaryAction::Deny(_),
             ),
             "worktree land must be the sole command",
         );
         assert!(
             matches!(
-                analyze_catenary_command("catenary worktree land /wt | tee log"),
+                analyze_catenary_command("catenary worktree land /wt | tee log", None),
                 CatenaryAction::Deny(_),
             ),
             "worktree land must not pipe out",
@@ -4276,7 +4417,7 @@ mod tests {
             "catenary version",
         ] {
             assert_eq!(
-                analyze_catenary_command(cmd),
+                analyze_catenary_command(cmd, None),
                 CatenaryAction::Allow { has_foreign: false },
                 "{cmd} should be a bare global-read allow",
             );
@@ -4320,7 +4461,7 @@ mod tests {
         // subcommand arm (the global-read arm sits after them), so
         // `catenary grep --help` is a search allow, not the global read.
         assert_eq!(
-            analyze_catenary_command("catenary grep --help"),
+            analyze_catenary_command("catenary grep --help", None),
             CatenaryAction::Allow { has_foreign: false },
         );
     }
@@ -4331,7 +4472,7 @@ mod tests {
         // so a pipe or chain is a bare-only violation.
         assert!(
             matches!(
-                analyze_catenary_command("catenary commands | grep git"),
+                analyze_catenary_command("catenary commands | grep git", None),
                 CatenaryAction::Deny(_),
             ),
             "piping `catenary commands` should deny",
@@ -4360,19 +4501,19 @@ mod tests {
     #[test]
     fn matcher_routes_editing_lifecycle() {
         assert_eq!(
-            analyze_catenary_command("catenary editing start"),
+            analyze_catenary_command("catenary editing start", None),
             CatenaryAction::EditingStart,
         );
         assert_eq!(
-            analyze_catenary_command("catenary diagnostics"),
+            analyze_catenary_command("catenary diagnostics", None),
             CatenaryAction::Diagnostics,
         );
         assert_eq!(
-            analyze_catenary_command("/usr/local/bin/catenary diagnostics"),
+            analyze_catenary_command("/usr/local/bin/catenary diagnostics", None),
             CatenaryAction::Diagnostics,
         );
         assert_eq!(
-            analyze_catenary_command("DEBUG=1 catenary editing start"),
+            analyze_catenary_command("DEBUG=1 catenary editing start", None),
             CatenaryAction::EditingStart,
         );
     }
@@ -4387,22 +4528,22 @@ mod tests {
         // cleared". The bare form still routes to the prepare.
         assert!(
             matches!(
-                analyze_catenary_command("catenary diagnostics | head"),
+                analyze_catenary_command("catenary diagnostics | head", None),
                 CatenaryAction::Deny(_)
             ),
             "piped diagnostics must deny before the prepare drains the set",
         );
         assert!(matches!(
-            analyze_catenary_command("catenary diagnostics > out.txt"),
+            analyze_catenary_command("catenary diagnostics > out.txt", None),
             CatenaryAction::Deny(_)
         ));
         assert!(matches!(
-            analyze_catenary_command("catenary diagnostics && make test"),
+            analyze_catenary_command("catenary diagnostics && make test", None),
             CatenaryAction::Deny(_)
         ));
         // The bare form is the only one that reaches the drain.
         assert_eq!(
-            analyze_catenary_command("catenary diagnostics"),
+            analyze_catenary_command("catenary diagnostics", None),
             CatenaryAction::Diagnostics,
         );
     }
@@ -4429,15 +4570,15 @@ mod tests {
     #[test]
     fn matcher_accepts_search_chains() {
         assert_eq!(
-            analyze_catenary_command("cd src && catenary grep p"),
+            analyze_catenary_command("cd src && catenary grep p", None),
             CatenaryAction::Allow { has_foreign: true },
         );
         assert_eq!(
-            analyze_catenary_command("catenary grep a && catenary grep b"),
+            analyze_catenary_command("catenary grep a && catenary grep b", None),
             CatenaryAction::Allow { has_foreign: false },
         );
         assert_eq!(
-            analyze_catenary_command("catenary glob x ; catenary glob y"),
+            analyze_catenary_command("catenary glob x ; catenary glob y", None),
             CatenaryAction::Allow { has_foreign: false },
         );
     }
@@ -4446,13 +4587,13 @@ mod tests {
     fn matcher_accepts_arg_substitution() {
         // `$VAR` is not a substitution — bare allow.
         assert_eq!(
-            analyze_catenary_command("catenary grep \"$PAT\""),
+            analyze_catenary_command("catenary grep \"$PAT\"", None),
             CatenaryAction::Allow { has_foreign: false },
         );
         // `$(cmd)` inside an arg is permitted; the inner command is flagged for
         // regime-2 allowlist validation (`has_foreign: true`), not denied here.
         assert_eq!(
-            analyze_catenary_command("catenary grep \"$(rg-config)\""),
+            analyze_catenary_command("catenary grep \"$(rg-config)\"", None),
             CatenaryAction::Allow { has_foreign: true },
         );
     }
@@ -4462,7 +4603,7 @@ mod tests {
         // Path prefix + a literal "catenary" inside the pattern: positional
         // tokenization still resolves the subcommand to grep.
         assert_eq!(
-            analyze_catenary_command(r#"/opt/catenary/bin/catenary grep "catenary" src"#),
+            analyze_catenary_command(r#"/opt/catenary/bin/catenary grep "catenary" src"#, None),
             CatenaryAction::Allow { has_foreign: false },
         );
     }
@@ -4485,7 +4626,7 @@ mod tests {
             "catenary grep p 2>&1 | head",
         ] {
             assert_eq!(
-                analyze_catenary_command(cmd),
+                analyze_catenary_command(cmd, None),
                 CatenaryAction::Allow { has_foreign: true },
                 "{cmd} should be an allow with foreign downstream",
             );
@@ -4499,11 +4640,11 @@ mod tests {
         // output — so it admits bare, chains, and pipes out freely.
         assert_eq!(recognize_catenary_sub(&["query"]), Recog::Agent(Sub::Query));
         assert_eq!(
-            analyze_catenary_command("catenary query --kind hook --search worktree-create"),
+            analyze_catenary_command("catenary query --kind hook --search worktree-create", None),
             CatenaryAction::Allow { has_foreign: false },
         );
         assert_eq!(
-            analyze_catenary_command("catenary query --kind hook | head"),
+            analyze_catenary_command("catenary query --kind hook | head", None),
             CatenaryAction::Allow { has_foreign: true },
         );
         // Unlike grep/glob, query reads no stdin — a pipe INTO it teaches
@@ -4519,15 +4660,15 @@ mod tests {
         // upstream foreign segment is allowlist-checked separately, hence
         // `has_foreign: true`).
         assert_eq!(
-            analyze_catenary_command("chezmoi managed | catenary grep p"),
+            analyze_catenary_command("chezmoi managed | catenary grep p", None),
             CatenaryAction::Allow { has_foreign: true },
         );
         assert_eq!(
-            analyze_catenary_command("ls | catenary glob src"),
+            analyze_catenary_command("ls | catenary glob src", None),
             CatenaryAction::Allow { has_foreign: true },
         );
         assert_eq!(
-            analyze_catenary_command("cat src/main.rs | catenary grep p"),
+            analyze_catenary_command("cat src/main.rs | catenary grep p", None),
             CatenaryAction::Allow { has_foreign: true },
         );
     }
@@ -4539,7 +4680,7 @@ mod tests {
         // the Search class.
         assert!(
             matches!(
-                analyze_catenary_command("git log | catenary diagnostics"),
+                analyze_catenary_command("git log | catenary diagnostics", None),
                 CatenaryAction::Deny(_),
             ),
             "piped-in diagnostics must still deny",
@@ -4555,11 +4696,11 @@ mod tests {
         // Ticket 07 / decision 025: search output is complete and client-owned,
         // so a file redirect is now allowed.
         assert_eq!(
-            analyze_catenary_command("catenary grep p > out.txt"),
+            analyze_catenary_command("catenary grep p > out.txt", None),
             CatenaryAction::Allow { has_foreign: false },
         );
         assert_eq!(
-            analyze_catenary_command("catenary glob src > out.txt"),
+            analyze_catenary_command("catenary glob src > out.txt", None),
             CatenaryAction::Allow { has_foreign: false },
         );
     }
@@ -4738,7 +4879,7 @@ mod tests {
             "someprog > file.rs",
         ] {
             assert_eq!(
-                analyze_catenary_command(cmd),
+                analyze_catenary_command(cmd, None),
                 CatenaryAction::NotCatenary,
                 "{cmd} has no catenary command",
             );
@@ -4825,7 +4966,7 @@ mod tests {
             check_command(cmd, rules, None)
                 .map_or(Outcome::Allow, |d| Outcome::DenyForeign(d.reason))
         };
-        match analyze_catenary_command(cmd) {
+        match analyze_catenary_command(cmd, None) {
             CatenaryAction::Deny(_) => Outcome::DenyCatenary,
             // Every allowed catenary line resolves its write-set through the
             // same path (ws38 ticket 02 folded-in edge): a catenary-only
@@ -5134,14 +5275,14 @@ mod tests {
     fn ticket04_bare_diagnostics_is_isolated() {
         // `catenary diagnostics` → isolated, handed off (allowed).
         assert_eq!(
-            analyze_catenary_command("catenary diagnostics"),
+            analyze_catenary_command("catenary diagnostics", None),
             CatenaryAction::Diagnostics,
         );
         // Scoped paths keep it one `SimpleCommand`, so the count-based gate
         // still passes it as isolated — the paths are a first-class scoped set
         // (ws37 ticket 02), not a denial trigger.
         assert_eq!(
-            analyze_catenary_command("catenary diagnostics src/main.rs"),
+            analyze_catenary_command("catenary diagnostics src/main.rs", None),
             CatenaryAction::Diagnostics,
         );
     }
@@ -5159,7 +5300,7 @@ mod tests {
             "catenary diagnostics .",
         ] {
             assert_eq!(
-                analyze_catenary_command(cmd),
+                analyze_catenary_command(cmd, None),
                 CatenaryAction::Diagnostics,
                 "scoped sole-command diagnostics must stay handed-off, not denied: {cmd}",
             );
@@ -5169,7 +5310,7 @@ mod tests {
         // counting command positions — not a per-arg check).
         assert!(
             matches!(
-                analyze_catenary_command("sleep 1; catenary diagnostics src/main.rs"),
+                analyze_catenary_command("sleep 1; catenary diagnostics src/main.rs", None),
                 CatenaryAction::Deny(_),
             ),
             "a chained scoped diagnostics must still deny on isolation",
@@ -5183,7 +5324,7 @@ mod tests {
         // *count* (two `SimpleCommand`s), never a substring scan.
         assert!(
             matches!(
-                analyze_catenary_command("sleep 100; catenary diagnostics"),
+                analyze_catenary_command("sleep 100; catenary diagnostics", None),
                 CatenaryAction::Deny(_),
             ),
             "a chained `catenary diagnostics` must deny on isolation",
@@ -5197,7 +5338,7 @@ mod tests {
         // the catenary command is in a compound, so it is not the sole command.
         assert!(
             matches!(
-                analyze_catenary_command("for f in *.rs; do catenary diagnostics; done"),
+                analyze_catenary_command("for f in *.rs; do catenary diagnostics; done", None),
                 CatenaryAction::Deny(_),
             ),
             "a `for`-loop body `catenary diagnostics` must deny on isolation",
@@ -5209,7 +5350,7 @@ mod tests {
     fn ticket04_cd_then_grep_allowed() {
         // `cd src && catenary grep foo` → allowed (grep chains freely).
         assert_eq!(
-            analyze_catenary_command("cd src && catenary grep foo"),
+            analyze_catenary_command("cd src && catenary grep foo", None),
             CatenaryAction::Allow { has_foreign: true },
         );
     }
@@ -5225,7 +5366,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    analyze_catenary_command(cmd),
+                    analyze_catenary_command(cmd, None),
                     CatenaryAction::Deny(ref m) if m.contains("`catenary sed` is retired"),
                 ),
                 "`{cmd}` should teach native sed -i",
@@ -5279,13 +5420,16 @@ mod tests {
         // count, not by scanning for the word "diagnostics". Both directions
         // confirm the gate reads the parse's structure, never raw text.
         assert_eq!(
-            analyze_catenary_command(r#"git commit -m "ran catenary diagnostics on the tree""#),
+            analyze_catenary_command(
+                r#"git commit -m "ran catenary diagnostics on the tree""#,
+                None
+            ),
             CatenaryAction::NotCatenary,
             "a quoted `catenary diagnostics` is prose, not a command",
         );
         // A genuine second command is seen structurally (count == 2 → deny).
         assert!(matches!(
-            analyze_catenary_command("true && catenary diagnostics"),
+            analyze_catenary_command("true && catenary diagnostics", None),
             CatenaryAction::Deny(_),
         ));
     }
@@ -5303,7 +5447,7 @@ mod tests {
         // The catenary gate finds no `catenary` command — the body is gone, so
         // the only command is the foreign `git`.
         assert_eq!(
-            analyze_catenary_command(cmd),
+            analyze_catenary_command(cmd, None),
             CatenaryAction::NotCatenary,
             "a `catenary diagnostics` in a heredoc body must not be recognized",
         );

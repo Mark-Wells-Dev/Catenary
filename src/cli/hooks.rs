@@ -1083,7 +1083,10 @@ pub fn run_pre_tool(format: HostFormat) {
     // with a pedagogical message.
     if let Some(ref shell_cmd) = extract_shell_command(&hook_json, tool_name, format) {
         use crate::cli::command_filter::CatenaryAction;
-        match crate::cli::command_filter::analyze_catenary_command(shell_cmd) {
+        // The declared client keys client-specific denials (misc 177): the
+        // format travels with the hook definition, so the capability it
+        // implies (a WorktreeCreate registration) holds by construction.
+        match crate::cli::command_filter::analyze_catenary_command(shell_cmd, Some(format)) {
             CatenaryAction::Deny(reason) => {
                 print!("{}", format_deny(&reason, format));
                 return;

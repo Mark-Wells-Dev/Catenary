@@ -401,7 +401,12 @@ impl HookRouter {
         // matcher's clear message.
         if is_bash_tool(tool_name) {
             use crate::cli::command_filter::CatenaryAction;
-            match command.map(crate::cli::command_filter::analyze_catenary_command) {
+            // No declared client here: the daemon-side boundary classifier has
+            // no hook-definition identity, and the client-side matcher already
+            // carries the client-keyed denials (misc 177) before any IPC — so
+            // `None` classifies neutrally and never over-denies for hosts
+            // whose hook set lacks WorktreeCreate.
+            match command.map(|c| crate::cli::command_filter::analyze_catenary_command(c, None)) {
                 Some(CatenaryAction::Deny(msg)) => return Some(HookResult::Deny(msg)),
                 Some(
                     CatenaryAction::EditingStart

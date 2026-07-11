@@ -109,6 +109,45 @@ fn client_fallback_allows_allowlisted_command() -> Result<()> {
     Ok(())
 }
 
+/// misc 177: through the real hook binary, `--format=claude` declares a client
+/// whose installed hook set registers `WorktreeCreate`, so agent-side
+/// `catenary worktree add` is denied with the dispatch teaching. This pins the
+/// one line of wiring the unit tests can't reach — `run_pre_tool` passing its
+/// declared format into the matcher.
+#[test]
+fn worktree_add_denied_with_dispatch_teaching_for_claude_format() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("tempdir path")?;
+
+    let stdout = run_client_hook(root, "catenary worktree add topic")?;
+    let decision = parse_decision(&stdout)
+        .context("worktree add under --format=claude should produce a deny envelope")?;
+    assert_eq!(
+        decision, "deny",
+        "worktree add must be denied for the claude format, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("WorktreeCreate") && stdout.contains("isolation:"),
+        "the denial must teach the isolation dispatch flow, got: {stdout}"
+    );
+    Ok(())
+}
+
+/// Companion: the deny is surgical — the sanctioned cleanup verb `worktree rm`
+/// stays allowed (silent stdout) under the same declared client.
+#[test]
+fn worktree_rm_still_allowed_for_claude_format() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("tempdir path")?;
+
+    let stdout = run_client_hook(root, "catenary worktree rm /tmp/wt")?;
+    assert!(
+        parse_decision(&stdout).is_none(),
+        "worktree rm must stay allowed for the claude format (no deny), got: {stdout}"
+    );
+    Ok(())
+}
+
 /// Bug 80, leg 3 (confirm-intentional): the command filter kept enforcing
 /// correctly with **no daemon** during the outage — a killed daemon must not
 /// make the shell surface fail open *or* closed. This drives the real
