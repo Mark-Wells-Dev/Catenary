@@ -14,6 +14,9 @@
 #   2. create-release  cut a GitHub Release with the binaries attached
 #   3. publish-crate   publish to crates.io via Trusted Publishing (OIDC — no
 #                      stored token): catenary-proc, then catenary-mcp
+#   4. notify-distribution  dispatch the distribution repos (pkgbuilds,
+#                      homebrew-tap, scoop-bucket) so packaging starts
+#                      immediately instead of on their next poll
 #
 # Triggered ONLY by tag pushes (which require write access), so a fork PR can
 # never trigger it — the publish credential is never exposed to untrusted code.
@@ -153,3 +156,30 @@ jobs:
           sleep 30
           # Root package (catenary-mcp).
           cargo publish --allow-dirty
+
+  # Push, don't poll: nudge the distribution repos so packaging starts now
+  # instead of on their next scheduled poll. Each dispatched workflow is an
+  # idempotent no-op when nothing newer has shipped, and each keeps its
+  # schedule as a fallback — so a missing or expired DIST_DISPATCH_TOKEN
+  # (fine-grained PATs cap at 1 year) degrades to polling, never a red
+  # release. The token is a TwoWells org secret (fine-grained PAT,
+  # Actions: write on exactly these three repos), shared with each upstream
+  # that ships releases. scoop-bucket carries no catenary manifest (no
+  # Windows asset), so its dispatch is a no-op — kept anyway so this job
+  # stays copy-paste identical across the TwoWells upstreams.
+  notify-distribution:
+    name: Notify Distribution Repos
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch distribution watchers
+        env:
+          GH_TOKEN: ${{ secrets.DIST_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "DIST_DISPATCH_TOKEN unset — falling back to scheduled polls."
+            exit 0
+          fi
+          gh workflow run watch.yml --repo TwoWells/pkgbuilds
+          gh workflow run bump.yml --repo TwoWells/homebrew-tap
+          gh workflow run bump.yml --repo TwoWells/scoop-bucket
