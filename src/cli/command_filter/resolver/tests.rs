@@ -2449,16 +2449,103 @@ fn unmodeled_writer_proceed_tracks_the_allowlist() {
     assert!(none.message.contains("redirect"), "{}", none.message);
 }
 
-/// A content-query git form in a directory that isn't a repository: the git
-/// query fails, so the write-set can't be read — `git-query-failed`.
+/// A content-query git form in a directory that isn't a repository names the
+/// non-repo cwd (misc 154) — no longer the three-way `git-query-failed`
+/// disjunction.
 #[test]
-fn git_content_query_failure_is_opaque() {
+fn git_content_form_outside_a_repo_names_the_cwd() {
     let t = tmp();
     let op = resolve_command("git stash pop", Some(t.path())).expect_err("not a repo");
-    assert_eq!(op.construct, "git-query-failed");
+    assert_eq!(op.construct, "git-not-a-repo");
     assert!(
-        op.message.contains("which files this command would change"),
+        op.message.contains("isn't inside a git repository"),
         "{}",
         op.message,
     );
+    assert!(
+        op.message.contains(&t.path().display().to_string()),
+        "names the cwd: {}",
+        op.message,
+    );
+}
+
+/// `git apply` with a patch file that doesn't exist names the missing path
+/// (misc 154) — the stat result the query implies, not a repo/ref/stash
+/// disjunction.
+#[test]
+fn git_apply_missing_patch_names_the_path() {
+    let t = git_repo();
+    let root = root_of(&t);
+    commit(&root, "a.rs", "one\n");
+    let op = resolve_command("git apply nope.patch", Some(&root)).expect_err("missing patch");
+    assert_eq!(op.construct, "git-missing-patch");
+    let named = root.join("nope.patch");
+    assert!(
+        op.message
+            .contains(&format!("`{}` does not exist", named.display())),
+        "{}",
+        op.message,
+    );
+}
+
+/// A genuinely unknown ref or stash keeps the query-failed teaching, now free
+/// of the missing-patch and non-repo branches (misc 154).
+#[test]
+fn git_unknown_ref_or_stash_keeps_query_failed() {
+    let t = git_repo();
+    let root = root_of(&t);
+    commit(&root, "a.rs", "one\n");
+    // Unknown ref in a pathspec checkout.
+    let op =
+        resolve_command("git checkout no-such-ref -- a.rs", Some(&root)).expect_err("unknown ref");
+    assert_eq!(op.construct, "git-query-failed");
+    assert!(
+        op.message.contains("the ref / patch / stash is unknown"),
+        "{}",
+        op.message,
+    );
+    assert!(
+        !op.message.contains("isn't a repository"),
+        "non-repo branch removed: {}",
+        op.message,
+    );
+    // Unknown stash (the repo has none).
+    let op = resolve_command("git stash pop", Some(&root)).expect_err("no stash");
+    assert_eq!(op.construct, "git-query-failed");
+}
+
+/// A compound command denied mid-chain names the leg that drew the denial
+/// (misc 154); the all-or-nothing compound behavior itself is unchanged — the
+/// whole line is denied.
+#[test]
+fn compound_denial_names_the_denied_leg() {
+    let t = git_repo();
+    let root = root_of(&t);
+    commit(&root, "a.rs", "one\n");
+    let op = resolve_command("echo x > p.txt && git apply nope.patch", Some(&root))
+        .expect_err("denied mid-chain");
+    assert_eq!(op.construct, "git-missing-patch");
+    assert_eq!(op.denied_leg.as_deref(), Some("git apply nope.patch"));
+    assert!(
+        op.message
+            .contains("Denied leg of the compound command: `git apply nope.patch`"),
+        "{}",
+        op.message,
+    );
+    // The leg note leads and the decision-023 pointer still closes the denial.
+    assert!(
+        op.message
+            .starts_with("Denied leg of the compound command:"),
+        "{}",
+        op.message,
+    );
+    assert!(
+        op.message.ends_with("Write model: `catenary commands`."),
+        "{}",
+        op.message,
+    );
+    // A single-command line carries no leg note.
+    let solo = resolve_command("git apply nope.patch", Some(&root)).expect_err("missing patch");
+    assert!(solo.denied_leg.is_none());
+    assert!(!solo.message.contains("Denied leg"), "{}", solo.message);
 }

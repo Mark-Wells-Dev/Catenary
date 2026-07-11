@@ -346,7 +346,7 @@ fn content_diff_words(
         }
     }
     let cwd = query_cwd(state).ok_or_else(no_cwd)?;
-    let root = repo_root(cwd).ok_or_else(query_failed)?;
+    let root = repo_root(cwd).ok_or_else(|| not_a_repository(cwd))?;
 
     let mut q: Vec<&str> = vec!["diff", "--name-only", ref_word, "--"];
     for (p, _) in paths {
@@ -439,6 +439,21 @@ fn resolve_apply(
         }
     }
     let cwd = query_cwd(state).ok_or_else(no_cwd)?;
+
+    // The lookup the numstat query implies, surfaced as its own cause (misc
+    // 154): a missing patch file is named instead of the generic query
+    // failure. A bare `-` is stdin by convention — the stdin teaching, not a
+    // bogus path.
+    for &pi in &patch_files {
+        let arg = args[pi].as_str();
+        if arg == "-" {
+            return Err(stdin_patch());
+        }
+        let path = cwd.join(arg);
+        if !path.exists() {
+            return Err(missing_patch(&path));
+        }
+    }
 
     let mut q: Vec<&str> = vec!["apply", "--numstat"];
     q.extend(passthru);
@@ -536,7 +551,7 @@ fn stash_show(
         break;
     }
     let cwd = query_cwd(state).ok_or_else(no_cwd)?;
-    let root = repo_root(cwd).ok_or_else(query_failed)?;
+    let root = repo_root(cwd).ok_or_else(|| not_a_repository(cwd))?;
 
     let mut q: Vec<&str> = vec!["stash", "show", "--name-only"];
     if let Some(r) = stash_ref {
@@ -776,9 +791,32 @@ fn no_cwd() -> Unresolved {
 fn query_failed() -> Unresolved {
     u(
         "git-query-failed",
-        "git couldn't tell the hook which files this command would change — this isn't a \
-         repository here, or the ref / patch / stash is unknown. Check the arguments, or \
-         apply the change through the host's edit tools.",
+        "git couldn't tell the hook which files this command would change — the ref / \
+         patch / stash is unknown. Check the arguments, or apply the change through the \
+         host's edit tools.",
+    )
+}
+
+fn not_a_repository(cwd: &Path) -> Unresolved {
+    u(
+        "git-not-a-repo",
+        format!(
+            "git couldn't tell the hook which files this command would change — `{}` \
+             isn't inside a git repository. Run the command from inside the repository \
+             it targets.",
+            cwd.display()
+        ),
+    )
+}
+
+fn missing_patch(path: &Path) -> Unresolved {
+    u(
+        "git-missing-patch",
+        format!(
+            "The patch file `{}` does not exist, so the hook can't read which files it \
+             would change. Create the patch first, or check the path.",
+            path.display()
+        ),
     )
 }
 

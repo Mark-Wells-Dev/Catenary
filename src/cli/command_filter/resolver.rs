@@ -74,6 +74,12 @@ pub struct OpaqueWrite {
     pub construct: &'static str,
     /// The teaching message: names the construct and the resolvable form.
     pub message: String,
+    /// The rendered leg (command word plus arguments) that drew the denial,
+    /// when the command line was compound — more than one leg — so the agent
+    /// can tell which leg the teaching message is about (misc 154). Folded
+    /// into [`Self::message`] by the entry points; `None` for a
+    /// single-command line.
+    pub denied_leg: Option<String>,
 }
 
 /// How one command segment touches the working tree.
@@ -153,7 +159,18 @@ pub(crate) fn resolve_script_with(
     state.toolset = toolset;
     state.script_hosts = script_hosts;
     let mut writes = BTreeSet::new();
-    resolve_into(script, &mut state, &mut writes)?;
+    resolve_into(script, &mut state, &mut writes).map_err(|mut op| {
+        // A compound command is checked as a unit, so without this note the
+        // agent can't tell which leg the teaching message is about (misc 154).
+        if let Some(leg) = &op.denied_leg {
+            op.message = format!(
+                "Denied leg of the compound command: `{leg}` — the whole command is \
+                 checked before anything runs, so no leg has run. {}",
+                op.message
+            );
+        }
+        op
+    })?;
     Ok(LineWrites { writes })
 }
 
@@ -251,6 +268,12 @@ fn resolve_into(
     state: &mut State,
     writes: &mut BTreeSet<PathBuf>,
 ) -> Result<(), OpaqueWrite> {
+    let compound = script
+        .pipelines
+        .iter()
+        .map(|p| p.commands.len())
+        .sum::<usize>()
+        > 1;
     let mut conditional = false;
     for pipeline in &script.pipelines {
         let sole_stage = pipeline.commands.len() == 1;
@@ -263,13 +286,43 @@ fn resolve_into(
             };
             match resolve_segment(command, state, ctx) {
                 SegmentClass::Recorded(paths) => writes.extend(paths),
-                SegmentClass::Opaque(op) => return Err(op),
+                SegmentClass::Opaque(mut op) => {
+                    // Attribute the denial to its leg (misc 154). Set once: a
+                    // leg already named inside a substitution's sub-script is
+                    // the more precise attribution and is kept.
+                    if compound && op.denied_leg.is_none() {
+                        op.denied_leg = Some(render_leg(command));
+                    }
+                    return Err(op);
+                }
                 SegmentClass::PureDelete | SegmentClass::NoWrite => {}
             }
         }
         conditional = matches!(pipeline.terminator, Some(ListOp::And | ListOp::Or));
     }
     Ok(())
+}
+
+/// Cap on the rendered denied-leg text; a longer leg is truncated with `…`.
+const MAX_LEG_CHARS: usize = 80;
+
+/// Render a segment for the denied-leg attribution (misc 154): the command
+/// word plus its arguments (quoting and redirects are not reproduced — the
+/// rendering identifies the leg, it does not replay it), truncated so a
+/// pathological leg doesn't swamp the denial message.
+fn render_leg(cmd: &SimpleCommand) -> String {
+    let mut text = cmd.name.clone().unwrap_or_else(|| "shell".to_string());
+    for a in &cmd.argv {
+        text.push(' ');
+        text.push_str(a);
+    }
+    if text.chars().count() > MAX_LEG_CHARS {
+        let mut truncated: String = text.chars().take(MAX_LEG_CHARS).collect();
+        truncated.push('…');
+        truncated
+    } else {
+        text
+    }
 }
 
 // ── Segment resolution ───────────────────────────────────────────────────────
@@ -288,6 +341,7 @@ impl Unresolved {
             command: command.to_string(),
             construct: self.construct,
             message: self.message,
+            denied_leg: None,
         }
     }
 }
