@@ -169,8 +169,11 @@ pub enum GlobOutcome {
     },
     /// `--count` summary: number of resolved filesystem paths.
     Count {
-        /// Number of paths the query resolves to (files counted once each,
-        /// directories counted by their listed entries).
+        /// Number of paths the query resolves to. A glob pattern contributes
+        /// its match set — each match counted once, file or directory alike,
+        /// the same tally as the plain output's cardinality header (misc 184).
+        /// A directly-named file counts once; a directly-named directory
+        /// counts by its listed entries.
         paths: usize,
     },
 }
@@ -916,15 +919,23 @@ impl GlobServer {
 
     /// Counts the filesystem paths a glob query resolves to (`--count`).
     ///
-    /// Mirrors [`Self::handle_literal_paths`] dispatch — **directories first**,
-    /// so a symlink-to-dir (which `is_dir()` follows) contributes its listed
-    /// entry count, exactly as the listing renders it, rather than counting as a
-    /// single file/symlink (WS31-review D1/T1). Each directory contributes the
-    /// same filtered set [`Self::handle_glob_dir`] renders — tallied by the
-    /// content-free [`Self::count_dir_entries`], which applies the identical
-    /// filters but reads no file content (misc 159); each remaining resolved
-    /// file or symlink-to-file counts once. LSP enrichment is skipped — a count
-    /// is pure filesystem, and reads **zero** file content bytes.
+    /// A **glob-pattern argument** contributes its match set — each match
+    /// counts once, file or directory alike — exactly the tally the plain
+    /// output's cardinality header reports (misc 184). The listing
+    /// legitimately descends into a matched directory to render its contents;
+    /// the count must not, or the two surfaces disagree whenever a pattern
+    /// matches directories.
+    ///
+    /// A **directly-named argument** mirrors [`Self::handle_literal_paths`]
+    /// dispatch — **directories first**, so a symlink-to-dir (which `is_dir()`
+    /// follows) contributes its listed entry count, exactly as the listing
+    /// renders it, rather than counting as a single file/symlink (WS31-review
+    /// D1/T1). Each named directory contributes the same filtered set
+    /// [`Self::handle_glob_dir`] renders — tallied by the content-free
+    /// [`Self::count_dir_entries`], which applies the identical filters but
+    /// reads no file content (misc 159); each remaining resolved file or
+    /// symlink-to-file counts once. LSP enrichment is skipped — a count is
+    /// pure filesystem, and reads **zero** file content bytes.
     ///
     /// A free helper over [`FilesystemManager`] (not `&self`) so
     /// [`Self::count_paths_off_thread`] can run it in a `spawn_blocking` task —
@@ -951,29 +962,40 @@ impl GlobServer {
             cancel,
         );
         apply_exclude_to_groups(fs_manager, &mut groups, exclude);
-        let resolved: Vec<PathBuf> = groups.into_iter().flat_map(|g| g.resolved).collect();
         let mut total = 0usize;
-        for path in &resolved {
+        for group in &groups {
             if cancel.is_cancelled() {
                 break;
             }
-            if path.is_dir() {
-                let canonical = path
-                    .canonicalize()
-                    .map_err(|e| anyhow!("Path does not exist: {}: {e}", path.display()))?;
-                // Content-free count: mirrors the listing's filtered set exactly
-                // but never reads a file's content for a line count it would
-                // discard (misc 159 — the free win and the runaway's dominant
-                // cost). `fs_manager` is no longer needed here.
-                total += Self::count_dir_entries(
-                    &canonical,
-                    include_gitignored,
-                    include_hidden,
-                    exclude,
-                    cancel,
-                );
-            } else if path.is_file() || path.is_symlink() {
-                total += 1;
+            // A pattern's count is its match set — the same set the plain
+            // output's `N files match <pattern>` header reports (misc 184). A
+            // matched directory counts once; only the listing descends into it.
+            if group.is_pattern {
+                total += group.resolved.len();
+                continue;
+            }
+            for path in &group.resolved {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                if path.is_dir() {
+                    let canonical = path
+                        .canonicalize()
+                        .map_err(|e| anyhow!("Path does not exist: {}: {e}", path.display()))?;
+                    // Content-free count: mirrors the listing's filtered set exactly
+                    // but never reads a file's content for a line count it would
+                    // discard (misc 159 — the free win and the runaway's dominant
+                    // cost). `fs_manager` is no longer needed here.
+                    total += Self::count_dir_entries(
+                        &canonical,
+                        include_gitignored,
+                        include_hidden,
+                        exclude,
+                        cancel,
+                    );
+                } else if path.is_file() || path.is_symlink() {
+                    total += 1;
+                }
             }
         }
         Ok(total)
@@ -2664,7 +2686,9 @@ mod tests {
 
     /// The free win (regardless of root cause) — `--count` reads ZERO file
     /// content bytes, and issues zero line-count reads (`file_info`), even when
-    /// a single-star pattern resolves a directory of thousands of files.
+    /// a directly-named directory holds thousands of files. (A *pattern* no
+    /// longer enumerates matched directories at all — misc 184 — so the named
+    /// dir is the leg where enumeration still happens.)
     #[test]
     #[allow(clippy::expect_used, reason = "test assertions")]
     fn pathology_count_reads_zero_content_bytes() {
@@ -2672,24 +2696,18 @@ mod tests {
         use tokio_util::sync::CancellationToken;
 
         let n = 3000;
-        let (_guard, base, _big) = pathology_fixture(3, n);
+        let (_guard, _base, big) = pathology_fixture(3, n);
         let server = test_glob_server();
         let cancel = CancellationToken::new();
 
         probe::reset();
-        let count = GlobServer::count_paths(
-            &server.fs_manager,
-            &[base.join("b*")],
-            false,
-            false,
-            None,
-            &cancel,
-        )
-        .expect("count b*");
+        let count =
+            GlobServer::count_paths(&server.fs_manager, &[big], false, false, None, &cancel)
+                .expect("count named big dir");
 
-        assert!(
-            count >= n,
-            "sanity: the big directory's children are counted"
+        assert_eq!(
+            count, n,
+            "sanity: the named directory's children are counted"
         );
         assert_eq!(
             probe::file_info_calls(),
@@ -2705,9 +2723,11 @@ mod tests {
     }
 
     /// The returned set is exactly complete (count == the constructed N), and
-    /// the total per-resolved-directory enumeration stays bounded by `c·N` — no
-    /// superlinear blowup from combining a big matched directory with tiny
-    /// siblings (the runaway's trigger).
+    /// the total enumeration stays bounded by `c·N` — no superlinear blowup
+    /// from combining a big matched directory with tiny siblings (the
+    /// runaway's trigger). The pattern is `b*/*` — matching the files
+    /// themselves — since a pattern's count is its match set (misc 184): `b*`
+    /// would now count the `k` matched directories, not their children.
     #[test]
     #[allow(clippy::expect_used, reason = "test assertions")]
     fn pathology_count_complete_and_enumeration_bounded() {
@@ -2719,20 +2739,20 @@ mod tests {
         let server = test_glob_server();
         let cancel = CancellationToken::new();
 
-        // Constructed total the pattern `b*` resolves: `big/` (n children) plus
-        // `k - 1` siblings with one child each.
+        // Constructed total the pattern `b*/*` matches: `big/`'s n children
+        // plus `k - 1` siblings' one child each.
         let constructed = n + (k - 1);
 
         probe::reset();
         let count = GlobServer::count_paths(
             &server.fs_manager,
-            &[base.join("b*")],
+            &[base.join("b*/*")],
             false,
             false,
             None,
             &cancel,
         )
-        .expect("count b*");
+        .expect("count b*/*");
 
         assert_eq!(
             count, constructed,
@@ -2751,6 +2771,167 @@ mod tests {
             touched <= budget,
             "expansion + enumeration must touch ≤ {budget} entries for N={constructed}, \
              touched {touched}"
+        );
+    }
+
+    // ─── `--count` reports the match set (misc 184) ─────────────────────
+    //
+    // The sighting: `catenary glob 'tickets/*' --count` answered 753 for a
+    // pattern whose plain output's own header said `45 files match` (45
+    // subdirectories, 0 loose files). The count leg descended into matched
+    // directories (tallying their entries) while the header counted the match
+    // set. These tests mirror the ticket's probe table over a temp fixture and
+    // pin both surfaces to the same set.
+
+    /// Builds the misc-184 fixture mirroring the ticket's probe table:
+    /// `tickets/` holds three subdirectories (two files each) and no loose
+    /// files; `archive/` mixes two loose files with two subdirectories (one
+    /// file each); `misc/` is a flat directory of four files.
+    #[allow(clippy::expect_used, reason = "test fixture construction")]
+    fn misc184_fixture() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize base");
+        for ws in ["ws1", "ws2", "ws3"] {
+            let dir = base.join("tickets").join(ws);
+            std::fs::create_dir_all(&dir).expect("mkdir workstream");
+            for f in ["a.md", "b.md"] {
+                std::fs::write(dir.join(f), "x\n").expect("write ticket");
+            }
+        }
+        for d in ["old1", "old2"] {
+            let dir = base.join("archive").join(d);
+            std::fs::create_dir_all(&dir).expect("mkdir archive dir");
+            std::fs::write(dir.join("kept.md"), "x\n").expect("write archived file");
+        }
+        for f in ["one.md", "two.md"] {
+            std::fs::write(base.join("archive").join(f), "x\n").expect("write archive file");
+        }
+        let misc = base.join("misc");
+        std::fs::create_dir(&misc).expect("mkdir misc");
+        for i in 0..4 {
+            std::fs::write(misc.join(format!("t{i}.md")), "x\n").expect("write misc file");
+        }
+        (tmp, base)
+    }
+
+    /// Runs [`GlobServer::count_paths`] for a single pattern argument.
+    #[allow(clippy::expect_used, reason = "test helper")]
+    fn misc184_count(server: &GlobServer, pattern: PathBuf) -> usize {
+        GlobServer::count_paths(
+            &server.fs_manager,
+            &[pattern],
+            false,
+            false,
+            None,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("count_paths")
+    }
+
+    /// Extracts the tally from the plain output's cardinality header — the
+    /// leading `N` of `N files match <pattern>` (or `1 file matches`) — by
+    /// running the real render pipeline (`execute`, count off).
+    #[allow(clippy::expect_used, reason = "test helper")]
+    fn misc184_header_tally(
+        server: &GlobServer,
+        rt: &tokio::runtime::Runtime,
+        pattern: &Path,
+    ) -> usize {
+        let params = serde_json::json!({ "paths": [pattern.to_string_lossy()] });
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let outcome = rt
+            .block_on(server.execute(&params, None, &cancel))
+            .expect("execute glob");
+        let GlobOutcome::Rendered { output, .. } = outcome else {
+            unreachable!("a non-count glob yields Rendered");
+        };
+        output
+            .lines()
+            .next()
+            .expect("cardinality header line")
+            .split_whitespace()
+            .next()
+            .expect("header tally")
+            .parse()
+            .expect("header tally is a number")
+    }
+
+    /// A pattern matching only directories counts the match set — the tally the
+    /// plain header reports — not the directories' contents. Also covers the
+    /// ticket's mixed `archive/*` probe: loose files and subdirectories each
+    /// count once.
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn misc184_dir_match_count_equals_header_tally() {
+        let (_guard, base) = misc184_fixture();
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let server = test_glob_server();
+
+        // Directory-only match set: 3 dirs, 0 loose files — the sighting's
+        // shape (45 dirs → count 753 pre-fix).
+        let pattern = base.join("tickets/*");
+        let count = misc184_count(&server, pattern.clone());
+        assert_eq!(count, 3, "tickets/* matches 3 dirs — each counts once");
+        let header = misc184_header_tally(&server, &rt, &pattern);
+        assert_eq!(
+            count, header,
+            "--count ({count}) and the plain header ({header}) report the same set"
+        );
+
+        // Mixed match set (the archive probe): 2 files + 2 dirs = 4, not
+        // 4 + the dirs' children.
+        let pattern = base.join("archive/*");
+        let count = misc184_count(&server, pattern.clone());
+        assert_eq!(count, 4, "archive/* matches 2 files + 2 dirs — each once");
+        let header = misc184_header_tally(&server, &rt, &pattern);
+        assert_eq!(
+            count, header,
+            "--count ({count}) and the plain header ({header}) report the same set"
+        );
+    }
+
+    /// A flat all-files pattern was correct before the fix and stays so — the
+    /// common case that let the bug survive.
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn misc184_flat_file_match_count_unchanged() {
+        let (_guard, base) = misc184_fixture();
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let server = test_glob_server();
+
+        let pattern = base.join("misc/*");
+        let count = misc184_count(&server, pattern.clone());
+        assert_eq!(count, 4, "misc/* matches the 4 flat files");
+        let header = misc184_header_tally(&server, &rt, &pattern);
+        assert_eq!(
+            count, header,
+            "--count ({count}) and the plain header ({header}) report the same set"
+        );
+    }
+
+    /// Recursive `**/*` over a nested tree carries the same mechanism — dirs at
+    /// depth ≥1 also match, and each counts once, exactly as the header tallies
+    /// it (the ticket's unverified probe, confirmed here).
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn misc184_recursive_count_equals_header_tally() {
+        let (_guard, base) = misc184_fixture();
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let server = test_glob_server();
+
+        // tickets/**/* matches every path below tickets/: 3 dirs + 6 files.
+        // Pre-fix each matched dir also contributed its children, double-
+        // counting every file.
+        let pattern = base.join("tickets/**/*");
+        let count = misc184_count(&server, pattern.clone());
+        assert_eq!(
+            count, 9,
+            "tickets/**/* matches 3 dirs + 6 files — each path once"
+        );
+        let header = misc184_header_tally(&server, &rt, &pattern);
+        assert_eq!(
+            count, header,
+            "--count ({count}) and the plain header ({header}) report the same set"
         );
     }
 }
