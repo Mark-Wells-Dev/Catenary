@@ -5931,6 +5931,40 @@ pub fn ensure_daemon_running() -> Result<DaemonStartOutcome> {
     )
 }
 
+/// Heals the Linux rename-swap artifact in the bridge's own path (misc 182).
+///
+/// After a binary swap under a running bridge (`cargo install --path .` /
+/// `catenary update` rename over the file), `/proc/self/exe` resolves to
+/// `<path> (deleted)` — the dead inode's name, not the living file. The
+/// rename left the NEW binary at the original path, and exec'ing the path is
+/// exactly what the respawn wants — so the marker is trimmed when (and only
+/// when) the trimmed path exists again. A binary genuinely named
+/// `… (deleted)` passes through untouched: its trimmed sibling doesn't
+/// exist. macOS is unaffected (`current_exe` there answers the original
+/// path, which the rename refreshed in place). Kept on `current_exe`, not a
+/// PATH lookup — test hermeticity depends on it (`CARGO_BIN_EXE` binaries
+/// are not on PATH, and `isolate_env` clears PATH).
+#[cfg(unix)]
+fn heal_swapped_exe(exe: PathBuf) -> PathBuf {
+    let Some(trimmed) = exe
+        .to_str()
+        .and_then(|s| s.strip_suffix(" (deleted)"))
+        .map(PathBuf::from)
+    else {
+        return exe;
+    };
+    if trimmed.is_file() {
+        info!(
+            source = Source::DaemonLifecycle.as_str(),
+            healed = %trimmed.display(),
+            "respawn path carried the ` (deleted)` rename-swap marker; exec'ing the living path",
+        );
+        trimmed
+    } else {
+        exe
+    }
+}
+
 /// Spawns `catenary daemon` as a detached child process.
 ///
 /// The daemon binds the MCP socket and begins accepting connections.
@@ -5943,7 +5977,7 @@ fn spawn_daemon() -> Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
-    let exe = std::env::current_exe().context("resolve current executable path")?;
+    let exe = heal_swapped_exe(std::env::current_exe().context("resolve current executable path")?);
 
     let log_dir = crate::paths::state_dir().join("catenary");
     std::fs::create_dir_all(&log_dir)
@@ -11643,6 +11677,34 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn heal_swapped_exe_trims_marker_when_target_lives() {
+        // misc 182: after a rename-swap, /proc/self/exe reads `… (deleted)`
+        // while the NEW binary sits at the original path — heal to the path.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let living = dir.path().join("catenary");
+        std::fs::write(&living, b"bin").expect("write");
+        assert_eq!(
+            heal_swapped_exe(dir.path().join("catenary (deleted)")),
+            living
+        );
+    }
+
+    #[test]
+    fn heal_swapped_exe_keeps_marker_when_no_living_sibling() {
+        // A binary genuinely named `… (deleted)` (or a swap that removed the
+        // file without replacing it) passes through untouched.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let deleted = dir.path().join("catenary (deleted)");
+        assert_eq!(heal_swapped_exe(deleted.clone()), deleted);
+    }
+
+    #[test]
+    fn heal_swapped_exe_passes_unmarked_path_through() {
+        let p = PathBuf::from("/usr/bin/catenary");
+        assert_eq!(heal_swapped_exe(p.clone()), p);
     }
 
     #[test]
