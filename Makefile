@@ -411,16 +411,19 @@ rustgrep:
 rustglob:
 	$(call iso_run,$(RUST_REPO_HOME),$(RUST_REPO_ENV),glob '$(RUST_REPO_DIR)/**/*.$(RUST_REPO_EXT)')
 
-# Install the working tree's binary onto PATH — the maintainer's nightly
-# distribution channel (`cargo install --path .`), as a target so the ritual
-# is one word and never skipped (the v2 release day ran an entire session
-# against a 30-commit-stale binary and daemon because the raw form was).
-# Prints both versions afterward: the running daemon keeps serving the OLD
-# build until bounced, and the version pair makes the skew visible.
+# Install the working tree's binary onto PATH and bounce the daemon — the
+# maintainer's nightly distribution channel as one word, now including the
+# bounce (the v2 release day ran an entire session against a 30-commit-stale
+# binary and daemon because the raw ritual was skipped). Prints the version
+# pair first so the skew being fixed is visible, then stops the daemon: the
+# respawn heals the rename-swap marker (misc 182), so live bridges revive
+# the NEW build and replay their sessions on their own — the bounce is safe
+# to automate. `--force` skips the TTY confirmation (the bounce is the
+# point here); no daemon running is a clean no-op.
 install:
 	@cargo install --path . --locked
 	@catenary version
-	@echo "If the daemon lags the CLI: catenary stop (live bridges respawn the daemon and replay their sessions; a session whose binary was swapped under it may need /mcp)"
+	@catenary stop --force
 
 # Verify we're in a good state for release
 pre-release-check:
