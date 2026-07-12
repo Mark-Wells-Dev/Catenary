@@ -1837,6 +1837,13 @@ struct WorktreeRegistry {
     /// A worktree surviving into a new session gets fresh surfacing from the
     /// `SessionStart` line, not a re-nag.
     nagged: Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
+    /// Worktrees already surfaced dirty-kept to the parent this daemon lifetime
+    /// (bug 91): the `SubagentStop` dirty-kept notice ([`surface_dirty_kept`])
+    /// fires **once per worktree path**, so several subagents whose cwd resolves
+    /// to the one surviving dirty worktree yield exactly one reminder — not one
+    /// per stopping agent. Cleared for a path by [`WorktreeRegistry::prune_missing`]
+    /// once its dir is gone, so a worktree recreated at the same path re-surfaces.
+    surfaced: Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
 }
 
 #[cfg(unix)]
@@ -1845,6 +1852,7 @@ impl WorktreeRegistry {
         Self {
             inner: Arc::new(std::sync::Mutex::new(HashMap::new())),
             nagged: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            surfaced: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -1855,6 +1863,56 @@ impl WorktreeRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(worktree.to_path_buf())
+    }
+
+    /// Record that a worktree has been surfaced dirty-kept to the parent; returns
+    /// `true` only the first time (bug 91 — one reminder per worktree path, not
+    /// per stopping subagent).
+    fn mark_surfaced(&self, worktree: &Path) -> bool {
+        self.surfaced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(worktree.to_path_buf())
+    }
+
+    /// Drop every registration whose worktree directory is gone on disk, clearing
+    /// its `nagged`/`surfaced` marks too (bug 91). Returns the pruned paths.
+    ///
+    /// Ages out the stale tracked entries a landed/removed worktree leaves behind:
+    /// a registration (and its once-per-worktree surfacing marks) must not outlive
+    /// its directory, or a phantom entry lingers and a path recreated there is
+    /// denied a fresh reminder. Clearing the marks with the entry keeps the safety
+    /// invariant intact — a worktree that exists and is dirty is always reportable;
+    /// only *gone* paths lose their marks.
+    fn prune_missing(&self) -> Vec<PathBuf> {
+        let gone: Vec<PathBuf> = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let gone: Vec<PathBuf> = inner
+                .keys()
+                .filter(|path| !path.exists())
+                .cloned()
+                .collect();
+            for path in &gone {
+                inner.remove(path);
+            }
+            gone
+        };
+        if !gone.is_empty() {
+            for path in &gone {
+                self.nagged
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(path);
+                self.surfaced
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(path);
+            }
+        }
+        gone
     }
 
     /// Register (or replace) a worktree by its canonical path.
@@ -2536,11 +2594,25 @@ impl SessionManager {
         let session = ctx.primary.clone();
         let watcher = ctx.worktree_watcher.clone();
         let mounts = ctx.worktree_mounts.clone();
+        let registry = ctx.worktree_registry.clone();
         rt.spawn(async move {
             let mut ticker = tokio::time::interval(WORKTREE_ROOT_GC_INTERVAL);
             ticker.tick().await; // consume the immediate first tick
             loop {
                 ticker.tick().await;
+                // Age out registry entries whose worktree dir is gone (bug 91) —
+                // the crash-safe backstop for a stale tracked entry a
+                // landed/removed worktree left behind, clearing its
+                // once-per-worktree surfacing marks so a path recreated there
+                // re-surfaces. Independent of the root reap below.
+                let pruned = registry.prune_missing();
+                if !pruned.is_empty() {
+                    debug!(
+                        source = Source::DaemonDispatch.as_str(),
+                        count = pruned.len(),
+                        "aged out worktree registrations whose dir is gone",
+                    );
+                }
                 let removed = reap_missing_worktree_roots(&tracker);
                 if !removed.is_empty() {
                     // Drop any in-memory watches + idle clocks for the reaped
@@ -3641,7 +3713,6 @@ fn dispose_worktree_in_background(
     registry: &WorktreeRegistry,
     parent_context: &crate::bridge::ParentContextQueue,
     session_id: &str,
-    agent_id: &str,
     worktree: &Path,
     host_initiated: bool,
 ) {
@@ -3656,29 +3727,57 @@ fn dispose_worktree_in_background(
         crate::worktree_dispose::Disposition::Disposed
         | crate::worktree_dispose::Disposition::Remnant => registry.forget(worktree),
         crate::worktree_dispose::Disposition::KeptDirty { .. } if !host_initiated => {
-            surface_dirty_kept(parent_context, session_id, agent_id, worktree);
+            surface_dirty_kept(registry, parent_context, session_id, worktree);
         }
         _ => {}
     }
 }
 
+/// The owning agent id of a worktree, taken from its on-disk directory name (bug
+/// 91).
+///
+/// A subagent worktree's leaf directory name **is** the agent id (misc 150 —
+/// `worktree_segment` uses the bare `agent-<id>` id as the path segment), so the
+/// dir name is the correct, self-describing owner — never the id of whatever
+/// subagent happened to trigger the dispose (its cwd may merely *enclose* this
+/// worktree). Falls back to the full path display if the leaf is unreadable.
+#[cfg(unix)]
+fn worktree_owner_label(worktree: &Path) -> String {
+    worktree.file_name().map_or_else(
+        || worktree.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
 /// Surface a dirty worktree kept at `SubagentStop` to the *parent agent* (misc
-/// 151, D-1).
+/// 151, D-1) — once per worktree path (bug 91).
 ///
 /// The retired notification queue's user `systemMessage` leg is gone (tui-rework
 /// 04): the notice's actionable audience is the parent agent, delivered as
 /// `additionalContext` ([`queue_parent_additional_context`]). The `warn!` stays
 /// as the firehose/log record of the event (queryable via `catenary query`), no
 /// longer a user notification.
+///
+/// Bug 91: the owner is the worktree's own directory name
+/// ([`worktree_owner_label`]), not the triggering subagent's id, and the notice
+/// is deduped to **once per worktree path** ([`WorktreeRegistry::mark_surfaced`]).
+/// Several subagents whose cwd resolves to the one surviving dirty worktree used
+/// to each queue a line naming their own (phantom-to-that-path) id; now the one
+/// worktree yields one reminder naming its real owner. The dedup never suppresses
+/// a *first* report — a dirty worktree that exists is always surfaced.
 #[cfg(unix)]
 fn surface_dirty_kept(
+    registry: &WorktreeRegistry,
     parent_context: &crate::bridge::ParentContextQueue,
     session_id: &str,
-    agent_id: &str,
     worktree: &Path,
 ) {
+    if !registry.mark_surfaced(worktree) {
+        return; // already surfaced this worktree — one reminder per path
+    }
+    let owner = worktree_owner_label(worktree);
     let message = format!(
-        "subagent `{agent_id}` left a dirty worktree at `{}` (kept; land its work \
+        "subagent `{owner}` left a dirty worktree at `{}` (kept; land its work \
          or `catenary worktree rm` it)",
         worktree.display(),
     );
@@ -4612,7 +4711,7 @@ async fn handle_hook_dispatch(
             let sid = session_id.clone();
             let wt = canonical.clone();
             tokio::task::spawn_blocking(move || {
-                dispose_worktree_in_background(&registry, &parent_context, &sid, "", &wt, true);
+                dispose_worktree_in_background(&registry, &parent_context, &sid, &wt, true);
             });
         }
 
@@ -5692,10 +5791,9 @@ async fn handle_hook_dispatch(
             let registry = ctx.worktree_registry.clone();
             let parent_context = ctx.primary.parent_context.clone();
             let sid = session_id.clone();
-            let aid = agent_id.to_string();
             let wt = worktree.clone();
             tokio::task::spawn_blocking(move || {
-                dispose_worktree_in_background(&registry, &parent_context, &sid, &aid, &wt, false);
+                dispose_worktree_in_background(&registry, &parent_context, &sid, &wt, false);
             });
         }
     }
@@ -10361,6 +10459,175 @@ mod tests {
         let wt = PathBuf::from("/state/catenary/worktrees/agents/s/a");
         assert!(registry.mark_nagged(&wt), "first nag marks");
         assert!(!registry.mark_nagged(&wt), "second nag is suppressed");
+    }
+
+    #[test]
+    fn worktree_registry_mark_surfaced_is_once_per_worktree() {
+        // The dirty-kept surfacing fires once per worktree path per daemon
+        // lifetime (bug 91) — the dedup that collapses the phantom-agent pileup.
+        let registry = WorktreeRegistry::new();
+        let wt = PathBuf::from("/state/catenary/worktrees/agents/s/a");
+        assert!(registry.mark_surfaced(&wt), "first surfacing marks");
+        assert!(
+            !registry.mark_surfaced(&wt),
+            "second surfacing is suppressed"
+        );
+    }
+
+    #[test]
+    fn surface_dirty_kept_is_once_per_path_naming_the_dirname() {
+        // Bug 91 — the sighting pinned: several subagents whose cwd resolves to
+        // the ONE surviving dirty worktree each drive `surface_dirty_kept` for
+        // that same path (the phantom-agent pileup). It must now yield exactly
+        // ONE reminder, attributed to the worktree's on-disk directory name (the
+        // real owner's agent id) — never one line per triggering agent.
+        let registry = WorktreeRegistry::new();
+        let parent_context = crate::bridge::ParentContextQueue::new();
+        // The surviving dirty worktree — its leaf dir name IS the owner agent id
+        // (misc 150: `worktree_segment` uses the bare `agent-<id>` id as the
+        // segment), matching the ticket's `.../a8458e9e8f03be469`.
+        let worktree = PathBuf::from("/state/catenary/worktrees/agents/sess-1/a8458e9e8f03be469");
+
+        // Three phantom stops + the real one all resolve (via cwd) to this path.
+        for _ in 0..4 {
+            surface_dirty_kept(&registry, &parent_context, "sess-1", &worktree);
+        }
+
+        let drained = parent_context.drain("sess-1");
+        assert_eq!(
+            drained.len(),
+            1,
+            "one dirty worktree yields exactly one reminder (deduped by path): {drained:?}",
+        );
+        let line = &drained[0];
+        assert!(
+            line.contains("subagent `a8458e9e8f03be469` left a dirty worktree"),
+            "the reminder names the dirname-derived owner, not a triggering agent: {line}",
+        );
+        assert!(
+            line.contains(&worktree.display().to_string()),
+            "the reminder still carries the surviving worktree path: {line}",
+        );
+    }
+
+    #[test]
+    fn worktree_registry_prune_missing_ages_out_gone_entries_and_clears_marks() {
+        // Bug 91 age-out: a registration whose worktree dir is gone is dropped,
+        // and its once-per-worktree nag/surfaced marks are cleared with it, so a
+        // path recreated there is not denied a fresh reminder.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize");
+
+        let present = base.join("present");
+        std::fs::create_dir(&present).expect("mkdir present");
+        let gone = base.join("gone");
+        std::fs::create_dir(&gone).expect("mkdir gone");
+
+        let registry = WorktreeRegistry::new();
+        for (wt, agent) in [(&present, "present"), (&gone, "gone")] {
+            registry.register(crate::worktree_create::WorktreeMeta {
+                worktree: wt.clone(),
+                source_repo: PathBuf::from("/repo"),
+                base_commit: "deadbeef".to_string(),
+                branch: format!("agent-{agent}"),
+                name: format!("agent-{agent}"),
+                agent_id: Some(agent.to_string()),
+                session_id: "sess-1".to_string(),
+                created_at: "2026-07-06T00:00:00.000Z".to_string(),
+                class: "agent".to_string(),
+                link: None,
+                vcs: crate::worktree_create::WORKTREE_VCS_GIT.to_string(),
+            });
+        }
+        // Mark both surfaced/nagged, then delete the `gone` dir.
+        assert!(registry.mark_surfaced(&gone));
+        assert!(registry.mark_nagged(&gone));
+        assert!(registry.mark_surfaced(&present));
+        std::fs::remove_dir_all(&gone).expect("rm gone");
+
+        let pruned = registry.prune_missing();
+        assert_eq!(pruned, vec![gone.clone()], "only the gone dir is pruned");
+        assert_eq!(registry.len(), 1, "the present registration survives");
+        assert_eq!(
+            registry.get(&present).map(|m| m.worktree),
+            Some(present.clone()),
+            "the present worktree is still registered",
+        );
+        // The gone path's marks cleared → a worktree recreated there re-surfaces.
+        assert!(
+            registry.mark_surfaced(&gone),
+            "the pruned path's surfaced mark was cleared (re-surface allowed)",
+        );
+        assert!(
+            registry.mark_nagged(&gone),
+            "the pruned path's nagged mark was cleared (re-nag allowed)",
+        );
+        // The present path is untouched — its mark still suppresses a re-surface.
+        assert!(
+            !registry.mark_surfaced(&present),
+            "the surviving worktree's surfaced mark is preserved (still deduped)",
+        );
+    }
+
+    #[test]
+    fn surface_dirty_kept_always_reports_a_present_dirty_worktree() {
+        // The safety invariant (bug 91): dedup must never suppress the FIRST
+        // report of a worktree that exists and is dirty. After prune ages out a
+        // gone registration (clearing its mark), a worktree recreated at the same
+        // path surfaces afresh — the safety net never goes silent for a present,
+        // dirty worktree.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize");
+        let worktree = base.join("agents").join("sess-1").join("owner-id");
+        std::fs::create_dir_all(&worktree).expect("mkdir worktree");
+
+        let registry = WorktreeRegistry::new();
+        let parent_context = crate::bridge::ParentContextQueue::new();
+        registry.register(crate::worktree_create::WorktreeMeta {
+            worktree: worktree.clone(),
+            source_repo: PathBuf::from("/repo"),
+            base_commit: "deadbeef".to_string(),
+            branch: "agent-owner-id".to_string(),
+            name: "agent-owner-id".to_string(),
+            agent_id: Some("owner-id".to_string()),
+            session_id: "sess-1".to_string(),
+            created_at: "2026-07-06T00:00:00.000Z".to_string(),
+            class: "agent".to_string(),
+            link: None,
+            vcs: crate::worktree_create::WORKTREE_VCS_GIT.to_string(),
+        });
+
+        // First surfacing — always reported.
+        surface_dirty_kept(&registry, &parent_context, "sess-1", &worktree);
+        assert_eq!(
+            parent_context.drain("sess-1").len(),
+            1,
+            "first report fires"
+        );
+        // Duplicate while the dir still exists — suppressed.
+        surface_dirty_kept(&registry, &parent_context, "sess-1", &worktree);
+        assert_eq!(
+            parent_context.drain("sess-1").len(),
+            0,
+            "a duplicate for the same present path is deduped",
+        );
+
+        // The dir is landed away → the age-out prune drops the registration and
+        // clears its surfaced mark.
+        std::fs::remove_dir_all(&worktree).expect("rm worktree");
+        assert_eq!(
+            registry.prune_missing(),
+            vec![worktree.clone()],
+            "the gone registration ages out",
+        );
+        // A new worktree is created at the same path — it must surface afresh.
+        std::fs::create_dir_all(&worktree).expect("recreate worktree");
+        surface_dirty_kept(&registry, &parent_context, "sess-1", &worktree);
+        assert_eq!(
+            parent_context.drain("sess-1").len(),
+            1,
+            "a worktree recreated at a pruned path surfaces afresh (safety net intact)",
+        );
     }
 
     // ── Companion roots (workstream 29) ──────────────────────────────────
