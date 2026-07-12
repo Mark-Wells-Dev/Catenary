@@ -9,7 +9,7 @@
 //! which owns the `EditingManager`.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Result, anyhow};
@@ -40,6 +40,28 @@ struct BatchFile {
     /// Whether a receipt covering this file, computed after its last recorded
     /// edit, has been handed to a client (misc 141).
     delivered: bool,
+    /// Whether this target has ever been observed to exist on disk — the
+    /// phantom-vs-real latch (bug 76).
+    ///
+    /// A write set is resolved and recorded at `PreToolUse`, *before* the
+    /// command runs (decision 026 resolve-or-deny). When the command then fails
+    /// wholesale (the sighting: a `git apply` with wrong-cwd paths — exit
+    /// non-zero, zero bytes written), the recorded targets never come to exist.
+    /// Such a phantom entry must not arm the gate or print a
+    /// `[path does not exist]` receipt line for a file nothing ever touched.
+    ///
+    /// `materialized` is set true at record time when the target already exists
+    /// (a write/edit to a pre-existing file), and latched true by
+    /// [`EditingManager::reconcile`] the first time a not-yet-materialized
+    /// target is observed on disk (a successful new-file creation). It is the
+    /// signal that separates *never-materialized* (drop silently — nonexistence
+    /// of a never-created file is not a finding) from *written-then-deleted*
+    /// (keep — the `[path does not exist]` receipt is the honest report of a
+    /// vanished real edit). A file created *and* deleted entirely between two
+    /// reconciliation passes — its creation never observed — is
+    /// indistinguishable from a phantom with the records kept here and collapses
+    /// into the phantom bucket; dropping it silently is the conservative choice.
+    materialized: bool,
 }
 
 /// Per-agent editing accumulator: one **batch** plus the out-of-coverage note
@@ -303,7 +325,22 @@ impl EditingManager {
     ///
     /// A no-op if the agent is not in editing mode — the accumulation path only
     /// calls this for an agent already known to be editing (the entry exists).
-    pub fn record_covered_edit(&self, session_id: Option<&str>, agent_id: &str, path: PathBuf) {
+    ///
+    /// `existed_at_record` reports whether the target already existed on disk
+    /// when this edit was recorded (bug 76): `true` for a write/edit to a
+    /// pre-existing file, `false` for a to-be-created target. It seeds the
+    /// [`BatchFile::materialized`] latch so [`reconcile`](Self::reconcile) can
+    /// later tell a never-materialized phantom (a resolved write whose command
+    /// failed) from a written-then-deleted real edit. Re-recording an existing
+    /// entry only ever latches `materialized` true — a target once observed on
+    /// disk is never demoted to a phantom by a later record that missed it.
+    pub fn record_covered_edit(
+        &self,
+        session_id: Option<&str>,
+        agent_id: &str,
+        path: PathBuf,
+        existed_at_record: bool,
+    ) {
         let key = editing_key(session_id, agent_id);
         if let Some(entry) = self
             .state
@@ -318,16 +355,69 @@ impl EditingManager {
                 entry.files.push(BatchFile {
                     path,
                     delivered: false,
+                    materialized: existed_at_record,
                 });
             } else if let Some(existing) = entry.files.iter_mut().find(|f| f.path == path) {
                 // Already in the incomplete batch — a fresh edit re-arms its gate.
                 existing.delivered = false;
+                existing.materialized = existing.materialized || existed_at_record;
             } else {
                 entry.files.push(BatchFile {
                     path,
                     delivered: false,
+                    materialized: existed_at_record,
                 });
             }
+        }
+    }
+
+    /// Reconciles the agent's batch against disk, dropping never-materialized
+    /// phantom entries and latching real new-file creations (bug 76).
+    ///
+    /// Runs at the two boundaries where a stale batch would do harm: the next
+    /// write command's boundary block (phantom gate debt) and the diagnose
+    /// prepare snapshot (phantom `[path does not exist]` receipt lines). For
+    /// each not-yet-materialized entry, `exists` probes the target on disk: if
+    /// present now it is a successful creation — latch `materialized` true; if
+    /// still absent it is a phantom (a resolved write whose command never wrote
+    /// it) and is dropped. Already-materialized entries are untouched, so a real
+    /// edit that was written and later deleted survives to render its honest
+    /// `[path does not exist]` receipt.
+    ///
+    /// `exists` is injected (rather than calling `Path::exists` inline) so tests
+    /// can drive the phantom / real / deleted cases deterministically without
+    /// touching the filesystem. A no-op if the agent has no batch.
+    pub fn reconcile(
+        &self,
+        session_id: Option<&str>,
+        agent_id: &str,
+        exists: impl Fn(&Path) -> bool,
+    ) {
+        let key = editing_key(session_id, agent_id);
+        if let Some(entry) = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&key)
+        {
+            entry.files.retain_mut(|file| {
+                if file.materialized {
+                    // Once observed on disk, an entry is real forever — a later
+                    // deletion is reported honestly, not pruned as a phantom.
+                    return true;
+                }
+                if exists(&file.path) {
+                    // A to-be-created target that came to exist: a successful
+                    // new-file write. Latch it and keep it in the batch.
+                    file.materialized = true;
+                    true
+                } else {
+                    // Never materialized and still absent — a phantom recorded
+                    // by a command that never wrote it. Drop it: it arms no gate
+                    // and prints no receipt line.
+                    false
+                }
+            });
         }
     }
 
@@ -519,8 +609,8 @@ mod tests {
     fn record_covered_edit_accumulates() {
         let em = EditingManager::new();
         em.start_editing(None, "").expect("start");
-        em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
-        em.record_covered_edit(None, "", PathBuf::from("/src/lib.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
+        em.record_covered_edit(None, "", PathBuf::from("/src/lib.rs"), true);
         let files = em.files(None, "");
         assert_eq!(files.len(), 2);
         // Fresh edits are undelivered — the gate is armed.
@@ -531,8 +621,8 @@ mod tests {
     fn record_covered_edit_deduplicates() {
         let em = EditingManager::new();
         em.start_editing(None, "").expect("start");
-        em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
-        em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
+        em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
         let files = em.files(None, "");
         assert_eq!(files.len(), 1);
     }
@@ -540,7 +630,7 @@ mod tests {
     #[test]
     fn record_covered_edit_ignored_when_not_editing() {
         let em = EditingManager::new();
-        em.record_covered_edit(None, "ghost", PathBuf::from("/src/main.rs"));
+        em.record_covered_edit(None, "ghost", PathBuf::from("/src/main.rs"), true);
         assert!(em.files(None, "ghost").is_empty());
     }
 
@@ -556,7 +646,7 @@ mod tests {
         // First daemon instance: an armed gate (undelivered covered edit).
         let before = EditingManager::new();
         before.start_editing(sid, "agent-a").expect("start");
-        before.record_covered_edit(sid, "agent-a", PathBuf::from("/src/main.rs"));
+        before.record_covered_edit(sid, "agent-a", PathBuf::from("/src/main.rs"), true);
         assert!(
             before.has_undelivered(sid, "agent-a"),
             "the gate must be armed before the restart"
@@ -589,7 +679,7 @@ mod tests {
         let em = EditingManager::new();
         em.start_editing(None, "").expect("start");
         assert!(!em.has_files(None, ""), "no files yet");
-        em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
         assert!(em.has_files(None, ""), "file added");
     }
 
@@ -603,8 +693,8 @@ mod tests {
     fn files_snapshots_the_whole_batch() {
         let em = EditingManager::new();
         em.start_editing(None, "").expect("start");
-        em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
-        em.record_covered_edit(None, "", PathBuf::from("/src/lib.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
+        em.record_covered_edit(None, "", PathBuf::from("/src/lib.rs"), true);
 
         let snapshot = em.files(None, "");
         assert_eq!(
@@ -626,7 +716,7 @@ mod tests {
     fn skipped_reads_buckets_without_mutating() {
         let em = EditingManager::new();
         em.start_editing(None, "").expect("start");
-        em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
         em.increment_outside(None, "");
         em.increment_outside(None, "");
 
@@ -739,7 +829,7 @@ mod tests {
         let em = EditingManager::new();
         em.record_outside_edit(None, "", Some(PathBuf::from("/home/dev/other")));
         em.record_uncovered_edit(None, "", "Makefile".to_string());
-        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"), true);
 
         // The bare run delivers the receipt (note included) — buckets reset.
         em.mark_delivered_all(None, "");
@@ -749,7 +839,7 @@ mod tests {
         );
 
         // A fresh covered-only batch afterwards carries NO stale trailer.
-        em.record_covered_edit(None, "", PathBuf::from("/src/b.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/b.rs"), true);
         em.mark_delivered_all(None, "");
         assert!(
             em.skipped(None, "").is_empty(),
@@ -764,7 +854,7 @@ mod tests {
         // bare run rather than vanish silently.
         let em = EditingManager::new();
         em.record_outside_edit(None, "", None);
-        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"), true);
 
         em.mark_delivered(None, "", &[PathBuf::from("/src/a.rs")]);
         assert_eq!(
@@ -783,8 +873,8 @@ mod tests {
         // retained so a repeat bare run re-diagnoses the same scope.
         let em = EditingManager::new();
         em.start_editing(None, "").expect("start");
-        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"));
-        em.record_covered_edit(None, "", PathBuf::from("/src/b.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"), true);
+        em.record_covered_edit(None, "", PathBuf::from("/src/b.rs"), true);
         assert!(em.has_undelivered(None, ""), "fresh batch is undelivered");
 
         em.mark_delivered_all(None, "");
@@ -809,8 +899,8 @@ mod tests {
         // re-arms without discarding the batch.
         let em = EditingManager::new();
         em.start_editing(None, "").expect("start");
-        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"));
-        em.record_covered_edit(None, "", PathBuf::from("/src/b.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"), true);
+        em.record_covered_edit(None, "", PathBuf::from("/src/b.rs"), true);
         // Deliver only a.rs (scoped), leaving b.rs undelivered → incomplete.
         em.mark_delivered(None, "", &[PathBuf::from("/src/a.rs")]);
         assert_eq!(
@@ -820,7 +910,7 @@ mod tests {
         );
 
         // A fresh edit to the already-delivered a.rs re-arms it — no reset.
-        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"), true);
         assert_eq!(
             em.files(None, ""),
             vec![PathBuf::from("/src/a.rs"), PathBuf::from("/src/b.rs")],
@@ -839,12 +929,12 @@ mod tests {
         // the batch and starts a new one with just that file.
         let em = EditingManager::new();
         em.start_editing(None, "").expect("start");
-        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"));
-        em.record_covered_edit(None, "", PathBuf::from("/src/b.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"), true);
+        em.record_covered_edit(None, "", PathBuf::from("/src/b.rs"), true);
         em.mark_delivered_all(None, "");
 
         // Now the batch is complete → the next covered edit resets it.
-        em.record_covered_edit(None, "", PathBuf::from("/src/c.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/c.rs"), true);
         assert_eq!(
             em.files(None, ""),
             vec![PathBuf::from("/src/c.rs")],
@@ -865,7 +955,7 @@ mod tests {
         em.record_outside_edit(None, "", Some(PathBuf::from("/home/dev/Lattice")));
         assert!(!em.has_files(None, ""), "no covered files yet");
 
-        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"), true);
         assert_eq!(
             em.files(None, ""),
             vec![PathBuf::from("/src/a.rs")],
@@ -884,8 +974,8 @@ mod tests {
         // is a no-op.
         let em = EditingManager::new();
         em.start_editing(None, "").expect("start");
-        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"));
-        em.record_covered_edit(None, "", PathBuf::from("/src/b.rs"));
+        em.record_covered_edit(None, "", PathBuf::from("/src/a.rs"), true);
+        em.record_covered_edit(None, "", PathBuf::from("/src/b.rs"), true);
 
         em.mark_delivered(
             None,
@@ -916,8 +1006,8 @@ mod tests {
         // for b.rs, and the batch keeps both files.
         let em = EditingManager::new();
         em.start_editing(None, "agent-a").expect("start");
-        em.record_covered_edit(None, "agent-a", PathBuf::from("/src/a.rs"));
-        em.record_covered_edit(None, "agent-a", PathBuf::from("/src/b.rs"));
+        em.record_covered_edit(None, "agent-a", PathBuf::from("/src/a.rs"), true);
+        em.record_covered_edit(None, "agent-a", PathBuf::from("/src/b.rs"), true);
 
         em.mark_delivered(None, "agent-a", &[PathBuf::from("/src/a.rs")]);
         assert_eq!(
@@ -957,7 +1047,7 @@ mod tests {
         let em = EditingManager::new();
         em.start_editing(None, "agent-a").expect("start a");
         em.start_editing(None, "agent-b").expect("start b");
-        em.record_covered_edit(None, "agent-a", PathBuf::from("/src/main.rs"));
+        em.record_covered_edit(None, "agent-a", PathBuf::from("/src/main.rs"), true);
         let count = em.clear_all();
         assert_eq!(count, 2);
         assert!(!em.is_editing(None, "agent-a"));
@@ -988,8 +1078,8 @@ mod tests {
         em.start_editing(Some("s1"), "").expect("start");
         em.start_editing(Some("s2"), "").expect("start");
 
-        em.record_covered_edit(Some("s1"), "", PathBuf::from("/a.rs"));
-        em.record_covered_edit(Some("s2"), "", PathBuf::from("/b.rs"));
+        em.record_covered_edit(Some("s1"), "", PathBuf::from("/a.rs"), true);
+        em.record_covered_edit(Some("s2"), "", PathBuf::from("/b.rs"), true);
 
         assert_eq!(em.files(Some("s1"), ""), vec![PathBuf::from("/a.rs")]);
         assert_eq!(em.files(Some("s2"), ""), vec![PathBuf::from("/b.rs")]);
@@ -1008,8 +1098,8 @@ mod tests {
         em.start_editing(Some("S"), "").expect("main start");
 
         // Distinct covered files per agent.
-        em.record_covered_edit(Some("S"), "subA", PathBuf::from("/a.rs"));
-        em.record_covered_edit(Some("S"), "", PathBuf::from("/b.rs"));
+        em.record_covered_edit(Some("S"), "subA", PathBuf::from("/a.rs"), true);
+        em.record_covered_edit(Some("S"), "", PathBuf::from("/b.rs"), true);
         // Distinct skipped-no-coverage counts per agent.
         em.increment_outside(Some("S"), "subA");
         em.increment_outside(Some("S"), "subA");
@@ -1069,5 +1159,157 @@ mod tests {
         assert_eq!(editing_key(Some(""), "agent"), "agent");
         assert_eq!(editing_key(Some("sess-1"), ""), "sess-1\0");
         assert_eq!(editing_key(Some("sess-1"), "sub"), "sess-1\0sub");
+    }
+
+    // ── Phantom reconciliation (bug 76) ────────────────────────────────
+
+    #[test]
+    fn reconcile_drops_never_materialized_phantom() {
+        // The sighting: a write set resolved and recorded at PreToolUse, whose
+        // command then failed wholesale (zero bytes written). The target never
+        // came to exist — recorded not-materialized, still absent at reconcile.
+        // It must be dropped so it arms no gate and prints no receipt line.
+        let em = EditingManager::new();
+        em.start_editing(None, "").expect("start");
+        em.record_covered_edit(None, "", PathBuf::from("/phantom.rs"), false);
+        assert!(em.has_undelivered(None, ""), "recorded → gate armed");
+
+        // The command failed: the target still does not exist on disk.
+        em.reconcile(None, "", |_| false);
+
+        assert!(
+            em.files(None, "").is_empty(),
+            "the phantom entry is dropped from the batch"
+        );
+        assert!(
+            !em.has_undelivered(None, ""),
+            "no phantom gate debt survives — future work is not gated on it"
+        );
+    }
+
+    #[test]
+    fn reconcile_keeps_real_edit_that_still_exists() {
+        // A write/edit to a pre-existing file: recorded materialized. Reconcile
+        // must keep it — a real edit still gates until diagnosed.
+        let em = EditingManager::new();
+        em.start_editing(None, "").expect("start");
+        em.record_covered_edit(None, "", PathBuf::from("/real.rs"), true);
+
+        // Even a probe that would report absence must not drop a materialized
+        // entry (it was observed on disk at record time).
+        em.reconcile(None, "", |_| false);
+
+        assert_eq!(
+            em.files(None, ""),
+            vec![PathBuf::from("/real.rs")],
+            "a real edit survives reconciliation"
+        );
+        assert!(em.has_undelivered(None, ""), "the real edit still gates");
+    }
+
+    #[test]
+    fn reconcile_latches_successful_new_file_creation() {
+        // A to-be-created target recorded not-materialized whose command DID
+        // write it: reconcile observes it on disk and latches it materialized,
+        // keeping it in the batch to gate and be reported like any real edit.
+        let em = EditingManager::new();
+        em.start_editing(None, "").expect("start");
+        em.record_covered_edit(None, "", PathBuf::from("/created.rs"), false);
+
+        // First pass: the file now exists (the write succeeded) → latch + keep.
+        em.reconcile(None, "", |_| true);
+        assert_eq!(
+            em.files(None, ""),
+            vec![PathBuf::from("/created.rs")],
+            "a successful new-file creation is kept"
+        );
+        assert!(em.has_undelivered(None, ""), "the created file gates");
+
+        // Latched: a later pass reporting absence (the file was deleted) must
+        // NOT drop it — a written-then-deleted real edit is reported honestly,
+        // not pruned as a phantom.
+        em.reconcile(None, "", |_| false);
+        assert_eq!(
+            em.files(None, ""),
+            vec![PathBuf::from("/created.rs")],
+            "once materialized, a later deletion does not prune the entry"
+        );
+    }
+
+    #[test]
+    fn reconcile_keeps_written_then_deleted_real_edit() {
+        // A pre-existing file edited (materialized) and then deleted: it is a
+        // real edit that vanished. Reconcile must keep it so `catenary
+        // diagnostics` reports its nonexistence honestly — NOT hide it. This is
+        // the constraint that distinguishes bug 76 from over-pruning.
+        let em = EditingManager::new();
+        em.start_editing(None, "").expect("start");
+        em.record_covered_edit(None, "", PathBuf::from("/deleted.rs"), true);
+
+        // The file no longer exists on disk, yet it was genuinely edited.
+        em.reconcile(None, "", |_| false);
+
+        assert_eq!(
+            em.files(None, ""),
+            vec![PathBuf::from("/deleted.rs")],
+            "a written-then-deleted real edit is not pruned"
+        );
+        assert!(
+            em.has_undelivered(None, ""),
+            "the vanished real edit still gates — its receipt is the honest report"
+        );
+    }
+
+    #[test]
+    fn reconcile_mixed_batch_drops_only_the_phantom() {
+        // A batch mixing a real edit and a phantom (the failed-apply shape:
+        // some targets landed, others never wrote): reconcile drops only the
+        // never-materialized phantom, leaving the real edit's gate intact.
+        let em = EditingManager::new();
+        em.start_editing(None, "").expect("start");
+        em.record_covered_edit(None, "", PathBuf::from("/kept.rs"), true);
+        em.record_covered_edit(None, "", PathBuf::from("/phantom.rs"), false);
+
+        // Only the real edit exists on disk.
+        em.reconcile(None, "", |p| p == Path::new("/kept.rs"));
+
+        assert_eq!(
+            em.files(None, ""),
+            vec![PathBuf::from("/kept.rs")],
+            "only the phantom is dropped; the real edit survives"
+        );
+        assert!(
+            em.has_undelivered(None, ""),
+            "the surviving real edit keeps the gate armed"
+        );
+    }
+
+    #[test]
+    fn reconcile_re_record_latches_materialized() {
+        // A target first recorded not-materialized, then re-recorded once it
+        // exists (a second edit after the create landed), latches materialized —
+        // so a later reconcile with an absence probe does not prune it.
+        let em = EditingManager::new();
+        em.start_editing(None, "").expect("start");
+        em.record_covered_edit(None, "", PathBuf::from("/f.rs"), false);
+        // Second edit, now that the file exists: re-record with existed=true.
+        em.record_covered_edit(None, "", PathBuf::from("/f.rs"), true);
+        assert_eq!(em.files(None, "").len(), 1, "re-record does not duplicate");
+
+        em.reconcile(None, "", |_| false);
+        assert_eq!(
+            em.files(None, ""),
+            vec![PathBuf::from("/f.rs")],
+            "re-recording with existed=true latches materialized — not pruned"
+        );
+    }
+
+    #[test]
+    fn reconcile_is_noop_for_agent_without_batch() {
+        // A defensive no-op: reconciling an agent with no editing entry must not
+        // panic or create state.
+        let em = EditingManager::new();
+        em.reconcile(None, "ghost", |_| false);
+        assert!(!em.is_editing(None, "ghost"), "reconcile creates no entry");
     }
 }

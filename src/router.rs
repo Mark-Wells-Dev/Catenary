@@ -5176,6 +5176,21 @@ async fn handle_hook_dispatch(
         // — and holds for milliseconds at most.
         let permit = ctx.handoff.acquire(HandoffKey::Diagnostics).await?;
 
+        // Reconcile the batch against disk before snapshotting it (bug 76): a
+        // write set is resolved and recorded at `PreToolUse`, before the command
+        // runs, so a command that failed wholesale left phantom targets that
+        // never came to exist. Dropping them here keeps the receipt from
+        // printing `[path does not exist]` lines for files nothing ever touched,
+        // while a real edit written and later deleted survives (observed on disk
+        // once) to render its honest `[path does not exist]` line. The
+        // `delivered` flags are untouched — reconciliation is membership truth,
+        // not the delivery transaction. This mutates *membership* only; the
+        // flag-flip deferral below is unaffected.
+        router
+            .session
+            .editing
+            .reconcile(editing_session, &agent_id, Path::exists);
+
         // Snapshot the whole of this agent's batch (misc 141): the bare form
         // re-diagnoses every batch file, delivered or not, so `files()` returns
         // all of them. The batch is never mutated here — its `delivered` flags
@@ -7695,6 +7710,7 @@ mod tests {
             Some("sess-1"),
             "",
             std::path::PathBuf::from("/p/A/src/lib.rs"),
+            true,
         );
         assert_eq!(board.sessions()[0].status, SessionStatus::Editing);
 
@@ -7739,6 +7755,7 @@ mod tests {
             Some("sess-1"),
             "agent-a",
             std::path::PathBuf::from("/p/A/src/sub.rs"),
+            true,
         );
         assert_eq!(
             board.sessions()[0].subagents[0].status,
@@ -7974,6 +7991,7 @@ mod tests {
                 Some("session-a"),
                 "",
                 std::path::PathBuf::from("/src/main.rs"),
+                true,
             );
         }
 
@@ -8654,11 +8672,13 @@ mod tests {
                 Some("sess-1"),
                 "sub-a",
                 std::path::PathBuf::from("/src/a.rs"),
+                true,
             );
             router.session.editing.record_covered_edit(
                 Some("sess-1"),
                 "",
                 std::path::PathBuf::from("/src/b.rs"),
+                true,
             );
         }
 
@@ -8739,6 +8759,7 @@ mod tests {
                 Some("sess-1"),
                 "",
                 std::path::PathBuf::from("/src/edited.rs"),
+                true,
             );
         }
 
@@ -8841,11 +8862,11 @@ mod tests {
             router
                 .session
                 .editing
-                .record_covered_edit(Some("sess-1"), "", file_a.clone());
+                .record_covered_edit(Some("sess-1"), "", file_a.clone(), true);
             router
                 .session
                 .editing
-                .record_covered_edit(Some("sess-1"), "", file_b.clone());
+                .record_covered_edit(Some("sess-1"), "", file_b.clone(), true);
             // Arm the guardrail on the root the way a covered edit would.
             ctx.editing_guardrail
                 .try_acquire(&root, "sess-1")
@@ -8929,11 +8950,11 @@ mod tests {
             router
                 .session
                 .editing
-                .record_covered_edit(Some("sess-1"), "", root.join("a.rs"));
+                .record_covered_edit(Some("sess-1"), "", root.join("a.rs"), true);
             router
                 .session
                 .editing
-                .record_covered_edit(Some("sess-1"), "", root.join("b.rs"));
+                .record_covered_edit(Some("sess-1"), "", root.join("b.rs"), true);
             ctx.editing_guardrail
                 .try_acquire(&root, "sess-1")
                 .expect("arm guardrail");
@@ -9028,11 +9049,11 @@ mod tests {
             router
                 .session
                 .editing
-                .record_covered_edit(Some("sess-1"), "", file_a.clone());
+                .record_covered_edit(Some("sess-1"), "", file_a.clone(), true);
             router
                 .session
                 .editing
-                .record_covered_edit(Some("sess-1"), "", file_b.clone());
+                .record_covered_edit(Some("sess-1"), "", file_b.clone(), true);
         }
 
         // Run 1: covers the whole batch, flips every flag on delivery.
@@ -9132,7 +9153,7 @@ mod tests {
             router
                 .session
                 .editing
-                .record_covered_edit(Some("sess-1"), "", file_a.clone());
+                .record_covered_edit(Some("sess-1"), "", file_a.clone(), true);
         }
 
         // Prepare, then run a consume whose client is already fully closed by
@@ -9277,6 +9298,7 @@ mod tests {
                     Some(session_id),
                     "",
                     file.to_path_buf(),
+                    true,
                 );
             }
             let prepare = serde_json::json!({
@@ -9417,7 +9439,7 @@ mod tests {
             router
                 .session
                 .editing
-                .record_covered_edit(Some("sess-1"), "", file_a.clone());
+                .record_covered_edit(Some("sess-1"), "", file_a.clone(), true);
             ctx.editing_guardrail
                 .try_acquire(&root, "sess-1")
                 .expect("arm guardrail");
@@ -9462,7 +9484,7 @@ mod tests {
             router
                 .session
                 .editing
-                .record_covered_edit(Some("sess-1"), "", file_a.clone());
+                .record_covered_edit(Some("sess-1"), "", file_a.clone(), true);
             ctx.editing_guardrail
                 .try_acquire(&root, "sess-1")
                 .expect("re-arm guardrail on re-edit");
@@ -9518,7 +9540,7 @@ mod tests {
             router
                 .session
                 .editing
-                .record_covered_edit(Some("sess-1"), "", edited.clone());
+                .record_covered_edit(Some("sess-1"), "", edited.clone(), true);
             ctx.editing_guardrail
                 .try_acquire(&root, "sess-1")
                 .expect("arm guardrail");
@@ -9599,7 +9621,7 @@ mod tests {
             router
                 .session
                 .editing
-                .record_covered_edit(Some("sess-1"), "", file_a.clone());
+                .record_covered_edit(Some("sess-1"), "", file_a.clone(), true);
         }
 
         // Consume WITHOUT a prepared handoff: the run is served hookless (bug
@@ -11575,6 +11597,7 @@ mod tests {
                 Some("sess-1"),
                 "sub-1",
                 std::path::PathBuf::from("/src/main.rs"),
+                true,
             );
         }
 

@@ -397,6 +397,17 @@ impl HookRouter {
             return None;
         }
 
+        // Reconcile the batch against disk before consulting the gate (bug 76):
+        // a write set is resolved and recorded at `PreToolUse`, before the
+        // command runs, so a command that then fails wholesale leaves phantom
+        // targets that never came to exist. Dropping them here means a failed
+        // write cannot gate future work on files nothing ever touched, while a
+        // real edit that was written and later deleted survives (it was observed
+        // on disk once) to gate and be reported honestly.
+        self.session
+            .editing
+            .reconcile(session_id, agent_id, Path::exists);
+
         // Boundary block gates on undelivered covered debt, not the mode bit.
         // Nothing undelivered ⇒ nothing to diagnose ⇒ flow free (misc 141).
         if !self.session.editing.has_undelivered(session_id, agent_id) {
@@ -616,6 +627,14 @@ impl HookRouter {
     /// `verb = "wrote"`), so both attribute identically. The first covered
     /// write of an editing batch also flips the session-board status to
     /// `editing` — `set_last_action` marks the snapshot dirty (ticket 05).
+    ///
+    /// `path` must already be canonicalized by the caller. Existence is probed
+    /// here (record time) to seed the phantom-vs-real latch (bug 76): a write
+    /// resolved and recorded at `PreToolUse` whose command then fails wholesale
+    /// leaves a target that never comes to exist, and the batch must not gate on
+    /// it. A target that already exists is a write/edit to a real file; a
+    /// not-yet-existing one is a to-be-created target, reconciled against disk
+    /// at the next boundary.
     fn record_covered_write(
         &self,
         path: &Path,
@@ -623,9 +642,13 @@ impl HookRouter {
         agent_id: &str,
         verb: &str,
     ) {
-        self.session
-            .editing
-            .record_covered_edit(session_id, agent_id, path.to_path_buf());
+        let existed_at_record = path.exists();
+        self.session.editing.record_covered_edit(
+            session_id,
+            agent_id,
+            path.to_path_buf(),
+            existed_at_record,
+        );
         self.session
             .set_last_action(format!("{verb} {}", self.session.display_path(path)));
         debug!(
@@ -645,10 +668,15 @@ impl HookRouter {
     /// them and their root has not set `disable_diag`) enter the tracked set
     /// under `(session_id, agent_id)`, the **first** covered write entering
     /// editing mode implicitly — exactly like the first edit; uncovered targets
-    /// (`> hits.txt` with no feeder) record nothing and never gate. Recording
-    /// before execution means a command that then fails leaves phantom debt —
-    /// the safe direction: diagnostics walks it, finds it clean, and the debt
-    /// clears (the fail asymmetry, decision 026).
+    /// (`> hits.txt` with no feeder) record nothing and never gate.
+    ///
+    /// Recording happens before execution, so a command that then fails
+    /// wholesale would leave phantom targets that never came to exist. Each
+    /// recorded target carries its record-time disk existence (bug 76): a
+    /// never-materialized target is dropped at the next boundary block or
+    /// diagnose snapshot ([`EditingManager::reconcile`]), so a failed write
+    /// arms no gate and prints no receipt line, while a real edit — written and
+    /// perhaps later deleted — survives to be reported honestly.
     fn handle_shell_write_accumulation(
         &self,
         writes: &[PathBuf],
@@ -840,7 +868,7 @@ mod tests {
         router
             .session
             .editing
-            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
+            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
 
         // Edit tool — should allow during editing mode
         let result = router.handle_enforce_editing("Edit", None, None, None, "");
@@ -866,7 +894,7 @@ mod tests {
         router
             .session
             .editing
-            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
+            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
 
         // bugs/16: a piped lifecycle command during editing must get a clear
         // pipe-deny from the canonical-form matcher, not the boundary block
@@ -946,7 +974,7 @@ mod tests {
         router
             .session
             .editing
-            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
+            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
 
         let result = router.handle_require_release(None, "", false);
         let Some(HookResult::Block(reason)) = result else {
@@ -1452,7 +1480,7 @@ mod tests {
         router
             .session
             .editing
-            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
+            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
 
         // Filesystem-only Bash — should allow during editing
         let result = router.handle_enforce_editing("Bash", None, Some("rm -rf target/"), None, "");
@@ -1483,7 +1511,7 @@ mod tests {
         router
             .session
             .editing
-            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
+            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
 
         // Non-filesystem Bash — should deny during editing
         let result = router.handle_enforce_editing("Bash", None, Some("cargo build"), None, "");
@@ -1501,7 +1529,7 @@ mod tests {
         router
             .session
             .editing
-            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
+            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
 
         // Bash without command string — cannot verify, must deny
         let result = router.handle_enforce_editing("Bash", None, None, None, "");
@@ -1516,6 +1544,10 @@ mod tests {
     fn boundary_blocks_on_covered_set() {
         let (router, root) = test_router_with_root();
         let in_root = format!("{}/src/main.rs", root.display());
+        // The Edit targets a real file — Edit acts on an existing file, and the
+        // reconcile step (bug 76) keeps only edits that materialized on disk.
+        std::fs::create_dir_all(format!("{}/src", root.display())).expect("mkdir src");
+        std::fs::write(&in_root, "fn main() {}\n").expect("write edit target");
 
         // A covered edit (dispatched end-to-end) enters editing mode and
         // accumulates the file.
@@ -1659,11 +1691,11 @@ mod tests {
         router
             .session
             .editing
-            .record_covered_edit(None, "", main_rs.clone());
+            .record_covered_edit(None, "", main_rs.clone(), true);
         router
             .session
             .editing
-            .record_covered_edit(None, "", lib_rs.clone());
+            .record_covered_edit(None, "", lib_rs.clone(), true);
 
         let msg = router.boundary_block_message(None, "", Some("make test"), "Bash");
 
@@ -1729,7 +1761,7 @@ mod tests {
         router
             .session
             .editing
-            .record_covered_edit(None, "", notes.clone());
+            .record_covered_edit(None, "", notes.clone(), true);
         let msg = router.boundary_block_message(None, "", Some("cargo build"), "Bash");
 
         assert!(msg.contains("mocklint"), "names the linter feeder: {msg}");
@@ -1773,11 +1805,11 @@ mod tests {
         router
             .session
             .editing
-            .record_covered_edit(None, "", main_rs.clone());
+            .record_covered_edit(None, "", main_rs.clone(), true);
         router
             .session
             .editing
-            .record_covered_edit(None, "", notes.clone());
+            .record_covered_edit(None, "", notes.clone(), true);
         let msg = router.boundary_block_message(None, "", Some("make check"), "Bash");
 
         assert!(msg.contains("rust-analyzer"), "names the LSP feeder: {msg}");
@@ -2075,7 +2107,7 @@ mod tests {
         router
             .session
             .editing
-            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"));
+            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
         router
             .session
             .parent_context
@@ -2373,6 +2405,127 @@ mod tests {
                 .as_ref()
                 .is_some_and(|a| a.summary.starts_with("wrote ")),
             "covered shell write should surface as `wrote <path>`, got {action:?}",
+        );
+    }
+
+    #[test]
+    fn failed_shell_write_leaves_no_phantom_gate_debt() {
+        // Bug 76 sighting: a resolved shell write to a covered target is
+        // recorded at PreToolUse, before the command runs. The command then
+        // failed wholesale (a `git apply` with wrong-cwd paths — zero bytes
+        // written), so the target never came to exist. The next non-edit
+        // command must NOT be gated on that phantom — the boundary block
+        // reconciles the batch against disk first and drops it.
+        let (router, root) = test_router_with_root();
+        // A covered target that will NEVER be created on disk (the failed apply
+        // resolved paths against the wrong repo).
+        let phantom = PathBuf::from(format!("{}/src/phantom.rs", root.display()));
+
+        router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Bash".to_string(),
+            file_path: None,
+            command: Some("git apply tui09.diff".to_string()),
+            agent_id: String::new(),
+            session_id: None,
+            writes: vec![phantom],
+        });
+        // The write was recorded (resolve-or-deny records before execution), so
+        // pre-reconcile the batch holds the phantom and the gate looks armed.
+        assert!(
+            router.session.editing.has_undelivered(None, ""),
+            "the write is recorded at PreToolUse — pre-reconcile the gate is armed"
+        );
+
+        // A subsequent non-edit command reaches the boundary block, which
+        // reconciles first: the phantom target does not exist, so it is dropped
+        // and the command flows free — no phantom gate debt.
+        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, "");
+        assert!(
+            result.is_none(),
+            "a failed write must not gate future work on a never-created file, got {result:?}"
+        );
+        assert!(
+            router.session.editing.files(None, "").is_empty(),
+            "the phantom entry is dropped from the batch on reconciliation"
+        );
+    }
+
+    #[test]
+    fn failed_shell_write_reconciled_but_real_edit_still_gates() {
+        // The asymmetry the fix must preserve: a batch mixing a phantom (failed
+        // write) and a real edit (a target that DID land on disk) drops only the
+        // phantom. The real edit keeps the gate armed and appears in the block.
+        let (router, root) = test_router_with_root();
+        let phantom = PathBuf::from(format!("{}/src/phantom.rs", root.display()));
+        let real = PathBuf::from(format!("{}/src/real.rs", root.display()));
+        // Create only the real target on disk — the write to it succeeded.
+        std::fs::create_dir_all(real.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&real, "fn real() {}\n").expect("write real target");
+
+        router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Bash".to_string(),
+            file_path: None,
+            command: Some("git apply patch.diff".to_string()),
+            agent_id: String::new(),
+            session_id: None,
+            writes: vec![phantom, real.clone()],
+        });
+
+        // The boundary block reconciles: phantom dropped, real edit kept.
+        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, "");
+        let Some(HookResult::Deny(reason)) = result else {
+            unreachable!("the surviving real edit must still gate, got {result:?}");
+        };
+        assert_eq!(
+            router.session.editing.files(None, ""),
+            vec![real],
+            "only the real edit survives reconciliation"
+        );
+        assert!(
+            reason.contains("real.rs") && !reason.contains("phantom.rs"),
+            "the block lists the real edit, never the dropped phantom, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn real_shell_write_then_deletion_is_reported_not_pruned() {
+        // The honest-conservative boundary: a covered target that DID land on
+        // disk (materialized at record time) and was later deleted must NOT be
+        // pruned as a phantom — it was a genuine edit. It survives reconciliation
+        // to keep the gate armed so `catenary diagnostics` reports it honestly.
+        let (router, root) = test_router_with_root();
+        let written = PathBuf::from(format!("{}/src/written.rs", root.display()));
+        std::fs::create_dir_all(written.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&written, "fn written() {}\n").expect("write target");
+
+        router.dispatch(crate::hook::HookRequest::PreTool {
+            tool_name: "Bash".to_string(),
+            file_path: None,
+            command: Some("cat tpl > src/written.rs".to_string()),
+            agent_id: String::new(),
+            session_id: None,
+            writes: vec![written.clone()],
+        });
+        assert!(
+            router.session.editing.has_undelivered(None, ""),
+            "the real write arms the gate"
+        );
+
+        // The agent then deletes the file before diagnosing it.
+        std::fs::remove_file(&written).expect("delete the written file");
+
+        // Reconciliation at the boundary must KEEP it — it was observed on disk
+        // at record time (materialized), so its later absence is a real edit's
+        // deletion, reported honestly, not a phantom to hide.
+        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, "");
+        assert!(
+            matches!(result, Some(HookResult::Deny(_))),
+            "a written-then-deleted real edit still gates, got {result:?}"
+        );
+        assert_eq!(
+            router.session.editing.files(None, ""),
+            vec![written],
+            "the vanished real edit is retained for its honest receipt — not pruned"
         );
     }
 
