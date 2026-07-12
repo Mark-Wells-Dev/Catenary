@@ -2738,12 +2738,30 @@ fn check_stale_hooks() {
     );
 }
 
-/// Resolve the Claude Code hooks.json path from `installed_plugins.json`.
+/// Resolve the hooks.json copy that Claude Code actually EXECUTES.
 ///
-/// Returns `None` if Claude Code is not installed or the plugin entry
-/// cannot be resolved.
+/// The comparand depends on the marketplace source type (misc 180):
+///
+/// - **Directory sources** (dev installs): Claude Code resolves hook content
+///   LIVE from the marketplace's source directory, not the version-keyed
+///   plugin cache. The live copy is `<installLocation>/plugins/catenary/hooks/
+///   hooks.json` (the plugin's `source: ./plugins/catenary` under the
+///   marketplace root recorded in `known_marketplaces.json`). Comparing the
+///   frozen cache here reads stale/current backwards.
+/// - **Release / marketplace sources** (github): the frozen version-keyed
+///   plugin cache IS what executes, so compare `<installPath>/hooks/hooks.json`
+///   from `installed_plugins.json`.
+///
+/// Returns `None` if Claude Code is not installed or the copy cannot be
+/// resolved.
 #[cfg(unix)]
 fn resolve_claude_hooks_path(home: &std::path::Path) -> Option<std::path::PathBuf> {
+    // Directory source: the live hooks live under the marketplace source dir.
+    if let Some(live) = resolve_claude_directory_hooks_path(home) {
+        return Some(live);
+    }
+
+    // Release / marketplace source: the frozen version-keyed cache executes.
     let plugins_file = home.join(".claude/plugins/installed_plugins.json");
     let plugins_json = std::fs::read_to_string(plugins_file).ok()?;
     let plugins: serde_json::Value = serde_json::from_str(&plugins_json).ok()?;
@@ -2756,6 +2774,31 @@ fn resolve_claude_hooks_path(home: &std::path::Path) -> Option<std::path::PathBu
         .get("installPath")
         .and_then(serde_json::Value::as_str)?;
     Some(std::path::PathBuf::from(install_path).join("hooks/hooks.json"))
+}
+
+/// The live hooks copy for a directory-source install, or `None` when the
+/// marketplace is not a directory source.
+///
+/// For a directory source, `known_marketplaces.json` records
+/// `source.source == "directory"` and the source directory in `source.path`
+/// (falling back to the sibling `installLocation`). The plugin's hooks live at
+/// `<dir>/plugins/catenary/hooks/hooks.json`, mirroring the marketplace's
+/// `plugins[].source` of `./plugins/catenary`.
+#[cfg(unix)]
+fn resolve_claude_directory_hooks_path(home: &std::path::Path) -> Option<std::path::PathBuf> {
+    let marketplaces_file = home.join(".claude/plugins/known_marketplaces.json");
+    let marketplaces_json = std::fs::read_to_string(marketplaces_file).ok()?;
+    let marketplaces: serde_json::Value = serde_json::from_str(&marketplaces_json).ok()?;
+    let entry = marketplaces.get("catenary")?;
+    let source = entry.get("source")?;
+    if source.get("source").and_then(serde_json::Value::as_str) != Some("directory") {
+        return None;
+    }
+    let dir = source
+        .get("path")
+        .or_else(|| entry.get("installLocation"))
+        .and_then(serde_json::Value::as_str)?;
+    Some(std::path::PathBuf::from(dir).join("plugins/catenary/hooks/hooks.json"))
 }
 
 #[cfg(test)]
@@ -2808,6 +2851,109 @@ mod tests {
             stale_hooks_message("Antigravity CLI", "antigravity"),
             "Stale Antigravity CLI hooks detected. Run: catenary install antigravity",
         );
+    }
+
+    // ── Hooks-comparand resolution (misc 180) ─────────────────────
+
+    /// Write `installed_plugins.json` pointing the plugin at a version-keyed
+    /// cache dir (the frozen copy), the release/marketplace layout.
+    #[cfg(unix)]
+    fn write_installed_plugins(home: &std::path::Path, install_path: &std::path::Path) {
+        let plugins_dir = home.join(".claude/plugins");
+        std::fs::create_dir_all(&plugins_dir).expect("create plugins dir");
+        let installed = serde_json::json!({
+            "version": 2,
+            "plugins": {
+                "catenary@catenary": [{
+                    "scope": "user",
+                    "installPath": install_path.to_string_lossy(),
+                    "version": "2.0.2",
+                }],
+            },
+        });
+        std::fs::write(
+            plugins_dir.join("installed_plugins.json"),
+            serde_json::to_string_pretty(&installed).expect("serialize installed_plugins"),
+        )
+        .expect("write installed_plugins.json");
+    }
+
+    /// Write `known_marketplaces.json` for the catenary marketplace with the
+    /// given inner `source.source` type and directory path.
+    #[cfg(unix)]
+    fn write_known_marketplaces(home: &std::path::Path, source_type: &str, dir: &std::path::Path) {
+        let plugins_dir = home.join(".claude/plugins");
+        std::fs::create_dir_all(&plugins_dir).expect("create plugins dir");
+        let marketplaces = serde_json::json!({
+            "catenary": {
+                "source": { "source": source_type, "path": dir.to_string_lossy() },
+                "installLocation": dir.to_string_lossy(),
+            },
+        });
+        std::fs::write(
+            plugins_dir.join("known_marketplaces.json"),
+            serde_json::to_string_pretty(&marketplaces).expect("serialize known_marketplaces"),
+        )
+        .expect("write known_marketplaces.json");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_source_resolves_live_source_hooks_not_the_frozen_cache() {
+        // A directory-source install: the frozen version-keyed cache exists and
+        // differs from the live source dir. Claude Code executes the LIVE copy,
+        // so the comparand must be `<installLocation>/plugins/catenary/hooks/
+        // hooks.json` — not the cache — or the staleness verdict inverts.
+        let home = tempfile::tempdir().expect("tempdir");
+        let cache = home
+            .path()
+            .join(".claude/plugins/cache/catenary/catenary/2.0.2");
+        let source = home.path().join("Projects/Catenary");
+        write_installed_plugins(home.path(), &cache);
+        write_known_marketplaces(home.path(), "directory", &source);
+
+        let resolved = resolve_claude_hooks_path(home.path()).expect("resolve hooks path");
+        assert_eq!(
+            resolved,
+            source.join("plugins/catenary/hooks/hooks.json"),
+            "directory source must compare against the live source dir, not the cache",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_source_keeps_the_frozen_cache_comparand() {
+        // A github (release) install: the frozen version-keyed cache IS what
+        // executes, so the comparand stays `<installPath>/hooks/hooks.json`.
+        let home = tempfile::tempdir().expect("tempdir");
+        let cache = home
+            .path()
+            .join(".claude/plugins/cache/catenary/catenary/2.0.2");
+        let marketplace = home.path().join(".claude/plugins/marketplaces/catenary");
+        write_installed_plugins(home.path(), &cache);
+        write_known_marketplaces(home.path(), "github", &marketplace);
+
+        let resolved = resolve_claude_hooks_path(home.path()).expect("resolve hooks path");
+        assert_eq!(
+            resolved,
+            cache.join("hooks/hooks.json"),
+            "github source keeps the frozen-cache comparand",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_marketplaces_falls_back_to_the_frozen_cache() {
+        // No known_marketplaces.json (or unreadable): fall back to the frozen
+        // cache path rather than fabricating a directory comparand.
+        let home = tempfile::tempdir().expect("tempdir");
+        let cache = home
+            .path()
+            .join(".claude/plugins/cache/catenary/catenary/2.0.2");
+        write_installed_plugins(home.path(), &cache);
+
+        let resolved = resolve_claude_hooks_path(home.path()).expect("resolve hooks path");
+        assert_eq!(resolved, cache.join("hooks/hooks.json"));
     }
 
     // ── CLI hook subcommand tests ─────────────────────────────────

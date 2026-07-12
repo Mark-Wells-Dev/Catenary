@@ -89,7 +89,15 @@ fn claude_hooks_findings_at(home: &Path) -> Vec<Finding> {
         .as_deref()
         .map_or_else(|| version.to_string(), |src| format!("{version} ({src})"));
 
-    let hooks_path = install_path.join("hooks/hooks.json");
+    // For a directory source, Claude Code executes hooks resolved LIVE from the
+    // marketplace source dir, not the frozen version-keyed plugin cache (misc
+    // 180). Comparing the cache here reads stale/current backwards. The live
+    // copy is `<marketplace dir>/plugins/catenary/hooks/hooks.json`. Release /
+    // github sources keep the frozen-cache comparand, where frozen is correct.
+    let hooks_path = read_marketplace_directory(home).map_or_else(
+        || install_path.join("hooks/hooks.json"),
+        |dir| dir.join("plugins/catenary/hooks/hooks.json"),
+    );
     let Ok(installed) = std::fs::read_to_string(&hooks_path) else {
         return vec![Finding::new(
             FindingCode::HooksMissing,
@@ -481,6 +489,31 @@ fn read_marketplace_source(home: &Path) -> Option<String> {
         .map(std::string::ToString::to_string)
 }
 
+/// The catenary marketplace source directory, or `None` when the source is
+/// not a directory source (misc 180).
+///
+/// For a directory source, `known_marketplaces.json` records
+/// `source.source == "directory"` with the source directory in `source.path`
+/// (falling back to the sibling `installLocation`). That directory holds the
+/// live plugin — including the hooks Claude Code executes — under
+/// `plugins/catenary`, mirroring the marketplace's `plugins[].source` of
+/// `./plugins/catenary`.
+fn read_marketplace_directory(home: &Path) -> Option<PathBuf> {
+    let path = home.join(".claude/plugins/known_marketplaces.json");
+    let contents = std::fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    let entry = json.get("catenary")?;
+    let source = entry.get("source")?;
+    if source.get("source").and_then(serde_json::Value::as_str) != Some("directory") {
+        return None;
+    }
+    source
+        .get("path")
+        .or_else(|| entry.get("installLocation"))
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+}
+
 /// Normalize a JSON string for comparison (parse and re-serialize).
 fn normalize_json(s: &str) -> String {
     serde_json::from_str::<serde_json::Value>(s)
@@ -627,6 +660,96 @@ mod tests {
             "fix-it must not lead with the bare reinstall known to re-copy \
              stale cached content: {fix_it}",
         );
+    }
+
+    // ── directory-source live-comparand (misc 180) ──────────────────
+
+    /// Write `known_marketplaces.json` for a directory source rooted at
+    /// `source_dir`, and lay out the live hooks under
+    /// `<source_dir>/plugins/catenary/hooks/hooks.json`.
+    fn write_directory_source(home: &Path, source_dir: &Path, live_hooks: &str) {
+        let live = source_dir.join("plugins/catenary/hooks");
+        fs::create_dir_all(&live).expect("create live plugin dir");
+        fs::write(live.join("hooks.json"), live_hooks).expect("write live hooks");
+        let marketplaces = serde_json::json!({
+            "catenary": {
+                "source": { "source": "directory", "path": source_dir.to_string_lossy() },
+                "installLocation": source_dir.to_string_lossy(),
+            },
+        });
+        fs::write(
+            home.join(".claude/plugins/known_marketplaces.json"),
+            serde_json::to_string_pretty(&marketplaces).expect("serialize known_marketplaces"),
+        )
+        .expect("write known_marketplaces.json");
+    }
+
+    #[test]
+    fn directory_source_reads_ok_from_live_hooks_even_when_cache_is_stale() {
+        // Directory source: the frozen cache holds STALE hooks but the live
+        // source dir holds the current set. Claude Code executes the live copy,
+        // so the doctor must compare against it and read OK — not nag stale off
+        // the cache (the false-stale direction the ticket calls out).
+        let home = tempfile::tempdir().expect("tempdir");
+        write_claude_plugin_layout(home.path(), r#"{"hooks":{}}"#); // stale cache
+        let source_dir = home.path().join("Projects/Catenary");
+        write_directory_source(home.path(), &source_dir, CLAUDE_HOOKS_EXPECTED);
+
+        let findings = claude_hooks_findings_at(home.path());
+        let finding = findings.first().expect("one finding");
+        assert_eq!(
+            finding.code,
+            FindingCode::HooksOk,
+            "current live hooks read OK despite a stale frozen cache",
+        );
+    }
+
+    #[test]
+    fn directory_source_reads_stale_from_live_hooks_even_when_cache_is_current() {
+        // Directory source: the frozen cache happens to hold the current set but
+        // the live source dir has drifted. Claude Code executes the live copy,
+        // so the doctor must read STALE off it — not go OK off the cache (the
+        // false-fresh direction).
+        let home = tempfile::tempdir().expect("tempdir");
+        write_claude_plugin_layout(home.path(), CLAUDE_HOOKS_EXPECTED); // current cache
+        let source_dir = home.path().join("Projects/Catenary");
+        write_directory_source(home.path(), &source_dir, r#"{"hooks":{}}"#);
+
+        let findings = claude_hooks_findings_at(home.path());
+        let finding = findings.first().expect("one finding");
+        assert_eq!(
+            finding.code,
+            FindingCode::HooksStale,
+            "drifted live hooks read STALE despite a current frozen cache",
+        );
+        assert_eq!(finding.severity, Severity::Error);
+    }
+
+    #[test]
+    fn non_directory_source_keeps_the_frozen_cache_comparand() {
+        // A github (release) source: no directory dir is recorded, so the
+        // comparand stays the frozen version-keyed cache — a matching cache
+        // reads OK exactly as before misc 180.
+        let home = tempfile::tempdir().expect("tempdir");
+        write_claude_plugin_layout(home.path(), CLAUDE_HOOKS_EXPECTED);
+        let marketplaces = serde_json::json!({
+            "catenary": {
+                "source": { "source": "github", "repo": "TwoWells/Catenary" },
+                "installLocation": home
+                    .path()
+                    .join(".claude/plugins/marketplaces/catenary")
+                    .to_string_lossy(),
+            },
+        });
+        fs::write(
+            home.path().join(".claude/plugins/known_marketplaces.json"),
+            serde_json::to_string_pretty(&marketplaces).expect("serialize known_marketplaces"),
+        )
+        .expect("write known_marketplaces.json");
+
+        let findings = claude_hooks_findings_at(home.path());
+        let finding = findings.first().expect("one finding");
+        assert_eq!(finding.code, FindingCode::HooksOk);
     }
 
     // ── command filter status ───────────────────────────────────────
