@@ -3,7 +3,7 @@
 
 //! Grep tool: ripgrep + symbol index pipeline with LSP enrichment.
 
-use super::session::ResolvedGlob;
+use super::session::ExcludeSet;
 use anyhow::{Context, Result, anyhow};
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
@@ -100,9 +100,12 @@ pub struct GrepInput {
     /// workspace roots.
     #[serde(default)]
     pub paths: Vec<PathBuf>,
-    /// Glob pattern to exclude from matches (optional).
+    /// Glob patterns to exclude from matches (repeatable `--exclude-pattern`).
+    ///
+    /// Empty for a query with no exclusion. The router resolves each pattern
+    /// against `cwd` before dispatch; a path is excluded when any matches.
     #[serde(default)]
-    pub exclude: Option<String>,
+    pub exclude: Vec<String>,
     /// Include gitignored files (default: false).
     #[serde(default)]
     pub include_gitignored: bool,
@@ -462,12 +465,7 @@ impl GrepServer {
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<GrepOutcome> {
         let effective_roots = self.effective_search_roots(search_paths, cwd);
-        let resolved_exclude = input
-            .exclude
-            .as_deref()
-            .map(ResolvedGlob::new)
-            .transpose()?
-            .map(Arc::new);
+        let resolved_exclude = Arc::new(ExcludeSet::compile(&input.exclude)?);
 
         // A count must never inflate from context lines, and `-l` is irrelevant
         // here — keep only the matcher/file-filter flags, drop context.
@@ -514,12 +512,7 @@ impl GrepServer {
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<GrepOutcome> {
         let effective_roots = self.effective_search_roots(search_paths, cwd);
-        let resolved_exclude = input
-            .exclude
-            .as_deref()
-            .map(ResolvedGlob::new)
-            .transpose()?
-            .map(Arc::new);
+        let resolved_exclude = Arc::new(ExcludeSet::compile(&input.exclude)?);
 
         // Matcher/file-filter flags only; context never changes the file set.
         let flags = GrepFlags {
@@ -584,12 +577,7 @@ impl GrepServer {
         // caller has no cwd, the explicit all-roots mode. See
         // [`Self::effective_search_roots`] (bug 31).
         let effective_roots = self.effective_search_roots(&input.paths, cwd);
-        let resolved_exclude = input
-            .exclude
-            .as_deref()
-            .map(ResolvedGlob::new)
-            .transpose()?
-            .map(Arc::new);
+        let resolved_exclude = Arc::new(ExcludeSet::compile(&input.exclude)?);
 
         // Step 1: Ripgrep scoped to file set → raw hits with matched text.
         // Context lines (`-A`/`-B`/`-C`) and inverted selection (`-v`) are
@@ -812,7 +800,7 @@ impl GrepServer {
     async fn ripgrep_matches_blocking(
         pattern: String,
         roots: Vec<PathBuf>,
-        exclude: Option<Arc<ResolvedGlob>>,
+        exclude: Arc<ExcludeSet>,
         include_gitignored: bool,
         include_hidden: bool,
         fs_manager: Arc<FilesystemManager>,
@@ -823,7 +811,7 @@ impl GrepServer {
             Self::ripgrep_matches(
                 &pattern,
                 &roots,
-                exclude.as_ref(),
+                &exclude,
                 include_gitignored,
                 include_hidden,
                 &fs_manager,
@@ -855,7 +843,7 @@ impl GrepServer {
     fn ripgrep_matches(
         pattern: &str,
         roots: &[PathBuf],
-        exclude: Option<&Arc<ResolvedGlob>>,
+        exclude: &Arc<ExcludeSet>,
         include_gitignored: bool,
         include_hidden: bool,
         fs_manager: &Arc<FilesystemManager>,
@@ -926,7 +914,7 @@ impl GrepServer {
                 let matcher = matcher.clone();
                 let mut searcher = build_searcher(flags);
                 let invert = flags.invert;
-                let exclude = exclude.cloned();
+                let exclude = Arc::clone(exclude);
                 let root = root.clone();
                 // A file root is an explicitly-named path (positional arg or a
                 // glob that expanded to it); its skip is reported per-file. A
@@ -1004,9 +992,7 @@ impl GrepServer {
                         .map_or(OBSERVED_STAT_MISS_MTIME, mtime_nanos);
                     state.local.files.push((path.to_path_buf(), observed_mtime));
 
-                    if let Some(rg) = &exclude
-                        && rg.is_match(path, &root)
-                    {
+                    if exclude.is_match(path, &root) {
                         return WalkState::Continue;
                     }
 
@@ -2613,7 +2599,7 @@ mod tests {
         let rg = GrepServer::ripgrep_matches(
             "TODO",
             std::slice::from_ref(&file),
-            None,
+            &no_exclude(),
             false, // include_gitignored = false: the bypass must not depend on it
             false,
             &fs,
@@ -2694,6 +2680,12 @@ mod tests {
 
     // ─── flag parity: searcher (-v invert / -A/-B/-C context) ───────────
 
+    /// The empty exclude set — the no-`--exclude-pattern` case, wired as
+    /// `ripgrep_matches` now takes it (an `Arc<ExcludeSet>`, not an `Option`).
+    fn no_exclude() -> Arc<ExcludeSet> {
+        Arc::new(ExcludeSet::default())
+    }
+
     /// Run `ripgrep_matches` over a one-file tempdir and return the matched
     /// line numbers (sorted), the line→texts present.
     fn rg_over(dir: &Path, pattern: &str, flags: &GrepFlags) -> RipgrepMatches {
@@ -2701,7 +2693,7 @@ mod tests {
         GrepServer::ripgrep_matches(
             pattern,
             std::slice::from_ref(&dir.to_path_buf()),
-            None,
+            &no_exclude(),
             false,
             false,
             &fs,
@@ -2921,7 +2913,7 @@ mod tests {
         let gated = GrepServer::ripgrep_matches(
             "TODO",
             std::slice::from_ref(&root),
-            None,
+            &no_exclude(),
             false,
             false,
             &fs,
@@ -2945,7 +2937,7 @@ mod tests {
         let with_ignored = GrepServer::ripgrep_matches(
             "TODO",
             std::slice::from_ref(&root),
-            None,
+            &no_exclude(),
             true,
             false,
             &fs,
@@ -2985,7 +2977,7 @@ mod tests {
         let named = GrepServer::ripgrep_matches(
             "NEEDLE",
             std::slice::from_ref(&big),
-            None,
+            &no_exclude(),
             false,
             false,
             &fs,
@@ -3007,7 +2999,7 @@ mod tests {
         let walked = GrepServer::ripgrep_matches(
             "NEEDLE",
             std::slice::from_ref(&root.to_path_buf()),
-            None,
+            &no_exclude(),
             false,
             false,
             &fs,
@@ -3041,7 +3033,7 @@ mod tests {
         let named = GrepServer::ripgrep_matches(
             "NEEDLE",
             std::slice::from_ref(&blob),
-            None,
+            &no_exclude(),
             false,
             false,
             &fs,
@@ -3060,7 +3052,7 @@ mod tests {
         let walked = GrepServer::ripgrep_matches(
             "NEEDLE",
             std::slice::from_ref(&root.to_path_buf()),
-            None,
+            &no_exclude(),
             false,
             false,
             &fs,
@@ -3097,7 +3089,7 @@ mod tests {
         let full = GrepServer::ripgrep_matches(
             "needle",
             std::slice::from_ref(&root.to_path_buf()),
-            None,
+            &no_exclude(),
             false,
             false,
             &fs,
@@ -3118,7 +3110,7 @@ mod tests {
         let quit = GrepServer::ripgrep_matches(
             "needle",
             std::slice::from_ref(&root.to_path_buf()),
-            None,
+            &no_exclude(),
             false,
             false,
             &fs,

@@ -246,6 +246,58 @@ impl ResolvedGlob {
     }
 }
 
+/// A set of compiled `--exclude-pattern` globs, matched as a union.
+///
+/// `--exclude-pattern` is repeatable (clap append, like its siblings `--glob`
+/// and `--type`): every occurrence contributes one pattern, and a path is
+/// excluded when **any** pattern matches it. An empty set excludes nothing —
+/// the no-exclude case is a set of zero patterns, not a wrapping `Option`, so a
+/// single flat type reaches every consumer (bug 89) and no collected pattern
+/// can be silently dropped by a leg that forgot to thread the `Option` (the
+/// bug-73 leak class).
+///
+/// Exclude patterns are only ever *matched*, never expanded, so a
+/// [`ResolvedGlob`] per pattern is sufficient. `Clone` so it can move into the
+/// `spawn_blocking` tasks that run glob's off-thread walks (mirroring
+/// [`ResolvedGlob`]).
+#[derive(Clone, Default)]
+pub struct ExcludeSet {
+    globs: Vec<ResolvedGlob>,
+}
+
+impl ExcludeSet {
+    /// Compiles each pattern into the set, skipping empty strings.
+    ///
+    /// Each pattern is compiled independently — the router has already resolved
+    /// each against `cwd` (grep) or expanded a basename to `**/<name>` (glob),
+    /// so per-pattern spellings differ and must not be merged into one glob.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any pattern is not a valid glob.
+    pub fn compile(patterns: &[String]) -> Result<Self> {
+        let globs = patterns
+            .iter()
+            .filter(|p| !p.is_empty())
+            .map(|p| ResolvedGlob::new(p))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { globs })
+    }
+
+    /// True when no pattern was supplied — excludes nothing.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.globs.is_empty()
+    }
+
+    /// Whether **any** pattern in the set selects `path` (matched against
+    /// `root`), the union semantics of a repeated `--exclude-pattern`.
+    #[must_use]
+    pub fn is_match(&self, path: &Path, root: &Path) -> bool {
+        self.globs.iter().any(|g| g.is_match(path, root))
+    }
+}
+
 /// Resolves search path arguments into the concrete paths to scope a query.
 ///
 /// Mirrors the CLI's literal-first contract on the daemon side: a path that
@@ -1341,6 +1393,44 @@ mod tests {
     #[test]
     fn expand_tilde_no_op_for_relative() {
         assert_eq!(expand_tilde("src/main.rs"), "src/main.rs");
+    }
+
+    // ── ExcludeSet (bug 89) ───────────────────────────────────────
+
+    #[test]
+    fn exclude_set_empty_is_noop() {
+        let set = ExcludeSet::compile(&[]).expect("compile empty");
+        assert!(set.is_empty());
+        assert!(
+            !set.is_match(Path::new("/root/a.rs"), Path::new("/root")),
+            "an empty set matches nothing"
+        );
+    }
+
+    #[test]
+    fn exclude_set_matches_any_pattern() {
+        // A repeated `--exclude-pattern` unions its patterns: a path is excluded
+        // when ANY glob in the set matches it (bug 89).
+        let set = ExcludeSet::compile(&["/root/*.rs".to_string(), "/root/*.txt".to_string()])
+            .expect("compile");
+        assert!(!set.is_empty());
+        let root = Path::new("/root");
+        assert!(set.is_match(Path::new("/root/a.rs"), root), "first pattern");
+        assert!(
+            set.is_match(Path::new("/root/b.txt"), root),
+            "second pattern"
+        );
+        assert!(
+            !set.is_match(Path::new("/root/keep.md"), root),
+            "a path matching neither pattern survives"
+        );
+    }
+
+    #[test]
+    fn exclude_set_skips_empty_strings() {
+        // An empty pattern string contributes nothing — the set stays empty.
+        let set = ExcludeSet::compile(&[String::new()]).expect("compile");
+        assert!(set.is_empty(), "empty-string patterns are skipped");
     }
 
     #[test]

@@ -114,9 +114,10 @@ enum Command {
         #[arg(short_alias = 't', long = "type", value_name = "TYPE")]
         type_filter: Vec<String>,
 
-        /// Exclude matches by glob pattern (e.g., tests/**).
-        #[arg(long = "exclude-pattern")]
-        exclude: Option<String>,
+        /// Exclude matches by glob pattern, e.g. `tests/**` (repeatable; each
+        /// occurrence adds a pattern, and a path is dropped when any matches).
+        #[arg(long = "exclude-pattern", value_name = "GLOB")]
+        exclude: Vec<String>,
 
         /// Report the match count ("N matches in M files") instead of results.
         #[arg(short_alias = 'c', long)]
@@ -160,9 +161,10 @@ enum Command {
         #[arg(name = "PATH", required = true)]
         paths: Vec<String>,
 
-        /// Exclude matches by glob pattern (e.g., tests/**).
-        #[arg(long = "exclude-pattern")]
-        exclude: Option<String>,
+        /// Exclude matches by glob pattern, e.g. `tests/**` (repeatable; each
+        /// occurrence adds a pattern, and a path is dropped when any matches).
+        #[arg(long = "exclude-pattern", value_name = "GLOB")]
+        exclude: Vec<String>,
 
         /// Report the path count ("N paths") instead of results.
         #[arg(long)]
@@ -1938,7 +1940,7 @@ async fn run_grep(
     out: &mut cli::Output,
     pattern: String,
     paths: Vec<PathBuf>,
-    exclude: Option<String>,
+    exclude: Vec<String>,
     count: bool,
     include_gitignored: bool,
     include_hidden: bool,
@@ -2360,7 +2362,7 @@ where
 async fn run_glob(
     out: &mut cli::Output,
     paths: Vec<PathBuf>,
-    exclude: Option<String>,
+    exclude: Vec<String>,
     count: bool,
     include_gitignored: bool,
     include_hidden: bool,
@@ -3496,7 +3498,7 @@ mod tests {
         };
         assert_eq!(pattern, "foo");
         assert!(scope.is_empty());
-        assert!(exclude.is_none());
+        assert!(exclude.is_empty());
         assert!(!count);
         assert!(!include_gitignored);
         assert!(!include_hidden);
@@ -3661,10 +3663,34 @@ mod tests {
         };
         assert_eq!(pattern, "foo|bar");
         assert_eq!(scope, vec!["src/"]);
-        assert_eq!(exclude.as_deref(), Some("tests/"));
+        assert_eq!(exclude, vec!["tests/".to_string()]);
         assert!(count);
         assert!(include_gitignored);
         assert!(include_hidden);
+    }
+
+    #[test]
+    fn test_cli_grep_exclude_pattern_repeatable() {
+        use clap::Parser;
+        // `--exclude-pattern` is repeatable (bug 89), matching its siblings
+        // `--glob`/`--type`: a second occurrence appends rather than erroring.
+        let args = Args::try_parse_from([
+            "catenary",
+            "grep",
+            "foo",
+            "--exclude-pattern",
+            "tests/**",
+            "--exclude-pattern",
+            "vendor/**",
+        ])
+        .expect("repeated --exclude-pattern should parse");
+        let Some(Command::Grep { exclude, .. }) = args.command else {
+            unreachable!("expected Grep command");
+        };
+        assert_eq!(
+            exclude,
+            vec!["tests/**".to_string(), "vendor/**".to_string()]
+        );
     }
 
     #[test]
@@ -3808,7 +3834,7 @@ mod tests {
             unreachable!("expected Glob command");
         };
         assert_eq!(paths, vec!["src/"]);
-        assert!(exclude.is_none());
+        assert!(exclude.is_empty());
         assert!(!count);
         assert!(!include_gitignored);
         assert!(!include_hidden);
@@ -3859,10 +3885,34 @@ mod tests {
             unreachable!("expected Glob command");
         };
         assert_eq!(paths, vec!["src/"]);
-        assert_eq!(exclude.as_deref(), Some("target/**"));
+        assert_eq!(exclude, vec!["target/**".to_string()]);
         assert!(count);
         assert!(include_gitignored);
         assert!(include_hidden);
+    }
+
+    #[test]
+    fn test_cli_glob_exclude_pattern_repeatable() {
+        use clap::Parser;
+        // `--exclude-pattern` is repeatable (bug 89): a second occurrence
+        // appends instead of hard-erroring `cannot be used multiple times`.
+        let args = Args::try_parse_from([
+            "catenary",
+            "glob",
+            "src/",
+            "--exclude-pattern",
+            "target/**",
+            "--exclude-pattern",
+            "vendor/**",
+        ])
+        .expect("repeated --exclude-pattern should parse");
+        let Some(Command::Glob { exclude, .. }) = args.command else {
+            unreachable!("expected Glob command");
+        };
+        assert_eq!(
+            exclude,
+            vec!["target/**".to_string(), "vendor/**".to_string()]
+        );
     }
 
     #[test]

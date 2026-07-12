@@ -2618,3 +2618,96 @@ fn grep_exclude_pattern_still_excludes() -> Result<()> {
     );
     Ok(())
 }
+
+// ── repeatable --exclude-pattern reaches every consumer (bug 89) ──────
+
+/// A repeated `--exclude-pattern` (bug 89) unions its patterns and BOTH reach a
+/// glob **pattern** argument's matches — the bug-73 leak class must not
+/// resurface for a multi-pattern exclude. `keep.md` matches neither and
+/// survives; the listing and `--count` agree on the surviving set (parity).
+#[test]
+fn glob_exclude_pattern_repeatable_reaches_pattern_matches_and_count() -> Result<()> {
+    let dir = common::canonical_tempdir()?;
+    std::fs::create_dir(dir.path().join("src"))?;
+    std::fs::write(dir.path().join("src/a.rs"), "fn a() {}")?;
+    std::fs::write(dir.path().join("src/b.txt"), "b")?;
+    std::fs::write(dir.path().join("src/keep.md"), "# keep")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    // Two excludes on the wire, matched as a union against the pattern's files.
+    let listing = bridge.call_glob(&json!({
+        "paths": ["src/*"],
+        "exclude": ["*.rs", "*.txt"],
+    }))?;
+    assert!(listing.contains("keep.md"), "keep.md survives: {listing}");
+    assert!(
+        !listing.contains("a.rs"),
+        "first exclude reaches the pattern match: {listing}"
+    );
+    assert!(
+        !listing.contains("b.txt"),
+        "second exclude reaches the pattern match: {listing}"
+    );
+
+    // `--count` filters identically — the surviving cardinality is 1, not the
+    // 3 pre-exclude matches — so listing and count never diverge (bug 73 parity
+    // holds for a multi-pattern exclude).
+    let raw = bridge.call_search_raw(
+        "tool/glob",
+        &json!({ "paths": ["src/*"], "exclude": ["*.rs", "*.txt"], "count": true }),
+    )?;
+    let paths = raw.get("paths").and_then(serde_json::Value::as_u64);
+    assert_eq!(
+        paths,
+        Some(1),
+        "count agrees with the multi-pattern-excluded listing: {raw}"
+    );
+    Ok(())
+}
+
+/// A repeated `--exclude-pattern` drops every named pattern from a grep pass —
+/// both excludes reach the ripgrep walk (bug 89). Only the file matching no
+/// exclude survives.
+#[test]
+fn grep_exclude_pattern_repeatable_excludes_all() -> Result<()> {
+    let dir = common::canonical_tempdir()?;
+    std::fs::write(dir.path().join("code.rs"), "let needle = 1;\n")?;
+    std::fs::write(dir.path().join("data.json"), "needle\n")?;
+    std::fs::write(dir.path().join("notes.txt"), "needle here\n")?;
+
+    let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
+    bridge.initialize()?;
+
+    // Two excludes on the wire — both must reach the walk.
+    let excluded = bridge.call_grep(&json!({
+        "pattern": "needle",
+        "exclude": ["*.rs", "*.json"],
+    }))?;
+    assert!(
+        !excluded.contains("code.rs"),
+        "first exclude drops code.rs: {excluded}"
+    );
+    assert!(
+        !excluded.contains("data.json"),
+        "second exclude drops data.json: {excluded}"
+    );
+    assert!(
+        excluded.contains("notes.txt"),
+        "the unmatched file survives: {excluded}"
+    );
+
+    // Parity: `--count` reports one distinct file, agreeing with the listing.
+    let raw = bridge.call_search_raw(
+        "tool/grep",
+        &json!({ "pattern": "needle", "exclude": ["*.rs", "*.json"], "count": true }),
+    )?;
+    let files = raw.get("files").and_then(serde_json::Value::as_u64);
+    assert_eq!(
+        files,
+        Some(1),
+        "grep --count agrees with the multi-pattern-excluded listing: {raw}"
+    );
+    Ok(())
+}

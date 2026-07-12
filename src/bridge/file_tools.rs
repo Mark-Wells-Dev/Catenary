@@ -35,7 +35,7 @@ use super::SourceLines;
 use super::filesystem_manager::{
     FilesystemManager, STAT_RETRY_ATTEMPTS, format_file_size, mtime_nanos,
 };
-use super::session::{ArgResolution, ResolvedGlob, expand_search_paths_grouped_cancellable};
+use super::session::{ArgResolution, ExcludeSet, expand_search_paths_grouped_cancellable};
 use crate::lsp::{LspClientManager, WalkBreadth};
 use crate::symbol_index::{Symbol, SymbolIndex};
 
@@ -93,9 +93,12 @@ pub struct GlobInput {
     /// (file outline, directory listing) without glob interpretation.
     #[serde(default)]
     pub paths: Vec<PathBuf>,
-    /// Glob pattern to exclude from results.
+    /// Glob patterns to exclude from results (repeatable `--exclude-pattern`).
+    ///
+    /// Empty for a query with no exclusion. The router resolves each pattern
+    /// before dispatch; a path is excluded when any matches.
     #[serde(default)]
-    pub exclude: Option<String>,
+    pub exclude: Vec<String>,
     /// Include gitignored files (default: false).
     #[serde(default)]
     pub include_gitignored: bool,
@@ -213,15 +216,11 @@ impl GlobServer {
 
         tracing::debug!("glob: {} path(s)", input.paths.len());
 
-        // Compile exclude pattern via ResolvedGlob. The CLI router
-        // resolves exclude against cwd before dispatch, so patterns
-        // are always absolute here.
-        let exclude = input
-            .exclude
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(ResolvedGlob::new)
-            .transpose()?;
+        // Compile the exclude set. `--exclude-pattern` is repeatable (bug 89):
+        // the CLI router resolves each pattern against cwd before dispatch, so
+        // each is absolute (or the `**/<name>` basename form) here, and a path
+        // is excluded when any matches. An empty set excludes nothing.
+        let exclude = ExcludeSet::compile(&input.exclude)?;
 
         // Count mode short-circuits enrichment — report the number of resolved
         // paths, not a rendered tree. The count walks run off the runtime thread
@@ -249,14 +248,7 @@ impl GlobServer {
         // threaded into the directory walk so a disconnected client's listing
         // stops promptly instead of running to completion (misc 140).
         let (output, no_match_indices) = self
-            .handle_literal_paths(
-                &input.paths,
-                &input,
-                exclude.as_ref(),
-                cwd,
-                parent_id,
-                cancel,
-            )
+            .handle_literal_paths(&input.paths, &input, &exclude, cwd, parent_id, cancel)
             .await?;
 
         Ok(GlobOutcome::Rendered {
@@ -382,7 +374,7 @@ impl GlobServer {
         &self,
         paths: &[PathBuf],
         input: &GlobInput,
-        exclude: Option<&ResolvedGlob>,
+        exclude: &ExcludeSet,
         cwd: Option<&Path>,
         parent_id: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
@@ -521,12 +513,7 @@ impl GlobServer {
     /// with `reap = false`: a scoped walk adds/updates only and never reaps a
     /// deletion. Roots with no covering server are skipped
     /// ([`WalkBreadth::None`](crate::lsp::WalkBreadth::None)).
-    async fn nudge_scoped(
-        &self,
-        resolved: &[PathBuf],
-        input: &GlobInput,
-        exclude: Option<&ResolvedGlob>,
-    ) {
+    async fn nudge_scoped(&self, resolved: &[PathBuf], input: &GlobInput, exclude: &ExcludeSet) {
         let observations = collect_scoped_observations(resolved, input, exclude);
         if observations.is_empty() {
             return;
@@ -580,7 +567,7 @@ impl GlobServer {
         &self,
         dir: &Path,
         input: &GlobInput,
-        exclude: Option<&ResolvedGlob>,
+        exclude: &ExcludeSet,
         cwd: Option<&Path>,
         parent_id: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
@@ -594,7 +581,7 @@ impl GlobServer {
                 canonical.clone(),
                 input.include_gitignored,
                 input.include_hidden,
-                exclude.cloned(),
+                exclude.clone(),
                 cancel,
             )
             .await?;
@@ -709,7 +696,7 @@ impl GlobServer {
         canonical: &Path,
         include_gitignored: bool,
         include_hidden: bool,
-        exclude: Option<&ResolvedGlob>,
+        exclude: &ExcludeSet,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Vec<GlobEntry>> {
         // Build non-gitignored set for flag detection.
@@ -751,9 +738,7 @@ impl GlobServer {
                 .unwrap_or_default();
 
             // Apply exclude filter against the entry path.
-            if let Some(rg) = exclude
-                && rg.is_match(&entry_path, canonical)
-            {
+            if exclude.is_match(&entry_path, canonical) {
                 continue;
             }
 
@@ -848,7 +833,7 @@ impl GlobServer {
         canonical: &Path,
         include_gitignored: bool,
         include_hidden: bool,
-        exclude: Option<&ResolvedGlob>,
+        exclude: &ExcludeSet,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> usize {
         let walker = WalkBuilder::new(canonical)
@@ -870,9 +855,7 @@ impl GlobServer {
             }
             // Same entry-level exclude filter `collect_dir_entries` applies, so
             // the count and the listing agree under an exclude (bug 73).
-            if let Some(rg) = exclude
-                && rg.is_match(&entry_path, canonical)
-            {
+            if exclude.is_match(&entry_path, canonical) {
                 continue;
             }
             count += 1;
@@ -888,7 +871,7 @@ impl GlobServer {
     /// would be read to completion for a dead client. `spawn_blocking` frees the
     /// runtime to fire the cancel token, which the walk observes per entry
     /// (mirroring grep's `ripgrep_matches_blocking`). Owned inputs move into the
-    /// task; `GlobEntry`/`ResolvedGlob` are `Send`.
+    /// task; `GlobEntry`/`ExcludeSet` are `Send`.
     ///
     /// # Errors
     ///
@@ -898,7 +881,7 @@ impl GlobServer {
         canonical: PathBuf,
         include_gitignored: bool,
         include_hidden: bool,
-        exclude: Option<ResolvedGlob>,
+        exclude: ExcludeSet,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Vec<GlobEntry>> {
         let fs_manager = Arc::clone(&self.fs_manager);
@@ -909,7 +892,7 @@ impl GlobServer {
                 &canonical,
                 include_gitignored,
                 include_hidden,
-                exclude.as_ref(),
+                &exclude,
                 &cancel,
             )
         })
@@ -947,7 +930,7 @@ impl GlobServer {
         paths: &[PathBuf],
         include_gitignored: bool,
         include_hidden: bool,
-        exclude: Option<&ResolvedGlob>,
+        exclude: &ExcludeSet,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<usize> {
         // Resolve per-argument so the exclude filter distinguishes a glob
@@ -1017,7 +1000,7 @@ impl GlobServer {
         paths: Vec<PathBuf>,
         include_gitignored: bool,
         include_hidden: bool,
-        exclude: Option<ResolvedGlob>,
+        exclude: ExcludeSet,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<usize> {
         let fs_manager = Arc::clone(&self.fs_manager);
@@ -1028,7 +1011,7 @@ impl GlobServer {
                 &paths,
                 include_gitignored,
                 include_hidden,
-                exclude.as_ref(),
+                &exclude,
                 &cancel,
             )
         })
@@ -1232,11 +1215,7 @@ fn dir_count_suffix(files: usize, dirs: usize) -> String {
 /// [`GlobServer::collect_dir_entries`]), so previewing a huge `target/` does not
 /// read 40 000 files. Symlinks are followed for the file/dir decision, matching
 /// the listing's classification.
-fn count_dir_children(
-    dir: &Path,
-    input: &GlobInput,
-    exclude: Option<&ResolvedGlob>,
-) -> (usize, usize) {
+fn count_dir_children(dir: &Path, input: &GlobInput, exclude: &ExcludeSet) -> (usize, usize) {
     let walker = WalkBuilder::new(dir)
         .max_depth(Some(1))
         .git_ignore(!input.include_gitignored)
@@ -1249,9 +1228,7 @@ fn count_dir_children(
         if entry_path.as_path() == dir {
             continue;
         }
-        if let Some(rg) = exclude
-            && rg.is_match(&entry_path, dir)
-        {
+        if exclude.is_match(&entry_path, dir) {
             continue;
         }
         if std::fs::metadata(&entry_path).is_ok_and(|m| m.is_dir()) {
@@ -1281,23 +1258,28 @@ fn count_dir_children(
 /// files the query surfaces. A pattern whose every match is excluded is left
 /// with an empty `resolved`, so it renders the honest `no matches for pattern`
 /// report rather than vanishing.
+///
+/// A path is dropped when **any** pattern in the set matches it, so every
+/// collected `--exclude-pattern` reaches this leg (bug 89) exactly as it reaches
+/// the grep walk and the named-dir entry filter — no pattern silently dropped
+/// (the bug-73 leak class).
 fn apply_exclude_to_groups(
     fs_manager: &FilesystemManager,
     groups: &mut [ArgResolution],
-    exclude: Option<&ResolvedGlob>,
+    exclude: &ExcludeSet,
 ) {
-    let Some(rg) = exclude else {
+    if exclude.is_empty() {
         return;
-    };
+    }
     for group in groups.iter_mut().filter(|g| g.is_pattern) {
         group
             .resolved
-            .retain(|path| !path_matches_exclude(fs_manager, rg, path));
+            .retain(|path| !path_matches_exclude(fs_manager, exclude, path));
     }
 }
 
-/// Whether `exclude` selects `path`, resolving the root a relative pattern
-/// strips.
+/// Whether any pattern in `exclude` selects `path`, resolving the root a
+/// relative pattern strips.
 ///
 /// An absolute exclude matches the full path (the root is ignored); a basename
 /// exclude (the `**/<name>` form the router expands a no-slash pattern into) is
@@ -1307,11 +1289,7 @@ fn apply_exclude_to_groups(
 /// verdict. This mirrors the entry-level filter
 /// [`GlobServer::collect_dir_entries`] and the grep walk apply, so a
 /// pattern-matched path is excluded on the same terms as a directory entry.
-fn path_matches_exclude(
-    fs_manager: &FilesystemManager,
-    exclude: &ResolvedGlob,
-    path: &Path,
-) -> bool {
+fn path_matches_exclude(fs_manager: &FilesystemManager, exclude: &ExcludeSet, path: &Path) -> bool {
     let root = fs_manager
         .resolve_root(path)
         .or_else(|| path.parent().map(Path::to_path_buf))
@@ -1340,7 +1318,7 @@ fn render_dir(
     fs_manager: &FilesystemManager,
     indent: &str,
     input: &GlobInput,
-    exclude: Option<&ResolvedGlob>,
+    exclude: &ExcludeSet,
 ) -> String {
     // Outline nodes sit one level deeper than their file header.
     let sym_base_indent = format!("{indent}\t");
@@ -1520,7 +1498,7 @@ fn path_is_file_or_symlink_with_retry_with(
 fn collect_scoped_observations(
     resolved: &[PathBuf],
     input: &GlobInput,
-    exclude: Option<&ResolvedGlob>,
+    exclude: &ExcludeSet,
 ) -> Vec<(PathBuf, i64)> {
     let mut observed: Vec<(PathBuf, i64)> = Vec::new();
     for path in resolved {
@@ -1549,9 +1527,7 @@ fn collect_scoped_observations(
                 if entry_path.as_path() == path.as_path() {
                     continue;
                 }
-                if let Some(rg) = exclude
-                    && rg.is_match(&entry_path, path)
-                {
+                if exclude.is_match(&entry_path, path) {
                     continue;
                 }
                 // Only regular files carry an mtime worth diffing; the per-file
@@ -1715,7 +1691,7 @@ mod tests {
         // its own path matches the exclude — a named directory's entries are
         // filtered downstream, not the argument itself (bug 73).
         let fs = FilesystemManager::new();
-        let exclude = ResolvedGlob::new("**/*.rs").expect("compile exclude");
+        let exclude = ExcludeSet::compile(&["**/*.rs".to_string()]).expect("compile exclude");
 
         let mut groups = vec![
             ArgResolution {
@@ -1732,7 +1708,7 @@ mod tests {
             },
         ];
 
-        apply_exclude_to_groups(&fs, &mut groups, Some(&exclude));
+        apply_exclude_to_groups(&fs, &mut groups, &exclude);
 
         // Pattern group: every `.rs` match dropped, the `.txt` survives.
         assert_eq!(
@@ -1749,13 +1725,42 @@ mod tests {
     }
 
     #[test]
-    fn apply_exclude_to_groups_none_is_noop() {
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn apply_exclude_to_groups_unions_multiple_patterns() {
+        // A repeated `--exclude-pattern` (bug 89) unions its patterns: a
+        // pattern-match is dropped when ANY compiled exclude selects it. Both
+        // patterns must reach the filter — the bug-73 leak class at the group
+        // level. `keep.md` matches neither and survives.
+        let fs = FilesystemManager::new();
+        let exclude = ExcludeSet::compile(&["**/*.rs".to_string(), "**/*.txt".to_string()])
+            .expect("compile exclude");
+
+        let mut groups = vec![ArgResolution {
+            resolved: vec![
+                PathBuf::from("/root/a.rs"),
+                PathBuf::from("/root/b.txt"),
+                PathBuf::from("/root/keep.md"),
+            ],
+            is_pattern: true,
+        }];
+
+        apply_exclude_to_groups(&fs, &mut groups, &exclude);
+
+        assert_eq!(
+            groups[0].resolved,
+            vec![PathBuf::from("/root/keep.md")],
+            "both excludes apply; only the unmatched path survives"
+        );
+    }
+
+    #[test]
+    fn apply_exclude_to_groups_empty_set_is_noop() {
         let fs = FilesystemManager::new();
         let mut groups = vec![ArgResolution {
             resolved: vec![PathBuf::from("/root/a.rs")],
             is_pattern: true,
         }];
-        apply_exclude_to_groups(&fs, &mut groups, None);
+        apply_exclude_to_groups(&fs, &mut groups, &ExcludeSet::default());
         assert_eq!(groups[0].resolved, vec![PathBuf::from("/root/a.rs")]);
     }
 
@@ -2369,7 +2374,11 @@ mod tests {
         }))
         .expect("deserialize GlobInput");
 
-        let observed = collect_scoped_observations(std::slice::from_ref(&linkdir), &input, None);
+        let observed = collect_scoped_observations(
+            std::slice::from_ref(&linkdir),
+            &input,
+            &ExcludeSet::default(),
+        );
 
         // Regression guard: the contained file must be observed at its CANONICAL
         // `realdir/x.<EXT>` path (the grep/diagnostics baseline key) — glob
@@ -2456,7 +2465,7 @@ mod tests {
             &input.paths,
             input.include_gitignored,
             input.include_hidden,
-            None,
+            &ExcludeSet::default(),
             &tokio_util::sync::CancellationToken::new(),
         )
         .expect("count_paths");
@@ -2569,7 +2578,13 @@ mod tests {
         // Baseline: without cancellation the walk enumerates every child.
         let live = tokio_util::sync::CancellationToken::new();
         let full = rt
-            .block_on(server.collect_dir_entries_off_thread(dir.clone(), false, false, None, &live))
+            .block_on(server.collect_dir_entries_off_thread(
+                dir.clone(),
+                false,
+                false,
+                ExcludeSet::default(),
+                &live,
+            ))
             .expect("walk uncancelled");
         assert_eq!(full.len(), 200, "uncancelled walk lists every child");
 
@@ -2578,7 +2593,13 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         cancel.cancel();
         let cancelled = rt
-            .block_on(server.collect_dir_entries_off_thread(dir, false, false, None, &cancel))
+            .block_on(server.collect_dir_entries_off_thread(
+                dir,
+                false,
+                false,
+                ExcludeSet::default(),
+                &cancel,
+            ))
             .expect("walk cancelled");
         assert!(
             cancelled.is_empty(),
@@ -2647,7 +2668,7 @@ mod tests {
             &[small_base.join("b*")],
             false,
             false,
-            None,
+            &ExcludeSet::default(),
             &cancel,
         )
         .expect("count small b*");
@@ -2660,7 +2681,7 @@ mod tests {
             &[big_base.join("b*")],
             false,
             false,
-            None,
+            &ExcludeSet::default(),
             &cancel,
         )
         .expect("count big b*");
@@ -2701,9 +2722,15 @@ mod tests {
         let cancel = CancellationToken::new();
 
         probe::reset();
-        let count =
-            GlobServer::count_paths(&server.fs_manager, &[big], false, false, None, &cancel)
-                .expect("count named big dir");
+        let count = GlobServer::count_paths(
+            &server.fs_manager,
+            &[big],
+            false,
+            false,
+            &ExcludeSet::default(),
+            &cancel,
+        )
+        .expect("count named big dir");
 
         assert_eq!(
             count, n,
@@ -2749,7 +2776,7 @@ mod tests {
             &[base.join("b*/*")],
             false,
             false,
-            None,
+            &ExcludeSet::default(),
             &cancel,
         )
         .expect("count b*/*");
@@ -2822,7 +2849,7 @@ mod tests {
             &[pattern],
             false,
             false,
-            None,
+            &ExcludeSet::default(),
             &tokio_util::sync::CancellationToken::new(),
         )
         .expect("count_paths")

@@ -91,7 +91,7 @@ head` works). Ask for a total with `--count`, narrow with `--type` or
 | `[PATH]...` | File or directory path(s) to scope the search (quoted globs allowed) |
 | `--glob <pat>` / `-g` | Include only files matching this glob (repeatable; `!pat` excludes) |
 | `--type <ty>` / `-t` | Include only files of this ripgrep type, e.g. `rust`, `md` (repeatable) |
-| `--exclude-pattern <pat>` | Glob pattern to exclude from matches |
+| `--exclude-pattern <pat>` | Glob pattern to exclude from matches (repeatable; a path is dropped when any matches) |
 | `--ignore-case` / `-i` | Case-insensitive matching (overrides smart-case) |
 | `--case-sensitive` / `-s` | Case-sensitive matching (overrides smart-case) |
 | `--word-regexp` / `-w` | Match whole words only |
@@ -151,7 +151,7 @@ freely — and `--count` answers "how many" without the listing.
 | Flag | Description |
 |------|-------------|
 | `[PATH]...` | File, directory, or quoted glob pattern(s) — absolute or cwd-relative, anchor in the pattern |
-| `--exclude-pattern <pat>` | Glob pattern to exclude from results |
+| `--exclude-pattern <pat>` | Glob pattern to exclude from results (repeatable; a path is dropped when any matches) |
 | `--count` | Report the path count instead of results |
 | `--include-gitignored` | Include files ignored by .gitignore |
 | `--include-hidden` | Include hidden files and directories |

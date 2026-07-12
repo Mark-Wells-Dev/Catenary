@@ -117,9 +117,18 @@ pub struct GrepRequest {
     /// are used as direct search roots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<PathBuf>,
-    /// Glob pattern to exclude from matches.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exclude: Option<String>,
+    /// Glob patterns to exclude from matches (repeatable `--exclude-pattern`).
+    ///
+    /// Empty for a query with no exclusion. Each pattern is resolved against
+    /// `cwd` in [`Self::to_params`] and matched as a union daemon-side. Accepts
+    /// a lone string or an array on the wire (a single-pattern spelling still
+    /// works).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_string_or_seq"
+    )]
+    pub exclude: Vec<String>,
     /// Include files ignored by `.gitignore`.
     #[serde(default)]
     pub include_gitignored: bool,
@@ -195,12 +204,23 @@ impl GrepRequest {
                     .collect(),
             );
         }
-        if let Some(ref exclude) = self.exclude {
-            let resolved = self
-                .cwd
-                .as_ref()
-                .map_or_else(|| exclude.clone(), |cwd| resolve_relative(exclude, cwd));
-            params["exclude"] = serde_json::Value::String(resolved);
+        if !self.exclude.is_empty() {
+            // `--exclude-pattern` is repeatable (bug 89): resolve each pattern
+            // against `cwd` independently and pass the whole set so every
+            // collected pattern reaches the daemon-side matcher (the bug-73
+            // leak class — no pattern silently dropped).
+            params["exclude"] = serde_json::Value::Array(
+                self.exclude
+                    .iter()
+                    .map(|exclude| {
+                        let resolved = self
+                            .cwd
+                            .as_ref()
+                            .map_or_else(|| exclude.clone(), |cwd| resolve_relative(exclude, cwd));
+                        serde_json::Value::String(resolved)
+                    })
+                    .collect(),
+            );
         }
         params["include_hidden"] = serde_json::Value::Bool(include_hidden);
 
@@ -300,9 +320,18 @@ pub struct GlobRequest {
     /// appropriate handler (file outline, directory listing).
     #[serde(default)]
     pub paths: Vec<PathBuf>,
-    /// Glob pattern to exclude from results.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exclude: Option<String>,
+    /// Glob patterns to exclude from results (repeatable `--exclude-pattern`).
+    ///
+    /// Empty for a query with no exclusion. Each pattern is resolved in
+    /// [`Self::to_params`] (basename → `**/<name>`, slash-bearing → `cwd`) and
+    /// matched as a union daemon-side. Accepts a lone string or an array on the
+    /// wire (a single-pattern spelling still works).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_string_or_seq"
+    )]
+    pub exclude: Vec<String>,
     /// Include files ignored by `.gitignore`.
     #[serde(default)]
     pub include_gitignored: bool,
@@ -370,18 +399,60 @@ impl GlobRequest {
                 .collect(),
         );
 
-        if let Some(ref exclude) = self.exclude {
-            let effective = if exclude.contains('/') {
-                self.cwd
-                    .as_ref()
-                    .map_or_else(|| exclude.clone(), |cwd| resolve_relative(exclude, cwd))
-            } else {
-                format!("**/{exclude}")
-            };
-            params["exclude"] = serde_json::Value::String(effective);
+        if !self.exclude.is_empty() {
+            // `--exclude-pattern` is repeatable (bug 89): resolve each pattern
+            // independently — a basename (no `/`) becomes a depth-independent
+            // `**/<name>`, a slash-bearing pattern resolves against `cwd` — and
+            // pass the whole set so every collected pattern reaches the
+            // daemon-side matcher (the bug-73 leak class — no pattern silently
+            // dropped by expansion, the named-dir walk, or `--count`).
+            params["exclude"] = serde_json::Value::Array(
+                self.exclude
+                    .iter()
+                    .map(|exclude| {
+                        let effective = if exclude.contains('/') {
+                            self.cwd.as_ref().map_or_else(
+                                || exclude.clone(),
+                                |cwd| resolve_relative(exclude, cwd),
+                            )
+                        } else {
+                            format!("**/{exclude}")
+                        };
+                        serde_json::Value::String(effective)
+                    })
+                    .collect(),
+            );
         }
         params
     }
+}
+
+/// Deserializes an `exclude` field from either a single string or an array of
+/// strings.
+///
+/// `--exclude-pattern` is repeatable (bug 89), so the CLI always sends the
+/// exclude set as a JSON array. Accepting a lone string too keeps the wire
+/// tolerant of a single-pattern spelling (`"exclude": "tests/**"`), so a caller
+/// that sends one pattern the obvious way is understood rather than rejected —
+/// a scalar folds into a one-element set. A missing field yields an empty set
+/// (excludes nothing).
+fn deserialize_string_or_seq<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrSeq {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(match StringOrSeq::deserialize(deserializer)? {
+        StringOrSeq::One(s) => vec![s],
+        StringOrSeq::Many(v) => v,
+    })
 }
 
 /// IPC response for `catenary glob`.
@@ -12889,7 +12960,7 @@ mod tests {
             cwd: Some(PathBuf::from("/home/user/project")),
             pattern: "TODO|FIXME".to_string(),
             paths: vec![PathBuf::from("src/main.rs"), PathBuf::from("src/lib.rs")],
-            exclude: Some("tests/**".to_string()),
+            exclude: vec!["tests/**".to_string(), "vendor/**".to_string()],
             include_gitignored: true,
             include_hidden: false,
             count: false,
@@ -12904,7 +12975,11 @@ mod tests {
             parsed.paths,
             vec![PathBuf::from("src/main.rs"), PathBuf::from("src/lib.rs")]
         );
-        assert_eq!(parsed.exclude.as_deref(), Some("tests/**"));
+        // A repeated `--exclude-pattern` roundtrips as a full set (bug 89).
+        assert_eq!(
+            parsed.exclude,
+            vec!["tests/**".to_string(), "vendor/**".to_string()]
+        );
         assert!(parsed.include_gitignored);
         assert!(!parsed.include_hidden);
     }
@@ -12916,7 +12991,7 @@ mod tests {
         let req: GrepRequest = serde_json::from_str(json).expect("deserialize");
         assert_eq!(req.cwd, Some(PathBuf::from("/tmp")));
         assert_eq!(req.pattern, "foo");
-        assert!(req.exclude.is_none());
+        assert!(req.exclude.is_empty());
         assert!(!req.include_gitignored);
         assert!(!req.include_hidden);
     }
@@ -12928,7 +13003,7 @@ mod tests {
             cwd: Some(PathBuf::from("/tmp")),
             pattern: "foo".to_string(),
             paths: vec![],
-            exclude: None,
+            exclude: vec![],
             include_gitignored: false,
             include_hidden: false,
             count: false,
@@ -12937,7 +13012,7 @@ mod tests {
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(!json.contains("paths"), "empty paths should be skipped");
-        assert!(!json.contains("exclude"), "None exclude should be skipped");
+        assert!(!json.contains("exclude"), "empty exclude should be skipped");
         // Default ripgrep-parity flags are skipped too — a flagless query
         // serializes exactly as before this surface existed.
         assert!(
@@ -13058,7 +13133,7 @@ mod tests {
         let req = GlobRequest {
             cwd: Some(PathBuf::from("/workspace")),
             paths: vec![PathBuf::from("src/"), PathBuf::from("tests/")],
-            exclude: Some("target/**".to_string()),
+            exclude: vec!["target/**".to_string(), "vendor/**".to_string()],
             include_gitignored: false,
             include_hidden: true,
             count: false,
@@ -13070,7 +13145,11 @@ mod tests {
             parsed.paths,
             vec![PathBuf::from("src/"), PathBuf::from("tests/")]
         );
-        assert_eq!(parsed.exclude.as_deref(), Some("target/**"));
+        // A repeated `--exclude-pattern` roundtrips as a full set (bug 89).
+        assert_eq!(
+            parsed.exclude,
+            vec!["target/**".to_string(), "vendor/**".to_string()]
+        );
         assert!(!parsed.include_gitignored);
         assert!(parsed.include_hidden);
     }
@@ -13082,7 +13161,7 @@ mod tests {
         let req: GlobRequest = serde_json::from_str(json).expect("deserialize");
         assert_eq!(req.cwd, Some(PathBuf::from("/home")));
         assert_eq!(req.paths, vec![PathBuf::from("src/")]);
-        assert!(req.exclude.is_none());
+        assert!(req.exclude.is_empty());
         assert!(!req.include_gitignored);
         assert!(!req.include_hidden);
     }
@@ -13107,6 +13186,79 @@ mod tests {
     fn method_constants() {
         assert_eq!(METHOD_GREP, "tool/grep");
         assert_eq!(METHOD_GLOB, "tool/glob");
+    }
+
+    // ── repeatable --exclude-pattern to_params (bug 89) ──────────
+
+    /// `GrepRequest::to_params` resolves EVERY collected exclude against `cwd`
+    /// and emits them all as an array — no collected pattern silently dropped
+    /// (bug 89, the bug-73 leak class at the router seam).
+    #[test]
+    fn grep_to_params_resolves_every_exclude() {
+        let req = GrepRequest {
+            cwd: Some(PathBuf::from("/proj")),
+            pattern: "x".to_string(),
+            paths: vec![],
+            exclude: vec!["tests/**".to_string(), "/abs/vendor/**".to_string()],
+            include_gitignored: false,
+            include_hidden: false,
+            count: false,
+            chunked: false,
+            flags: GrepFlags::default(),
+        };
+        let params = req.to_params();
+        let excludes = params["exclude"].as_array().expect("exclude is an array");
+        // Relative resolved against cwd; absolute passed through unchanged.
+        assert_eq!(
+            excludes,
+            &vec![
+                serde_json::Value::String("/proj/tests/**".to_string()),
+                serde_json::Value::String("/abs/vendor/**".to_string()),
+            ]
+        );
+    }
+
+    /// `GlobRequest::to_params` resolves EVERY collected exclude with the
+    /// per-pattern rule (basename → `**/<name>`, slash-bearing → `cwd`) and
+    /// emits them all — both spellings reach the array (bug 89).
+    #[test]
+    fn glob_to_params_resolves_every_exclude() {
+        let req = GlobRequest {
+            cwd: Some(PathBuf::from("/proj")),
+            paths: vec![PathBuf::from("src/")],
+            exclude: vec!["target".to_string(), "docs/**".to_string()],
+            include_gitignored: false,
+            include_hidden: false,
+            count: false,
+        };
+        let params = req.to_params();
+        let excludes = params["exclude"].as_array().expect("exclude is an array");
+        // Basename gets the depth-independent `**/` prefix; slash-bearing
+        // resolves against cwd.
+        assert_eq!(
+            excludes,
+            &vec![
+                serde_json::Value::String("**/target".to_string()),
+                serde_json::Value::String("/proj/docs/**".to_string()),
+            ]
+        );
+    }
+
+    /// The wire accepts a lone `exclude` string, folding it into a one-element
+    /// set — a single-pattern spelling still works (bug 89).
+    #[test]
+    fn grep_request_accepts_scalar_exclude() {
+        let json = r#"{"cwd":"/tmp","pattern":"foo","exclude":"tests/**"}"#;
+        let req: GrepRequest = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(req.exclude, vec!["tests/**".to_string()]);
+    }
+
+    /// The wire also accepts an `exclude` array (the repeatable form).
+    #[test]
+    fn glob_request_accepts_array_exclude() {
+        let json = r#"{"cwd":"/tmp","paths":["src/"],"exclude":["a/**","b/**"]}"#;
+        let req: GlobRequest = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(req.exclude, vec!["a/**".to_string(), "b/**".to_string()]);
     }
 
     // ── resolve_relative tests ──────────────────────────────────

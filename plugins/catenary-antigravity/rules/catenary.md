@@ -52,7 +52,7 @@ Flag synopses (long forms)
     --type TYPE — restrict to a ripgrep file type (e.g. rust, md)
     full: catenary grep --help
   catenary glob [PATH…]
-    --exclude-pattern GLOB — drop paths matching GLOB
+    --exclude-pattern GLOB — drop paths matching GLOB (repeatable)
     --count — report the path tally instead of the paths
     --include-gitignored — include files .gitignore hides
     --include-hidden — include hidden files and directories
