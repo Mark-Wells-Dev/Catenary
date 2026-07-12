@@ -1035,3 +1035,62 @@ fn test_grep_searches_large_utf8_file_uncapped() -> Result<()> {
     drop(bridge);
     Ok(())
 }
+
+// ── non-TTY stdout delivers full output (bugs/15) ─────────────────
+
+/// Regression guard for `bugs/15`: a `catenary` command whose stdout is a
+/// **pipe** (non-TTY — the harness-backgrounded capture case) must deliver its
+/// full output, not an empty capture. The command's `Output` writer wraps
+/// `io::stdout()` (a `LineWriter`), and every line it emits ends in `\n`, so the
+/// bytes reach the pipe on the normal (non-`process::exit`) return path — no
+/// exit-time flush is required. This test pins that contract at the process
+/// boundary so a future change (e.g. wrapping `Output` in an unflushed
+/// `BufWriter`) that would drop the tail is caught.
+///
+/// `catenary version` is chosen deliberately: it is hermetic (no live daemon
+/// needed) and, under `isolate_env`, no socket exists so the daemon probe
+/// resolves to `NotRunning`, giving a deterministic two-line receipt on stdout.
+#[test]
+fn test_version_piped_stdout_delivers_full_output() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+    // stdout as a pipe (not a TTY) — the exact capture geometry a backgrounding
+    // harness uses.
+    cmd.arg("version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = cmd.output().context("failed to run catenary version")?;
+    assert!(
+        output.status.success(),
+        "catenary version must exit 0, got {:?}; stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The capture is non-empty — the reported symptom (empty output file) must
+    // not recur.
+    assert!(
+        !stdout.trim().is_empty(),
+        "piped (non-TTY) stdout must carry the version receipt, not an empty capture"
+    );
+    // The full receipt lands: the CLI version line first, then the daemon line.
+    // No daemon is reachable under `isolate_env`, so the second line is the
+    // not-running verdict — the whole receipt, both lines, must arrive.
+    let mut lines = stdout.lines();
+    let cli_line = lines.next().unwrap_or_default();
+    assert!(
+        cli_line.starts_with("catenary "),
+        "first line is the CLI version, got:\n{stdout}"
+    );
+    assert_eq!(
+        lines.next().unwrap_or_default(),
+        "daemon: not running",
+        "the daemon line lands too (no daemon under isolate_env), got:\n{stdout}"
+    );
+
+    Ok(())
+}
