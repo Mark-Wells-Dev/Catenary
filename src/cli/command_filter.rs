@@ -678,9 +678,10 @@ enum Sub {
     /// fires upstream). Bare-only lifecycle: it mutates the on-disk worktree
     /// set and must run as the sole command.
     WorktreeRm,
-    /// `catenary worktree diff` — the complete worktree-vs-HEAD diff (misc 158).
-    /// Search-class: no handoff, complete client-owned output (a `git apply`
-    /// patch), so it chains and pipes like `grep`/`glob`.
+    /// `catenary worktree diff` — the complete worktree-vs-branch-point diff
+    /// (misc 158/166: commit-aware — committed work included). Search-class: no
+    /// handoff, complete client-owned output (a `git apply` patch), so it chains
+    /// and pipes like `grep`/`glob`.
     WorktreeDiff,
     /// `catenary worktree land` — apply a worktree's diff into its owning repo
     /// (misc 158). Bare-only lifecycle: it writes to the owning repo (its

@@ -457,10 +457,17 @@ enum WorktreeCommand {
         path: Option<PathBuf>,
     },
     /// Remove a worktree — class-appropriate (agent asserts captured work; feats
-    /// refuses dirty).
+    /// refuses dirty). `--force` discards a dirty worktree through the proper
+    /// disposal path (retire the root, sweep the sidecar) — the explicit
+    /// exception to the never-auto-clean rule; it names the dirty files it drops.
     Rm {
         /// Path of the worktree to remove.
         path: PathBuf,
+        /// Discard a dirty worktree (uncommitted, untracked, or unpushed work).
+        /// Names the dropped files. Use only when the work is superseded or
+        /// abandoned — dirty worktrees are never auto-cleaned.
+        #[arg(long)]
+        force: bool,
     },
     /// Print a worktree's complete diff vs HEAD (tracked changes plus untracked
     /// files as new-file hunks; a valid `git apply` patch).
@@ -955,8 +962,8 @@ fn main() -> Result<()> {
                 WorktreeCommand::Add { branch, path } => {
                     cli::worktree::run_add(&mut out, &branch, path.as_deref())
                 }
-                WorktreeCommand::Rm { path } => {
-                    build_runtime()?.block_on(cli::worktree::run_rm(&mut out, path))
+                WorktreeCommand::Rm { path, force } => {
+                    build_runtime()?.block_on(cli::worktree::run_rm(&mut out, path, force))
                 }
                 WorktreeCommand::Diff { path, name_only } => {
                     cli::worktree::run_diff(&mut out, &path, name_only)

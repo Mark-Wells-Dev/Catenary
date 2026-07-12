@@ -55,6 +55,17 @@ fn spawn_daemon(repo: &Path) -> BridgeProcess {
     .expect("spawn daemon")
 }
 
+/// The current `HEAD` oid of `dir` (`git rev-parse HEAD`).
+fn git_head(dir: &Path) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("rev-parse HEAD");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 /// Initializes a git repo with one commit at `dir`.
 fn init_repo(dir: &Path) {
     std::fs::create_dir_all(dir).expect("mkdir repo");
@@ -271,7 +282,11 @@ fn land_keep_lands_without_removing() {
 }
 
 #[test]
-fn land_local_commit_refuses_with_teaching() {
+fn committed_worktree_diffs_and_lands_without_committing_in_the_parent() {
+    // Commit-aware diff/land (misc 166): a worktree that COMMITTED its work must
+    // still diff to its real delta (not an empty vs-HEAD patch) and land that work
+    // into the owning repo — as an uncommitted change; land never commits in the
+    // parent.
     let repo_dir = tempfile::tempdir().expect("repo dir");
     let repo = repo_dir.path().join("repo");
     init_repo(&repo);
@@ -280,24 +295,51 @@ fn land_local_commit_refuses_with_teaching() {
     let state_home = bridge.state_home().to_string();
     let worktree = create_worktree(&state_home, &repo);
 
-    // A local commit in the worktree beyond its recorded base.
+    let owner_head_before = git_head(&repo);
+
+    // The worker commits its work in the worktree (against the intended flow, but
+    // exactly the case misc 166 makes recoverable).
     std::fs::write(worktree.join("committed.txt"), "c\n").expect("write");
+    std::fs::write(worktree.join("README.md"), "hello committed\n").expect("modify tracked");
     run_git(&worktree, &["config", "user.email", "t@example.com"]);
     run_git(&worktree, &["config", "user.name", "Test"]);
-    run_git(&worktree, &["add", "committed.txt"]);
+    run_git(&worktree, &["add", "-A"]);
     run_git(&worktree, &["commit", "-q", "-m", "worker local commit"]);
 
+    // The commit-aware diff shows the committed work (a vs-HEAD diff would be
+    // empty — the pre-166 blindness).
+    let diff = run_diff(&state_home, &worktree, false);
+    assert!(
+        diff.contains("committed.txt") && diff.contains("new file mode"),
+        "the committed new file is visible in the diff:\n{diff}"
+    );
+    assert!(
+        diff.contains("README.md"),
+        "the committed tracked change is visible in the diff:\n{diff}"
+    );
+
+    // Land applies the committed work into the owning repo.
     let resp = land(&bridge, &worktree, false);
-    assert_eq!(resp["status"], "refused", "land response: {resp}");
-    let msg = resp["message"].as_str().unwrap_or("");
-    assert!(
-        msg.contains("local") && msg.contains("commit"),
-        "the refusal teaches about local commits: {msg}"
+    assert_eq!(resp["status"], "ok", "land response: {resp}");
+    assert_eq!(resp["removed"], true, "worktree removed on success");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("committed.txt")).expect("read"),
+        "c\n",
+        "the committed new file landed in the owning repo",
     );
-    assert!(
-        worktree.exists(),
-        "the worktree is kept on a local-commit refusal"
+    assert_eq!(
+        std::fs::read_to_string(repo.join("README.md")).expect("read"),
+        "hello committed\n",
+        "the committed tracked change landed in the owning repo",
     );
+    // Land never commits in the parent — the owning repo's HEAD is unchanged and
+    // the landed work is an uncommitted working-tree change.
+    assert_eq!(
+        git_head(&repo),
+        owner_head_before,
+        "land must not create a commit in the owning repo",
+    );
+    assert!(!worktree.exists(), "the worktree is removed on success");
 }
 
 #[test]

@@ -3493,12 +3493,18 @@ fn worktree_ls_row(
     row
 }
 
-/// Handle a `tool/worktree-rm` request (misc 151): load the sidecar, reap any
+/// Handle a `tool/worktree-rm` request (misc 151/166): load the sidecar, reap any
 /// live mount, and dispose class-appropriately, returning the CLI response.
 ///
 /// An agent worktree removes on the caller's captured-work assertion (the
 /// force-shaped landing path — firehose-logged); a feats worktree refuses dirty
-/// (uncommitted or unpushed). A path with no sidecar is never ours to touch.
+/// (uncommitted or unpushed). `--force` (misc 166) is the explicit, user-typed
+/// exception to the never-auto-clean rule: it routes *any* class through the
+/// force-shaped disposal path ([`crate::worktree_dispose::remove_agent_asserted`])
+/// — the same one that retires the root and sweeps the sidecar — so a superseded
+/// dirty worktree is discarded properly instead of via a raw-git dance. The
+/// response then names the discarded work (the dirty summary). A path with no
+/// sidecar is never ours to touch.
 #[cfg(unix)]
 async fn handle_worktree_rm(
     ctx: &HookDispatchContext,
@@ -3507,6 +3513,10 @@ async fn handle_worktree_rm(
     let Some(raw_path) = raw.get("path").and_then(|v| v.as_str()) else {
         return serde_json::json!({ "status": "error", "message": "missing path" });
     };
+    let force = raw
+        .get("force")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let worktree = Path::new(raw_path)
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from(raw_path));
@@ -3521,7 +3531,33 @@ async fn handle_worktree_rm(
         });
     };
 
-    let disposition = if meta.class == crate::worktree_create::WORKTREE_CLASS_FEAT {
+    // Capture the dirty summary BEFORE removal so the response can name what a
+    // forced discard drops — the directory is gone once disposal succeeds.
+    let discarded = force
+        .then(|| crate::worktree_dispose::dirty_summary(&meta))
+        .flatten();
+
+    let disposition = if force {
+        // The explicit, user-typed exception to the never-auto-clean rule: discard
+        // through the force-shaped disposal path regardless of class or dirty state
+        // — it retires the root and sweeps the sidecar, so no raw-git dance leaves
+        // the registry inconsistent. Firehose-logged as the deliberate exception.
+        if let Some(summary) = &discarded {
+            info!(
+                source = Source::DaemonDispatch.as_str(),
+                worktree = %worktree.display(),
+                discarded = %summary,
+                "worktree rm --force: discarding a dirty worktree on the caller's explicit assertion",
+            );
+        } else {
+            info!(
+                source = Source::DaemonDispatch.as_str(),
+                worktree = %worktree.display(),
+                "worktree rm --force: removing a clean worktree",
+            );
+        }
+        crate::worktree_dispose::remove_agent_asserted(&meta)
+    } else if meta.class == crate::worktree_create::WORKTREE_CLASS_FEAT {
         crate::worktree_dispose::remove_feat(&meta)
     } else {
         // The captured-work assertion is the deliberate force-shaped path — record
@@ -3546,15 +3582,19 @@ async fn handle_worktree_rm(
         retire_root(ctx, tracker, &worktree).await;
     }
 
-    worktree_rm_response(&disposition, &worktree)
+    worktree_rm_response(&disposition, &worktree, discarded.as_deref())
 }
 
 /// Map a disposal [`Disposition`](crate::worktree_dispose::Disposition) to the
 /// `catenary worktree rm` CLI response.
+///
+/// `discarded` is `Some(summary)` only for a forced discard of a dirty worktree
+/// (misc 166) — it rides back so the CLI can name what was dropped.
 #[cfg(unix)]
 fn worktree_rm_response(
     disposition: &crate::worktree_dispose::Disposition,
     worktree: &Path,
+    discarded: Option<&str>,
 ) -> serde_json::Value {
     use crate::worktree_dispose::Disposition;
     match disposition {
@@ -3562,6 +3602,7 @@ fn worktree_rm_response(
             "status": "ok",
             "removed": true,
             "path": worktree.display().to_string(),
+            "discarded": discarded,
         }),
         Disposition::KeptDirty { reason } => serde_json::json!({
             "status": "kept",

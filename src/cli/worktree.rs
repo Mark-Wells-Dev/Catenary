@@ -124,14 +124,21 @@ pub fn run_add(out: &mut Output, branch: &str, path: Option<&Path>) -> Result<()
     Ok(())
 }
 
-/// `catenary worktree rm <path>` — remove a worktree (class-appropriate).
+/// `catenary worktree rm <path> [--force]` — remove a worktree
+/// (class-appropriate).
+///
+/// Without `--force`, a dirty worktree is refused exactly as before (dirty
+/// worktrees are never auto-cleaned). `--force` is the explicit, user-typed
+/// exception: it discards a dirty worktree through the proper disposal path
+/// (retire the root, sweep the sidecar) and the output names what was
+/// discarded — the dirty-file summary the daemon returns.
 ///
 /// # Errors
 ///
 /// Returns an error if no daemon is running or the response is invalid. A refusal
 /// (dirty feats worktree, git refusal, non-Catenary path) is printed, not an
 /// error — the caller still exits successfully.
-pub async fn run_rm(out: &mut Output, path: PathBuf) -> Result<()> {
+pub async fn run_rm(out: &mut Output, path: PathBuf, force: bool) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     // Absolutize before sending: the daemon's cwd differs from ours, so a
@@ -151,6 +158,7 @@ pub async fn run_rm(out: &mut Output, path: PathBuf) -> Result<()> {
     let request = serde_json::json!({
         "method": "tool/worktree-rm",
         "path": abs.display().to_string(),
+        "force": force,
     });
     let mut payload = serde_json::to_string(&request)?;
     payload.push('\n');
@@ -169,7 +177,16 @@ pub async fn run_rm(out: &mut Output, path: PathBuf) -> Result<()> {
 
     match status {
         "ok" => {
-            let _ = out.writeln(format_args!("removed worktree: {}", abs.display()));
+            // A forced discard names what it dropped (the dirty summary); a clean
+            // removal just confirms the path.
+            if let Some(discarded) = response.get("discarded").and_then(|v| v.as_str()) {
+                let _ = out.writeln(format_args!(
+                    "discarded dirty worktree ({discarded}): {}",
+                    abs.display()
+                ));
+            } else {
+                let _ = out.writeln(format_args!("removed worktree: {}", abs.display()));
+            }
         }
         "kept" | "refused" | "not_ours" | "error" => {
             let msg = response

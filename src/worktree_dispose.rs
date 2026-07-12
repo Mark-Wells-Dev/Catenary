@@ -659,6 +659,51 @@ pub fn worktree_status_dirty(worktree: &Path) -> bool {
     !matches!(git(worktree, &["status", "--porcelain"]), Some((true, s, _)) if s.is_empty())
 }
 
+/// A human summary of what a **dirty** worktree would lose on a forced discard,
+/// or `None` when the worktree is provably clean (misc 166).
+///
+/// Names the count of uncommitted/untracked working-tree entries (`git status
+/// --porcelain` lines) and, for a git worktree, the count of local commits beyond
+/// the recorded base — the concrete work `catenary worktree rm --force` drops, so
+/// the CLI can name it before it is gone. Best-effort: a git failure still
+/// summarizes as "dirty" rather than claiming clean, since `--force` proceeds
+/// regardless. Non-git (svn/hg) copies summarize on working-copy status alone
+/// (they carry no local-commit class the way git does).
+#[must_use]
+pub fn dirty_summary(meta: &WorktreeMeta) -> Option<String> {
+    if is_disposable_clean(meta) {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let changed = match git(&meta.worktree, &["status", "--porcelain"]) {
+        Some((true, out, _)) => out.lines().filter(|l| !l.trim().is_empty()).count(),
+        _ => 0,
+    };
+    if changed > 0 {
+        let noun = if changed == 1 { "file" } else { "files" };
+        parts.push(format!("{changed} uncommitted {noun}"));
+    }
+    if !is_nongit(vcs_of(meta)) {
+        let base = meta.base_commit.trim();
+        if !base.is_empty() {
+            let range = format!("{base}..HEAD");
+            if let Some((true, out, _)) = git(&meta.worktree, &["rev-list", "--count", &range]) {
+                let commits: u64 = out.trim().parse().unwrap_or(0);
+                if commits > 0 {
+                    let noun = if commits == 1 { "commit" } else { "commits" };
+                    parts.push(format!("{commits} local {noun}"));
+                }
+            }
+        }
+    }
+    // A dirty worktree we could not itemize (a git failure) still names *that* it
+    // is dirty rather than silently claiming no loss.
+    if parts.is_empty() {
+        return Some("uncommitted work".to_string());
+    }
+    Some(parts.join(", "))
+}
+
 /// The ahead/behind counts of a feats worktree relative to its upstream.
 ///
 /// Runs `rev-list --left-right --count @{u}...HEAD` → `(behind, ahead)`, or
@@ -1059,6 +1104,41 @@ mod tests {
         assert_eq!(d, Disposition::Disposed, "asserted rm force-removes: {d:?}");
         assert!(!worktree.exists());
         assert!(!sidecar_path(&worktree).exists());
+    }
+
+    #[test]
+    fn dirty_summary_is_none_for_a_clean_worktree() {
+        let (_tmp, _root, _repo, _worktree, meta) = fixture("clean-sum", WORKTREE_CLASS_AGENT);
+        assert_eq!(
+            dirty_summary(&meta),
+            None,
+            "a provably-clean worktree drops nothing",
+        );
+    }
+
+    #[test]
+    fn dirty_summary_counts_uncommitted_files() {
+        let (_tmp, _root, _repo, worktree, meta) = fixture("dirty-sum", WORKTREE_CLASS_AGENT);
+        std::fs::write(worktree.join("a.txt"), "x").expect("write a");
+        std::fs::write(worktree.join("b.txt"), "y").expect("write b");
+        let summary = dirty_summary(&meta).expect("dirty summary");
+        assert!(
+            summary.contains("2 uncommitted files"),
+            "names the two uncommitted files: {summary}",
+        );
+    }
+
+    #[test]
+    fn dirty_summary_counts_local_commits() {
+        let (_tmp, _root, _repo, worktree, meta) = fixture("commit-sum", WORKTREE_CLASS_AGENT);
+        std::fs::write(worktree.join("c.txt"), "z").expect("write c");
+        tgit(&worktree, &["add", "c.txt"]);
+        tgit(&worktree, &["commit", "-qm", "local"]);
+        let summary = dirty_summary(&meta).expect("dirty summary");
+        assert!(
+            summary.contains("1 local commit"),
+            "names the local commit: {summary}",
+        );
     }
 
     #[test]

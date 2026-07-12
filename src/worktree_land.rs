@@ -9,18 +9,24 @@
 //! invisible to `git diff` until `git add -N`; write-capable git denied through
 //! `-C` but allowed after `cd`).
 //!
-//! ## `worktree diff` — complete by construction
+//! ## `worktree diff` — complete by construction, commit-aware
 //!
-//! [`worktree_diff`] emits a COMPLETE unified diff of the worktree's state vs
-//! `HEAD`: tracked changes **plus** untracked files rendered as new-file hunks
-//! (the `git add -N` trap absorbed into the verb). The synthesis uses a
-//! **temporary index** (`GIT_INDEX_FILE` pointed at a scratch file): `read-tree
-//! HEAD` loads the base tree, `add -A` stages every change — tracked
-//! modification and untracked non-ignored file alike, gitignore-honest by
-//! construction — and `diff --cached` renders the lot. The worktree's real index
-//! is never touched. The output is a valid unified diff a `git apply` consumes.
-//! [`worktree_changed_paths`] is the same set as a path list — the write-set
-//! resolution primitive `land` and the hook need.
+//! [`worktree_diff`] emits a COMPLETE unified diff of the worktree's state vs its
+//! **branch point** — the merge-base of the recorded creation base and the
+//! worktree's current `HEAD` ([`diff_base`], misc 166): tracked changes **plus**
+//! untracked files rendered as new-file hunks (the `git add -N` trap absorbed
+//! into the verb), and — the misc-166 leg — **committed** work too. The synthesis
+//! uses a **temporary index** (`GIT_INDEX_FILE` pointed at a scratch file):
+//! `read-tree <base>` loads the branch-point tree, `add -A` stages every change
+//! against it — tracked modification, untracked non-ignored file, and anything a
+//! local commit already wrote into the working tree alike, gitignore-honest by
+//! construction — and `diff --cached <base>` renders the lot. Anchoring on the
+//! merge-base rather than `HEAD` is what makes a worktree that committed its work
+//! diff to its real delta instead of an empty patch (the pre-166 vs-`HEAD` diff
+//! read as "no changes"). The worktree's real index is never touched. The output
+//! is a valid unified diff a `git apply` consumes. [`worktree_changed_paths`] is
+//! the same set as a path list — the write-set resolution primitive `land` and
+//! the hook need.
 //!
 //! ## `worktree land` — apply into the owning repo, then remove
 //!
@@ -29,8 +35,11 @@
 //! commits**. The atomicity guard is a plain `git apply --check` first (see
 //! `apply_check` for why the check must not carry `--3way`): a refusal leaves
 //! the owning repo untouched, and [`land`] returns a [`LandOutcome`] naming the
-//! actual cause — the conflicting file paths on an apply refusal, the local
-//! commits on a committed-work refusal, the vcs on a non-git worktree.
+//! actual cause — the conflicting file paths on an apply refusal, the vcs on a
+//! non-git worktree. Because the diff is now anchored on the branch point
+//! ([`diff_base`], misc 166), a worktree that **committed** its work lands that
+//! work as an ordinary patch — no separate committed-work refusal, and no commit
+//! ever made in the parent (`git apply` writes the working tree only).
 //!
 //! On full success the worktree is removed through the existing disposal
 //! machinery ([`crate::worktree_dispose::remove_agent_asserted`]); the caller's
@@ -88,6 +97,49 @@ fn git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Option<(bool, String,
     Some((output.status.success(), stdout, stderr))
 }
 
+/// The commit the diff/land is anchored on — the **branch point** of the
+/// worktree, so committed work is visible and landable (misc 166).
+///
+/// This is `git merge-base <recorded-base> HEAD`: the common ancestor of the
+/// worktree's current `HEAD` and the commit the worktree branch was cut from
+/// (recorded in the sidecar's `base_commit` at creation). When the worktree
+/// never committed, `HEAD` is still at the recorded base and the merge-base *is*
+/// that commit, so the diff is identical to the pre-166 vs-`HEAD` diff. When the
+/// worktree committed, the merge-base stays at the branch point and the diff
+/// spans the committed work too — the whole point of the leg.
+///
+/// Falls back to the literal ref `HEAD` when no branch point can be resolved: the
+/// worktree carries no sidecar (a bare path, not a registered worktree), the
+/// sidecar records no base (`git rev-parse HEAD` failed at creation), or the
+/// merge-base query itself fails. That fallback is exactly the pre-166 behavior —
+/// a worktree with no recorded branch point can only be diffed against its own
+/// `HEAD`, and a committed one still trips the disposal moved-HEAD guard rather
+/// than silently dropping work.
+fn diff_base(worktree: &Path) -> String {
+    let recorded = read_sidecar(worktree)
+        .map(|m| m.base_commit)
+        .filter(|b| !b.trim().is_empty());
+    let Some(base) = recorded else {
+        return "HEAD".to_string();
+    };
+    match git(worktree, None, &["merge-base", &base, "HEAD"]) {
+        Some((true, out, _)) if !out.trim().is_empty() => out.trim().to_string(),
+        // The recorded base is unreachable from HEAD (history rewritten, or HEAD
+        // detached below it) — fall back to the recorded base itself, still a
+        // committed-work-visible anchor.
+        _ => base,
+    }
+}
+
+/// Read the worktree's sidecar [`WorktreeMeta`] — `Some` when it exists and
+/// parses, `None` for a bare (unregistered) path or a malformed sidecar.
+fn read_sidecar(worktree: &Path) -> Option<WorktreeMeta> {
+    let sidecar = crate::worktree_create::sidecar_path(worktree);
+    std::fs::read_to_string(sidecar)
+        .ok()
+        .and_then(|c| serde_json::from_str::<WorktreeMeta>(&c).ok())
+}
+
 /// A scratch temporary-index path unique to this call, deleted on drop.
 ///
 /// The temp index lives beside the worktree's sidecar area under the system temp
@@ -122,22 +174,27 @@ impl Drop for TempIndex {
 }
 
 /// Stage the worktree's full working-tree state (tracked changes + untracked
-/// non-ignored files) into a fresh temporary index seeded from `HEAD`.
+/// non-ignored files) into a fresh temporary index seeded from `base` (the
+/// branch point; misc 166).
 ///
-/// Returns the [`TempIndex`] on success so the caller can run `diff --cached`
-/// against it, or `None` when any staging step fails (not a git worktree, git
-/// missing, a corrupt HEAD). `add -A` respects gitignore, so ignored files never
-/// enter the index and never appear in the diff — they are not part of the work
-/// product.
-fn stage_into_temp_index(worktree: &Path) -> Option<TempIndex> {
+/// Returns the [`TempIndex`] on success so the caller can run
+/// `diff --cached <base>` against it, or `None` when any staging step fails (not a
+/// git worktree, git missing, an unresolvable base). Seeding from the branch point
+/// rather than `HEAD` is what carries committed work into the diff: `add -A`
+/// stages the whole working tree — which reflects committed and uncommitted
+/// changes alike — over the branch-point tree. `add -A` respects gitignore, so
+/// ignored files never enter the index and never appear in the diff — they are not
+/// part of the work product.
+fn stage_into_temp_index(worktree: &Path, base: &str) -> Option<TempIndex> {
     let index = TempIndex::new();
-    // Seed the temp index from HEAD's tree.
-    let (ok, _, _) = git(worktree, Some(&index.path), &["read-tree", "HEAD"])?;
+    // Seed the temp index from the branch point's tree.
+    let (ok, _, _) = git(worktree, Some(&index.path), &["read-tree", base])?;
     if !ok {
         return None;
     }
-    // Stage every change into the temp index: tracked modifications AND untracked
-    // (non-ignored) files. `-A` includes deletions; gitignore is honored.
+    // Stage every change into the temp index: committed AND uncommitted tracked
+    // modifications AND untracked (non-ignored) files. `-A` includes deletions;
+    // gitignore is honored.
     let (ok, _, _) = git(worktree, Some(&index.path), &["add", "-A"])?;
     if !ok {
         return None;
@@ -145,12 +202,15 @@ fn stage_into_temp_index(worktree: &Path) -> Option<TempIndex> {
     Some(index)
 }
 
-/// The COMPLETE unified diff of the worktree vs `HEAD` (misc 158).
+/// The COMPLETE unified diff of the worktree vs its **branch point** (misc
+/// 158/166).
 ///
 /// Tracked changes plus untracked non-ignored files rendered as new-file hunks,
-/// via the temporary-index synthesis (the worktree's real index is untouched).
-/// The output is a valid unified diff a `git apply` consumes; an empty string
-/// means the worktree matches `HEAD` (nothing to land).
+/// plus committed work — everything the worktree did since its branch point (the
+/// merge-base of the recorded creation base and `HEAD`; [`diff_base`]) — via the
+/// temporary-index synthesis (the worktree's real index is untouched). The output
+/// is a valid unified diff a `git apply` consumes; an empty string means the
+/// worktree matches its branch point (nothing to land).
 ///
 /// # Errors
 ///
@@ -164,14 +224,16 @@ pub fn worktree_diff(worktree: &Path) -> anyhow::Result<String> {
             worktree.display()
         );
     }
-    let index = stage_into_temp_index(worktree)
+    let base = diff_base(worktree);
+    let index = stage_into_temp_index(worktree, &base)
         .ok_or_else(|| anyhow::anyhow!("{} is not a git worktree", worktree.display()))?;
-    // `--cached HEAD` renders every staged delta; the temp index carries the full
-    // working-tree state, so untracked files appear as new-file hunks.
+    // `--cached <base>` renders every staged delta against the branch point; the
+    // temp index carries the full working-tree state, so untracked files appear as
+    // new-file hunks and committed work appears as ordinary hunks.
     let (ok, stdout, stderr) = git(
         worktree,
         Some(&index.path),
-        &["diff", "--cached", "--no-color", "HEAD"],
+        &["diff", "--cached", "--no-color", &base],
     )
     .ok_or_else(|| anyhow::anyhow!("could not run git in {}", worktree.display()))?;
     if !ok {
@@ -184,12 +246,15 @@ pub fn worktree_diff(worktree: &Path) -> anyhow::Result<String> {
     Ok(stdout)
 }
 
-/// The changed-path list of the worktree vs `HEAD` — the `--name-only` view
-/// (misc 158).
+/// The changed-path list of the worktree vs its **branch point** — the
+/// `--name-only` view (misc 158/166).
 ///
-/// Tracked-modified plus untracked non-ignored paths, one per entry, relative to
-/// the worktree root (git's native diff-path convention). This is the write-set
-/// resolution primitive `land` and the hook use.
+/// Tracked-modified plus untracked non-ignored paths plus committed-work paths,
+/// one per entry, relative to the worktree root (git's native diff-path
+/// convention), against the branch point ([`diff_base`]). This is the write-set
+/// resolution primitive `land` and the hook use — anchored on the same base as
+/// [`worktree_diff`], so the hook's resolved write-set and land's applied set stay
+/// identical whether or not the worktree committed.
 ///
 /// # Errors
 ///
@@ -201,12 +266,13 @@ pub fn worktree_changed_paths(worktree: &Path) -> anyhow::Result<Vec<String>> {
             worktree.display()
         );
     }
-    let index = stage_into_temp_index(worktree)
+    let base = diff_base(worktree);
+    let index = stage_into_temp_index(worktree, &base)
         .ok_or_else(|| anyhow::anyhow!("{} is not a git worktree", worktree.display()))?;
     let (ok, stdout, stderr) = git(
         worktree,
         Some(&index.path),
-        &["diff", "--cached", "--name-only", "HEAD"],
+        &["diff", "--cached", "--name-only", &base],
     )
     .ok_or_else(|| anyhow::anyhow!("could not run git in {}", worktree.display()))?;
     if !ok {
@@ -222,35 +288,6 @@ pub fn worktree_changed_paths(worktree: &Path) -> anyhow::Result<Vec<String>> {
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect())
-}
-
-/// The local commits a worktree carries beyond its recorded base commit, or an
-/// empty vec when `HEAD` is still at the base (misc 158).
-///
-/// Workers never commit — the committed-changes leg (merge-base diffing) is
-/// post-v2 — so a worktree whose `HEAD` moved off the recorded base is refused,
-/// naming the commits. Returns the short-oid + subject lines
-/// (`<oid> <subject>`). A git failure or an empty recorded base returns an empty
-/// vec (the local-commit guard is advisory; the apply guard backstops it).
-fn local_commits_beyond_base(meta: &WorktreeMeta) -> Vec<String> {
-    let base = meta.base_commit.trim();
-    if base.is_empty() {
-        return Vec::new();
-    }
-    let range = format!("{base}..HEAD");
-    match git(
-        &meta.worktree,
-        None,
-        &["log", "--oneline", "--no-decorate", &range],
-    ) {
-        Some((true, stdout, _)) => stdout
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect(),
-        _ => Vec::new(),
-    }
 }
 
 /// Whether the diff applies cleanly into the owning repo, or the conflicting
@@ -368,24 +405,25 @@ fn push_unique(paths: &mut Vec<String>, path: &str) {
     }
 }
 
-/// Land the worktree's complete diff into its owning repo (misc 158).
+/// Land the worktree's complete diff into its owning repo (misc 158/166).
 ///
 /// The full guarded sequence:
 ///
 /// 1. **Non-git refusal** — a worktree whose sidecar `vcs` is not git
-///    (svn/hg; misc 148) refuses, naming the vcs (the committed-work / non-git
-///    legs are post-v2).
+///    (svn/hg; misc 148) refuses, naming the vcs (the non-git leg is post-v2).
 /// 2. **Missing-path refusal** — a worktree dir that no longer exists refuses by
 ///    naming the state, never a bare ENOENT.
-/// 3. **Local-commit refusal** — a worktree whose `HEAD` moved off the recorded
-///    base refuses, naming the commits (workers never commit).
-/// 4. **Compute the diff** — the complete unified diff (untracked included).
-///    An empty diff is [`LandOutcome::Empty`] (nothing to land).
-/// 5. **Plain `--check`** — validate against the owning repo (`apply_check`);
+/// 3. **Compute the diff** — the complete unified diff of the worktree vs its
+///    branch point ([`diff_base`], misc 166): untracked files as new-file hunks
+///    AND committed work as ordinary hunks. An empty diff is
+///    [`LandOutcome::Empty`] (nothing to land). There is no longer a local-commit
+///    refusal — committed work lands as an ordinary patch; the apply guards below
+///    backstop it, and `git apply` never commits in the parent.
+/// 4. **Plain `--check`** — validate against the owning repo (`apply_check`);
 ///    a refusal leaves the owning repo untouched and names the conflicting
 ///    files.
-/// 6. **`--3way` apply** — the real mutation into the owning repo. Never commits.
-/// 7. **Remove** — on full success, remove the worktree through the disposal
+/// 5. **`--3way` apply** — the real mutation into the owning repo. Never commits.
+/// 6. **Remove** — on full success, remove the worktree through the disposal
 ///    machinery ([`crate::worktree_dispose::remove_agent_asserted`]) unless
 ///    `keep` is set.
 ///
@@ -416,30 +454,8 @@ pub fn land(meta: &WorktreeMeta, keep: bool) -> LandOutcome {
         };
     }
 
-    // 3. Local commits beyond the recorded base refuse, naming them.
-    let commits = local_commits_beyond_base(meta);
-    if !commits.is_empty() {
-        let list = commits
-            .iter()
-            .map(|c| format!("  {c}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let noun = if commits.len() == 1 {
-            "commit"
-        } else {
-            "commits"
-        };
-        return LandOutcome::Refused {
-            reason: format!(
-                "this worktree has local {noun} beyond its branch point — `land` never applies \
-                 committed work (workers never commit; the committed-changes leg is post-v2):\n\
-                 {list}\nMerge or cherry-pick these into the owning repo yourself, then \
-                 `catenary worktree rm` the worktree.",
-            ),
-        };
-    }
-
-    // 4. Compute the complete diff (untracked included).
+    // 3. Compute the complete diff vs the branch point (untracked + committed
+    //    work included; misc 166). An empty diff is a kept no-op.
     let diff = match worktree_diff(&meta.worktree) {
         Ok(d) => d,
         Err(e) => {
@@ -463,19 +479,19 @@ pub fn land(meta: &WorktreeMeta, keep: bool) -> LandOutcome {
         };
     }
 
-    // 5. Validate the apply first (mutates nothing) — a refusal here leaves the
+    // 4. Validate the apply first (mutates nothing) — a refusal here leaves the
     //    owning repo untouched, naming the conflicting files.
     if let Err(reason) = apply_check(owning_repo, &diff) {
         return LandOutcome::Refused { reason };
     }
 
-    // 6. Apply for real. A TOCTOU-race failure keeps the worktree and surfaces
+    // 5. Apply for real. A TOCTOU-race failure keeps the worktree and surfaces
     //    the reason (the check passed, so this is rare).
     if let Err(reason) = apply_3way(owning_repo, &diff) {
         return LandOutcome::Refused { reason };
     }
 
-    // 7. Remove the worktree on full success (unless `--keep`). A removal refusal
+    // 6. Remove the worktree on full success (unless `--keep`). A removal refusal
     //    does not un-land the applied work — report the applied paths and that
     //    the worktree was kept; the caller surfaces the removal reason.
     let removed = if keep {
@@ -498,10 +514,10 @@ mod tests {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    use super::{
-        LandOutcome, land, local_commits_beyond_base, worktree_changed_paths, worktree_diff,
+    use super::{LandOutcome, diff_base, land, worktree_changed_paths, worktree_diff};
+    use crate::worktree_create::{
+        WORKTREE_CLASS_AGENT, WORKTREE_VCS_GIT, WorktreeMeta, sidecar_path,
     };
-    use crate::worktree_create::{WORKTREE_CLASS_AGENT, WORKTREE_VCS_GIT, WorktreeMeta};
 
     /// Whether a binary is on PATH (skip git-dependent tests where absent).
     fn have_bin(bin: &str) -> bool {
@@ -564,6 +580,18 @@ mod tests {
             link: None,
             vcs: WORKTREE_VCS_GIT.to_string(),
         }
+    }
+
+    /// Write `meta` to the worktree's sidecar (`<worktree>.meta.json`) so
+    /// [`diff_base`] can read the recorded `base_commit` — the branch-point anchor
+    /// the commit-aware diff/land is computed against (misc 166).
+    fn write_meta_sidecar(meta: &WorktreeMeta) {
+        let path = sidecar_path(&meta.worktree);
+        std::fs::write(
+            &path,
+            serde_json::to_string(meta).expect("serialize sidecar"),
+        )
+        .expect("write sidecar");
     }
 
     /// Create a real linked worktree `<repo>-wt` off `repo`'s HEAD.
@@ -742,7 +770,21 @@ mod tests {
     }
 
     #[test]
-    fn land_refuses_local_commits_naming_them() {
+    fn diff_base_falls_back_to_head_without_a_sidecar() {
+        if !have_bin("git") {
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tmp");
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let wt = add_worktree(&repo);
+        // No sidecar: the branch-point anchor is unresolvable, so the diff base is
+        // the literal `HEAD` ref (the pre-166 behavior).
+        assert_eq!(diff_base(&wt), "HEAD");
+    }
+
+    #[test]
+    fn diff_shows_committed_work_against_the_branch_point() {
         if !have_bin("git") {
             return;
         }
@@ -751,29 +793,84 @@ mod tests {
         init_repo(&repo);
         let wt = add_worktree(&repo);
 
-        // Record the base BEFORE committing, then make a local commit.
+        // Record the base BEFORE committing (the sidecar's branch point), then make
+        // a local commit in the worktree.
         let meta = meta_for(&repo, &wt);
+        write_meta_sidecar(&meta);
         std::fs::write(wt.join("committed.txt"), "c\n").expect("write");
         tgit(&wt, &["add", "committed.txt"]);
         tgit(&wt, &["commit", "-q", "-m", "local work"]);
 
-        let commits = local_commits_beyond_base(&meta);
-        assert_eq!(commits.len(), 1, "one local commit detected: {commits:?}");
+        // The diff base is the branch point (the recorded base), NOT HEAD (which
+        // moved off it). A vs-HEAD diff would be empty — the pre-166 blindness.
+        assert_eq!(
+            diff_base(&wt),
+            meta.base_commit,
+            "the diff anchors on the branch point, not the moved HEAD",
+        );
+        let diff = worktree_diff(&wt).expect("diff");
+        assert!(
+            diff.contains("committed.txt") && diff.contains("new file mode"),
+            "the committed file is visible in the diff:\n{diff}"
+        );
+        let names = worktree_changed_paths(&wt).expect("names");
+        assert!(
+            names.iter().any(|p| p == "committed.txt"),
+            "name-only lists the committed file: {names:?}"
+        );
+    }
 
+    #[test]
+    fn land_applies_committed_work_without_committing_in_the_parent() {
+        if !have_bin("git") {
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tmp");
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let wt = add_worktree(&repo);
+
+        let owner_head_before = head_of(&repo);
+
+        // Record the base, then commit work in the worktree.
+        let meta = meta_for(&repo, &wt);
+        write_meta_sidecar(&meta);
+        std::fs::write(wt.join("committed.txt"), "c\n").expect("write");
+        tgit(&wt, &["add", "committed.txt"]);
+        tgit(&wt, &["commit", "-q", "-m", "local work"]);
+
+        // `--keep` so we assert the apply independently of removal.
         match land(&meta, true) {
-            LandOutcome::Refused { reason } => {
+            LandOutcome::Landed { paths, .. } => {
                 assert!(
-                    reason.contains("local work") || reason.contains("commit"),
-                    "the refusal names the local commit: {reason}"
+                    paths.iter().any(|p| p == "committed.txt"),
+                    "the committed file lands: {paths:?}"
                 );
             }
-            other => panic!("expected Refused, got {other:?}"),
+            other => panic!("expected Landed, got {other:?}"),
         }
-        // README untouched in the owning repo — nothing applied.
+        // The committed content is now in the owning repo's working tree...
         assert_eq!(
-            std::fs::read_to_string(repo.join("README.md")).expect("read"),
-            "hello\n",
-            "nothing applied on a local-commit refusal",
+            std::fs::read_to_string(repo.join("committed.txt")).expect("read"),
+            "c\n",
+            "the committed work landed in the owning repo",
+        );
+        // ...but as an uncommitted change — land never commits in the parent.
+        assert_eq!(
+            head_of(&repo),
+            owner_head_before,
+            "land must not create a commit in the owning repo",
+        );
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("status");
+        let status = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            status.contains("committed.txt"),
+            "the landed file is an uncommitted working-tree change:\n{status}"
         );
     }
 

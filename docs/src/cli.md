@@ -353,18 +353,19 @@ prepare a change in isolation and land it when it is ready.
 ```bash
 catenary worktree add my-feature          # create a feats-class worktree for a branch
 catenary worktree ls                      # list Catenary-managed worktrees
-catenary worktree diff <path>             # print the worktree's full diff vs HEAD
+catenary worktree diff <path>             # print the worktree's full diff vs its branch point
 catenary worktree land <path>             # apply + stage the changes, then retire the worktree
 catenary worktree rm <path>               # remove a worktree
+catenary worktree rm --force <path>       # discard a superseded dirty worktree
 ```
 
 | Subcommand | Description |
 |------------|-------------|
 | `add <branch> [path]` | Create a durable worktree for `<branch>` (default path under Catenary's state dir; pass an explicit `path` to override). Adds a sibling symlink for discovery. |
 | `ls` | List Catenary-managed worktrees — path, class, creator, age, clean/dirty, and (for `feats` worktrees) ahead/behind counts. |
-| `diff <path>` | Print the worktree's complete diff vs `HEAD` — tracked changes plus untracked files as new-file hunks — as a valid `git apply` patch. `--name-only` prints just the changed paths. |
-| `land <path>` | Apply the worktree's diff into the owning repo with `git apply --3way`, **stage** the result, arm a diagnostics batch over the changed files, delete the branch, and retire the root. It **never commits** — you review and commit. `--keep` lands without removing the worktree. |
-| `rm <path>` | Remove a worktree class-appropriately. A dirty worktree is never auto-reaped — `rm` refuses to discard uncaptured work. |
+| `diff <path>` | Print the worktree's complete diff vs its **branch point** (the merge-base of its creation base and current `HEAD`) — tracked changes, untracked files as new-file hunks, **and committed work** — as a valid `git apply` patch. `--name-only` prints just the changed paths. |
+| `land <path>` | Apply the worktree's diff into the owning repo with `git apply --3way`, **stage** the result, arm a diagnostics batch over the changed files, delete the branch, and retire the root. It **never commits** — you review and commit. Committed worktree work lands as an uncommitted change. `--keep` lands without removing the worktree. |
+| `rm <path>` | Remove a worktree class-appropriately. A dirty worktree is never auto-reaped — `rm` refuses to discard uncaptured work. `--force` is the explicit exception: it discards a dirty (superseded or abandoned) worktree through the proper disposal path — retiring the root and sweeping the registry — and names the dropped work. |
 
 `land` stages but does not commit, so the changes land in your index for review.
 A dirty worktree is never removed automatically: unlanded work is always kept
