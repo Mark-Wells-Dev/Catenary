@@ -595,12 +595,16 @@ fn subagent_line(
 
 /// Render the problems pane as entry groups (one or two lines each).
 ///
-/// Each entry is the labelled finding, then its fix-it indented. A suggestion
-/// tail renders with a dim header so it can never be mistaken for a problem. The
-/// entry at `selected` (an entry index, matching what the list highlights) wraps
-/// its finding message to the full text across as many lines as it needs rather
-/// than truncating it to one line with `…` (tui-rework 12, item 1); every other
-/// entry stays compact. Continuation lines indent under the message column.
+/// Each entry is the labelled finding, then its fix-it indented — one entry per
+/// row, so the returned index space matches `rows` exactly (the cursor/highlight
+/// index space; bug 77). The suggestion tail carries a dim `suggestions` header as
+/// the first line of the first suggestion entry — a property of that entry, not an
+/// entry of its own — so it can never be mistaken for a problem yet never shifts
+/// the entry index below it. The entry at `selected` (a row index, matching what
+/// the list highlights) wraps its finding message to the full text across as many
+/// lines as it needs rather than truncating it to one line with `…` (tui-rework
+/// 12, item 1); every other entry stays compact. Continuation lines indent under
+/// the message column.
 #[must_use]
 pub fn problem_entries(
     rows: &[ProblemRow],
@@ -608,34 +612,38 @@ pub fn problem_entries(
     theme: &Theme,
     selected: Option<usize>,
 ) -> Vec<Vec<Line<'static>>> {
-    let mut out: Vec<Vec<Line<'static>>> = Vec::new();
+    let mut out: Vec<Vec<Line<'static>>> = Vec::with_capacity(rows.len());
     let mut suggestion_header_emitted = false;
-    for r in rows {
+    for (i, r) in rows.iter().enumerate() {
+        // The `suggestions` header is the first line of the first suggestion
+        // entry, not a standalone entry — one entry per row keeps entry index ==
+        // row index for every row, so highlight/wrap track the cursor (bug 77).
+        let mut lines: Vec<Line<'static>> = Vec::new();
         if r.is_suggestion && !suggestion_header_emitted {
-            out.push(vec![Line::from(vec![Span::styled(
+            lines.push(Line::from(vec![Span::styled(
                 "  suggestions".to_string(),
                 theme.muted,
-            )])]);
+            )]));
             suggestion_header_emitted = true;
         }
         let style = severity_style(theme, r.severity);
         let label = format!("  {}: ", r.severity.label());
         let label_w = label.chars().count();
-        let is_selected = selected == Some(out.len());
-        let mut lines = if is_selected {
+        let is_selected = selected == Some(i);
+        if is_selected {
             // Full message, wrapped under the message column (item 1).
             let head = vec![
                 Span::styled(label, style),
                 Span::styled(r.message.clone(), style),
             ];
-            super::format::wrap_line(&head, width, label_w)
+            lines.extend(super::format::wrap_line(&head, width, label_w));
         } else {
             let head_avail = width.saturating_sub(label_w);
-            vec![Line::from(vec![
+            lines.push(Line::from(vec![
                 Span::styled(label, style),
                 Span::styled(truncate_to_width(&r.message, head_avail), style),
-            ])]
-        };
+            ]));
+        }
         if let Some(fix) = &r.fix_it {
             for l in fix.lines() {
                 lines.push(Line::from(vec![Span::styled(
@@ -1652,6 +1660,143 @@ mod tests {
             "unselected row truncates with `…`: {head}"
         );
         assert!(spans_width(&plain[0][0].spans) <= width, "within width");
+    }
+
+    #[test]
+    fn suggestion_header_rides_first_suggestion_entry_index_matches_rows() {
+        use crate::health::FindingCode;
+
+        // Two problems then two suggestions: the inline `suggestions` header must
+        // not shift the entry index away from the row index (bug 77). The header
+        // is a property of the first suggestion entry, so one entry per row holds.
+        let row = |sev: Severity, msg: &str, is_suggestion: bool| ProblemRow {
+            code: FindingCode::ServerRoutedBroken,
+            severity: sev,
+            message: msg.to_string(),
+            fix_it: None,
+            owner: Owner::Global,
+            is_suggestion,
+        };
+        let rows = vec![
+            row(Severity::Error, "err a", false),
+            row(Severity::Warning, "warn b", false),
+            row(Severity::Suggestion, "sugg c", true),
+            row(Severity::Suggestion, "sugg d", true),
+        ];
+        let theme = Theme::new();
+        let width = 60usize;
+
+        let entries = crate::tui::render::problem_entries(&rows, width, &theme, None);
+        assert_eq!(
+            entries.len(),
+            rows.len(),
+            "one entry per row — the header is not an entry of its own",
+        );
+
+        let text_of = |entry: &[Line<'static>]| -> String {
+            entry
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .map(|s| s.content.to_string())
+                .collect()
+        };
+
+        // The header rides the first suggestion entry (row index 2), as its first
+        // line, and appears nowhere else.
+        let header_hits: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| text_of(e).contains("suggestions"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            header_hits,
+            vec![2],
+            "the `suggestions` header rides exactly the first suggestion's entry",
+        );
+        let first_line: String = entries[2][0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            first_line.contains("suggestions"),
+            "the header is the first line of the first suggestion entry: {first_line}",
+        );
+
+        // Every row's message lives in the entry at its own index — the boundary
+        // rows around the header (last problem, first/second suggestion) included.
+        for (i, r) in rows.iter().enumerate() {
+            assert!(
+                text_of(&entries[i]).contains(&r.message),
+                "row {i} ({}) renders at entry index {i}",
+                r.message,
+            );
+        }
+    }
+
+    #[test]
+    fn selecting_a_suggestion_row_highlights_that_row_not_off_by_one() {
+        use crate::health::FindingCode;
+
+        // A long message so the *selected* entry wraps to > 1 line — the tell that
+        // the highlight landed on that entry. Pre-fix, `selected == Some(row)` was
+        // compared against `out.len()` (which included the header), so selecting a
+        // suggestion row wrapped the wrong entry.
+        let long = "a suggestion message long enough that it can only be shown in \
+            full by wrapping across several lines of the problems pane body";
+        let row = |sev: Severity, msg: &str, is_suggestion: bool| ProblemRow {
+            code: FindingCode::ServerInstallSuggestion,
+            severity: sev,
+            message: msg.to_string(),
+            fix_it: None,
+            owner: Owner::Global,
+            is_suggestion,
+        };
+        let rows = vec![
+            row(Severity::Error, "err", false),
+            row(Severity::Suggestion, long, true),
+            row(Severity::Suggestion, long, true),
+        ];
+        let theme = Theme::new();
+        let width = 40usize;
+
+        // Selecting the first suggestion (row index 1) wraps entry 1 and only 1.
+        let entries = crate::tui::render::problem_entries(&rows, width, &theme, Some(1));
+        assert!(
+            entries[1].len() > 1,
+            "the selected suggestion row (index 1) wraps: {} lines",
+            entries[1].len(),
+        );
+        assert_eq!(
+            entries[0].len(),
+            1,
+            "the unselected problem row above the header stays compact",
+        );
+        assert_eq!(
+            entries[2].len(),
+            1,
+            "the unselected suggestion row below stays compact",
+        );
+
+        // Selecting the second suggestion (row index 2 — below the header) wraps
+        // entry 2, proving the header does not shift the highlight down by one.
+        let entries = crate::tui::render::problem_entries(&rows, width, &theme, Some(2));
+        assert!(
+            entries[2].len() > 1,
+            "the selected suggestion row (index 2) wraps: {} lines",
+            entries[2].len(),
+        );
+        // Entry 1 keeps its header line; unselected it is header + one compact line.
+        let entry1_text: String = entries[1]
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            entry1_text.contains("suggestions"),
+            "the first suggestion entry still carries the header when unselected",
+        );
     }
 
     #[test]

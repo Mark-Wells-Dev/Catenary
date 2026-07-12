@@ -1329,6 +1329,93 @@ mod tests {
         );
     }
 
+    /// A non-suggestion problem row, so the suggestion tail sits at a non-zero
+    /// index — the shape that exposes the inline-header off-by-one (bug 77).
+    fn problem_row(owner: Owner) -> ProblemRow {
+        ProblemRow {
+            code: FindingCode::ServerRoutedBroken,
+            severity: Severity::Error,
+            message: "a routed server is broken".to_string(),
+            fix_it: None,
+            owner,
+            is_suggestion: false,
+        }
+    }
+
+    #[test]
+    fn action_key_on_a_suggestion_row_below_the_header_resolves_that_row() {
+        // A problem at index 0, the taplo suggestion at index 1 (below where the
+        // inline `suggestions` header renders). The cursor sits on the suggestion.
+        // Pre-fix the entry/highlight index was off by one against this row index;
+        // the `a`-key action always used the row index, so this pins that they now
+        // agree — the highlight and the action land on the same finding (bug 77).
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+        let mut app = app_with(&theme, &icons, snap_with_servers(1), Config::default());
+        app.inject_install_env(
+            recipes_map("taplo", cargo_recipe()),
+            blessed_manifest("taplo", "0.10.0"),
+            Box::new(RecordingRunner(Rc::new(RefCell::new(Vec::new())))),
+            Box::new(NoFetch),
+        );
+        app.problem_rows = vec![problem_row(Owner::Global), suggestion_row("taplo")];
+        app.focus = Pane::Problems;
+
+        // On the problem row (index 0) the action offers no install.
+        app.problem_cursor.index = 0;
+        assert!(
+            app.available_install().is_none(),
+            "the problem row above the header offers no install",
+        );
+
+        // On the suggestion row (index 1) the action resolves to that suggestion.
+        app.problem_cursor.index = 1;
+        let install = app
+            .available_install()
+            .expect("the suggestion row below the header offers its install");
+        assert_eq!(
+            install.server(),
+            "taplo",
+            "the action resolves to the cursored suggestion, not off-by-one",
+        );
+    }
+
+    #[test]
+    fn enter_on_a_suggestion_row_below_the_header_focuses_that_rows_owner() {
+        // Enter (`activate`) focuses the cursored row's owner. A problem row with a
+        // no-op `Global` owner sits at index 0; the suggestion (owner Server srv0)
+        // at index 1. If the action were off-by-one it would resolve index 0 and
+        // focus would stay on Problems; correct resolution flips focus to the tree.
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+        let mut app = app_with(&theme, &icons, snap_with_servers(1), Config::default());
+        app.problem_rows = vec![problem_row(Owner::Global), {
+            let mut r = suggestion_row("srv0");
+            r.owner = Owner::Server("srv0".to_string());
+            r
+        }];
+        app.focus = Pane::Problems;
+
+        // Cursor on the problem row (Global owner): Enter is a focus no-op.
+        app.problem_cursor.index = 0;
+        app.activate();
+        assert_eq!(
+            app.focus,
+            Pane::Problems,
+            "the Global-owner problem row's Enter does not move focus",
+        );
+
+        // Cursor on the suggestion row: Enter focuses its server owner's tree.
+        app.problem_cursor.index = 1;
+        app.activate();
+        assert_eq!(
+            app.focus,
+            Pane::RootTree,
+            "Enter on the suggestion row below the header focuses its server owner",
+        );
+        assert_eq!(app.last_tree, Pane::RootTree);
+    }
+
     #[test]
     fn action_key_opens_install_overlay_and_confirm_runs_the_pinned_command() {
         let theme = Theme::new();
