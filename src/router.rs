@@ -3820,11 +3820,26 @@ fn load_meta_from_sidecar(worktree: &Path) -> Option<crate::worktree_create::Wor
 /// ([`surface_dirty_kept`]) unless the removal was host-initiated (`WorktreeRemove`
 /// logs the divergence inside [`crate::worktree_dispose::dispose`] instead). A
 /// path with no registry entry and no sidecar is silently skipped (never ours).
+///
+/// `stopping_agent_id` is the identity gate for the `SubagentStop` fallback (bug
+/// 103). `SubagentStop` resolves its dispose target identity-first, cwd-second
+/// (`resolve_stop_reap_target`); the cwd fallback resolves the *enclosing*
+/// worktree root, so a nested/foreign subagent whose cwd merely sits inside a
+/// live sibling's worktree resolves onto that sibling — and the clean arm would
+/// then **delete** the live owner's tree. Passing `Some(stopping_agent_id)` gates
+/// the dispose to a matching owner: the tree is disposed only when the stopping
+/// agent IS the worktree's owner (its dirname, bug 91's [`worktree_owner_label`]).
+/// A foreign stop skips the dispose entirely — the fallback may have surfaced the
+/// worktree, but must never SELECT it as a dispose target; the hourly GC (which
+/// prunes gone dirs, `497c989`) carries any genuinely-orphaned tree. Pass `None`
+/// to bypass the gate for a host-initiated `WorktreeRemove`, where the human
+/// asked for removal of this exact path and there is no stopping-agent identity.
 #[cfg(unix)]
 fn dispose_worktree_in_background(
     registry: &WorktreeRegistry,
     parent_context: &crate::bridge::ParentContextQueue,
     session_id: &str,
+    stopping_agent_id: Option<&str>,
     worktree: &Path,
     host_initiated: bool,
 ) {
@@ -3834,6 +3849,24 @@ fn dispose_worktree_in_background(
     else {
         return;
     };
+    // Bug 103 identity gate: a `SubagentStop` may dispose only its own worktree.
+    // A stop whose agent identity does not own this tree must not select it for
+    // disposal, even though the cwd fallback surfaced it. `None` (a host-initiated
+    // `WorktreeRemove`) bypasses the gate.
+    if let Some(stopping_agent_id) = stopping_agent_id
+        && !stop_owns_worktree(stopping_agent_id, worktree)
+    {
+        debug!(
+            source = Source::DaemonDispatch.as_str(),
+            session_id = %session_id,
+            stopping_agent_id = stopping_agent_id,
+            owner = %worktree_owner_label(worktree),
+            worktree = %worktree.display(),
+            "subagent stop dispose skipped — stopping agent is not the worktree owner \
+             (cwd fallback surfaced a live sibling; not disposing)",
+        );
+        return;
+    }
     let disposition = crate::worktree_dispose::dispose(&meta, host_initiated);
     match &disposition {
         crate::worktree_dispose::Disposition::Disposed
@@ -3859,6 +3892,25 @@ fn worktree_owner_label(worktree: &Path) -> String {
         || worktree.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
     )
+}
+
+/// Whether the agent stopping at `SubagentStop` **owns** `worktree` — the bug 103
+/// dispose gate.
+///
+/// `resolve_stop_reap_target` resolves a stop's dispose target identity-first,
+/// cwd-second; the cwd leg falls back to the *enclosing* worktree root, so a
+/// nested/foreign subagent whose cwd merely sits inside a live sibling's tree
+/// resolves onto that sibling. Disposing there would delete a live owner's
+/// workspace (bug 103). Ownership is the tree's on-disk directory name — bug 91's
+/// dirname-IS-owner primitive ([`worktree_owner_label`]): a subagent worktree's
+/// leaf segment is exactly its agent id (misc 150). Only a stop whose agent
+/// identity equals that owner may dispose; a foreign stop must not select the
+/// tree, letting the hourly GC carry any genuinely-orphaned one.
+#[cfg(unix)]
+fn stop_owns_worktree(stopping_agent_id: &str, worktree: &Path) -> bool {
+    // An empty id (no agent identity in the stop payload) can never prove
+    // ownership; decline rather than fall through to a cwd-selected delete.
+    !stopping_agent_id.is_empty() && stopping_agent_id == worktree_owner_label(worktree)
 }
 
 /// Surface a dirty worktree kept at `SubagentStop` to the *parent agent* (misc
@@ -4823,7 +4875,9 @@ async fn handle_hook_dispatch(
             let sid = session_id.clone();
             let wt = canonical.clone();
             tokio::task::spawn_blocking(move || {
-                dispose_worktree_in_background(&registry, &parent_context, &sid, &wt, true);
+                // Host-initiated removal: no stopping-agent identity to gate on —
+                // the human asked for this exact path (bug 103 gate bypassed).
+                dispose_worktree_in_background(&registry, &parent_context, &sid, None, &wt, true);
             });
         }
 
@@ -5915,12 +5969,26 @@ async fn handle_hook_dispatch(
             // auto-disposed; dirty → kept and surfaced to the parent (D-1). Runs
             // whether or not the root was still mounted (an idle-reaped worktree
             // still disposes).
+            //
+            // Bug 103 identity gate: pass the stopping agent's id so the dispose
+            // fires only when it IS the worktree's owner. `resolve_stop_reap_target`
+            // may fall back to the cwd-enclosing root, resolving a nested/foreign
+            // subagent's stop onto a live sibling's tree; the gate stops that
+            // fallback from disposing a tree the stopping agent does not own.
             let registry = ctx.worktree_registry.clone();
             let parent_context = ctx.primary.parent_context.clone();
             let sid = session_id.clone();
+            let aid = agent_id.to_string();
             let wt = worktree.clone();
             tokio::task::spawn_blocking(move || {
-                dispose_worktree_in_background(&registry, &parent_context, &sid, &wt, false);
+                dispose_worktree_in_background(
+                    &registry,
+                    &parent_context,
+                    &sid,
+                    Some(&aid),
+                    &wt,
+                    false,
+                );
             });
         }
     }
@@ -10761,6 +10829,194 @@ mod tests {
             parent_context.drain("sess-1").len(),
             1,
             "a worktree recreated at a pruned path surfaces afresh (safety net intact)",
+        );
+    }
+
+    // ── SubagentStop dispose identity gate (bug 103) ─────────────────────
+    //
+    // The cwd-enclosing fallback in `resolve_stop_reap_target` can surface a live
+    // sibling's worktree for a nested/foreign subagent's stop; the clean arm then
+    // *deleted* that live tree. The gate: a stop disposes only its own worktree,
+    // owned by the tree's on-disk dirname (bug 91's dirname-IS-owner primitive).
+
+    #[test]
+    fn stop_owns_worktree_gates_dispose_by_owner_dirname() {
+        // The gate decision in isolation (bug 103). The worktree leaf dir name IS
+        // the owner agent id (misc 150: `worktree_segment` uses the bare
+        // `agent-<id>` id as the segment).
+        let worktree = PathBuf::from("/state/catenary/worktrees/agents/sess-1/a8458e9e8f03be469");
+
+        // Matching owner → the tree's own stop disposes.
+        assert!(
+            stop_owns_worktree("a8458e9e8f03be469", &worktree),
+            "the owning agent's own stop may dispose its worktree",
+        );
+        // A nested/foreign subagent whose cwd merely encloses this tree → declined.
+        assert!(
+            !stop_owns_worktree("nested-guide-agent", &worktree),
+            "a foreign/nested stop must NOT select this live sibling for disposal",
+        );
+        // An empty id (no agent identity in the stop payload) can never prove
+        // ownership — declined, never a cwd-selected delete.
+        assert!(
+            !stop_owns_worktree("", &worktree),
+            "an empty stop identity never owns a worktree",
+        );
+    }
+
+    #[test]
+    fn dispose_background_foreign_stop_never_disposes_and_keeps_registry() {
+        // Bug 103 wiring: a foreign/nested stop drives
+        // `dispose_worktree_in_background` for a live sibling's tree (the cwd
+        // fallback surfaced it). The gate must short-circuit BEFORE `dispose`, so
+        // the registration survives, the directory survives, and nothing is
+        // surfaced — the exact bug (a live clean tree deleted) does not happen.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize");
+        // The owner's live worktree: its leaf dir name IS the owner's agent id.
+        let worktree = base.join("agents").join("sess-1").join("owner-id");
+        std::fs::create_dir_all(&worktree).expect("mkdir worktree");
+
+        let registry = WorktreeRegistry::new();
+        let parent_context = crate::bridge::ParentContextQueue::new();
+        registry.register(crate::worktree_create::WorktreeMeta {
+            worktree: worktree.clone(),
+            source_repo: PathBuf::from("/repo"),
+            base_commit: "deadbeef".to_string(),
+            branch: "agent-owner-id".to_string(),
+            name: "agent-owner-id".to_string(),
+            agent_id: Some("owner-id".to_string()),
+            session_id: "sess-1".to_string(),
+            created_at: "2026-07-06T00:00:00.000Z".to_string(),
+            class: "agent".to_string(),
+            link: None,
+            vcs: crate::worktree_create::WORKTREE_VCS_GIT.to_string(),
+        });
+
+        // A NESTED agent (id != the worktree's owner dirname) stops with its cwd
+        // resolved onto the owner's tree.
+        dispose_worktree_in_background(
+            &registry,
+            &parent_context,
+            "sess-1",
+            Some("nested-guide-agent"),
+            &worktree,
+            false,
+        );
+
+        assert!(
+            worktree.exists(),
+            "the live owner's worktree dir is NOT deleted by a foreign stop",
+        );
+        assert_eq!(
+            registry.get(&worktree).map(|m| m.worktree),
+            Some(worktree.clone()),
+            "the registration survives — the gate short-circuited before dispose",
+        );
+        assert_eq!(
+            parent_context.drain("sess-1").len(),
+            0,
+            "a foreign stop surfaces nothing (it never reached the dispose)",
+        );
+    }
+
+    #[test]
+    fn dispose_background_matching_owner_stop_passes_the_gate() {
+        // Bug 103: the owner's OWN stop passes the identity gate and reaches the
+        // `dispose` machinery (whose disposal outcomes are covered end-to-end in
+        // `worktree_dispose`). Here the tree is a plain dir outside the scheme
+        // root, so `dispose` returns `NotOurs` (no delete, no forget) — the point
+        // is that the gate does NOT short-circuit a matching-owner stop, and the
+        // registration is left for `dispose` to decide, not skipped by the gate.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize");
+        let worktree = base.join("agents").join("sess-1").join("owner-id");
+        std::fs::create_dir_all(&worktree).expect("mkdir worktree");
+
+        let registry = WorktreeRegistry::new();
+        let parent_context = crate::bridge::ParentContextQueue::new();
+        registry.register(crate::worktree_create::WorktreeMeta {
+            worktree: worktree.clone(),
+            source_repo: PathBuf::from("/repo"),
+            base_commit: "deadbeef".to_string(),
+            branch: "agent-owner-id".to_string(),
+            name: "agent-owner-id".to_string(),
+            agent_id: Some("owner-id".to_string()),
+            session_id: "sess-1".to_string(),
+            created_at: "2026-07-06T00:00:00.000Z".to_string(),
+            class: "agent".to_string(),
+            link: None,
+            vcs: crate::worktree_create::WORKTREE_VCS_GIT.to_string(),
+        });
+
+        // The owner's own stop (id == the worktree's owner dirname) passes the gate.
+        dispose_worktree_in_background(
+            &registry,
+            &parent_context,
+            "sess-1",
+            Some("owner-id"),
+            &worktree,
+            false,
+        );
+
+        // The gate itself is the assertion of record.
+        assert!(
+            stop_owns_worktree("owner-id", &worktree),
+            "the owner's own stop passes the dispose gate (dispose then decides)",
+        );
+        // Outside the scheme root, `dispose` classifies it `NotOurs`: the dir and
+        // its registration are untouched (no forget, no surface) — the gate did
+        // not swallow the call, `dispose`'s guard did.
+        assert!(worktree.exists(), "a `NotOurs` path is never deleted");
+        assert_eq!(
+            parent_context.drain("sess-1").len(),
+            0,
+            "a `NotOurs` disposition surfaces nothing",
+        );
+    }
+
+    #[test]
+    fn dispose_background_host_initiated_removal_bypasses_the_identity_gate() {
+        // The dirty arm / host path is unchanged (bug 103): a host-initiated
+        // `WorktreeRemove` passes `None` for the stopping-agent id, so the identity
+        // gate never fires — the human asked for this exact path. The tree here is
+        // outside the scheme root, so `dispose` returns `NotOurs`; the point is
+        // that `None` reaches `dispose` without an ownership check standing in the
+        // way (a bare dir name that would FAIL the subagent gate).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize");
+        // A `--worktree` (user-named) tree whose dirname is not an agent id — it
+        // would never match a subagent gate, yet host removal must still proceed.
+        let worktree = base.join("feats").join("repo").join("my-feature");
+        std::fs::create_dir_all(&worktree).expect("mkdir worktree");
+
+        let registry = WorktreeRegistry::new();
+        let parent_context = crate::bridge::ParentContextQueue::new();
+        registry.register(crate::worktree_create::WorktreeMeta {
+            worktree: worktree.clone(),
+            source_repo: PathBuf::from("/repo"),
+            base_commit: "deadbeef".to_string(),
+            branch: "my-feature".to_string(),
+            name: "my-feature".to_string(),
+            agent_id: None,
+            session_id: "sess-1".to_string(),
+            created_at: "2026-07-06T00:00:00.000Z".to_string(),
+            class: "feat".to_string(),
+            link: None,
+            vcs: crate::worktree_create::WORKTREE_VCS_GIT.to_string(),
+        });
+
+        // Host-initiated dispose: `None` bypasses the gate entirely.
+        dispose_worktree_in_background(&registry, &parent_context, "sess-1", None, &worktree, true);
+
+        // `None` is not subject to ownership: had the gate applied it would have
+        // skipped (dirname "my-feature" is no agent id). It reaches `dispose`,
+        // which classifies the non-scheme path `NotOurs` (untouched).
+        assert!(worktree.exists(), "a `NotOurs` path is never deleted");
+        assert_eq!(
+            registry.get(&worktree).map(|m| m.worktree),
+            Some(worktree.clone()),
+            "a `NotOurs` disposition leaves the registration",
         );
     }
 
