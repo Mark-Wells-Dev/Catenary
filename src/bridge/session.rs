@@ -1320,6 +1320,33 @@ impl Session {
         self.client_manager.lint_covers(path)
     }
 
+    /// Whether this file's *only* diagnostics coverage is an **unverified**
+    /// (enrichment-only) server — a diagnostics server exists but is not blessed,
+    /// so Catenary withholds its diagnostics (diagnostics-debt 04b).
+    ///
+    /// The signal that separates the "not diagnostics-covered" skip bucket (a
+    /// server exists, unblessed) from the truly-uncovered bucket (no server at
+    /// all). Only meaningful when [`has_coverage`](Self::has_coverage) is already
+    /// `false` — a blessed server or a linter would make the file genuinely
+    /// covered — so a caller checks coverage first, then this. A `disable_lsp`
+    /// root runs no server, so its files are never unverified-only. Out-of-root
+    /// files have no per-root config to consult and return `false`.
+    #[must_use]
+    pub fn has_unverified_only_coverage(&self, path: &Path) -> bool {
+        let Some(root) = self.fs_manager.resolve_root(path) else {
+            return false;
+        };
+        if self.client_manager.is_lsp_disabled(&root) {
+            return false;
+        }
+        let lang = self.fs_manager.language_id(path).or_else(|| {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_string)
+        });
+        lang.is_some_and(|id| self.client_manager.has_unverified_only_server(&root, &id))
+    }
+
     /// The diagnostic feeders — LSP servers and standalone linters — that track
     /// `path`, sorted and deduplicated by name.
     ///

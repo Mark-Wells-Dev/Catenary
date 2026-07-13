@@ -93,6 +93,16 @@ pub fn isolate_env(cmd: &mut Command, root: &str) {
     // maintainer's desktop once per daemon-spawning test. `CATENARY_NOTIFY=0`
     // is the sink's own suppression knob; must come after the clearing loop.
     cmd.env("CATENARY_NOTIFY", "0");
+    // Bless every configured server for the integration harness (diagnostics-debt
+    // 04b). Env-derived (`CATENARY_SERVERS`) servers and mockls stand-ins have
+    // names absent from the blessed manifest, so without this they would classify
+    // as unverified/enrichment-only and produce no diagnostics — every mock-driven
+    // diagnostics test would go silent. The `*` wildcard blesses all, so a test
+    // need not enumerate its mock names. A test that specifically exercises the
+    // enrichment-only branch overrides this after the call (e.g.
+    // `cmd.env("CATENARY_BLESS_SERVERS", "")` to bless nothing). Must come after
+    // the clearing loop.
+    cmd.env("CATENARY_BLESS_SERVERS", "*");
 }
 
 /// CI triage escape hatch: with `CATENARY_CONFORMANCE_KEEP` set in the

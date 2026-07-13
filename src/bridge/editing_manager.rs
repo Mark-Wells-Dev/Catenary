@@ -98,15 +98,24 @@ struct EditingState {
     skipped: SkippedEdits,
 }
 
-/// Edits skipped during batch accumulation, split by the two distinct
-/// predicates a receipt must not conflate (misc 173).
+/// Edits skipped during batch accumulation, split by the distinct predicates a
+/// receipt must not conflate (misc 173; the unverified bucket added in
+/// diagnostics-debt 04b).
 ///
 /// Root-containment and feeder-coverage are different facts: an in-root
 /// `Makefile` has no covering server but is NOT outside tracked roots.
-/// Rendering both buckets through one "outside tracked roots" line taught the
+/// Rendering both through one "outside tracked roots" line taught the
 /// wrong lesson — the note named the containing root in the same parenthesis
-/// that claimed the edit was outside it. The buckets ride the diagnostics
-/// handoff and render as two distinct advisory lines on the bare-run receipt.
+/// that claimed the edit was outside it. The three buckets ride the diagnostics
+/// handoff and render as distinct advisory lines on the bare-run receipt:
+///
+/// - **outside** every tracked root;
+/// - **uncovered** — in-root, no diagnostic feeder at all (`Makefile`, `.txt`);
+/// - **unverified** — in-root, covered *only* by an unverified (enrichment-only)
+///   server: a diagnostics server exists but is not blessed, so Catenary withholds
+///   its diagnostics. The wording declares this plainly ("not diagnostics-covered")
+///   rather than blaming Catenary — DESIGN's footgun ruling: receipts only speak
+///   where we can vouch; unknowns get declaration, not interpretation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SkippedEdits {
     /// Edits made outside every tracked workspace root.
@@ -120,13 +129,20 @@ pub struct SkippedEdits {
     /// Distinct display names (file names) of the uncovered in-root files, so
     /// the note can name what went unchecked ("(Makefile)").
     pub uncovered_files: BTreeSet<String>,
+    /// In-root edits whose only covering server is **unverified**
+    /// (enrichment-only, diagnostics-debt 04b): a diagnostics server exists but is
+    /// not blessed, so its diagnostics are withheld and the gate never arms.
+    pub unverified: usize,
+    /// Distinct display names (file names) of the unverified-only in-root files,
+    /// so the note can name them under the "not diagnostics-covered" declaration.
+    pub unverified_files: BTreeSet<String>,
 }
 
 impl SkippedEdits {
-    /// `true` when both buckets are empty — nothing skipped, no note to render.
+    /// `true` when every bucket is empty — nothing skipped, no note to render.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.outside == 0 && self.uncovered == 0
+        self.outside == 0 && self.uncovered == 0 && self.unverified == 0
     }
 }
 
@@ -563,6 +579,31 @@ impl EditingManager {
         drop(state);
     }
 
+    /// Records an in-root edit whose only covering server is **unverified**
+    /// (enrichment-only, diagnostics-debt 04b), **creating** the editing entry if
+    /// none exists yet.
+    ///
+    /// The third skip predicate (DESIGN §"The blessed set"): the file IS under a
+    /// tracked root and a diagnostics server *is* configured for its language, but
+    /// that server is a custom `[lsp.server.*]` def absent from the blessed
+    /// manifest, so Catenary withholds its diagnostics — the gate never arms.
+    /// Recorded in its own bucket, distinct from the truly-uncovered case, so the
+    /// bare-run note declares "not diagnostics-covered" (a server exists) rather
+    /// than "no covering server" (none exists). Standalone semantics match the
+    /// sibling skip recorders: the entry it creates carries no files, never trips
+    /// the boundary block, and is silently cleared at stop if never diagnosed.
+    pub fn record_unverified_edit(&self, session_id: Option<&str>, agent_id: &str, name: String) {
+        let key = editing_key(session_id, agent_id);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state.entry(key).or_default();
+        entry.skipped.unverified += 1;
+        entry.skipped.unverified_files.insert(name);
+        drop(state);
+    }
+
     /// Clears all editing state. Returns the number of entries removed.
     ///
     /// Used by `SessionStart` cleanup to clear stale state when the
@@ -821,6 +862,40 @@ mod tests {
         assert!(
             !em.has_files(None, ""),
             "an uncovered-only entry has no covered files — it never gates"
+        );
+    }
+
+    #[test]
+    fn record_unverified_edit_is_its_own_bucket() {
+        // diagnostics-debt 04b: an in-root edit covered ONLY by an unverified
+        // server lands in the `unverified` bucket — distinct from `uncovered`
+        // (no server at all) and `outside` — carrying the file's display name so
+        // the note can declare "not diagnostics-covered". Standalone semantics
+        // match the sibling recorders: the entry holds no files, never gates.
+        let em = EditingManager::new();
+        assert!(!em.is_editing(None, ""), "no entry before the edit");
+        em.record_unverified_edit(None, "", "widget.zig".to_string());
+        em.record_unverified_edit(None, "", "widget.zig".to_string());
+        em.record_unverified_edit(None, "", "gadget.zig".to_string());
+
+        let skipped = em.skipped(None, "");
+        assert_eq!(skipped.unverified, 3, "every unverified edit counts");
+        assert_eq!(
+            skipped.unverified_files,
+            BTreeSet::from(["gadget.zig".to_string(), "widget.zig".to_string()]),
+            "distinct display names, deduplicated"
+        );
+        assert_eq!(
+            skipped.uncovered, 0,
+            "unverified-only edits never land in the uncovered bucket"
+        );
+        assert_eq!(
+            skipped.outside, 0,
+            "unverified-only edits never land in the outside bucket"
+        );
+        assert!(
+            !em.has_files(None, ""),
+            "an unverified-only entry has no covered files — it never gates"
         );
     }
 

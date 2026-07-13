@@ -115,6 +115,13 @@ async fn test_mockls_document_lifecycle() -> Result<()> {
 ///
 /// mockls `--log-init-params` writes the full initialize request params
 /// to a file. We parse it and assert the capabilities Catenary advertises.
+///
+/// Uses a **blessed** server name (`clangd`) so the full diagnostics-capable
+/// shape is advertised — including `publishDiagnostics` (diagnostics-debt 04b:
+/// an unverified server has its diagnostics advertisement withheld, which is
+/// covered by `enrichment_only_server_gets_no_diagnostics_advertisement`). The
+/// mockls binary and the language id stay `MOCK_LANG_A`; only Catenary's internal
+/// server identity is the blessed name.
 #[tokio::test]
 async fn test_client_capabilities() -> Result<()> {
     let dir = tempdir()?;
@@ -126,7 +133,7 @@ async fn test_client_capabilities() -> Result<()> {
         bin,
         &[MOCK_LANG_A, "--log-init-params", log_path],
         MOCK_LANG_A,
-        MOCK_LANG_A,
+        "clangd",
         test_logging(),
         None,
         None,
@@ -214,6 +221,59 @@ async fn test_client_capabilities() -> Result<()> {
     assert!(
         text_doc.get("formatting").is_none(),
         "formatting capability should not be advertised"
+    );
+
+    client.shutdown().await?;
+    Ok(())
+}
+
+/// diagnostics-debt 04b, deliverable 1: an **unverified** server (a custom name
+/// absent from the blessed manifest) is advertised **no diagnostics capability** —
+/// neither `textDocument.diagnostic` (pull) nor `textDocument.publishDiagnostics`
+/// (push). Every non-diagnostics capability survives, so its grep/glob enrichment
+/// is untouched. This is the "no advertisement" acceptance pinned at the wire.
+#[tokio::test]
+async fn enrichment_only_server_gets_no_diagnostics_advertisement() -> Result<()> {
+    let dir = tempdir()?;
+    let init_log = dir.path().join("init_params.json");
+    let bin = env!("CARGO_BIN_EXE_mockls");
+
+    let log_path = init_log.to_str().ok_or_else(|| anyhow::anyhow!("path"))?;
+    // `yX4Za` is absent from the blessed manifest ⇒ unverified ⇒ enrichment-only.
+    let mut client = catenary_mcp::lsp::LspClient::spawn(
+        bin,
+        &[MOCK_LANG_A, "--log-init-params", log_path],
+        MOCK_LANG_A,
+        MOCK_LANG_A,
+        test_logging(),
+        None,
+        None,
+        "",
+    )?;
+
+    client.initialize(&[dir.path().to_path_buf()], None).await?;
+
+    let params_json = std::fs::read_to_string(&init_log)?;
+    let params: serde_json::Value = serde_json::from_str(&params_json)?;
+    let text_doc = &params["capabilities"]["textDocument"];
+
+    // No diagnostics advertisement — both channels withheld.
+    assert!(
+        text_doc.get("diagnostic").is_none(),
+        "an enrichment-only server must not be advertised the pull capability",
+    );
+    assert!(
+        text_doc.get("publishDiagnostics").is_none(),
+        "an enrichment-only server must not be advertised the push capability",
+    );
+    // Enrichment (navigation) capabilities survive — grep/glob is untouched.
+    assert!(
+        text_doc.get("definition").is_some(),
+        "definition (enrichment) must still be advertised",
+    );
+    assert!(
+        text_doc.get("documentSymbol").is_some(),
+        "documentSymbol (enrichment) must still be advertised",
     );
 
     client.shutdown().await?;

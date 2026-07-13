@@ -162,6 +162,18 @@ pub struct LspServer {
     /// [`super::server_behavior::ServerProfile::declares_push`], immutable
     /// thereafter.
     declares_push: bool,
+    /// Blessed/unverified classification: when set, this server is an unverified
+    /// custom def and is **enrichment-only** (diagnostics-debt 04b / DESIGN
+    /// §"The blessed set") — never a diagnostics source. [`Self::supports_diagnostics`]
+    /// returns `false` for it regardless of advertised capabilities, so the
+    /// `diagnostic_servers` gate excludes it, the held-open batch sync lifecycle
+    /// never engages it, and any publish it sends anyway is never collected. Its
+    /// query capabilities (definition, references, symbols) and watched-files
+    /// delivery are untouched: only diagnostics listening is withheld. Set once at
+    /// construction from
+    /// [`super::server_behavior::ServerProfile::is_enrichment_only`], immutable
+    /// thereafter.
+    enrichment_only: bool,
     supports_workspace_diagnostics: OnceLock<bool>,
     supports_text_document_sync: OnceLock<bool>,
     supports_definition: OnceLock<bool>,
@@ -270,11 +282,13 @@ impl LspServer {
         let profile = super::server_behavior::ServerProfile::for_server(server_name.as_str());
         let pull_suppressed = profile.suppresses_pull_diagnostics();
         let declares_push = profile.declares_push();
+        let enrichment_only = profile.is_enrichment_only();
         Self {
             capabilities: OnceLock::new(),
             supports_pull_diagnostics: AtomicBool::new(false),
             pull_suppressed,
             declares_push,
+            enrichment_only,
             supports_workspace_diagnostics: OnceLock::new(),
             supports_text_document_sync: OnceLock::new(),
             supports_definition: OnceLock::new(),
@@ -451,12 +465,35 @@ impl LspServer {
     /// via `publishDiagnostics`) or `diagnosticProvider` (pull diagnostics
     /// via `textDocument/diagnostic`). Used as the capability gate for
     /// diagnostic dispatch in [`super::LspClientManager::get_servers`].
+    ///
+    /// **Always `false` for an enrichment-only (unverified) server**
+    /// (diagnostics-debt 04b / DESIGN §"The blessed set"), regardless of what it
+    /// advertised: an unverified server is never a diagnostics source, so the
+    /// `diagnostic_servers` gate excludes it, the held-open batch sync lifecycle
+    /// never engages it, and a stray publish it sends anyway is never collected.
+    /// Its query capabilities and watched-files delivery are unaffected — those
+    /// gate on other predicates.
     pub fn supports_diagnostics(&self) -> bool {
+        if self.enrichment_only {
+            return false;
+        }
         self.supports_text_document_sync
             .get()
             .copied()
             .unwrap_or(false)
             || self.supports_pull_diagnostics()
+    }
+
+    /// Returns whether this server is **enrichment-only** — unverified, so never a
+    /// diagnostics source (diagnostics-debt 04b).
+    ///
+    /// Set once at construction from
+    /// [`super::server_behavior::ServerProfile::is_enrichment_only`] (a custom
+    /// `[lsp.server.*]` def absent from the blessed manifest). Immutable
+    /// thereafter. See [`Self::supports_diagnostics`] for the behavioural
+    /// consequence.
+    pub const fn is_enrichment_only(&self) -> bool {
+        self.enrichment_only
     }
 
     /// Returns whether the server supports pull diagnostics.
@@ -526,11 +563,18 @@ impl LspServer {
     /// (LSP 3.17). Gates the whole-root `catenary diagnostics .` scope onto a
     /// single `workspace/diagnostic` request off the server's existing project
     /// model, in place of the per-file fan-out (workstream 37 ticket 04).
+    ///
+    /// **Always `false` for an enrichment-only server** (diagnostics-debt 04b): an
+    /// unverified server is never a diagnostics source, even for a whole-root
+    /// scope, regardless of what its `initialize` response advertised — the same
+    /// stance [`Self::supports_diagnostics`] takes for the per-file path.
     pub fn supports_workspace_diagnostics(&self) -> bool {
-        self.supports_workspace_diagnostics
-            .get()
-            .copied()
-            .unwrap_or(false)
+        !self.enrichment_only
+            && self
+                .supports_workspace_diagnostics
+                .get()
+                .copied()
+                .unwrap_or(false)
     }
 
     /// Returns the diagnostic pull `identifier`, if the server advertised one.
@@ -1378,6 +1422,19 @@ mod tests {
     /// Helper: creates an `LspServer` with capabilities already set.
     fn server_with_caps(caps: Value) -> LspServer {
         let server = test_server();
+        server.set_capabilities(caps);
+        server
+    }
+
+    /// Helper: creates a **blessed** `LspServer` with capabilities already set.
+    ///
+    /// `test-server` is an unverified name, so it classifies enrichment-only and
+    /// [`LspServer::supports_diagnostics`] is `false` regardless of advertised
+    /// capability (diagnostics-debt 04b). The push/pull OR-logic tests below need
+    /// a diagnostics-eligible server, so they use `clangd` — blessed and fully
+    /// uncased (no discipline row, so not pull-suppressed and not enrichment-only).
+    fn blessed_server_with_caps(caps: Value) -> LspServer {
+        let server = LspServer::new("c".to_string(), "clangd".to_string(), None);
         server.set_capabilities(caps);
         server
     }
@@ -2702,44 +2759,75 @@ mod tests {
     #[test]
     fn supports_diagnostics_text_document_sync_only() {
         // textDocumentSync present, no diagnosticProvider → should still
-        // support diagnostics (push via publishDiagnostics).
-        let server = server_with_caps(json!({ "textDocumentSync": { "openClose": true } }));
+        // support diagnostics (push via publishDiagnostics). Blessed server so the
+        // enrichment-only gate does not fire.
+        let server = blessed_server_with_caps(json!({ "textDocumentSync": { "openClose": true } }));
         assert!(!server.supports_pull_diagnostics());
         assert!(server.supports_diagnostics());
     }
 
     #[test]
     fn supports_diagnostics_pull_only() {
-        // diagnosticProvider present, no textDocumentSync → supports diagnostics
-        let server = server_with_caps(json!({ "diagnosticProvider": {} }));
+        // diagnosticProvider present, no textDocumentSync → supports diagnostics.
+        let server = blessed_server_with_caps(json!({ "diagnosticProvider": {} }));
         assert!(server.supports_pull_diagnostics());
         assert!(server.supports_diagnostics());
     }
 
     #[test]
     fn supports_diagnostics_neither() {
-        let server = server_with_caps(json!({}));
+        let server = blessed_server_with_caps(json!({}));
         assert!(!server.supports_diagnostics());
+    }
+
+    #[test]
+    fn enrichment_only_server_never_supports_diagnostics() {
+        // An unverified custom def (`test-server` is absent from the blessed
+        // manifest) is enrichment-only, so `supports_diagnostics` is false even
+        // when it advertises both push and pull — the batch sync lifecycle never
+        // engages it and its publishes are never collected (diagnostics-debt 04b).
+        let server = server_with_caps(json!({
+            "textDocumentSync": { "openClose": true },
+            "diagnosticProvider": {}
+        }));
+        assert!(server.is_enrichment_only(), "test-server is unverified");
+        assert!(
+            !server.supports_diagnostics(),
+            "an enrichment-only server is never a diagnostics source",
+        );
     }
 
     #[test]
     fn workspace_diagnostics_gated_on_nested_flag() {
         // A pull provider without `workspaceDiagnostics` supports per-file pull
-        // but NOT the whole-workspace request.
-        let per_file = server_with_caps(json!({
+        // but NOT the whole-workspace request. Blessed server so the workspace-diag
+        // capability is not withheld by the enrichment-only gate.
+        let per_file = blessed_server_with_caps(json!({
             "diagnosticProvider": { "workspaceDiagnostics": false }
         }));
         assert!(per_file.supports_pull_diagnostics());
         assert!(!per_file.supports_workspace_diagnostics());
 
         // The nested flag flips workspace support on.
-        let workspace = server_with_caps(json!({
+        let workspace = blessed_server_with_caps(json!({
             "diagnosticProvider": { "workspaceDiagnostics": true }
         }));
         assert!(workspace.supports_workspace_diagnostics());
 
         // Absent provider → no workspace support.
-        assert!(!server_with_caps(json!({})).supports_workspace_diagnostics());
+        assert!(!blessed_server_with_caps(json!({})).supports_workspace_diagnostics());
+    }
+
+    #[test]
+    fn enrichment_only_server_never_supports_workspace_diagnostics() {
+        // Even if an unverified server spontaneously advertises
+        // `workspaceDiagnostics`, the enrichment-only gate withholds the whole-root
+        // scope — never a diagnostics source (diagnostics-debt 04b).
+        let server = server_with_caps(json!({
+            "diagnosticProvider": { "workspaceDiagnostics": true }
+        }));
+        assert!(server.is_enrichment_only());
+        assert!(!server.supports_workspace_diagnostics());
     }
 
     #[test]

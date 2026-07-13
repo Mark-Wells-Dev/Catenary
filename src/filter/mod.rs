@@ -80,7 +80,7 @@ impl DiagnosticCode {
 /// - Empty string: drop the diagnostic entirely.
 #[must_use]
 pub fn compress_message(server: &str, version: Option<&str>, message: &str) -> String {
-    let record = crate::recipes::seed_manifest().discipline_for(server);
+    let record = crate::recipes::active_manifest().discipline_for(server);
     if record.compress.is_empty() || !record.compress_applies(version) {
         return message.to_string();
     }

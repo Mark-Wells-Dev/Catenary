@@ -950,21 +950,146 @@ pub fn default_blessed_manifest() -> Result<BlessedManifest> {
     parse_blessed_manifest(DEFAULT_BLESSED_MANIFEST)
 }
 
-/// The embedded seed manifest, parsed once and cached — the build-time
-/// projection source for [`crate::lsp::server_behavior::ServerProfile`] and the
-/// [`crate::filter`] compressor (diagnostics-debt 04).
+/// The embedded seed manifest, parsed once and cached — the offline
+/// directional-safety **floor** under [`active_manifest`] (diagnostics-debt 04).
 ///
-/// The daemon does not thread the *fetched* manifest into the synchronous LSP
-/// construction seams (`LspServer::new`, `params::initialize`), so those seams
-/// project from the embedded seed — always available offline and the
-/// directional-safety floor: a server absent from the seed carries no casing and
+/// Always available offline: a server absent from the seed carries no casing and
 /// no compression, which only ever makes Catenary noisier. A malformed embedded
 /// manifest (its own tests forbid it) degrades to an empty manifest — every
-/// server then classifies enrichment-only, never more trusting.
+/// server then classifies enrichment-only, never more trusting. This is the value
+/// [`active_manifest`] is seeded with before any registry refresh threads a
+/// fetched manifest in.
 #[must_use]
 pub fn seed_manifest() -> &'static BlessedManifest {
     static SEED: std::sync::OnceLock<BlessedManifest> = std::sync::OnceLock::new();
     SEED.get_or_init(|| default_blessed_manifest().unwrap_or_default())
+}
+
+/// The process-wide **active** blessed manifest (diagnostics-debt 04b).
+///
+/// The projection source for [`crate::lsp::server_behavior::ServerProfile`], the
+/// [`crate::filter`] compressor, and the blessed/unverified classification.
+///
+/// The synchronous LSP construction seams (`LspServer::new`, `params::initialize`,
+/// `compress_message`) are server-name-blind and cannot thread the resolved
+/// registry through their signatures, so they consult this holder. It is seeded
+/// with the embedded [`seed_manifest`] — the offline floor — and upgraded in
+/// place by [`install_active_manifest`] when the daemon's registry refresh
+/// resolves a fetched or cached manifest (the registry chain's output). A re-pin
+/// therefore ships updated discipline/casing/compression **without a binary
+/// release**: the projection shape is unchanged; only the source upgrades.
+///
+/// **Directional safety, preserved:** the registry loader already degrades a
+/// fetch failure, a bad signature, or an unreadable schema down to the seed
+/// (`RegistrySource::Seed`), so an install only ever replaces the floor with an
+/// equal-or-more-verified manifest — fetched-absent stays seed-only (noisier),
+/// never more trusting.
+#[must_use]
+pub fn active_manifest() -> std::sync::Arc<BlessedManifest> {
+    std::sync::Arc::clone(
+        &active_slot()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// Installs a resolved manifest as the process-wide [`active_manifest`].
+///
+/// Called by the daemon's registry-refresh task after a resolution, so live
+/// daemons pick up a re-pin's discipline without a binary release. Overwrites the
+/// current active manifest wholesale — the registry chain has already resolved
+/// the best rung available (verified → cache → seed) and degraded a failed fetch
+/// to the seed, so the installed value is never *less* verified than the floor
+/// (directional safety).
+pub fn install_active_manifest(manifest: std::sync::Arc<BlessedManifest>) {
+    *active_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = manifest;
+}
+
+/// The swappable slot backing [`active_manifest`], seeded with the offline floor.
+fn active_slot() -> &'static std::sync::RwLock<std::sync::Arc<BlessedManifest>> {
+    static SLOT: std::sync::OnceLock<std::sync::RwLock<std::sync::Arc<BlessedManifest>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(seed_manifest().clone())))
+}
+
+/// The env var naming extra servers to treat as **blessed**, colon-separated —
+/// the deliberate operator opt-in (diagnostics-debt 04b).
+///
+/// A server named here classifies as a diagnostics source even though it is
+/// absent from the manifest's blessed set. Two intended uses: a power user who has
+/// personally verified a custom server and accepts its diagnostics, and the
+/// integration/conformance harness, whose mock servers stand in for real (blessed)
+/// servers to exercise the diagnostics lifecycle. The sentinel `*` blesses **every**
+/// server — the harness's wildcard, so a mockls stand-in with a random name is a
+/// diagnostics source without the test enumerating it.
+///
+/// It only ever makes Catenary **more** trusting, and only when explicitly set —
+/// unlike a missing manifest, which must degrade to noisier (directional safety
+/// governs the *automatic* direction; an operator opt-in is a separate,
+/// deliberate act).
+const BLESS_SERVERS_ENV: &str = "CATENARY_BLESS_SERVERS";
+
+/// Whether `server_name` is **blessed** — a diagnostics source — per the active
+/// manifest OR the [`BLESS_SERVERS_ENV`] operator override (diagnostics-debt 04b).
+///
+/// The single classification predicate every seam consults
+/// ([`crate::lsp::server_behavior::ServerProfile::for_server`], the manager's
+/// coverage gate, the doctor disclosure), so the manifest membership and the
+/// opt-in stay in one place. A server absent from both is unverified —
+/// enrichment-only, never a diagnostics source.
+#[must_use]
+pub fn is_server_blessed(server_name: &str) -> bool {
+    active_manifest().is_blessed(server_name)
+        || env_blessed(server_name)
+        || test_blessed(server_name)
+}
+
+/// The `#[cfg(test)]` blessing rule — in-process unit tests that exercise the
+/// diagnostics *lifecycle* with a mock server (a name absent from the manifest)
+/// must have it treated as a diagnostics source, not downgraded to
+/// enrichment-only.
+///
+/// `std::env::set_var` is `unsafe` under Rust 2024 and this crate forbids
+/// `unsafe`, so the subprocess env override ([`env_blessed`]) — the harness's
+/// mechanism — is unreachable from an in-process test. The in-process twin is the
+/// **`mockls-` prefix**: every unit-test mock server is named `mockls-…` (the
+/// shared convention across the `manager`/`hook_router` fixtures), so the prefix
+/// blesses them all without each test enumerating a name. It only ever *adds*
+/// blessed names, so the classification tests — which assert a name
+/// (`test-server`, `yX4Za`, `some-custom-server`, none `mockls-` prefixed) is
+/// enrichment-only — stay strict.
+#[cfg(test)]
+fn test_blessed(server_name: &str) -> bool {
+    server_name.starts_with("mockls-")
+}
+
+/// Non-test build: no test blessing, so classification is manifest + env only.
+#[cfg(not(test))]
+const fn test_blessed(_server_name: &str) -> bool {
+    false
+}
+
+/// Whether [`BLESS_SERVERS_ENV`] blesses `server_name` — the `*` wildcard blesses
+/// all, otherwise an exact colon-separated entry match (empty/whitespace entries
+/// ignored).
+fn env_blessed(server_name: &str) -> bool {
+    std::env::var(BLESS_SERVERS_ENV).is_ok_and(|raw| bless_list_matches(&raw, server_name))
+}
+
+/// The pure matcher behind [`env_blessed`]: whether the colon-separated `raw`
+/// bless list covers `server_name`.
+///
+/// `*` blesses everything; otherwise an entry matches `server_name` exactly.
+/// Empty/whitespace-only entries are ignored, so a trailing colon or a blank list
+/// blesses nothing. Split out (rather than inlined) because `std::env::set_var` is
+/// `unsafe` under Rust 2024 and this crate forbids `unsafe`, so the matcher is
+/// tested directly on strings.
+fn bless_list_matches(raw: &str, server_name: &str) -> bool {
+    raw.split(':')
+        .map(str::trim)
+        .any(|entry| entry == "*" || (!entry.is_empty() && entry == server_name))
 }
 
 #[cfg(test)]
@@ -1154,6 +1279,20 @@ mod tests {
                 "discipline row `{name}` names a server that is not in the blessed set"
             );
         }
+    }
+
+    #[test]
+    fn bless_list_matches_wildcard_and_exact_entries() {
+        // The operator opt-in (diagnostics-debt 04b): `*` blesses everything;
+        // otherwise an exact colon-separated entry matches; blank entries are
+        // ignored so a trailing colon or an empty list blesses nothing.
+        assert!(super::bless_list_matches("*", "anything"));
+        assert!(super::bless_list_matches("foo:*:bar", "whatever"));
+        assert!(super::bless_list_matches("mockls:my-server", "my-server"));
+        assert!(super::bless_list_matches(" my-server ", "my-server"));
+        assert!(!super::bless_list_matches("foo:bar", "my-server"));
+        assert!(!super::bless_list_matches("", "my-server"));
+        assert!(!super::bless_list_matches(":", "my-server"));
     }
 
     #[test]

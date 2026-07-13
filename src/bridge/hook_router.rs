@@ -597,24 +597,44 @@ impl HookRouter {
                 self.record_covered_write(path, session_id, agent_id, "edited");
             }
         } else if self.session.is_within_roots(path) {
-            // In-root but no covering feeder (misc 173): a different predicate
-            // from out-of-roots — the root IS tracked; the file's type just has
-            // no configured server or linter (`Makefile`, `.txt`, logs).
-            // Recorded in its own bucket with the file's display name so the
-            // bare-run note names what went unchecked instead of claiming the
-            // edit was outside a root it then prints. Same standalone
-            // semantics as the outside leg: the entry is created when needed,
-            // holds no files, and never trips the gate.
-            self.session.editing.record_uncovered_edit(
-                session_id,
-                agent_id,
-                skipped_display_name(path),
-            );
-            debug!(
-                source = Source::HookDispatch.as_str(),
-                file = file_path,
-                "file skipped (in-root, no covering feeder)",
-            );
+            if self.session.has_unverified_only_coverage(path) {
+                // In-root, covered ONLY by an unverified (enrichment-only) server
+                // (diagnostics-debt 04b): a diagnostics server exists but is not
+                // blessed, so Catenary withholds its diagnostics and the gate
+                // does not arm. Its own bucket, distinct from the truly-uncovered
+                // one, so the note declares "not diagnostics-covered" (a server
+                // exists) rather than "no covering server" (none does) — the
+                // footgun ruling: unknowns get declaration, not interpretation.
+                self.session.editing.record_unverified_edit(
+                    session_id,
+                    agent_id,
+                    skipped_display_name(path),
+                );
+                debug!(
+                    source = Source::HookDispatch.as_str(),
+                    file = file_path,
+                    "file skipped (in-root, only an unverified server covers it)",
+                );
+            } else {
+                // In-root but no covering feeder (misc 173): a different predicate
+                // from out-of-roots — the root IS tracked; the file's type just has
+                // no configured server or linter (`Makefile`, `.txt`, logs).
+                // Recorded in its own bucket with the file's display name so the
+                // bare-run note names what went unchecked instead of claiming the
+                // edit was outside a root it then prints. Same standalone
+                // semantics as the outside leg: the entry is created when needed,
+                // holds no files, and never trips the gate.
+                self.session.editing.record_uncovered_edit(
+                    session_id,
+                    agent_id,
+                    skipped_display_name(path),
+                );
+                debug!(
+                    source = Source::HookDispatch.as_str(),
+                    file = file_path,
+                    "file skipped (in-root, no covering feeder)",
+                );
+            }
         } else {
             // Out-of-root edit: `handle_enforce_editing` let it flow
             // free WITHOUT entering editing mode, so a *standalone* one (no
@@ -707,6 +727,7 @@ impl HookRouter {
         let mut started = self.session.editing.is_editing(session_id, agent_id);
         let mut outside = 0usize;
         let mut uncovered: Vec<String> = Vec::new();
+        let mut unverified: Vec<String> = Vec::new();
         for path in writes {
             // Canonicalize (when it exists) before the coverage check so a
             // symlinked prefix does not mis-file a covered write as out-of-root —
@@ -720,9 +741,17 @@ impl HookRouter {
                 }
                 self.record_covered_write(&path, session_id, agent_id, "wrote");
             } else if self.session.is_within_roots(&path) {
-                // In-root, no covering feeder (misc 173) — its own bucket,
-                // named, so the note doesn't misattribute it to root coverage.
-                uncovered.push(skipped_display_name(&path));
+                if self.session.has_unverified_only_coverage(&path) {
+                    // In-root, only an unverified (enrichment-only) server covers
+                    // it (diagnostics-debt 04b) — its own bucket, so the note
+                    // declares "not diagnostics-covered" (a server exists) rather
+                    // than "no covering server".
+                    unverified.push(skipped_display_name(&path));
+                } else {
+                    // In-root, no covering feeder (misc 173) — its own bucket,
+                    // named, so the note doesn't misattribute it to root coverage.
+                    uncovered.push(skipped_display_name(&path));
+                }
             } else {
                 outside += 1;
             }
@@ -740,6 +769,11 @@ impl HookRouter {
                 self.session
                     .editing
                     .record_uncovered_edit(session_id, agent_id, name);
+            }
+            for name in unverified {
+                self.session
+                    .editing
+                    .record_unverified_edit(session_id, agent_id, name);
             }
         }
     }

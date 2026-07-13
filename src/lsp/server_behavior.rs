@@ -15,21 +15,29 @@
 //! are user-scope-only; conformance settings are shipped/engine-scope-only.
 //!
 //! The knowledge lives in exactly one place — the blessed **manifest**
-//! (`defaults/blessed-manifest.toml`, `[discipline.<server>]` tables). This
-//! module is the *projection* of that data onto the shape the seams consume: the
-//! former hand-coded profile table became the manifest's build-time projection
-//! (diagnostics-debt 04 — generated from the manifest, not a rival home). The
-//! projection reads the embedded seed manifest ([`crate::recipes::seed_manifest`],
-//! parsed once) because the LSP construction seams are synchronous and the daemon
-//! does not thread the *fetched* manifest into them; the seed is always available
-//! offline and is the directional-safety floor. The consuming seams
-//! (client-capability construction, initialization-option assembly, the
-//! diagnostics pull gate) each make a single profile call and are themselves
-//! server-name-blind: no seam special-cases a server by name. The CI conformance
-//! matrix re-verifies every profile invariant on every re-pin, which is what makes
-//! carrying these settings safe (maintainer direction, bug 82: discipline
-//! knowledge is "not something I want to be 'configurable' by the user but set on
-//! a case by case basis").
+//! (`defaults/blessed-manifest.toml`, `[blessed.*]` + `[discipline.<server>]`
+//! tables). This module is the *projection* of that data onto the shape the seams
+//! consume: the former hand-coded profile table became the manifest's build-time
+//! projection (diagnostics-debt 04 — generated from the manifest, not a rival
+//! home). The projection reads the process-wide **active** manifest
+//! ([`crate::recipes::active_manifest`]) — seeded with the embedded seed and
+//! upgraded in place by the daemon's registry refresh (diagnostics-debt 04b) — so
+//! a re-pin ships updated discipline/casing/classification without a binary
+//! release; the seed remains the offline floor and the directional-safety default.
+//! The consuming seams (client-capability construction, initialization-option
+//! assembly, the diagnostics pull gate) each make a single profile call and are
+//! themselves server-name-blind: no seam special-cases a server by name. The CI
+//! conformance matrix re-verifies every profile invariant on every re-pin, which
+//! is what makes carrying these settings safe (maintainer direction, bug 82:
+//! discipline knowledge is "not something I want to be 'configurable' by the user
+//! but set on a case by case basis").
+//!
+//! The profile also carries the **blessed/unverified classification**
+//! (diagnostics-debt 04b / DESIGN §"The blessed set"): a server absent from the
+//! manifest's blessed set is an unverified custom def and is **enrichment-only**
+//! ([`ServerProfile::is_enrichment_only`]) — no diagnostics capability advertised,
+//! publishes ignored, no batch sync lifecycle — while grep/glob queries and
+//! watched-files delivery are untouched.
 //!
 //! Three conformance invariants are cased today:
 //!
@@ -81,6 +89,14 @@ use crate::config::merge::deep_merge;
 /// server-name-blind.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerProfile {
+    /// When set, the server is **unverified** — a custom `[lsp.server.*]` def
+    /// absent from the blessed manifest — so it is **enrichment-only**
+    /// (diagnostics-debt 04b / DESIGN §"The blessed set"): it advertises no
+    /// diagnostics capability, its publishes are ignored if sent anyway, and the
+    /// held-open batch sync lifecycle never engages it. grep/glob queries keep
+    /// their own open→query→close cycle (it is the diagnostics *listening* that is
+    /// withheld); watched-files are still delivered. A blessed server clears this.
+    enrichment_only: bool,
     /// When set, the server must never receive the `textDocument.diagnostic`
     /// client capability, and must never be sent `textDocument/diagnostic`
     /// (advertised pull *or* best-effort probe) — its native pushes are the sole
@@ -106,26 +122,64 @@ pub struct ServerProfile {
 
 impl ServerProfile {
     /// Resolves the conformance profile for `server_name` — the single lookup
-    /// every seam calls. Projects the server's manifest discipline record; a
-    /// server with no discipline row (an unverified custom def, or a blessed
-    /// server that needs no casing) resolves to the default (no conformance
-    /// settings) profile.
+    /// every seam calls. Reads the process-wide **active** manifest
+    /// ([`crate::recipes::active_manifest`]), so a re-pin's classification and
+    /// casing reach the seams without a binary release (diagnostics-debt 04b). A
+    /// server absent from the manifest's blessed set is **enrichment-only**; a
+    /// blessed server with no discipline row (or one that needs no casing)
+    /// resolves to the casing-free (but blessed) profile.
     #[must_use]
     pub fn for_server(server_name: &str) -> Self {
-        Self::from_record(&crate::recipes::seed_manifest().discipline_for(server_name))
+        let manifest = crate::recipes::active_manifest();
+        // Classification consults the operator opt-in too
+        // ([`crate::recipes::is_server_blessed`]); the discipline record is
+        // manifest-only (an opt-in server carries no casing, which is the safe
+        // default — no forced options, no pull suppression).
+        Self::from_record(&manifest.discipline_for(server_name))
+            .with_enrichment_only(!crate::recipes::is_server_blessed(server_name))
     }
 
     /// Projects a manifest [`crate::recipes::DisciplineRecord`] onto a
     /// `ServerProfile` — the single place the manifest's casing data becomes the
     /// shape the seams consume (diagnostics-debt 04).
+    ///
+    /// Leaves the blessed/unverified classification at its default (blessed —
+    /// `enrichment_only == false`); [`Self::for_server`] sets it from the
+    /// manifest's blessed set. A bare `from_record` is the casing projection only,
+    /// used where the discipline record is already in hand.
     #[must_use]
     pub fn from_record(record: &crate::recipes::DisciplineRecord) -> Self {
         Self {
+            enrichment_only: false,
             suppress_pull_diagnostics: record.suppress_pull,
             forced_initialization_options: record.forced_init_options.as_ref().map(toml_to_json),
             forbidden_initialization_options: record.forbidden_init_options.clone(),
             declares_push: record.declares_push,
         }
+    }
+
+    /// Sets the enrichment-only (unverified) classification, consuming and
+    /// returning `self` — the builder leg [`Self::for_server`] uses after the
+    /// casing projection.
+    #[must_use]
+    const fn with_enrichment_only(mut self, enrichment_only: bool) -> Self {
+        self.enrichment_only = enrichment_only;
+        self
+    }
+
+    /// Whether this server is **enrichment-only** — unverified, so it is never a
+    /// diagnostics source (diagnostics-debt 04b / DESIGN §"The blessed set").
+    ///
+    /// An enrichment-only server advertises no diagnostics capability
+    /// ([`Self::shape_client_capabilities`] strips both the pull capability and
+    /// `publishDiagnostics`), its publishes are ignored, and the batch sync
+    /// lifecycle never engages it ([`super::LspServer::supports_diagnostics`] is
+    /// `false`). grep/glob queries keep their own open→query→close cycle and
+    /// watched-files are still delivered — it is the diagnostics *listening* that
+    /// is withheld, exactly the delivery behaviour that is unverified.
+    #[must_use]
+    pub const fn is_enrichment_only(&self) -> bool {
+        self.enrichment_only
     }
 
     /// Whether this server's client-side pull path is gated off.
@@ -153,16 +207,34 @@ impl ServerProfile {
     /// Applies the profile's client-capability shaping to a built `capabilities`
     /// object in place — the capability-construction seam.
     ///
-    /// Today this removes `textDocument.diagnostic` for a pull-suppressed server.
-    /// Removing the key (rather than building a different block) keeps the
-    /// capability shape byte-for-byte identical for every un-profiled server.
+    /// Two shapings, both by key removal so the capability shape stays
+    /// byte-for-byte identical for every un-profiled (blessed, uncased) server:
+    ///
+    /// - a **pull-suppressed** server (rust-analyzer) loses `textDocument.diagnostic`
+    ///   — it is never asked to serve pull diagnostics;
+    /// - an **enrichment-only** server (unverified, diagnostics-debt 04b) loses
+    ///   **both** `textDocument.diagnostic` (pull) *and*
+    ///   `textDocument.publishDiagnostics` (push): Catenary advertises no
+    ///   diagnostics capability at all, so the server has no signal to publish
+    ///   into and its diagnostics listening is withheld. Every other advertised
+    ///   capability (definition, references, symbols, …) survives, so grep/glob
+    ///   enrichment and watched-files continue unchanged.
     pub fn shape_client_capabilities(&self, capabilities: &mut Value) {
-        if self.suppress_pull_diagnostics
-            && let Some(text_document) = capabilities
-                .get_mut("textDocument")
-                .and_then(Value::as_object_mut)
-        {
-            text_document.remove("diagnostic");
+        if !(self.suppress_pull_diagnostics || self.enrichment_only) {
+            return;
+        }
+        let Some(text_document) = capabilities
+            .get_mut("textDocument")
+            .and_then(Value::as_object_mut)
+        else {
+            return;
+        };
+        // A pull-suppressed OR enrichment-only server loses the pull capability.
+        text_document.remove("diagnostic");
+        // An enrichment-only server additionally loses the push capability — no
+        // diagnostics advertisement whatsoever.
+        if self.enrichment_only {
+            text_document.remove("publishDiagnostics");
         }
     }
 
@@ -280,7 +352,9 @@ mod tests {
         });
         ServerProfile::for_server("rust-analyzer").shape_client_capabilities(&mut caps);
         assert!(caps["textDocument"].get("diagnostic").is_none());
-        // Only `diagnostic` is dropped; siblings survive.
+        // Only `diagnostic` is dropped; siblings survive. A blessed pull-suppressed
+        // server still advertises push (`publishDiagnostics`) — it is not
+        // enrichment-only.
         assert!(caps["textDocument"].get("definition").is_some());
     }
 
@@ -292,6 +366,80 @@ mod tests {
         let mut caps = original.clone();
         ServerProfile::for_server("clangd").shape_client_capabilities(&mut caps);
         assert_eq!(caps, original);
+    }
+
+    // ── blessed / unverified classification (diagnostics-debt 04b) ───────
+
+    #[test]
+    fn blessed_servers_are_not_enrichment_only() {
+        // Every blessed server (whether pull-suppressed, declared-push, or uncased)
+        // is a diagnostics source — never enrichment-only.
+        for name in ["rust-analyzer", "gopls", "lattice", "clangd", "taplo"] {
+            assert!(
+                !ServerProfile::for_server(name).is_enrichment_only(),
+                "{name} is blessed and must not be enrichment-only",
+            );
+        }
+    }
+
+    #[test]
+    fn unverified_custom_def_is_enrichment_only() {
+        // A custom `[lsp.server.*]` def absent from the blessed manifest is
+        // unverified ⇒ enrichment-only.
+        assert!(
+            ServerProfile::for_server("some-custom-server").is_enrichment_only(),
+            "an unverified custom def must be enrichment-only",
+        );
+        assert!(ServerProfile::for_server("yX4Za").is_enrichment_only());
+    }
+
+    #[test]
+    fn shape_withholds_all_diagnostics_for_enrichment_only() {
+        // An enrichment-only (unverified) server advertises NO diagnostics
+        // capability: both the pull `diagnostic` block and the push
+        // `publishDiagnostics` block are stripped, while every other capability
+        // survives so grep/glob enrichment and watched-files are untouched.
+        let mut caps = json!({
+            "textDocument": {
+                "diagnostic": { "dynamicRegistration": false },
+                "publishDiagnostics": { "versionSupport": true },
+                "definition": { "linkSupport": true },
+                "documentSymbol": {}
+            }
+        });
+        let profile = ServerProfile::for_server("some-custom-server");
+        assert!(profile.is_enrichment_only());
+        profile.shape_client_capabilities(&mut caps);
+        assert!(
+            caps["textDocument"].get("diagnostic").is_none(),
+            "the pull capability is withheld",
+        );
+        assert!(
+            caps["textDocument"].get("publishDiagnostics").is_none(),
+            "the push capability is withheld — no diagnostics advertisement at all",
+        );
+        // Non-diagnostics capabilities survive: grep/glob enrichment continues.
+        assert!(caps["textDocument"].get("definition").is_some());
+        assert!(caps["textDocument"].get("documentSymbol").is_some());
+    }
+
+    #[test]
+    fn shape_keeps_publish_for_blessed_suppressed_server() {
+        // A blessed pull-suppressed server (rust-analyzer) keeps its push
+        // capability — only the pull block is dropped. This is the exact boundary
+        // between "pull-suppressed" and "enrichment-only".
+        let mut caps = json!({
+            "textDocument": {
+                "diagnostic": { "dynamicRegistration": false },
+                "publishDiagnostics": { "versionSupport": true }
+            }
+        });
+        ServerProfile::for_server("rust-analyzer").shape_client_capabilities(&mut caps);
+        assert!(caps["textDocument"].get("diagnostic").is_none());
+        assert!(
+            caps["textDocument"].get("publishDiagnostics").is_some(),
+            "a blessed suppressed server still advertises push",
+        );
     }
 
     #[test]

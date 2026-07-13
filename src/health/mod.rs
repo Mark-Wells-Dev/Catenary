@@ -166,6 +166,10 @@ pub enum FindingCode {
     ServerInstallSuggestion,
     /// A configured server nothing routes to — dormant inventory.
     ServerDormant,
+    /// A routed server that is **unverified** (a custom `[lsp.server.*]` def
+    /// absent from the blessed manifest) — enrichment-only, never a diagnostics
+    /// source (diagnostics-debt 04b). A [`Severity::Warning`] disclosure.
+    ServerEnrichmentOnly,
     /// A server that probed ready.
     ServerReady,
     /// The running daemon serves a different build than this binary.
@@ -227,6 +231,7 @@ impl FindingCode {
             Self::ServerRoutedBroken => "server-routed-broken",
             Self::ServerInstallSuggestion => "server-install-suggestion",
             Self::ServerDormant => "server-dormant",
+            Self::ServerEnrichmentOnly => "server-enrichment-only",
             Self::ServerReady => "server-ready",
             Self::VersionSkew => "version-skew",
             Self::HooksStale => "hooks-stale",

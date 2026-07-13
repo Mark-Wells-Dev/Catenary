@@ -956,9 +956,11 @@ enum HandoffPayload {
         /// The batch's files snapshotted from the editing session (delivered
         /// ones included — a bare pull re-diagnoses the whole batch).
         files: Vec<PathBuf>,
-        /// Edits skipped at accumulation time, split by predicate (misc 173):
-        /// outside tracked roots vs in-root with no covering feeder. The
-        /// bare-run receipt renders each bucket as its own advisory line.
+        /// Edits skipped at accumulation time, split by predicate (misc 173; the
+        /// unverified bucket added in diagnostics-debt 04b): outside tracked
+        /// roots, in-root with no covering feeder, or in-root covered only by an
+        /// unverified (enrichment-only) server. The bare-run receipt renders each
+        /// bucket as its own advisory line.
         skipped: SkippedEdits,
         /// Host session id (from the staging hook). The bare `catenary
         /// diagnostics` process is identity-less, so the session id rides the
@@ -2973,6 +2975,14 @@ impl SessionManager {
     /// resolution is a network-free no-op and the loop exits immediately — nothing
     /// happens for users until the maintainer turns the registry on.
     ///
+    /// Each resolution's manifest is installed as the process-wide
+    /// [`crate::recipes::active_manifest`] (diagnostics-debt 04b), so the LSP
+    /// construction seams project a re-pin's discipline/casing/classification
+    /// without a binary release. The loader has already degraded a fetch failure,
+    /// a bad signature, or an unreadable schema down to the seed before this point,
+    /// so the installed manifest is never *less* verified than the offline floor
+    /// (directional safety — an absent fetch stays seed-only, never more trusting).
+    ///
     /// A fully detached task mirroring the sibling spawn_* reapers; the config is
     /// read independently in a blocking sub-task so a slow config load never
     /// stalls the runtime.
@@ -2999,6 +3009,14 @@ impl SessionManager {
                     break;
                 };
                 crate::registry::log_resolution(&resolved);
+                // Thread the resolved manifest into the LSP construction seams
+                // (diagnostics-debt 04b): a re-pin's discipline/casing/classification
+                // reaches live daemons without a binary release. The loader already
+                // floored a failed/unreadable resolution at the seed, so this only
+                // ever installs an equal-or-more-verified manifest.
+                crate::recipes::install_active_manifest(std::sync::Arc::new(
+                    resolved.payload.manifest.clone(),
+                ));
                 if !enabled {
                     // Seed-only (the shipped default): nothing to refresh on a
                     // timer, so the task retires after the startup resolution.
@@ -3260,14 +3278,21 @@ fn get_or_create_router(
 /// edits never renders the bare `[no edited files]` lie (bug 58). Returns
 /// `output` unchanged when nothing was skipped.
 ///
-/// The two buckets are different predicates and render as two distinct lines
-/// (misc 173) — collapsing them claimed "outside tracked roots" for an in-root
-/// `Makefile` while naming its containing root in the same parenthesis:
+/// The buckets are different predicates and render as distinct lines
+/// (misc 173; the unverified bucket added in diagnostics-debt 04b) — collapsing
+/// them claimed "outside tracked roots" for an in-root `Makefile` while naming
+/// its containing root in the same parenthesis:
 ///
 /// - **In-root, no covering feeder** (`skipped.uncovered`): the root is
 ///   tracked, but no server or linter covers the file (`Makefile`, `.txt`,
 ///   logs). The note names the files — "(2 edits had no covering server when
 ///   made (Makefile) — not checked)" — so it teaches what went unchecked.
+/// - **In-root, only an unverified server** (`skipped.unverified`): a
+///   diagnostics server IS configured for the file's language, but it is an
+///   unverified custom def (enrichment-only), so Catenary withholds its
+///   diagnostics. The note DECLARES "not diagnostics-covered" — a server exists
+///   (never "no covering server"), and the wording never blames Catenary
+///   (DESIGN's footgun ruling).
 /// - **Outside tracked roots** (`skipped.outside`): `skipped.outside_roots`
 ///   carries the distinct enclosing project roots of those edits (walk
 ///   repository markers up from each). When non-empty the note names them —
@@ -3275,9 +3300,9 @@ fn get_or_create_router(
 ///   would mount (ephemeral-roots ticket 01); when empty (no detectable
 ///   root) it falls back to the plain count.
 ///
-/// Both wordings are past-tense event language — the edits *were* outside /
-/// *had* no covering server *when made*, not a claim about current server
-/// state (bug 170).
+/// Every wording is past-tense event language — the edits *were* outside /
+/// *had* no covering server / *were* not diagnostics-covered *when made*, not a
+/// claim about current server state (bug 170).
 #[cfg(unix)]
 fn with_skipped_edits_note(output: String, skipped: &SkippedEdits) -> String {
     if skipped.is_empty() {
@@ -3300,6 +3325,33 @@ fn with_skipped_edits_note(output: String, skipped: &SkippedEdits) -> String {
                 .join(", ");
             notes.push(format!(
                 "({count} edit{plural} had no covering server when made ({named}) \u{2014} not checked)",
+            ));
+        }
+    }
+    if skipped.unverified > 0 {
+        // The third rendering (diagnostics-debt 04b): a diagnostics server IS
+        // configured for these files, but it is unverified (a custom
+        // `[lsp.server.*]` def, enrichment-only), so Catenary withholds its
+        // diagnostics. The wording DECLARES the fact plainly ("not
+        // diagnostics-covered") — never "no covering server" (a server exists) and
+        // never uncertainty language that would read as a Catenary quirk. DESIGN's
+        // footgun ruling: receipts only speak where we can vouch; unknowns get
+        // declaration, not interpretation.
+        let count = skipped.unverified;
+        let plural = if count == 1 { "" } else { "s" };
+        if skipped.unverified_files.is_empty() {
+            notes.push(format!(
+                "({count} edit{plural} not diagnostics-covered when made \u{2014} only an unverified server covers them, not checked)",
+            ));
+        } else {
+            let named = skipped
+                .unverified_files
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            notes.push(format!(
+                "({count} edit{plural} not diagnostics-covered when made ({named}) \u{2014} only an unverified server covers them, not checked)",
             ));
         }
     }
@@ -5430,6 +5482,7 @@ async fn handle_hook_dispatch(
             file_count = files.len(),
             skipped_outside = skipped.outside,
             skipped_uncovered = skipped.uncovered,
+            skipped_unverified = skipped.unverified,
             "diagnostics: snapshotted batch from EditingManager (flip deferred to delivery)",
         );
 
@@ -7889,12 +7942,27 @@ mod tests {
     /// Like [`bind_with_session`] but registers `roots` as workspace roots, so
     /// files under them have LSP coverage (tiers 1–2) for editing accumulation.
     fn bind_with_session_roots(dir: &Path, roots: Vec<PathBuf>) -> SessionManager {
+        bind_with_session_config(
+            dir,
+            roots,
+            crate::config::Config::default_with_classification(),
+        )
+    }
+
+    /// Like [`bind_with_session_roots`] but with an explicit config, so a test can
+    /// inject a custom `[lsp.server.*]`/`[lsp.language.*]` binding (e.g. an
+    /// unverified server — diagnostics-debt 04b).
+    fn bind_with_session_config(
+        dir: &Path,
+        roots: Vec<PathBuf>,
+        config: crate::config::Config,
+    ) -> SessionManager {
         let logging = LoggingServer::new();
         let runtime = tokio::runtime::Handle::current();
         let instance_id: Arc<str> = "daemon".into();
         let parent_context = crate::bridge::ParentContextQueue::new();
         let session = Arc::new(crate::bridge::session::Session::new(
-            crate::config::Config::default_with_classification(),
+            config,
             roots,
             logging.clone(),
             instance_id,
@@ -8548,15 +8616,19 @@ mod tests {
     fn skipped_note_renders_both_buckets_distinctly() {
         use std::collections::BTreeSet;
 
-        // A batch mixing both skip predicates renders two distinct lines
-        // (misc 173): the in-root uncovered files by name, the outside edits
-        // by root — never one conflated claim.
+        // A batch mixing all three skip predicates renders three distinct lines
+        // (misc 173; the unverified bucket added in diagnostics-debt 04b): the
+        // in-root uncovered files by name, the unverified-only files under the
+        // "not diagnostics-covered" declaration, and the outside edits by root —
+        // never one conflated claim.
         let covered = "src/main.rs [clean]";
         let skipped = SkippedEdits {
             outside: 2,
             outside_roots: BTreeSet::from([PathBuf::from("/home/dev/Projects/homelab")]),
             uncovered: 1,
             uncovered_files: BTreeSet::from(["Makefile".to_string()]),
+            unverified: 1,
+            unverified_files: BTreeSet::from(["widget.zig".to_string()]),
         };
         let receipt = with_skipped_edits_note(covered.to_string(), &skipped);
         assert!(
@@ -8568,18 +8640,35 @@ mod tests {
             "the uncovered bucket renders its own named line: {receipt}"
         );
         assert!(
+            receipt.contains("1 edit not diagnostics-covered when made (widget.zig)"),
+            "the unverified bucket declares 'not diagnostics-covered' by name: {receipt}"
+        );
+        assert!(
+            receipt.contains("only an unverified server covers them"),
+            "the unverified line states a server exists, unblessed: {receipt}"
+        );
+        // The footgun ruling: the wording never blames Catenary and never says
+        // "no covering server" for the unverified bucket (a server DOES exist).
+        assert!(
+            !receipt.contains("Catenary"),
+            "the note never reads as a Catenary quirk: {receipt}"
+        );
+        assert!(
             receipt.contains("2 edits were outside tracked roots when made (roots: "),
             "the outside bucket keeps the root-aware wording: {receipt}"
         );
         let uncovered_pos = receipt
             .find("had no covering server")
             .expect("uncovered line present");
+        let unverified_pos = receipt
+            .find("not diagnostics-covered")
+            .expect("unverified line present");
         let outside_pos = receipt
             .find("outside tracked roots")
             .expect("outside line present");
         assert!(
-            uncovered_pos < outside_pos,
-            "in-root note renders before the outside note: {receipt}"
+            uncovered_pos < unverified_pos && unverified_pos < outside_pos,
+            "the three notes render in order (uncovered, unverified, outside): {receipt}"
         );
     }
 
@@ -8752,6 +8841,85 @@ mod tests {
         assert!(
             !response.contains("outside tracked roots"),
             "an in-root edit must not be misattributed to root coverage (misc 173), got: {response}",
+        );
+
+        shutdown.cancel();
+    }
+
+    /// diagnostics-debt 04b: an in-root edit whose only covering server is an
+    /// UNVERIFIED custom def must NOT arm the gate, and its receipt must render
+    /// the "not diagnostics-covered" bucket (a server exists, unblessed) — never
+    /// "no covering server" (which would deny a server exists) and never a claim
+    /// that reads as a Catenary quirk (the footgun ruling). This is the
+    /// end-to-end pin: gate silent + receipt bucket wording, together.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn done_editing_handoff_unverified_only_declares_not_diagnostics_covered() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let root = dir.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("create workspace dir");
+
+        // A config binding a custom extension to an UNVERIFIED server (a name
+        // absent from the blessed manifest). No blessing env here — the daemon
+        // classifies it enrichment-only.
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[lsp.server.qqz-ls]\npath = \"/nonexistent/qqz-ls\"\n\n\
+             [lsp.language.qqz]\nextensions = [\"qqz\"]\nservers = [\"qqz-ls\"]\n",
+        )
+        .expect("write config");
+        let config =
+            crate::config::Config::load_from_sources(&[config_path]).expect("config loads");
+
+        let manager = Arc::new(bind_with_session_config(
+            dir.path(),
+            vec![root.clone()],
+            config,
+        ));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Edit an in-root file whose only covering server is unverified.
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "Edit",
+            "file_path": root.join("widget.qqz").display().to_string(),
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let _ = hook_roundtrip(&ipc_path, &req).await;
+
+        // Prepare + run bare diagnostics.
+        let req = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "agent_id": "",
+            "session_id": "sess-1"
+        });
+        let line = hook_roundtrip(&ipc_path, &req).await;
+        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
+
+        let req = serde_json::json!({"method": "tool/editing-stop"});
+        let response = hook_roundtrip_full(&ipc_path, &req).await;
+        assert!(
+            response.contains("not diagnostics-covered"),
+            "an unverified-only edit declares 'not diagnostics-covered', got: {response}",
+        );
+        assert!(
+            response.contains("widget.qqz"),
+            "the note names the unverified-only file, got: {response}",
+        );
+        assert!(
+            !response.contains("had no covering server"),
+            "a server DOES exist — the note must not deny it (uncovered wording), got: {response}",
+        );
+        assert!(
+            !response.contains("outside tracked roots"),
+            "an in-root edit is not outside a root, got: {response}",
         );
 
         shutdown.cancel();
@@ -10170,6 +10338,7 @@ mod tests {
                         )]),
                         uncovered: 1,
                         uncovered_files: std::collections::BTreeSet::from(["Makefile".to_string()]),
+                        ..SkippedEdits::default()
                     },
                     session_id: "sess-1".to_string(),
                     editing_session: Some("sess-1".to_string()),

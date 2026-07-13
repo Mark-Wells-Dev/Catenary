@@ -505,6 +505,56 @@ pub fn strike_findings(servers: &[crate::state_snapshot::ServerEntry]) -> Vec<Fi
     findings
 }
 
+/// One warn-tier finding per configured, routed **unverified** server
+/// (diagnostics-debt 04b / DESIGN §"The blessed set").
+///
+/// An unverified server is a custom `[lsp.server.*]` def absent from the blessed
+/// manifest, so it is enrichment-only and never a diagnostics source.
+///
+/// The loud, user-facing disclosure the design requires: an unverified server
+/// still enriches grep/glob, but Catenary withholds its diagnostics (no
+/// capability advertised, publishes ignored, the gate never arms). The finding
+/// names the server and points at the blessed manifest so the user knows *why*
+/// and *where* to look — declaration, never a Catenary-quirk apology.
+///
+/// Scoped to **intent-routed** servers ([`is_intent_routed`]): a dormant
+/// unverified def nothing routes to is inventory, not an actionable disclosure —
+/// consistent with the routed-vs-dormant severity ladder. A blessed server (the
+/// common case) never produces a finding here.
+#[allow(clippy::implicit_hasher, reason = "callers use the default hasher")]
+#[must_use]
+pub fn enrichment_only_findings(
+    config: &Config,
+    active_languages: &HashSet<String>,
+) -> Vec<Finding> {
+    let mut names: Vec<&String> = config.server.keys().collect();
+    names.sort_unstable();
+
+    names
+        .into_iter()
+        .filter(|name| {
+            !crate::recipes::is_server_blessed(name)
+                && is_intent_routed(config, name, active_languages)
+        })
+        .map(|name| {
+            Finding::new(
+                FindingCode::ServerEnrichmentOnly,
+                Severity::Warning,
+                format!(
+                    "{name}: unverified custom server — enrichment-only, not a diagnostics source"
+                ),
+            )
+            .with_fix_it(
+                "This server is not in Catenary's blessed manifest, so its diagnostics are \
+                 withheld: it advertises no diagnostics capability, its publishes are ignored, \
+                 and the edit gate never arms for its files. It still enriches grep/glob. Only a \
+                 server that passed the CI conformance gate is trusted to report diagnostics — \
+                 see `defaults/blessed-manifest.toml`.",
+            )
+        })
+        .collect()
+}
+
 /// Default per-server timeout for the initialize probe (5 minutes).
 ///
 /// Julia's `LanguageServer.jl` compiles on first run and can take minutes
@@ -754,6 +804,47 @@ mod tests {
         };
         config.language.insert(lang.to_string(), lang_config);
         config
+    }
+
+    #[test]
+    fn enrichment_only_finding_names_the_unverified_routed_server() {
+        // diagnostics-debt 04b: a configured, routed unverified server (a custom
+        // def absent from the blessed manifest) earns exactly one warn-tier
+        // disclosure naming it enrichment-only, with the manifest as the pointer.
+        let config = routed_config("custlang", "my-custom-server");
+        // An explicitly-configured server is intent-routed on its binding alone.
+        let findings = enrichment_only_findings(&config, &HashSet::new());
+        let finding = findings
+            .iter()
+            .find(|f| f.code == FindingCode::ServerEnrichmentOnly)
+            .expect("one enrichment-only finding for the unverified server");
+        assert_eq!(finding.severity, Severity::Warning, "warn-tier disclosure");
+        assert!(
+            finding.message.contains("my-custom-server")
+                && finding.message.contains("enrichment-only"),
+            "the finding names the server and declares it enrichment-only: {}",
+            finding.message,
+        );
+        assert!(
+            finding
+                .fix_it
+                .as_deref()
+                .is_some_and(|f| f.contains("blessed-manifest.toml")),
+            "the fix-it points at the manifest",
+        );
+    }
+
+    #[test]
+    fn enrichment_only_finding_silent_for_blessed_server() {
+        // A blessed server (rust-analyzer) is a diagnostics source, so it produces
+        // NO enrichment-only finding — the disclosure fires only for the unverified.
+        let config = routed_config("rust", "rust-analyzer");
+        let active: HashSet<String> = std::iter::once("rust".to_string()).collect();
+        let findings = enrichment_only_findings(&config, &active);
+        assert!(
+            findings.is_empty(),
+            "a blessed server is never enrichment-only: {findings:?}",
+        );
     }
 
     #[test]

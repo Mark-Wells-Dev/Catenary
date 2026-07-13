@@ -267,6 +267,14 @@ pub fn gather_snapshot(
         }
     }
 
+    // ── Enrichment-only disclosure (diagnostics-debt 04b) ────────────
+    // Each configured, routed server absent from the blessed manifest is
+    // enrichment-only — a warn-tier board disclosure naming it, owner = server.
+    for f in crate::health::servers::enrichment_only_findings(config, feed.active_languages()) {
+        let owner = server_name_from_finding(&f).map_or(Owner::Global, Owner::Server);
+        out.push(OwnedFinding { finding: f, owner });
+    }
+
     // ── Live-only server signals from the board ──────────────────────
     out.extend(live_server_findings(snapshot));
 
@@ -310,6 +318,7 @@ fn server_name_from_finding(f: &Finding) -> Option<String> {
         FindingCode::ServerRoutedBroken
         | FindingCode::ServerInstallSuggestion
         | FindingCode::ServerDormant
+        | FindingCode::ServerEnrichmentOnly
         | FindingCode::ServerReady => f
             .message
             .split(':')

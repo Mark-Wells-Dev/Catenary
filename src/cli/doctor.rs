@@ -178,6 +178,14 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
     let server_findings = crate::health::servers::server_findings(&config, &feed);
     render_findings(out, &server_findings, show_diff);
 
+    // Enrichment-only disclosure (diagnostics-debt 04b): each configured, routed
+    // server that is unverified (absent from the blessed manifest) earns a
+    // warn-tier finding naming it enrichment-only, with the manifest as the
+    // pointer. A blessed server produces nothing here.
+    let enrichment_findings =
+        crate::health::servers::enrichment_only_findings(&config, feed.active_languages());
+    render_findings(out, &enrichment_findings, show_diff);
+
     // Live strike-ledger state (misc 167): a struck-out server on the running
     // daemon's board stays down until a restart/remount, even when doctor's
     // own fresh probe succeeds — surface that split honestly. Read from the

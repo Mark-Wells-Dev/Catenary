@@ -65,6 +65,20 @@ fn changed_file_uri(root: &Path, rel: &Path) -> String {
     crate::lsp::lang::path_to_uri(&root.join(rel))
 }
 
+/// Whether `server_name` is **blessed** — a diagnostics source — the
+/// diagnostics-coverage classifier (diagnostics-debt 04b / DESIGN §"The blessed
+/// set").
+///
+/// A blessed server is a diagnostics source; an unverified custom `[lsp.server.*]`
+/// def is enrichment-only and never a diagnostics source, so a file whose only
+/// covering server is unverified has no diagnostics coverage — the gate does not
+/// arm for it. Delegates to [`crate::recipes::is_server_blessed`] (the active
+/// manifest plus the operator opt-in), so a re-pin's classification takes effect
+/// without a binary release and the whole daemon shares one predicate.
+fn server_is_blessed(server_name: &str) -> bool {
+    crate::recipes::is_server_blessed(server_name)
+}
+
 /// Maps a semantic [`ChangeKind`] to its LSP `FileChangeType` wire value:
 /// Created ⇒ 1, Changed ⇒ 2, Deleted ⇒ 3.
 ///
@@ -952,15 +966,21 @@ impl LspClientManager {
             let Some(def) = self.config.server.get(&binding.name) else {
                 return false;
             };
-            def.single_file && !failures.contains(&(lang.to_string(), binding.name.clone()))
+            // Only a BLESSED single-file server is diagnostics coverage
+            // (diagnostics-debt 04b): an unverified server is enrichment-only and
+            // never a diagnostics source, so it must not arm the gate.
+            def.single_file
+                && server_is_blessed(&binding.name)
+                && !failures.contains(&(lang.to_string(), binding.name.clone()))
         })
     }
 
-    /// Returns whether any server is configured for this language in `root`.
+    /// Returns whether any **blessed** server is configured for this language in
+    /// `root` — the diagnostics coverage gate (diagnostics-debt 04b).
     ///
     /// Used by the editing-boundary gate to decide whether an in-root edit
-    /// has LSP coverage. Unlike [`Self::has_single_file_coverage`], this does
-    /// not require `single_file` mode or a running instance — it reports
+    /// has diagnostics coverage. Unlike [`Self::has_single_file_coverage`], this
+    /// does not require `single_file` mode or a running instance — it reports
     /// purely config-level coverage. A configured but cold per-root instance
     /// still counts as covered (granularity Decision 3): a warm language's
     /// in-root file must not be silently dropped just because no instance has
@@ -968,6 +988,12 @@ impl LspClientManager {
     /// classification-only entries, or types absent from every `[lsp.language.*]`
     /// table (`.txt`, logs, data/scratch files) — return `false`, so
     /// non-served in-root edits flow free.
+    ///
+    /// **Only a blessed server binding counts** (DESIGN §"The blessed set"): an
+    /// unverified custom `[lsp.server.*]` def is enrichment-only, so a file whose
+    /// *only* covering server is unverified has no diagnostics coverage — the gate
+    /// never arms for it and its receipt bucket renders `[not diagnostics-covered]`.
+    /// A file also covered by a blessed server or a linter is still covered.
     ///
     /// Resolves the binding per-root ([`Self::effective_language`]), so a project
     /// `[lsp.language.*]` rebinding decides coverage; a project `[lsp.server.*]`
@@ -978,9 +1004,44 @@ impl LspClientManager {
             return false;
         };
         lang_config.servers().iter().any(|binding| {
-            self.config.server.contains_key(&binding.name)
-                || self.effective_server_def(&binding.name, root).is_some()
+            server_is_blessed(&binding.name)
+                && (self.config.server.contains_key(&binding.name)
+                    || self.effective_server_def(&binding.name, root).is_some())
         })
+    }
+
+    /// Returns whether this language's *only* configured, defined servers in
+    /// `root` are **unverified** — enrichment-only, so a diagnostics server
+    /// exists but Catenary withholds its diagnostics (diagnostics-debt 04b).
+    ///
+    /// The complement of [`Self::has_configured_server`] within the
+    /// server-is-defined set: at least one binding resolves to a real server def,
+    /// and **none** of the defined bindings is blessed. This is the signal for the
+    /// "not diagnostics-covered" skip bucket (DESIGN §"The blessed set" footgun
+    /// ruling) — distinct from the truly-uncovered case (no server defined at
+    /// all), because here a server *does* exist; the wording must declare that,
+    /// never blame Catenary. Returns `false` when a blessed server also covers the
+    /// language (that file is genuinely covered, not unverified-only).
+    #[must_use]
+    pub fn has_unverified_only_server(&self, root: &Path, lang: &str) -> bool {
+        let Some(lang_config) = self.effective_language(root, lang) else {
+            return false;
+        };
+        let mut any_defined = false;
+        for binding in lang_config.servers() {
+            let defined = self.config.server.contains_key(&binding.name)
+                || self.effective_server_def(&binding.name, root).is_some();
+            if !defined {
+                continue;
+            }
+            if server_is_blessed(&binding.name) {
+                // A blessed server covers the language ⇒ genuinely covered,
+                // never unverified-only.
+                return false;
+            }
+            any_defined = true;
+        }
+        any_defined
     }
 
     /// Returns the current workspace roots.
@@ -7725,6 +7786,101 @@ mod tests {
         assert!(
             !manager.is_lsp_disabled(&root),
             "disable_diag must not imply disable_lsp"
+        );
+    }
+
+    /// A config binding a blessed server (`clangd`) to one language and an
+    /// unverified custom server to another, for the classification-gate tests
+    /// (diagnostics-debt 04b).
+    fn blessed_and_unverified_config() -> Arc<Config> {
+        let mut server = HashMap::new();
+        server.insert(
+            "clangd".to_string(),
+            ServerDef {
+                path: Some("/usr/bin/clangd".to_string()),
+                ..ServerDef::default()
+            },
+        );
+        server.insert(
+            "my-custom".to_string(),
+            ServerDef {
+                path: Some("/usr/bin/my-custom".to_string()),
+                ..ServerDef::default()
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            "c".to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new("clangd".to_string())]),
+                ..LanguageConfig::default()
+            },
+        );
+        language.insert(
+            "custlang".to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new("my-custom".to_string())]),
+                ..LanguageConfig::default()
+            },
+        );
+        Arc::new(Config {
+            language,
+            server,
+            log_retention_days: 7,
+            notifications: None,
+            icons: None,
+            tools: None,
+            resolved_commands: None,
+            observability: None,
+            roots: None,
+            registry: None,
+            linter: HashMap::new(),
+        })
+    }
+
+    #[test]
+    fn has_configured_server_requires_a_blessed_binding() {
+        // The diagnostics-coverage gate counts only BLESSED servers
+        // (diagnostics-debt 04b): a blessed binding (clangd) covers its language;
+        // a language whose only binding is an unverified custom def does NOT.
+        let manager = LspClientManager::new(
+            blessed_and_unverified_config(),
+            test_logging(),
+            test_fs_with_roots(&["/ws"]),
+        );
+        let root = PathBuf::from("/ws");
+        assert!(
+            manager.has_configured_server(&root, "c"),
+            "clangd is blessed — its language is covered"
+        );
+        assert!(
+            !manager.has_configured_server(&root, "custlang"),
+            "an unverified-only language has no diagnostics coverage"
+        );
+    }
+
+    #[test]
+    fn has_unverified_only_server_flags_the_unblessed_only_case() {
+        // The complement (diagnostics-debt 04b): the unverified-only language is
+        // the "not diagnostics-covered" case (a server exists, unblessed); a
+        // blessed language is NOT unverified-only; an unbound language is neither.
+        let manager = LspClientManager::new(
+            blessed_and_unverified_config(),
+            test_logging(),
+            test_fs_with_roots(&["/ws"]),
+        );
+        let root = PathBuf::from("/ws");
+        assert!(
+            manager.has_unverified_only_server(&root, "custlang"),
+            "a custom-only language is unverified-only — the receipt declares it"
+        );
+        assert!(
+            !manager.has_unverified_only_server(&root, "c"),
+            "a blessed language is covered, never unverified-only"
+        );
+        assert!(
+            !manager.has_unverified_only_server(&root, "python"),
+            "an unbound language has no server at all — not unverified-only"
         );
     }
 
