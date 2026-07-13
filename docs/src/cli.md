@@ -377,8 +377,13 @@ until you land or explicitly remove it.
 > isolated worktree is dispatching a subagent with the Agent/Task tool's
 > `isolation: "worktree"`, which creates, relocates, and anchors the worktree
 > itself. A hand-run add anchors nothing, leaving the subagent pinned to the
-> main tree. The cleanup verbs (`diff`, `land`, `rm`) stay available, and human
-> terminal use is unaffected — hooks only filter agent tool calls.
+> main tree. On the same hosts, agent-side `catenary worktree rm --force` — the
+> dirty-discard lever — is denied too (misc 188): discarding uncommitted work
+> is the maintainer's lever, not the agent's. The read/cleanup verbs stay
+> available (`diff` to review, `land` to keep, bare `rm` to dispose a clean
+> worktree — bare `rm` refuses a dirty worktree on its own), and human terminal
+> use is unaffected — hooks only filter agent tool calls, so operators keep
+> `--force`.
 
 ### `catenary doctor`
 

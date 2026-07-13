@@ -838,6 +838,11 @@ struct CatenaryOcc {
     backgrounded: bool,
     /// Catenary is *wrapped* in a `$()`/`<()`/backtick substitution.
     wrapped: bool,
+    /// The occurrence is `catenary worktree rm --force` — the dirty-discard
+    /// lever, denied client-keyed on `WorktreeCreate` hosts (misc 188). The
+    /// flag is read from the parsed argv at scan time, so it is available
+    /// alongside `recog` for the early dispatch deny.
+    forced_worktree_rm: bool,
 }
 
 /// What the `PreToolUse` hook should do with a shell command, after recognizing
@@ -983,6 +988,23 @@ pub fn analyze_catenary_command(cmd: &str, client: Option<HostFormat>) -> Catena
         return CatenaryAction::Deny(worktree_add_dispatch_denial());
     }
 
+    // Agent-side `catenary worktree rm --force` is the dirty-discard lever —
+    // auto-discarding uncommitted work is the fatal sin on this surface, so it
+    // is denied client-keyed on the same `WorktreeCreate` hosts (misc 188).
+    // Bare `worktree rm` stays allowed (it refuses dirty worktrees itself,
+    // misc 158); only the explicit `--force` is bounced, in any form, before
+    // the output-ownership and bare-only denials, so the agent always learns
+    // the worktree lifecycle rather than a generic complaint. Operator
+    // hand-runs are untouched — humans at terminals are unfiltered.
+    if crate::cli::teaching::hook_set_has_worktree_create(client)
+        && scan
+            .occs
+            .iter()
+            .any(|o| matches!(o.recog, Recog::Agent(Sub::WorktreeRm)) && o.forced_worktree_rm)
+    {
+        return CatenaryAction::Deny(worktree_rm_force_dispatch_denial());
+    }
+
     // First occurrence with a per-command problem wins (document order).
     for occ in &scan.occs {
         if let Some(msg) = catenary_occ_denial(occ) {
@@ -1119,6 +1141,7 @@ fn scan_catenary_into(script: &parse::ParsedScript, scan: &mut CatenaryScan) {
                     redirected: command.redirects.iter().any(redirect_writes_file),
                     backgrounded: pipeline.backgrounded,
                     wrapped: false,
+                    forced_worktree_rm: worktree_rm_is_forced(&command.argv),
                 });
             } else {
                 scan.has_foreign_segment = true;
@@ -1147,6 +1170,7 @@ fn scan_substitution(sub: &parse::ParsedScript, scan: &mut CatenaryScan) {
                     redirected: false,
                     backgrounded: false,
                     wrapped: true,
+                    forced_worktree_rm: worktree_rm_is_forced(&command.argv),
                 });
             } else {
                 scan.inner_foreign_substitution = true;
@@ -1159,6 +1183,24 @@ fn scan_substitution(sub: &parse::ParsedScript, scan: &mut CatenaryScan) {
 fn recognize_catenary_argv(argv: &[String]) -> Recog {
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     recognize_catenary_sub(&refs)
+}
+
+/// Whether the argv is a `catenary worktree rm` invocation carrying `--force`
+/// (its long-only flag — `catenary worktree rm <path> [--force]`, misc 166).
+///
+/// Read from the parsed argv so the client-keyed dispatch deny (misc 188) can
+/// distinguish the dirty-discard lever from a bare clean removal without
+/// touching `Recog`/`Sub`, which stay flag-blind. Any token position is
+/// accepted (`--force` before or after the path); `--force=…` value forms and
+/// the bare-only `rm` stay off the lever.
+fn worktree_rm_is_forced(argv: &[String]) -> bool {
+    matches!(
+        (
+            argv.first().map(String::as_str),
+            argv.get(1).map(String::as_str)
+        ),
+        (Some("worktree"), Some("rm"))
+    ) && argv.iter().any(|a| a == "--force")
 }
 
 /// Per-occurrence deny reason in priority order, or `None` if the occurrence is
@@ -1380,6 +1422,27 @@ fn worktree_add_dispatch_denial() -> String {
      that anchoring — the agent stays pinned to the main tree and its file \
      access prompts against the wrong workspace. Review and clean up with \
      `catenary worktree diff` and `catenary worktree land`."
+        .to_string()
+}
+
+/// Client-keyed teaching denial for agent-side `catenary worktree rm --force`
+/// on clients whose installed hook set registers `WorktreeCreate` (misc 188).
+///
+/// `--force` discards a worktree *with* uncommitted work — the fatal sin on
+/// this surface, whose standing doctrine is that auto-discarding dirty work is
+/// never the agent's call. Bare `catenary worktree rm` stays available (it
+/// refuses dirty worktrees itself, misc 158), so the clean-disposal path is
+/// untouched; only the explicit lever is bounced. The teaching names the
+/// worktree lifecycle so the agent hands the review back rather than reaching
+/// for the discard. Humans at terminals are unfiltered, so operator hand-runs
+/// keep `--force`.
+fn worktree_rm_force_dispatch_denial() -> String {
+    "Don't hand-run `catenary worktree rm --force` — discarding a worktree with \
+     uncommitted work is the maintainer's lever, not the agent's. On a \
+     WorktreeCreate host the worktree lifecycle is: review with `catenary \
+     worktree diff`, keep with `catenary worktree land`, dispose clean with \
+     `catenary worktree rm` (bare `rm` refuses a dirty worktree on its own). \
+     Surface the dirty worktree for review — don't force-drop the work."
         .to_string()
 }
 
@@ -4347,6 +4410,78 @@ mod tests {
                 analyze_catenary_command("catenary worktree add feature/auth", Some(client)),
                 CatenaryAction::Allow { has_foreign: false },
                 "{client:?} must keep worktree add until its hook set carries WorktreeCreate",
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_rm_force_denied_with_lifecycle_teaching_for_worktree_create_clients() {
+        // misc 188: on a client whose installed hook set registers
+        // WorktreeCreate (today Claude Code), agent-side `worktree rm --force`
+        // — the dirty-discard lever — is denied in ANY form (bare, path-first,
+        // flag-first, path-prefixed, chained, piped, wrapped), and the teaching
+        // always names the worktree lifecycle, never a generic complaint.
+        for cmd in [
+            "catenary worktree rm --force /some/path",
+            "catenary worktree rm /some/path --force",
+            "/usr/local/bin/catenary worktree rm --force /wt",
+            "cd /repo && catenary worktree rm --force /wt",
+            "catenary worktree rm --force /wt | tee log",
+            "echo $(catenary worktree rm --force /wt)",
+        ] {
+            let msg = match analyze_catenary_command(cmd, Some(HostFormat::Claude)) {
+                CatenaryAction::Deny(m) => m,
+                _ => String::new(),
+            };
+            assert!(
+                !msg.is_empty(),
+                "{cmd} must be denied for a WorktreeCreate client",
+            );
+            assert!(
+                msg.contains("--force")
+                    && msg.contains("maintainer's lever")
+                    && msg.contains("worktree diff")
+                    && msg.contains("worktree land")
+                    && msg.contains("worktree rm"),
+                "{cmd} must teach the worktree lifecycle and the maintainer's lever, got: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn bare_worktree_rm_survives_the_force_deny_for_worktree_create_clients() {
+        // The deny is surgical (misc 188): only the explicit `--force` is
+        // bounced. Bare `worktree rm` (which refuses a dirty worktree itself,
+        // misc 158) stays the sanctioned clean-disposal verb for WorktreeCreate
+        // clients — a token merely *containing* "force" doesn't trip it.
+        for cmd in [
+            "catenary worktree rm /some/path",
+            "catenary worktree rm /forced/path",
+        ] {
+            assert_eq!(
+                analyze_catenary_command(cmd, Some(HostFormat::Claude)),
+                CatenaryAction::Allow { has_foreign: false },
+                "{cmd} must stay allowed for a WorktreeCreate client",
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_rm_force_stays_lifecycle_for_clients_without_worktree_create() {
+        // Only a hook set that registers WorktreeCreate keys the deny — the
+        // host-keyed path (Antigravity/OpenCode, and the daemon-side `None`
+        // classifier) keeps `worktree rm --force` a plain bare-only lifecycle
+        // verb, exactly as the misc-177 add deny stays client-keyed.
+        assert_eq!(
+            analyze_catenary_command("catenary worktree rm --force /wt", None),
+            CatenaryAction::Allow { has_foreign: false },
+            "no declared client keeps worktree rm --force a plain lifecycle verb",
+        );
+        for client in [HostFormat::Antigravity, HostFormat::OpenCode] {
+            assert_eq!(
+                analyze_catenary_command("catenary worktree rm --force /wt", Some(client)),
+                CatenaryAction::Allow { has_foreign: false },
+                "{client:?} must keep worktree rm --force until its hook set carries WorktreeCreate",
             );
         }
     }

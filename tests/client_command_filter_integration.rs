@@ -148,6 +148,30 @@ fn worktree_rm_still_allowed_for_claude_format() -> Result<()> {
     Ok(())
 }
 
+/// misc 188: through the real hook binary, `--format=claude` also denies the
+/// dirty-discard lever `catenary worktree rm --force` with the worktree
+/// lifecycle teaching — the maintainer's lever, not the agent's. This pins the
+/// same one line of wiring (`run_pre_tool` passing its declared format into the
+/// matcher) for the force deny.
+#[test]
+fn worktree_rm_force_denied_with_lifecycle_teaching_for_claude_format() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("tempdir path")?;
+
+    let stdout = run_client_hook(root, "catenary worktree rm --force /tmp/wt")?;
+    let decision = parse_decision(&stdout)
+        .context("worktree rm --force under --format=claude should produce a deny envelope")?;
+    assert_eq!(
+        decision, "deny",
+        "worktree rm --force must be denied for the claude format, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("--force") && stdout.contains("maintainer's lever"),
+        "the denial must teach the worktree lifecycle and the maintainer's lever, got: {stdout}"
+    );
+    Ok(())
+}
+
 /// Bug 80, leg 3 (confirm-intentional): the command filter kept enforcing
 /// correctly with **no daemon** during the outage — a killed daemon must not
 /// make the shell surface fail open *or* closed. This drives the real
