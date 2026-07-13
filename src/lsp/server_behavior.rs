@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Per-server behavior profiles (misc 157).
+//! Per-server behavior profiles (misc 157; projected from the manifest,
+//! diagnostics-debt 04).
 //!
 //! One engine-internal lookup, [`ServerProfile::for_server`], resolves a server's
 //! **conformance settings** — the engine-required invariants Catenary needs to
@@ -13,14 +14,22 @@
 //! config layer. This is the enforcement-keys boundary inverted — enforcement keys
 //! are user-scope-only; conformance settings are shipped/engine-scope-only.
 //!
-//! The knowledge lives in exactly one place — the [`profile`] table below. The
-//! consuming seams (client-capability construction, initialization-option
-//! assembly, the diagnostics pull gate) each make a single profile call and are
-//! themselves server-name-blind: no seam special-cases a server by name. The CI
-//! conformance matrix re-verifies every profile invariant on every re-pin, which
-//! is what makes carrying these settings in code safe (maintainer direction, bug
-//! 82: discipline knowledge is "not something I want to be 'configurable' by the
-//! user but set on a case by case basis").
+//! The knowledge lives in exactly one place — the blessed **manifest**
+//! (`defaults/blessed-manifest.toml`, `[discipline.<server>]` tables). This
+//! module is the *projection* of that data onto the shape the seams consume: the
+//! former hand-coded profile table became the manifest's build-time projection
+//! (diagnostics-debt 04 — generated from the manifest, not a rival home). The
+//! projection reads the embedded seed manifest ([`crate::recipes::seed_manifest`],
+//! parsed once) because the LSP construction seams are synchronous and the daemon
+//! does not thread the *fetched* manifest into them; the seed is always available
+//! offline and is the directional-safety floor. The consuming seams
+//! (client-capability construction, initialization-option assembly, the
+//! diagnostics pull gate) each make a single profile call and are themselves
+//! server-name-blind: no seam special-cases a server by name. The CI conformance
+//! matrix re-verifies every profile invariant on every re-pin, which is what makes
+//! carrying these settings safe (maintainer direction, bug 82: discipline
+//! knowledge is "not something I want to be 'configurable' by the user but set on
+//! a case by case basis").
 //!
 //! Three conformance invariants are cased today:
 //!
@@ -59,15 +68,17 @@
 //!   first-run false-`[clean]` window that per-connection demonstration
 //!   (`has_ever_published`) reopens on every respawn and daemon bounce.
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::config::merge::deep_merge;
 
 /// The resolved conformance profile for one LSP server.
 ///
-/// Built by [`Self::for_server`] from the engine-internal [`profile`] table. All
+/// Built by [`Self::for_server`] as the projection of the server's manifest
+/// [`crate::recipes::DisciplineRecord`] onto the shape the seams consume. All
 /// seams consult a `ServerProfile` rather than testing a server name, so the
-/// per-server knowledge stays in the table and the seams stay server-name-blind.
+/// per-server knowledge stays in the manifest and the seams stay
+/// server-name-blind.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerProfile {
     /// When set, the server must never receive the `textDocument.diagnostic`
@@ -77,12 +88,14 @@ pub struct ServerProfile {
     suppress_pull_diagnostics: bool,
     /// Conformance `initializationOptions` overlaid onto (and winning over) the
     /// user-supplied options at initialize time. `None` when the server has no
-    /// forced options.
+    /// forced options. Projected from the manifest's `forced_init_options` (a
+    /// `toml::Value` converted to JSON — the shape the LSP wire uses).
     forced_initialization_options: Option<Value>,
     /// Top-level `initializationOptions` keys **enforced absent**: stripped after
     /// the user/forced merge, so no config layer can deliver them and the
     /// server's own built-in default is the only value that ever applies.
-    forbidden_initialization_options: &'static [&'static str],
+    /// Projected from the manifest's `forbidden_init_options`.
+    forbidden_initialization_options: Vec<String>,
     /// When set, the server **contractually publishes** diagnostics for every
     /// opened document — a publish on every `didOpen` (including unchanged
     /// files), an explicit `[]` for clean. The retrieval evidence bar arms on
@@ -93,11 +106,26 @@ pub struct ServerProfile {
 
 impl ServerProfile {
     /// Resolves the conformance profile for `server_name` — the single lookup
-    /// every seam calls. Returns the default (no conformance settings) profile for
-    /// any server not named in the [`profile`] table.
+    /// every seam calls. Projects the server's manifest discipline record; a
+    /// server with no discipline row (an unverified custom def, or a blessed
+    /// server that needs no casing) resolves to the default (no conformance
+    /// settings) profile.
     #[must_use]
     pub fn for_server(server_name: &str) -> Self {
-        profile(server_name)
+        Self::from_record(&crate::recipes::seed_manifest().discipline_for(server_name))
+    }
+
+    /// Projects a manifest [`crate::recipes::DisciplineRecord`] onto a
+    /// `ServerProfile` — the single place the manifest's casing data becomes the
+    /// shape the seams consume (diagnostics-debt 04).
+    #[must_use]
+    pub fn from_record(record: &crate::recipes::DisciplineRecord) -> Self {
+        Self {
+            suppress_pull_diagnostics: record.suppress_pull,
+            forced_initialization_options: record.forced_init_options.as_ref().map(toml_to_json),
+            forbidden_initialization_options: record.forbidden_init_options.clone(),
+            declares_push: record.declares_push,
+        }
     }
 
     /// Whether this server's client-side pull path is gated off.
@@ -157,56 +185,37 @@ impl ServerProfile {
             (None, user) => user.cloned(),
         };
         if let Some(object) = merged.as_mut().and_then(Value::as_object_mut) {
-            for key in self.forbidden_initialization_options {
-                object.remove(*key);
+            for key in &self.forbidden_initialization_options {
+                object.remove(key.as_str());
             }
         }
         merged
     }
 }
 
-/// The engine-internal per-server profile table — the single source of casing
-/// knowledge. Every entry is a conformance invariant the CI conformance matrix
-/// re-verifies per re-pin. A server absent from the table gets the default
-/// (empty) profile.
-fn profile(server_name: &str) -> ServerProfile {
-    match server_name {
-        "rust-analyzer" => ServerProfile {
-            suppress_pull_diagnostics: true,
-            forced_initialization_options: None,
-            forbidden_initialization_options: &[],
-            declares_push: false,
-        },
-        "gopls" => ServerProfile {
-            suppress_pull_diagnostics: false,
-            // `pullDiagnostics` is forced FALSE (bug 87): gopls's pull mode
-            // stops real pushes and publishes empty placeholders that the
-            // heard-empty rule reads as authoritative — false `[clean]`.
-            forced_initialization_options: Some(json!({
-                "pullDiagnostics": false,
-            })),
-            // `diagnosticsDelay` is enforced ABSENT (run 9 + maintainer
-            // ruling): at "0s" every publish fires instantly-and-empty on the
-            // unchecked snapshot — the debounce couples publishing to
-            // completed analysis, and "zero it to minimize latency" is the
-            // natural user reasoning that reintroduces the false-clean. Only
-            // gopls's own default may apply.
-            forbidden_initialization_options: &["diagnosticsDelay"],
-            declares_push: false,
-        },
-        // Declared push (misc 187): lattice's contract — pinned cross-repo in
-        // misc 153 / Lattice ticket 16 / its decision 022 and re-verified
-        // behaviorally per re-pin by the conformance matrix — is a publish on
-        // EVERY didOpen, unchanged files included, explicit `[]` for clean.
-        // Other push servers (marksman, taplo, …) join only with conformance
-        // evidence in hand.
-        "lattice" => ServerProfile {
-            suppress_pull_diagnostics: false,
-            forced_initialization_options: None,
-            forbidden_initialization_options: &[],
-            declares_push: true,
-        },
-        _ => ServerProfile::default(),
+/// Convert a `toml::Value` (the manifest's forced-init-options shape) into a
+/// `serde_json::Value` (the LSP wire shape).
+///
+/// Tables become objects, arrays become arrays, and scalars map across the two
+/// value spaces. TOML datetimes stringify (LSP has no datetime scalar); a numeric
+/// integer that overflows `i64` cannot occur in a TOML source, so the mapping is
+/// total for any parsed manifest value.
+fn toml_to_json(value: &toml::Value) -> Value {
+    match value {
+        toml::Value::String(s) => Value::String(s.clone()),
+        toml::Value::Integer(i) => Value::Number((*i).into()),
+        toml::Value::Float(f) => {
+            serde_json::Number::from_f64(*f).map_or(Value::Null, Value::Number)
+        }
+        toml::Value::Boolean(b) => Value::Bool(*b),
+        toml::Value::Datetime(dt) => Value::String(dt.to_string()),
+        toml::Value::Array(arr) => Value::Array(arr.iter().map(toml_to_json).collect()),
+        toml::Value::Table(table) => Value::Object(
+            table
+                .iter()
+                .map(|(k, v)| (k.clone(), toml_to_json(v)))
+                .collect(),
+        ),
     }
 }
 

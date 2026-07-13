@@ -1,17 +1,31 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Diagnostic noise filtering for LSP server output.
+//! Diagnostic message compression — a generic line-strip engine driven by
+//! manifest data (diagnostics-debt 04 / misc 165's rider).
 //!
-//! Each LSP server may attach noise to diagnostic messages (reference URLs,
-//! lint attribution boilerplate, etc.) that wastes tokens when delivered to
-//! AI agents. This module provides a `DiagnosticFilter` trait with
-//! per-server implementations that rewrite or drop noisy messages.
+//! LSP servers attach boilerplate to diagnostic messages (reference URLs, lint
+//! attribution) that wastes tokens when delivered to AI agents. This module is a
+//! **message compressor** with fixed, narrow semantics:
 //!
-//! Implementations **must** default to pass-through for unrecognized server
-//! versions — we are writing regexes against output format we don't own.
-
-mod rust_analyzer;
+//! - a message **line** whose trimmed text matches a manifest
+//!   [`StripRule`](crate::recipes::StripRule) is deleted whole;
+//! - a message left **empty** after stripping drops entirely (the
+//!   standalone-attribution case);
+//! - nothing is ever **rewritten or injected**;
+//! - a server/version outside its manifest pin is **pass-through**.
+//!
+//! The per-server rules are not code here — they ride the blessed manifest
+//! (`defaults/blessed-manifest.toml`, `[[discipline.<server>.compress]]`), the
+//! declared-constants species: regexes against an output format Catenary does not
+//! own, verified per re-pin. This engine stays in the binary; the rules travel
+//! with the pin, so a re-pin ships updated compression without a binary release,
+//! and the embedded seed carries the rules offline. The doctrine line: **the
+//! filter's mandate is compression, never verdict policy** — a stale manifest can
+//! only let boilerplate reflood, never eat content.
+//!
+//! The severity threshold ([`severity_passes`]) stays user config — a separate
+//! lever this engine never touches.
 
 /// LSP severity constants (1=Error through 4=Hint).
 pub const SEVERITY_ERROR: u8 = 1;
@@ -47,11 +61,47 @@ impl DiagnosticCode {
     }
 }
 
-/// Trait for filtering noise from LSP diagnostic messages.
+/// Compresses noise from a diagnostic message using the server's manifest
+/// [`StripRule`](crate::recipes::StripRule)s.
 ///
-/// Implementations are per-server (keyed by the server command name, e.g.,
-/// `"rust-analyzer"`). The default implementation passes messages through
-/// unchanged.
+/// Deletes whole message lines that match any of the server's strip rules; a
+/// message that is empty after stripping returns `""` (a signal to the caller to
+/// drop the diagnostic entirely). Passes the message through **unchanged** when
+/// the server has no rules, or when `version` is outside the rules' pinned range
+/// ([`DisciplineRecord::compress_applies`](crate::recipes::DisciplineRecord::compress_applies))
+/// — the version safety the hand-coded rules carried, now manifest data. The
+/// engine never rewrites text or fires on `source`/`code`/`severity`; those
+/// remain available to a caller but are not consulted, keeping the compressor's
+/// mandate narrow (compression, never verdict policy).
+///
+/// # Return value
+///
+/// - Non-empty string: deliver this message (original or line-stripped).
+/// - Empty string: drop the diagnostic entirely.
+#[must_use]
+pub fn compress_message(server: &str, version: Option<&str>, message: &str) -> String {
+    let record = crate::recipes::seed_manifest().discipline_for(server);
+    if record.compress.is_empty() || !record.compress_applies(version) {
+        return message.to_string();
+    }
+    message
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !record.compress.iter().any(|rule| rule.matches(trimmed))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
+        .to_string()
+}
+
+/// Trait for compressing noise from LSP diagnostic messages.
+///
+/// A thin seam over [`compress_message`] so call sites can hold a `&dyn`
+/// compressor. There is a single production implementation
+/// ([`ManifestFilter`]) — the per-server behavior lives in the manifest, not in
+/// distinct trait impls.
 ///
 /// # Return value
 ///
@@ -62,7 +112,12 @@ impl DiagnosticCode {
     reason = "diagnostic context requires all fields"
 )]
 pub trait DiagnosticFilter: Send + Sync {
-    /// Filters noise from a diagnostic message.
+    /// Compresses noise from a diagnostic message.
+    ///
+    /// The manifest engine consults only `server`, `version`, and `message`; the
+    /// remaining fields (`source`, `code`, `severity`, `language_id`) are part of
+    /// the diagnostic context a caller carries and are accepted for signature
+    /// stability, but the compressor deliberately does not rule on them.
     fn filter_message(
         &self,
         server: &str,
@@ -75,38 +130,38 @@ pub trait DiagnosticFilter: Send + Sync {
     ) -> String;
 }
 
-/// Default filter that passes all messages through unchanged.
-struct DefaultFilter;
+/// The manifest-driven compressor — the single [`DiagnosticFilter`]
+/// implementation.
+///
+/// Delegates to [`compress_message`], which reads the server's strip rules from
+/// the manifest. Zero-sized: it holds no per-server state, so one static instance
+/// serves every server.
+pub struct ManifestFilter;
 
-impl DiagnosticFilter for DefaultFilter {
+impl DiagnosticFilter for ManifestFilter {
     fn filter_message(
         &self,
-        _server: &str,
-        _version: Option<&str>,
+        server: &str,
+        version: Option<&str>,
         _source: Option<&str>,
         _code: Option<&DiagnosticCode>,
         _severity: u8,
         _language_id: &str,
         message: &str,
     ) -> String {
-        message.to_string()
+        compress_message(server, version, message)
     }
 }
 
-/// Returns the appropriate diagnostic filter for a server command.
+/// Returns the diagnostic compressor for a server command.
 ///
-/// Matches on the command name (e.g., `"rust-analyzer"`) because different
-/// servers for the same language (pylsp vs pyright vs ruff) need different
-/// filters.
+/// A single manifest-driven implementation serves every server — the per-server
+/// behavior is the server's manifest strip rules, not a distinct impl. Kept as a
+/// lookup so call sites hold a `&dyn DiagnosticFilter` uniformly.
 #[must_use]
-pub fn get_filter(server_command: &str) -> &'static dyn DiagnosticFilter {
-    static DEFAULT: DefaultFilter = DefaultFilter;
-    static RUST_ANALYZER: rust_analyzer::RustAnalyzerFilter = rust_analyzer::RustAnalyzerFilter;
-
-    match server_command {
-        "rust-analyzer" => &RUST_ANALYZER,
-        _ => &DEFAULT,
-    }
+pub fn get_filter(_server_command: &str) -> &'static dyn DiagnosticFilter {
+    static MANIFEST: ManifestFilter = ManifestFilter;
+    &MANIFEST
 }
 
 /// Parses a severity string from config into a `u8` (LSP severity encoding).
@@ -149,23 +204,136 @@ const fn severity_rank(s: u8) -> u8 {
 mod tests {
     use super::*;
 
+    /// Compress a message for `server` at `version` through the manifest engine.
+    fn compress(server: &str, version: Option<&str>, message: &str) -> String {
+        compress_message(server, version, message)
+    }
+
+    // ── the generic engine over the pinned rust-analyzer rules ──────────
+
     #[test]
-    fn default_filter_passes_through() {
-        let filter = DefaultFilter;
+    fn strips_clippy_url() {
+        let msg = "unused variable `x`\nfor further information visit https://rust-lang.github.io/rust-clippy/master/index.html#unused_variable";
+        assert_eq!(
+            compress("rust-analyzer", Some("1.92.0"), msg),
+            "unused variable `x`"
+        );
+    }
+
+    #[test]
+    fn strips_lint_attribution_on_by_default() {
+        let msg = "unused variable `x`\n`#[warn(unused_variables)]` on by default";
+        assert_eq!(
+            compress("rust-analyzer", Some("1.92.0"), msg),
+            "unused variable `x`"
+        );
+    }
+
+    #[test]
+    fn strips_lint_attribution_implied_by() {
+        let msg =
+            "unused variable `x`\n`#[warn(clippy::pedantic)]` implied by `#[warn(clippy::all)]`";
+        assert_eq!(
+            compress("rust-analyzer", Some("1.92.0"), msg),
+            "unused variable `x`"
+        );
+    }
+
+    #[test]
+    fn strips_lint_attribution_to_override() {
+        let msg = "unused variable `x`\n`#[allow(unused)]` to override `#[warn(unused_variables)]`";
+        assert_eq!(
+            compress("rust-analyzer", Some("1.92.0"), msg),
+            "unused variable `x`"
+        );
+    }
+
+    #[test]
+    fn strips_multiple_noise_lines() {
+        let msg = "needless return\nfor further information visit https://example.com\n`#[warn(clippy::needless_return)]` on by default";
+        assert_eq!(
+            compress("rust-analyzer", Some("1.92.0"), msg),
+            "needless return"
+        );
+    }
+
+    #[test]
+    fn drops_standalone_w_flag_implied_by() {
+        let msg = "`-W clippy::doc-markdown` implied by `-W clippy::pedantic`";
+        assert_eq!(compress("rust-analyzer", Some("1.92.0"), msg), "");
+    }
+
+    #[test]
+    fn drops_standalone_to_override_with_allow() {
+        let msg = "to override `-W clippy::pedantic` add `#[allow(clippy::doc_markdown)]`";
+        assert_eq!(compress("rust-analyzer", Some("1.92.0"), msg), "");
+    }
+
+    #[test]
+    fn drops_standalone_to_override_with_warn() {
+        let msg = "to override `-D warnings` add `#[warn(clippy::doc_markdown)]`";
+        assert_eq!(compress("rust-analyzer", Some("1.92.0"), msg), "");
+    }
+
+    // ── preserve: a clean message survives byte-exact ───────────────────
+
+    #[test]
+    fn preserves_clean_message() {
+        let msg = "expected `usize`, found `&str`";
+        assert_eq!(compress("rust-analyzer", Some("1.92.0"), msg), msg);
+    }
+
+    #[test]
+    fn preserves_multiline_clean_message() {
+        let msg = "mismatched types\nexpected `usize`\n   found `&str`";
+        assert_eq!(compress("rust-analyzer", Some("1.92.0"), msg), msg);
+    }
+
+    // ── version safety: out-of-pin and unknown versions pass through ────
+
+    #[test]
+    fn passthrough_for_unknown_version() {
+        let msg = "unused variable `x`\nfor further information visit https://example.com";
+        assert_eq!(compress("rust-analyzer", Some("2.0.0"), msg), msg);
+    }
+
+    #[test]
+    fn passthrough_for_no_version() {
+        let msg = "unused variable `x`\nfor further information visit https://example.com";
+        assert_eq!(compress("rust-analyzer", None, msg), msg);
+    }
+
+    // ── directional safety: an unverified/unruled server never strips ───
+
+    #[test]
+    fn passthrough_for_unruled_server() {
+        // A server with no compression rules in the manifest passes every
+        // message through unchanged — the compressor never invents rules.
+        let msg = "unused variable `x`\nfor further information visit https://example.com";
+        assert_eq!(compress("gopls", Some("v0.22.0"), msg), msg);
+        assert_eq!(compress("some-custom-server", Some("1.0.0"), msg), msg);
+    }
+
+    // ── the trait seam and the get_filter lookup ────────────────────────
+
+    #[test]
+    fn manifest_filter_matches_direct_compress() {
+        let filter = get_filter("rust-analyzer");
+        let msg = "unused variable `x`\nfor further information visit https://example.com";
         let result = filter.filter_message(
-            "some-server",
-            None,
-            None,
+            "rust-analyzer",
+            Some("1.92.0"),
+            Some("clippy"),
             None,
             SEVERITY_WARNING,
             "rust",
-            "unused variable `x`",
+            msg,
         );
         assert_eq!(result, "unused variable `x`");
     }
 
     #[test]
-    fn get_filter_returns_default_for_unknown() {
+    fn get_filter_passes_unknown_server_through() {
         let filter = get_filter("unknown-server");
         let result = filter.filter_message(
             "unknown-server",
@@ -179,22 +347,7 @@ mod tests {
         assert_eq!(result, "syntax error");
     }
 
-    #[test]
-    fn get_filter_returns_rust_analyzer() {
-        let filter = get_filter("rust-analyzer");
-        // Should strip the URL line
-        let message = "unused variable `x`\nfor further information visit https://example.com";
-        let result = filter.filter_message(
-            "rust-analyzer",
-            Some("1.92.0"),
-            Some("clippy"),
-            None,
-            SEVERITY_WARNING,
-            "rust",
-            message,
-        );
-        assert_eq!(result, "unused variable `x`");
-    }
+    // ── severity + code helpers (unchanged, user-config lever) ──────────
 
     #[test]
     fn parse_severity_valid() {
@@ -212,13 +365,9 @@ mod tests {
 
     #[test]
     fn severity_passes_threshold() {
-        // Error passes warning threshold
         assert!(severity_passes(SEVERITY_ERROR, SEVERITY_WARNING));
-        // Warning passes warning threshold
         assert!(severity_passes(SEVERITY_WARNING, SEVERITY_WARNING));
-        // Hint does not pass warning threshold
         assert!(!severity_passes(SEVERITY_HINT, SEVERITY_WARNING));
-        // Info does not pass warning threshold
         assert!(!severity_passes(SEVERITY_INFORMATION, SEVERITY_WARNING));
     }
 

@@ -592,6 +592,187 @@ pub fn conformance_exempt_names(
     from_recipes.chain(from_provisions).collect()
 }
 
+/// The publisher discipline of a blessed server — the bug-82 taxonomy, made data
+/// (diagnostics-debt 04 / DESIGN §"Publisher-discipline metadata").
+///
+/// A server's discipline states what silence and emptiness *mean* on its
+/// diagnostics channel, so the ledger knows how to settle a debt. It is a
+/// conformance-verified property that rides the manifest per-pin, not a measured
+/// guess. A server absent from the manifest (an unverified custom def) has **no**
+/// discipline — it is enrichment-only and never a diagnostics source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Discipline {
+    /// The server answers `textDocument/diagnostic` pulls (e.g. gopls in pull
+    /// mode) — a pull settles the debt directly.
+    Pull,
+    /// The server publishes on document events, echoing the version (e.g.
+    /// rust-analyzer, lattice) — a versioned publish settles; a versioned empty
+    /// publish is an authoritative clean.
+    Event,
+    /// The server publishes on an internal debounce timer bounded by a declared
+    /// constant (e.g. ts-ls) — the ledger awaits the version echo, bounded by
+    /// [`DisciplineRecord::debounce_ms`], never interpreting silence.
+    Debounce,
+    /// The server scans once and does not re-publish (marksman-class) — silence
+    /// is not clean; a missing answer is a fault, not evidence.
+    Scan,
+    /// The server publishes only on diff/never (marksman diff-only) — like
+    /// [`Self::Scan`], silence is not clean.
+    Diff,
+}
+
+impl Discipline {
+    /// The lowercase token used in the manifest TOML and in tracing.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pull => "pull",
+            Self::Event => "event",
+            Self::Debounce => "debounce",
+            Self::Scan => "scan",
+            Self::Diff => "diff",
+        }
+    }
+}
+
+/// One line-strip rule for the message compressor (diagnostics-debt 04 / misc
+/// 165's rider / DESIGN §"The manifest").
+///
+/// The compressor's rules are the declared-constants species — regexes against an
+/// output format Catenary does not own — so they ride the manifest per-pin
+/// instead of lagging a binary release. The engine that consumes these
+/// ([`crate::filter`]) has fixed, narrow semantics: a message *line* whose
+/// trimmed text matches this rule is deleted whole; a message left empty after
+/// stripping drops entirely; nothing is ever rewritten or injected. A rule that
+/// ate verdict text would fail the strip+preserve conformance fixtures before it
+/// shipped. The mandate is **compression, never verdict policy**.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StripRule {
+    /// A required literal prefix on the line's trimmed text. A line must start
+    /// with this to be a candidate for the rule (the cheap, unambiguous anchor
+    /// the hand-coded rules used — e.g. `` `#[ ``, `for further information
+    /// visit`).
+    pub prefix: String,
+    /// Optional substrings that must **all** be present on the line for the rule
+    /// to fire. Empty ⇒ the prefix alone is sufficient. Narrows a prefix that
+    /// would otherwise be too broad (e.g. anchor on `` `#[ `` but only strip when
+    /// the line also says `on by default` / `implied by` / `to override`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contains_all: Vec<String>,
+    /// Optional substrings of which **any** one present makes the rule fire
+    /// (together with the prefix and every `contains_all`). Empty ⇒ no
+    /// any-of constraint. Models the `on by default` / `implied by` / `to
+    /// override` alternation the hand-coded rustc-attribution rule carried.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contains_any: Vec<String>,
+}
+
+impl StripRule {
+    /// Whether `trimmed` (a message line, already trimmed) matches this rule and
+    /// should therefore be deleted.
+    ///
+    /// A line matches when it starts with [`Self::prefix`], contains every
+    /// [`Self::contains_all`] substring, and — when [`Self::contains_any`] is
+    /// non-empty — contains at least one of those. The semantics are deliberately
+    /// narrow (delete whole matching lines; never rewrite) so a manifest rule can
+    /// only ever compress boilerplate, never rule on a verdict.
+    #[must_use]
+    pub fn matches(&self, trimmed: &str) -> bool {
+        trimmed.starts_with(&self.prefix)
+            && self.contains_all.iter().all(|s| trimmed.contains(s))
+            && (self.contains_any.is_empty()
+                || self.contains_any.iter().any(|s| trimmed.contains(s)))
+    }
+}
+
+/// The per-server discipline record — the misc-157 profile table, made manifest
+/// data (diagnostics-debt 04 §"Discipline metadata as data").
+///
+/// One record per blessed server carries what the daemon needs to run the full
+/// adapter against it: its [`Discipline`], its declared constants (the debounce
+/// window), its capability casing (whether to withhold the pull capability,
+/// whether it contractually publishes), and its message-compression
+/// [`StripRule`]s. The [`crate::lsp::server_behavior::ServerProfile`] projects
+/// from this record at build time — the table is generated from the manifest,
+/// not a rival home for the same knowledge.
+///
+/// Every field defaults, so a discipline row may carry only what a server needs
+/// (rust-analyzer withholds pull; gopls forces init options; lattice declares
+/// push) and the manifest stays terse. A server with **no** discipline row is
+/// unverified — enrichment-only, never a diagnostics source.
+///
+/// Does not derive `Eq`: [`Self::forced_init_options`] is a [`toml::Value`],
+/// which cannot implement `Eq` (it may hold a float). `PartialEq` suffices for
+/// the round-trip and projection tests; nothing keys a `DisciplineRecord`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DisciplineRecord {
+    /// The server's publisher discipline. `None` ⇒ the record carries only
+    /// casing/compression (the common case is a discipline is always stated for a
+    /// blessed diagnostics server; `None` tolerates a casing-only row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discipline: Option<Discipline>,
+    /// The declared debounce window in milliseconds, for a [`Discipline::Debounce`]
+    /// server (ts-ls's declared 300–800 ms + 50 ms). Declared in the pinned
+    /// source and re-verified at every re-pin; the ledger awaits the version echo
+    /// bounded by this constant rather than interpreting silence. Absent for
+    /// non-debounce disciplines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debounce_ms: Option<u64>,
+    /// Capability casing: withhold the `textDocument.diagnostic` client capability
+    /// and never issue a pull for this server — its native pushes are the sole
+    /// diagnostic channel (rust-analyzer, RA #18709). Defaults to `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub suppress_pull: bool,
+    /// Capability casing: the server contractually publishes for every opened
+    /// document, an explicit `[]` for clean (lattice, misc 187). Arms the
+    /// retrieval evidence bar by declaration. Defaults to `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub declares_push: bool,
+    /// Forced `initializationOptions` overlaid onto — and winning over — the
+    /// user's options at initialize time (gopls's `pullDiagnostics: false`, bug
+    /// 87). A raw TOML value serialized as an inline table / sub-table. Absent ⇒
+    /// no forced options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced_init_options: Option<toml::Value>,
+    /// Top-level `initializationOptions` keys enforced absent — stripped after the
+    /// user/forced merge so the server's own default is the only value that can
+    /// apply (gopls's `diagnosticsDelay`, run 9). Empty ⇒ none forbidden.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forbidden_init_options: Vec<String>,
+    /// The message-compression line-strip rules for this server's diagnostic
+    /// output (rust-analyzer's clippy/rustc boilerplate). Empty ⇒ the server's
+    /// messages pass through unchanged. Version-scoped via
+    /// [`Self::compress_versions`]: a version outside the pinned set is
+    /// pass-through, matching the hand-coded rules' version safety.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compress: Vec<StripRule>,
+    /// Version prefixes the [`Self::compress`] rules are pinned against (e.g.
+    /// `"1."` for rust-analyzer 1.x). A reported server version that starts with
+    /// one of these is in-scope for the rules; any other version — or an unknown
+    /// version — is pass-through. Empty ⇒ the rules apply to any version (used
+    /// only when a rule is version-agnostic).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compress_versions: Vec<String>,
+}
+
+impl DisciplineRecord {
+    /// Whether this server's reported `version` is in scope for its compression
+    /// rules.
+    ///
+    /// A version is in scope when it starts with one of [`Self::compress_versions`]
+    /// (an empty pin list means version-agnostic ⇒ always in scope). An absent
+    /// version is out of scope whenever a pin list is present — matching the
+    /// hand-coded rules' rule that an unknown version is pass-through.
+    #[must_use]
+    pub fn compress_applies(&self, version: Option<&str>) -> bool {
+        if self.compress_versions.is_empty() {
+            return true;
+        }
+        version.is_some_and(|v| self.compress_versions.iter().any(|p| v.starts_with(p)))
+    }
+}
+
 /// One blessed server entry: a server that passed the CI conformance gate on one
 /// platform.
 ///
@@ -615,17 +796,78 @@ pub struct BlessedEntry {
     pub tier: Option<String>,
 }
 
+/// The manifest schema version this binary understands (diagnostics-debt 04).
+///
+/// Bumped when a manifest change is **not** backward-compatible with an older
+/// binary — a new field an old binary can ignore does not bump it (serde's
+/// `#[serde(default)]` already tolerates unknown-to-old fields). A fetched
+/// manifest whose [`ManifestMeta::min_schema`] exceeds this constant is refused
+/// by [`BlessedManifest::engine_supports`] and the loader degrades to its
+/// embedded snapshot: directional safety, an unreadable manifest never makes
+/// Catenary more trusting.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+
+/// Schema/min-engine metadata for the manifest (`[manifest]`; diagnostics-debt
+/// 04).
+///
+/// Lets an old binary meeting a newer manifest degrade to its snapshot rather
+/// than misread data it does not understand. Both fields default, so the shipped
+/// seed and every existing manifest parse without the table present (an absent
+/// `[manifest]` means "schema 0, no engine floor" — always supported).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestMeta {
+    /// The minimum [`MANIFEST_SCHEMA_VERSION`] a binary must implement to read
+    /// this manifest safely. Absent ⇒ `0` (any binary). A binary whose
+    /// [`MANIFEST_SCHEMA_VERSION`] is below this must degrade to its snapshot.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub min_schema: u32,
+    /// The minimum engine (Catenary) version this manifest targets, for the
+    /// human-readable finding when a degrade fires. Advisory — the machine gate
+    /// is [`Self::min_schema`]. Absent ⇒ no floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_engine: Option<String>,
+}
+
+/// serde `skip_serializing_if` for a defaults-zero `u32` — omit it from TOML when
+/// it holds its default so an absent `[manifest]` table stays absent.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires an fn(&T) -> bool"
+)]
+const fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// serde `skip_serializing_if` for a default [`ManifestMeta`] — omit the
+/// `[manifest]` table when it carries no floor, so an unversioned manifest stays
+/// unversioned on round-trip.
+fn meta_is_default(meta: &ManifestMeta) -> bool {
+    *meta == ManifestMeta::default()
+}
+
 /// The committed blessed-manifest: server → platform → conformed record.
 ///
 /// Rows are platform-qualified (`[blessed.<server>.<platform>]`; misc 164), so
 /// one server may carry an entry per platform it conformed on (e.g. a
 /// `linux-x86_64` and a `macos-arm64` row). The one committed manifest holds both
 /// platforms — there is no per-platform manifest file.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BlessedManifest {
+    /// Schema/min-engine metadata (`[manifest]`). Default (schema 0, no floor)
+    /// when the table is absent — every existing manifest and the seed.
+    #[serde(default, rename = "manifest", skip_serializing_if = "meta_is_default")]
+    pub meta: ManifestMeta,
     /// Blessed entries keyed by canonical server name, then by platform token.
     #[serde(default)]
     pub blessed: BTreeMap<String, BTreeMap<String, BlessedEntry>>,
+    /// Per-server publisher-discipline records — the misc-157 profile table made
+    /// manifest data (diagnostics-debt 04). Keyed by canonical server name,
+    /// platform-agnostic (discipline is a behavior of the server binary, not of
+    /// the host it ran on). A server present in [`Self::blessed`] but absent here
+    /// carries the default (empty) discipline. Written as `[discipline.<server>]`
+    /// tables in the manifest TOML.
+    #[serde(default)]
+    pub discipline: BTreeMap<String, DisciplineRecord>,
 }
 
 impl BlessedManifest {
@@ -643,6 +885,48 @@ impl BlessedManifest {
             .get(server)?
             .values()
             .find(|entry| entry.version == version)
+    }
+
+    /// Whether `server` is **blessed** — present in the manifest's blessed set on
+    /// any platform (diagnostics-debt 04 §"Classification").
+    ///
+    /// Manifest membership is the classifier: a blessed server earns the full
+    /// diagnostics adapter; a server absent here is an unverified custom def and
+    /// is enrichment-only (no diagnostics advertisement, publishes ignored, no
+    /// batch sync lifecycle). Blessing is any-platform, matching
+    /// [`Self::entry_at_version`]: a server that conformed on Linux is blessed for
+    /// classification even when running on macOS.
+    #[must_use]
+    pub fn is_blessed(&self, server: &str) -> bool {
+        self.blessed
+            .get(server)
+            .is_some_and(|rows| !rows.is_empty())
+    }
+
+    /// The discipline record for `server`, or the default (empty) record when the
+    /// server carries no discipline row.
+    ///
+    /// The single lookup the [`crate::lsp::server_behavior::ServerProfile`]
+    /// projection and the message compressor consult. Returning the default for
+    /// an absent server keeps the callers server-name-blind — an unknown server
+    /// naturally resolves to no casing and no compression, which is the
+    /// directional-safety default (noisier, never more trusting).
+    #[must_use]
+    pub fn discipline_for(&self, server: &str) -> DisciplineRecord {
+        self.discipline.get(server).cloned().unwrap_or_default()
+    }
+
+    /// Whether this binary understands the manifest's schema
+    /// (diagnostics-debt 04).
+    ///
+    /// True when the manifest's [`ManifestMeta::min_schema`] is at or below the
+    /// binary's [`MANIFEST_SCHEMA_VERSION`]. A newer manifest that requires a
+    /// schema this binary does not implement returns `false`, and the loader
+    /// degrades to its embedded snapshot rather than misreading fields — an old
+    /// binary meeting a new manifest is noisier (seed-only), never more trusting.
+    #[must_use]
+    pub const fn engine_supports(&self) -> bool {
+        self.meta.min_schema <= MANIFEST_SCHEMA_VERSION
     }
 }
 
@@ -664,6 +948,23 @@ pub fn parse_blessed_manifest(contents: &str) -> Result<BlessedManifest> {
 /// malformed.
 pub fn default_blessed_manifest() -> Result<BlessedManifest> {
     parse_blessed_manifest(DEFAULT_BLESSED_MANIFEST)
+}
+
+/// The embedded seed manifest, parsed once and cached — the build-time
+/// projection source for [`crate::lsp::server_behavior::ServerProfile`] and the
+/// [`crate::filter`] compressor (diagnostics-debt 04).
+///
+/// The daemon does not thread the *fetched* manifest into the synchronous LSP
+/// construction seams (`LspServer::new`, `params::initialize`), so those seams
+/// project from the embedded seed — always available offline and the
+/// directional-safety floor: a server absent from the seed carries no casing and
+/// no compression, which only ever makes Catenary noisier. A malformed embedded
+/// manifest (its own tests forbid it) degrades to an empty manifest — every
+/// server then classifies enrichment-only, never more trusting.
+#[must_use]
+pub fn seed_manifest() -> &'static BlessedManifest {
+    static SEED: std::sync::OnceLock<BlessedManifest> = std::sync::OnceLock::new();
+    SEED.get_or_init(|| default_blessed_manifest().unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -819,6 +1120,192 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── discipline metadata as manifest data (diagnostics-debt 04) ───────
+
+    #[test]
+    fn discipline_table_parses_and_roundtrips() {
+        // The `[discipline.<server>]` tables (discipline, declared constants,
+        // capability casing, compression rules) parse from the shipped manifest
+        // and survive a TOML round-trip byte-for-byte.
+        let manifest = default_blessed_manifest().expect("manifest parses");
+        assert!(
+            !manifest.discipline.is_empty(),
+            "the shipped manifest carries discipline rows"
+        );
+        let serialized = toml::to_string(&manifest).expect("serialize");
+        let reparsed = parse_blessed_manifest(&serialized).expect("reparse");
+        assert_eq!(
+            manifest.discipline, reparsed.discipline,
+            "the discipline table round-trips through TOML"
+        );
+    }
+
+    #[test]
+    fn every_discipline_row_is_a_blessed_server() {
+        // A discipline row grants a server the full diagnostics adapter. A row for
+        // a non-blessed server would be an unverified server masquerading as a
+        // diagnostics source — the classification the design forbids.
+        let manifest = default_blessed_manifest().expect("manifest parses");
+        for name in manifest.discipline.keys() {
+            assert!(
+                manifest.is_blessed(name),
+                "discipline row `{name}` names a server that is not in the blessed set"
+            );
+        }
+    }
+
+    #[test]
+    fn is_blessed_classifies_membership() {
+        // Manifest membership is the classifier: a blessed server (rust-analyzer)
+        // is blessed; a name absent from the blessed set (a custom def) is not.
+        let manifest = default_blessed_manifest().expect("manifest parses");
+        assert!(
+            manifest.is_blessed("rust-analyzer"),
+            "rust-analyzer is blessed"
+        );
+        assert!(manifest.is_blessed("lattice"), "lattice is blessed");
+        assert!(
+            !manifest.is_blessed("some-custom-server"),
+            "a custom def is not blessed"
+        );
+        // The default (empty) manifest blesses nothing — directional safety.
+        assert!(!BlessedManifest::default().is_blessed("rust-analyzer"));
+    }
+
+    #[test]
+    fn discipline_projects_the_cased_servers() {
+        // The three servers the misc-157 profile table cased are now manifest
+        // data, and `discipline_for` projects exactly those settings.
+        let manifest = default_blessed_manifest().expect("manifest parses");
+
+        // rust-analyzer: withholds the pull capability, event discipline.
+        let ra = manifest.discipline_for("rust-analyzer");
+        assert!(ra.suppress_pull, "rust-analyzer suppresses pull");
+        assert!(!ra.declares_push);
+        assert_eq!(ra.discipline, Some(Discipline::Event));
+        assert!(!ra.compress.is_empty(), "rust-analyzer carries strip rules");
+        assert_eq!(ra.compress_versions, vec!["1.".to_owned()]);
+
+        // gopls: forces pullDiagnostics off, forbids diagnosticsDelay.
+        let gopls = manifest.discipline_for("gopls");
+        assert!(!gopls.suppress_pull);
+        assert_eq!(
+            gopls.forbidden_init_options,
+            vec!["diagnosticsDelay".to_owned()]
+        );
+        let forced = gopls
+            .forced_init_options
+            .as_ref()
+            .expect("gopls forces init options");
+        assert_eq!(
+            forced.get("pullDiagnostics").and_then(toml::Value::as_bool),
+            Some(false)
+        );
+
+        // lattice: declares push.
+        let lattice = manifest.discipline_for("lattice");
+        assert!(lattice.declares_push, "lattice declares push");
+
+        // An unruled/unverified server projects the empty record.
+        let unknown = manifest.discipline_for("some-custom-server");
+        assert_eq!(unknown, DisciplineRecord::default());
+    }
+
+    #[test]
+    fn engine_supports_gates_on_min_schema() {
+        // The shipped seed carries no `[manifest]` floor ⇒ schema 0 ⇒ always
+        // supported. A manifest requiring a schema this binary implements is
+        // supported; one requiring a newer schema is refused (degrade-to-snapshot).
+        let seed = default_blessed_manifest().expect("manifest parses");
+        assert_eq!(seed.meta, ManifestMeta::default(), "seed carries no floor");
+        assert!(
+            seed.engine_supports(),
+            "the shipped seed is always readable"
+        );
+
+        let at_floor = BlessedManifest {
+            meta: ManifestMeta {
+                min_schema: MANIFEST_SCHEMA_VERSION,
+                min_engine: None,
+            },
+            ..BlessedManifest::default()
+        };
+        assert!(
+            at_floor.engine_supports(),
+            "a manifest at the floor is readable"
+        );
+
+        let too_new = BlessedManifest {
+            meta: ManifestMeta {
+                min_schema: MANIFEST_SCHEMA_VERSION + 1,
+                min_engine: Some("99.0.0".to_owned()),
+            },
+            ..BlessedManifest::default()
+        };
+        assert!(
+            !too_new.engine_supports(),
+            "a manifest requiring a newer schema must be refused"
+        );
+    }
+
+    #[test]
+    fn manifest_meta_roundtrips_through_toml() {
+        // The `[manifest]` table parses and round-trips; an absent table stays
+        // absent (schema 0).
+        let toml = "[manifest]\nmin_schema = 1\nmin_engine = \"2.1.0\"\n\
+                    [blessed.taplo.linux-x86_64]\nversion = \"0.10.0\"\n\
+                    platform = \"linux-x86_64\"\ndate = \"2026-07-07\"\n";
+        let manifest = parse_blessed_manifest(toml).expect("parses");
+        assert_eq!(manifest.meta.min_schema, 1);
+        assert_eq!(manifest.meta.min_engine.as_deref(), Some("2.1.0"));
+        let serialized = toml::to_string(&manifest).expect("serialize");
+        let reparsed = parse_blessed_manifest(&serialized).expect("reparse");
+        assert_eq!(manifest.meta, reparsed.meta, "the meta table round-trips");
+    }
+
+    #[test]
+    fn compress_rules_strip_boilerplate_and_preserve_verdicts() {
+        // Strip AND preserve against the PIN (misc 165's rider): the manifest's
+        // real rust-analyzer rules compress boilerplate to shape, and a clean
+        // multi-line verdict survives byte-exact. A rule that ate verdict text
+        // would fail here before it shipped.
+        let manifest = default_blessed_manifest().expect("manifest parses");
+        let ra = manifest.discipline_for("rust-analyzer");
+
+        // A helper mirroring the engine's whole-line-delete semantics.
+        let strip = |message: &str| -> String {
+            message
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim();
+                    !ra.compress.iter().any(|rule| rule.matches(trimmed))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim_end()
+                .to_string()
+        };
+
+        // STRIP: a real clippy warning loses its URL and attribution lines.
+        let clippy = "unused variable: `x`\n\
+                      for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#unused_variables\n\
+                      `#[warn(unused_variables)]` on by default";
+        assert_eq!(strip(clippy), "unused variable: `x`");
+
+        // PRESERVE: a clean multi-line rustc verdict survives byte-exact — no
+        // line here is boilerplate, so the compressor is the identity.
+        let verdict = "mismatched types\n\
+                       expected struct `String`, found `&str`\n\
+                       note: expected because of the `let` binding";
+        assert_eq!(strip(verdict), verdict, "a verdict body is never eaten");
+
+        // PRESERVE: the `compress_versions` pin gates the rules — an unknown
+        // version is pass-through even for boilerplate (version safety).
+        assert!(!ra.compress_applies(Some("2.0.0")));
+        assert!(!ra.compress_applies(None));
+        assert!(ra.compress_applies(Some("1.95.0")));
     }
 
     #[test]

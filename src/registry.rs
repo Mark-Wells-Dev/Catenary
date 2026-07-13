@@ -113,7 +113,10 @@ const FETCHED_AT_FILE: &str = "fetched_at";
 /// On the wire this is a single TOML document with `[recipe.<name>]` and
 /// `[blessed.<name>.<platform>]` tables — the two data sets [`crate::recipes`]
 /// ships as separate embedded files, bundled into one signed artifact.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Does not derive `Eq`: the manifest's [`DisciplineRecord`] carries a
+// [`toml::Value`] (forced init options) that cannot implement `Eq`. `PartialEq`
+// is all the round-trip and resolution tests need; nothing keys a payload.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RegistryPayload {
     /// CI-internal install recipes keyed by canonical server name.
     pub recipes: BTreeMap<String, InstallRecipe>,
@@ -196,6 +199,16 @@ struct RegistryDoc {
     recipe: BTreeMap<String, InstallRecipe>,
     #[serde(default)]
     blessed: BTreeMap<String, BTreeMap<String, BlessedEntry>>,
+    /// Per-server publisher-discipline records (`[discipline.<server>]`;
+    /// diagnostics-debt 04). Carried on the wire so a re-pin ships updated
+    /// discipline/casing/compression without a binary release.
+    #[serde(default)]
+    discipline: BTreeMap<String, crate::recipes::DisciplineRecord>,
+    /// Schema/min-engine metadata (`[manifest]`; diagnostics-debt 04). Gates
+    /// whether this binary may read the fetched manifest — a manifest requiring
+    /// a newer schema degrades to the snapshot.
+    #[serde(default)]
+    manifest: crate::recipes::ManifestMeta,
 }
 
 /// Parse a signed registry payload's bytes into a [`RegistryPayload`].
@@ -209,11 +222,32 @@ struct RegistryDoc {
 pub fn parse_payload(bytes: &[u8]) -> Result<RegistryPayload> {
     let text = std::str::from_utf8(bytes).context("registry payload is not valid UTF-8")?;
     let doc: RegistryDoc = toml::from_str(text).context("registry payload is not valid TOML")?;
+    let manifest = BlessedManifest {
+        meta: doc.manifest,
+        blessed: doc.blessed,
+        discipline: doc.discipline,
+    };
+    // Schema/min-engine gate (diagnostics-debt 04): a manifest requiring a
+    // newer schema than this binary implements is refused here, so the loader
+    // degrades to the cached/seed copy rather than misreading fields the new
+    // schema redefined. Directional safety — an unreadable manifest is never
+    // more trusting.
+    if !manifest.engine_supports() {
+        let want = manifest
+            .meta
+            .min_engine
+            .as_deref()
+            .unwrap_or("a newer engine");
+        return Err(anyhow!(
+            "the registry manifest requires schema {} ({want}); this binary implements \
+             schema {} — degrading to the cached or seed manifest",
+            manifest.meta.min_schema,
+            crate::recipes::MANIFEST_SCHEMA_VERSION,
+        ));
+    }
     Ok(RegistryPayload {
         recipes: doc.recipe,
-        manifest: BlessedManifest {
-            blessed: doc.blessed,
-        },
+        manifest,
     })
 }
 
@@ -915,6 +949,43 @@ mod tests {
     }
 
     #[test]
+    fn newer_schema_manifest_degrades_to_seed() {
+        // A verified fetch whose manifest requires a newer schema than this
+        // binary implements is refused at parse-for-use and degrades to the seed
+        // — an old binary meeting a new manifest is noisier, never more trusting
+        // (diagnostics-debt 04, directional safety).
+        let too_new = format!(
+            "[manifest]\nmin_schema = {}\nmin_engine = \"99.0.0\"\n\n{SAMPLE}",
+            crate::recipes::MANIFEST_SCHEMA_VERSION + 1
+        );
+        let key = test_key(11);
+        let artifact = FetchedArtifact {
+            payload: too_new.as_bytes().to_vec(),
+            signature: sign(&key, too_new.as_bytes()),
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let clock = FakeClock::at(7_000_000);
+        let resolved =
+            RegistryLoader::new(&enabled_config(), &FakeFetcher::serving(artifact), &clock)
+                .with_trust_root(public_bytes(&key))
+                .with_cache_dir(tmp.path())
+                .resolve();
+        // The signature verified, but the schema is unreadable ⇒ seed (no cache
+        // existed), carrying a stale finding (the parse-for-use failed).
+        assert_eq!(resolved.source, RegistrySource::Seed);
+        assert!(
+            resolved
+                .findings
+                .iter()
+                .any(|f| f.code == FindingCode::RegistryStale),
+            "an unreadable-schema manifest is a stale finding: {:?}",
+            resolved.findings
+        );
+        // The seed is still served — never unpinned, never the newer manifest.
+        assert!(resolved.payload.manifest.engine_supports());
+    }
+
+    #[test]
     fn refresh_due_predicate() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
         let interval = Duration::from_secs(3600);
@@ -944,14 +1015,18 @@ mod tests {
         struct Doc<'a> {
             recipe: &'a BTreeMap<String, InstallRecipe>,
             blessed: &'a BTreeMap<String, BTreeMap<String, BlessedEntry>>,
+            discipline: &'a BTreeMap<String, crate::recipes::DisciplineRecord>,
         }
         let seed = seed_payload().expect("seed");
         let text = toml::to_string(&Doc {
             recipe: &seed.recipes,
             blessed: &seed.manifest.blessed,
+            discipline: &seed.manifest.discipline,
         })
         .expect("serialize");
         let reparsed = parse_payload(text.as_bytes()).expect("reparse");
         assert_eq!(seed.recipes, reparsed.recipes);
+        // The discipline table round-trips on the wire too (diagnostics-debt 04).
+        assert_eq!(seed.manifest.discipline, reparsed.manifest.discipline);
     }
 }

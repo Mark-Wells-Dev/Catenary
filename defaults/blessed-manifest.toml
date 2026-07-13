@@ -262,3 +262,80 @@ platform = "macos-arm64"
 date = "2026-07-10"
 tier = "verified-on-macos"
 
+# ── Publisher-discipline metadata (diagnostics-debt 04) ──────────────────────
+#
+# One `[discipline.<server>]` per blessed server whose adapter needs casing —
+# the misc-157 profile table, made manifest data. These are platform-agnostic
+# (discipline is a behavior of the server binary, not the host it ran on) and
+# carry what the daemon needs to run the full diagnostics adapter: the publisher
+# discipline (pull/event/debounce/scan/diff), declared constants (the debounce
+# window), the capability casing (withhold the pull capability, force/forbid
+# init options, declare push), and the message-compression line-strip rules.
+#
+#   [discipline.<server>]
+#   discipline = "event"                  # pull | event | debounce | scan | diff
+#   debounce_ms = 300                     # declared window for a debounce server
+#   suppress_pull = true                  # withhold textDocument.diagnostic
+#   declares_push = true                  # contractual publish per didOpen
+#   forbidden_init_options = ["..."]      # keys enforced absent post-merge
+#   forced_init_options = { key = false } # options overlaid, winning over user
+#   compress_versions = ["1."]            # version prefixes the strip rules pin
+#   [[discipline.<server>.compress]]      # a line-strip rule (whole-line delete)
+#   prefix = "for further information visit"
+#
+# The compression engine (src/filter) has fixed, narrow semantics: a message
+# LINE whose trimmed text matches a rule is deleted whole; a message left empty
+# after stripping drops entirely; nothing is rewritten or injected; an
+# out-of-pin version is pass-through. The mandate is compression, never verdict
+# policy — the strip+preserve conformance fixtures assert both directions
+# against the pin, so a rule that ate verdict text would fail the gate before it
+# shipped (misc 165's ruling). A server absent from this table carries the empty
+# discipline: no casing, no compression. An UNVERIFIED custom def (absent from
+# the blessed set entirely) is enrichment-only and never a diagnostics source.
+
+# rust-analyzer — push-first for the Rust family (RA #18709): the native pushes
+# are the sole diagnostic channel, so the pull capability is withheld. The
+# clippy/rustc boilerplate strip rules (formerly hand-coded in
+# src/filter/rust_analyzer.rs) are pinned to the 1.x line.
+[discipline.rust-analyzer]
+discipline = "event"
+suppress_pull = true
+compress_versions = ["1."]
+
+# Clippy "for further information visit https://..." URL lines.
+[[discipline.rust-analyzer.compress]]
+prefix = "for further information visit"
+
+# Rustc/clippy lint attribution: "`#[warn(...)]` on by default" etc.
+[[discipline.rust-analyzer.compress]]
+prefix = "`#["
+contains_any = ["on by default", "implied by", "to override"]
+
+# Standalone `-W` flag attribution: "`-W clippy::...` implied by ...".
+[[discipline.rust-analyzer.compress]]
+prefix = "`-W "
+contains_all = ["implied by"]
+
+# Standalone override instruction: "to override `-W ...` add `#[allow(...)]`".
+[[discipline.rust-analyzer.compress]]
+prefix = "to override"
+contains_any = ["`#[allow(", "`#[warn("]
+
+# gopls — event-publishing, but the pull mode is a footgun (bug 87): pull mode
+# stops real pushes and publishes empty placeholders read as authoritative
+# heard-empty, so `pullDiagnostics` is forced FALSE. `diagnosticsDelay` is
+# enforced ABSENT (run 9): at "0s" every publish fires instantly-and-empty on
+# the unchecked snapshot, so only gopls's own default may apply.
+[discipline.gopls]
+discipline = "event"
+forbidden_init_options = ["diagnosticsDelay"]
+forced_init_options = { pullDiagnostics = false }
+
+# lattice — declared push (misc 187): the contract, pinned cross-repo in misc
+# 153 / Lattice ticket 16 / its decision 022 and re-verified per re-pin, is a
+# publish on EVERY didOpen (unchanged files included), explicit `[]` for clean.
+# The retrieval evidence bar arms on this declaration from turn zero.
+[discipline.lattice]
+discipline = "event"
+declares_push = true
+
