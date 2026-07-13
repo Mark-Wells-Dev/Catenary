@@ -15,9 +15,13 @@
 //!
 //! This module adds a *prompt* teardown signal: a bounded filesystem watch on
 //! each mounted worktree dir that reaps the root the instant the dir is deleted.
-//! It does **not** add new teardown logic — it is a new, fast *trigger* for the
-//! existing reap (`remove_contributor` + `sync_roots`) the GC and the (dead)
-//! `WorktreeRemove` handler already run. The hourly
+//! Because a worktree is *structurally ephemeral* — the dispose lifecycle deletes
+//! the dir at stop and the hourly GC carries crash-orphans — dir-existence is the
+//! honest lifetime signal, so this vanish-watch is the release edge for a
+//! worktree root (which no longer expires on an idle clock — bug 106). Each
+//! deleted dir retires its root through the full retire discipline
+//! ([`crate::router`]'s `retire_root`: every contributor declaring the path, never
+//! just the `worktree:*` mount — misc 183's lesson). The hourly
 //! [`crate::router::WORKTREE_ROOT_GC_INTERVAL`] GC stays as the crash-safe
 //! backstop: this watch is in-memory and dies with the daemon.
 //!
@@ -57,12 +61,18 @@ use tracing::debug;
 use crate::source::Source;
 
 /// A reap event emitted by the watcher's [`notify`] callback: the deletion of a
-/// watched worktree path. Carries the contributor key so the reaper task can run
-/// the existing teardown without re-deriving it.
+/// watched worktree path.
+///
+/// Carries the contributor key and the canonical worktree path so the reaper task
+/// can retire the root without re-deriving either.
 #[derive(Debug, Clone)]
 pub struct WorktreeDeleted {
     /// The `worktree:{session_id}:{path}` contributor key whose dir was deleted.
     pub contributor: String,
+    /// The canonical worktree path that vanished — the root the reaper retires
+    /// through the full [`crate::router`] retire discipline (every contributor
+    /// declaring it, not just the `worktree:*` mount).
+    pub worktree: PathBuf,
 }
 
 /// Per-watch registration state, behind a single mutex shared with the
@@ -132,9 +142,12 @@ impl WorktreeWatcher {
                 return;
             }
             for path in &event.paths {
-                if let Some(contributor) = matching_contributor(&cb_state, path) {
+                if let Some((contributor, worktree)) = matching_contributor(&cb_state, path) {
                     // Non-blocking; a closed channel (daemon shutting down) is fine.
-                    let _ = tx.send(WorktreeDeleted { contributor });
+                    let _ = tx.send(WorktreeDeleted {
+                        contributor,
+                        worktree,
+                    });
                 }
             }
         })?;
@@ -368,14 +381,18 @@ impl WorktreeWatcher {
 }
 
 /// Finds the contributor whose watched worktree path equals `deleted` (the parent
-/// watch reports the full child path on a delete). Returns the key to reap, if
-/// any.
-fn matching_contributor(state: &Arc<Mutex<WatchState>>, deleted: &Path) -> Option<String> {
+/// watch reports the full child path on a delete). Returns the `(contributor,
+/// worktree path)` to reap, if any — the path lets the reaper retire the root
+/// through the full retire discipline (every contributor declaring it).
+fn matching_contributor(
+    state: &Arc<Mutex<WatchState>>,
+    deleted: &Path,
+) -> Option<(String, PathBuf)> {
     let state = state.lock().unwrap_or_else(PoisonError::into_inner);
     state
         .contributors
         .iter()
-        .find_map(|(key, path)| (path.as_path() == deleted).then(|| key.clone()))
+        .find_map(|(key, path)| (path.as_path() == deleted).then(|| (key.clone(), path.clone())))
 }
 
 /// Whether a [`notify`] event kind is a deletion. Kept liberal across backends:
@@ -416,7 +433,10 @@ mod tests {
         }));
         assert_eq!(
             matching_contributor(&state, &PathBuf::from("/tmp/wt/agent-a")),
-            Some("worktree:s1:/tmp/wt/agent-a".to_string())
+            Some((
+                "worktree:s1:/tmp/wt/agent-a".to_string(),
+                PathBuf::from("/tmp/wt/agent-a"),
+            ))
         );
         assert_eq!(
             matching_contributor(&state, &PathBuf::from("/tmp/wt/agent-b")),

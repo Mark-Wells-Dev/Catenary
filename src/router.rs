@@ -909,10 +909,11 @@ struct HookDispatchContext {
     /// sidecars at startup; anchors the identity-keyed `SubagentStop` reap and the
     /// `worktree-remove` reverse lookup, and carries misc 151's disposal metadata.
     worktree_registry: WorktreeRegistry,
-    /// Per-root idle clock + blocked-on-permission flag for mounted worktree-class
-    /// roots (misc 150). Refreshed by the same qualifying activities that touch
-    /// the ephemeral clocks; the worktree idle reaper reads it to unmount a quiet
-    /// worktree root, and a blocked root is exempt from that expiry.
+    /// Per-root blocked-on-permission flag for mounted worktree-class roots (misc
+    /// 150). Feeds the `blocked` root-state in `catenary worktree ls` (misc 151);
+    /// the flag is cleared by qualifying activity under the root and on the next
+    /// identity event. Worktree roots are pinned-class — no idle clock (bug 106);
+    /// their release edge is the worktrees-dir vanish-watch.
     worktree_mounts: WorktreeMounts,
     /// Live subagents by parent session (tui-rework 03). Recorded at
     /// `SubagentStart`, pruned at `SubagentStop` / `SessionEnd`; shared with the
@@ -1834,44 +1835,37 @@ fn reap_idle_ephemeral_roots(
     expired
 }
 
-// ── Worktree-class roots: registry, idle clock, blocked-on-permission (misc 150) ──
+// ── Worktree-class roots: registry, blocked-on-permission display (misc 150) ──
 
-/// How long a mounted worktree root survives without a refreshing activity
-/// before the idle reaper unmounts it.
+/// One worktree root's blocked-on-permission display flag.
 ///
-/// Longer than [`EPHEMERAL_ROOT_IDLE_TIMEOUT`] — a worktree subagent is a
-/// heavier, longer-lived context whose servers are worth keeping warm across
-/// brief lulls. A blocked-on-permission root is exempt from this expiry.
-#[cfg(unix)]
-const WORKTREE_ROOT_IDLE_TIMEOUT: Duration = Duration::from_mins(30);
-
-/// How often the worktree idle-expiry reaper wakes to sweep inactive worktree
-/// roots. Coarse relative to the 30-minute timeout — the extra slack is at most
-/// one sweep interval.
-#[cfg(unix)]
-const WORKTREE_ROOT_IDLE_SWEEP_INTERVAL: Duration = Duration::from_mins(5);
-
-/// One worktree root's idle clock and blocked-on-permission flag.
+/// A worktree root is pinned-class — it does not expire on an idle clock (bug
+/// 106); the worktrees dir vanish-watch is its release edge. This struct no
+/// longer carries a last-activity instant: it survives only as the per-root
+/// blocked-on-permission flag the `catenary worktree ls` root-state column reads.
 #[cfg(unix)]
 struct WorktreeClock {
-    /// The tracked root path (for `touch_covering`'s prefix test and logging).
+    /// The tracked root path (for `touch_covering`'s prefix test, `mounted_roots`,
+    /// and logging).
     root: PathBuf,
-    /// Last qualifying activity under the root.
-    last: Instant,
-    /// Blocked-on-permission: idle expiry is suspended while set.
+    /// Blocked-on-permission: the subagent is parked at a permission prompt. Feeds
+    /// the `blocked` root-state in `catenary worktree ls` (misc 151); cleared on
+    /// the next identity event or qualifying activity under the root.
     blocked: bool,
 }
 
-/// Per-root idle + blocked state for mounted worktree-class roots, keyed by
-/// contributor (misc 150).
+/// Per-root blocked-on-permission state for mounted worktree-class roots, keyed
+/// by contributor (misc 150).
 ///
 /// The worktree analogue of [`EphemeralMounts`], but keyed by the **contributor**
 /// rather than the path: a worktree contributor may be identity-shaped
-/// (`worktree:{session}:{agent_id}`), which is not path-derivable, so the reaper
-/// must carry the key it will `remove_contributor`. Each entry also tracks a
-/// blocked-on-permission flag — a subagent parked at a permission prompt for
-/// hours is *blocked*, not orphaned, so it is exempt from idle expiry until the
-/// flag clears (an identity event or qualifying activity).
+/// (`worktree:{session}:{agent_id}`), which is not path-derivable, so a teardown
+/// must carry the key it will `remove`. Each entry tracks a blocked-on-permission
+/// flag — a subagent parked at a permission prompt is *blocked*, surfaced as the
+/// `blocked` root-state in `catenary worktree ls`; the flag clears on an identity
+/// event or qualifying activity. Worktree roots no longer expire on idle (bug
+/// 106), so this structure carries no idle clock — only the display flag and the
+/// mounted-root set.
 #[cfg(unix)]
 #[derive(Clone)]
 struct WorktreeMounts {
@@ -1886,9 +1880,9 @@ impl WorktreeMounts {
         }
     }
 
-    /// Start (or refresh) a mounted worktree root's idle clock. Mounting always
-    /// clears any stale blocked flag.
-    fn track(&self, contributor: &str, root: &Path, now: Instant) {
+    /// Track a mounted worktree root. Mounting always clears any stale blocked
+    /// flag (a re-mount at the same key is a fresh, unblocked subagent).
+    fn track(&self, contributor: &str, root: &Path) {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1896,32 +1890,31 @@ impl WorktreeMounts {
                 contributor.to_string(),
                 WorktreeClock {
                     root: root.to_path_buf(),
-                    last: now,
                     blocked: false,
                 },
             );
     }
 
-    /// Refresh — and unblock — every worktree root that encloses `path`.
+    /// Unblock every worktree root that encloses `path`.
     ///
-    /// Qualifying activity under a root both keeps it alive and clears its
-    /// blocked-on-permission suspension (the agent resumed work). `path` should
-    /// already be canonicalized so it lines up with the canonical root keys.
-    fn touch_covering(&self, path: &Path, now: Instant) {
+    /// Qualifying activity under a root clears its blocked-on-permission flag (the
+    /// agent resumed work), so `catenary worktree ls` stops rendering it `blocked`.
+    /// `path` should already be canonicalized so it lines up with the canonical
+    /// root keys.
+    fn touch_covering(&self, path: &Path) {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for clock in inner.values_mut() {
             if path.starts_with(&clock.root) {
-                clock.last = now;
                 clock.blocked = false;
             }
         }
     }
 
-    /// Mark a single worktree root blocked (idle expiry suspended). Returns
-    /// whether a matching root was found.
+    /// Mark a single worktree root blocked-on-permission. Returns whether a
+    /// matching root was found.
     fn mark_blocked(&self, contributor: &str) -> bool {
         let mut inner = self
             .inner
@@ -1966,7 +1959,7 @@ impl WorktreeMounts {
         }
     }
 
-    /// Drop a root's clock entry (on reap).
+    /// Drop a root's entry (on teardown).
     fn remove(&self, contributor: &str) {
         self.inner
             .lock()
@@ -1974,27 +1967,13 @@ impl WorktreeMounts {
             .remove(contributor);
     }
 
-    /// Drop every clock entry whose contributor starts with `prefix` (the
-    /// `SessionEnd` sweep).
+    /// Drop every entry whose contributor starts with `prefix` (the `SessionEnd`
+    /// sweep).
     fn remove_prefix(&self, prefix: &str) {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|contributor, _| !contributor.starts_with(prefix));
-    }
-
-    /// The `(contributor, root)` of every **non-blocked** root idle at least
-    /// `idle` before `now`.
-    fn expired(&self, now: Instant, idle: Duration) -> Vec<(String, PathBuf)> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|(_, clock)| {
-                !clock.blocked && now.saturating_duration_since(clock.last) >= idle
-            })
-            .map(|(contributor, clock)| (contributor.clone(), clock.root.clone()))
-            .collect()
     }
 
     /// Every mounted worktree root path with its blocked flag (misc 151 —
@@ -2017,43 +1996,6 @@ impl WorktreeMounts {
             .get(contributor)
             .is_some_and(|clock| clock.blocked)
     }
-
-    /// Whether a contributor carries an idle clock (test-only).
-    #[cfg(test)]
-    fn contains(&self, contributor: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(contributor)
-    }
-}
-
-/// Reaps every worktree root idle beyond `idle` as of `now` (blocked roots
-/// exempt), returning the reaped `(contributor, root)` pairs so the caller can
-/// re-sync + log.
-///
-/// Pure [`RootTracker`] + [`WorktreeMounts`] (+ watch) mutation — no async, no
-/// `sync_roots` (the reaper loop owns the single re-sync), mirroring
-/// [`reap_idle_ephemeral_roots`]. **Never** any disk action: a worktree can hold
-/// unlanded work, so idle expiry only drops the in-memory root + its language
-/// servers; the directory and its sidecar are untouched.
-#[cfg(unix)]
-fn reap_idle_worktree_roots(
-    tracker: &RootTracker,
-    mounts: &WorktreeMounts,
-    watcher: Option<&crate::worktree_watch::WorktreeWatcher>,
-    now: Instant,
-    idle: Duration,
-) -> Vec<(String, PathBuf)> {
-    let expired = mounts.expired(now, idle);
-    for (contributor, _) in &expired {
-        tracker.remove_contributor(contributor);
-        if let Some(watcher) = watcher {
-            watcher.unregister(contributor);
-        }
-        mounts.remove(contributor);
-    }
-    expired
 }
 
 /// In-memory identity→(path, metadata) registry for Catenary-created worktrees
@@ -2277,11 +2219,12 @@ async fn ensure_ephemeral_mounts(
         // tracker's canonical roots; a glob pattern / not-yet-existing path keeps
         // its resolved spelling (its enclosing `.git` still resolves lexically).
         let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-        // Every qualifying activity refreshes the covering root's idle clock —
-        // both the ephemeral clock and the worktree-class clock (misc 150), the
-        // latter also clearing any blocked-on-permission flag.
+        // Every qualifying activity refreshes the covering ephemeral root's idle
+        // clock, and clears any blocked-on-permission flag on a covering
+        // worktree-class root (misc 150 — the worktree root itself no longer
+        // expires on idle, bug 106).
         mounts.touch_covering(&canonical, now);
-        ctx.worktree_mounts.touch_covering(&canonical, now);
+        ctx.worktree_mounts.touch_covering(&canonical);
         let existing: HashSet<PathBuf> = tracker.global_roots().into_iter().collect();
         if let Some(root) = ephemeral_root_to_mount(&canonical, &existing) {
             let contributor = ephemeral_contributor(&root);
@@ -2953,80 +2896,27 @@ impl SessionManager {
         });
     }
 
-    /// Spawns the idle-expiry reaper for mounted worktree-class roots (misc 150).
-    ///
-    /// Every [`WORKTREE_ROOT_IDLE_SWEEP_INTERVAL`] it unmounts every worktree root
-    /// idle beyond [`WORKTREE_ROOT_IDLE_TIMEOUT`] and **not** blocked-on-permission
-    /// ([`reap_idle_worktree_roots`]): `remove_contributor` + watch `unregister`,
-    /// then one re-sync of the reduced union — the same teardown the
-    /// `WorktreeRemove`/`SubagentStop` paths run, so the worktree's servers shut
-    /// down cleanly. **Never** any disk action: a worktree can hold unlanded work,
-    /// so idle expiry reclaims only RAM. The idle clock is refreshed by every
-    /// qualifying activity under the root, so an actively used worktree never
-    /// expires mid-work; a blocked root is exempt entirely. Each expiry emits an
-    /// `info!` firehose event (no user-notification noise).
-    ///
-    /// A detached background task mirroring [`Self::spawn_ephemeral_root_reaper`]:
-    /// consumes the immediate first tick, then runs until daemon exit. No-op
-    /// unless [`Self::with_session`] wired the tracker + primary session.
-    pub fn spawn_worktree_root_idle_reaper(&self, rt: &tokio::runtime::Handle) {
-        let (Some(tracker), Some(ctx)) = (&self.root_tracker, &self.hook_ctx) else {
-            return;
-        };
-        let tracker = tracker.clone();
-        let session = ctx.primary.clone();
-        let mounts = ctx.worktree_mounts.clone();
-        let watcher = ctx.worktree_watcher.clone();
-        rt.spawn(async move {
-            let mut ticker = tokio::time::interval(WORKTREE_ROOT_IDLE_SWEEP_INTERVAL);
-            ticker.tick().await; // consume the immediate first tick
-            loop {
-                ticker.tick().await;
-                let expired = reap_idle_worktree_roots(
-                    &tracker,
-                    &mounts,
-                    watcher.as_ref(),
-                    Instant::now(),
-                    WORKTREE_ROOT_IDLE_TIMEOUT,
-                );
-                if !expired.is_empty() {
-                    // Same sync the request handlers use: re-sync the (now
-                    // smaller) union once, shutting down the reaped roots' servers.
-                    if let Err(e) = session.sync_roots(tracker.global_roots_rich()).await {
-                        debug!(
-                            source = Source::DaemonDispatch.as_str(),
-                            "root sync after worktree idle expiry failed: {e}",
-                        );
-                    }
-                    for (contributor, root) in &expired {
-                        info!(
-                            source = Source::DaemonDispatch.as_str(),
-                            session_id = worktree_contributor_session_id(contributor).unwrap_or(""),
-                            root = %root.display(),
-                            contributor = %contributor,
-                            "reaped idle worktree root",
-                        );
-                    }
-                    // The root board changed — flush the snapshot promptly.
-                    session.touch_snapshot();
-                }
-            }
-        });
-    }
-
-    /// Spawns the worktree-deletion reaper — the prompt teardown trigger for
-    /// `worktree:*` roots (ticket 05).
+    /// Spawns the worktree-deletion reaper — the **release edge** for
+    /// `worktree:*` roots (ticket 05; bug 106).
     ///
     /// Drains the channel the [`crate::worktree_watch::WorktreeWatcher`] feeds from
     /// its [`notify`] callback. Each [`crate::worktree_watch::WorktreeDeleted`] is
     /// the deletion of a watched worktree dir — for git subagents the host runs
     /// `git worktree remove` itself and fires no `WorktreeRemove` hook, so this is
-    /// the only prompt signal. On each event it runs the SAME reap the
-    /// `WorktreeRemove` handler and the GC run — `remove_contributor` +
-    /// `sync_roots` — then drops the now-dead watch. Reaping is idempotent: a
-    /// double-reap from the watch, the GC, and the `SessionEnd` sweep is a
-    /// harmless no-op (`remove_contributor` of an absent key changes nothing, and
-    /// the re-sync is to the same union).
+    /// the prompt signal. Since a worktree root is now pinned-class (no idle
+    /// expiry — bug 106), the vanished directory is the honest lifetime signal, so
+    /// this watch is the primary teardown trigger, not merely a fast alternative
+    /// to it.
+    ///
+    /// Each event retires the vanished root through the **full retire discipline**
+    /// ([`retire_root`], misc 183's lesson): every contributor declaring the path
+    /// releases exactly it (never just the `worktree:*` mount, which would orphan
+    /// the per-root server set behind another holder), its deletion watch and idle
+    /// clock unregister, its provenance leaves the ledger, and the reduced union
+    /// syncs once. Reaping is idempotent: a double-reap from a coalesced delete
+    /// burst, the GC, and the `SessionEnd` sweep is a harmless no-op
+    /// (`retire_root` of an already-absent root changes nothing, and the re-sync is
+    /// to the same union).
     ///
     /// A detached background task on the provided runtime handle, mirroring
     /// [`Self::spawn_worktree_root_gc`]; it exits when the channel closes (daemon
@@ -3045,26 +2935,14 @@ impl SessionManager {
             return;
         };
         let tracker = tracker.clone();
-        let session = ctx.primary.clone();
-        let watcher = ctx.worktree_watcher.clone();
-        let mounts = ctx.worktree_mounts.clone();
+        let ctx = ctx.clone();
         rt.spawn(async move {
             while let Some(event) = rx.recv().await {
-                let contributor = event.contributor;
-                // Drop the watch first so a coalesced burst of delete events for
-                // the same worktree doesn't re-reap; idempotent either way.
-                if let Some(watcher) = &watcher {
-                    watcher.unregister(&contributor);
-                }
-                // Drop the worktree idle clock too so it never outlives the root.
-                mounts.remove(&contributor);
-                tracker.remove_contributor(&contributor);
-                if let Err(e) = session.sync_roots(tracker.global_roots_rich()).await {
-                    debug!(
-                        source = Source::DaemonDispatch.as_str(),
-                        "root sync after worktree-deletion reap failed: {e}",
-                    );
-                }
+                // Retire the vanished root from ALL of its contributors, not just
+                // the `worktree:*` mount (misc 183): `retire_root` unregisters the
+                // watch + idle clock, prunes the provenance ledger, and re-syncs
+                // once. Idempotent against a coalesced delete burst and the GC.
+                retire_root(&ctx, &tracker, &event.worktree).await;
                 // Scope the reap log under the contributing session — the same
                 // firehose shard as the mount (which logs inside the
                 // session-scoped hook handler) — so a worktree's full lifecycle
@@ -3073,9 +2951,11 @@ impl SessionManager {
                 // daemon scope for a malformed key (no behavior change).
                 debug!(
                     source = Source::DaemonDispatch.as_str(),
-                    session_id = worktree_contributor_session_id(&contributor).unwrap_or(""),
-                    contributor = %contributor,
-                    "reaped worktree root on dir deletion",
+                    session_id =
+                        worktree_contributor_session_id(&event.contributor).unwrap_or(""),
+                    contributor = %event.contributor,
+                    worktree = %event.worktree.display(),
+                    "retired worktree root on dir deletion",
                 );
             }
         });
@@ -4942,9 +4822,11 @@ async fn handle_hook_dispatch(
                     format!("worktree:{session_id}:{agent_id}")
                 };
                 tracker.set_roots(&contributor, vec![worktree.clone()]);
-                // Start the worktree-class idle clock (misc 150).
-                ctx.worktree_mounts
-                    .track(&contributor, &worktree, Instant::now());
+                // Track the mounted worktree root for the blocked-on-permission
+                // display flag (misc 150). The root is pinned-class — its lifetime
+                // is the directory (the vanish-watch retires it), not an idle clock
+                // (bug 106).
+                ctx.worktree_mounts.track(&contributor, &worktree);
 
                 // Register the bounded deletion watch (ticket 05): the prompt
                 // teardown trigger, since `git worktree remove` fires no
@@ -5100,13 +4982,14 @@ async fn handle_hook_dispatch(
     // ── Blocked-on-permission (misc 150) ──────────────────────────
     //
     // Fires when the host CLI sends a `PermissionRequest` hook (a pure observer;
-    // returns no decision). Marks the agent's worktree root **blocked** so the
-    // idle reaper exempts it: a subagent parked at a permission prompt for hours
-    // is blocked, not orphaned. Identity-scoped when the payload carries
-    // `agent_id`; else the coarse fallback suspends idle expiry for ALL of this
-    // session's worktree roots (prompts are rare). The flag clears on the next
-    // identity event (any hook dispatch with that agent_id) or qualifying activity
-    // under the root. No ceiling on the blocked state.
+    // returns no decision). Marks the agent's worktree root **blocked** — a
+    // subagent parked at a permission prompt — so `catenary worktree ls` renders
+    // its root-state as `blocked` (misc 151). Identity-scoped when the payload
+    // carries `agent_id`; else the coarse fallback marks ALL of this session's
+    // worktree roots (prompts are rare). The flag clears on the next identity
+    // event (any hook dispatch with that agent_id) or qualifying activity under
+    // the root. The flag no longer gates a lifetime decision: worktree roots are
+    // pinned-class (no idle expiry — bug 106), released only by the vanish-watch.
     //
     // Short-circuits before get_or_create_router: daemon-level root concern only.
     if method == "permission-request/blocked" {
@@ -5119,7 +5002,7 @@ async fn handle_hook_dispatch(
                 source = Source::DaemonDispatch.as_str(),
                 session_id = %session_id,
                 count = marked,
-                "permission prompt (no agent id): suspended idle expiry for the session's worktree roots",
+                "permission prompt (no agent id): marked the session's worktree roots blocked",
             );
         } else {
             let contributor = format!("worktree:{session_id}:{agent_id}");
@@ -5129,7 +5012,7 @@ async fn handle_hook_dispatch(
                 session_id = %session_id,
                 agent_id = agent_id,
                 marked = marked,
-                "permission prompt: suspended idle expiry for the agent's worktree root",
+                "permission prompt: marked the agent's worktree root blocked",
             );
         }
 
@@ -6218,9 +6101,10 @@ async fn handle_hook_dispatch(
     }
 
     // A hook dispatch carrying an agent identity clears any blocked-on-permission
-    // suspension for that agent's worktree root (misc 150) — the human answered
-    // the prompt and the agent resumed. (The SubagentStop reap above already
-    // dropped the clock, so this is a no-op there.)
+    // flag for that agent's worktree root (misc 150) — the human answered the
+    // prompt and the agent resumed, so `catenary worktree ls` stops rendering it
+    // `blocked`. (The SubagentStop reap above already dropped the entry, so this
+    // is a no-op there.)
     if let Some(aid) = raw
         .get("agent_id")
         .and_then(|v| v.as_str())
@@ -6231,16 +6115,17 @@ async fn handle_hook_dispatch(
     }
 
     // Edit tracking is a qualifying activity (ticket 02 / misc 150): a `PreToolUse`
-    // edit of a file under an ephemeral or worktree root refreshes that root's idle
-    // clock (and clears any blocked flag), so an agent actively editing under it
-    // never has it expire mid-work. This only *refreshes* — edits never mount (a
-    // query does), keeping the edit hook fast.
+    // edit of a file under an ephemeral root refreshes that root's idle clock, so
+    // an agent actively editing under it never has it expire mid-work; an edit
+    // under a worktree root clears any blocked-on-permission flag (the worktree
+    // root itself no longer expires on idle, bug 106). This only *refreshes* —
+    // edits never mount (a query does), keeping the edit hook fast.
     if let Some(file_path) = raw.get("file_path").and_then(|v| v.as_str()) {
         let path = Path::new(file_path);
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let now = Instant::now();
         ctx.ephemeral_mounts.touch_covering(&canonical, now);
-        ctx.worktree_mounts.touch_covering(&canonical, now);
+        ctx.worktree_mounts.touch_covering(&canonical);
     }
 
     let envelope = HookResponseEnvelope {
@@ -12595,21 +12480,22 @@ mod tests {
     //
     // `WorktreeRemove` never fires for git worktrees (the host runs
     // `git worktree remove` itself), so the prompt teardown trigger is the
-    // bounded directory-deletion watch. These tests cover the *reap* the watch
-    // reaper, the GC, and the `SessionEnd` sweep all share — `remove_contributor`
-    // + watch `unregister` + the reduced-union sync — and its idempotence across
-    // those paths. The real-FS deletion→channel half (the OS watch firing on a
-    // `remove_dir_all`) is covered by `worktree_watch::tests`'
-    // `deletion_emits_contributor_event`; here we drive the tracker + watcher
+    // bounded directory-deletion watch. These tests cover the teardown primitives
+    // the watch reaper (`retire_root`), the GC, and the `SessionEnd` sweep all
+    // share — dropping a contributor's root + watch `unregister` — and their
+    // idempotence across those paths. The real-FS deletion→channel half (the OS
+    // watch firing on a `remove_dir_all`) is covered by `worktree_watch::tests`'
+    // `deletion_emits_contributor_event`; the full `retire_root` release edge is
+    // covered by the integration test; here we drive the tracker + watcher
     // directly so the assertions stay deterministic (no OS-event timing).
 
     #[test]
     fn worktree_watch_reap_drops_only_the_deleted_root() {
-        // The reaper's per-event action (see `spawn_worktree_watch_reaper`): on a
-        // `WorktreeDeleted` for one watched worktree, `unregister` its watch and
-        // `remove_contributor`, leaving every other root in `global_roots`
-        // untouched. Mirrors `reap_missing_worktree_roots_reaps_only_gone_dirs`
-        // but for the prompt watch path rather than the hourly GC.
+        // The teardown primitive the reaper composes: dropping one watched
+        // worktree's contributor and `unregister`ing its watch leaves every other
+        // root in `global_roots` untouched. Mirrors
+        // `reap_missing_worktree_roots_reaps_only_gone_dirs` but for the prompt
+        // watch path rather than the hourly GC.
         let (watcher, _rx) = crate::worktree_watch::WorktreeWatcher::new().expect("create watcher");
         let dir = tempfile::tempdir().expect("tempdir");
         let base = dir.path().canonicalize().expect("canonicalize");
@@ -13022,91 +12908,73 @@ mod tests {
         );
     }
 
-    // ── Worktree-class idle clock + blocked state (misc 150) ───────────────
+    // ── Worktree-class roots: pinned-class lifetime + blocked display (misc 150 / bug 106) ──
 
     #[test]
-    fn worktree_idle_sweep_reaps_quiet_and_activity_refreshes() {
-        let tracker = RootTracker::new();
-        let mounts = WorktreeMounts::new();
-        let idle = PathBuf::from("/wt/idle");
-        let fresh = PathBuf::from("/wt/fresh");
-        let key_idle = format!("worktree:sess:{}", idle.display());
-        let key_fresh = format!("worktree:sess:{}", fresh.display());
-        tracker.set_roots(&key_idle, vec![idle.clone()]);
-        tracker.set_roots(&key_fresh, vec![fresh.clone()]);
-
-        let t0 = Instant::now();
-        mounts.track(&key_idle, &idle, t0);
-        mounts.track(&key_fresh, &fresh, t0);
-
-        // Activity under `fresh` refreshes its clock; `idle` is left stale.
-        let later = t0 + Duration::from_mins(40);
-        mounts.touch_covering(&fresh.join("src/x.rs"), later);
-
-        let expired =
-            reap_idle_worktree_roots(&tracker, &mounts, None, later, Duration::from_mins(30));
-        assert_eq!(
-            expired,
-            vec![(key_idle.clone(), idle.clone())],
-            "only the quiet worktree root expires",
+    fn worktree_root_is_pinned_class_never_ephemeral() {
+        // bug 106: a mounted worktree root carries a `worktree:*` contributor, so
+        // it is NEVER classified ephemeral (`[ephemeral · expires when idle]`) — no
+        // idle clock reaps it while its directory exists. The vanish-watch is its
+        // only release edge. This pins the classification the CLI ls renders on.
+        let root = PathBuf::from("/wt/pinned");
+        let key = format!("worktree:sess:{}", root.display());
+        assert!(
+            !root_is_ephemeral(std::slice::from_ref(&key)),
+            "a worktree-mounted root is pinned-class, never ephemeral",
         );
-        let global = tracker.global_roots();
-        assert!(!global.contains(&idle), "idle worktree root reaped");
-        assert!(global.contains(&fresh), "active worktree root survives");
-        assert!(!mounts.contains(&key_idle), "reaped clock entry gone");
-        assert!(mounts.contains(&key_fresh), "active clock entry kept");
+        assert!(
+            !root_is_ephemeral(&[key, "ephemeral:/wt/pinned".to_string()]),
+            "even alongside an ephemeral contributor, the worktree mount pins it",
+        );
     }
 
     #[test]
-    fn worktree_blocked_suspends_idle_until_identity_clears() {
+    fn worktree_blocked_flag_marks_clears_and_survives_activity() {
+        // The blocked-on-permission flag is now a pure display state (misc 151's
+        // `catenary worktree ls` root-state), no longer gating any idle expiry
+        // (bug 106): mark it, clear it on an identity event, and clear it on
+        // qualifying activity. The root is never expired — only its flag moves.
         let mounts = WorktreeMounts::new();
         let root = PathBuf::from("/wt/blocked");
         let key = format!("worktree:sess:{}", root.display());
-        let t0 = Instant::now();
-        mounts.track(&key, &root, t0);
+        mounts.track(&key, &root);
 
-        // Blocked-on-permission → exempt from idle expiry, however long it sits.
         assert!(mounts.mark_blocked(&key), "the root is present and marked");
         assert!(mounts.is_blocked(&key));
-        let long_after = t0 + Duration::from_hours(2);
-        assert!(
-            mounts
-                .expired(long_after, Duration::from_mins(30))
-                .is_empty(),
-            "a blocked root never expires, whatever the idle span",
-        );
 
-        // The next identity event clears the flag; the root then expires normally.
+        // An identity event clears the flag (the human answered the prompt).
         mounts.clear_blocked(&key);
         assert!(!mounts.is_blocked(&key));
-        assert_eq!(
-            mounts.expired(long_after, Duration::from_mins(30)),
-            vec![(key.clone(), root.clone())],
-            "once unblocked, a stale root is idle-expired",
-        );
 
-        // Qualifying activity also clears the flag (the coarser path).
+        // Qualifying activity under the root also clears the flag.
         mounts.mark_blocked(&key);
         assert!(mounts.is_blocked(&key));
-        mounts.touch_covering(&root.join("f.rs"), long_after);
+        mounts.touch_covering(&root.join("f.rs"));
         assert!(
             !mounts.is_blocked(&key),
-            "activity under the root clears the blocked flag too",
+            "activity under the root clears the blocked flag",
+        );
+
+        // The root's mount entry is never dropped by any of this — only teardown
+        // (`remove`) drops it, which is the vanish-watch/GC/SessionEnd path.
+        assert_eq!(
+            mounts.mounted_roots(),
+            vec![(root, false)],
+            "the root stays mounted (unblocked) throughout — no idle expiry",
         );
     }
 
     #[test]
     fn worktree_blocked_session_marks_all_that_sessions_roots() {
-        // The coarse fallback (no agent identity in the permission payload)
-        // suspends idle expiry for every worktree root of the session.
+        // The coarse fallback (no agent identity in the permission payload) marks
+        // every worktree root of the session blocked for the `worktree ls` display.
         let mounts = WorktreeMounts::new();
         let a = PathBuf::from("/wt/a");
         let b = PathBuf::from("/wt/b");
         let other = PathBuf::from("/wt/other");
-        let t0 = Instant::now();
-        mounts.track("worktree:sess-1:one", &a, t0);
-        mounts.track("worktree:sess-1:two", &b, t0);
-        mounts.track("worktree:sess-2:x", &other, t0);
+        mounts.track("worktree:sess-1:one", &a);
+        mounts.track("worktree:sess-1:two", &b);
+        mounts.track("worktree:sess-2:x", &other);
 
         assert_eq!(mounts.mark_blocked_session("sess-1"), 2);
         assert!(mounts.is_blocked("worktree:sess-1:one"));

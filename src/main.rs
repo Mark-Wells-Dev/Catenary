@@ -1770,15 +1770,16 @@ fn run_daemon_main() -> Result<()> {
     // staleness heuristic.
     manager.spawn_worktree_root_gc(rt.handle());
 
-    // Worktree-deletion reaper (workstream 30, ticket 05): the PROMPT teardown
-    // trigger for `worktree:*` roots. `git worktree remove` fires no
-    // `WorktreeRemove` hook, so without this the hourly GC above is the only live
-    // reaper (≤1 h leak). This reaper drains the bounded directory-deletion watch
-    // (registered at `SubagentStart` mount) and reaps the root within the
-    // FS-event latency. Spawned AFTER `with_session` so the watcher + channel
-    // exist; a no-op for a session-less manager or if the OS watcher was
-    // unavailable. The GC stays the crash-safe backstop (the watch dies with the
-    // daemon).
+    // Worktree-deletion reaper (workstream 30, ticket 05; bug 106): the RELEASE
+    // EDGE for `worktree:*` roots. A worktree root is pinned-class — it does not
+    // expire on an idle clock (bug 106); its lifetime is the directory. `git
+    // worktree remove` fires no `WorktreeRemove` hook, so this watch (registered
+    // at `SubagentStart` mount) reaps the root within the FS-event latency the
+    // instant its dir is deleted, retiring it through the full retire discipline
+    // (misc 183 — never orphan the server set). Spawned AFTER `with_session` so
+    // the watcher + channel exist; a no-op for a session-less manager or if the OS
+    // watcher was unavailable. The hourly GC above stays the crash-safe backstop
+    // (the watch dies with the daemon).
     manager.spawn_worktree_watch_reaper(rt.handle());
 
     // Ephemeral-root idle-expiry reaper (ephemeral-roots ticket 02): tears down
@@ -1787,13 +1788,6 @@ fn run_daemon_main() -> Result<()> {
     // no-op for a session-less manager. These roots have no MCP heartbeat to pin
     // on, so the idle detector is their only release signal (DESIGN.md).
     manager.spawn_ephemeral_root_reaper(rt.handle());
-
-    // Worktree-root idle-expiry reaper (misc 150): unmounts a mounted worktree
-    // root that has gone idle past the (longer) worktree timeout, reclaiming its
-    // language servers' RAM — the reported buildup fix. Never touches disk (a
-    // worktree can hold unlanded work); a blocked-on-permission root is exempt.
-    // Spawned AFTER `with_session` so the tracker + worktree clock exist.
-    manager.spawn_worktree_root_idle_reaper(rt.handle());
 
     // External signed-registry refresh (tui-rework 08): resolve the published,
     // signed recipes+blessed-manifest artifact on start and on the slow
