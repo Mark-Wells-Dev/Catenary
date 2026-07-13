@@ -929,18 +929,24 @@ fn expired_evidence_renders_unverified_not_clean() -> Result<()> {
     Ok(())
 }
 
-/// Heard-empty: an explicit empty publish is evidence — no probe (misc 153).
+/// An UNVERSIONED empty publish is a HINT, not authority — it does not settle,
+/// so the best-effort probe still fires (diagnostics-debt 03; misc 153's
+/// heard-empty demoted to the versioned case only).
 ///
-/// mockls with `--push-empty` publishes `"diagnostics": []` on `didOpen` — the
-/// push-only Lattice-16 contract shape: a clean file gets an explicit empty
-/// publish, not silence. The push cache then holds `Some(vec![])`
-/// (heard-empty), which is authoritative: `retrieve_diagnostics` reports
-/// `[clean]` backed by that evidence and never fires the best-effort probe.
-/// The request log shows zero `textDocument/diagnostic`. This is the
-/// end-to-end twin of `never_heard_draws_one_best_effort_probe`: same absent
-/// capability, opposite publish behavior, opposite probe outcome.
+/// mockls with `--push-empty` (no `--publish-version`) publishes
+/// `"diagnostics": []` **without a version** on `didOpen`. Pre-03 this
+/// unconditionally read `[clean]` and suppressed the probe (heard-empty as
+/// authority). Under the ledger an unversioned empty from an undeclared server
+/// carries no current-version echo — it is a hint, exactly the gopls pull-mode
+/// placeholder shape (bug 87) that used to defeat the pull. So the debt stays
+/// unsettled and the never-heard path draws its one best-effort probe. mockls
+/// (no `--reject-pull`) answers that probe with an empty report, so the file
+/// still resolves `[clean]` — but by a legitimate on-demand verdict, not by
+/// second-guessing an authoritative empty. The companion
+/// `versioned_empty_at_current_settles_and_suppresses_probe` is the
+/// authoritative twin: a *versioned* empty settles and the probe never fires.
 #[test]
-fn heard_empty_push_suppresses_probe() -> Result<()> {
+fn unversioned_empty_is_a_hint_probe_still_fires() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let logs = tempfile::tempdir()?;
     let rlog = logs.path().join("requests.jsonl");
@@ -957,14 +963,64 @@ fn heard_empty_push_suppresses_probe() -> Result<()> {
     let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
     assert!(
         text.contains("[clean]"),
-        "an explicit empty publish reads as clean. Got: {text}"
+        "the file still resolves clean — via the probe's on-demand empty \
+         verdict, not the unversioned publish's authority. Got: {text}"
+    );
+
+    let rlog_text = read_merged_log(&rlog);
+    assert_eq!(
+        count_request_method(&rlog_text, "textDocument/diagnostic"),
+        1,
+        "an unversioned empty is a hint, not authority — the best-effort probe \
+         still fires exactly once (bug 85 / bug 87); log:\n{rlog_text}"
+    );
+
+    Ok(())
+}
+
+/// A VERSIONED empty publish echoing the current version SETTLES as the
+/// authoritative clean — the probe never fires (diagnostics-debt 03).
+///
+/// mockls with `--push-empty --publish-version` publishes `"diagnostics": []`
+/// **carrying the current document version**. That is the versioned-empty
+/// authoritative clean: it settles the staleness question directly, so
+/// `retrieve_diagnostics` reports `[clean]` off the settled evidence and never
+/// fires the best-effort probe. The request log shows zero
+/// `textDocument/diagnostic` — the authoritative twin of
+/// `unversioned_empty_is_a_hint_probe_still_fires`: same clean receipt, but the
+/// authority (and so the suppressed probe) is earned by the version echo.
+#[test]
+fn versioned_empty_at_current_settles_and_suppresses_probe() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let logs = tempfile::tempdir()?;
+    let rlog = logs.path().join("requests.jsonl");
+    let rlog_arg = rlog.to_str().context("rlog path")?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let mut bridge = spawn_mockls(
+        &[
+            "--push-empty",
+            "--publish-version",
+            "--request-log",
+            rlog_arg,
+        ],
+        dir.path().to_str().context("path")?,
+    )?;
+    bridge.initialize()?;
+
+    let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
+    assert!(
+        text.contains("[clean]"),
+        "a versioned empty at the current version is the authoritative clean. \
+         Got: {text}"
     );
 
     let rlog_text = read_merged_log(&rlog);
     assert_eq!(
         count_request_method(&rlog_text, "textDocument/diagnostic"),
         0,
-        "heard-empty is evidence — the probe must not fire; log:\n{rlog_text}"
+        "a versioned empty SETTLES — the probe must not fire; log:\n{rlog_text}"
     );
 
     Ok(())

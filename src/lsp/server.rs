@@ -868,6 +868,70 @@ impl LspServer {
             .copied()
     }
 
+    /// The cached diagnostics for `uri` **only when a publish settles the
+    /// current debt** — the version-aware settlement consult (diagnostics-debt
+    /// 03, retiring the version-blind read, bug 85).
+    ///
+    /// A debt is the answer owed for the version stamped on `uri`'s current sync
+    /// state ([`Self::doc_version`] — the last-sent version, the real monotonic
+    /// document version of ticket 01's held-open registry). A publish settles it
+    /// only when it echoes that version; settlement, not mere presence, is what
+    /// makes a cached entry authoritative:
+    ///
+    /// - a **versioned** publish echoing the current version settles — `Some` of
+    ///   its diagnostics, **including `Some(vec![])`**: a versioned empty at the
+    ///   current version is the authoritative clean (misc 153's heard-empty
+    ///   demoted to exactly this case). A versioned publish carrying any *other*
+    ///   version does not settle (`None`): the `< current` straggler is already
+    ///   dropped before the cache by the staleness gate in [`Self::on_notification`],
+    ///   and a `> current` echo cannot legitimately arise (Catenary owns the
+    ///   version sequence);
+    /// - an **unversioned** publish is a *hint*, interpreted through the server's
+    ///   discipline (ticket 04 makes discipline manifest data; until then it is
+    ///   sourced from the conformance profile — here [`Self::declares_push`]):
+    ///   - a non-empty unversioned publish carries real findings, so it settles
+    ///     with that content (a dirty file must render dirty — the fast native
+    ///     publish of a native-then-flycheck server, rust-analyzer's bug-28
+    ///     shape, and every unversioned push server's diagnostics);
+    ///   - an empty unversioned publish settles **only** for a declared-push
+    ///     server, whose contract is a publish on every `didOpen` with an
+    ///     explicit `[]` for clean (misc 187 — lattice's authoritative empty).
+    ///     For any other server an unversioned empty is the demoted misc-153
+    ///     case — it settles nothing (the gopls pull-mode placeholder-push
+    ///     defeat, bug 87, stops mattering structurally: a placeholder without a
+    ///     current-version echo never renders `[clean]` from authority).
+    ///
+    /// `None` means the debt is **unsettled** — never-heard, or heard only a
+    /// non-settling hint. The caller resolves it through the never-heard path
+    /// (pull / probe / evidence bar / the silent-server contract), never a
+    /// fabricated `[clean]`. Distinct from [`super::client::LspClient::get_diagnostics`],
+    /// which is the raw channel-state read (any cached publish → `Some`) the
+    /// retrieval evidence bar consults for heard-ness.
+    pub(crate) fn settled_diagnostics(&self, uri: &str) -> Option<Vec<Value>> {
+        // Read the debt's version first, then the cache — the same
+        // doc_versions-before-diagnostics lock order `on_notification` uses, so
+        // the two locks are never held in conflicting orders.
+        let current = self.doc_version(uri);
+        // Take a copy of the cached entry and release the cache lock before the
+        // settlement branch (no work held under the lock).
+        let (published_version, diags) = {
+            let cache = self
+                .diagnostics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.get(uri).cloned()?
+        };
+        match published_version {
+            // Versioned: settles iff it echoes the current sent version.
+            Some(pv) => (current == Some(pv)).then_some(diags),
+            // Unversioned non-empty: a hint carrying real content — settle with
+            // it. Unversioned empty: authoritative only under the declared-push
+            // contract, else a non-settling hint.
+            None if !diags.is_empty() || self.declares_push => Some(diags),
+            None => None,
+        }
+    }
+
     // ── Dispatch methods (moved from ServerInbox) ─────────────────
 
     /// Handles a server notification (no response needed).
@@ -2003,6 +2067,212 @@ mod tests {
 
         let cached = server.diagnostics.lock().expect("lock").contains_key(uri);
         assert!(cached, "a version-less publish is cached as before");
+    }
+
+    // ── settled_diagnostics: version-echo settlement (diagnostics-debt 03) ──
+
+    /// A versioned publish echoing the current sent version SETTLES the debt —
+    /// even when EMPTY (the versioned-empty authoritative clean, misc 153's
+    /// heard-empty demoted to exactly this case).
+    #[test]
+    fn versioned_empty_at_current_version_settles() {
+        let server = test_server();
+        let uri = "file:///v.rs";
+        server.note_doc_version(uri, 3);
+
+        // A versioned empty publish at the current version.
+        server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({ "uri": uri, "version": 3, "diagnostics": [] }),
+        );
+
+        // Settlement: Some(empty) — an authoritative clean, distinct from an
+        // unsettled None.
+        let settled = server.settled_diagnostics(uri);
+        assert!(
+            matches!(settled, Some(ref d) if d.is_empty()),
+            "a versioned empty at the current version settles as an \
+             authoritative clean, got: {settled:?}"
+        );
+        // The raw channel-state read still reports heard.
+        let heard = server.diagnostics.lock().expect("lock").contains_key(uri);
+        assert!(heard, "the publish is heard");
+    }
+
+    /// A versioned non-empty publish at the current version settles with its
+    /// diagnostics.
+    #[test]
+    fn versioned_dirty_at_current_version_settles() {
+        let server = test_server();
+        let uri = "file:///d.rs";
+        server.note_doc_version(uri, 1);
+        server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({
+                "uri": uri, "version": 1,
+                "diagnostics": [{"message": "boom", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}}]
+            }),
+        );
+        let settled = server.settled_diagnostics(uri).expect("settled");
+        assert_eq!(settled.len(), 1, "the dirty verdict settles");
+        assert_eq!(settled[0]["message"], "boom");
+    }
+
+    /// A stale-version publish NEVER settles a fresh debt (the `1cacf5f` gate,
+    /// now native). The staleness gate drops a `< current` publish before the
+    /// cache, so the only surviving entry is fresh; but even a defensively
+    /// cached older version reads unsettled through `settled_diagnostics`. Here
+    /// the debt is bumped to a NEWER version after a publish landed at the old
+    /// one — the cached publish no longer echoes the current version.
+    #[test]
+    fn stale_version_publish_never_settles() {
+        let server = test_server();
+        let uri = "file:///s.rs";
+        // Round 1: send version 1, hear a version-1 publish → cached.
+        server.note_doc_version(uri, 1);
+        server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({ "uri": uri, "version": 1, "diagnostics": [] }),
+        );
+        assert!(
+            server.settled_diagnostics(uri).is_some(),
+            "at version 1 the version-1 publish settles"
+        );
+
+        // Round 2: the document changes — the debt is now version 2, and no
+        // new publish has echoed it yet. The version-1 publish still in the
+        // cache is stale: it must NOT settle the fresh debt.
+        server.note_doc_version(uri, 2);
+        assert!(
+            server.settled_diagnostics(uri).is_none(),
+            "a publish carrying the previous version never settles the fresh \
+             debt (bug 85 — the staleness question, now version-aware)"
+        );
+        // …but the channel still reads heard (a publish did arrive).
+        assert!(
+            server.diagnostics.lock().expect("lock").contains_key(uri),
+            "raw heard-ness is unchanged — only settlement is version-aware"
+        );
+    }
+
+    /// A late same-version publish RE-SETTLES with better content on the next
+    /// consult (the repeat-run contract; replace-per-URI, RA native-then-
+    /// flycheck — bug 28). Completeness stays settle's job.
+    #[test]
+    fn late_same_version_publish_resettles_with_better_content() {
+        let server = test_server();
+        let uri = "file:///late.rs";
+        server.note_doc_version(uri, 4);
+
+        // First (fast native) publish at version 4: a partial verdict.
+        server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({
+                "uri": uri, "version": 4,
+                "diagnostics": [{"message": "native", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}}]
+            }),
+        );
+        let first = server.settled_diagnostics(uri).expect("first settles");
+        assert_eq!(first[0]["message"], "native");
+
+        // A LATER publish at the SAME version 4 (flycheck) replaces per-URI —
+        // the next consult re-settles with the better content.
+        server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({
+                "uri": uri, "version": 4,
+                "diagnostics": [
+                    {"message": "native", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}},
+                    {"message": "flycheck", "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}}}
+                ]
+            }),
+        );
+        let second = server.settled_diagnostics(uri).expect("re-settles");
+        assert_eq!(second.len(), 2, "the late same-version publish re-settles");
+        assert_eq!(second[1]["message"], "flycheck");
+    }
+
+    /// An UNVERSIONED empty publish from an undeclared server does NOT settle —
+    /// it is a hint, not authority (the demoted misc-153 case; the gopls
+    /// pull-mode placeholder-push defeat, bug 87, stops mattering structurally).
+    #[test]
+    fn unversioned_empty_undeclared_does_not_settle() {
+        let server = test_server(); // "test-server" — does not declare push
+        assert!(!server.declares_push());
+        let uri = "file:///u.rs";
+        server.note_doc_version(uri, 1);
+
+        // An unversioned empty publish (a placeholder / clearing push).
+        server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({ "uri": uri, "diagnostics": [] }),
+        );
+
+        // Heard on the channel, but it settles nothing — the debt stays open.
+        assert!(
+            server.diagnostics.lock().expect("lock").contains_key(uri),
+            "the unversioned empty is heard"
+        );
+        assert!(
+            server.settled_diagnostics(uri).is_none(),
+            "an unversioned empty from an undeclared server is a hint, not an \
+             authoritative clean — it must not settle (bug 85 / bug 87)"
+        );
+    }
+
+    /// An UNVERSIONED empty publish from a DECLARED-PUSH server settles as the
+    /// authoritative clean — its contract is a publish on every didOpen with an
+    /// explicit `[]` for clean (misc 187, lattice's authoritative empty).
+    #[test]
+    fn unversioned_empty_declared_push_settles() {
+        let server = LspServer::new("markdown".to_string(), "lattice".to_string(), None);
+        assert!(server.declares_push());
+        let uri = "file:///clean.md";
+        server.note_doc_version(uri, 1);
+
+        server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({ "uri": uri, "diagnostics": [] }),
+        );
+
+        let settled = server.settled_diagnostics(uri);
+        assert!(
+            matches!(settled, Some(ref d) if d.is_empty()),
+            "a declared-push server's unversioned empty is the contractual \
+             clean and settles, got: {settled:?}"
+        );
+    }
+
+    /// An UNVERSIONED non-empty publish settles with its content regardless of
+    /// declaration — a hint carrying real findings must render dirty (the fast
+    /// native publish of a native-then-flycheck server, and every unversioned
+    /// push server's diagnostics).
+    #[test]
+    fn unversioned_dirty_settles_with_content() {
+        let server = test_server();
+        let uri = "file:///ud.rs";
+        server.note_doc_version(uri, 1);
+        server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({
+                "uri": uri,
+                "diagnostics": [{"message": "real error", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}}]
+            }),
+        );
+        let settled = server.settled_diagnostics(uri).expect("dirty settles");
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0]["message"], "real error");
+    }
+
+    /// A never-heard URI is unsettled (`None`) — no publish, no settlement.
+    #[test]
+    fn never_heard_uri_is_unsettled() {
+        let server = test_server();
+        server.note_doc_version("file:///nh.rs", 1);
+        assert!(
+            server.settled_diagnostics("file:///nh.rs").is_none(),
+            "a never-heard URI has no settling publish"
+        );
     }
 
     #[test]

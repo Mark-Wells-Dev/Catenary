@@ -1037,17 +1037,21 @@ impl LspClient {
         Ok(super::extract::workspace_diagnostic_report(&result))
     }
 
-    /// Gets cached diagnostics for a specific URI, preserving the heard-empty
-    /// vs never-heard distinction.
+    /// The **raw channel-state** read: the cached diagnostics for a URI,
+    /// preserving the heard vs never-heard distinction with no version judgment.
     ///
-    /// Returns `Some(diagnostics)` when the server has published a
+    /// Returns `Some(diagnostics)` when the server has published *any*
     /// `textDocument/publishDiagnostics` for this URI — **including
-    /// `Some(vec![])`** when that publish carried an empty set. An explicit
-    /// empty publish is the server's evidence-backed clean, not the absence of
-    /// evidence. Returns `None` when the server has never published for this URI
-    /// (never-heard), so a caller can distinguish a heard-empty clean from a
-    /// genuine no-result and decide whether a best-effort pull is warranted
-    /// (misc 153).
+    /// `Some(vec![])`** for an empty publish — and `None` when it has never
+    /// published (never-heard). This is heard-ness (did a publish arrive at
+    /// all), the question the retrieval evidence bar asks: it waits for a
+    /// publish to land, regardless of whether that publish settles the debt.
+    ///
+    /// For the **settlement** question — does a cached publish authoritatively
+    /// answer for the version we edited — use [`Self::settled_diagnostics`]. A
+    /// heard-but-non-settling publish (an unversioned empty from an undeclared
+    /// server, a stale version) reads `Some` here and `None` there: the receipt
+    /// consults settlement, so it never renders `[clean]` from a hint (bug 85).
     pub fn get_diagnostics(&self, uri: &str) -> Option<Vec<Value>> {
         let cache = self
             .server
@@ -1055,6 +1059,23 @@ impl LspClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.get(uri).map(|(_, diags)| diags.clone())
+    }
+
+    /// The **settlement** consult: the cached diagnostics for a URI only when a
+    /// publish echoing the current document version settles the debt
+    /// (diagnostics-debt 03, retiring the version-blind read — bug 85).
+    ///
+    /// Delegates to [`LspServer::settled_diagnostics`], which keys the decision
+    /// on the URI's current sent version (ticket 01's held-open registry
+    /// version) and the server's discipline: a versioned publish echoing the
+    /// current version settles (empty = authoritative clean), an unversioned
+    /// non-empty publish settles with its content, an unversioned empty settles
+    /// only for a declared-push server, and everything else — a stale version, a
+    /// bare placeholder — settles nothing (`None`). The receipt consults this,
+    /// not [`Self::get_diagnostics`], so a hint never launders into a `[clean]`.
+    #[must_use]
+    pub fn settled_diagnostics(&self, uri: &str) -> Option<Vec<Value>> {
+        self.server.settled_diagnostics(uri)
     }
 
     /// Removes cached diagnostics for the given URIs.

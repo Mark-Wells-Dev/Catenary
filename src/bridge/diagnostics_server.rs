@@ -58,6 +58,7 @@ const PULL_RETRIGGER_LIMIT: u32 = 3;
 /// placeholder — bug 84's retired mechanism); the caller skips recording the
 /// file so it resolves [`FileOutcome::NoResults`] and renders the honest
 /// `[unverified — <server> returned no result]` line.
+#[derive(Debug)]
 enum PullSettlement {
     /// The pull returned a report — the debt settles with these diagnostics
     /// (possibly empty: an evidence-backed clean).
@@ -1585,13 +1586,20 @@ impl DiagnosticsServer {
         });
 
         for RoundDoc { path, uri, .. } in docs {
-            let diagnostics = match client.get_diagnostics(uri) {
-                // A publish was heard for this file — authoritative, EVEN WHEN
-                // EMPTY. `Some(vec![])` is the server's evidence-backed clean: an
-                // explicit empty publish, not the absence of one. Pull is never
-                // consulted, so a push+pull server reports one source per file
-                // per run (no double-reporting) and a push-only server's honest
-                // empty is never second-guessed by an off-spec probe (misc 153).
+            let diagnostics = match client.settled_diagnostics(uri) {
+                // A publish SETTLED the debt for this file — authoritative, EVEN
+                // WHEN EMPTY. Settlement (not mere presence, bug 85) means a
+                // versioned publish echoed the current version — `Some(vec![])`
+                // is then the versioned-empty authoritative clean — or a
+                // discipline-trusted hint carried it (an unversioned non-empty
+                // publish's real findings; a declared-push server's contractual
+                // empty). Pull is never consulted, so a push+pull server reports
+                // one source per file per run (no double-reporting) and a
+                // push-only server's honest empty is never second-guessed by an
+                // off-spec probe (misc 153). A heard-but-non-settling publish (an
+                // unversioned empty from an undeclared server, a stale version)
+                // reads `None` here and falls to the never-heard path — the debt
+                // stays unsettled until a current-version echo lands.
                 Some(diags) => diags,
                 // Never heard AND the server advertises the pull model: ask it
                 // the way it asked to be asked. A returned report settles the
@@ -1636,9 +1644,10 @@ impl DiagnosticsServer {
                         Some(pulled) => reconsult_push_after_empty_pull(&client, uri, pulled),
                         // The probe went unanswered (`-32601` and friends) —
                         // that is not evidence of anything. Re-consult the push
-                        // cache: a publish that landed during the round-trip is
-                        // evidence in hand (bug 99).
-                        None => match client.get_diagnostics(uri) {
+                        // cache for a SETTLING publish: one that landed during the
+                        // round-trip and echoes the current version is evidence in
+                        // hand (bug 99); a stale or non-settling one is not.
+                        None => match client.settled_diagnostics(uri) {
                             Some(published) => published,
                             // No publish, no answered probe. If the evidence
                             // bar armed for this URI and expired, the pipeline
@@ -2393,17 +2402,20 @@ fn render_diagnostic_code(code: Option<&Value>) -> String {
 /// lua-language-server publishes ~270 ms after `didSave` while settle sees
 /// idle at 60 ms) can publish while the pull is in flight, and the reader
 /// dispatches that publish into the push cache strictly before it resolves
-/// the pull's response. Evidence in hand outranks the probe's nothing —
-/// rendering `[clean]` over a cached truthful publish falsifies the receipt.
-/// A non-empty pull is returned as-is (one source per file, misc 153), and a
-/// still-empty cache keeps the pull's honest empty.
+/// the pull's response. A **settling** publish in hand — one echoing the
+/// current version ([`LspClient::settled_diagnostics`]) — outranks the probe's
+/// nothing; rendering `[clean]` over a cached truthful publish would falsify
+/// the receipt. A non-empty pull is returned as-is (one source per file, misc
+/// 153), and a cache with no settling publish keeps the pull's honest empty. A
+/// stale or non-settling cached publish is ignored — it never overrides the
+/// pull's fresh answer (diagnostics-debt 03).
 fn reconsult_push_after_empty_pull(
     client: &LspClient,
     uri: &str,
     pulled: Vec<Value>,
 ) -> Vec<Value> {
     if pulled.is_empty()
-        && let Some(published) = client.get_diagnostics(uri)
+        && let Some(published) = client.settled_diagnostics(uri)
     {
         return published;
     }
@@ -2433,8 +2445,12 @@ fn reconsult_push_after_empty_pull(
 ///   downgrades *nothing* and leaves the debt unsettled — the next round pulls
 ///   again.
 ///
-/// On any error the push cache is re-consulted once more: a publish that landed
-/// during the failing round-trip settles the debt legitimately (bug 99).
+/// On any error the push cache is re-consulted once more for a **settling**
+/// publish: one that landed during the failing round-trip and echoes the
+/// current version settles the debt legitimately (bug 99). A stale or
+/// non-settling cached publish must not settle a fresh debt here either — the
+/// re-consult is version-aware ([`LspClient::settled_diagnostics`]), so an old
+/// round's straggler never fabricates this round's verdict (diagnostics-debt 03).
 async fn pull_settling(client: &LspClient, uri: &str) -> PullSettlement {
     let mut retriggers = 0u32;
     loop {
@@ -2471,10 +2487,12 @@ async fn pull_settling(client: &LspClient, uri: &str) -> PullSettlement {
                     debug!("pull diagnostics failed (transient, no downgrade): {e}");
                 }
 
-                // Bug 99: a publish that raced the failing round-trip is
-                // evidence in hand and settles the debt legitimately.
+                // Bug 99: a SETTLING publish that raced the failing round-trip
+                // is evidence in hand and settles the debt legitimately; a stale
+                // or non-settling one leaves the debt unsettled (bug 85 — a
+                // stale-version publish never settles a fresh debt here either).
                 return client
-                    .get_diagnostics(uri)
+                    .settled_diagnostics(uri)
                     .map_or(PullSettlement::Unsettled, PullSettlement::Settled);
             }
         }
@@ -4321,6 +4339,72 @@ mod tests {
             matches!(again, PullSettlement::Unsettled),
             "the next round retries the pull after a transient failure"
         );
+
+        client.shutdown().await.expect("shutdown");
+    }
+
+    /// The pull error-path re-consult is version-aware (diagnostics-debt 03): a
+    /// STALE cached publish (a previous round's straggler) must not settle a
+    /// fresh debt on the error path either — the debt stays unsettled.
+    #[tokio::test]
+    async fn pull_error_stale_cached_publish_does_not_settle() {
+        let (mut client, _dir) = spawn_pull_client(&["--pull-diagnostics", "--fail-pull"]).await;
+        let uri = "file:///pull-honesty/stale.pUll1";
+
+        // The debt is at version 3, but a version-2 publish (a straggler from a
+        // previous round) sits in the cache — heard, but stale.
+        client.server().note_doc_version(uri, 3);
+        client.server().on_notification(
+            "textDocument/publishDiagnostics",
+            &serde_json::json!({
+                "uri": uri, "version": 2,
+                "diagnostics": [{"message": "stale", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}}]
+            }),
+        );
+
+        // The pull fails (-32603); the error re-consult finds only the stale
+        // publish, which does not echo the current version, so it does not
+        // settle the fresh debt.
+        let outcome = pull_settling(&client, uri).await;
+        assert!(
+            matches!(outcome, PullSettlement::Unsettled),
+            "a stale-version cached publish must not settle a fresh debt on the \
+             pull error path (bug 85), got: {outcome:?}"
+        );
+
+        client.shutdown().await.expect("shutdown");
+    }
+
+    /// The pull error-path bug-99 re-consult still settles from a FRESH racing
+    /// publish: one echoing the current version is evidence in hand.
+    #[tokio::test]
+    async fn pull_error_fresh_racing_publish_settles() {
+        let (mut client, _dir) = spawn_pull_client(&["--pull-diagnostics", "--fail-pull"]).await;
+        let uri = "file:///pull-honesty/fresh.pUll1";
+
+        // The debt is at version 5, and a version-5 publish raced the failing
+        // pull into the cache — a current-version echo.
+        client.server().note_doc_version(uri, 5);
+        client.server().on_notification(
+            "textDocument/publishDiagnostics",
+            &serde_json::json!({
+                "uri": uri, "version": 5,
+                "diagnostics": [{"message": "fresh", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}}]
+            }),
+        );
+
+        let diags = match pull_settling(&client, uri).await {
+            PullSettlement::Settled(diags) => diags,
+            PullSettlement::Unsettled => {
+                Vec::new() // asserted non-empty below — Unsettled fails the test
+            }
+        };
+        assert_eq!(
+            diags.len(),
+            1,
+            "a fresh current-version racing publish must settle the debt (bug 99)"
+        );
+        assert_eq!(diags[0]["message"], "fresh");
 
         client.shutdown().await.expect("shutdown");
     }
