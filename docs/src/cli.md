@@ -343,6 +343,37 @@ been deleted, and repeating it is a harmless no-op. The worktree, ephemeral, and
 The old `catenary roots add` / `catenary roots rm` spellings are retired: use
 `catenary pin` / `catenary unpin`.
 
+#### Pins persist across a restart
+
+A pin is durable operator intent, so it survives a daemon restart. `catenary pin`
+records the root in your user config's `[roots] pinned` array (and `catenary
+unpin` removes it), a comment-preserving edit that leaves the rest of your
+hand-authored config untouched. At the next daemon start each entry is re-added as
+a pin — a zero-cost restore: a root becomes a tracker entry and a roots-board line
+but spawns no language server until its first use.
+
+**Hand-edits are first-class.** Adding a path to the `[roots] pinned` array is
+itself a pin; it takes effect at the next daemon start. Home-prefixed paths render
+with `~` to match the file's idiom, and entries are compared canonically (one
+spelling per root):
+
+```toml
+[roots]
+pinned = [
+  "~/Projects/Catenary",
+  "~/Projects/Lattice",
+]
+```
+
+A pinned path that is **missing at boot** (a deleted repo, an unmounted volume) is
+kept in the config — Catenary never rewrites your config outside an explicit
+`pin`/`unpin`, so a transiently absent mount stays pinned — and `catenary doctor`
+flags it. Remove it deliberately with `catenary unpin <path>` (or by deleting the
+line) when the root is gone for good.
+
+MCP workspace roots are not persisted this way: a live client re-asserts them on
+each connect, so they never come from a snapshot.
+
 ### `catenary worktree`
 
 Manage Catenary-created worktrees — the sanctioned replacement for `git

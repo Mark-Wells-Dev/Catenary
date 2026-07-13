@@ -27,7 +27,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
+use toml_edit::{DocumentMut, InlineTable, Item, RawString, Table, Value};
 
 /// The config file a mutation writes to.
 ///
@@ -284,6 +284,213 @@ impl Mutation {
         }
         write_document(path, &doc)
     }
+}
+
+/// Adds a canonical root to the persisted pin list (`[roots] pinned`), preserving
+/// the config's comments and layout everywhere but the edited array (misc 175).
+///
+/// `canonical` is the daemon's already-canonicalized root path — the same
+/// spelling the [`crate::config::Config::pinned_roots`] boot restore matches
+/// against the tracker. The entry is written home-compressed (a `$HOME`-prefixed
+/// path renders with `~` to match the file's idiom); an entry whose expanded,
+/// canonical form already equals `canonical` is a no-op, so a repeat pin never
+/// duplicates a line. Creates the file (and `[roots]` table) when absent.
+///
+/// Returns `true` when a new entry was written, `false` when the root was already
+/// pinned (the write is skipped and the file is left byte-identical).
+///
+/// # Errors
+///
+/// Returns an error if the file exists but cannot be read or parsed as TOML, the
+/// `[roots]`/`pinned` shape is incompatible with the edit, or the write fails.
+pub fn pin_config(path: &Path, canonical: &Path) -> Result<bool> {
+    let mut doc = read_document(path)?;
+    let array = ensure_pinned_array(&mut doc)?;
+    if pinned_array_contains(array, canonical) {
+        return Ok(false);
+    }
+    push_pin_entry(array, &compress_home(canonical));
+    write_document(path, &doc)?;
+    Ok(true)
+}
+
+/// Append `entry` to a pin array, preserving a hand-authored **multiline** layout.
+///
+/// `toml_edit`'s bare [`toml_edit::Array::push`] appends inline, collapsing a
+/// one-entry-per-line array onto the previous line and shoving the new value in
+/// front of the array's trailing decor. When the array already spans multiple
+/// lines, this pushes with a decor prefix of `\n<indent>` — matching the existing
+/// entries' indentation — so the new entry lands on its own line, its own-line
+/// comment prefixes stay bound to their entries, and the file is not reflowed. An
+/// inline (single-line) array keeps the plain inline push.
+///
+/// Comment placement follows `toml_edit`'s model: a comment on its own line above
+/// an entry is that entry's *prefix* and is preserved exactly; a rare inline
+/// comment after the previous last element lives in the array *trailing* (between
+/// the final comma and `]`) and stays there — never lost, never rendered as
+/// invalid TOML, though it then sits after the appended line.
+fn push_pin_entry(array: &mut toml_edit::Array, entry: &str) {
+    if let Some(indent) = multiline_indent(array) {
+        let mut value = Value::from(entry);
+        value.decor_mut().set_prefix(format!("\n{indent}"));
+        array.push_formatted(value);
+    } else {
+        array.push(entry);
+    }
+}
+
+/// The per-entry indentation of a multiline pin array, or `None` when the array
+/// renders inline.
+///
+/// A pin array is multiline when an existing entry's decor prefix carries a
+/// newline (a one-per-line hand-authored array) or, for an empty array, when its
+/// trailing whitespace does (a `pinned = [\n]` skeleton). The indent is the
+/// whitespace after that newline — reused verbatim so a 2-space or 4-space file
+/// keeps its own gutter — falling back to two spaces when a newline is present
+/// but the indent could not be read (an empty or comment-only run).
+fn multiline_indent(array: &toml_edit::Array) -> Option<String> {
+    fn indent_after_newline(raw: Option<&str>) -> Option<String> {
+        let s = raw?;
+        if !s.contains('\n') {
+            return None;
+        }
+        let after = s.rsplit('\n').next().unwrap_or("");
+        // Reuse a clean whitespace gutter verbatim; otherwise a sensible default.
+        Some(if after.trim().is_empty() && !after.is_empty() {
+            after.to_string()
+        } else {
+            "  ".to_string()
+        })
+    }
+
+    // A populated array: read the first entry's prefix.
+    if let Some(first) = array.get(0)
+        && let Some(indent) =
+            indent_after_newline(first.decor().prefix().and_then(RawString::as_str))
+    {
+        return Some(indent);
+    }
+    // An empty but multiline skeleton (`pinned = [\n]`): read the trailing.
+    if array.is_empty() {
+        return indent_after_newline(array.trailing().as_str());
+    }
+    None
+}
+
+/// Removes a canonical root from the persisted pin list (`[roots] pinned`),
+/// preserving the config's comments and layout everywhere but the edited array
+/// (misc 175).
+///
+/// Every entry whose expanded, canonical form equals `canonical` is dropped
+/// (idiom-agnostic: a `~`-prefixed and an absolute spelling of the same root both
+/// match, and a stray duplicate is cleared in one pass). An `unpin` of a
+/// never-pinned path — or a config with no `[roots] pinned` array at all — is a
+/// no-op that leaves the file untouched.
+///
+/// Returns `true` when at least one entry was removed, `false` when nothing
+/// matched (the file is left byte-identical).
+///
+/// # Errors
+///
+/// Returns an error if the file exists but cannot be read or parsed as TOML, the
+/// existing `pinned` value is not an array, or the write fails.
+pub fn unpin_config(path: &Path, canonical: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut doc = read_document(path)?;
+    let Some(array) = pinned_array_mut(&mut doc)? else {
+        return Ok(false);
+    };
+    let before = array.len();
+    array.retain(|entry| {
+        entry
+            .as_str()
+            .is_none_or(|s| !pinned_entry_matches(s, canonical))
+    });
+    if array.len() == before {
+        return Ok(false);
+    }
+    write_document(path, &doc)?;
+    Ok(true)
+}
+
+/// Navigate/create the `[roots] pinned` array, returning it mutable.
+///
+/// Creates the `[roots]` table and an empty `pinned` array when absent. Errors if
+/// `[roots]` or `pinned` exists as an incompatible non-table / non-array.
+fn ensure_pinned_array(doc: &mut DocumentMut) -> Result<&mut toml_edit::Array> {
+    let roots = ensure_table_path(doc.as_table_mut(), &["roots"])?;
+    if !roots.contains_key("pinned") {
+        roots.insert("pinned", Item::Value(Value::Array(toml_edit::Array::new())));
+    }
+    roots
+        .get_mut("pinned")
+        .and_then(Item::as_array_mut)
+        .context("config key `roots.pinned` is not an array")
+}
+
+/// Borrow the existing `[roots] pinned` array mutably, or `None` when `[roots]`
+/// or `pinned` is absent (an `unpin` on a config that never pinned anything).
+///
+/// Unlike [`ensure_pinned_array`] this creates nothing — an `unpin` must never
+/// author a `[roots]` table just to find it empty. Errors if `pinned` exists as a
+/// non-array.
+fn pinned_array_mut(doc: &mut DocumentMut) -> Result<Option<&mut toml_edit::Array>> {
+    let Some(roots) = doc
+        .as_table_mut()
+        .get_mut("roots")
+        .and_then(Item::as_table_mut)
+    else {
+        return Ok(None);
+    };
+    let Some(item) = roots.get_mut("pinned") else {
+        return Ok(None);
+    };
+    item.as_array_mut()
+        .map(Some)
+        .context("config key `roots.pinned` is not an array")
+}
+
+/// Whether any string entry in `array` canonically resolves to `canonical`.
+fn pinned_array_contains(array: &toml_edit::Array, canonical: &Path) -> bool {
+    array
+        .iter()
+        .filter_map(Value::as_str)
+        .any(|s| pinned_entry_matches(s, canonical))
+}
+
+/// Whether the raw pin entry `raw` (as authored, possibly `~`-prefixed) resolves
+/// to the canonical root `canonical`.
+///
+/// Expands a leading `~`, then canonicalizes so a symlinked or non-normalized
+/// spelling still matches the tracker's canonical form; falls back to the
+/// lexically-absolutized spelling when the path does not exist on disk (a
+/// transiently absent mount — the entry stays comparable so `unpin` can still
+/// remove it).
+fn pinned_entry_matches(raw: &str, canonical: &Path) -> bool {
+    let expanded = crate::bridge::expand_tilde(raw);
+    let expanded = Path::new(&expanded);
+    let resolved = expanded.canonicalize().unwrap_or_else(|_| {
+        std::path::absolute(expanded).unwrap_or_else(|_| expanded.to_path_buf())
+    });
+    resolved == canonical
+}
+
+/// Renders `path` with a leading `~` when it lies under `$HOME`, matching the
+/// config file's hand-authored idiom; otherwise the plain absolute form.
+fn compress_home(path: &Path) -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        let home = Path::new(&home);
+        if let Ok(rel) = path.strip_prefix(home) {
+            // `~` alone for `$HOME` itself; `~/rel` otherwise.
+            if rel.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", rel.display());
+        }
+    }
+    path.display().to_string()
 }
 
 /// Rewrite `[lsp.language.<language>].servers` from `bindings`, with `server`'s
@@ -698,5 +905,198 @@ command = \"shellcheck\"
         assert!(section_is_project_scoped("diagnostics"));
         assert!(!section_is_project_scoped("commands"));
         assert!(!section_is_project_scoped("notifications"));
+    }
+
+    // ── persisted pins (misc 175) ────────────────────────────────────
+
+    #[test]
+    fn pin_creates_roots_pinned_array_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let root = PathBuf::from("/srv/project");
+        assert!(pin_config(&path, &root).expect("pin"));
+        let out = std::fs::read_to_string(&path).expect("read");
+        // A `[roots]` header with the pinned array, and the absolute path
+        // verbatim (not under $HOME).
+        assert!(out.contains("[roots]"), "roots header written: {out}");
+        assert!(out.contains("\"/srv/project\""), "entry written: {out}");
+        // Round-trips through the real loader shape.
+        let doc: toml::Value = toml::from_str(&out).expect("valid toml");
+        let pinned = doc["roots"]["pinned"].as_array().expect("pinned array");
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0].as_str(), Some("/srv/project"));
+    }
+
+    #[test]
+    fn pin_renders_home_prefixed_path_with_tilde() {
+        // The written entry uses `~` for a $HOME-prefixed root, matching the
+        // file's idiom. `compress_home` reads $HOME; construct the root under it
+        // so the assertion is deterministic without mutating the environment.
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let root = PathBuf::from(&home).join("Projects").join("Widget");
+        assert!(pin_config(&path, &root).expect("pin"));
+        let out = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            out.contains("\"~/Projects/Widget\""),
+            "home-prefixed path rendered with ~: {out}"
+        );
+    }
+
+    #[test]
+    fn pin_is_idempotent_no_duplicate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let root = PathBuf::from("/srv/project");
+        assert!(pin_config(&path, &root).expect("first pin adds"));
+        assert!(
+            !pin_config(&path, &root).expect("second pin is a no-op"),
+            "a repeat pin reports no change"
+        );
+        let out = std::fs::read_to_string(&path).expect("read");
+        let doc: toml::Value = toml::from_str(&out).expect("valid toml");
+        assert_eq!(
+            doc["roots"]["pinned"].as_array().expect("pinned").len(),
+            1,
+            "no duplicate entry: {out}"
+        );
+    }
+
+    #[test]
+    fn pin_unpin_round_trip_preserves_hand_authored_comments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Own-line comments (the common hand-authored form) bind to their entry as
+        // a prefix and survive exactly; the pin appends on its own line without
+        // reflowing the file.
+        let original = "\
+# Catenary config — hand tuned.
+log_retention_days = 14   # keep two weeks
+
+[roots]
+# my long-lived projects
+pinned = [
+  # the main repo
+  \"/srv/alpha\",
+]
+
+# rust toolchain
+[lsp.server.rust-analyzer]
+path = \"/usr/bin/rust-analyzer\"
+";
+        let path = write(dir.path(), "config.toml", original);
+        let beta = PathBuf::from("/srv/beta");
+        assert!(pin_config(&path, &beta).expect("pin beta"));
+        let after_pin = std::fs::read_to_string(&path).expect("read");
+        // Every comment and the alpha entry survive byte-for-byte; the file still
+        // parses and now carries beta on its own line.
+        for line in [
+            "# Catenary config — hand tuned.",
+            "log_retention_days = 14   # keep two weeks",
+            "# my long-lived projects",
+            "  # the main repo",
+            "  \"/srv/alpha\",",
+            "# rust toolchain",
+            "path = \"/usr/bin/rust-analyzer\"",
+        ] {
+            assert!(
+                after_pin.contains(line),
+                "comment/line survives pin: {line:?}\n{after_pin}"
+            );
+        }
+        assert!(after_pin.contains("/srv/beta"), "beta added: {after_pin}");
+        // Beta landed on its own line with the file's own indent — no reflow.
+        assert!(
+            after_pin.contains("  \"/srv/beta\""),
+            "beta on its own indented line: {after_pin}"
+        );
+        // The result is valid TOML with both entries.
+        let doc: toml::Value = toml::from_str(&after_pin).expect("valid toml after pin");
+        assert_eq!(doc["roots"]["pinned"].as_array().expect("pinned").len(), 2);
+
+        // Unpin beta: the added entry goes, every comment stays.
+        assert!(unpin_config(&path, &beta).expect("unpin beta"));
+        let after_unpin = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            !after_unpin.contains("/srv/beta"),
+            "beta removed: {after_unpin}"
+        );
+        for line in [
+            "# Catenary config — hand tuned.",
+            "# my long-lived projects",
+            "  # the main repo",
+            "  \"/srv/alpha\",",
+            "# rust toolchain",
+        ] {
+            assert!(
+                after_unpin.contains(line),
+                "comment/line survives unpin: {line:?}\n{after_unpin}"
+            );
+        }
+    }
+
+    #[test]
+    fn unpin_matches_canonically_across_spellings() {
+        // A `~`-spelled entry and the absolute spelling of the same real dir are
+        // the same root — `unpin` on either removes it (canonical comparison).
+        let real = tempfile::tempdir().expect("tempdir");
+        let canonical = real.path().canonicalize().expect("canonicalize");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        // Author the entry as the absolute path; unpin by the same canonical.
+        std::fs::write(
+            &path,
+            format!("[roots]\npinned = [\n  \"{}\",\n]\n", canonical.display()),
+        )
+        .expect("write");
+        assert!(
+            unpin_config(&path, &canonical).expect("unpin"),
+            "canonical entry removed"
+        );
+        let out = std::fs::read_to_string(&path).expect("read");
+        let doc: toml::Value = toml::from_str(&out).expect("valid toml");
+        assert_eq!(
+            doc["roots"]["pinned"].as_array().expect("pinned").len(),
+            0,
+            "entry gone: {out}"
+        );
+    }
+
+    #[test]
+    fn unpin_of_absent_entry_is_a_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // No config file at all.
+        let missing = dir.path().join("config.toml");
+        assert!(
+            !unpin_config(&missing, &PathBuf::from("/srv/gone")).expect("unpin missing file"),
+            "unpin on a missing config is a benign no-op"
+        );
+        assert!(!missing.exists(), "unpin never creates the config");
+
+        // A config with a `[roots] pinned` array that lacks the target.
+        let path = write(
+            dir.path(),
+            "present.toml",
+            "[roots]\npinned = [\n  \"/srv/keep\",\n]\n",
+        );
+        assert!(
+            !unpin_config(&path, &PathBuf::from("/srv/never-pinned")).expect("unpin absent entry"),
+            "unpin of a never-pinned path reports no change"
+        );
+        let out = std::fs::read_to_string(&path).expect("read");
+        assert!(out.contains("/srv/keep"), "existing entry untouched: {out}");
+    }
+
+    #[test]
+    fn unpin_with_no_roots_section_is_a_noop() {
+        // An `unpin` must never author a `[roots]` table just to find it empty.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write(dir.path(), "config.toml", "log_retention_days = 7\n");
+        assert!(
+            !unpin_config(&path, &PathBuf::from("/srv/x")).expect("unpin"),
+            "no change"
+        );
+        let out = std::fs::read_to_string(&path).expect("read");
+        assert!(!out.contains("[roots]"), "no roots table created: {out}");
     }
 }

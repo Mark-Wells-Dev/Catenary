@@ -1317,6 +1317,30 @@ impl Session {
     ///
     /// Returns an error if root synchronization fails.
     pub async fn sync_roots(&self, roots: Vec<Arc<Root>>) -> Result<()> {
+        self.sync_roots_inner(roots, true).await
+    }
+
+    /// Like [`sync_roots`](Self::sync_roots) but **without** the eager `spawn_all`
+    /// pre-warm — the boot-restore path for persisted pins (misc 175).
+    ///
+    /// Registers the roots (so a first-touch tool call resolves them) and runs the
+    /// manager's `spawn_for_added_roots` leg, which is a no-op on a fresh daemon
+    /// (no language is active elsewhere yet). Skipping the pre-warm keeps the
+    /// zero-cost-restore promise: a restored pin is a tracker entry and a
+    /// roots-board line until first use, when the ordinary lazy first-touch spawn
+    /// pays. The runtime `catenary pin` keeps its warm-language pre-warm via
+    /// [`sync_roots`](Self::sync_roots); only boot restore uses this leg.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if root synchronization fails.
+    pub async fn sync_roots_no_prewarm(&self, roots: Vec<Arc<Root>>) -> Result<()> {
+        self.sync_roots_inner(roots, false).await
+    }
+
+    /// Shared root-sync body. `prewarm` gates the fire-and-forget `spawn_all`:
+    /// on for the ordinary path (a pin/MCP-sync pre-warms), off for boot restore.
+    async fn sync_roots_inner(&self, roots: Vec<Arc<Root>>, prewarm: bool) -> Result<()> {
         // Path-only view for the validator (a path-only consumer).
         let paths: Vec<PathBuf> = roots.iter().map(|r| r.path().to_path_buf()).collect();
 
@@ -1343,8 +1367,11 @@ impl Session {
 
         // Fire-and-forget: spawn_all is pre-warming, not a gate.
         // Tool calls that need a server will trigger spawning on demand.
-        let cm = self.client_manager.clone();
-        tokio::spawn(async move { cm.spawn_all().await });
+        // Boot restore (misc 175) skips it so a restored pin spawns nothing.
+        if prewarm {
+            let cm = self.client_manager.clone();
+            tokio::spawn(async move { cm.spawn_all().await });
+        }
         Ok(())
     }
 

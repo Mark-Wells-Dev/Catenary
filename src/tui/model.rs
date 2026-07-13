@@ -1059,6 +1059,7 @@ mod tests {
                 "*",
                 "{root}Internal",
             )])),
+            pinned: Vec::new(),
         });
         let mut snap = Snapshot::default();
         for path in ["/p/Catenary", "/p/CatenaryInternal", "/p/Aaa"] {

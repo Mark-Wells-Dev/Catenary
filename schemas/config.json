@@ -658,7 +658,7 @@
     },
     "RootsConfig": {
       "additionalProperties": false,
-      "description": "Workspace-root configuration (`[roots]`).\n\nUser-level only. The lone field today is [`companions`](Self::companions); the section exists so companion-root rules have a stable home as more root-policy knobs land.",
+      "description": "Workspace-root configuration (`[roots]`).\n\nUser-level only. Homes the companion-root rules ([`companions`](Self::companions)) and the persisted pin list ([`pinned`](Self::pinned)); the section exists so root-policy knobs have a stable home as more land.",
       "properties": {
         "companions": {
           "additionalProperties": {
@@ -670,6 +670,13 @@
             "object",
             "null"
           ]
+        },
+        "pinned": {
+          "description": "Persisted pinned workspace roots (`[roots] pinned`, misc 175).\n\nThe durable form of `catenary pin`: each entry is a root re-added as a pin contributor at daemon boot so a pin survives a restart. `pin`/`unpin` add/remove entries with comment-preserving TOML editing (the config is hand-authored); a hand-edit to this array IS a pin, effective at the next daemon start. Home-prefixed paths render with `~`; entries are compared canonically (one spelling per root). Boot restore is zero-cost — nothing spawns until a root's first touch — and a missing path at boot keeps the entry and surfaces a doctor finding rather than rewriting the user's config.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "type": "object"

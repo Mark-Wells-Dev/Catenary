@@ -223,6 +223,12 @@ enum Command {
     ///
     /// Coverage is automatic — pinning changes a root's *lifetime*, not whether
     /// it is served. Matches the stored/normalized path.
+    ///
+    /// Pins persist: the root is recorded in your user config's `[roots] pinned`
+    /// list (comment-preserving) so it survives a daemon restart, re-added at the
+    /// next boot. Hand-edits are first-class — adding a path to that array is
+    /// itself a pin, effective at the next daemon start. A pinned path missing at
+    /// boot is kept (never rewritten) and flagged by `catenary doctor`.
     Pin {
         /// Path to pin as a workspace root.
         path: PathBuf,
@@ -232,7 +238,9 @@ enum Command {
     ///
     /// Matches the stored/normalized path, so it works even after the directory
     /// is removed, and is idempotent. Touches only the pin contributor — the
-    /// worktree, ephemeral, and mcp classes own their own lifecycles.
+    /// worktree, ephemeral, and mcp classes own their own lifecycles. Also
+    /// removes the entry from your user config's `[roots] pinned` list, so the
+    /// pin does not return on the next daemon start.
     Unpin {
         /// Path to unpin.
         path: PathBuf,

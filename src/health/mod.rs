@@ -132,6 +132,9 @@ pub enum FindingCode {
     ConfigLegacyCommandsField,
     /// A config key no Catenary schema defines (misc 131).
     ConfigUnknownKey,
+    /// A `[roots] pinned` entry whose path is missing on disk — kept in the
+    /// config (never pruned) but not restored at boot (misc 175).
+    ConfigPinnedRootMissing,
     /// A `Config::validate` error.
     ConfigValidationError,
     /// A user-defined server no `[lsp.language.*]` entry routes to.
@@ -209,6 +212,7 @@ impl FindingCode {
             Self::ConfigLanguageInlinesServer => "config-language-inlines-server",
             Self::ConfigLegacyCommandsField => "config-legacy-commands-field",
             Self::ConfigUnknownKey => "config-unknown-key",
+            Self::ConfigPinnedRootMissing => "config-pinned-root-missing",
             Self::ConfigValidationError => "config-validation-error",
             Self::ConfigUnreferencedServer => "config-unreferenced-server",
             Self::ConfigDuplicateExtension => "config-duplicate-extension",

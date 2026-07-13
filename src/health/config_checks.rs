@@ -283,6 +283,38 @@ pub fn validation_findings(config: &Config) -> Vec<Finding> {
         .collect()
 }
 
+/// Missing persisted-pin findings (misc 175).
+///
+/// Each `[roots] pinned` entry whose path is absent on disk (deleted repo,
+/// unmounted volume) produces a [`Severity::Warning`] finding. The entry is
+/// **kept** in the config — Catenary never rewrites the user's config outside an
+/// explicit pin/unpin, so a transiently absent mount stays pinned — and this
+/// surfaces it instead of silently discarding operator intent. The message names
+/// the entry as authored (the `~`-prefixed spelling), and the fix-it points at
+/// `catenary unpin` for a genuinely gone root.
+#[must_use]
+pub fn pinned_root_findings(config: &Config) -> Vec<Finding> {
+    config
+        .pinned_roots()
+        .iter()
+        .filter(|entry| {
+            let expanded = crate::bridge::expand_tilde(entry);
+            !Path::new(&expanded).exists()
+        })
+        .map(|entry| {
+            Finding::new(
+                FindingCode::ConfigPinnedRootMissing,
+                Severity::Warning,
+                format!("Pinned root '{entry}' is missing on disk — kept in config, not restored"),
+            )
+            .with_fix_it(format!(
+                "If the root is gone for good, run `catenary unpin {entry}`; a \
+                 transiently absent mount stays pinned and restores on its next boot."
+            ))
+        })
+        .collect()
+}
+
 /// Unreferenced *user-defined* server findings.
 ///
 /// An embedded default orphaned by a user `[lsp.language.*]` override is normal
@@ -822,5 +854,57 @@ mod tests {
             },
         );
         assert!(leftover_launcher_args_findings(&config).is_empty());
+    }
+
+    // ── persisted-pin missing path (misc 175) ────────────────────────
+
+    /// A `Config` whose `[roots] pinned` list is exactly `entries`.
+    fn config_with_pins(entries: &[&str]) -> Config {
+        let mut config = Config::default();
+        config.roots = Some(crate::config::RootsConfig {
+            companions: None,
+            pinned: entries.iter().map(|s| (*s).to_string()).collect(),
+        });
+        config
+    }
+
+    #[test]
+    fn pinned_root_findings_flag_a_missing_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let present = tmp.path().join("present");
+        fs::create_dir(&present).expect("mkdir present");
+        let missing = tmp.path().join("gone");
+        let config = config_with_pins(&[
+            present.to_str().expect("utf8"),
+            missing.to_str().expect("utf8"),
+        ]);
+
+        let findings = pinned_root_findings(&config);
+        assert_eq!(findings.len(), 1, "only the missing path warns");
+        let f = &findings[0];
+        assert_eq!(f.code, FindingCode::ConfigPinnedRootMissing);
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(
+            f.message.contains(missing.to_str().expect("utf8")),
+            "names the missing entry: {}",
+            f.message
+        );
+        assert!(
+            rendered(f).contains("catenary unpin"),
+            "fix-it points at unpin: {}",
+            rendered(f)
+        );
+    }
+
+    #[test]
+    fn pinned_root_findings_silent_when_all_present() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = config_with_pins(&[tmp.path().to_str().expect("utf8")]);
+        assert!(pinned_root_findings(&config).is_empty());
+    }
+
+    #[test]
+    fn pinned_root_findings_empty_without_pins() {
+        assert!(pinned_root_findings(&Config::default()).is_empty());
     }
 }

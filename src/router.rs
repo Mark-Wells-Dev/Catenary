@@ -1468,6 +1468,157 @@ fn ephemeral_contributor(root: &Path) -> String {
     format!("{EPHEMERAL_CONTRIBUTOR_PREFIX}{}", root.display())
 }
 
+/// The user config file (`~/.config/catenary/config.toml`) the persisted pin
+/// list lives in (misc 175).
+///
+/// Resolves through the same [`crate::config::ConfigLayer::User`] path the
+/// guided-mutation writer uses, so a `pin`/`unpin` config write and the boot
+/// restore agree on which file carries `[roots] pinned`.
+#[cfg(unix)]
+fn user_config_path() -> PathBuf {
+    crate::paths::config_dir()
+        .join("catenary")
+        .join("config.toml")
+}
+
+/// Persist a `catenary pin` to the user config's `[roots] pinned` list (misc
+/// 175), the durability leg of the runtime pin.
+///
+/// The runtime pin (the `hook` contributor) has already been applied by the
+/// time this runs; the config write is what survives a daemon restart. Failure
+/// is non-fatal to the pin — the root is pinned live regardless — so a write
+/// error is logged at `warn!()` (a TUI health finding, no interrupt) rather than
+/// failing the command: the operator's live pin still holds, only its
+/// persistence is impaired.
+#[cfg(unix)]
+fn persist_pin(canonical: &Path) {
+    let path = user_config_path();
+    match crate::config::pin_config(&path, canonical) {
+        Ok(true) => debug!(
+            source = Source::DaemonDispatch.as_str(),
+            path = %canonical.display(),
+            "persisted pin to user config",
+        ),
+        Ok(false) => debug!(
+            source = Source::DaemonDispatch.as_str(),
+            path = %canonical.display(),
+            "pin already present in user config — no config change",
+        ),
+        Err(e) => warn!(
+            source = Source::DaemonDispatch.as_str(),
+            path = %canonical.display(),
+            "failed to persist pin to user config (the root is pinned live regardless): {e:#}",
+        ),
+    }
+}
+
+/// Drop a `catenary unpin` from the user config's `[roots] pinned` list (misc
+/// 175), mirroring [`persist_pin`].
+///
+/// A missing config file or an absent entry is a benign no-op. A write failure
+/// is non-fatal and logged at `warn!()`. Returns `true` when an entry was
+/// removed — the caller folds this into the `unpin` outcome so a config-only
+/// entry (a pin whose path was missing at boot) still reports success.
+#[cfg(unix)]
+fn persist_unpin(canonical: &Path) -> bool {
+    let path = user_config_path();
+    match crate::config::unpin_config(&path, canonical) {
+        Ok(true) => {
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                path = %canonical.display(),
+                "removed pin from user config",
+            );
+            true
+        }
+        Ok(false) => {
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                path = %canonical.display(),
+                "pin not present in user config — no config change",
+            );
+            false
+        }
+        Err(e) => {
+            warn!(
+                source = Source::DaemonDispatch.as_str(),
+                path = %canonical.display(),
+                "failed to remove pin from user config: {e:#}",
+            );
+            false
+        }
+    }
+}
+
+/// Restore persisted pins at daemon boot (misc 175): re-add each `[roots]
+/// pinned` config entry as a `hook` contributor so a pin survives a restart.
+///
+/// Each entry is tilde-expanded then canonicalized (the tracker canonicalizes
+/// every root, so this yields one spelling per root — matching a hand-authored
+/// `~`-prefixed spelling and the daemon's own pin-time canonical form). An entry
+/// whose path is **missing on disk** (deleted repo, unmounted volume) is left in
+/// the config and NOT tracked: the doctor missing-pin finding surfaces it, and
+/// Catenary never rewrites the user's config outside an explicit pin/unpin, so a
+/// transiently absent mount stays pinned.
+///
+/// Restore is zero-cost. `add_roots` births a config-loaded [`Root`] (a tracker
+/// entry + a roots-board line) but spawns nothing: on a fresh daemon no language
+/// is active, so `spawn_for_added_roots` (the warm-language spawn leg) fires for
+/// none of them, and the first-touch lazy spawn pays only when a root is used.
+/// The single `sync_roots` push (fire-and-forget on the session runtime, like the
+/// startup `spawn_all`) makes the roots resolvable by tool calls without eager
+/// spawning.
+#[cfg(unix)]
+fn restore_pinned_roots(tracker: &RootTracker, session: &Arc<Session>) {
+    let mut restored: Vec<PathBuf> = Vec::new();
+    for entry in session.config.pinned_roots() {
+        let expanded = crate::bridge::expand_tilde(entry);
+        let expanded = PathBuf::from(expanded);
+        match expanded.canonicalize() {
+            Ok(canonical) => restored.push(canonical),
+            Err(_) => {
+                // Missing at boot — keep the config entry (never pruned), let the
+                // doctor missing-pin finding surface it. A transiently absent
+                // mount stays pinned.
+                info!(
+                    source = Source::DaemonLifecycle.as_str(),
+                    entry = %entry,
+                    "pinned root missing at boot — kept in config, not tracked \
+                     (see `catenary doctor`)",
+                );
+            }
+        }
+    }
+
+    if restored.is_empty() {
+        return;
+    }
+
+    tracker.add_roots("hook", &restored);
+    info!(
+        source = Source::DaemonLifecycle.as_str(),
+        count = restored.len(),
+        "restored persisted pins from user config",
+    );
+
+    // Push the restored union into the FilesystemManager/LspClientManager so a
+    // first-touch tool call resolves the root, WITHOUT the eager pre-warm:
+    // `sync_roots_no_prewarm` skips the fire-and-forget `spawn_all`, so a restored
+    // pin spawns no server (its `spawn_for_added_roots` leg is a no-op on a fresh
+    // daemon). The lazy first-touch path is preserved. Fire-and-forget on the
+    // session runtime, mirroring the startup spawn.
+    let session = Arc::clone(session);
+    let global = tracker.global_roots_rich();
+    session.runtime.clone().spawn(async move {
+        if let Err(e) = session.sync_roots_no_prewarm(global).await {
+            warn!(
+                source = Source::DaemonLifecycle.as_str(),
+                "root sync after pin restore failed: {e:#}",
+            );
+        }
+    });
+}
+
 /// Per-root idle clock for activity-mounted ephemeral roots.
 ///
 /// Holds the last-activity [`Instant`] of every ephemeral root, keyed by
@@ -2565,6 +2716,19 @@ impl SessionManager {
         self.lsp = Some(session.lsp_client_manager().clone());
         let root_tracker = RootTracker::new();
         self.root_tracker = Some(root_tracker.clone());
+
+        // Persisted-pin restore (misc 175): re-add each `[roots] pinned` config
+        // entry as a `hook` contributor so a pin survives a daemon restart. A
+        // hand-edit to the array is honored the same way — adding a path IS a
+        // pin, effective now. Restore is zero-cost: `add_roots` births a
+        // config-loaded `Root` (a tracker entry + roots-board line) but nothing
+        // is active on a fresh daemon, so `spawn_for_added_roots` spawns no
+        // server until the root's first touch (the lazy path is preserved). A
+        // missing path (deleted repo, unmounted volume) is left in the config and
+        // NOT added to the tracker — the doctor missing-pin finding surfaces it;
+        // Catenary never rewrites the user's config outside an explicit
+        // pin/unpin, so a transiently absent mount stays pinned.
+        restore_pinned_roots(&root_tracker, &session);
 
         let sessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
         // Shared with the root board so `state.json` can surface each ephemeral
@@ -5774,6 +5938,11 @@ async fn handle_hook_dispatch(
                     upgraded_from_ephemeral = upgraded,
                     "added root via hook contributor",
                 );
+                // Persistence leg (misc 175): record the pin in the user config's
+                // `[roots] pinned` list so it survives a daemon restart. The
+                // runtime pin above already took effect; a config-write failure is
+                // non-fatal and warned, never bounced back to the command.
+                persist_pin(&canonical);
             }
             serde_json::json!({"status": "ok", "path": canonical.display().to_string()})
         } else {
@@ -5824,6 +5993,17 @@ async fn handle_hook_dispatch(
                         path = %canonical.display(),
                         "removed root from hook contributor",
                     );
+                }
+                // Persistence leg (misc 175): drop the entry from the user
+                // config's `[roots] pinned` list. Runs even when the tracker had
+                // no live `hook` contributor — a pin whose path was missing at
+                // boot is kept in config but never re-added to the tracker
+                // (keep-with-doctor-finding), so `unpin` must be able to remove a
+                // config-only entry. `unpin` succeeds when EITHER the live pin OR
+                // the config entry was removed; only when NEITHER existed is it
+                // the benign idempotent `not_found`.
+                let config_removed = persist_unpin(&canonical);
+                if removed || config_removed {
                     serde_json::json!({"status": "ok", "path": canonical.display().to_string()})
                 } else {
                     serde_json::json!({
@@ -11152,6 +11332,7 @@ mod tests {
                     "*",
                     "{root}Internal",
                 )])),
+                pinned: Vec::new(),
             }),
             ..crate::config::Config::default()
         };

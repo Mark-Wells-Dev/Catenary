@@ -30,7 +30,9 @@ pub use commands::{
 };
 pub use language::{DispatchMethod, LanguageConfig, ServerBinding};
 pub use linter::LinterConfig;
-pub use mutate::{BindingSpec, ConfigLayer, Mutation, section_is_project_scoped};
+pub use mutate::{
+    BindingSpec, ConfigLayer, Mutation, pin_config, section_is_project_scoped, unpin_config,
+};
 pub use parse::{
     DEFAULT_LINTERS, DEFAULT_SERVERS, MIGRATION_GUIDANCE_POINTER, ProjectConfig, SERVER_DEF_KEYS,
     config_sources, default_server_names, load_project_config,
@@ -66,9 +68,10 @@ pub struct NotificationConfig {
 
 /// Workspace-root configuration (`[roots]`).
 ///
-/// User-level only. The lone field today is [`companions`](Self::companions);
-/// the section exists so companion-root rules have a stable home as more
-/// root-policy knobs land.
+/// User-level only. Homes the companion-root rules
+/// ([`companions`](Self::companions)) and the persisted pin list
+/// ([`pinned`](Self::pinned)); the section exists so root-policy knobs have a
+/// stable home as more land.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct RootsConfig {
@@ -80,6 +83,20 @@ pub struct RootsConfig {
     /// is warned-and-ignored (it is not a project-allowed key) so a public repo
     /// cannot leak a private sibling path.
     pub companions: Option<CompanionRules>,
+
+    /// Persisted pinned workspace roots (`[roots] pinned`, misc 175).
+    ///
+    /// The durable form of `catenary pin`: each entry is a root re-added as a
+    /// pin contributor at daemon boot so a pin survives a restart. `pin`/`unpin`
+    /// add/remove entries with comment-preserving TOML editing (the config is
+    /// hand-authored); a hand-edit to this array IS a pin, effective at the next
+    /// daemon start. Home-prefixed paths render with `~`; entries are compared
+    /// canonically (one spelling per root). Boot restore is zero-cost — nothing
+    /// spawns until a root's first touch — and a missing path at boot keeps the
+    /// entry and surfaces a doctor finding rather than rewriting the user's
+    /// config.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned: Vec<String>,
 }
 
 /// External signed-registry configuration (`[registry]`, tui-rework 08).
@@ -434,6 +451,20 @@ impl Config {
     #[must_use]
     pub fn companion_rules(&self) -> Option<&CompanionRules> {
         self.roots.as_ref()?.companions.as_ref()
+    }
+
+    /// Returns the raw persisted pin entries (`[roots] pinned`), verbatim as
+    /// authored (`~`-prefixed spellings not yet expanded).
+    ///
+    /// Empty when `[roots]` is absent or carries no `pinned` array. The daemon
+    /// expands and canonicalizes each entry at boot restore (misc 175); the
+    /// doctor missing-path check reads the raw form to name the entry as the
+    /// user wrote it.
+    #[must_use]
+    pub fn pinned_roots(&self) -> &[String] {
+        self.roots
+            .as_ref()
+            .map_or(&[], |roots| roots.pinned.as_slice())
     }
 }
 
@@ -1557,6 +1588,52 @@ command = "rust-analyzer"
         fs::write(&path, "[roots]\nbogus = true\n").expect("write");
 
         assert!(Config::load_from_sources(&[path]).is_err());
+    }
+
+    #[test]
+    fn roots_pinned_absent_is_empty() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "")?;
+
+        let config = Config::load_from_sources(&[path])?;
+        assert!(config.pinned_roots().is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn roots_pinned_parses_the_array() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[roots]\npinned = [\"~/Projects/Catenary\", \"/srv/other\"]\n",
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        assert_eq!(
+            config.pinned_roots(),
+            &["~/Projects/Catenary".to_string(), "/srv/other".to_string()],
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn roots_pinned_coexists_with_companions() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[roots]\npinned = [\"/srv/one\"]\n\n[roots.companions]\n\"*\" = \"{root}Internal\"\n",
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        assert_eq!(config.pinned_roots(), &["/srv/one".to_string()]);
+        assert!(config.companion_rules().is_some());
+
+        Ok(())
     }
 
     #[test]

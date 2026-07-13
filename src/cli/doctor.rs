@@ -146,6 +146,7 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
         &config,
     ));
     config_findings.extend(crate::health::config_checks::leftover_launcher_args_findings(&config));
+    config_findings.extend(crate::health::config_checks::pinned_root_findings(&config));
     if render_findings(out, &config_findings, show_diff) {
         let _ = out.writeln(format_args!(""));
     }
