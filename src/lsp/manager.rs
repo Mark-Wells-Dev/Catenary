@@ -1207,10 +1207,12 @@ impl LspClientManager {
     /// One lookup pass for [`Self::get_servers`]: the matching live clients in
     /// priority order, plus the instance keys of dead-but-present per-root
     /// instances the demand routed to (the misc 167 revive candidates).
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "clients lock held across async iteration for consistent snapshot"
-    )]
+    ///
+    /// Two phases: the registry lock is held only to snapshot candidate
+    /// instances — never across a client-lock await. A client mutex can be
+    /// held for a full diagnose batch (settle included), and awaiting one
+    /// under the registry guard convoyed every manager lookup daemon-wide
+    /// behind a single busy server (bug 104).
     #[allow(
         clippy::too_many_lines,
         reason = "workspace folder fallback adds branches but logic is linear"
@@ -1240,64 +1242,78 @@ impl LspClientManager {
             };
             // Resolve marker root once for all servers in this language.
             let resolved = self.resolve_server_root(path, &lang_id, &root);
-            let clients = self.clients.lock().await;
+
+            // Phase 1 — registry snapshot: resolve each binding to its
+            // candidate instance under the registry lock, awaiting no client
+            // lock. The `bool` marks a workspace-root fallback whose folder
+            // capability is checked in phase 2, after the guard drops.
+            let mut candidates: Vec<(String, Arc<Mutex<LspClient>>, bool)> = Vec::new();
+            {
+                let clients = self.clients.lock().await;
+                for binding in lang_config.servers() {
+                    let skip = |reason: &str| {
+                        debug!(
+                            source = Source::LspDispatch.as_str(),
+                            server = binding.name.as_str(),
+                            "get_servers: skipped {}: {reason}",
+                            binding.name,
+                        );
+                    };
+                    if method.is_some_and(|m| binding.is_method_disabled(m)) {
+                        skip("method disabled");
+                        continue;
+                    }
+                    // A project `[lsp.server.*]` def is a legal binding target, so
+                    // resolve the def per-root rather than user-config only.
+                    let Some(server_def) = self.effective_server_def(&binding.name, &root) else {
+                        skip("server def not found");
+                        continue;
+                    };
+                    if !file_matches_patterns(path, &server_def.compiled_patterns) {
+                        skip("file_patterns mismatch");
+                        continue;
+                    }
+                    if let Some(c) = find_instance(&clients, &lang_id, &binding.name, &resolved) {
+                        candidates.push((binding.name.clone(), c, false));
+                    } else if resolved != root {
+                        // No instance at marker root — a workspace-root
+                        // instance is the fallback if it supports workspace
+                        // folders (checked in phase 2).
+                        if let Some(ws) = find_instance(&clients, &lang_id, &binding.name, &root) {
+                            candidates.push((binding.name.clone(), ws, true));
+                        } else {
+                            skip(&format!("no instance for root {}", resolved.display()));
+                        }
+                    } else {
+                        debug!(
+                            source = Source::LspDispatch.as_str(),
+                            server = binding.name.as_str(),
+                            "get_servers: skipped {}: no instance for root {}",
+                            binding.name,
+                            resolved.display(),
+                        );
+                    }
+                }
+            }
+
+            // Phase 2 — per-client checks with the registry guard dropped:
+            // waiting on a busy candidate stalls only this lookup, never the
+            // registry.
             let mut result = Vec::new();
             let mut dead: Vec<InstanceKey> = Vec::new();
-
-            for binding in lang_config.servers() {
+            for (name, client, ws_fallback) in candidates {
                 let skip = |reason: &str| {
                     debug!(
                         source = Source::LspDispatch.as_str(),
-                        server = binding.name.as_str(),
-                        "get_servers: skipped {}: {reason}",
-                        binding.name,
+                        server = name.as_str(),
+                        "get_servers: skipped {name}: {reason}",
                     );
-                };
-                if method.is_some_and(|m| binding.is_method_disabled(m)) {
-                    skip("method disabled");
-                    continue;
-                }
-                // A project `[lsp.server.*]` def is a legal binding target, so
-                // resolve the def per-root rather than user-config only.
-                let Some(server_def) = self.effective_server_def(&binding.name, &root) else {
-                    skip("server def not found");
-                    continue;
-                };
-                if !file_matches_patterns(path, &server_def.compiled_patterns) {
-                    skip("file_patterns mismatch");
-                    continue;
-                }
-                let client = if let Some(c) =
-                    find_instance(&clients, &lang_id, &binding.name, &resolved)
-                {
-                    c
-                } else if resolved != root {
-                    // No instance at marker root — check for a
-                    // workspace-folder-capable instance at the workspace root.
-                    if let Some(ws) = find_instance(&clients, &lang_id, &binding.name, &root) {
-                        if ws.lock().await.supports_workspace_folders() {
-                            ws
-                        } else {
-                            skip(
-                                "no instance for marker root, workspace instance not folder-capable",
-                            );
-                            continue;
-                        }
-                    } else {
-                        skip(&format!("no instance for root {}", resolved.display()));
-                        continue;
-                    }
-                } else {
-                    debug!(
-                        source = Source::LspDispatch.as_str(),
-                        server = binding.name.as_str(),
-                        "get_servers: skipped {}: no instance for root {}",
-                        binding.name,
-                        resolved.display(),
-                    );
-                    continue;
                 };
                 let locked = client.lock().await;
+                if ws_fallback && !locked.supports_workspace_folders() {
+                    skip("no instance for marker root, workspace instance not folder-capable");
+                    continue;
+                }
                 if !locked.is_alive() || locked.lifecycle().is_terminal() {
                     // Dead-but-present on a live root: a misc 167 revive
                     // candidate (the terminal-but-lingering `Failed` class
@@ -1380,12 +1396,16 @@ impl LspClientManager {
             return;
         };
 
-        // Collect matching instances under the lock, then release before waiting.
+        // Collect matching instances under the lock, then release before
+        // waiting. No client lock is awaited under the registry guard (bug
+        // 104): a workspace-root fallback's folder capability is checked in
+        // the wait loop below, after the guard drops. The `bool` marks such a
+        // fallback.
         #[allow(
             clippy::option_if_let_else,
             reason = "if/else clearer than map_or_else here"
         )]
-        let to_wait: Vec<Arc<Mutex<LspClient>>> = {
+        let to_wait: Vec<(Arc<Mutex<LspClient>>, bool)> = {
             let clients = self.clients.lock().await;
             if let Some(root) = self.fs.resolve_root(path) {
                 // Tiers 1–2: rooted file. Resolve the binding per-root so a
@@ -1399,14 +1419,14 @@ impl LspClientManager {
                 let mut instances = Vec::new();
                 for binding in lang_config.servers() {
                     if let Some(c) = find_instance(&clients, &lang_id, &binding.name, &resolved) {
-                        instances.push(c);
+                        instances.push((c, false));
                     } else if resolved != root
                         && let Some(ws) = find_instance(&clients, &lang_id, &binding.name, &root)
-                        && ws.lock().await.supports_workspace_folders()
                     {
-                        // No instance at marker root — fall back to a
-                        // workspace-folder-capable instance at the workspace root.
-                        instances.push(ws);
+                        // No instance at marker root — fall back to the
+                        // workspace-root instance if it supports workspace
+                        // folders (checked after the guard drops).
+                        instances.push((ws, true));
                     }
                 }
                 instances
@@ -1424,14 +1444,19 @@ impl LspClientManager {
                             binding.name.clone(),
                             Scope::SingleFile,
                         );
-                        clients.get(&sf_key).cloned()
+                        clients.get(&sf_key).cloned().map(|c| (c, false))
                     })
                     .collect()
             }
         };
 
-        for client_mutex in to_wait {
-            client_mutex.lock().await.wait_ready().await;
+        for (client_mutex, ws_fallback) in to_wait {
+            let locked = client_mutex.lock().await;
+            if ws_fallback && !locked.supports_workspace_folders() {
+                continue;
+            }
+            locked.wait_ready().await;
+            drop(locked);
         }
     }
 
@@ -1574,18 +1599,23 @@ impl LspClientManager {
         let mut clients = self.clients.lock().await;
 
         // Double-check: another task may have spawned this server
-        // while we waited.
+        // while we waited. Both arms diverge, so the registry guard is
+        // dropped before the client lock is awaited (bug 104) — the
+        // not-found path below keeps the guard, which is what prevents a
+        // duplicate concurrent spawn.
         if let Some(found) = find_instance(&clients, lang, server_name, root) {
-            if found.lock().await.is_alive() {
-                let key = found
-                    .lock()
-                    .await
+            drop(clients);
+            let key = {
+                let locked = found.lock().await;
+                if !locked.is_alive() {
+                    anyhow::bail!("LSP server '{server_name}' ({lang}) is dead");
+                }
+                locked
                     .server()
                     .key()
-                    .ok_or_else(|| anyhow!("Existing server missing instance key"))?;
-                return Ok((key, found));
-            }
-            anyhow::bail!("LSP server '{server_name}' ({lang}) is dead");
+                    .ok_or_else(|| anyhow!("Existing server missing instance key"))?
+            };
+            return Ok((key, found));
         }
 
         let program = server_def.program(server_name);
@@ -1957,15 +1987,20 @@ impl LspClientManager {
     ) -> Result<Arc<Mutex<LspClient>>> {
         let project_scoped = self.is_project_scoped(lang, root);
 
-        // Fast path: check for an existing instance.
-        {
+        // Fast path: check for an existing instance. The registry guard drops
+        // before the client lock is awaited: a client mutex can be held for a
+        // full diagnose batch (settle included), and awaiting it under the
+        // registry lock convoyed every manager lookup daemon-wide behind one
+        // busy server (bug 104).
+        let found = {
             let clients = self.clients.lock().await;
-            if let Some(found) = find_instance(&clients, lang, server_name, root) {
-                if found.lock().await.is_alive() {
-                    return Ok(found);
-                }
-                anyhow::bail!("LSP server '{server_name}' ({lang}) is dead");
+            find_instance(&clients, lang, server_name, root)
+        };
+        if let Some(found) = found {
+            if found.lock().await.is_alive() {
+                return Ok(found);
             }
+            anyhow::bail!("LSP server '{server_name}' ({lang}) is dead");
         }
 
         // Miss — spawn only for a path some installed root covers
@@ -2333,9 +2368,14 @@ impl LspClientManager {
             self.config.language.keys().map(String::as_str).collect();
 
         // Collect (language, server_name, root) triples that need spawning,
-        // and (client, marker_root) pairs that need workspace folder additions.
+        // and (client, marker_root, language, server_name) candidates for
+        // workspace folder additions. The candidate's folder capability is
+        // probed after the registry guard drops — awaiting a client lock
+        // under the registry guard convoyed every manager lookup daemon-wide
+        // behind a single busy server (bug 104).
         let mut to_spawn: HashSet<(String, String, PathBuf)> = HashSet::new();
-        let mut folder_additions: Vec<(Arc<Mutex<LspClient>>, PathBuf)> = Vec::new();
+        let mut folder_candidates: Vec<(Arc<Mutex<LspClient>>, PathBuf, String, String)> =
+            Vec::new();
 
         {
             let active = self.clients.lock().await;
@@ -2375,12 +2415,17 @@ impl LspClientManager {
                     }
                     // No instance at marker root. For workspace-folder-capable
                     // servers, send the marker root as a workspace folder
-                    // addition to the workspace-root instance.
+                    // addition to the workspace-root instance (capability
+                    // checked below, outside the guard).
                     if resolved != root
                         && let Some(ws) = find_instance(&active, &lang, &binding.name, &root)
-                        && ws.lock().await.supports_workspace_folders()
                     {
-                        folder_additions.push((ws, resolved.clone()));
+                        folder_candidates.push((
+                            ws,
+                            resolved.clone(),
+                            lang.clone(),
+                            binding.name.clone(),
+                        ));
                         continue;
                     }
                     to_spawn.insert((lang.clone(), binding.name.clone(), resolved.clone()));
@@ -2390,11 +2435,18 @@ impl LspClientManager {
 
         // Send workspace folder additions to existing instances.
         // Deduplication is handled by LspClient::add_workspace_folder
-        // (tracks added folders across calls).
-        for (client, marker_root) in &folder_additions {
+        // (tracks added folders across calls). A candidate whose instance
+        // turns out not to support workspace folders degrades to a per-root
+        // spawn — the same decision the pre-bug-104 in-guard check made.
+        for (client, marker_root, lang, server_name) in folder_candidates {
             let mut locked = client.lock().await;
+            if !locked.supports_workspace_folders() {
+                drop(locked);
+                to_spawn.insert((lang, server_name, marker_root));
+                continue;
+            }
             if locked.is_alive()
-                && let Err(e) = locked.add_workspace_folder(marker_root).await
+                && let Err(e) = locked.add_workspace_folder(&marker_root).await
             {
                 debug!(
                     "Failed to add workspace folder {}: {e}",
@@ -2749,44 +2801,47 @@ impl LspClientManager {
     /// Workspace-scoped and other instances are untouched.
     async fn shutdown_root_instances(&self, root: &Path) {
         let sr = root.display().to_string();
-        let mut clients = self.clients.lock().await;
-        let to_remove: Vec<InstanceKey> = clients
-            .keys()
-            .filter(|k| matches!(&k.scope, Scope::Root(r) if r.as_path() == root))
-            .cloned()
-            .collect();
-        for key in to_remove {
-            if let Some(client_mutex) = clients.remove(&key) {
+        // Detach under the registry lock, shut down after: `shutdown()`
+        // round-trips the server, and a client mutex can be held for a full
+        // diagnose batch (settle included) — awaiting either under the
+        // registry guard convoyed every manager lookup daemon-wide behind one
+        // root's teardown (bug 104). Removal-first preserves the invariant: a
+        // detached instance is unreachable by lookup before its processes go.
+        let detached: Vec<(InstanceKey, Arc<Mutex<LspClient>>)> = {
+            let mut clients = self.clients.lock().await;
+            clients
+                .extract_if(|k, _| matches!(&k.scope, Scope::Root(r) if r.as_path() == root))
+                .collect()
+        };
+        for (key, client_mutex) in detached {
+            info!(
+                source = Source::LspLifecycle.as_str(),
+                server = key.server.as_str(),
+                scope_root = sr.as_str(),
+                "Shutting down per-root instance {key}",
+            );
+            let mut client = client_mutex.lock().await;
+            if client.is_alive()
+                && let Err(e) = client.shutdown().await
+            {
                 info!(
                     source = Source::LspLifecycle.as_str(),
                     server = key.server.as_str(),
                     scope_root = sr.as_str(),
-                    "Shutting down per-root instance {key}",
+                    "Failed to shutdown per-root instance {key}: {e}",
                 );
-                let mut client = client_mutex.lock().await;
-                if client.is_alive()
-                    && let Err(e) = client.shutdown().await
-                {
-                    info!(
-                        source = Source::LspLifecycle.as_str(),
-                        server = key.server.as_str(),
-                        scope_root = sr.as_str(),
-                        "Failed to shutdown per-root instance {key}: {e}",
-                    );
-                }
-                drop(client);
-                drop(client_mutex);
-                // Drop the board entry: the instance is gone, so the snapshot
-                // must not keep rendering it healthy (bug 72). Ordered after the
-                // client drops so the reader loop's `on_shutdown` (which cannot
-                // upgrade its `Weak` once the last `LspServer` ref is gone)
-                // never re-creates a ghost behind us.
-                if let Some(writer) = &self.snapshot {
-                    writer.remove_server(&key);
-                }
+            }
+            drop(client);
+            drop(client_mutex);
+            // Drop the board entry: the instance is gone, so the snapshot
+            // must not keep rendering it healthy (bug 72). Ordered after the
+            // client drops so the reader loop's `on_shutdown` (which cannot
+            // upgrade its `Weak` once the last `LspServer` ref is gone)
+            // never re-creates a ghost behind us.
+            if let Some(writer) = &self.snapshot {
+                writer.remove_server(&key);
             }
         }
-        drop(clients);
         // Retirement resets the strike ledger for the root (misc 167 / bug
         // 93): the retired root's servers must not revive — their instances
         // just left the map, so no demand can find them — and a later remount
@@ -2801,32 +2856,31 @@ impl LspClientManager {
     /// now be covered by workspace or per-root instances. Single-file
     /// servers are lazily re-spawned on the next request if still needed.
     async fn shutdown_single_file_instances(&self) {
-        let mut clients = self.clients.lock().await;
-        let sf_keys: Vec<InstanceKey> = clients
-            .keys()
-            .filter(|k| k.scope == Scope::SingleFile)
-            .cloned()
-            .collect();
-        for key in sf_keys {
-            if let Some(client_mutex) = clients.remove(&key) {
+        // Detach under the registry lock, shut down after (bug 104) — same
+        // discipline as [`Self::shutdown_root_instances`].
+        let detached: Vec<(InstanceKey, Arc<Mutex<LspClient>>)> = {
+            let mut clients = self.clients.lock().await;
+            clients
+                .extract_if(|k, _| k.scope == Scope::SingleFile)
+                .collect()
+        };
+        for (key, client_mutex) in detached {
+            info!(
+                source = Source::LspLifecycle.as_str(),
+                server = key.server.as_str(),
+                "Shutting down single-file instance {key}",
+            );
+            let mut client = client_mutex.lock().await;
+            if client.is_alive()
+                && let Err(e) = client.shutdown().await
+            {
                 info!(
                     source = Source::LspLifecycle.as_str(),
                     server = key.server.as_str(),
-                    "Shutting down single-file instance {key}",
+                    "Failed to shutdown single-file instance {key}: {e}",
                 );
-                let mut client = client_mutex.lock().await;
-                if client.is_alive()
-                    && let Err(e) = client.shutdown().await
-                {
-                    info!(
-                        source = Source::LspLifecycle.as_str(),
-                        server = key.server.as_str(),
-                        "Failed to shutdown single-file instance {key}: {e}",
-                    );
-                }
             }
         }
-        drop(clients);
 
         self.single_file_failures
             .lock()
