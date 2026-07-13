@@ -5548,6 +5548,15 @@ async fn handle_hook_dispatch(
             .as_ref()
             .map(|h| (h.2.clone(), h.3.clone(), h.4.clone()));
 
+        // The held-open document owner (diagnostics-debt 01): the same
+        // `(editing_session, agent_id)` key the batch accumulates under.
+        // Batch-opened documents are tagged with it so the owning agent's
+        // Stop/SubagentStop closes exactly its documents. The hookless
+        // scoped form carries no identity — its documents open untagged.
+        let doc_owner: Option<String> = flip_keys.as_ref().map(|(_, editing_session, agent_id)| {
+            crate::bridge::editing_manager::editing_key(editing_session.as_deref(), agent_id)
+        });
+
         // Extract scope_id early so we can emit the incoming hook
         // event before running the diagnostics pipeline. This ensures
         // the tool/editing-stop event is the first message in the
@@ -5659,12 +5668,15 @@ async fn handle_hook_dispatch(
                 // bracket), the socket closes, the probe reads EOF, and we drop the
                 // pipeline future instead of leaving a settle wait pinned on
                 // a Busy server (bug 24). Mirrors the grep/glob cancel-on-disconnect
-                // path. The dropped batch self-heals: `open_document_on` sends
-                // `didChange` (not a duplicate `didOpen`) for an already-open doc.
+                // path. The dropped batch self-heals: `open_document_on`'s change
+                // gate re-syncs an already-open doc (didChange when its content
+                // moved, nothing when unchanged — never a duplicate `didOpen`).
                 let raced = race_against_disconnect(
-                    ctx.primary
-                        .diagnostics
-                        .process_files_batched(&diag_files, Some(&scope_id)),
+                    ctx.primary.diagnostics.process_files_batched(
+                        &diag_files,
+                        Some(&scope_id),
+                        doc_owner.as_deref(),
+                    ),
                     &mut buf_reader,
                 )
                 .await;
@@ -6022,6 +6034,36 @@ async fn handle_hook_dispatch(
         && let Some(nag) = lingering_worktree_nag(&ctx, &session_id, &raw)
     {
         result.result = Some(crate::hook::HookResult::Block(nag));
+    }
+
+    // ── Held-open batch teardown at stop (diagnostics-debt 01) ──────────
+    //
+    // Both Stop and SubagentStop reach the daemon as `post-agent/require-release`.
+    // An **allowed** stop is batch end: close the stopping `(session, agent)`'s
+    // held-open documents on every server connection — exactly that agent's, no
+    // other's. A `Block` means the agent is NOT stopping (it is about to run
+    // `catenary diagnostics`, which reuses the held-open docs), so they stay
+    // open. Backgrounded: a client mutex can be held across a sibling's full
+    // diagnose settle (bug 104), and the stop response must not queue behind
+    // it. Daemon death closes implicitly (bug 79, unchanged).
+    if method == "post-agent/require-release"
+        && !matches!(&result.result, Some(crate::hook::HookResult::Block(_)))
+    {
+        let agent_id = raw
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let editing_session = raw
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let session = ctx.primary.clone();
+        tokio::spawn(async move {
+            session
+                .close_agent_docs(editing_session.as_deref(), &agent_id)
+                .await;
+        });
     }
 
     // ── Subagent worktree teardown at stop (misc 150) ──────────

@@ -254,6 +254,23 @@ enum FileOutcome {
     NoResults,
 }
 
+/// One batch file's state within a diagnostics round on one server
+/// (diagnostics-debt 01).
+///
+/// `synced` records whether this round sent sync traffic (`didOpen` /
+/// `didChange`) for the file — the change gate's verdict. An unsynced file
+/// is held open with content the server already has; whether it still owes
+/// a `didSave` is a registry question
+/// ([`LspClient::document_needs_save`]), asked at save time.
+struct RoundDoc {
+    /// Canonical filesystem path.
+    path: PathBuf,
+    /// Document URI on the server.
+    uri: String,
+    /// Whether this round sent `didOpen`/`didChange` for the file.
+    synced: bool,
+}
+
 /// The routing decision for a scoped diagnostics request (workstream 37
 /// ticket 04, decision 5).
 ///
@@ -320,6 +337,7 @@ impl DiagnosticsServer {
         &self,
         files: &[PathBuf],
         parent_id: Option<&str>,
+        owner: Option<&str>,
     ) -> DiagnosticsOutcome {
         if files.is_empty() {
             return DiagnosticsOutcome {
@@ -339,8 +357,9 @@ impl DiagnosticsServer {
         // no-capability directories expanded to their covered files. Also yields
         // the per-file server assignment, so a file that dies before producing a
         // result can name the server(s) that owed it one (bug 56).
-        let (mut canonical_paths, uncovered, out_of_scope, path_servers, stuck_servers) =
-            self.fan_out(&plan.fan_out, parent_id, &mut feeds).await;
+        let (mut canonical_paths, uncovered, out_of_scope, path_servers, stuck_servers) = self
+            .fan_out(&plan.fan_out, parent_id, owner, &mut feeds)
+            .await;
 
         // Whole-root + capable scopes: one workspace/diagnostic request each,
         // merged into the same per-file map the fan-out populated.
@@ -378,9 +397,10 @@ impl DiagnosticsServer {
     /// The per-file fan-out lifecycle: the always-available diagnostics engine
     /// (ticket 02's path), now factored behind the ticket-04 scope router.
     ///
-    /// Pipeline: resolve + canonicalize → group by server → per server (open all
-    /// → settle → health probe → didSave all → settle → retrieve per file → close
-    /// all) → linter feeders. Populates `feeds` with each file's raw feeder
+    /// Pipeline: resolve + canonicalize → group by server → per server (the
+    /// held-open batch round: change-gated didOpen/didChange → settle → health
+    /// probe → didSave the unsaved → settle → retrieve per file; documents stay
+    /// open — diagnostics-debt 01) → linter feeders. Populates `feeds` with each file's raw feeder
     /// diagnostics and returns the covered `canonical_paths`, the uncovered list,
     /// the out-of-scope list (named paths that do not exist or resolve outside
     /// every mounted root — bug 58 / ephemeral-roots ticket 01), and a per-file
@@ -401,6 +421,7 @@ impl DiagnosticsServer {
         &self,
         files: &[PathBuf],
         parent_id: Option<&str>,
+        owner: Option<&str>,
         feeds: &mut BTreeMap<String, FileFeed>,
     ) -> (
         Vec<PathBuf>,
@@ -633,7 +654,7 @@ impl DiagnosticsServer {
         // JSON, feeder-blind (ticket 02).
         for (name, (client_mutex, paths)) in &server_groups {
             if self
-                .run_server_batch_with_recovery(client_mutex, paths, parent_id, feeds)
+                .run_server_batch_with_recovery(client_mutex, paths, parent_id, owner, feeds)
                 .await
             {
                 // The server ended terminal with an unretrieved remainder and
@@ -1166,9 +1187,10 @@ impl DiagnosticsServer {
         client_mutex: &Arc<Mutex<LspClient>>,
         paths: &[PathBuf],
         parent_id: Option<&str>,
+        owner: Option<&str>,
         feeds: &mut BTreeMap<String, FileFeed>,
     ) -> bool {
-        self.run_server_batch(client_mutex, paths, parent_id, feeds)
+        self.run_server_batch(client_mutex, paths, parent_id, owner, feeds)
             .await;
 
         let remainder: Vec<PathBuf> = paths
@@ -1200,7 +1222,7 @@ impl DiagnosticsServer {
         // (degrade — no further attempts this run; the next demand retries,
         // strikes permitting).
         if let Some(fresh) = self.client_manager.revive_server(&key).await {
-            self.run_server_batch(&fresh, &remainder, parent_id, feeds)
+            self.run_server_batch(&fresh, &remainder, parent_id, owner, feeds)
                 .await;
             // Respawn-dead iff any of the remainder is *still* unretrieved after
             // the fresh instance ran: the process-state evidence that the server
@@ -1214,18 +1236,32 @@ impl DiagnosticsServer {
         }
     }
 
-    /// Runs the batched diagnostics lifecycle on a single server.
+    /// Runs the batched diagnostics lifecycle on a single server — the
+    /// **held-open batch round** (diagnostics-debt 01).
     ///
-    /// Opens all files, settles, runs health probe if needed, sends
-    /// didSave, settles again, holds the retrieval evidence bar
-    /// ([`await_publish_evidence`]), retrieves diagnostics per file,
-    /// and closes all files. Cleanup runs once regardless of
-    /// bail-outs.
+    /// Documents are opened once per connection and stay open across rounds:
+    /// the round sends `didOpen` only for files not yet held, `didChange`
+    /// (full sync, version++) only for files whose disk content moved since
+    /// the last send (mtime fast-path, content hash breaking the same-mtime
+    /// tie — this round-start check is also the out-of-band-write detection:
+    /// servers do not deliver watched-files for open documents), and
+    /// `didSave` for exactly the files whose last-sent content is unsaved.
+    /// A file unchanged since its last saved send gets **no sync traffic**
+    /// and serves from the push cache. Documents are never closed here —
+    /// batch end is the owning agent's Stop/SubagentStop
+    /// ([`LspClientManager::close_agent_docs`]); daemon death closes
+    /// implicitly (bug 79, unchanged).
+    ///
+    /// Blessed/unverified classification is ticket 04 of the
+    /// diagnostics-debt wave; until it lands, every configured server gets
+    /// this held-open batch lifecycle uniformly — this is where 04 will
+    /// branch.
     async fn run_server_batch(
         &self,
         client_mutex: &Arc<Mutex<LspClient>>,
         paths: &[PathBuf],
         parent_id: Option<&str>,
+        owner: Option<&str>,
         feeds: &mut BTreeMap<String, FileFeed>,
     ) {
         let Some(baseline) = self.pre_open_settle(client_mutex).await else {
@@ -1241,25 +1277,24 @@ impl DiagnosticsServer {
         // final publishDiagnostics may still be in the kernel pipe
         // buffer — the write syscall completed (so CPU shows idle) but
         // the reader loop hasn't processed the bytes yet. Under load,
-        // this gap widens. Drain the pipe first to ensure the cache
-        // reflects the server's final state, then clear.
+        // this gap widens. Drain the pipe first so the per-send cache
+        // clears inside `open_document_on` see (and remove) those stale
+        // entries rather than racing them. An **unchanged** held-open
+        // file's cache entry deliberately survives — its last publish is
+        // still evidence for the text the server holds, and the server
+        // will not re-publish an unchanged document.
         {
             let server = client_mutex.lock().await.server().clone();
             drain_pipe(&server).await;
         }
-        self.clear_stale_diagnostics(client_mutex, paths).await;
 
-        let opened = self.open_files(client_mutex, paths, parent_id).await;
-        if opened.is_empty() {
+        let docs = self.open_files(client_mutex, paths, parent_id, owner).await;
+        if docs.is_empty() {
             return;
         }
 
-        // Settle + save + retrieve. Any bail → skip retrieve, still close.
-        if self
-            .settle_and_save(client_mutex, &opened, baseline)
-            .await
-            .is_ok()
-        {
+        // Settle + save + retrieve. Any bail → skip retrieve.
+        if let Ok(stimulated) = self.settle_and_save(client_mutex, &docs, baseline).await {
             // Drain any in-flight publishDiagnostics still in the stdio
             // pipe buffer before reading the diagnostic cache.
             let server = client_mutex.lock().await.server().clone();
@@ -1274,13 +1309,15 @@ impl DiagnosticsServer {
             // working request channel to ask instead — hold retrieval until
             // that publish lands. URIs whose evidence never arrives come back
             // in `evidence_expired` and must not render `[clean]`.
-            let evidence_expired = await_publish_evidence(client_mutex, &opened).await;
+            let evidence_expired = await_publish_evidence(client_mutex, &docs, stimulated).await;
 
-            self.retrieve_diagnostics(client_mutex, &opened, feeds, &evidence_expired)
+            self.retrieve_diagnostics(client_mutex, &docs, feeds, &evidence_expired)
                 .await;
         }
 
-        self.close_all(client_mutex, &opened).await;
+        // End of round: documents stay open (the held-open lifecycle); only
+        // the causation scope is cleared.
+        client_mutex.lock().await.set_parent_id(None);
     }
 
     /// Settles the server before opening files.
@@ -1315,24 +1352,35 @@ impl DiagnosticsServer {
         Some(sample_baseline(&server).await)
     }
 
-    /// Opens all files on the server, collecting their URIs.
+    /// Syncs all batch files onto the server through the held-open change
+    /// gate, collecting their URIs and per-file sync actions.
     ///
+    /// Per file (via [`LspClientManager::open_document_on`]): `didOpen` when
+    /// not yet held open, `didChange` (full text, version++) when disk
+    /// content moved since the last send, **nothing** when unchanged. Each
+    /// file is tagged with the owning `(session, agent)` editing key so
+    /// Stop/SubagentStop can close exactly this agent's documents.
     /// Files that fail to open are logged and skipped.
     async fn open_files(
         &self,
         client_mutex: &Arc<Mutex<LspClient>>,
         paths: &[PathBuf],
         parent_id: Option<&str>,
-    ) -> Vec<(PathBuf, String)> {
-        let mut opened_uris: Vec<(PathBuf, String)> = Vec::new();
+        owner: Option<&str>,
+    ) -> Vec<RoundDoc> {
+        let mut docs: Vec<RoundDoc> = Vec::new();
 
         for path in paths {
             match self
                 .client_manager
-                .open_document_on(path, client_mutex, parent_id.map(str::to_string))
+                .open_document_on(path, client_mutex, parent_id.map(str::to_string), owner)
                 .await
             {
-                Ok(uri) => opened_uris.push((path.clone(), uri)),
+                Ok((uri, action)) => docs.push(RoundDoc {
+                    path: path.clone(),
+                    uri,
+                    synced: action.sends(),
+                }),
                 Err(e) => {
                     let name = client_mutex.lock().await.server_name().to_string();
                     warn!(
@@ -1344,14 +1392,24 @@ impl DiagnosticsServer {
             }
         }
 
-        opened_uris
+        docs
     }
 
-    /// Settles after opens, runs health probe, and sends `didSave`.
+    /// Settles after the round's sync traffic, runs the health probe, and
+    /// sends `didSave` for exactly the files that owe one.
     ///
-    /// Returns `Ok(())` when the server is ready for retrieval, or
-    /// `Err(())` if the server died or a critical step failed (caller
-    /// should skip retrieval but still close documents).
+    /// The save set is the registry's unsaved files
+    /// ([`LspClient::document_needs_save`]): files this round `didOpen`ed or
+    /// `didChange`d, plus files whose content an out-of-round send (a query
+    /// open or the watched-files didChange relay) synced without a save —
+    /// an on-save analyzer has not re-checked those. A file unchanged since
+    /// its last saved send gets no `didSave` — no sync traffic at all
+    /// (diagnostics-debt 01).
+    ///
+    /// Returns `Ok(stimulated)` when the server is ready for retrieval —
+    /// `stimulated` is `true` when the round sent any traffic (sync or
+    /// save), the retrieval evidence bar's arming input — or `Err(())` if
+    /// the server died or a critical step failed (caller skips retrieval).
     ///
     /// The client lock is held across settle calls so that no other
     /// operation can send requests to the server between stimulus and
@@ -1364,10 +1422,10 @@ impl DiagnosticsServer {
     async fn settle_and_save(
         &self,
         client_mutex: &Arc<Mutex<LspClient>>,
-        opened_uris: &[(PathBuf, String)],
+        docs: &[RoundDoc],
         post_open_baseline: u64,
-    ) -> Result<(), ()> {
-        let client = client_mutex.lock().await;
+    ) -> Result<bool, ()> {
+        let mut client = client_mutex.lock().await;
 
         if matches!(
             client.lifecycle(),
@@ -1379,55 +1437,67 @@ impl DiagnosticsServer {
         let server = client.server().clone();
         let server_name = client.server_name().to_string();
         let cancel = CancellationToken::new();
+        let synced_any = docs.iter().any(|d| d.synced);
 
-        if !settle_after(
-            &server,
-            post_open_baseline,
-            cancel.clone(),
-            &server_name,
-            "post-open",
-        )
-        .await
-            || matches!(
-                client.lifecycle(),
-                ServerLifecycle::Failed | ServerLifecycle::Dead
+        if synced_any
+            && (!settle_after(
+                &server,
+                post_open_baseline,
+                cancel.clone(),
+                &server_name,
+                "post-open",
             )
+            .await
+                || matches!(
+                    client.lifecycle(),
+                    ServerLifecycle::Failed | ServerLifecycle::Dead
+                ))
         {
             return Err(());
         }
 
         // ── Health probe ──────────────────────────────────────────
         if client.lifecycle() == ServerLifecycle::Probing
-            && !client.run_health_probe(&opened_uris[0].1).await
+            && !client.run_health_probe(&docs[0].uri).await
         {
             return Err(());
         }
 
-        // ── didSave all ───────────────────────────────────────────
+        // ── didSave the unsaved ───────────────────────────────────
+        let mut saved_any = false;
         if client.wants_did_save() {
-            let baseline = sample_baseline(&server).await;
+            let save_set: Vec<&str> = docs
+                .iter()
+                .filter(|d| client.document_needs_save(&d.uri))
+                .map(|d| d.uri.as_str())
+                .collect();
+            if !save_set.is_empty() {
+                let baseline = sample_baseline(&server).await;
 
-            for (_, uri) in opened_uris {
-                if let Err(e) = client.did_save(uri).await {
-                    warn!(
-                        server = %server_name,
-                        "batch didSave failed: {e}",
-                    );
+                for uri in save_set {
+                    if let Err(e) = client.did_save(uri).await {
+                        warn!(
+                            server = %server_name,
+                            "batch didSave failed: {e}",
+                        );
+                        return Err(());
+                    }
+                    client.mark_document_saved(uri);
+                    saved_any = true;
+                }
+
+                if !settle_after(&server, baseline, cancel, &server_name, "post-didSave").await
+                    || matches!(
+                        client.lifecycle(),
+                        ServerLifecycle::Failed | ServerLifecycle::Dead
+                    )
+                {
                     return Err(());
                 }
             }
-
-            if !settle_after(&server, baseline, cancel, &server_name, "post-didSave").await
-                || matches!(
-                    client.lifecycle(),
-                    ServerLifecycle::Failed | ServerLifecycle::Dead
-                )
-            {
-                return Err(());
-            }
         }
 
-        Ok(())
+        Ok(synced_any || saved_any)
     }
 
     /// Retrieves raw diagnostics for each opened file on the server and merges
@@ -1450,7 +1520,7 @@ impl DiagnosticsServer {
     async fn retrieve_diagnostics(
         &self,
         client_mutex: &Arc<Mutex<LspClient>>,
-        opened_uris: &[(PathBuf, String)],
+        docs: &[RoundDoc],
         feeds: &mut BTreeMap<String, FileFeed>,
         evidence_expired: &HashSet<String>,
     ) {
@@ -1471,7 +1541,7 @@ impl DiagnosticsServer {
             language_id: lang_id,
         });
 
-        for (path, uri) in opened_uris {
+        for RoundDoc { path, uri, .. } in docs {
             let diagnostics = match client.get_diagnostics(uri) {
                 // A publish was heard for this file — authoritative, EVEN WHEN
                 // EMPTY. `Some(vec![])` is the server's evidence-backed clean: an
@@ -1615,41 +1685,6 @@ impl DiagnosticsServer {
                 self.client_manager.record_server_service(key);
             }
         }
-    }
-
-    /// Clears diagnostics cache entries for files about to be opened.
-    ///
-    /// The readdir nudge (Phase 1b) may cause the server to emit
-    /// `publishDiagnostics` for files it discovers on disk — e.g.,
-    /// rust-analyzer's "unlinked-file" for a new `.rs` file before
-    /// the parent `mod` declaration is visible. Clearing the cache
-    /// after `pre_open_settle` ensures only fresh diagnostics from
-    /// the batch settle phase survive to retrieval.
-    async fn clear_stale_diagnostics(
-        &self,
-        client_mutex: &Arc<Mutex<LspClient>>,
-        paths: &[PathBuf],
-    ) {
-        let uris: Vec<String> = paths
-            .iter()
-            .filter_map(|p| p.canonicalize().ok())
-            .map(|p| crate::lsp::lang::path_to_uri(&p))
-            .collect();
-        let uri_refs: Vec<&str> = uris.iter().map(String::as_str).collect();
-        client_mutex.lock().await.clear_diagnostics_for(&uri_refs);
-    }
-
-    /// Closes all opened documents on a server and clears `parent_id`.
-    async fn close_all(
-        &self,
-        client_mutex: &Arc<Mutex<LspClient>>,
-        opened_uris: &[(PathBuf, String)],
-    ) {
-        let mut client = client_mutex.lock().await;
-        for (_, uri) in opened_uris {
-            client.close_tracked_document(uri).await;
-        }
-        client.set_parent_id(None);
     }
 
     /// Makes a path relative to its grouping root, for display.
@@ -1855,9 +1890,18 @@ const DEBOUNCE_DEAD_ZONE_SAMPLES: u32 = 30;
 /// poll window is not dropped). The caller must not let those render
 /// `[clean]` from absence. An empty set means every URI was heard or the bar
 /// never armed.
+///
+/// `stimulated` is whether the round sent the server any traffic (sync or
+/// save). An **unstimulated** round (every file unchanged and saved — the
+/// held-open repeat run) owes the server no wait: nothing was sent, so no
+/// publish is coming, and the still-never-heard set expires immediately —
+/// keeping a file that expired `[unverified]` last round honestly
+/// `[unverified]` on the repeat run instead of flipping to a false
+/// `[clean]` (diagnostics-debt 01).
 async fn await_publish_evidence(
     client_mutex: &Arc<Mutex<LspClient>>,
-    opened_uris: &[(PathBuf, String)],
+    docs: &[RoundDoc],
+    stimulated: bool,
 ) -> HashSet<String> {
     let (server, server_name, mut pending) = {
         let client = client_mutex.lock().await;
@@ -1866,10 +1910,10 @@ async fn await_publish_evidence(
         if client.supports_pull_diagnostics() {
             return HashSet::new();
         }
-        let pending: HashSet<String> = opened_uris
+        let pending: HashSet<String> = docs
             .iter()
-            .filter(|(_, uri)| client.get_diagnostics(uri).is_none())
-            .map(|(_, uri)| uri.clone())
+            .filter(|d| client.get_diagnostics(&d.uri).is_none())
+            .map(|d| d.uri.clone())
             .collect();
         (
             client.server().clone(),
@@ -1888,6 +1932,17 @@ async fn await_publish_evidence(
         || server.has_answered_probe()
     {
         return HashSet::new();
+    }
+
+    // No stimulus this round → no publish is owed or coming; the never-heard
+    // set expires without a wait (see the doc comment).
+    if !stimulated {
+        debug!(
+            server = %server_name,
+            pending = pending.len(),
+            "evidence bar: unstimulated round, never-heard files expire without a wait",
+        );
+        return pending;
     }
 
     debug!(

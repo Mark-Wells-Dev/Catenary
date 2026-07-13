@@ -840,15 +840,20 @@ fn delayed_publish_after_settle_reaches_the_receipt() -> Result<()> {
 /// never `[clean]` — the honest resolution of the bar's own residual.
 ///
 /// mockls with `--publish-once --diagnostics-on-save` publishes on the first
-/// `didSave` only — a push server that never re-publishes an unchanged
-/// document (the bug-74 shape) — and `--reject-pull` answers the probe with
-/// `-32601`, so on the second run there is NO evidence channel at all:
-/// never-heard, no publish coming, probe rejected. The bare receipt's trust
-/// contract (`[clean]` means evidenced-clean) demands the unverified line
-/// here; the pre-bar pipeline rendered absence as `[clean]`. (Gating the one
+/// `didSave` only — a push server that never re-publishes (the bug-74
+/// shape) — and `--reject-pull` answers the probe with `-32601`. The file is
+/// **rewritten** between the calls, so round 2 relays `didChange`+`didSave`
+/// through the held-open change gate, clearing the round-1 publish (it was
+/// computed against the old text) — and then NO evidence channel exists at
+/// all: never-heard, no publish coming, probe rejected. The bare receipt's
+/// trust contract (`[clean]` means evidenced-clean) demands the unverified
+/// line here; the pre-bar pipeline rendered absence as `[clean]`. (An
+/// UNCHANGED file on round 2 now correctly serves round 1's cached publish —
+/// the held-open lifecycle keeps it as evidence for text the server still
+/// holds — so the never-heard state requires the rewrite. Gating the one
 /// publish on `didSave` keeps it out of the daemon's spawn-time eager health
-/// probe, whose `didOpen`/`didClose` of the same file would otherwise consume
-/// it before the batch's clear-then-open.)
+/// probe, whose `didOpen`/`didClose` of the same file would otherwise
+/// consume it before the batch's first round.)
 #[test]
 fn expired_evidence_renders_unverified_not_clean() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -878,6 +883,10 @@ fn expired_evidence_renders_unverified_not_clean() -> Result<()> {
         first.contains("mock diagnostic"),
         "first contact hears the one publish. Got: {first}"
     );
+
+    // Rewrite: round 2's didChange clears the round-1 publish (stale by
+    // construction) and no new one ever comes (publish-once).
+    std::fs::write(&file, "echo changed\n")?;
 
     // Call 2: never-heard, bar armed, no publish ever comes (publish-once),
     // probe rejected. The dead-air budget drains and the file must resolve

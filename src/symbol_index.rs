@@ -28,7 +28,11 @@ use crate::bridge::filesystem_manager::mtime_nanos;
 /// slip the mtime backstop misses (bug #26). Zero-dep by design — the
 /// page-cache-warm read dominates the cost, so the hash algorithm is off the
 /// hot path and an xxh3-class dependency buys nothing measurable here.
-fn hash_bytes(bytes: &[u8]) -> u64 {
+///
+/// Shared with the held-open document change gate
+/// ([`crate::lsp::LspClient::plan_document_sync`], diagnostics-debt 01) — one
+/// staleness idiom, not two.
+pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hasher);
     hasher.finish()

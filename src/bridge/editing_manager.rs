@@ -19,7 +19,11 @@ use anyhow::{Result, anyhow};
 /// The key is `"{session_id}\0{agent_id}"` when a non-empty session ID is
 /// present, falling back to just `agent_id` for backward compatibility
 /// with hosts that don't provide a session ID.
-fn editing_key(session_id: Option<&str>, agent_id: &str) -> String {
+///
+/// `pub(crate)`: the held-open document registry tags each batch-opened
+/// document with this same key as its owner (diagnostics-debt 01), so the
+/// Stop/SubagentStop close resolves exactly the batch's identity.
+pub(crate) fn editing_key(session_id: Option<&str>, agent_id: &str) -> String {
     match session_id {
         Some(sid) if !sid.is_empty() => format!("{sid}\0{agent_id}"),
         _ => agent_id.to_string(),

@@ -24,6 +24,54 @@ use crate::logging::LoggingServer;
 pub type DiagnosticsCache =
     Arc<std::sync::Mutex<std::collections::HashMap<String, (Option<i32>, Vec<Value>)>>>;
 
+/// Held-open document state on one server connection (diagnostics-debt 01).
+///
+/// One entry per open URI: the current **real** LSP document version
+/// (monotonic per URI, bumped only when content is actually sent), the disk
+/// state the last `didOpen`/`didChange` carried (the mtime+hash change gate,
+/// misc 190's two-leg shape), and the batch owners holding the document open.
+#[derive(Debug, Default)]
+struct OpenDocState {
+    /// Current document version — the version the server holds. Bumped only
+    /// on a committed `didOpen`/`didChange`, never per diagnostics round
+    /// (the synthetic round stamps retired with the held-open lifecycle).
+    version: i32,
+    /// `mtime_nanos` of the disk file at the last committed send, or `None`
+    /// when it could not be stat-ed (degrades the fast path to the hash leg).
+    last_sent_mtime: Option<i64>,
+    /// Content hash ([`crate::symbol_index::hash_bytes`]) of the text last
+    /// sent — breaks the same-mtime tie (the same-second slip).
+    last_sent_hash: u64,
+    /// Whether the last-sent content has been `didSave`d. `false` after any
+    /// `didOpen`/`didChange` (content the server has not been told is saved —
+    /// an on-save analyzer has not re-checked it), `true` after `didSave`.
+    saved: bool,
+    /// Batch owners holding this document open: `(session, agent)` editing
+    /// keys. Empty for query-opened documents, which no Stop owns.
+    owners: HashSet<String>,
+}
+
+/// The sync action the change gate decided for a document
+/// (diagnostics-debt 01).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocSync {
+    /// First open on this connection: send `didOpen` with this version.
+    Open(i32),
+    /// Held open and disk content moved since the last send: send
+    /// `didChange` (full sync, whole text) with this version.
+    Change(i32),
+    /// Held open and unchanged since the last send: no sync traffic.
+    Unchanged,
+}
+
+impl DocSync {
+    /// Whether this action sends sync traffic (`didOpen`/`didChange`).
+    #[must_use]
+    pub const fn sends(self) -> bool {
+        !matches!(self, Self::Unchanged)
+    }
+}
+
 /// Manages communication with an LSP server process.
 pub struct LspClient {
     // Server representation (capabilities, state, dispatch, transport)
@@ -48,13 +96,17 @@ pub struct LspClient {
     parent_id: Option<String>,
     /// Cancellation token for the current MCP tool call.
     cancel: CancellationToken,
-    /// Per-client document state: URI → version.
+    /// Per-connection held-open document registry: URI → open-doc state
+    /// (diagnostics-debt 01).
     ///
-    /// Tracks which documents are open on this client and their current
-    /// version number. Each client maintains independent versions so
-    /// that multi-server dispatch gives each server a clean monotonic
-    /// sequence.
-    open_documents: HashMap<String, i32>,
+    /// Tracks which documents are open on this client, their current real
+    /// LSP document version, the last-sent disk state (the mtime+hash change
+    /// gate), and the batch owners holding them open. Each client maintains
+    /// independent versions so that multi-server dispatch gives each server
+    /// a clean monotonic sequence. The registry dies with the instance —
+    /// daemon or server death closes documents implicitly (bug 79's
+    /// release-on-death stance, unchanged).
+    open_documents: HashMap<String, OpenDocState>,
     /// Monotonic per-URI version floor, surviving close/reopen (unlike
     /// `open_documents`, whose entry drops on close). A reopen issues
     /// `floor + 1` rather than restarting at 1, so a straggler publish from
@@ -1076,38 +1128,133 @@ impl LspClient {
         self.open_documents.contains_key(uri)
     }
 
-    /// Registers an open and returns `(first_open, version)`.
+    /// Plans this round's sync for `uri` against the change gate
+    /// (diagnostics-debt 01). Read-only: nothing is recorded until
+    /// [`Self::commit_document_sync`] confirms the send succeeded.
     ///
-    /// First open returns `(true, floor + 1)` — caller sends `didOpen`.
-    /// Subsequent opens increment the version and return `(false, version)`
-    /// — caller sends `didChange`. Versions are monotonic per URI across
-    /// close/reopen (the floor survives [`Self::close_tracked_document`]),
-    /// so the publish staleness gate can tell a previous open's straggler
-    /// publish from this open's evidence (bug 101, heard-stale leg).
-    pub fn open_document(&mut self, uri: &str) -> (bool, i32) {
-        use std::collections::hash_map::Entry;
-        let floor = self.version_floor.get(uri).copied().unwrap_or(0);
-        let (first, version) = match self.open_documents.entry(uri.to_string()) {
-            Entry::Occupied(mut e) => {
-                *e.get_mut() += 1;
-                (false, *e.get())
-            }
-            Entry::Vacant(e) => {
-                let version = floor.saturating_add(1);
-                e.insert(version);
-                (true, version)
-            }
+    /// The gate is misc 190's two-leg staleness shape (the `SymbolIndex`
+    /// primitive, not a third idiom):
+    ///
+    /// - **not open** → [`DocSync::Open`] at `floor + 1`. Versions are
+    ///   monotonic per URI across close/reopen (the floor survives
+    ///   [`Self::close_owned_documents`]), so the publish staleness gate can
+    ///   tell a previous open's straggler publish from this open's evidence
+    ///   (bug 101, heard-stale leg);
+    /// - **mtime moved** (differs from last-sent, either direction — a
+    ///   `git checkout` can restore an older stamp) → [`DocSync::Change`] at
+    ///   `version + 1`, no hash consulted (the cheap leg stays cheap);
+    /// - **mtime unchanged** → the content hash breaks the same-mtime tie: a
+    ///   differing hash is a same-granularity write ([`DocSync::Change`]), an
+    ///   equal hash is [`DocSync::Unchanged`] — no sync traffic. A missing
+    ///   mtime on either side degrades to the hash leg.
+    #[must_use]
+    pub fn plan_document_sync(&self, uri: &str, mtime: Option<i64>, hash: u64) -> DocSync {
+        let Some(entry) = self.open_documents.get(uri) else {
+            let floor = self.version_floor.get(uri).copied().unwrap_or(0);
+            return DocSync::Open(floor.saturating_add(1));
         };
-        self.version_floor.insert(uri.to_string(), version);
-        (first, version)
+        let mtime_unchanged = match (entry.last_sent_mtime, mtime) {
+            (Some(recorded), Some(current)) => recorded == current,
+            // No stamp to compare — degrade to the hash leg.
+            _ => true,
+        };
+        if mtime_unchanged && hash == entry.last_sent_hash {
+            return DocSync::Unchanged;
+        }
+        DocSync::Change(entry.version.saturating_add(1))
     }
 
-    /// Closes a document while the caller holds the lock.
+    /// Records a committed `didOpen`/`didChange` in the held-open registry:
+    /// the new version, the disk state it carried (the next round's change-gate
+    /// reference), and the not-yet-saved flag.
+    pub fn commit_document_sync(&mut self, uri: &str, version: i32, mtime: Option<i64>, hash: u64) {
+        let entry = self.open_documents.entry(uri.to_string()).or_default();
+        entry.version = version;
+        entry.last_sent_mtime = mtime;
+        entry.last_sent_hash = hash;
+        entry.saved = false;
+        self.version_floor.insert(uri.to_string(), version);
+    }
+
+    /// Whether the last-sent content of an open document still owes a
+    /// `didSave` — content synced (by a diagnostics round, a query open, or
+    /// the watched-files relay) that no round has saved yet, so an on-save
+    /// analyzer has not re-checked it. `false` for unopened URIs.
+    #[must_use]
+    pub fn document_needs_save(&self, uri: &str) -> bool {
+        self.open_documents.get(uri).is_some_and(|e| !e.saved)
+    }
+
+    /// Marks an open document's last-sent content as saved (a `didSave` went
+    /// out for it).
+    pub fn mark_document_saved(&mut self, uri: &str) {
+        if let Some(entry) = self.open_documents.get_mut(uri) {
+            entry.saved = true;
+        }
+    }
+
+    /// Tags a batch owner (a `(session, agent)` editing key) on an open
+    /// document. Owned documents are held open until the owner's
+    /// Stop/SubagentStop ([`Self::close_owned_documents`]); a query-cycle
+    /// close ([`Self::close_tracked_document`]) never touches them.
+    pub fn tag_document_owner(&mut self, uri: &str, owner: &str) {
+        if let Some(entry) = self.open_documents.get_mut(uri) {
+            entry.owners.insert(owner.to_string());
+        }
+    }
+
+    /// Closes every held-open document `owner` holds on this connection,
+    /// and only those (diagnostics-debt 01, batch end).
+    ///
+    /// Removes `owner` from each document it holds; a document whose owner
+    /// set drains sends `didClose` and leaves the registry (its version
+    /// floor survives for the staleness gate). A document another agent
+    /// still holds stays open, as does every query-opened (never-owned)
+    /// document. Returns the number of documents closed.
+    pub async fn close_owned_documents(&mut self, owner: &str) -> usize {
+        let mut to_close: Vec<String> = Vec::new();
+        for (uri, entry) in &mut self.open_documents {
+            if entry.owners.remove(owner) && entry.owners.is_empty() {
+                to_close.push(uri.clone());
+            }
+        }
+        for uri in &to_close {
+            self.open_documents.remove(uri);
+            let _ = self.did_close(uri).await;
+        }
+        to_close.len()
+    }
+
+    /// Force-closes a document whose disk file was **deleted** (the
+    /// changed-set walker's deletion leg). A held-open document cannot
+    /// outlive its file: owners are dropped with the entry — there is no
+    /// text left to hold — and `didClose` is sent, after which the deletion
+    /// routes to the server as `didChangeWatchedFiles` like any closed file.
+    pub async fn close_document_on_disk_delete(&mut self, uri: &str) {
+        if self.open_documents.remove(uri).is_some() {
+            let _ = self.did_close(uri).await;
+        }
+    }
+
+    /// Closes a document while the caller holds the lock — the query-cycle
+    /// close (eager health probe and friends).
     ///
     /// Removes the URI from per-client tracking and sends `didClose`.
     /// Eliminates the lock gap that would exist if the caller dropped
     /// the guard and called a separate close method.
+    ///
+    /// A **batch-held** document (any owner tagged) is never closed here:
+    /// the held-open lifecycle owns its lifetime, and a query that touched
+    /// it must skip both the open and the close (diagnostics-debt 01,
+    /// the query seam).
     pub async fn close_tracked_document(&mut self, uri: &str) {
+        if self
+            .open_documents
+            .get(uri)
+            .is_some_and(|e| !e.owners.is_empty())
+        {
+            return;
+        }
         if self.open_documents.remove(uri).is_some() {
             let _ = self.did_close(uri).await;
         }
@@ -1405,31 +1552,63 @@ mod tests {
         Ok(())
     }
 
-    // ── open_document version tracking ──────────────────────────────
+    // ── held-open registry: change gate + versions (diagnostics-debt 01) ──
 
     #[tokio::test]
-    async fn open_document_version_tracking() -> Result<()> {
+    async fn change_gate_versions_bump_only_on_content_movement() -> Result<()> {
+        // Real document versions: v1 at first open, v++ only when disk
+        // content moved since the last send — an unchanged document plans
+        // no sync traffic at all (the retired synthetic round stamps bumped
+        // every round regardless).
         let (mut client, _dir) = spawn_and_init(&[]).await?;
+        let uri = "file:///a.rs";
 
-        // First open → (true, 1)
-        let (first, version) = client.open_document("file:///a.rs");
-        assert!(first, "first open should return true");
-        assert_eq!(version, 1);
+        // Not open → Open(1).
+        assert_eq!(
+            client.plan_document_sync(uri, Some(10), 111),
+            DocSync::Open(1)
+        );
+        client.commit_document_sync(uri, 1, Some(10), 111);
+        assert!(client.is_document_open(uri));
 
-        // Same URI again → (false, 2)
-        let (first, version) = client.open_document("file:///a.rs");
-        assert!(!first, "second open should return false");
-        assert_eq!(version, 2);
+        // Same mtime, same hash → no sync traffic.
+        assert_eq!(
+            client.plan_document_sync(uri, Some(10), 111),
+            DocSync::Unchanged
+        );
 
-        // Third open → (false, 3)
-        let (first, version) = client.open_document("file:///a.rs");
-        assert!(!first, "third open should return false");
-        assert_eq!(version, 3);
+        // Same mtime, different hash — the same-granularity slip → Change(2).
+        assert_eq!(
+            client.plan_document_sync(uri, Some(10), 222),
+            DocSync::Change(2)
+        );
 
-        // Different URI → (true, 1)
-        let (first, version) = client.open_document("file:///b.rs");
-        assert!(first, "first open of different URI should return true");
-        assert_eq!(version, 1);
+        // Moved mtime → Change(2) on the cheap leg (hash not consulted:
+        // an equal hash with a moved mtime still plans a send).
+        assert_eq!(
+            client.plan_document_sync(uri, Some(11), 111),
+            DocSync::Change(2)
+        );
+
+        // Plan is read-only: nothing was committed, so version stays 1 and
+        // a re-plan of the unchanged state still sends nothing.
+        assert_eq!(
+            client.plan_document_sync(uri, Some(10), 111),
+            DocSync::Unchanged
+        );
+
+        // Commit a change → next change plans version 3.
+        client.commit_document_sync(uri, 2, Some(11), 222);
+        assert_eq!(
+            client.plan_document_sync(uri, Some(12), 333),
+            DocSync::Change(3)
+        );
+
+        // Different URI → independent sequence.
+        assert_eq!(
+            client.plan_document_sync("file:///b.rs", Some(10), 111),
+            DocSync::Open(1)
+        );
 
         client.shutdown().await?;
         Ok(())
@@ -1443,25 +1622,103 @@ mod tests {
         // older version than the current round's didOpen and the publish
         // staleness gate can drop it.
         let (mut client, _dir) = spawn_and_init(&[]).await?;
+        let uri = "file:///a.rs";
 
-        let (first, version) = client.open_document("file:///a.rs");
-        assert!(first);
-        assert_eq!(version, 1);
-        let (first, version) = client.open_document("file:///a.rs");
-        assert!(!first);
-        assert_eq!(version, 2);
-
-        client.close_tracked_document("file:///a.rs").await;
-        assert!(!client.is_document_open("file:///a.rs"));
-
-        // Reopen: a fresh didOpen (first == true) but the version continues
-        // the sequence rather than restarting at 1.
-        let (first, version) = client.open_document("file:///a.rs");
-        assert!(first, "reopen after close is a fresh didOpen");
         assert_eq!(
-            version, 3,
+            client.plan_document_sync(uri, Some(10), 111),
+            DocSync::Open(1)
+        );
+        client.commit_document_sync(uri, 1, Some(10), 111);
+        assert_eq!(
+            client.plan_document_sync(uri, Some(11), 222),
+            DocSync::Change(2)
+        );
+        client.commit_document_sync(uri, 2, Some(11), 222);
+
+        client.close_tracked_document(uri).await;
+        assert!(!client.is_document_open(uri));
+
+        // Reopen: a fresh didOpen but the version continues the sequence
+        // rather than restarting at 1 (the floor survives close).
+        assert_eq!(
+            client.plan_document_sync(uri, Some(11), 222),
+            DocSync::Open(3),
             "the version floor survives close — reopen continues the sequence"
         );
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn save_flag_tracks_unsaved_content() -> Result<()> {
+        // Every committed send (didOpen/didChange) marks the content unsaved;
+        // a didSave marks it saved — the round didSaves exactly the unsaved.
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+        let uri = "file:///a.rs";
+
+        assert!(
+            !client.document_needs_save(uri),
+            "unopened URI owes no save"
+        );
+        client.commit_document_sync(uri, 1, Some(10), 111);
+        assert!(client.document_needs_save(uri), "fresh open owes a save");
+        client.mark_document_saved(uri);
+        assert!(
+            !client.document_needs_save(uri),
+            "saved content owes nothing"
+        );
+        client.commit_document_sync(uri, 2, Some(11), 222);
+        assert!(
+            client.document_needs_save(uri),
+            "a didChange re-arms the save debt"
+        );
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owned_documents_close_per_owner_and_resist_query_close() -> Result<()> {
+        // Stop/SubagentStop close exactly the owning agent's docs — and a
+        // query-cycle close never touches a held (owned) document.
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+        let (a, b, q) = ("file:///a.rs", "file:///b.rs", "file:///q.rs");
+
+        client.commit_document_sync(a, 1, Some(10), 1);
+        client.tag_document_owner(a, "sess\0agent-1");
+        client.commit_document_sync(b, 1, Some(10), 2);
+        client.tag_document_owner(b, "sess\0agent-2");
+        // A query-opened doc: no owner.
+        client.commit_document_sync(q, 1, Some(10), 3);
+
+        // The query-cycle close skips the held docs, closes the unowned one.
+        client.close_tracked_document(a).await;
+        assert!(
+            client.is_document_open(a),
+            "a held doc resists a query close"
+        );
+        client.close_tracked_document(q).await;
+        assert!(
+            !client.is_document_open(q),
+            "an unowned doc closes normally"
+        );
+
+        // Agent 1 stops: exactly its doc closes.
+        let closed = client.close_owned_documents("sess\0agent-1").await;
+        assert_eq!(closed, 1);
+        assert!(!client.is_document_open(a));
+        assert!(
+            client.is_document_open(b),
+            "the other agent's held doc stays open"
+        );
+
+        // A doc held by two owners closes only when the last owner stops.
+        client.tag_document_owner(b, "sess\0agent-3");
+        assert_eq!(client.close_owned_documents("sess\0agent-2").await, 0);
+        assert!(client.is_document_open(b));
+        assert_eq!(client.close_owned_documents("sess\0agent-3").await, 1);
+        assert!(!client.is_document_open(b));
 
         client.shutdown().await?;
         Ok(())

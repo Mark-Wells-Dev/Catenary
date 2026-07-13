@@ -45,38 +45,32 @@ capability gate (`supports_diagnostics`) and the config-level filter
 server receives the file via `open_document_on` and produces
 diagnostics independently.
 
-## Per-client version tracking
+## The held-open registry and real versions
 
-Each server gets an independent monotonic version sequence. The first
-`open_document` call for a URI returns `(first_open: true, version: 1)`
-and sends `textDocument/didOpen`. Subsequent calls increment the
-version and return `(false, version)` — the caller sends
-`textDocument/didChange` with the full file content.
+Each client keeps a per-connection open-docs registry: URI → the
+current **real** LSP document version, the disk state the last send
+carried (`mtime` + content hash — the change gate), a saved flag, and
+the batch owners holding the document open. Versions are monotonic per
+URI per client and bump **only when content is actually sent**: the
+first open sends `textDocument/didOpen` at the version floor + 1;
+a later call whose disk content moved since the last send relays
+`textDocument/didChange` (full sync, whole text, version + 1); an
+unchanged document sends **nothing**. The change gate is two-legged
+(shared shape with the `SymbolIndex` staleness check): a moved mtime is
+a change outright; an unchanged mtime hashes the content to break the
+same-granularity tie.
 
 This per-client tracking means multi-server dispatch gives each server
-a clean sequence starting at 1, regardless of how many other servers
-have the same file open. LSP requires monotonically increasing
+a clean independent sequence. LSP requires monotonically increasing
 versions per server — sharing a global counter across servers would
-create gaps that some servers reject.
+create gaps that some servers reject. The version floor survives a
+close, so a reopen continues the sequence rather than restarting at 1 —
+which lets the publish staleness gate drop a straggler publish from a
+previous open (bug 101, heard-stale leg).
 
-## Stateless document lifecycle
-
-Outside editing mode, Catenary uses a stateless document lifecycle:
-**open → request → close** per tool call. No document state
-accumulates across calls. After each tool dispatch, any file that was
-opened for that request is closed.
-
-This is a deliberate design choice from the waitv2 rewrite. Stateless
-lifecycle eliminates migration concerns when routing changes mid-session
-— for example, when `catenary pin` shifts which server handles a file, or
-when a project-scoped server is spawned that shadows a workspace
-instance. There is no accumulated document state to reconcile when
-ownership changes.
-
-The cost is that every tool call re-reads the file and sends the full
-content. In practice this is cheap: files are already in the OS page
-cache from the agent's own reads, and the `didOpen`/`didClose`
-round-trip is a pair of notifications (no server response to wait for).
+Registry state dies with the connection: a server respawn or daemon
+death closes documents implicitly, consistent with the debt ledger's
+release-on-death stance (bug 79).
 
 ## Editing mode
 
@@ -149,21 +143,37 @@ runs `catenary diagnostics`. During editing mode:
    Files outside workspace roots or with no server coverage are
    categorized as N/A.
 
-3. **Per-server batch lifecycle.** For each server, the pipeline runs:
-   - **Open all files** — `open_document_on` for every file in the
-     server's group. The server sees the complete final state of all
-     files simultaneously.
+3. **Per-server held-open batch round.** For each server, the pipeline
+   runs:
+   - **Change-gated sync** — `open_document_on` for every file in the
+     server's group: `didOpen` for files not yet held open, `didChange`
+     (full text, version++) for held-open files whose disk content
+     moved since the last send, **nothing** for unchanged files. The
+     round-start mtime+hash check is also the out-of-band-write
+     detection — servers do not deliver watched-files events for open
+     documents, so this check is the only way a direct disk write to a
+     held-open file is ever seen. The server sees the complete final
+     state of all files simultaneously.
    - **Settle** — wait for the server to finish processing via the
-     [idle detection model](lsp-client.md#idle-detection-and-settle).
+     [idle detection model](lsp-client.md#idle-detection-and-settle)
+     (skipped when the round sent nothing).
    - **Health probe** — if the server is still in `Probing` state, run
      an explicit health check.
-   - **`didSave` all** — triggers flycheck on servers that only
-     produce diagnostics on save (e.g., rust-analyzer runs
-     `cargo check` on `didSave`).
+   - **`didSave` the unsaved** — exactly the files whose last-sent
+     content no round has saved yet; triggers flycheck on servers that
+     only produce diagnostics on save (e.g., rust-analyzer runs
+     `cargo check` on `didSave`). A file unchanged since its last saved
+     send gets no save — no sync traffic at all.
    - **Settle again** — wait for flycheck to complete.
    - **Retrieve diagnostics** — read per-file diagnostics from the
-     server's cache.
-   - **Close all** — `didClose` for every opened file.
+     server's cache. An unchanged file's cached publish deliberately
+     survives between rounds: it is still evidence for the text the
+     server holds, and the server will not re-publish an unchanged
+     document.
+   - **Documents stay open.** Batch end is the owning
+     `(session, agent)`'s Stop/SubagentStop, which closes exactly that
+     agent's held-open documents on every connection. Daemon death
+     closes implicitly (bug 79).
 
 4. **Format output.** Results are categorized: files with diagnostics
    get per-line error/warning output, clean files are grouped on one
@@ -256,11 +266,20 @@ against a per-root mtime baseline:
    Servers register interest via `client/registerCapability` for
    `workspace/didChangeWatchedFiles`.
 
-4. **Precise notification.** Each server gets a single
-   `workspace/didChangeWatchedFiles` carrying only its matching changes,
-   as `(uri, changeType)` pairs whose `changeType` is the true semantic
-   kind (Created → 1, Changed → 2, Deleted → 3). It is never a broad
-   unconditional poke.
+4. **Two dispatch forms, keyed on open state** (the watch-before-query
+   invariant: Catenary is the single disk walker, and pending disk
+   knowledge is delivered before any server query):
+   - a **closed** document routes as a single
+     `workspace/didChangeWatchedFiles` carrying only that server's
+     matching changes, as `(uri, changeType)` pairs whose `changeType`
+     is the true semantic kind (Created → 1, Changed → 2, Deleted → 3) —
+     never a broad unconditional poke;
+   - an **open** document routes as the `didChange` full-text relay
+     through the change gate — servers treat the client's text as the
+     truth for open documents and ignore watched-files events for them.
+     A **deleted** open document is force-closed first (it cannot
+     outlive its file), then its deletion routes as watched-files like
+     any closed file.
 
 ### Registration management
 

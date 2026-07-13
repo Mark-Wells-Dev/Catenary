@@ -161,11 +161,14 @@ current `parent_id` for causation tracking.
 
 Client-local state (not shared with the reader loop):
 
-- **Document tracking.** `open_documents: HashMap<String, i32>` — per-
-  client URI to version map. Each client maintains independent monotonic
-  version sequences, so multi-server dispatch gives each server a clean
-  sequence starting at 1. `open_document` returns `(first_open, version)`:
-  first open sends `didOpen`, subsequent opens send `didChange`.
+- **Document tracking.** `open_documents` — the per-connection held-open
+  registry: URI → real document version, last-sent disk state (mtime +
+  content hash, the change gate), saved flag, and batch owners. Each
+  client maintains independent monotonic version sequences, so
+  multi-server dispatch gives each server a clean sequence.
+  `plan_document_sync` decides per call: first open sends `didOpen`, a
+  moved file sends `didChange` (full text, version++), an unchanged file
+  sends nothing (see [Document Lifecycle](documents.md)).
 
 - **Position encoding.** Negotiated during `initialize` (defaults to
   UTF-16 per spec).

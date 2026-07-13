@@ -9,8 +9,10 @@
 //! Integration tests for the batched diagnostics pipeline
 //! (`process_files_batched`).
 //!
-//! Uses mockls to exercise the batch lifecycle: open all files → settle →
-//! didSave all → settle → retrieve per file → close all.
+//! Uses mockls to exercise the held-open batch lifecycle
+//! (diagnostics-debt 01): change-gated didOpen/didChange → settle →
+//! didSave the unsaved → settle → retrieve per file; documents stay open
+//! across rounds and close at the owning agent's Stop/SubagentStop.
 
 mod common;
 
@@ -451,4 +453,469 @@ fn assert_no_unlinked(text: &str) {
         || text.contains("unlinked-file")
         || text.contains("file is not included");
     assert!(!has_unlinked, "unlinked-file diagnostic in output:\n{text}");
+}
+
+// ─── Held-open batch lifecycle (diagnostics-debt 01) ────────────────
+//
+// The per-round atomic didOpen→…→didClose cycle is retired: a batch file is
+// opened once per connection, change-synced only when its disk content moved
+// (mtime fast-path, hash tie-break), saved only when its last-sent content is
+// unsaved, and closed only at the owning agent's Stop/SubagentStop. These
+// tests read mockls's `--notification-log` and assert **deltas** between
+// rounds — the spawn-time eager health probe opens/closes the first matching
+// file in the root, so absolute counts are ambiguous by design.
+
+/// Counts notification-log entries with `method` addressed to `uri`.
+fn count_doc_notifications(log: &str, method: &str, uri: &str) -> usize {
+    log.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|e| {
+            e.get("method").and_then(serde_json::Value::as_str) == Some(method)
+                && e.get("uri").and_then(serde_json::Value::as_str) == Some(uri)
+        })
+        .count()
+}
+
+/// The last logged document version for `(method, uri)`, if any
+/// (mockls logs `version` for didOpen/didChange).
+fn last_doc_version(log: &str, method: &str, uri: &str) -> Option<i64> {
+    log.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|e| {
+            e.get("method").and_then(serde_json::Value::as_str) == Some(method)
+                && e.get("uri").and_then(serde_json::Value::as_str) == Some(uri)
+        })
+        .filter_map(|e| e.get("version").and_then(serde_json::Value::as_i64))
+        .next_back()
+}
+
+/// Polls the merged notification log until `pred` holds (or the generous
+/// backstop trips), returning the snapshot. Positive signals gate the
+/// assertion; the caller still asserts on the snapshot so a backstop trip
+/// fails loudly.
+fn poll_merged_log_until(base: &std::path::Path, mut pred: impl FnMut(&str) -> bool) -> String {
+    let deadline = std::time::Instant::now() + common::POLL_BACKSTOP;
+    loop {
+        let log = common::read_merged_log(base);
+        if pred(&log) || std::time::Instant::now() >= deadline {
+            return log;
+        }
+        std::thread::sleep(common::POLL_SPACING);
+    }
+}
+
+/// A file URI exactly as the daemon derives it (canonical path).
+fn doc_uri(path: &std::path::Path) -> Result<String> {
+    Ok(format!("file://{}", path.canonicalize()?.display()))
+}
+
+/// Unit tier 1: an unchanged file's repeat round sends **no sync traffic** —
+/// no reopen, no didChange, no didSave, no close — and the receipt still
+/// carries the held evidence (the cached publish survives between rounds).
+#[test]
+fn held_open_unchanged_round_sends_nothing() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let logdir = tempfile::tempdir()?;
+    let nlog = logdir.path().join("notifications.jsonl");
+    let nlog_arg = nlog.to_str().context("nlog path")?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let root = dir.path().to_str().context("path")?;
+    let mut bridge = spawn_mockls(&["--advertise-save", "--notification-log", nlog_arg], root)?;
+    bridge.initialize()?;
+    let uri = doc_uri(&file)?;
+
+    let first = bridge.call_diagnostics(file.to_str().context("path")?)?;
+    assert!(
+        first.contains("mock diagnostic"),
+        "round 1 reports the publish. Got: {first}"
+    );
+    let log1 = common::read_merged_log(&nlog);
+    let opens = count_doc_notifications(&log1, "textDocument/didOpen", &uri);
+    let changes = count_doc_notifications(&log1, "textDocument/didChange", &uri);
+    let saves = count_doc_notifications(&log1, "textDocument/didSave", &uri);
+    let closes = count_doc_notifications(&log1, "textDocument/didClose", &uri);
+    assert!(opens >= 1, "round 1 opens the file; log:\n{log1}");
+
+    // Round 2, file untouched: the change gate says unchanged+saved.
+    let second = bridge.call_diagnostics(file.to_str().context("path")?)?;
+    assert!(
+        second.contains("mock diagnostic"),
+        "the repeat receipt serves the held evidence. Got: {second}"
+    );
+    let log2 = common::read_merged_log(&nlog);
+    assert_eq!(
+        count_doc_notifications(&log2, "textDocument/didOpen", &uri),
+        opens,
+        "an unchanged round must not reopen; log:\n{log2}"
+    );
+    assert_eq!(
+        count_doc_notifications(&log2, "textDocument/didChange", &uri),
+        changes,
+        "an unchanged round must not didChange; log:\n{log2}"
+    );
+    assert_eq!(
+        count_doc_notifications(&log2, "textDocument/didSave", &uri),
+        saves,
+        "an unchanged round must not didSave; log:\n{log2}"
+    );
+    assert_eq!(
+        count_doc_notifications(&log2, "textDocument/didClose", &uri),
+        closes,
+        "the batch never closes between rounds; log:\n{log2}"
+    );
+
+    Ok(())
+}
+
+/// Unit tier 2: a changed file's round sends `didChange` with the **next real
+/// version** (monotonic, not a per-round stamp) followed by `didSave` — and
+/// still no reopen, no close.
+#[test]
+fn held_open_changed_round_sends_didchange_and_didsave() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let logdir = tempfile::tempdir()?;
+    let nlog = logdir.path().join("notifications.jsonl");
+    let nlog_arg = nlog.to_str().context("nlog path")?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let root = dir.path().to_str().context("path")?;
+    let mut bridge = spawn_mockls(&["--advertise-save", "--notification-log", nlog_arg], root)?;
+    bridge.initialize()?;
+    let uri = doc_uri(&file)?;
+
+    let _ = bridge.call_diagnostics(file.to_str().context("path")?)?;
+    let log1 = common::read_merged_log(&nlog);
+    let opens = count_doc_notifications(&log1, "textDocument/didOpen", &uri);
+    let changes = count_doc_notifications(&log1, "textDocument/didChange", &uri);
+    let saves = count_doc_notifications(&log1, "textDocument/didSave", &uri);
+    let closes = count_doc_notifications(&log1, "textDocument/didClose", &uri);
+    let open_version =
+        last_doc_version(&log1, "textDocument/didOpen", &uri).context("didOpen version")?;
+
+    // The edit: disk content moves between rounds.
+    std::fs::write(&file, "echo changed\necho line2\n")?;
+    let second = bridge.call_diagnostics(file.to_str().context("path")?)?;
+    assert!(
+        second.contains("mock diagnostic"),
+        "round 2 reports fresh diagnostics. Got: {second}"
+    );
+
+    let log2 = common::read_merged_log(&nlog);
+    assert_eq!(
+        count_doc_notifications(&log2, "textDocument/didOpen", &uri),
+        opens,
+        "a changed round didChanges, never reopens; log:\n{log2}"
+    );
+    assert_eq!(
+        count_doc_notifications(&log2, "textDocument/didChange", &uri),
+        changes + 1,
+        "exactly one didChange for the moved content; log:\n{log2}"
+    );
+    assert_eq!(
+        count_doc_notifications(&log2, "textDocument/didSave", &uri),
+        saves + 1,
+        "the didChange is followed by its didSave; log:\n{log2}"
+    );
+    assert_eq!(
+        count_doc_notifications(&log2, "textDocument/didClose", &uri),
+        closes,
+        "the batch never closes between rounds; log:\n{log2}"
+    );
+    let change_version =
+        last_doc_version(&log2, "textDocument/didChange", &uri).context("didChange version")?;
+    assert_eq!(
+        change_version,
+        open_version + 1,
+        "the didChange carries the next real document version; log:\n{log2}"
+    );
+
+    Ok(())
+}
+
+/// Unit tier 5: an **out-of-band** write to a held-open document — no hook
+/// tracked it — is detected at round start by the mtime+hash check (servers
+/// deliver no watched-files for open documents, so the round-start check IS
+/// the detection) and relayed as `didChange`+`didSave`.
+#[test]
+fn out_of_band_write_detected_at_round_start() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let logdir = tempfile::tempdir()?;
+    let nlog = logdir.path().join("notifications.jsonl");
+    let nlog_arg = nlog.to_str().context("nlog path")?;
+    let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo hello\n")?;
+
+    let root = dir.path().to_str().context("path")?;
+    let mut bridge = spawn_mockls(&["--advertise-save", "--notification-log", nlog_arg], root)?;
+    bridge.initialize()?;
+    let uri = doc_uri(&file)?;
+
+    let _ = bridge.call_diagnostics(file.to_str().context("path")?)?;
+    let log1 = common::read_merged_log(&nlog);
+    let changes = count_doc_notifications(&log1, "textDocument/didChange", &uri);
+    let saves = count_doc_notifications(&log1, "textDocument/didSave", &uri);
+    let opens = count_doc_notifications(&log1, "textDocument/didOpen", &uri);
+
+    // Out-of-band: the file changes on disk with NO hook-tracked edit, then a
+    // bare repeat run re-diagnoses the persisted batch.
+    std::fs::write(&file, "echo out of band\n")?;
+    let socket = bridge.wait_for_ipc_socket()?;
+    common::ipc_request(
+        &socket,
+        &serde_json::json!({"method": "pre-tool/editing-stop", "agent_id": ""}),
+    )?;
+    let text = common::ipc_request_long(
+        &socket,
+        bridge.daemon_pid(),
+        &serde_json::json!({"method": "tool/editing-stop"}),
+    )?;
+    let receipt = common::diagnostics_output(&text);
+    assert!(
+        receipt.contains("mock diagnostic"),
+        "the bare repeat run re-diagnoses the batch. Got: {receipt}"
+    );
+
+    let log2 = common::read_merged_log(&nlog);
+    assert_eq!(
+        count_doc_notifications(&log2, "textDocument/didChange", &uri),
+        changes + 1,
+        "the round-start mtime+hash check detects the out-of-band write; log:\n{log2}"
+    );
+    assert_eq!(
+        count_doc_notifications(&log2, "textDocument/didSave", &uri),
+        saves + 1,
+        "the relayed content is saved so on-save analyzers re-check it; log:\n{log2}"
+    );
+    assert_eq!(
+        count_doc_notifications(&log2, "textDocument/didOpen", &uri),
+        opens,
+        "detection relays didChange, never a reopen; log:\n{log2}"
+    );
+
+    Ok(())
+}
+
+/// Unit tier 3: Stop/SubagentStop close the stopping agent's held-open
+/// documents — and ONLY those. Two agents hold different files open on the
+/// same connection; agent 1's stop closes its file while agent 2's stays
+/// open until its own stop.
+#[test]
+fn stop_closes_exactly_the_owning_agents_docs() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let logdir = tempfile::tempdir()?;
+    let nlog = logdir.path().join("notifications.jsonl");
+    let nlog_arg = nlog.to_str().context("nlog path")?;
+    let file1 = dir.path().join(format!("agent_one.{MOCK_LANG_A}"));
+    let file2 = dir.path().join(format!("agent_two.{MOCK_LANG_A}"));
+    std::fs::write(&file1, "echo one\n")?;
+    std::fs::write(&file2, "echo two\n")?;
+
+    let root = dir.path().to_str().context("path")?;
+    let mut bridge = spawn_mockls(&["--advertise-save", "--notification-log", nlog_arg], root)?;
+    bridge.initialize()?;
+    let uri1 = doc_uri(&file1)?;
+    let uri2 = doc_uri(&file2)?;
+    let socket = bridge.wait_for_ipc_socket()?;
+
+    // Each agent edits its own file and pays its gate.
+    for (agent, file) in [("a1", &file1), ("a2", &file2)] {
+        common::ipc_request(
+            &socket,
+            &serde_json::json!({"method": "pre-tool/editing-start", "agent_id": agent}),
+        )?;
+        common::ipc_request(
+            &socket,
+            &serde_json::json!({
+                "method": "pre-tool/editing-state",
+                "tool_name": "Edit",
+                "file_path": file.to_str().context("path")?,
+                "agent_id": agent,
+            }),
+        )?;
+        common::ipc_request(
+            &socket,
+            &serde_json::json!({"method": "pre-tool/editing-stop", "agent_id": agent}),
+        )?;
+        common::ipc_request_long(
+            &socket,
+            bridge.daemon_pid(),
+            &serde_json::json!({"method": "tool/editing-stop"}),
+        )?;
+    }
+
+    let log0 = common::read_merged_log(&nlog);
+    let closes1 = count_doc_notifications(&log0, "textDocument/didClose", &uri1);
+    let closes2 = count_doc_notifications(&log0, "textDocument/didClose", &uri2);
+
+    // Agent 1 stops (debt paid → the stop is allowed). The close is a
+    // background side effect, so poll for its signal.
+    common::ipc_request(
+        &socket,
+        &serde_json::json!({
+            "method": "post-agent/require-release",
+            "agent_id": "a1",
+            "stop_hook_active": false,
+        }),
+    )?;
+    let log_after_a1 = poll_merged_log_until(&nlog, |log| {
+        count_doc_notifications(log, "textDocument/didClose", &uri1) > closes1
+    });
+    assert_eq!(
+        count_doc_notifications(&log_after_a1, "textDocument/didClose", &uri1),
+        closes1 + 1,
+        "agent 1's stop closes its held-open doc; log:\n{log_after_a1}"
+    );
+    assert_eq!(
+        count_doc_notifications(&log_after_a1, "textDocument/didClose", &uri2),
+        closes2,
+        "agent 2's held-open doc survives agent 1's stop; log:\n{log_after_a1}"
+    );
+
+    // Agent 2 stops: now (and only now) its doc closes.
+    common::ipc_request(
+        &socket,
+        &serde_json::json!({
+            "method": "post-agent/require-release",
+            "agent_id": "a2",
+            "stop_hook_active": false,
+        }),
+    )?;
+    let log_after_a2 = poll_merged_log_until(&nlog, |log| {
+        count_doc_notifications(log, "textDocument/didClose", &uri2) > closes2
+    });
+    assert_eq!(
+        count_doc_notifications(&log_after_a2, "textDocument/didClose", &uri2),
+        closes2 + 1,
+        "agent 2's own stop closes its doc; log:\n{log_after_a2}"
+    );
+
+    Ok(())
+}
+
+/// Unit tier 4 (the query seam, unchanged leg): a grep/glob query against a
+/// held-open document neither reopens nor closes it — and, unchanged on
+/// disk, relays nothing at all.
+#[test]
+fn query_against_held_open_doc_neither_reopens_nor_closes() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let logdir = tempfile::tempdir()?;
+    let nlog = logdir.path().join("notifications.jsonl");
+    let nlog_arg = nlog.to_str().context("nlog path")?;
+    let file = dir.path().join(format!("seam.{MOCK_LANG_A}"));
+    std::fs::write(&file, "fn seam_probe\nseam_probe\n")?;
+
+    let root = dir.path().to_str().context("path")?;
+    let mut bridge = spawn_mockls(
+        &[
+            "--advertise-save",
+            "--register-file-watchers",
+            "--notification-log",
+            nlog_arg,
+        ],
+        root,
+    )?;
+    bridge.initialize()?;
+    let uri = doc_uri(&file)?;
+
+    // The batch holds the doc open.
+    let _ = bridge.call_diagnostics(file.to_str().context("path")?)?;
+    let log1 = common::read_merged_log(&nlog);
+    let opens = count_doc_notifications(&log1, "textDocument/didOpen", &uri);
+    let changes = count_doc_notifications(&log1, "textDocument/didChange", &uri);
+    let closes = count_doc_notifications(&log1, "textDocument/didClose", &uri);
+
+    // An enriched query touches the file — no lifecycle traffic results.
+    let text = bridge.call_tool_text("grep", &serde_json::json!({ "pattern": "seam_probe" }))?;
+    assert!(
+        text.contains("seam_probe"),
+        "the query itself serves. Got:\n{text}"
+    );
+
+    let log2 = common::read_merged_log(&nlog);
+    assert_eq!(
+        count_doc_notifications(&log2, "textDocument/didOpen", &uri),
+        opens,
+        "a query never reopens a held-open doc; log:\n{log2}"
+    );
+    assert_eq!(
+        count_doc_notifications(&log2, "textDocument/didClose", &uri),
+        closes,
+        "a query never closes a held-open doc; log:\n{log2}"
+    );
+    assert_eq!(
+        count_doc_notifications(&log2, "textDocument/didChange", &uri),
+        changes,
+        "an unchanged held-open doc gets no relay from a query; log:\n{log2}"
+    );
+
+    Ok(())
+}
+
+/// Unit tier 4 (the query seam, changed leg — the watch-before-query
+/// invariant's second dispatch form): pending disk knowledge for an **open**
+/// document is delivered before the query as the didChange full-text relay,
+/// never as `didChangeWatchedFiles` — and still no reopen, no close.
+#[test]
+fn query_relays_didchange_for_changed_held_open_doc() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let logdir = tempfile::tempdir()?;
+    let nlog = logdir.path().join("notifications.jsonl");
+    let nlog_arg = nlog.to_str().context("nlog path")?;
+    let file = dir.path().join(format!("relay.{MOCK_LANG_A}"));
+    std::fs::write(&file, "fn relay_probe\nrelay_probe\n")?;
+
+    let root = dir.path().to_str().context("path")?;
+    let mut bridge = spawn_mockls(
+        &[
+            "--advertise-save",
+            "--register-file-watchers",
+            "--notification-log",
+            nlog_arg,
+        ],
+        root,
+    )?;
+    bridge.initialize()?;
+    let uri = doc_uri(&file)?;
+
+    // The batch holds the doc open.
+    let _ = bridge.call_diagnostics(file.to_str().context("path")?)?;
+    let log1 = common::read_merged_log(&nlog);
+    let opens = count_doc_notifications(&log1, "textDocument/didOpen", &uri);
+    let changes = count_doc_notifications(&log1, "textDocument/didChange", &uri);
+    let closes = count_doc_notifications(&log1, "textDocument/didClose", &uri);
+
+    // The disk moves out-of-band; the next query must deliver that knowledge
+    // to the open doc as a didChange relay (watch-before-query).
+    common::rewrite_advancing_mtime(&file, "fn relay_probe\nfn relay_extra\nrelay_probe\n")?;
+    let _ = bridge.call_tool_text("grep", &serde_json::json!({ "pattern": "relay_probe" }))?;
+
+    let log2 = poll_merged_log_until(&nlog, |log| {
+        count_doc_notifications(log, "textDocument/didChange", &uri) > changes
+    });
+    assert!(
+        count_doc_notifications(&log2, "textDocument/didChange", &uri) > changes,
+        "the changed open doc is relayed as didChange before the query; log:\n{log2}"
+    );
+    assert_eq!(
+        count_doc_notifications(&log2, "textDocument/didOpen", &uri),
+        opens,
+        "the relay is a didChange, never a reopen; log:\n{log2}"
+    );
+    assert_eq!(
+        count_doc_notifications(&log2, "textDocument/didClose", &uri),
+        closes,
+        "the query never closes the held-open doc; log:\n{log2}"
+    );
+    // The open doc must NOT be routed as watched-files — servers ignore
+    // those for open documents (the invariant's two dispatch forms).
+    let watched = common::watched_file_changes(&log2);
+    assert!(
+        !watched.iter().any(|(u, _)| u == &uri),
+        "an open doc never routes as didChangeWatchedFiles; got {watched:?}"
+    );
+
+    Ok(())
 }

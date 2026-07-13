@@ -15,6 +15,7 @@ use crate::bridge::filesystem_manager::{Change, ChangeKind, FilesystemManager, R
 use crate::config::{Config, DispatchMethod, LanguageConfig, ServerDef};
 use crate::logging::LoggingServer;
 use crate::lsp::LspClient;
+use crate::lsp::client::DocSync;
 use crate::lsp::glob::{self, LspGlob};
 use crate::lsp::instance_key::{InstanceKey, Scope};
 use crate::lsp::rust_toolchain;
@@ -89,6 +90,10 @@ const fn change_kind_wire_type(kind: ChangeKind) -> u8 {
 /// routing and the walk-breadth gate's coverage check.
 struct Covering {
     server: Arc<LspServer>,
+    /// The owning client handle — needed by the changed-set routing's
+    /// open-document leg (the didChange full-text relay, diagnostics-debt
+    /// 01). Never locked while the clients registry lock is held (bug 104).
+    client: Arc<Mutex<LspClient>>,
     name: String,
     watchers: Vec<crate::lsp::server::ParsedWatcher>,
 }
@@ -1812,20 +1817,18 @@ impl LspClientManager {
             return;
         };
 
-        let Ok(content) = std::fs::read_to_string(&probe_path) else {
-            debug!("Cannot read probe file {}", probe_path.display());
+        // Query-cycle open through the held-open gate: at spawn time nothing
+        // is held, so this is a plain didOpen; the close below skips a
+        // batch-held document by construction (diagnostics-debt 01).
+        let Ok((uri, _)) = self
+            .open_document_on(&probe_path, client_mutex, None, None)
+            .await
+        else {
+            debug!("Eager probe didOpen failed for {}", probe_path.display());
             return;
         };
 
-        let uri = crate::lsp::lang::path_to_uri(&probe_path);
         let mut client = client_mutex.lock().await;
-
-        let (_, version) = client.open_document(&uri);
-        if let Err(e) = client.did_open(&uri, lang, version, &content).await {
-            debug!("Eager probe didOpen failed: {e}");
-            return;
-        }
-
         client.run_health_probe(&uri).await;
         client.close_tracked_document(&uri).await;
         drop(client);
@@ -2026,15 +2029,27 @@ impl LspClientManager {
         Ok(client)
     }
 
-    /// Opens a document on a specific client.
+    /// Opens (or change-syncs) a document on a specific client through the
+    /// held-open change gate (diagnostics-debt 01).
     ///
-    /// Reads the file, checks per-client open state, sends `didOpen` or
-    /// `didChange` as appropriate. Version tracking is per-client — each
-    /// server gets an independent monotonic sequence starting at 1.
+    /// Reads the file and consults the per-connection registry
+    /// ([`LspClient::plan_document_sync`]): first open sends `didOpen`; an
+    /// open document whose disk content moved since the last send (mtime
+    /// fast-path, content hash breaking the same-mtime tie) sends
+    /// `didChange` (full sync, whole text, version++); an unchanged open
+    /// document sends **nothing**. Versions are real, monotonic per URI
+    /// per client — each server gets an independent sequence.
     ///
-    /// Used by request/response dispatch: the caller gets clients from
-    /// [`get_servers`](Self::get_servers) and opens the document on each
-    /// as it iterates the priority chain.
+    /// A query cycle against a held-open document therefore never reopens
+    /// it — and never closes it (no close leg exists here); the didChange
+    /// full-text relay for a moved open document is the query-side half of
+    /// the watch-before-query invariant (see [`Self::nudge_changed_set`]).
+    ///
+    /// `owner` tags the document as held by a `(session, agent)` batch, so
+    /// Stop/SubagentStop can close exactly that agent's documents
+    /// ([`Self::close_agent_docs`]); query callers pass `None`.
+    ///
+    /// Returns the document URI and the [`DocSync`] action taken.
     ///
     /// # Errors
     ///
@@ -2049,10 +2064,17 @@ impl LspClientManager {
         path: &Path,
         client: &Arc<Mutex<LspClient>>,
         parent_id: Option<String>,
-    ) -> Result<String> {
+        owner: Option<&str>,
+    ) -> Result<(String, DocSync)> {
         let canonical = path.canonicalize()?;
         let uri = crate::lsp::lang::path_to_uri(&canonical);
         let text = tokio::fs::read_to_string(&canonical).await?;
+        // Disk state for the change gate: the mtime stamp plus the content
+        // hash of the text about to be sent (misc 190's two-leg shape).
+        let mtime = std::fs::metadata(&canonical)
+            .ok()
+            .map(|m| crate::bridge::filesystem_manager::mtime_nanos(&m));
+        let hash = crate::symbol_index::hash_bytes(text.as_bytes());
 
         let mut client = client.lock().await;
         client.set_parent_id(parent_id);
@@ -2065,19 +2087,63 @@ impl LspClientManager {
             ));
         }
 
-        let (first_open, version) = client.open_document(&uri);
-        if first_open {
-            let language_id = self
-                .fs
-                .language_id(path)
-                .unwrap_or_else(|| "plaintext".to_string());
-            client.did_open(&uri, &language_id, version, &text).await?;
-        } else {
-            client.did_change(&uri, version, &text).await?;
+        // Held-open lifecycle (diagnostics-debt 01): didOpen once per
+        // connection; after that, sync traffic only when disk content moved
+        // since the last send — an unchanged document sends nothing. The
+        // registry is committed only after a successful send, so a dropped
+        // notification is retried by the next demand.
+        let action = client.plan_document_sync(&uri, mtime, hash);
+        match action {
+            DocSync::Open(version) => {
+                let language_id = self
+                    .fs
+                    .language_id(path)
+                    .unwrap_or_else(|| "plaintext".to_string());
+                // Drop any cached publish for content the server never saw
+                // (e.g. a watched-files-induced stale publish — the
+                // unlinked-file class): only evidence for the content being
+                // sent may survive to retrieval.
+                client.clear_diagnostics_for(&[&uri]);
+                client.did_open(&uri, &language_id, version, &text).await?;
+                client.commit_document_sync(&uri, version, mtime, hash);
+            }
+            DocSync::Change(version) => {
+                // The cached publish refers to the pre-change text — stale by
+                // construction. The post-change publish (or the next round's
+                // didSave-triggered one) re-earns the entry.
+                client.clear_diagnostics_for(&[&uri]);
+                client.did_change(&uri, version, &text).await?;
+                client.commit_document_sync(&uri, version, mtime, hash);
+            }
+            DocSync::Unchanged => {}
+        }
+        if let Some(owner) = owner {
+            client.tag_document_owner(&uri, owner);
         }
 
         drop(client);
-        Ok(uri)
+        Ok((uri, action))
+    }
+
+    /// Closes every held-open document `owner` (a `(session, agent)` editing
+    /// key) holds, across every server connection — the batch-end leg of the
+    /// held-open lifecycle (diagnostics-debt 01), dispatched from
+    /// Stop/SubagentStop. Daemon death closes implicitly (bug 79, unchanged).
+    ///
+    /// Bug 104 discipline: the clients registry lock is held only to snapshot
+    /// instance handles — each client lock is awaited after the guard drops.
+    pub async fn close_agent_docs(&self, owner: &str) {
+        let snapshot: Vec<Arc<Mutex<LspClient>>> =
+            self.clients.lock().await.values().cloned().collect();
+        for client_mutex in snapshot {
+            let closed = client_mutex.lock().await.close_owned_documents(owner).await;
+            if closed > 0 {
+                debug!(
+                    source = Source::LspDispatch.as_str(),
+                    "closed {closed} held-open document(s) for stopping agent",
+                );
+            }
+        }
     }
 
     /// Returns diagnostic-enabled servers for a file path without opening
@@ -2524,6 +2590,7 @@ impl LspClientManager {
             }
             covering.push(Covering {
                 server: client.server().clone(),
+                client: Arc::clone(&client_mutex),
                 name: client.server_name().to_string(),
                 watchers,
             });
@@ -2566,7 +2633,11 @@ impl LspClientManager {
     /// 4. Fan out: each server receives only the changes matching **its** globs
     ///    and watch-**kind** mask (via
     ///    [`covers`](crate::lsp::server::ParsedWatcher::covers)), minus
-    ///    `exclude`, as `workspace/didChangeWatchedFiles`. The wire
+    ///    `exclude`, as `workspace/didChangeWatchedFiles` — for **closed**
+    ///    documents; a change to an **open** document dispatches as the
+    ///    didChange full-text relay instead (the two forms of the
+    ///    watch-before-query invariant — see the step-4 comment in the body;
+    ///    diagnostics-debt 01). The wire
     ///    `FileChangeType` carries the true semantic [`ChangeKind`] (Created ⇒ 1,
     ///    Changed ⇒ 2, Deleted ⇒ 3), agreeing with the kind-mask filter. The
     ///    first walk's cold snapshot is `Changed`; only a path absent from an
@@ -2609,6 +2680,11 @@ impl LspClientManager {
     /// `revert_baseline_changes` for both inherent residuals (WS31-review F4).
     ///
     /// [`watched_files_snapshot`]: crate::lsp::server::LspServer::watched_files_snapshot
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linear pipeline; the open-document relay leg (diagnostics-debt 01) \
+                  adds the second dispatch form of the watch-before-query invariant"
+    )]
     pub async fn nudge_changed_set(
         &self,
         root: &Path,
@@ -2664,12 +2740,30 @@ impl LspClientManager {
         }
 
         // Step 4 + 5: per-server routing then settle.
+        //
+        // **Watch-before-query invariant (stated, load-bearing):** Catenary is
+        // the single disk walker — one walker dispatching to n servers, never
+        // n walkers — and before ANY server query, pending disk knowledge is
+        // delivered. Two dispatch forms, keyed on open state
+        // (diagnostics-debt 01):
+        //
+        // - a **closed** document routes as `workspace/didChangeWatchedFiles`
+        //   (the classic relay);
+        // - an **open** (held-open or query-opened) document routes as the
+        //   didChange full-text relay through the change gate
+        //   ([`Self::open_document_on`]) — servers treat the client's text as
+        //   the truth for open documents and do not deliver watched-files
+        //   events for them, so a watched-files route would be dropped on the
+        //   server floor. For the same reason, servers cannot detect
+        //   out-of-band writes to open documents at all: the mtime+hash check
+        //   at each dispatch (here, and at diagnostics round start) IS the
+        //   detection.
         for c in &covering {
             // Each routed entry carries its true wire `FileChangeType`, matching
             // the semantic kind that passed this server's watch-kind mask. The
             // `&Change` is retained so a failed delivery can revert exactly the
             // entries this server should have received (F4 recovery, below).
-            let mut routed: Vec<(String, u8, &Change)> = Vec::new();
+            let mut candidates: Vec<(String, u8, &Change)> = Vec::new();
             for change in &change_set.changes {
                 if exclude.contains(&change.rel) {
                     continue;
@@ -2679,7 +2773,7 @@ impl LspClientManager {
                     .iter()
                     .any(|w| w.covers(&change.rel, &abs, change.kind))
                 {
-                    routed.push((
+                    candidates.push((
                         changed_file_uri(root, &change.rel),
                         change_kind_wire_type(change.kind),
                         change,
@@ -2687,7 +2781,57 @@ impl LspClientManager {
                 }
             }
 
+            if candidates.is_empty() {
+                continue;
+            }
+
+            // Partition on open state (one client lock — never held across
+            // the notify/settle below, bug 104 discipline). A `Deleted` for
+            // an **open** document has no text to relay: the document cannot
+            // outlive its file, so it is force-closed here (owners dropped)
+            // and the deletion then routes as watched-files like any closed
+            // file — reap consumers (delete-masked watchers, server file
+            // indices) still hear it.
+            let mut open_docs: Vec<(String, u8, &Change)> = Vec::new();
+            let mut routed: Vec<(String, u8, &Change)> = Vec::new();
+            {
+                let mut client = c.client.lock().await;
+                for (uri, wire, change) in candidates {
+                    if !client.is_document_open(&uri) {
+                        routed.push((uri, wire, change));
+                    } else if change.kind == ChangeKind::Deleted {
+                        client.close_document_on_disk_delete(&uri).await;
+                        routed.push((uri, wire, change));
+                    } else {
+                        open_docs.push((uri, wire, change));
+                    }
+                }
+                drop(client);
+            }
+
+            // Open-document leg: the didChange full-text relay.
+            let mut relayed = false;
+            for (_, _, change) in &open_docs {
+                let abs = root.join(&change.rel);
+                match self.open_document_on(&abs, &c.client, None, None).await {
+                    Ok(_) => relayed = true,
+                    Err(e) => {
+                        debug!(
+                            source = Source::LspDispatch.as_str(),
+                            server = c.name.as_str(),
+                            "changed-set nudge didChange relay dropped: {e}",
+                        );
+                        // Same F4 recovery as the watched-files leg: revert so
+                        // the next walk re-emits.
+                        self.fs.revert_baseline_changes(root, &[(*change).clone()]);
+                    }
+                }
+            }
+
             if routed.is_empty() {
+                if relayed {
+                    self.settle_after_nudge(c).await;
+                }
                 continue;
             }
 
@@ -2721,29 +2865,35 @@ impl LspClientManager {
                 self.fs.revert_baseline_changes(root, &reverted);
             }
 
-            // Settle: wait for the server to go idle after the nudge, then drain
-            // the stdio pipe so its post-nudge state is visible before the read.
-            let result = await_idle(
-                &c.server,
-                IdleDetector::unconditional(),
-                CancellationToken::new(),
-                &c.name,
-            )
-            .await;
+            self.settle_after_nudge(c).await;
+        }
+    }
+
+    /// Settles one covering server after a changed-set dispatch: waits for it
+    /// to go idle, then drains the stdio pipe so its post-nudge state is
+    /// visible before the caller's read. Shared by both dispatch forms
+    /// (watched-files and the open-document didChange relay).
+    async fn settle_after_nudge(&self, c: &Covering) {
+        let result = await_idle(
+            &c.server,
+            IdleDetector::unconditional(),
+            CancellationToken::new(),
+            &c.name,
+        )
+        .await;
+        debug!(
+            source = Source::LspDispatch.as_str(),
+            server = c.name.as_str(),
+            "changed-set nudge settle: {result:?}",
+        );
+        if result != SettleResult::RootDied
+            && let Err(e) = c.server.drain().await
+        {
             debug!(
                 source = Source::LspDispatch.as_str(),
                 server = c.name.as_str(),
-                "changed-set nudge settle: {result:?}",
+                "changed-set nudge drain: {e}",
             );
-            if result != SettleResult::RootDied
-                && let Err(e) = c.server.drain().await
-            {
-                debug!(
-                    source = Source::LspDispatch.as_str(),
-                    server = c.name.as_str(),
-                    "changed-set nudge drain: {e}",
-                );
-            }
         }
     }
 
@@ -5691,7 +5841,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_document_on_single_client() -> Result<()> {
-        // open_document_on returns URI and sends didOpen.
+        // open_document_on returns URI + sync action, and sends didOpen.
         let dir = tempfile::tempdir().expect("tempdir");
         let fs = test_fs_with_roots(&[]);
         fs.set_roots(vec![dir.path().to_path_buf()]);
@@ -5701,8 +5851,15 @@ mod tests {
         std::fs::write(&path, "content").expect("write");
 
         let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
-        let uri = manager.open_document_on(&path, &client, None).await?;
+        let (uri, action) = manager.open_document_on(&path, &client, None, None).await?;
         assert!(uri.starts_with("file://"));
+        // The eager health probe may have opened/closed this same fixture
+        // file at spawn, advancing the version floor — so assert the action
+        // kind, not an absolute version.
+        assert!(
+            matches!(action, DocSync::Open(_)),
+            "first open sends didOpen, got {action:?}"
+        );
         assert!(
             client.lock().await.is_document_open(&uri),
             "Client should track the document as open"
@@ -5712,7 +5869,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_document_on_second_call() -> Result<()> {
-        // Second open on the same client sends didChange, not duplicate didOpen.
+        // Held-open change gate (diagnostics-debt 01): a second call with the
+        // file unchanged on disk sends NOTHING (no duplicate didOpen, no
+        // didChange); a call after the disk content moved sends didChange
+        // with the next real version.
         let dir = tempfile::tempdir().expect("tempdir");
         let fs = test_fs_with_roots(&[]);
         fs.set_roots(vec![dir.path().to_path_buf()]);
@@ -5722,11 +5882,29 @@ mod tests {
         std::fs::write(&path, "content").expect("write");
 
         let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
-        let uri1 = manager.open_document_on(&path, &client, None).await?;
-        let uri2 = manager.open_document_on(&path, &client, None).await?;
+        let (uri1, action1) = manager.open_document_on(&path, &client, None, None).await?;
+        let DocSync::Open(v1) = action1 else {
+            anyhow::bail!("first open must send didOpen, got {action1:?}");
+        };
+
+        let (uri2, action2) = manager.open_document_on(&path, &client, None, None).await?;
         assert_eq!(uri1, uri2);
-        // Both calls succeed — second sends didChange since the client
-        // already has the document open.
+        assert_eq!(
+            action2,
+            DocSync::Unchanged,
+            "an unchanged held-open document gets no sync traffic"
+        );
+
+        // Content moved on disk (same or new mtime — the hash breaks the
+        // tie either way): the next call relays didChange at the next
+        // real version.
+        std::fs::write(&path, "content changed").expect("write");
+        let (_, action3) = manager.open_document_on(&path, &client, None, None).await?;
+        assert_eq!(
+            action3,
+            DocSync::Change(v1 + 1),
+            "moved disk content relays didChange with a bumped real version"
+        );
         assert!(client.lock().await.is_document_open(&uri1));
         Ok(())
     }
@@ -5754,7 +5932,7 @@ mod tests {
         // Open document on both servers.
         let mut uri = String::new();
         for c in &servers {
-            uri = manager.open_document_on(&path, c, None).await?;
+            (uri, _) = manager.open_document_on(&path, c, None, None).await?;
         }
 
         // Verify all clients have the document open.

@@ -66,7 +66,7 @@ pub mod test_support {
     }
 }
 
-pub use client::LspClient;
+pub use client::{DocSync, LspClient};
 pub use instance_key::{InstanceKey, Scope};
 pub use manager::LspClientManager;
 pub(crate) use manager::WalkBreadth;

@@ -244,15 +244,18 @@ struct Args {
     #[arg(long)]
     flycheck_no_progress: bool,
 
-    /// Withhold each flycheck publish until the NEXT `textDocument/didOpen`,
-    /// writing it immediately after that open's own native publish (bug 101,
-    /// heard-stale leg — the macOS `flycheck_multi_round` incident, CI run
-    /// 29091745917). Pins the racing shape deterministically: a round-1
-    /// flycheck publish — computed against round-1 content, carrying round-1's
-    /// version — lands after round 2's clear-then-open and after round 2's
-    /// fresh native publish, exactly where a loaded runner's in-flight
-    /// straggler lands. Both writes happen on the main loop thread, so the
-    /// wire order (fresh first, straggler second) needs no timing at all.
+    /// Withhold each flycheck publish until the NEXT `textDocument/didOpen`
+    /// **or** `textDocument/didChange`, writing it immediately after that
+    /// notification's own native publish (bug 101, heard-stale leg — the
+    /// macOS `flycheck_multi_round` incident, CI run 29091745917). Pins the
+    /// racing shape deterministically: a round-1 flycheck publish — computed
+    /// against round-1 content, carrying round-1's version — lands after
+    /// round 2's fresh native publish, exactly where a loaded runner's
+    /// in-flight straggler lands. Under the held-open lifecycle
+    /// (diagnostics-debt 01) round 2's stimulus is a `didChange`, not a
+    /// reopen, so the release rides both notifications. Both writes happen
+    /// on the main loop thread, so the wire order (fresh first, straggler
+    /// second) needs no timing at all.
     #[arg(long)]
     flycheck_publish_on_next_open: bool,
 
@@ -841,7 +844,19 @@ impl MockServer {
                     .and_then(|td| td.get("uri"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                serde_json::json!({"method": method, "uri": uri})
+                // Carry the document version when the notification has one
+                // (didOpen/didChange) so tests can assert the real monotonic
+                // version sequence (diagnostics-debt 01).
+                params
+                    .get("textDocument")
+                    .and_then(|td| td.get("version"))
+                    .and_then(Value::as_i64)
+                    .map_or_else(
+                        || serde_json::json!({"method": method, "uri": uri}),
+                        |version| {
+                            serde_json::json!({"method": method, "uri": uri, "version": version})
+                        },
+                    )
             };
             let _ = writeln!(log, "{entry}");
         }
@@ -938,6 +953,12 @@ impl MockServer {
                         self.publish_diagnostics(uri);
                     }
                 }
+                // Release publishes parked by `--flycheck-publish-on-next-open`
+                // AFTER this change's native publish (same thread, so the wire
+                // order is pinned: fresh first, straggler second — bug 101).
+                // Under the held-open lifecycle a repeat round's stimulus is a
+                // didChange, not a reopen (diagnostics-debt 01).
+                self.flush_pending_flycheck_publishes();
             }
             "textDocument/didSave" => {
                 if let Some(td) = params.get("textDocument") {

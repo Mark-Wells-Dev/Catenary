@@ -656,8 +656,10 @@ fn conformance_bash_ls() -> Result<()> {
 // lattice and vscode-json-language-server each returned a deterministic
 // `[clean]` on a cold daemon. The tui-rework 07 report filed both under one
 // "cold-pull" heading, but they were two distinct gaps the conformance harness
-// caught: lattice publishes once on its workspace scan (which
-// `clear_stale_diagnostics` wipes before the batch reopens the unchanged file)
+// caught: lattice publishes once on its workspace scan (which the then
+// per-round pre-batch cache clear wiped before the batch reopened the
+// unchanged file — today the per-send clear in `open_document_on` only wipes
+// entries for content actually being resent)
 // and never advertises `diagnosticProvider`, so the settle-then-collect
 // pipeline never pulled it — even though it answers `textDocument/diagnostic`
 // on demand (fixed: best-effort pull on an empty push cache);

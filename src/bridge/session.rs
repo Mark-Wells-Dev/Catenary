@@ -1061,6 +1061,19 @@ impl Session {
             .clone()
     }
 
+    /// Closes every held-open document the `(session, agent)` batch owner
+    /// holds, across all server connections — the batch-end leg of the
+    /// held-open lifecycle (diagnostics-debt 01), dispatched from an allowed
+    /// Stop/SubagentStop.
+    ///
+    /// `session_id`/`agent_id` are resolved to the owner key exactly as the
+    /// editing batch resolves them
+    /// ([`editing_key`](super::editing_manager::editing_key)).
+    pub async fn close_agent_docs(&self, session_id: Option<&str>, agent_id: &str) {
+        let owner = super::editing_manager::editing_key(session_id, agent_id);
+        self.client_manager.close_agent_docs(&owner).await;
+    }
+
     /// Sets whether a `catenary diagnostics` run is in flight and marks the
     /// snapshot dirty so the board's status reflects the transition promptly.
     pub fn set_diagnostics_in_flight(&self, in_flight: bool) {

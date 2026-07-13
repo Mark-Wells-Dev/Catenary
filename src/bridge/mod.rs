@@ -210,8 +210,11 @@ pub(super) async fn ensure_symbols(
         let Some(server) = servers.first() else {
             continue;
         };
-        let Ok(uri) = client_manager
-            .open_document_on(path, server, parent_id.map(str::to_string))
+        // Query-cycle open through the held-open change gate (no owner —
+        // queries never hold): a doc the batch holds open is neither reopened
+        // here nor ever closed by this path (diagnostics-debt 01).
+        let Ok((uri, _)) = client_manager
+            .open_document_on(path, server, parent_id.map(str::to_string), None)
             .await
         else {
             continue;
