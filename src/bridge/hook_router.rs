@@ -1995,7 +1995,18 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         let handle = runtime.handle().clone();
 
-        let root = dir.path().join("workspace");
+        // Canonicalize the tempdir: production roots arrive canonicalized (the
+        // tracker canonicalizes every root), and the dispatch paths canonicalize
+        // file paths before the coverage check (`handle_file_accumulation`'s
+        // canonical-to-canonical alignment). A raw fixture root splits that
+        // alignment wherever the tempdir rides a symlink — macOS's
+        // /var → /private/var made these tests CI-red while Linux stayed green
+        // (reproducible on Linux with a symlinked TMPDIR).
+        let root = dir
+            .path()
+            .canonicalize()
+            .expect("canonical tempdir")
+            .join("workspace");
         std::fs::create_dir_all(&root).expect("create workspace dir");
 
         let instance_id: Arc<str> = "test-session".into();
