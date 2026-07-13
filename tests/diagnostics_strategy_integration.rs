@@ -627,12 +627,19 @@ fn wedged_daemon_fails_within_no_progress_budget() -> Result<()> {
     Ok(())
 }
 
-/// mockls with `--pull-diagnostics --fail-pull --no-push-diagnostics`:
-/// pull fails on first call → downgrade to push-only → clean. Second call
-/// skips pull (downgraded) → clean. A verified-clean file is listed
-/// explicitly as `[clean]` (ws37 ticket 01, retiring silent-on-clean).
+/// A pull error is never `[clean]` — the debt stays unsettled (bug 84).
+///
+/// mockls with `--pull-diagnostics --fail-pull --no-push-diagnostics`: the pull
+/// fails with a transient `InternalError` (-32603) and there is no push cache to
+/// fall back on. The old best-effort path fabricated a `[clean]` from the
+/// empty-vec placeholder AND downgraded the capability permanently. Both retire:
+/// the failing pull leaves the debt unsettled, so the file renders
+/// `[unverified — <server> returned no result]`; and because -32603 is transient
+/// (not the `-32601` method-not-found evidence), the capability is NOT
+/// downgraded, so the second call pulls again and stays honestly unverified —
+/// never a silent skip-to-clean.
 #[test]
-fn test_pull_downgrade_no_push() -> Result<()> {
+fn pull_error_renders_unverified_never_clean() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "echo hello\n")?;
@@ -643,28 +650,31 @@ fn test_pull_downgrade_no_push() -> Result<()> {
     )?;
     bridge.initialize()?;
 
-    // First call: pull fails → downgrade → clean → `[clean]`
+    // First call: pull fails, no push → debt unsettled → `[unverified]`.
     let text1 = bridge.call_diagnostics(file.to_str().context("path")?)?;
     assert!(
-        text1.contains("[clean]"),
-        "Failed pull with no push should list the file as `[clean]`. Got: {text1}"
+        text1.contains("[unverified") && !text1.contains("[clean]"),
+        "a failed pull with no push must render `[unverified]`, never `[clean]`. Got: {text1}"
     );
 
-    // Second call: pull skipped (downgraded) → clean → `[clean]`
+    // Second call: a transient failure did not downgrade the capability, so
+    // the pull is attempted again — and, failing again, stays unverified. The
+    // debt is never fabricated clean by a silent downgrade.
     let text2 = bridge.call_diagnostics(file.to_str().context("path")?)?;
     assert!(
-        text2.contains("[clean]"),
-        "Downgraded server should list the file as `[clean]` without retrying pull. Got: {text2}"
+        text2.contains("[unverified") && !text2.contains("[clean]"),
+        "a transient pull failure must NOT downgrade to a false `[clean]` on \
+         the next round. Got: {text2}"
     );
 
     Ok(())
 }
 
 /// mockls with `--pull-diagnostics --fail-pull --publish-version`:
-/// push is working, pull fails → downgrade → push cache has data →
-/// returns diagnostics.
+/// push is working, so the push cache is consulted first and the pull (which
+/// would fail) is never reached — the receipt carries the pushed diagnostic.
 #[test]
-fn test_pull_downgrade_with_push() -> Result<()> {
+fn test_pull_working_push_beats_broken_pull() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join(format!("test.{MOCK_LANG_A}"));
     std::fs::write(&file, "echo hello\n")?;

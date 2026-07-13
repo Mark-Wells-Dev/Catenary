@@ -82,6 +82,17 @@ struct Args {
     #[arg(long)]
     fail_pull: bool,
 
+    /// Answer the FIRST `N` `textDocument/diagnostic` pull requests with
+    /// `ServerCancelled` (-32802) plus `DiagnosticServerCancellationData`
+    /// (`{ "retriggerRequest": true }`), then serve the pull normally. Models
+    /// the LSP-spec "busy, re-trigger" a server sends while it is still
+    /// computing (bug 84). With `N = 1` the daemon's bounded re-trigger recovers
+    /// and settles on the retry; with `N` above the re-trigger bound the pull
+    /// stays cancelled and the debt must resolve unsettled — never `[clean]`.
+    /// Pair with `--pull-diagnostics`.
+    #[arg(long, default_value_t = 0)]
+    cancel_pull: u32,
+
     /// On `textDocument/diagnostic`: FIRST publish the file's diagnostics as
     /// a push notification, THEN answer the request itself with `-32601`
     /// (method not found). Models the bug-99 incident wire order — a
@@ -447,6 +458,10 @@ struct MockServer {
     request_log: Option<std::fs::File>,
     /// Whether the first definition request has been seen (for `--content-modified-once`).
     definition_failed_once: bool,
+    /// Remaining `ServerCancelled` responses to send for `textDocument/diagnostic`
+    /// (for `--cancel-pull`). Decremented per pull; a normal report is served
+    /// once it reaches zero.
+    pull_cancels_remaining: u32,
     /// Workspace roots parsed from `initialize` params.
     workspace_roots: Vec<String>,
     /// Whether `--die-on` is armed for THIS process (decision 027 recovery
@@ -498,6 +513,7 @@ impl MockServer {
                 .is_ok()
         });
 
+        let pull_cancels_remaining = args.cancel_pull;
         Self {
             args,
             documents: BTreeMap::new(),
@@ -511,6 +527,7 @@ impl MockServer {
             notification_log,
             request_log,
             definition_failed_once: false,
+            pull_cancels_remaining,
             workspace_roots: Vec::new(),
             die_armed,
             published_once: AtomicBool::new(false),
@@ -790,6 +807,20 @@ impl MockServer {
                             message: "mockls: pull diagnostics failure (--fail-pull)".to_string(),
                         }),
                     });
+                    return;
+                }
+                if self.pull_cancels_remaining > 0 {
+                    // ServerCancelled (-32802) with a retrigger request: the
+                    // LSP-spec "busy, ask again". `RpcError` carries no `data`
+                    // field, so send the whole envelope directly to attach the
+                    // `DiagnosticServerCancellationData`.
+                    self.pull_cancels_remaining -= 1;
+                    self.send_error_with_data(
+                        &id,
+                        -32802,
+                        "mockls: server cancelled (--cancel-pull)",
+                        &serde_json::json!({ "retriggerRequest": true }),
+                    );
                     return;
                 }
                 Some(self.handle_pull_diagnostics(&request.params))
@@ -2402,6 +2433,27 @@ impl MockServer {
         }
     }
 
+    /// Sends a JSON-RPC error response carrying an `error.data` payload.
+    ///
+    /// The local [`RpcError`] struct has no `data` field, so this builds the
+    /// envelope directly — used for `ServerCancelled` (-32802), whose
+    /// `DiagnosticServerCancellationData` (`{ "retriggerRequest": bool }`) the
+    /// daemon reads to decide whether to re-trigger the pull.
+    fn send_error_with_data(&mut self, id: &Value, code: i64, message: &str, data: &Value) {
+        send_message(
+            &self.writer,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": code, "message": message, "data": data },
+            }),
+        );
+
+        if self.check_drop_after() {
+            std::process::exit(1);
+        }
+    }
+
     /// Increment the response counter and return whether `drop_after`
     /// has been reached. Extracted so the counter logic is testable
     /// without triggering `process::exit`.
@@ -2898,6 +2950,7 @@ mod tests {
             publish_then_reject_pull: false,
             workspace_diagnostics: false,
             fail_pull: false,
+            cancel_pull: 0,
             reject_document_symbol: false,
             reject_pull: false,
             publish_once: false,
@@ -4400,6 +4453,50 @@ const PI: f64
             .expect("diagnostic response");
         assert!(diag["error"].is_object(), "Should fail with --fail-pull");
         assert_eq!(diag["error"]["code"], -32603);
+    }
+
+    #[test]
+    fn test_cancel_pull_first_then_serves() {
+        // `--cancel-pull 1` answers the first pull with ServerCancelled (-32802)
+        // plus `{ "retriggerRequest": true }`, then serves the second normally —
+        // the LSP-spec "busy, re-trigger" the daemon's bounded retry recovers.
+        let mut args = default_args();
+        args.pull_diagnostics = true;
+        args.cancel_pull = 1;
+        let uri = "file:///tmp/test.yX4Za";
+        let text = "fn hello\n";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, text)));
+        input.extend(frame(&pull_diagnostics_request(2, uri)));
+        input.extend(frame(&pull_diagnostics_request(3, uri)));
+        input.extend(frame(&shutdown_request(4)));
+
+        let messages = run_server_with(args, &input);
+
+        // First pull: ServerCancelled with the retrigger hint.
+        let cancelled = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(2))
+            .expect("first pull response");
+        assert_eq!(
+            cancelled["error"]["code"], -32802,
+            "the first pull is ServerCancelled"
+        );
+        assert_eq!(
+            cancelled["error"]["data"]["retriggerRequest"], true,
+            "ServerCancelled carries retriggerRequest: true"
+        );
+
+        // Second pull (the re-trigger): the real report.
+        let served = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_u64) == Some(3))
+            .expect("second pull response");
+        assert!(served["error"].is_null(), "the re-triggered pull is served");
+        assert_eq!(served["result"]["kind"], "full");
+        let items = served["result"]["items"].as_array().expect("items array");
+        assert_eq!(items[0]["source"], "mockls");
     }
 
     #[test]

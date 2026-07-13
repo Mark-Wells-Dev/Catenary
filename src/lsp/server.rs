@@ -549,8 +549,10 @@ impl LspServer {
 
     /// Permanently disables pull diagnostics for this server.
     ///
-    /// Called when `textDocument/diagnostic` fails on a server that
-    /// advertised `diagnosticProvider`. Subsequent calls to
+    /// Called only on `-32601` (`MethodNotFound`) evidence — the method is
+    /// genuinely unsupported (bug 84). A transient pull failure (busy,
+    /// `InternalError`, transport fault) must NOT downgrade: the next round
+    /// retries the pull. Subsequent calls to
     /// [`Self::supports_pull_diagnostics`] return `false`.
     pub fn downgrade_pull_diagnostics(&self) {
         self.supports_pull_diagnostics

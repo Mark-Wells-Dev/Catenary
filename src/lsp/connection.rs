@@ -166,6 +166,13 @@ pub struct LspResponseError {
     pub language: String,
     /// The server's human-readable error message.
     pub message: String,
+    /// The optional `error.data` payload the server attached to the response.
+    ///
+    /// Carries the diagnostic pull's `DiagnosticServerCancellationData`
+    /// (`{ "retriggerRequest": bool }`) alongside a `ServerCancelled` (-32802):
+    /// the caller reads it to honour the LSP spec's re-trigger request. Absent
+    /// for most error responses.
+    pub data: Option<serde_json::Value>,
 }
 
 /// Poll interval for failure detection sampling.
@@ -502,10 +509,13 @@ impl Connection {
                 // An error *response* — the server answered. Carry it as a
                 // typed error so a liveness probe can tell "the server said no"
                 // (alive) from a transport failure (gone). Display is unchanged.
+                // `data` rides along so a diagnostic pull can read a
+                // `ServerCancelled`'s `retriggerRequest` hint (bug 84).
                 return Err(LspResponseError {
                     code: error.code,
                     language: self.language.clone(),
                     message: error.message,
+                    data: error.data,
                 }
                 .into());
             }
@@ -1052,6 +1062,7 @@ mod tests {
             code: -32601,
             language: "sql".to_string(),
             message: "Unhandled method textDocument/documentSymbol".to_string(),
+            data: None,
         };
         assert_eq!(
             err.to_string(),
@@ -1068,6 +1079,7 @@ mod tests {
             code: -32601,
             language: "cmake".to_string(),
             message: "Method Not Found".to_string(),
+            data: None,
         }
         .into();
         assert!(

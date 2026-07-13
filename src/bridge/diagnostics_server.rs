@@ -28,6 +28,45 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+/// LSP `MethodNotFound` (JSON-RPC standard) — the only pull-error evidence that
+/// justifies a **permanent** capability downgrade: the method is genuinely
+/// unsupported, so `textDocument/diagnostic` will never work on this connection
+/// (bug 84). Every other pull error is transient and downgrades nothing.
+const LSP_METHOD_NOT_FOUND: i64 = -32601;
+
+/// LSP `ServerCancelled` (3.17) — "I could not serve this request right now."
+/// The spec pairs it with `DiagnosticServerCancellationData` carrying a
+/// `retriggerRequest` flag: when set (or absent — the safe default), the client
+/// should re-issue the same request. The pull loop honours this, bounded, so a
+/// busy server is retried without an unbounded spin (bug 84).
+const LSP_SERVER_CANCELLED: i64 = -32802;
+
+/// Bound on `ServerCancelled` re-triggers within a single file's pull.
+///
+/// Honest, finite: a server that stays busy past this many re-issues leaves the
+/// debt **unsettled** (never a silent zero) rather than looping forever. No wall
+/// clock gates the loop — each re-trigger is a fresh request the server answers
+/// (with data, a fresh cancel, or a different error), and the transport layer's
+/// own death/stuck detection bounds each individual request.
+const PULL_RETRIGGER_LIMIT: u32 = 3;
+
+/// The outcome of a pull attempt against a pull-discipline server.
+///
+/// A pull **settles** a debt directly (the design frame): a returned report —
+/// even an empty one — is the server's on-demand verdict for the current text.
+/// An **error** leaves the debt unsettled (never `Clean`, never an empty-vec
+/// placeholder — bug 84's retired mechanism); the caller skips recording the
+/// file so it resolves [`FileOutcome::NoResults`] and renders the honest
+/// `[unverified — <server> returned no result]` line.
+enum PullSettlement {
+    /// The pull returned a report — the debt settles with these diagnostics
+    /// (possibly empty: an evidence-backed clean).
+    Settled(Vec<Value>),
+    /// The pull errored (rejected, cancelled past the retrigger bound, or a
+    /// transport fault) — the debt stays unsettled.
+    Unsettled,
+}
+
 /// A single rendered diagnostic together with its LSP severity.
 ///
 /// The severity drives two policies that operate after rendering: the
@@ -1510,13 +1549,17 @@ impl DiagnosticsServer {
     /// it is hoisted to the per-file cross-feeder pass (ticket 02) so one policy
     /// reconciles every feeder's findings together. Every opened file is recorded
     /// (even with zero diagnostics) so the clean-vs-no-results distinction
-    /// survives the merge — with one deliberate exception: a URI in
-    /// `evidence_expired` (the retrieval evidence bar armed for it and its
-    /// publish never arrived, [`await_publish_evidence`]) whose best-effort
-    /// probe also goes unanswered is **not** recorded, so it resolves
-    /// [`FileOutcome::NoResults`] and renders the honest
-    /// `[unverified — <server> returned no result]` line instead of an
-    /// absence-of-evidence `[clean]` (bug 99 residual / misc 156).
+    /// survives the merge — with two deliberate exceptions, both of which leave
+    /// the file **unrecorded** so it resolves [`FileOutcome::NoResults`] and
+    /// renders the honest `[unverified — <server> returned no result]` line
+    /// instead of an absence-of-evidence `[clean]`:
+    ///
+    /// - a URI in `evidence_expired` (the retrieval evidence bar armed for it
+    ///   and its publish never arrived, [`await_publish_evidence`]) whose
+    ///   best-effort probe also goes unanswered (bug 99 residual / misc 156);
+    /// - a **pull that errored** on a pull-discipline server ([`pull_settling`]
+    ///   returning [`PullSettlement::Unsettled`]) — the pull's fault never
+    ///   fabricates a clean; the debt stays unsettled (bug 84).
     async fn retrieve_diagnostics(
         &self,
         client_mutex: &Arc<Mutex<LspClient>>,
@@ -1551,17 +1594,17 @@ impl DiagnosticsServer {
                 // empty is never second-guessed by an off-spec probe (misc 153).
                 Some(diags) => diags,
                 // Never heard AND the server advertises the pull model: ask it
-                // the way it asked to be asked.
+                // the way it asked to be asked. A returned report settles the
+                // debt (even empty — the on-demand clean); an error leaves it
+                // UNSETTLED — skip recording so the file resolves NoResults and
+                // renders the honest `[unverified — …]` line, never a fabricated
+                // `[clean]` (bug 84). ServerCancelled is re-triggered, and only
+                // -32601 downgrades the capability (see `pull_settling`).
                 None if client.supports_pull_diagnostics() => {
-                    let pulled = match client.pull_diagnostics(uri).await {
-                        Ok(diags) => diags,
-                        Err(e) => {
-                            client.server().downgrade_pull_diagnostics();
-                            debug!("pull diagnostics failed, downgraded: {e}");
-                            Vec::new()
-                        }
-                    };
-                    reconsult_push_after_empty_pull(&client, uri, pulled)
+                    match pull_settling(&client, uri).await {
+                        PullSettlement::Settled(diags) => diags,
+                        PullSettlement::Unsettled => continue,
+                    }
                 }
                 // Never heard, pull suppressed by engine casing (misc 157): the
                 // server is push-first by design (rust-analyzer) and must never be
@@ -2365,6 +2408,92 @@ fn reconsult_push_after_empty_pull(
         return published;
     }
     pulled
+}
+
+/// Pulls diagnostics from a pull-discipline server, settling the debt honestly
+/// on every outcome (bug 84).
+///
+/// The pull is the server's on-demand verdict, so a returned report — empty or
+/// not — [`settles`](PullSettlement::Settled) the debt (re-consulting the push
+/// cache first, bug 99: a publish that raced the round-trip is evidence in
+/// hand). Errors never fabricate a clean:
+///
+/// - **`ServerCancelled` (-32802)** is the spec's "busy, re-trigger": the same
+///   request is re-issued, bounded by [`PULL_RETRIGGER_LIMIT`], while the
+///   server's `DiagnosticServerCancellationData.retriggerRequest` permits it
+///   (absent data defaults to retrigger). An exhausted or declined re-trigger
+///   leaves the debt [`Unsettled`](PullSettlement::Unsettled) — the fault named
+///   in the log, never a silent zero.
+/// - **`MethodNotFound` (-32601)** is the *only* evidence that downgrades the
+///   capability permanently ([`LspServer::downgrade_pull_diagnostics`]): the
+///   method is genuinely unsupported. Even so, this round's debt is left
+///   unsettled — a downgrade governs future rounds, it does not fabricate a
+///   verdict for this one.
+/// - **Any other error** (a transient `InternalError`, a transport fault)
+///   downgrades *nothing* and leaves the debt unsettled — the next round pulls
+///   again.
+///
+/// On any error the push cache is re-consulted once more: a publish that landed
+/// during the failing round-trip settles the debt legitimately (bug 99).
+async fn pull_settling(client: &LspClient, uri: &str) -> PullSettlement {
+    let mut retriggers = 0u32;
+    loop {
+        match client.pull_diagnostics(uri).await {
+            Ok(diags) => {
+                return PullSettlement::Settled(reconsult_push_after_empty_pull(
+                    client, uri, diags,
+                ));
+            }
+            Err(e) => {
+                let code = e
+                    .downcast_ref::<crate::lsp::connection::LspResponseError>()
+                    .map(|r| r.code);
+
+                // ServerCancelled: re-trigger per the spec, bounded — a busy
+                // server gets a fresh request, never an infinite spin.
+                if code == Some(LSP_SERVER_CANCELLED)
+                    && retrigger_requested(&e)
+                    && retriggers < PULL_RETRIGGER_LIMIT
+                {
+                    retriggers += 1;
+                    debug!("pull diagnostics ServerCancelled, re-triggering ({retriggers})");
+                    continue;
+                }
+
+                // MethodNotFound is the sole downgrade evidence (bug 84): the
+                // method is genuinely absent, so future rounds skip the pull.
+                if code == Some(LSP_METHOD_NOT_FOUND) {
+                    client.server().downgrade_pull_diagnostics();
+                    debug!("pull diagnostics unsupported (-32601), downgraded: {e}");
+                } else {
+                    // Transient (busy past the bound, internal error, transport
+                    // fault): no downgrade — the next round retries the pull.
+                    debug!("pull diagnostics failed (transient, no downgrade): {e}");
+                }
+
+                // Bug 99: a publish that raced the failing round-trip is
+                // evidence in hand and settles the debt legitimately.
+                return client
+                    .get_diagnostics(uri)
+                    .map_or(PullSettlement::Unsettled, PullSettlement::Settled);
+            }
+        }
+    }
+}
+
+/// Reads the LSP `DiagnosticServerCancellationData.retriggerRequest` hint off a
+/// `ServerCancelled` error, defaulting to `true`.
+///
+/// The spec's data payload is `{ "retriggerRequest": bool }`. When the server
+/// omits the data (or the flag), the safe default is to re-trigger — a bare
+/// `ServerCancelled` is "busy, ask again". Only an explicit
+/// `retriggerRequest: false` declines the re-issue.
+fn retrigger_requested(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<crate::lsp::connection::LspResponseError>()
+        .and_then(|r| r.data.as_ref())
+        .and_then(|d| d.get("retriggerRequest"))
+        .and_then(Value::as_bool)
+        != Some(false)
 }
 
 /// Renders one LSP-shaped diagnostic into a [`DiagEntry`], or `None` when the
@@ -4119,5 +4248,187 @@ mod tests {
         ];
         let kept = drop_challenged_provisional(entries, &ra_weights());
         assert_eq!(kept.len(), 2, "non-provisional findings untouched");
+    }
+
+    // ── pull honesty: an error is never `Clean` (bug 84) ────────────────
+    //
+    // Operation/state assertions over `pull_settling`, no wall clocks. The
+    // helper is the single seam the retrieval path routes a pull-discipline
+    // server through: a returned report settles the debt, an error leaves it
+    // unsettled, and only `-32601` downgrades the capability. Each test spawns
+    // mockls and drives the pull directly, asserting the `PullSettlement`
+    // variant and the server's `supports_pull_diagnostics` state.
+
+    use crate::lsp::connection::LspResponseError;
+
+    /// Spawns mockls with `extra_args`, initialized against a fresh tempdir.
+    async fn spawn_pull_client(extra_args: &[&str]) -> (LspClient, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = crate::lsp::test_support::mockls_bin();
+        let bin_str = bin.to_str().expect("mockls path is UTF-8");
+        let lang = "pUll1";
+        let mut args = vec![lang];
+        args.extend_from_slice(extra_args);
+        let mut client = LspClient::spawn(
+            bin_str,
+            &args,
+            lang,
+            lang,
+            crate::logging::LoggingServer::new(),
+            None,
+            None,
+            "",
+        )
+        .expect("spawn mockls");
+        client
+            .initialize(&[dir.path().to_path_buf()], None)
+            .await
+            .expect("initialize");
+        (client, dir)
+    }
+
+    /// A never-opened URI reads never-heard, so the pull is the only evidence
+    /// channel — no racing publish can settle the debt behind the pull's back.
+    const UNOPENED_URI: &str = "file:///pull-honesty/never-opened.pUll1";
+
+    /// A pull error leaves the debt UNSETTLED — never an empty-vec `Clean`
+    /// placeholder (bug 84's retired mechanism). An `InternalError` (-32603)
+    /// from `--fail-pull` returns `Unsettled` and, being transient, downgrades
+    /// nothing: the next round pulls again.
+    #[tokio::test]
+    async fn pull_error_leaves_debt_unsettled_without_downgrade() {
+        let (mut client, _dir) = spawn_pull_client(&["--pull-diagnostics", "--fail-pull"]).await;
+
+        assert!(
+            client.supports_pull_diagnostics(),
+            "the server advertises pull before the first attempt"
+        );
+
+        let outcome = pull_settling(&client, UNOPENED_URI).await;
+        assert!(
+            matches!(outcome, PullSettlement::Unsettled),
+            "a failed pull leaves the debt unsettled, never a Clean placeholder"
+        );
+        assert!(
+            client.supports_pull_diagnostics(),
+            "a transient pull failure must NOT downgrade the capability"
+        );
+
+        // Next round: the capability is intact, so the pull is attempted again
+        // (and fails again, staying unsettled) — never a silent skip-to-clean.
+        let again = pull_settling(&client, UNOPENED_URI).await;
+        assert!(
+            matches!(again, PullSettlement::Unsettled),
+            "the next round retries the pull after a transient failure"
+        );
+
+        client.shutdown().await.expect("shutdown");
+    }
+
+    /// `ServerCancelled` is the spec's "busy, re-trigger": a single cancel is
+    /// re-issued and the retry settles on the server's real report.
+    #[tokio::test]
+    async fn server_cancelled_retriggers_then_settles_on_success() {
+        // The first pull answers -32802 (retriggerRequest: true); the bounded
+        // re-trigger re-issues and the second pull serves the mock diagnostic.
+        let (mut client, _dir) =
+            spawn_pull_client(&["--pull-diagnostics", "--cancel-pull", "1"]).await;
+
+        let diags = match pull_settling(&client, UNOPENED_URI).await {
+            PullSettlement::Settled(diags) => diags,
+            PullSettlement::Unsettled => Vec::new(),
+        };
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.get("source").and_then(Value::as_str) == Some("mockls")),
+            "a single ServerCancelled must re-trigger and settle on the server's \
+             real report, not stay unsettled: {diags:?}"
+        );
+        assert!(
+            client.supports_pull_diagnostics(),
+            "ServerCancelled must never downgrade the capability"
+        );
+
+        client.shutdown().await.expect("shutdown");
+    }
+
+    /// An exhausted re-trigger leaves the debt UNSETTLED (never a silent zero)
+    /// and, being a transient fault, downgrades nothing.
+    #[tokio::test]
+    async fn exhausted_retrigger_leaves_debt_unsettled() {
+        // 99 cancels far exceeds the re-trigger bound, so every attempt in the
+        // loop answers -32802 and the pull never settles.
+        let (mut client, _dir) =
+            spawn_pull_client(&["--pull-diagnostics", "--cancel-pull", "99"]).await;
+
+        let outcome = pull_settling(&client, UNOPENED_URI).await;
+        assert!(
+            matches!(outcome, PullSettlement::Unsettled),
+            "a re-trigger the bound could not exhaust leaves the debt unsettled"
+        );
+        assert!(
+            client.supports_pull_diagnostics(),
+            "an exhausted ServerCancelled retry is transient — no downgrade"
+        );
+
+        client.shutdown().await.expect("shutdown");
+    }
+
+    /// `-32601` (`MethodNotFound`) is the sole downgrade evidence: the method is
+    /// genuinely unsupported, so the capability is downgraded — but this round's
+    /// debt still resolves unsettled, never a fabricated `Clean`.
+    #[tokio::test]
+    async fn method_not_found_records_downgrade() {
+        // `--reject-pull` answers -32601 even though `--pull-diagnostics`
+        // advertises the capability, so the retrieval path enters the pull arm.
+        let (mut client, _dir) = spawn_pull_client(&["--pull-diagnostics", "--reject-pull"]).await;
+
+        assert!(
+            client.supports_pull_diagnostics(),
+            "the capability is advertised before the rejecting pull"
+        );
+
+        let outcome = pull_settling(&client, UNOPENED_URI).await;
+        assert!(
+            matches!(outcome, PullSettlement::Unsettled),
+            "even a -32601 leaves this round's debt unsettled, not Clean"
+        );
+        assert!(
+            !client.supports_pull_diagnostics(),
+            "-32601 evidence downgrades the pull capability (bug 84)"
+        );
+
+        client.shutdown().await.expect("shutdown");
+    }
+
+    /// The `retriggerRequest` hint drives the re-trigger decision: absent data
+    /// and `true` retrigger; an explicit `false` declines.
+    #[test]
+    fn retrigger_requested_reads_the_cancellation_hint() {
+        let with_data = |data: Option<Value>| -> anyhow::Error {
+            LspResponseError {
+                code: LSP_SERVER_CANCELLED,
+                language: "x".to_string(),
+                message: "cancelled".to_string(),
+                data,
+            }
+            .into()
+        };
+
+        // No data: a bare ServerCancelled is "busy, ask again" → retrigger.
+        assert!(retrigger_requested(&with_data(None)));
+        // Explicit true → retrigger.
+        assert!(retrigger_requested(&with_data(Some(
+            serde_json::json!({ "retriggerRequest": true })
+        ))));
+        // Explicit false → decline.
+        assert!(!retrigger_requested(&with_data(Some(
+            serde_json::json!({ "retriggerRequest": false })
+        ))));
+        // Data present but flag absent → default to retrigger.
+        assert!(retrigger_requested(&with_data(Some(
+            serde_json::json!({ "other": 1 })
+        ))));
     }
 }
