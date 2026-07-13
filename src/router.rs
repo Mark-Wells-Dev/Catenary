@@ -3764,12 +3764,16 @@ fn worktree_rm_response(
 /// naming the cause. On full success the worktree is disposed (unless `keep`).
 /// Never commits.
 ///
-/// The diagnostics batch is armed by the `PreToolUse` hook's write-set resolver
-/// (misc 158, the `catenary worktree land` resolver arm), which resolves land's
-/// changed-path set client-side and records it into the lander's batch exactly
-/// as `git apply` does — the first-class arming leg, keyed on the actual caller.
-/// The daemon carries the applied paths back in the response so the CLI can
-/// report the count.
+/// The diagnostics batch is armed on the `PreToolUse` hook round-trip for the
+/// land command, but by **debt transfer**, not content (misc 189): the resolver
+/// maps the landed changed-path set client-side (opaque-gated), and the daemon
+/// (`HookRouter::handle_worktree_land_debt_transfer`) arms only the subset the
+/// worktree's owner left **unpaid** in the diagnostics ledger — keyed on the
+/// owner's `(session_id, agent_id)`, the agent id being the worktree's leaf
+/// directory name (bug 91). A worktree whose worker paid its gate lands
+/// debt-free. This handler (`tool/worktree-land`) performs the apply + removal
+/// only; it carries the applied paths back in the response so the CLI can report
+/// the count.
 #[cfg(unix)]
 async fn handle_worktree_land(
     ctx: &HookDispatchContext,
@@ -4544,7 +4548,8 @@ async fn handle_hook_dispatch(
     // the owning repo via `git apply --3way` (atomic — a plain `--check` refusal
     // leaves the owning repo untouched), and disposes the worktree on success
     // (unless `--keep`). Never commits; the diagnostics batch arms via the
-    // PreToolUse hook's write-set resolver. Daemon-level.
+    // PreToolUse hook by transferring the owner's unpaid debt (misc 189), not
+    // here. Daemon-level.
     if method == "tool/worktree-land" {
         let response = handle_worktree_land(&ctx, &raw).await;
         let mut payload = serde_json::to_vec(&response)?;

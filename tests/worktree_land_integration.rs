@@ -370,19 +370,34 @@ fn land_nongit_refuses_naming_the_vcs() {
     assert!(worktree.exists(), "the worktree is kept");
 }
 
-// ── Batch arming through the PreToolUse hook (misc 158) ─────────────────────
+// ── Batch arming through the PreToolUse hook: debt transfer (misc 189) ───────
+//
+// The ruling: landing a worktree transfers its worker's **unpaid** diagnostics
+// debt to the landing agent, and nothing more. A worktree whose worker **paid**
+// its gate lands debt-free; the old content-based arm (arm the whole landed
+// diff regardless of payment) is retired. These tests drive the full chain: the
+// owner subagent edits (and optionally pays) through the real hook IPC, then the
+// landing agent runs the real `PreToolUse` hook for `catenary worktree land` and
+// a bare diagnostics run — asserting the transfer, not the content.
 
-/// The mock language for the batch-arming test: files with this extension are
-/// covered by mockls, so land's resolved write-set enters the batch.
+/// The mock language: files with this extension are covered by mockls, so the
+/// owner's edits accumulate and land's transfer set enters the landing batch.
 const LAND_LANG: &str = "wLnd1";
 
+/// The owner subagent's identity — the session the worktree records in its
+/// sidecar (the parent session) and its agent id (the worktree's leaf dirname).
+const OWNER_SESSION: &str = "land-test";
+const OWNER_AGENT: &str = "w1";
+
 /// Drives the real `catenary hook pre-tool` binary for a Claude `Bash`
-/// `tool_input.command` under `state_home`, with PATH restored (the land
-/// resolver arm shells out to git). Returns the hook's stdout — a deny JSON,
-/// or empty on allow.
-fn pre_tool_bash(state_home: &str, command: &str) -> String {
+/// `tool_input.command` under `state_home`, carrying the landing agent's
+/// `session_id` (so the daemon routes to the same session that holds the owner's
+/// batch) with PATH restored (the land resolver shells out to git). Returns the
+/// hook's stdout — a deny JSON, or empty on allow.
+fn pre_tool_land(state_home: &str, session_id: &str, command: &str) -> String {
     let payload = json!({
         "tool_name": "Bash",
+        "session_id": session_id,
         "tool_input": { "command": command },
     });
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
@@ -403,25 +418,10 @@ fn pre_tool_bash(state_home: &str, command: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-#[test]
-fn land_write_set_arms_the_diagnostics_batch_via_the_hook() {
-    // The full first-class arming chain: the PreToolUse hook resolves land's
-    // write set (the worktree's changed paths mapped onto the owning repo) and
-    // records it into the caller's diagnostics batch — exactly like `git apply`
-    // — then the daemon applies and removes, and a bare diagnostics run walks
-    // exactly the landed paths.
-    let repo_dir = tempfile::tempdir().expect("repo dir");
-    let repo = repo_dir.path().join("repo");
-    std::fs::create_dir_all(&repo).expect("mkdir repo");
-    run_git(&repo, &["init", "-q"]);
-    run_git(&repo, &["config", "user.email", "t@example.com"]);
-    run_git(&repo, &["config", "user.name", "Test"]);
-    std::fs::write(repo.join(format!("tracked.{LAND_LANG}")), "echo hello\n")
-        .expect("write tracked");
-    run_git(&repo, &["add", "."]);
-    run_git(&repo, &["commit", "-q", "-m", "init"]);
-
-    // Daemon with mockls covering `.wLnd1` files and the repo as the sole root.
+/// Spawns the daemon with mockls covering `.wLnd1`, the repo as the sole root,
+/// and an active `[commands]` allowlist (so the land command's write resolver
+/// runs — an absent section short-circuits resolution). Returns the bridge.
+fn spawn_land_daemon(repo: &Path) -> BridgeProcess {
     let lsp = mockls_lsp_arg(LAND_LANG, "");
     let root = repo.to_str().expect("repo path").to_string();
     let bridge = BridgeProcess::spawn_with(move |cmd| {
@@ -433,9 +433,6 @@ fn land_write_set_arms_the_diagnostics_batch_via_the_hook() {
     })
     .expect("spawn daemon");
     let state_home = bridge.state_home().to_string();
-
-    // An active command allowlist so the hook's write resolver runs (an absent
-    // `[commands]` section short-circuits resolution entirely).
     let cfg_dir = xdg_config_home(&state_home).join("catenary");
     std::fs::create_dir_all(&cfg_dir).expect("mkdir config dir");
     std::fs::write(
@@ -443,62 +440,213 @@ fn land_write_set_arms_the_diagnostics_batch_via_the_hook() {
         "[commands]\nallow = [\"git\"]\npipeline = [\"grep\"]\n",
     )
     .expect("write commands config");
+    bridge
+}
+
+/// Pins `path` as a tracked root via `tool/roots-add` (the `catenary pin` path).
+///
+/// Both the owning repo AND the worktree are pinned as tracker roots so both
+/// survive the `sync_roots` a pin triggers (which rebuilds the primary session's
+/// roots from tracker contributors only — a `CATENARY_ROOTS`-seeded root that is
+/// not also a tracker contributor would be dropped). The owner's edits then
+/// accumulate as covered inside the worktree, and the landed files map onto the
+/// still-tracked owning repo.
+fn pin_root(socket: &Path, path: &Path) {
+    ipc_request(
+        socket,
+        &json!({
+            "method": "tool/roots-add",
+            "path": path.to_str().expect("root path"),
+        }),
+    )
+    .expect("pin root");
+}
+
+/// Records one covered edit into the OWNER's batch (`OWNER_SESSION`/`OWNER_AGENT`)
+/// via the real editing-state hook IPC — the worker touching a file in its
+/// worktree.
+fn owner_edits(socket: &Path, file: &Path) {
+    ipc_request(
+        socket,
+        &json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": "Edit",
+            "file_path": file.to_str().expect("file path"),
+            "session_id": OWNER_SESSION,
+            "agent_id": OWNER_AGENT,
+        }),
+    )
+    .expect("owner edit");
+}
+
+/// Pays the OWNER's gate — a bare `catenary diagnostics` for its batch: prepare
+/// the handoff, then consume it, flipping every batch file to delivered.
+fn owner_pays(bridge: &BridgeProcess, socket: &Path) {
+    ipc_request(
+        socket,
+        &json!({
+            "method": "pre-tool/editing-stop",
+            "session_id": OWNER_SESSION,
+            "agent_id": OWNER_AGENT,
+        }),
+    )
+    .expect("owner prepare handoff");
+    ipc_request_long(
+        socket,
+        bridge.daemon_pid(),
+        &json!({
+            "method": "tool/editing-stop",
+            "session_id": OWNER_SESSION,
+            "agent_id": OWNER_AGENT,
+        }),
+    )
+    .expect("owner consume handoff");
+}
+
+/// The landing agent's bare `catenary diagnostics` receipt for its own batch
+/// (session `OWNER_SESSION`, main agent `""`) after the land — the transfer's
+/// visible effect.
+fn landing_receipt(bridge: &BridgeProcess, socket: &Path) -> String {
+    ipc_request(
+        socket,
+        &json!({
+            "method": "pre-tool/editing-stop",
+            "session_id": OWNER_SESSION,
+            "agent_id": "",
+        }),
+    )
+    .expect("landing prepare handoff");
+    let text = ipc_request_long(
+        socket,
+        bridge.daemon_pid(),
+        &json!({
+            "method": "tool/editing-stop",
+            "session_id": OWNER_SESSION,
+            "agent_id": "",
+        }),
+    )
+    .expect("landing consume handoff");
+    diagnostics_output(&text)
+}
+
+#[test]
+fn land_of_a_paid_worktree_arms_nothing() {
+    // Acceptance: a worktree whose worker PAID its gate before landing arms
+    // nothing — re-arming would pay already-paid debt.
+    let repo_dir = tempfile::tempdir().expect("repo dir");
+    let repo = repo_dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    run_git(&repo, &["init", "-q"]);
+    run_git(&repo, &["config", "user.email", "t@example.com"]);
+    run_git(&repo, &["config", "user.name", "Test"]);
+    std::fs::write(repo.join(format!("tracked.{LAND_LANG}")), "echo hello\n")
+        .expect("write tracked");
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-q", "-m", "init"]);
+
+    let bridge = spawn_land_daemon(&repo);
+    let state_home = bridge.state_home().to_string();
+    let socket = bridge.wait_for_ipc_socket().expect("daemon socket");
 
     let worktree = create_worktree(&state_home, &repo);
-    std::fs::write(
-        worktree.join(format!("tracked.{LAND_LANG}")),
-        "echo changed\n",
-    )
-    .expect("modify tracked");
-    std::fs::write(worktree.join(format!("new.{LAND_LANG}")), "echo new\n").expect("add untracked");
+    // Pin both the owning repo and the worktree as tracker roots (see `pin_root`).
+    pin_root(&socket, &repo);
+    pin_root(&socket, &worktree);
 
-    // The daemon must be up before the hook runs (the hook silently no-ops
-    // without a socket, which would drop the write-set on the floor).
-    bridge.wait_for_ipc_socket().expect("daemon socket");
+    // The worker edits a covered file in the worktree, then PAYS its gate.
+    let edited = worktree.join(format!("tracked.{LAND_LANG}"));
+    std::fs::write(&edited, "echo changed\n").expect("modify tracked");
+    owner_edits(&socket, &edited);
+    owner_pays(&bridge, &socket);
 
-    // Drive the REAL PreToolUse hook with the land command. On allow it emits
-    // nothing (or a non-deny context payload); the resolved write set rides the
-    // `pre-tool/editing-state` IPC into the batch.
-    let hook_out = pre_tool_bash(
+    // The landing agent runs the real land hook, then lands.
+    let hook_out = pre_tool_land(
         &state_home,
+        OWNER_SESSION,
         &format!("catenary worktree land {}", worktree.display()),
     );
     assert!(
         !hook_out.contains("\"deny\"") && !hook_out.to_lowercase().contains("permissiondecision"),
         "the land command must pass the hook: {hook_out}"
     );
-
-    // Land for real so the files exist in the owning repo.
     let resp = land(&bridge, &worktree, false);
     assert_eq!(resp["status"], "ok", "land response: {resp}");
 
-    // Bare diagnostics for the same (session, agent) key the hook recorded
-    // under: prepare the handoff, then consume it. The receipt must walk
-    // exactly the landed paths.
-    let socket = bridge.wait_for_ipc_socket().expect("socket");
-    ipc_request(
-        &socket,
-        &json!({ "method": "pre-tool/editing-stop", "agent_id": "" }),
-    )
-    .expect("prepare handoff");
-    let text = ipc_request_long(
-        &socket,
-        bridge.daemon_pid(),
-        &json!({ "method": "tool/editing-stop" }),
-    )
-    .expect("consume handoff");
-    let receipt = diagnostics_output(&text);
+    // The landing agent's batch is empty — a paid worktree lands debt-free. The
+    // daemon returns an empty receipt for a genuinely empty batch (the CLI is what
+    // prints `[no edited files]`), so the diagnostics output is empty and never
+    // names the already-paid file.
+    let receipt = landing_receipt(&bridge, &socket);
+    assert!(
+        receipt.trim().is_empty(),
+        "a paid worktree must arm nothing on the landing agent:\n{receipt}"
+    );
+    assert!(
+        !receipt.contains(&format!("tracked.{LAND_LANG}")),
+        "the already-paid file must not re-arm the landing gate:\n{receipt}"
+    );
+}
 
+#[test]
+fn land_of_an_unpaid_worktree_transfers_exactly_its_unpaid_files() {
+    // Acceptance: a worktree with UNPAID entries transfers exactly those files'
+    // debt to the landing agent — and only the ones that actually land.
+    let repo_dir = tempfile::tempdir().expect("repo dir");
+    let repo = repo_dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    run_git(&repo, &["init", "-q"]);
+    run_git(&repo, &["config", "user.email", "t@example.com"]);
+    run_git(&repo, &["config", "user.name", "Test"]);
+    std::fs::write(repo.join(format!("tracked.{LAND_LANG}")), "echo hello\n")
+        .expect("write tracked");
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-q", "-m", "init"]);
+
+    let bridge = spawn_land_daemon(&repo);
+    let state_home = bridge.state_home().to_string();
+    let socket = bridge.wait_for_ipc_socket().expect("daemon socket");
+
+    let worktree = create_worktree(&state_home, &repo);
+    // Pin both the owning repo and the worktree as tracker roots (see `pin_root`).
+    pin_root(&socket, &repo);
+    pin_root(&socket, &worktree);
+
+    // The worker edits two covered files in the worktree and NEVER pays — a
+    // worker interrupted before `catenary diagnostics`.
+    let tracked = worktree.join(format!("tracked.{LAND_LANG}"));
+    let created = worktree.join(format!("new.{LAND_LANG}"));
+    std::fs::write(&tracked, "echo changed\n").expect("modify tracked");
+    std::fs::write(&created, "echo new\n").expect("add untracked");
+    owner_edits(&socket, &tracked);
+    owner_edits(&socket, &created);
+
+    // The landing agent runs the real land hook, then lands.
+    let hook_out = pre_tool_land(
+        &state_home,
+        OWNER_SESSION,
+        &format!("catenary worktree land {}", worktree.display()),
+    );
+    assert!(
+        !hook_out.contains("\"deny\"") && !hook_out.to_lowercase().contains("permissiondecision"),
+        "the land command must pass the hook: {hook_out}"
+    );
+    let resp = land(&bridge, &worktree, false);
+    assert_eq!(resp["status"], "ok", "land response: {resp}");
+
+    // The landing agent's batch armed for exactly the two unpaid files, mapped
+    // onto the owning repo — the debt transferred (a non-empty receipt naming
+    // both files; an empty receipt would mean nothing armed).
+    let receipt = landing_receipt(&bridge, &socket);
+    assert!(
+        !receipt.trim().is_empty(),
+        "unpaid debt must transfer to the landing agent:\n{receipt}"
+    );
     assert!(
         receipt.contains(&format!("tracked.{LAND_LANG}")),
-        "the batch armed for the landed tracked file:\n{receipt}"
+        "the unpaid tracked file's debt transferred:\n{receipt}"
     );
     assert!(
         receipt.contains(&format!("new.{LAND_LANG}")),
-        "the batch armed for the landed untracked file:\n{receipt}"
-    );
-    assert!(
-        !receipt.contains("no edited files"),
-        "the batch must not be empty after the hook recorded land's write set:\n{receipt}"
+        "the unpaid new file's debt transferred:\n{receipt}"
     );
 }

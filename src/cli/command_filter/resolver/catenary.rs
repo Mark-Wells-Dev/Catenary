@@ -1,22 +1,33 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Write-set resolution for `catenary worktree land` (misc 158).
+//! Write-set resolution for `catenary worktree land` (misc 158; debt-transfer
+//! semantics misc 189).
 //!
 //! `catenary worktree land <path>` writes the worktree's complete diff into the
 //! owning repo — a Write in `catenary`-subcommand clothing, exactly like
 //! `git apply` is a Write in git clothing (decision 026 §2). So it must stay
 //! inside the writes-resolve-or-deny law: the PreToolUse hook resolves land's
-//! write set *before* execution and records it into the diagnostics batch, so
-//! landing through the verb arms the gate precisely like today's manual
-//! `git apply` path.
+//! write set *before* execution and carries it on the allowed request.
 //!
-//! The write set is exactly `worktree diff --name-only` mapped onto the owning
-//! repo: read the worktree's sidecar for its `source_repo`, ask git for the
+//! The resolved write set is exactly `worktree diff --name-only` mapped onto the
+//! owning repo: read the worktree's sidecar for its `source_repo`, ask git for the
 //! changed-path list ([`crate::worktree_land::worktree_changed_paths`]), and
 //! join each onto the owning repo root. A computed worktree argument (a `$VAR` /
 //! `$(…)` / unquoted glob), a missing sidecar, or a git-query failure is Opaque
 //! — the same fail-closed direction as `git apply`.
+//!
+//! What that write set arms is the misc-189 correction. It is **not** the debt:
+//! the ruling is that landing a worktree whose worker **paid** its diagnostics
+//! gate arms nothing, and one with **unpaid** entries transfers exactly those
+//! files' debt — content-based arming (arm the whole landed diff) both
+//! double-pays already-paid content and splits inconsistently at larger file
+//! counts. So the resolved set is the *candidate* (which files landed, opaque-
+//! gated); the daemon's `handle_worktree_land_debt_transfer`
+//! intersects it with the owner's still-unpaid ledger — keyed
+//! `(sidecar.session_id, worktree_owner_label)` — and arms only that transfer.
+//! The resolver stays the client-side opaque gate and the landed-set source; the
+//! debt decision is the daemon ledger's, the only authority on payment.
 //!
 //! Every other `catenary` subcommand introduces no *attributable* uncommitted
 //! content into the working tree (they run under the canonical-form matcher,

@@ -188,15 +188,36 @@ impl HookRouter {
                     // Resolved shell writes attribute exactly like edits
                     // (ws38 ticket 02): covered targets enter the caller's
                     // modified-set, the first one entering editing mode.
+                    //
+                    // `catenary worktree land` is the one exception (misc 189):
+                    // its resolved write-set is the whole landed diff, but the
+                    // ruling says debt *transfers* from the owner, never
+                    // duplicates. So a land arms only the subset of the landed
+                    // files whose owner left them UNPAID — read from the owner's
+                    // ledger, not the git content. A worktree whose worker paid
+                    // (or whose batch died with a bounced daemon, bug 79) arms
+                    // nothing.
                     if !writes.is_empty() {
                         for write in &writes {
                             self.session.record_activity_touch(write);
                         }
-                        self.handle_shell_write_accumulation(
-                            &writes,
-                            session_id.as_deref(),
-                            &agent_id,
-                        );
+                        if let Some(land_path) = command
+                            .as_deref()
+                            .and_then(crate::cli::command_filter::worktree_land_path)
+                        {
+                            self.handle_worktree_land_debt_transfer(
+                                &land_path,
+                                &writes,
+                                session_id.as_deref(),
+                                &agent_id,
+                            );
+                        } else {
+                            self.handle_shell_write_accumulation(
+                                &writes,
+                                session_id.as_deref(),
+                                &agent_id,
+                            );
+                        }
                     }
                 }
                 // Deliver any pending parent-agent context on an allowed
@@ -719,6 +740,94 @@ impl HookRouter {
                 self.session
                     .editing
                     .record_uncovered_edit(session_id, agent_id, name);
+            }
+        }
+    }
+
+    /// Transfer a landed worktree's **unpaid** diagnostics debt to the landing
+    /// agent (misc 189) — the ruled land/ledger seam.
+    ///
+    /// Landing a worktree takes on its content, and — per the maintainer's ruling
+    /// — its debt: exactly the files the worker left **unpaid** (never ran
+    /// `catenary diagnostics` over), and nothing more. Debt follows unpaid
+    /// content and *transfers*; it never duplicates. This replaces the retired
+    /// content-based arm (which armed the whole landed diff regardless of
+    /// payment, and split inconsistently at larger file counts — misc 189's dig).
+    ///
+    /// Reads the worktree's sidecar for the owner's `(session_id, source_repo)`,
+    /// derives the owner's `agent_id` from the worktree's leaf directory name
+    /// ([`crate::worktree_land::worktree_owner_label`], bug 91), and looks the
+    /// owner's still-undelivered batch up in this session's ledger. The batch is
+    /// keyed `(session_id, agent_id)` and lives with the daemon instance — so a
+    /// worktree whose worker **paid**, whose worker **never edited**, or whose
+    /// batch **died with a bounced daemon** (bug 79) all present the same
+    /// debt-free ledger and arm nothing (the never-lock-out doctrine).
+    ///
+    /// `landed` is the land's resolved write-set (the applied files, mapped onto
+    /// the owning repo). The transfer is the owner-unpaid set intersected with
+    /// what actually landed ([`crate::worktree_land::owner_unpaid_landed`]): a
+    /// file the owner never paid but that did not land (a conflict) transfers no
+    /// debt. Each transferred path is recorded into the landing agent's batch
+    /// exactly like a covered edit, the first one entering editing mode.
+    ///
+    /// A missing/unparseable sidecar, or a non-covered owner session, arms
+    /// nothing — a silent no-op, never a lock-out.
+    fn handle_worktree_land_debt_transfer(
+        &self,
+        land_path: &str,
+        landed: &[PathBuf],
+        session_id: Option<&str>,
+        agent_id: &str,
+    ) {
+        // Canonicalize the worktree path the same way the daemon land handler
+        // does, so the owner's canonical batch paths strip-prefix cleanly.
+        let worktree = Path::new(land_path)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(land_path));
+
+        // The owner's identity: session + owning repo from the sidecar, agent id
+        // from the worktree's leaf directory name.
+        let sidecar = crate::worktree_create::sidecar_path(&worktree);
+        let Some(meta) = std::fs::read_to_string(&sidecar)
+            .ok()
+            .and_then(|c| serde_json::from_str::<crate::worktree_create::WorktreeMeta>(&c).ok())
+        else {
+            return; // not a registered worktree — nothing to transfer
+        };
+        let owner_label = crate::worktree_land::worktree_owner_label(&worktree);
+
+        // The owner's still-unpaid batch (debt-free if empty — paid, un-edited, or
+        // died with a bounced daemon). Keyed on the owner's recorded session.
+        let owner_session = (!meta.session_id.is_empty()).then_some(meta.session_id.as_str());
+        let owner_unpaid = self
+            .session
+            .editing
+            .undelivered_files(owner_session, &owner_label);
+        if owner_unpaid.is_empty() {
+            return;
+        }
+
+        // Transfer exactly the unpaid files that actually landed, mapped onto the
+        // owning repo.
+        let landed_set: std::collections::BTreeSet<PathBuf> = landed.iter().cloned().collect();
+        let transfer = crate::worktree_land::owner_unpaid_landed(
+            &owner_unpaid,
+            &worktree,
+            &meta.source_repo,
+            &landed_set,
+        );
+
+        let mut started = self.session.editing.is_editing(session_id, agent_id);
+        for path in &transfer {
+            // Canonicalize (when it exists) before the coverage check and record,
+            // matching `handle_shell_write_accumulation`'s canonical alignment.
+            let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if self.session.covered_for_diagnostics(&path) {
+                if !started {
+                    let _ = self.session.editing.start_editing(session_id, agent_id);
+                    started = true;
+                }
+                self.record_covered_write(&path, session_id, agent_id, "landed");
             }
         }
     }

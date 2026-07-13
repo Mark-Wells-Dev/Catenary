@@ -596,6 +596,50 @@ pub fn extract_command_names(cmd: &str) -> Vec<String> {
     parse::parse(cmd).command_positions()
 }
 
+/// The literal worktree-path operand of a `catenary worktree land <path>` command,
+/// if the command is exactly that shape (misc 189).
+///
+/// The daemon reads this from the `PreToolUse` shell command to look the landing
+/// worktree's owner up in the diagnostics ledger and transfer its unpaid debt (the
+/// arming leg moved off the content-based resolver arm). Walks the top-level
+/// pipeline commands for a `catenary` word whose argv recognizes as
+/// [`Sub::WorktreeLand`] and returns the first non-flag operand after `land` — the
+/// same operand [`resolver::catenary`] resolves the write-set against. A computed
+/// (`$VAR` / `$(…)`) operand is rejected: its spelling is not the real path, so it
+/// yields `None` and the arming falls through to no transfer (fail-closed, matching
+/// the resolver's opaque-path denial). `None` for any other command shape.
+#[must_use]
+pub fn worktree_land_path(command: &str) -> Option<String> {
+    let script = parse::parse(command);
+    for pipeline in &script.pipelines {
+        for cmd in &pipeline.commands {
+            if cmd.name.as_deref() != Some("catenary") {
+                continue;
+            }
+            if !matches!(
+                recognize_catenary_argv(&cmd.argv),
+                Recog::Agent(Sub::WorktreeLand)
+            ) {
+                continue;
+            }
+            // The worktree path is the first non-flag operand after `worktree land`
+            // (argv indices 0 = `worktree`, 1 = `land`). It must be literal — a
+            // computed operand's spelling is not the path, so decline.
+            for (i, word) in cmd.argv.iter().enumerate().skip(2) {
+                if word.len() > 1 && word.starts_with('-') {
+                    continue; // a flag (`--keep`), not the path operand
+                }
+                let meta = cmd.argv_meta.get(i).copied().unwrap_or_default();
+                // Literal iff no runtime substitution or live expansion reached the
+                // word — the same predicate the resolver's opaque-path gate uses.
+                let literal = !meta.value_subs && !meta.process_subs && !meta.any_live();
+                return literal.then(|| word.clone());
+            }
+        }
+    }
+    None
+}
+
 // ── Catenary command canonical-form matcher (ADR 013/014) ───────────────
 //
 // Catenary's own commands run under a *fail-closed canonical-form* regime
@@ -4535,6 +4579,50 @@ mod tests {
                 CatenaryAction::Deny(_),
             ),
             "worktree land must not pipe out",
+        );
+    }
+
+    #[test]
+    fn worktree_land_path_extracts_the_literal_worktree_operand() {
+        // The daemon reads the worktree path off the land command to look the
+        // owner's unpaid debt up (misc 189). The first non-flag operand after
+        // `land` is the path; `--keep` is skipped.
+        assert_eq!(
+            worktree_land_path("catenary worktree land /wt"),
+            Some("/wt".to_string()),
+            "the bare path operand is extracted",
+        );
+        assert_eq!(
+            worktree_land_path("catenary worktree land --keep /wt"),
+            Some("/wt".to_string()),
+            "a flag before the path is skipped",
+        );
+        assert_eq!(
+            worktree_land_path("catenary worktree land /wt --keep"),
+            Some("/wt".to_string()),
+            "a trailing flag does not shadow the path",
+        );
+    }
+
+    #[test]
+    fn worktree_land_path_is_none_for_non_land_and_computed_operands() {
+        // Only a `catenary worktree land` command yields a path; a computed
+        // operand is rejected (its spelling is not the real path — fail-closed,
+        // matching the resolver's opaque-path denial).
+        assert_eq!(
+            worktree_land_path("catenary worktree diff /wt"),
+            None,
+            "diff is not a land",
+        );
+        assert_eq!(
+            worktree_land_path("git apply patch"),
+            None,
+            "a foreign command is not a land",
+        );
+        assert_eq!(
+            worktree_land_path("catenary worktree land $WT"),
+            None,
+            "a computed (`$VAR`) operand is declined",
         );
     }
 

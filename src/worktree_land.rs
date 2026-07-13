@@ -43,10 +43,13 @@
 //!
 //! On full success the worktree is removed through the existing disposal
 //! machinery ([`crate::worktree_dispose::remove_agent_asserted`]); the caller's
-//! `--keep` flag skips that tail. Batch registration (arming the diagnostics
-//! gate for the landed paths) rides the `PreToolUse` hook's write-set resolver
-//! (misc 158, resolver arm), which records land's changed-path set into the
-//! lander's batch exactly like `git apply`.
+//! `--keep` flag skips that tail. Batch arming rides the `PreToolUse` hook, but
+//! it is **debt-transfer**, not content (misc 189): the resolver maps land's
+//! changed paths (the candidate/landed set, opaque-gated), and the daemon arms
+//! only the subset the worktree's owner left **unpaid** — read from the owner's
+//! diagnostics ledger, not the git diff. A worktree whose worker paid its gate
+//! lands debt-free. [`owner_unpaid_landed`] is the pure intersection primitive;
+//! [`worktree_owner_label`] names the owner for the ledger lookup.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -290,6 +293,69 @@ pub fn worktree_changed_paths(worktree: &Path) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
+/// The owning agent id of a worktree — its on-disk leaf directory name (bug 91's
+/// `worktree_owner_label` primitive; misc 150).
+///
+/// A subagent worktree's leaf segment **is** its agent id (`worktree_segment`
+/// stores the bare `<id>` — [`crate::worktree_create::parse_agent_id`]'s output —
+/// as the path segment), so the dir name is the self-describing owner. This is
+/// the key half of the owner's diagnostics-batch lookup: the batch is keyed
+/// `(session_id, agent_id)`, and this yields the `agent_id` the worker edited
+/// under. Falls back to the full path display when the leaf is unreadable.
+#[must_use]
+pub fn worktree_owner_label(worktree: &Path) -> String {
+    worktree.file_name().map_or_else(
+        || worktree.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+/// The subset of the owner's **unpaid** batch that actually lands, mapped onto
+/// the owning repo — the debt-transfer set (misc 189).
+///
+/// The ruling: landing a worktree whose worker **paid** its diagnostics gate arms
+/// nothing; landing one with **unpaid** entries transfers exactly those files'
+/// debt to the landing session. Debt follows content, and it transfers — never
+/// duplicates. This function computes that transfer set, purely, from the inputs
+/// the daemon has at land time:
+///
+/// - `owner_unpaid` — the owner's still-undelivered batch paths, absolute under
+///   the worktree (the daemon's ledger lookup, keyed
+///   `(sidecar.session_id, worktree_owner_label)`). An **empty** slice means the
+///   owner paid, never edited, or its batch died with a bounced daemon (bug 79) —
+///   all three are debt-free, and the result is empty (the never-lock-out
+///   doctrine: an honest nothing beats phantom debt, decision 026's annotation).
+/// - `worktree` — the owner's worktree root, to strip from each unpaid path.
+/// - `source_repo` — the owning repo root, to re-anchor each stripped path onto.
+/// - `landed` — the paths the land actually applied into the owning repo
+///   (absolute, owning-repo-relative-joined). An owner-unpaid file that did **not**
+///   land (a conflict-refused or dropped hunk) transfers no debt: only content
+///   that arrived carries its gate.
+///
+/// The result is the intersection: for each owner-unpaid path under the worktree,
+/// map it onto the owning repo and keep it only if it is in `landed`. Paths
+/// outside the worktree (a defensive guard — the ledger should never hold one)
+/// are skipped.
+#[must_use]
+pub fn owner_unpaid_landed(
+    owner_unpaid: &[PathBuf],
+    worktree: &Path,
+    source_repo: &Path,
+    landed: &std::collections::BTreeSet<PathBuf>,
+) -> std::collections::BTreeSet<PathBuf> {
+    let mut transfer = std::collections::BTreeSet::new();
+    for unpaid in owner_unpaid {
+        let Ok(rel) = unpaid.strip_prefix(worktree) else {
+            continue; // not under the worktree — never part of this land's debt
+        };
+        let mapped = source_repo.join(rel);
+        if landed.contains(&mapped) {
+            transfer.insert(mapped);
+        }
+    }
+    transfer
+}
+
 /// Whether the diff applies cleanly into the owning repo, or the conflicting
 /// paths (misc 158).
 ///
@@ -514,7 +580,10 @@ mod tests {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    use super::{LandOutcome, diff_base, land, worktree_changed_paths, worktree_diff};
+    use super::{
+        LandOutcome, diff_base, land, owner_unpaid_landed, worktree_changed_paths, worktree_diff,
+        worktree_owner_label,
+    };
     use crate::worktree_create::{
         WORKTREE_CLASS_AGENT, WORKTREE_VCS_GIT, WorktreeMeta, sidecar_path,
     };
@@ -918,6 +987,73 @@ mod tests {
             land(&meta, true),
             LandOutcome::Empty,
             "clean worktree lands nothing"
+        );
+    }
+
+    // ── misc 189: debt-transfer primitives ──────────────────────────────────
+
+    #[test]
+    fn owner_label_is_the_worktree_leaf() {
+        // The dirname IS the owner's agent id (bug 91): a subagent worktree's leaf
+        // segment is the bare `<id>` the worker edited under.
+        assert_eq!(
+            worktree_owner_label(Path::new("/wt/agents/s/w1")),
+            "w1",
+            "the leaf is the owner's agent id",
+        );
+    }
+
+    #[test]
+    fn transfer_of_a_paid_owner_is_empty() {
+        // No unpaid entries (the owner paid its gate, never edited, or its batch
+        // died with a bounced daemon) → nothing transfers, regardless of what
+        // landed. The never-lock-out doctrine, in a pure function.
+        let wt = Path::new("/wt");
+        let repo = Path::new("/repo");
+        let landed: std::collections::BTreeSet<_> =
+            [repo.join("a.rs"), repo.join("b.rs")].into_iter().collect();
+        assert!(
+            owner_unpaid_landed(&[], wt, repo, &landed).is_empty(),
+            "a paid (empty-ledger) owner transfers no debt",
+        );
+    }
+
+    #[test]
+    fn transfer_is_unpaid_intersect_landed_mapped_onto_the_repo() {
+        // The owner left three unpaid files; only two of them landed. Exactly those
+        // two transfer, re-anchored from the worktree onto the owning repo — a file
+        // that did not land carries no debt.
+        let wt = Path::new("/wt");
+        let repo = Path::new("/repo");
+        let unpaid = vec![wt.join("a.rs"), wt.join("sub/b.rs"), wt.join("dropped.rs")];
+        let landed: std::collections::BTreeSet<_> = [repo.join("a.rs"), repo.join("sub/b.rs")]
+            .into_iter()
+            .collect();
+        let transfer = owner_unpaid_landed(&unpaid, wt, repo, &landed);
+        let expected: std::collections::BTreeSet<_> = [repo.join("a.rs"), repo.join("sub/b.rs")]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            transfer, expected,
+            "only unpaid files that actually landed transfer, mapped onto the repo",
+        );
+    }
+
+    #[test]
+    fn transfer_skips_paths_outside_the_worktree() {
+        // A defensive guard: an unpaid path that is not under the worktree (the
+        // ledger should never hold one) is skipped rather than mis-mapped.
+        let wt = Path::new("/wt");
+        let repo = Path::new("/repo");
+        let unpaid = vec![Path::new("/elsewhere/x.rs").to_path_buf(), wt.join("in.rs")];
+        let mut landed = std::collections::BTreeSet::new();
+        landed.insert(repo.join("in.rs"));
+        let transfer = owner_unpaid_landed(&unpaid, wt, repo, &landed);
+        let mut expected = std::collections::BTreeSet::new();
+        expected.insert(repo.join("in.rs"));
+        assert_eq!(
+            transfer, expected,
+            "an out-of-worktree unpaid path is skipped; the in-worktree one transfers",
         );
     }
 }

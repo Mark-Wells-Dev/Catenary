@@ -248,8 +248,9 @@ pub fn run_diff(out: &mut Output, path: &Path, name_only: bool) -> Result<()> {
 /// applies the diff via `git apply --3way` (validated with a plain `--check`
 /// first, so a refusal leaves the owning repo untouched), and disposes the
 /// worktree (unless `keep`). On any failure the worktree is kept untouched and
-/// the error names the cause. The diagnostics batch arms via the `PreToolUse`
-/// hook's write-set resolver — the same first-class mechanism as `git apply`.
+/// the error names the cause. The diagnostics batch arms on the `PreToolUse`
+/// hook round-trip by transferring the worktree owner's **unpaid** debt to the
+/// landing agent (misc 189) — a paid worktree lands debt-free.
 ///
 /// # Errors
 ///
