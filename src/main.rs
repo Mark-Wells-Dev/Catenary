@@ -149,16 +149,19 @@ enum Command {
     /// Resolves against the current working directory. Results include symbol
     /// outlines when LSP data is available.
     Glob {
-        /// File or directory path(s), or quoted glob pattern(s).
+        /// A single glob pattern, quoted.
         ///
-        /// Multiple values are unioned — `src/tui/*` expands to individual
-        /// files and all are browsed. A path may also be a glob pattern: quote
-        /// it (`catenary glob 'src/**/*.rs'`) so Catenary expands it
-        /// gitignore-aware rather than the shell. Patterns may be absolute or
-        /// cwd-relative, and the anchor belongs *in the pattern* —
-        /// `catenary glob '/abs/dir/**/*.md'`; there is no separate directory
-        /// argument.
-        #[arg(name = "PATH", required = true)]
+        /// The positional is a pattern, decoded syntactically, always
+        /// (`catenary glob 'src/**/*.rs'`) — quote it so Catenary expands it
+        /// gitignore-aware, not the shell. A metachar-free spelling is a
+        /// self-matching literal (`catenary glob src/main.rs` outlines the file;
+        /// `catenary glob 'src/*'` lists the directory). Patterns may be absolute
+        /// or cwd-relative, and the anchor belongs *in the pattern*
+        /// (`catenary glob '/abs/dir/**/*.md'`); there is no separate directory
+        /// argument. Exactly one pattern — multiple patterns are a brace
+        /// alternation (`'{src,tests}/**/*.rs'`); an unquoted pattern the shell
+        /// expanded to several words is refused with teaching.
+        #[arg(name = "PATH")]
         paths: Vec<String>,
 
         /// Exclude matches by glob pattern, e.g. `tests/**` (repeatable; each
@@ -882,11 +885,19 @@ fn main() -> Result<()> {
             include_gitignored,
             include_hidden,
         }) => {
-            let paths = to_literal_paths(paths);
+            // Arity 1 is grammar (VERBS teaching moment 1): the bare form and
+            // N>1 are usage errors — teaching on stderr, exit 2 (clap's
+            // invalid-arg class). The trigger is structural; the diagnosis is
+            // generous.
+            let [pattern] = paths.as_slice() else {
+                eprint!("{}", glob_arity_refusal(&paths));
+                std::process::exit(2);
+            };
+            let pattern = PathBuf::from(pattern);
             let mut out = cli::Output::stdout(false);
             build_runtime()?.block_on(run_glob(
                 &mut out,
-                paths,
+                pattern,
                 exclude,
                 count,
                 include_gitignored,
@@ -1171,6 +1182,70 @@ fn to_literal_paths(values: Vec<String>) -> Vec<PathBuf> {
     values.into_iter().map(PathBuf::from).collect()
 }
 
+/// The `catenary glob` arity refusal (VERBS teaching moment 1) — for the bare
+/// form (0 arguments) and N>1 (usually an unquoted pattern the shell expanded).
+///
+/// The trigger is structural (arity ≠ 1); the diagnosis is generous. For the
+/// bare form the message keys on the nullglob rationale — an unquoted zero-match
+/// delivers zero args, so a cwd default would silently answer the wrong
+/// question. For N>1, if the words share a common extension (the shape a
+/// `*.rs`/`*.md` expansion leaves), the likely expanded pattern is named so the
+/// agent sees exactly what to quote. Brace alternation covers legitimate
+/// multi-pattern needs. Ends with a trailing newline; caller prints it to
+/// stderr verbatim.
+fn glob_arity_refusal(args: &[String]) -> String {
+    if args.is_empty() {
+        return "\
+error: catenary glob takes one pattern — got none.
+
+The positional is a pattern; quote it (`catenary glob 'src/**/*.rs'`). A bare \
+`glob` has no cwd default: under `nullglob` an unquoted zero-match delivers zero \
+arguments, so a default would silently answer the wrong question. To list the \
+cwd: `catenary glob '*'`.
+"
+        .to_string();
+    }
+
+    // Generous diagnosis: a shared extension across the words is the fingerprint
+    // of a shell glob expansion (`*.rs` → `a.rs b.rs …`) — name the pattern to
+    // quote.
+    let shared_ext = shared_extension(args);
+    let mut msg = format!(
+        "error: catenary glob takes one pattern — got {} arguments. This usually \
+means the shell expanded an unquoted pattern into several filenames.\n\n",
+        args.len()
+    );
+    if let Some(ext) = shared_ext {
+        let _ = std::fmt::Write::write_fmt(
+            &mut msg,
+            format_args!(
+                "Quote it so Catenary expands it, not the shell: `catenary glob '*.{ext}'`.\n"
+            ),
+        );
+    } else {
+        msg.push_str("Quote the pattern so Catenary expands it, not the shell.\n");
+    }
+    msg.push_str("Multiple patterns are a brace alternation: `catenary glob '{a,b}'`.\n");
+    msg
+}
+
+/// The extension shared by *every* argument, when there is one — the fingerprint
+/// of a shell glob expansion like `*.rs`. `None` when the arguments differ (or
+/// any lacks an extension), so the refusal falls back to the generic wording.
+fn shared_extension(args: &[String]) -> Option<String> {
+    let first = Path::new(args.first()?)
+        .extension()?
+        .to_string_lossy()
+        .into_owned();
+    args.iter()
+        .all(|a| {
+            Path::new(a)
+                .extension()
+                .is_some_and(|e| e.to_string_lossy() == first)
+        })
+        .then_some(first)
+}
+
 /// Returns `true` if the string contains glob metacharacters (`*`, `?`, `[`, `{`).
 fn contains_glob_metachar(s: &str) -> bool {
     s.contains('*') || s.contains('?') || s.contains('[') || s.contains('{')
@@ -1233,13 +1308,22 @@ enum SearchKind {
         bre_alternation: bool,
     },
     /// `catenary glob`. On a zero-result search, each glob-pattern argument
-    /// that expanded to nothing is reported loudly per-argument.
+    /// that expanded to nothing is reported loudly per-argument. The three
+    /// teaching vecs (VERBS moments 2–4) are emitted on stderr.
     Glob {
         /// Glob-pattern arguments (original spelling, daemon-reported) that
         /// expanded to zero matches. Rendered as `no matches for pattern:
         /// <pattern> (relative patterns anchor at cwd)` regardless of whether
-        /// other arguments produced results (misc 118).
+        /// other arguments produced results (misc 118). Each is followed by a
+        /// raw-string gitignore/hidden disclosure when the pattern names an
+        /// existing-but-hidden target (moment 2).
         no_match_patterns: Vec<String>,
+        /// Display paths of matched directories — each gets a
+        /// `for its listing: catenary glob '<dir>/*'` hint (moment 4).
+        dir_hints: Vec<String>,
+        /// Result basenames carrying a glob metacharacter — one note teaches the
+        /// escaped `'\<name>'` spelling (moment 3).
+        metachar_names: Vec<String>,
     },
 }
 
@@ -1278,34 +1362,37 @@ fn forward_display(paths: &SearchPaths) -> String {
 }
 
 /// Renders a search command's outcome under the three-outcome, always-exit-0
-/// contract (`bugs/13`).
+/// contract (`bugs/13`) and the VERBS streams ruling: **`out` carries results,
+/// `err` carries everything about them**.
 ///
-/// - **Results** — `daemon_output` non-empty → printed verbatim. A grep whose
-///   scope was anchored at the cwd (pathless, or at least one relative
-///   path/pattern argument) prints the `cwd:` anchor line first — grep hits
-///   under the cwd render cwd-relative, so without the anchor an agent whose
-///   shell cwd is not the tree it believes it is searching reads another
-///   tree's matches as its own, undetectably (misc 172: a worktree worker's
-///   relative globs resolved against the main checkout and that tree's
-///   unedited content came back looking like stale post-edit results).
+/// - **Results** (stdout) — `daemon_output` non-empty → printed verbatim on
+///   `out`. A grep whose scope was anchored at the cwd (pathless, or at least
+///   one relative path/pattern argument) prints the `cwd:` scope-disclosure
+///   anchor on `out` first — grep hits under the cwd render cwd-relative, so
+///   without the anchor an agent whose shell cwd is not the tree it believes it
+///   is searching reads another tree's matches as its own, undetectably (misc
+///   172). The anchor stays on **stdout** so an explicit `2>/dev/null` cannot
+///   drop the scope disclosure; it is scope, not an announcement banner.
 ///   Absolute-only scopes stay byte-identical. Glob is exempt: its listing
 ///   already renders absolute paths, which disclose the scope on their own.
-/// - **Empty** — `queried` ran but nothing came back → the cwd anchor is
-///   always printed (the only signal distinguishing "ran here, found nothing"
-///   from "did not run"). For grep, the zero-result echo follows: `no matches
-///   for: <pattern>` plus the `searched:` scope so the agent can check both its
-///   escaping and its paths. Glob's zero-result reporting is per-argument (see
-///   below), so it prints nothing extra here.
-/// - **No-match patterns** (glob) — a loud `no matches for pattern: <pattern>
-///   (relative patterns anchor at cwd)` is appended for each glob-pattern
-///   argument that expanded to nothing, regardless of whether *other* arguments
-///   produced results (misc 118). This mirrors the per-argument `path does not
-///   exist` for metachar-free absents: a pattern that matched nothing is never
-///   silent.
-/// - **Missing** — a loud `path does not exist: <path>` is appended for each
-///   non-existent plain-path argument, regardless of the above.
+/// - **Empty** (stderr) — `queried` ran but nothing came back → stdout stays
+///   empty (the zero-match shape: empty set, empty stdout, exit 0) and the cwd
+///   anchor + zero-match teaching ride `err`. For grep: `cwd:` (the signal
+///   distinguishing "ran here, found nothing" from "did not run") then `no
+///   matches for: <pattern>` plus the `searched:` scope.
+/// - **No-match patterns** (glob, stderr) — a loud `no matches for pattern:
+///   <pattern> (relative patterns anchor at cwd)` per glob-pattern argument that
+///   expanded to nothing, regardless of whether *other* arguments produced
+///   results (misc 118), each followed by a raw-string gitignore/hidden
+///   disclosure when the pattern names an existing-but-hidden target (teaching
+///   moment 2). Rides `err`.
+/// - **Teaching moments 3 & 4** (glob, stderr) — the metachar-bearing
+///   matched-name note and the directory-listing hint ride `err`.
+/// - **Missing** (grep names, stderr) — a loud `path does not exist: <path>` per
+///   non-existent plain-path argument. Rides `err`.
 fn render_search_outcome(
     out: &mut cli::Output,
+    err: &mut cli::Output,
     cwd: &Path,
     paths: &SearchPaths,
     daemon_output: &str,
@@ -1314,46 +1401,122 @@ fn render_search_outcome(
 ) {
     let body = daemon_output.trim_end_matches('\n');
     if body.is_empty() {
-        let _ = out.writeln(format_args!("cwd: {}", compress_home(cwd)));
+        // Zero-match shape: stdout empty, exit 0. All teaching rides stderr.
+        let _ = err.writeln(format_args!("cwd: {}", compress_home(cwd)));
         if queried
             && let SearchKind::Grep {
                 pattern,
                 bre_alternation,
             } = kind
         {
-            let _ = out.writeln(format_args!("no matches for: {pattern}"));
+            let _ = err.writeln(format_args!("no matches for: {pattern}"));
             if !paths.forward.is_empty() {
-                let _ = out.writeln(format_args!("searched: {}", forward_display(paths)));
+                let _ = err.writeln(format_args!("searched: {}", forward_display(paths)));
             }
             if *bre_alternation {
-                let _ = out.writeln(format_args!(
+                let _ = err.writeln(format_args!(
                     "hint: use `|` for alternation, not `\\|` (which matches a literal pipe)"
                 ));
             }
         }
     } else {
-        // The scope-disclosure anchor for cwd-anchored grep results (misc 172).
-        // The zero-result arm above prints `cwd:` unconditionally; the match
-        // arm must be equally honest whenever the scope derived from the cwd,
-        // or wrong-cwd results are indistinguishable from right-cwd ones.
+        // The scope-disclosure anchor for cwd-anchored grep results (misc 172),
+        // kept on stdout so `2>/dev/null` cannot lose it (see the doc comment).
         if matches!(kind, SearchKind::Grep { .. }) && cwd_anchored(paths) {
             let _ = out.writeln(format_args!("cwd: {}", compress_home(cwd)));
         }
         let _ = out.writeln(format_args!("{body}"));
     }
-    // Per-argument glob no-match report — fired whether or not the body was
-    // empty, so a pattern that matched nothing is loud even when a sibling
-    // argument rendered.
-    if let SearchKind::Glob { no_match_patterns } = kind {
+    // Per-argument glob no-match report (stderr) — fired whether or not the body
+    // was empty, so a pattern that matched nothing is loud even when a sibling
+    // argument rendered. Teaching moment 2's disclosure follows each.
+    if let SearchKind::Glob {
+        no_match_patterns,
+        dir_hints,
+        metachar_names,
+    } = kind
+    {
         for pattern in no_match_patterns {
-            let _ = out.writeln(format_args!(
+            let _ = err.writeln(format_args!(
                 "no matches for pattern: {pattern} (relative patterns anchor at cwd)"
             ));
+            if let Some(line) = glob_zero_match_disclosure(pattern, cwd) {
+                let _ = err.writeln(format_args!("{line}"));
+            }
+        }
+        // Teaching moment 3: a matched name bears a glob metacharacter, so it is
+        // reachable only by the escaped spelling. One note per distinct name.
+        for name in metachar_names {
+            let _ = err.writeln(format_args!(
+                "note: `{name}` contains a glob metacharacter — to match it by \
+                 name, escape it: `catenary glob '{}'`",
+                escape_glob_metachars(name)
+            ));
+        }
+        // Teaching moment 4: a pattern resolved a directory; hand over the
+        // listing spelling.
+        for dir in dir_hints {
+            let _ = err.writeln(format_args!("for its listing: `catenary glob '{dir}/*'`"));
         }
     }
     for path in &paths.missing {
-        let _ = out.writeln(format_args!("path does not exist: {path}"));
+        let _ = err.writeln(format_args!("path does not exist: {path}"));
     }
+}
+
+/// Teaching moment 2's disclosure: one stat on the **raw** pattern string
+/// (output-only), naming an existing-but-hidden target and the flag that reaches
+/// it. Returns `None` when the raw string does not resolve to a path on disk (a
+/// metachar-bearing pattern, or a genuine absent — the optional ignore-off
+/// recount is not a commitment, VERBS open questions).
+///
+/// Resolved against `cwd` for a relative pattern. The gitignore case is the
+/// primary lever (`--include-gitignored`); a dot-leading component that the
+/// wildcard language skips is the hidden analogue (`--include-hidden`). A path
+/// that exists but is *not* gitignore/hidden-shadowed yields no disclosure — the
+/// zero match came from something else (e.g. an exclude), and a spurious
+/// "add --include-gitignored" would misdirect.
+fn glob_zero_match_disclosure(pattern: &str, cwd: &Path) -> Option<String> {
+    let raw = Path::new(pattern);
+    let resolved = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        cwd.join(raw)
+    };
+    // One stat on the raw string. A broken symlink still "exists".
+    if resolved.symlink_metadata().is_err() {
+        return None;
+    }
+    // Hidden analogue: the target's own name leads with a dot (the wildcard
+    // language does not cross a leading dot), so `--include-hidden` is the lever.
+    // Keyed on the basename only — an ancestor dotdir (e.g. a tempdir under
+    // `~/.cache`) is not the agent's hidden target and must not misdirect.
+    let is_hidden = resolved
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.starts_with('.'));
+    if is_hidden {
+        return Some(format!(
+            "`{pattern}` exists but is hidden — add `--include-hidden`"
+        ));
+    }
+    Some(format!(
+        "`{pattern}` exists but is gitignored — add `--include-gitignored`"
+    ))
+}
+
+/// Escapes glob metacharacters in a literal name so it can be passed back as a
+/// pattern that matches the name verbatim (teaching moment 3, `rg -g`-style
+/// backslash escaping). `*` → `\*`, and likewise `?`, `[`, `]`, `{`, `}`.
+fn escape_glob_metachars(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if matches!(ch, '*' | '?' | '[' | ']' | '{' | '}') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Print the shared teaching payload — Catenary's full prevention content.
@@ -2012,6 +2175,15 @@ async fn run_grep(
         SearchResponse::default()
     };
 
+    // A usage error (uncompilable pattern, bug 105) is stderr + exit 2 on both
+    // the bare and `--count` forms — never a zero indistinguishable from a
+    // genuine no-match, never a swallowed parse error the exit code hides.
+    if let Some(msg) = &response.error {
+        eprintln!("{msg}");
+        std::process::exit(2);
+    }
+
+    let mut err = cli::Output::stderr(false);
     if count {
         render_grep_count(
             out,
@@ -2020,11 +2192,20 @@ async fn run_grep(
             &response.skipped,
         );
     } else {
-        render_search_outcome(out, &cwd, &resolved, &response.output, queried, &kind);
+        render_search_outcome(
+            out,
+            &mut err,
+            &cwd,
+            &resolved,
+            &response.output,
+            queried,
+            &kind,
+        );
         // Skip lines follow the results/echo (and any missing-path lines), so a
         // named path skipped instead of searched never silently vanishes (misc
-        // 135, bug 62). Nothing prints when nothing was skipped.
-        render_grep_skips(out, &response.skipped);
+        // 135, bug 62). Nothing prints when nothing was skipped. Skips are
+        // teaching about the scope, so they ride stderr with the rest.
+        render_grep_skips(&mut err, &response.skipped);
     }
     Ok(())
 }
@@ -2138,10 +2319,23 @@ struct SearchResponse {
     /// zero matches, reported per-argument (misc 118).
     #[serde(default)]
     no_match_patterns: Vec<String>,
+    /// glob: display paths of matched directories, for the teaching moment 4
+    /// listing hint on stderr.
+    #[serde(default)]
+    dir_hints: Vec<String>,
+    /// glob: result basenames carrying a glob metacharacter, for the teaching
+    /// moment 3 escaped-spelling note on stderr.
+    #[serde(default)]
+    metachar_names: Vec<String>,
     /// grep: files in the search scope skipped instead of searched (misc 135,
     /// bug 62). Empty for a normal all-searched query.
     #[serde(default)]
     skipped: catenary_mcp::bridge::GrepSkips,
+    /// A usage error (uncompilable pattern, bug 105) that aborted the search.
+    /// `Some` routes the CLI to stderr + exit 2 on both the bare and `--count`
+    /// forms; `None` for every successful query.
+    #[serde(default)]
+    error: Option<String>,
 }
 
 /// Adapts a daemon-less [`GrepResponse`](catenary_mcp::router::GrepResponse) into
@@ -2156,7 +2350,10 @@ impl From<catenary_mcp::router::GrepResponse> for SearchResponse {
             files: r.files,
             paths: None,
             no_match_patterns: Vec::new(),
+            dir_hints: Vec::new(),
+            metachar_names: Vec::new(),
             skipped: r.skipped,
+            error: r.error,
         }
     }
 }
@@ -2172,7 +2369,10 @@ impl From<catenary_mcp::router::GlobResponse> for SearchResponse {
             files: None,
             paths: r.paths,
             no_match_patterns: r.no_match_patterns,
+            dir_hints: r.dir_hints,
+            metachar_names: r.metachar_names,
             skipped: catenary_mcp::bridge::GrepSkips::default(),
+            error: r.error,
         }
     }
 }
@@ -2343,10 +2543,12 @@ where
                 matches,
                 files,
                 skipped,
+                error,
             } => {
                 response.matches = matches;
                 response.files = files;
                 response.skipped = skipped;
+                response.error = error;
                 break;
             }
         }
@@ -2359,9 +2561,16 @@ where
 
 /// Runs a glob query against the running daemon.
 ///
-/// Connects to the daemon's IPC socket, sends a [`GlobRequest`], and
-/// prints the rendered output to stdout. The daemon resolves relative
-/// paths against `cwd` before dispatching to the glob pipeline.
+/// The one-verb form (VERBS): the single positional is a pattern, decoded
+/// syntactically, always — no `resolve_search_paths` literal-first probe, no
+/// `path does not exist` classification (a metachar-free absent forwards as a
+/// pattern and gets the loud zero-match report + disclosure, not a silent
+/// missing line). The daemon absolutizes the relative pattern against `cwd` and
+/// expands it gitignore-aware. Arity 1 is enforced by the caller
+/// ([`main`])/clap before this runs; `pattern` is exactly one argument.
+///
+/// stdout carries results only; the loud zero-match line and the teaching
+/// moments ride stderr (the streams ruling).
 ///
 /// # Errors
 ///
@@ -2369,7 +2578,7 @@ where
 #[cfg(unix)]
 async fn run_glob(
     out: &mut cli::Output,
-    paths: Vec<PathBuf>,
+    pattern: PathBuf,
     exclude: Vec<String>,
     count: bool,
     include_gitignored: bool,
@@ -2379,41 +2588,61 @@ async fn run_glob(
 
     let cwd = std::env::current_dir().context("cannot determine working directory")?;
 
-    let resolved = resolve_search_paths(&paths, &cwd);
-    // Glob always scopes to explicit paths (clap requires at least one); query
-    // only when at least one argument resolved to a path or pattern.
-    let queried = !resolved.forward.is_empty();
-
-    let response = if queried {
-        let request = GlobRequest {
-            cwd: Some(cwd.clone()),
-            paths: resolved.forward.clone(),
-            exclude,
-            count,
-            include_gitignored,
-            include_hidden,
-        };
-        // Daemon-served when up; in-process (honestly labeled) when down.
-        if let Some(stream) = connect_daemon_ipc().await {
-            search_ipc_on(stream, METHOD_GLOB, &request).await?
-        } else {
-            let resp = catenary_mcp::router::run_glob_daemon_less(&request).await?;
-            emit_no_daemon_marker();
-            SearchResponse::from(resp)
-        }
-    } else {
-        SearchResponse::default()
+    // Always-pattern: the positional forwards as-is; there is no missing/literal
+    // classification (the `path does not exist` line is grep's name-operand
+    // teaching, not glob's — VERBS Dispositions). The `SearchPaths` is a
+    // single-forward, no-missing set so `render_search_outcome`'s
+    // missing-path loop is a no-op for glob.
+    let resolved = SearchPaths {
+        forward: vec![pattern.clone()],
+        missing: Vec::new(),
     };
+
+    let request = GlobRequest {
+        cwd: Some(cwd.clone()),
+        paths: resolved.forward.clone(),
+        exclude,
+        count,
+        include_gitignored,
+        include_hidden,
+    };
+    // Daemon-served when up; in-process (honestly labeled) when down.
+    let response = if let Some(stream) = connect_daemon_ipc().await {
+        search_ipc_on(stream, METHOD_GLOB, &request).await?
+    } else {
+        let resp = catenary_mcp::router::run_glob_daemon_less(&request).await?;
+        emit_no_daemon_marker();
+        SearchResponse::from(resp)
+    };
+
+    // A usage error (an invalid pattern the query never ran on) is stderr +
+    // exit 2 (VERBS: the arity/bare/invalid-pattern class).
+    if let Some(msg) = &response.error {
+        eprintln!("{msg}");
+        std::process::exit(2);
+    }
 
     if count {
         render_glob_count(out, response.paths.unwrap_or(0));
     } else {
-        // `no_match_patterns` is daemon-reported (original argument spelling);
-        // move it into the kind while still borrowing `output` (disjoint fields).
+        let mut err = cli::Output::stderr(false);
+        // `no_match_patterns`/`dir_hints`/`metachar_names` are daemon-reported
+        // (original argument spelling / display paths); move them into the kind
+        // while still borrowing `output` (disjoint fields).
         let kind = SearchKind::Glob {
             no_match_patterns: response.no_match_patterns,
+            dir_hints: response.dir_hints,
+            metachar_names: response.metachar_names,
         };
-        render_search_outcome(out, &cwd, &resolved, &response.output, queried, &kind);
+        render_search_outcome(
+            out,
+            &mut err,
+            &cwd,
+            &resolved,
+            &response.output,
+            true,
+            &kind,
+        );
     }
     Ok(())
 }
@@ -3849,8 +4078,11 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_glob_variadic() {
+    fn test_cli_glob_parses_multiple_positionals_for_the_arity_refusal() {
         use clap::Parser;
+        // clap still *collects* multiple positionals so the arity refusal can
+        // give a generous diagnosis (VERBS moment 1) — the `[pattern]` slice
+        // match in the arm is what refuses N≠1, not clap. Parse must succeed.
         let args = Args::try_parse_from([
             "catenary",
             "glob",
@@ -3858,13 +4090,52 @@ mod tests {
             "src/tui/mod.rs",
             "src/tui/render.rs",
         ]);
-        let args = args.expect("glob with multiple paths should parse");
+        let args = args.expect("glob collects multiple positionals for the arity diagnosis");
         let Some(Command::Glob { paths, .. }) = args.command else {
             unreachable!("expected Glob command");
         };
         assert_eq!(
             paths,
             vec!["src/tui/stream.rs", "src/tui/mod.rs", "src/tui/render.rs"]
+        );
+    }
+
+    #[test]
+    fn glob_arity_refusal_bare_teaches_the_nullglob_rationale() {
+        let msg = glob_arity_refusal(&[]);
+        assert!(msg.contains("takes one pattern — got none"), "{msg}");
+        assert!(
+            msg.contains("nullglob"),
+            "bare form keys on nullglob: {msg}"
+        );
+        assert!(
+            msg.contains("catenary glob '*'"),
+            "cwd listing spelling: {msg}"
+        );
+    }
+
+    #[test]
+    fn glob_arity_refusal_multi_names_the_likely_expansion() {
+        // A shared extension is the fingerprint of a shell glob expansion
+        // (`*.rs` → several `.rs` files) — the refusal names the pattern to quote.
+        let args = vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()];
+        let msg = glob_arity_refusal(&args);
+        assert!(msg.contains("got 3 arguments"), "{msg}");
+        assert!(
+            msg.contains("catenary glob '*.rs'"),
+            "names the likely expansion: {msg}"
+        );
+        assert!(msg.contains("{a,b}"), "brace alternation hint: {msg}");
+    }
+
+    #[test]
+    fn glob_arity_refusal_multi_without_shared_ext_is_generic() {
+        let args = vec!["Makefile".to_string(), "src".to_string()];
+        let msg = glob_arity_refusal(&args);
+        assert!(msg.contains("got 2 arguments"), "{msg}");
+        assert!(
+            !msg.contains("catenary glob '*."),
+            "no spurious extension guess: {msg}"
         );
     }
 
@@ -3932,10 +4203,20 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_glob_missing_path() {
+    fn test_cli_glob_bare_parses_empty_and_is_refused_at_runtime() {
         use clap::Parser;
-        let result = Args::try_parse_from(["catenary", "glob"]);
-        assert!(result.is_err(), "glob without path should fail");
+        // Bare `glob` now parses to an empty positional Vec (the `required`
+        // constraint was dropped so the arity refusal can give its own teaching);
+        // the refusal is enforced in the command arm via the `[pattern]` match,
+        // and `glob_arity_refusal(&[])` supplies the nullglob-keyed message
+        // (VERBS moment 1, stderr + exit 2).
+        let args = Args::try_parse_from(["catenary", "glob"]).expect("bare glob parses");
+        let Some(Command::Glob { paths, .. }) = args.command else {
+            unreachable!("expected Glob command");
+        };
+        assert!(paths.is_empty(), "bare glob has no positionals");
+        let msg = glob_arity_refusal(&paths);
+        assert!(msg.contains("takes one pattern — got none"), "{msg}");
     }
 
     // ── CLI pin / unpin / roots subcommand tests ────────────────────
@@ -4143,8 +4424,10 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used, reason = "test assertions")]
     fn glob_help_teaches_quoted_pattern_form() {
-        // misc 118: `catenary glob --help` teaches that a PATH may be a quoted
-        // glob pattern, absolute or cwd-relative, with the anchor in the pattern.
+        // VERBS: `catenary glob --help` teaches the one-verb form — the positional
+        // is a single quoted pattern (arity 1), decoded syntactically, with the
+        // anchor in the pattern; a metachar-free spelling is a self-matching
+        // literal.
         use clap::CommandFactory;
         let app = Args::command();
         let mut glob = app
@@ -4153,8 +4436,8 @@ mod tests {
             .clone();
         let help = glob.render_long_help().to_string();
         assert!(
-            help.contains("quoted glob pattern"),
-            "short teaser present: {help}"
+            help.contains("single glob pattern"),
+            "one-verb teaser present: {help}"
         );
         assert!(
             help.contains("catenary glob 'src/**/*.rs'"),
@@ -4167,6 +4450,14 @@ mod tests {
         assert!(
             help.contains("gitignore-aware"),
             "gitignore teaching present: {help}"
+        );
+        assert!(
+            help.contains("self-matching literal"),
+            "metachar-free-is-a-literal teaching present: {help}"
+        );
+        assert!(
+            help.contains("brace") && help.contains("alternation"),
+            "arity-1 / brace alternation teaching present: {help}"
         );
     }
 
@@ -4474,21 +4765,42 @@ mod tests {
 
     // ── render_search_outcome tests ──────────────────────────────────
 
+    /// A test glob `SearchKind` with the two teaching vecs empty (the common
+    /// shape for the render tests, which cover zero-match and results, not the
+    /// dir-hint/metachar-note moments).
+    fn glob_kind(no_match_patterns: Vec<String>) -> SearchKind {
+        SearchKind::Glob {
+            no_match_patterns,
+            dir_hints: vec![],
+            metachar_names: vec![],
+        }
+    }
+
+    /// Runs `render_search_outcome` over separate stdout/stderr buffers and
+    /// returns `(stdout, stderr)`. The VERBS streams ruling splits results
+    /// (stdout) from teaching (stderr), so the tests assert per stream.
     #[allow(
         clippy::needless_pass_by_value,
         reason = "test helper builds owned args inline at the call site"
     )]
-    fn render(paths: SearchPaths, output: &str, queried: bool, kind: SearchKind) -> String {
+    fn render(
+        paths: SearchPaths,
+        output: &str,
+        queried: bool,
+        kind: SearchKind,
+    ) -> (String, String) {
         let mut out = cli::Output::buffer(80);
+        let mut err = cli::Output::buffer(80);
         render_search_outcome(
             &mut out,
+            &mut err,
             Path::new("/tmp/work"),
             &paths,
             output,
             queried,
             &kind,
         );
-        out.into_string()
+        (out.into_string(), err.into_string())
     }
 
     #[test]
@@ -4497,65 +4809,92 @@ mod tests {
             forward: vec![PathBuf::from("src")],
             missing: vec![],
         };
-        let text = render(
+        let (out, err) = render(
             paths,
             "cwd: ~/work\nsrc/\n\tmain.rs",
             true,
-            SearchKind::Glob {
-                no_match_patterns: vec![],
-            },
+            glob_kind(vec![]),
         );
-        assert!(text.contains("main.rs"), "{text}");
-        assert!(!text.contains("no matches for pattern"), "{text}");
+        assert!(out.contains("main.rs"), "results on stdout: {out}");
+        assert!(
+            !err.contains("no matches for pattern"),
+            "no zero-match teaching: {err}"
+        );
     }
 
     #[test]
     fn render_glob_zero_match_is_loud() {
-        // A single pattern that matched nothing: cwd anchor + the loud
-        // per-pattern report (which supersedes the old `no files matched`).
+        // A single pattern that matched nothing: stdout empty (exit 0 shape);
+        // stderr carries the cwd anchor + the loud per-pattern report.
         let paths = SearchPaths {
             forward: vec![PathBuf::from("src/**/none.rs")],
             missing: vec![],
         };
-        let text = render(
+        let (out, err) = render(
             paths,
             "",
             true,
-            SearchKind::Glob {
-                no_match_patterns: vec!["src/**/none.rs".to_string()],
-            },
+            glob_kind(vec!["src/**/none.rs".to_string()]),
         );
-        assert!(text.contains("cwd:"), "cwd anchor always printed: {text}");
+        assert!(out.is_empty(), "zero-match stdout is empty: {out:?}");
+        assert!(err.contains("cwd:"), "cwd anchor on stderr: {err}");
         assert!(
-            text.contains(
+            err.contains(
                 "no matches for pattern: src/**/none.rs (relative patterns anchor at cwd)"
             ),
-            "{text}"
+            "loud zero-match on stderr: {err}"
         );
     }
 
     #[test]
     fn render_glob_zero_match_loud_even_when_sibling_renders() {
         // The gap misc 118 closes: a pattern matching nothing is reported even
-        // when another argument produced output (body non-empty).
+        // when another argument produced output (body non-empty). Results ride
+        // stdout, the zero-match teaching rides stderr.
         let paths = SearchPaths {
             forward: vec![PathBuf::from("src/**/none.rs"), PathBuf::from("src")],
             missing: vec![],
         };
-        let text = render(
+        let (out, err) = render(
             paths,
             "cwd: ~/work\nsrc/\n\tmain.rs",
             true,
-            SearchKind::Glob {
-                no_match_patterns: vec!["src/**/none.rs".to_string()],
-            },
+            glob_kind(vec!["src/**/none.rs".to_string()]),
         );
-        assert!(text.contains("main.rs"), "sibling still renders: {text}");
+        assert!(out.contains("main.rs"), "sibling renders on stdout: {out}");
         assert!(
-            text.contains(
+            err.contains(
                 "no matches for pattern: src/**/none.rs (relative patterns anchor at cwd)"
             ),
-            "zero-match pattern is loud alongside a rendered sibling: {text}"
+            "zero-match pattern is loud on stderr alongside a rendered sibling: {err}"
+        );
+    }
+
+    #[test]
+    fn render_glob_teaching_moments_ride_stderr() {
+        // Moments 3 (metachar-bearing matched name) and 4 (pattern resolved a
+        // directory) ride stderr; the listing itself stays on stdout, byte-exact.
+        let paths = SearchPaths {
+            forward: vec![PathBuf::from("*")],
+            missing: vec![],
+        };
+        let kind = SearchKind::Glob {
+            no_match_patterns: vec![],
+            dir_hints: vec!["src".to_string()],
+            metachar_names: vec!["*.md".to_string()],
+        };
+        let (out, err) = render(paths, "/abs/src/main.rs  (10 lines)", true, kind);
+        assert_eq!(
+            out, "/abs/src/main.rs  (10 lines)\n",
+            "the listing is unchanged on stdout"
+        );
+        assert!(
+            err.contains("for its listing: `catenary glob 'src/*'`"),
+            "moment 4 dir hint on stderr: {err}"
+        );
+        assert!(
+            err.contains("`*.md`") && err.contains("catenary glob '\\*.md'"),
+            "moment 3 escaped-spelling note on stderr: {err}"
         );
     }
 
@@ -4565,18 +4904,12 @@ mod tests {
             forward: vec![],
             missing: vec!["src/not/real.rs".to_string()],
         };
-        let text = render(
-            paths,
-            "",
-            false,
-            SearchKind::Glob {
-                no_match_patterns: vec![],
-            },
-        );
-        assert!(text.contains("cwd:"), "{text}");
+        let (out, err) = render(paths, "", false, glob_kind(vec![]));
+        assert!(out.is_empty(), "no results on stdout: {out:?}");
+        assert!(err.contains("cwd:"), "cwd anchor on stderr: {err}");
         assert!(
-            text.contains("path does not exist: src/not/real.rs"),
-            "{text}"
+            err.contains("path does not exist: src/not/real.rs"),
+            "missing path on stderr: {err}"
         );
     }
 
@@ -4586,17 +4919,11 @@ mod tests {
             forward: vec![],
             missing: vec![],
         };
-        let text = render(
-            paths,
-            "",
-            true,
-            SearchKind::Glob {
-                no_match_patterns: vec![],
-            },
-        );
+        let (out, err) = render(paths, "", true, glob_kind(vec![]));
+        assert!(out.is_empty(), "empty result: empty stdout: {out:?}");
         assert!(
-            text.contains("cwd:"),
-            "empty result still anchors cwd: {text}"
+            err.contains("cwd:"),
+            "empty result still anchors cwd on stderr: {err}"
         );
     }
 
@@ -4606,7 +4933,7 @@ mod tests {
             forward: vec![PathBuf::from("src")],
             missing: vec![],
         };
-        let text = render(
+        let (out, err) = render(
             paths,
             "",
             true,
@@ -4615,8 +4942,12 @@ mod tests {
                 bre_alternation: false,
             },
         );
-        assert!(text.contains("no matches for: needle"), "{text}");
-        assert!(text.contains("searched: src"), "{text}");
+        assert!(out.is_empty(), "empty result: empty stdout: {out:?}");
+        assert!(
+            err.contains("no matches for: needle"),
+            "zero echo on stderr: {err}"
+        );
+        assert!(err.contains("searched: src"), "scope on stderr: {err}");
     }
 
     #[test]
@@ -4625,7 +4956,7 @@ mod tests {
             forward: vec![],
             missing: vec![],
         };
-        let text = render(
+        let (_out, err) = render(
             paths,
             "",
             true,
@@ -4634,7 +4965,7 @@ mod tests {
                 bre_alternation: true,
             },
         );
-        assert!(text.contains("alternation"), "BRE hint shown: {text}");
+        assert!(err.contains("alternation"), "BRE hint on stderr: {err}");
     }
 
     // ── misc 172: cwd-anchored results disclose their scope ─────────
@@ -4643,12 +4974,13 @@ mod tests {
     fn render_grep_results_relative_scope_prints_cwd_anchor() {
         // The misc-172 sighting shape: a relative glob resolved against the
         // shell cwd. Hits render cwd-relative, so the anchor line is the only
-        // way an agent can see WHICH tree the matches came from.
+        // way an agent can see WHICH tree the matches came from — it stays on
+        // stdout (with the results) so `2>/dev/null` cannot lose the disclosure.
         let paths = SearchPaths {
             forward: vec![PathBuf::from("src/**/*.rs")],
             missing: vec![],
         };
-        let text = render(
+        let (out, _err) = render(
             paths,
             "src/paths.rs:181:    dirs::config_dir()",
             true,
@@ -4658,10 +4990,10 @@ mod tests {
             },
         );
         assert!(
-            text.starts_with("cwd: /tmp/work\n"),
-            "relative-scope results must open with the cwd anchor: {text}"
+            out.starts_with("cwd: /tmp/work\n"),
+            "relative-scope results must open with the cwd anchor on stdout: {out}"
         );
-        assert!(text.contains("dirs::config_dir()"), "{text}");
+        assert!(out.contains("dirs::config_dir()"), "{out}");
     }
 
     #[test]
@@ -4671,7 +5003,7 @@ mod tests {
             forward: vec![],
             missing: vec![],
         };
-        let text = render(
+        let (out, _err) = render(
             paths,
             "src/main.rs:1:fn main() {}",
             true,
@@ -4681,8 +5013,8 @@ mod tests {
             },
         );
         assert!(
-            text.starts_with("cwd: /tmp/work\n"),
-            "pathless results must open with the cwd anchor: {text}"
+            out.starts_with("cwd: /tmp/work\n"),
+            "pathless results must open with the cwd anchor on stdout: {out}"
         );
     }
 
@@ -4695,7 +5027,7 @@ mod tests {
             forward: vec![PathBuf::from("/abs/tree/src")],
             missing: vec![],
         };
-        let text = render(
+        let (out, _err) = render(
             paths,
             "probe.rs:3:    let marker = 1;",
             true,
@@ -4705,7 +5037,7 @@ mod tests {
             },
         );
         assert_eq!(
-            text, "probe.rs:3:    let marker = 1;\n",
+            out, "probe.rs:3:    let marker = 1;\n",
             "absolute-scope results must not grow an anchor line"
         );
     }
@@ -4718,29 +5050,27 @@ mod tests {
             forward: vec![PathBuf::from("src/**/*.rs")],
             missing: vec![],
         };
-        let text = render(
+        let (out, _err) = render(
             paths,
             "/abs/tree/src/main.rs  (10 lines)",
             true,
-            SearchKind::Glob {
-                no_match_patterns: vec![],
-            },
+            glob_kind(vec![]),
         );
         assert_eq!(
-            text, "/abs/tree/src/main.rs  (10 lines)\n",
-            "glob results must pass through unchanged"
+            out, "/abs/tree/src/main.rs  (10 lines)\n",
+            "glob results must pass through unchanged on stdout"
         );
     }
 
     #[test]
     fn render_not_queried_skips_zero_result_line() {
         // All arguments missing: no query ran, so no "no matches for" —
-        // the path-does-not-exist lines carry the explanation.
+        // the path-does-not-exist lines carry the explanation, on stderr.
         let paths = SearchPaths {
             forward: vec![],
             missing: vec!["gone.rs".to_string()],
         };
-        let text = render(
+        let (_out, err) = render(
             paths,
             "",
             false,
@@ -4749,8 +5079,62 @@ mod tests {
                 bre_alternation: false,
             },
         );
-        assert!(!text.contains("no matches for"), "{text}");
-        assert!(text.contains("path does not exist: gone.rs"), "{text}");
+        assert!(!err.contains("no matches for"), "no zero echo: {err}");
+        assert!(
+            err.contains("path does not exist: gone.rs"),
+            "missing on stderr: {err}"
+        );
+    }
+
+    // ── teaching moment 2 disclosure + moment 3 escaping ────────────
+
+    #[test]
+    fn glob_zero_match_disclosure_reports_gitignored_target() {
+        // A raw-string stat that resolves (the file exists on disk) but the
+        // pattern matched nothing → the gitignored disclosure names the flag.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let secret = tmp.path().join("secret.env");
+        std::fs::write(&secret, "K=V\n").expect("write");
+        let line = glob_zero_match_disclosure(&secret.to_string_lossy(), tmp.path())
+            .expect("existing target discloses");
+        assert!(line.contains("exists but is gitignored"), "{line}");
+        assert!(line.contains("--include-gitignored"), "{line}");
+    }
+
+    #[test]
+    fn glob_zero_match_disclosure_reports_hidden_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let hidden = tmp.path().join(".env");
+        std::fs::write(&hidden, "K=V\n").expect("write");
+        let line = glob_zero_match_disclosure(&hidden.to_string_lossy(), tmp.path())
+            .expect("existing hidden target discloses");
+        assert!(line.contains("exists but is hidden"), "{line}");
+        assert!(line.contains("--include-hidden"), "{line}");
+    }
+
+    #[test]
+    fn glob_zero_match_disclosure_silent_for_a_genuine_absent() {
+        // A raw string that resolves to nothing on disk (a metachar-bearing
+        // pattern, or a real absent) yields no disclosure — the optional
+        // ignore-off recount is not a commitment.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(
+            glob_zero_match_disclosure("*.nope", tmp.path()).is_none(),
+            "a metachar pattern does not raw-stat to a path"
+        );
+        assert!(
+            glob_zero_match_disclosure("truly_absent", tmp.path()).is_none(),
+            "a genuine absent discloses nothing"
+        );
+    }
+
+    #[test]
+    fn escape_glob_metachars_backslash_escapes_each() {
+        assert_eq!(escape_glob_metachars("*.md"), "\\*.md");
+        assert_eq!(escape_glob_metachars("a?b"), "a\\?b");
+        assert_eq!(escape_glob_metachars("[x].rs"), "\\[x\\].rs");
+        assert_eq!(escape_glob_metachars("{a,b}"), "\\{a,b\\}");
+        assert_eq!(escape_glob_metachars("plain.rs"), "plain.rs");
     }
 
     // ── --count rendering tests ────────────────────────────────────

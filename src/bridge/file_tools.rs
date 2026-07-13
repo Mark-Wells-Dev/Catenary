@@ -35,7 +35,7 @@ use super::SourceLines;
 use super::filesystem_manager::{
     FilesystemManager, STAT_RETRY_ATTEMPTS, format_file_size, mtime_nanos,
 };
-use super::session::{ArgResolution, ExcludeSet, expand_search_paths_grouped_cancellable};
+use super::session::{ArgResolution, ExcludeSet, expand_glob_patterns_grouped_cancellable};
 use crate::lsp::{LspClientManager, WalkBreadth};
 use crate::symbol_index::{Symbol, SymbolIndex};
 
@@ -58,7 +58,7 @@ pub(crate) mod probe {
     /// Entries visited by the expansion walk (`ResolvedGlob::expand_cancellable`).
     pub(crate) static EXPAND_ENTRIES: AtomicUsize = AtomicUsize::new(0);
     /// Entries visited by a per-resolved-directory enumeration
-    /// (`collect_dir_entries` / `count_dir_entries`).
+    /// (`collect_dir_entries`).
     pub(crate) static COLLECT_ENTRIES: AtomicUsize = AtomicUsize::new(0);
     /// Calls to `file_info` — each reads a file's content for its line count.
     pub(crate) static FILE_INFO_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -108,16 +108,6 @@ pub struct GlobInput {
     /// Working directory for cwd-scoped searches (relative patterns).
     #[serde(default)]
     pub cwd: Option<PathBuf>,
-    /// Original argument spellings, as the agent typed them, 1:1 with `paths`.
-    ///
-    /// `paths` holds the cwd-absolutized forms the pipeline expands;
-    /// `display_paths` preserves the pre-resolution spelling so a glob pattern's
-    /// cardinality header (misc 121) echoes what the agent typed — e.g.
-    /// `src/lsp/*.rs`, not its absolute form — matching the zero-match report's
-    /// original-spelling contract (misc 118). Empty when a caller builds params
-    /// without spellings; the header then falls back to the absolute pattern.
-    #[serde(default)]
-    pub display_paths: Vec<String>,
     /// Return a path count instead of rendered results (default: false).
     ///
     /// Short-circuits LSP enrichment: the pipeline reports the number of
@@ -169,16 +159,44 @@ pub enum GlobOutcome {
         /// `no matches for pattern: <pattern>` line against the *original*
         /// argument spelling (misc 118).
         no_match_indices: Vec<usize>,
+        /// Display paths of directories the query's patterns matched (VERBS
+        /// teaching moment 4). The CLI emits a `for its listing: catenary glob
+        /// '<dir>/*'` hint per directory on **stderr**, so the old spelling
+        /// `glob src` (a self-matching directory) hands over the listing form.
+        /// Deduplicated, in first-seen order.
+        dir_hints: Vec<String>,
+        /// Result basenames that carry a glob metacharacter (VERBS teaching
+        /// moment 3). The CLI emits a note teaching the escaped `'\*.md'`
+        /// spelling on **stderr**; the result paths themselves stay byte-exact
+        /// (ws35). Deduplicated, in first-seen order.
+        metachar_names: Vec<String>,
     },
     /// `--count` summary: number of resolved filesystem paths.
     Count {
-        /// Number of paths the query resolves to. A glob pattern contributes
-        /// its match set — each match counted once, file or directory alike,
-        /// the same tally as the plain output's cardinality header (misc 184).
-        /// A directly-named file counts once; a directly-named directory
-        /// counts by its listed entries.
+        /// Number of paths the query resolves to. The positional is a pattern,
+        /// so this is the pattern's match set — each match counted once, file or
+        /// directory alike (misc 184: one pattern, one set, one number). `--count`
+        /// is the sole tally on the search surface (the cardinality header
+        /// retired with the VERBS streams ruling).
         paths: usize,
     },
+}
+
+/// The daemon-side render of a glob query plus the structured teaching signals
+/// the CLI turns into stderr notes (VERBS teaching moments 2–4).
+///
+/// The daemon cannot write to the CLI's stderr — it returns these signals over
+/// IPC and the CLI (which owns the streams) emits the teaching, so teaching
+/// lives in the binary at the point of use, never the hook.
+struct RenderedGlob {
+    /// The complete stdout body (results only — no header).
+    output: String,
+    /// Argument indices whose pattern expanded to zero matches (misc 118).
+    no_match_indices: Vec<usize>,
+    /// Display paths of matched directories (teaching moment 4).
+    dir_hints: Vec<String>,
+    /// Result basenames carrying a glob metacharacter (teaching moment 3).
+    metachar_names: Vec<String>,
 }
 
 // ─── Glob tool server ─────────────────────────────────────────────────
@@ -247,13 +265,15 @@ impl GlobServer {
         // with no volume branch — the host caps only the final read. `cancel` is
         // threaded into the directory walk so a disconnected client's listing
         // stops promptly instead of running to completion (misc 140).
-        let (output, no_match_indices) = self
+        let rendered = self
             .handle_literal_paths(&input.paths, &input, &exclude, cwd, parent_id, cancel)
             .await?;
 
         Ok(GlobOutcome::Rendered {
-            output,
-            no_match_indices,
+            output: rendered.output,
+            no_match_indices: rendered.no_match_indices,
+            dir_hints: rendered.dir_hints,
+            metachar_names: rendered.metachar_names,
         })
     }
 
@@ -350,26 +370,25 @@ impl GlobServer {
 
     /// Dispatch each resolved path through the file or directory handler.
     ///
-    /// Paths that exist are dispatched directly; non-existent paths are treated
-    /// as glob patterns and expanded daemon-side via the gitignore-aware
-    /// `ignore` walker ([`expand_search_paths`](super::session::expand_search_paths)).
-    /// A shell-expanded (unquoted)
-    /// glob arrives as concrete paths and an unexpanded (quoted) glob arrives
-    /// as a pattern — both resolve to the same set here.
+    /// Every positional is a pattern (the one-verb form), expanded daemon-side
+    /// via the gitignore-aware `ignore` walker
+    /// ([`expand_glob_patterns_grouped_cancellable`](super::session::expand_glob_patterns_grouped_cancellable)).
+    /// A metachar-free argument is a self-matching literal — the glob whose only
+    /// match is that exact path — so a shell-expanded (unquoted) filename and its
+    /// quoted-pattern spelling resolve to the same set here, with uniform
+    /// gitignore semantics either way.
     ///
-    /// Returns the rendered output plus the indices (into `paths`) of
-    /// glob-pattern arguments that expanded to zero matches — the CLI turns
-    /// these into a loud per-argument `no matches for pattern` report (misc
-    /// 118).
+    /// Returns the rendered output plus the indices (into `paths`) of arguments
+    /// that expanded to zero matches — the CLI turns these into a loud
+    /// per-argument `no matches for pattern` report on **stderr**, with a
+    /// raw-string gitignore/hidden disclosure (misc 118 + the VERBS streams
+    /// ruling).
     ///
-    /// A glob-pattern argument that matched **≥1** path opens with a one-line
-    /// cardinality header — `N files match <pattern>` (singular grammar for one)
-    /// — printed *before* that pattern's per-file listings, so a
-    /// `| head`-truncated view still shows the true count (misc 121). The header
-    /// uses the pattern's original spelling ([`GlobInput::display_paths`]),
-    /// matching the zero-match report. Directory and single-file arguments
-    /// render unchanged — a directory already shows its own structure and a
-    /// named file is its own answer.
+    /// stdout carries results only: no cardinality header precedes a pattern's
+    /// listings (`--count` is the sole tally; the header retired with the
+    /// streams ruling). A pattern that resolves a directory still renders that
+    /// directory's enriched listing — the enriched dir line is an entry, not a
+    /// header.
     async fn handle_literal_paths(
         &self,
         paths: &[PathBuf],
@@ -378,18 +397,18 @@ impl GlobServer {
         cwd: Option<&Path>,
         parent_id: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<(String, Vec<usize>)> {
-        // Per-argument resolution so each pattern's matches stay grouped for its
-        // cardinality header; the flat set drives the nudge, exactly as before.
-        // The pattern expansion runs off the runtime thread so a massive pattern
-        // base directory is cancellable mid-walk (misc 140 phase 2).
+    ) -> Result<RenderedGlob> {
+        // Per-argument resolution so each pattern's zero-match report stays keyed
+        // to its argument index; the flat set drives the nudge. The pattern
+        // expansion runs off the runtime thread so a massive pattern base
+        // directory is cancellable mid-walk (misc 140 phase 2).
         let mut groups = {
             let paths = paths.to_vec();
             let include_gitignored = input.include_gitignored;
             let include_hidden = input.include_hidden;
             let cancel = cancel.clone();
             tokio::task::spawn_blocking(move || {
-                expand_search_paths_grouped_cancellable(
+                expand_glob_patterns_grouped_cancellable(
                     &paths,
                     include_gitignored,
                     include_hidden,
@@ -429,6 +448,10 @@ impl GlobServer {
 
         let mut full = String::new();
         let mut no_match_indices = Vec::new();
+        // Teaching signals (moments 3 & 4) collected as the render runs; the CLI
+        // emits the notes on stderr. First-seen order, deduplicated.
+        let mut dir_hints: Vec<String> = Vec::new();
+        let mut metachar_names: Vec<String> = Vec::new();
         for (i, group) in groups.iter().enumerate() {
             // Real walk cancellation (misc 140): the router fires this token when
             // the CLI client disconnects. Between paths — after the awaits above
@@ -438,36 +461,41 @@ impl GlobServer {
             if cancel.is_cancelled() {
                 break;
             }
-            if group.is_pattern {
-                if group.resolved.is_empty() {
-                    // A pattern that matched nothing is reported loudly CLI-side
-                    // (misc 118); nothing renders here.
-                    no_match_indices.push(i);
-                    continue;
-                }
-                // A pattern with ≥1 match opens with its cardinality header, so a
-                // `| head`-truncated view still shows the true count (misc 121).
-                // Echo the original spelling (falling back to the absolute
-                // pattern when a caller supplied no `display_paths`).
-                let display = input
-                    .display_paths
-                    .get(i)
-                    .cloned()
-                    .or_else(|| paths.get(i).map(|p| p.to_string_lossy().into_owned()))
-                    .unwrap_or_default();
-                let _ = writeln!(
-                    full,
-                    "{}",
-                    match_count_header(group.resolved.len(), &display)
-                );
+            if group.resolved.is_empty() {
+                // A pattern that matched nothing is reported loudly CLI-side on
+                // stderr (misc 118 + the VERBS streams ruling); nothing renders
+                // on stdout. Under the one-verb form every group is a pattern,
+                // so a zero-match argument is always a per-argument no-match — no
+                // cardinality header precedes the listings anymore (stdout is
+                // results only; `--count` is the sole tally).
+                no_match_indices.push(i);
+                continue;
             }
             for path in &group.resolved {
+                // Teaching moment 3: a matched name that carries a glob
+                // metacharacter is reachable only by the escaped spelling
+                // (`'\*.md'`). Record its basename so the CLI teaches it; the
+                // result path itself stays byte-exact (ws35).
+                if let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned())
+                    && name.contains(['*', '?', '[', ']', '{', '}'])
+                    && !metachar_names.contains(&name)
+                {
+                    metachar_names.push(name);
+                }
                 // Directories first — `is_dir()` follows symlinks, so a
                 // symlink-to-dir lists its contents (rather than rendering as a
                 // single file header). This dir-first order matches
                 // `collect_scoped_observations` so the listing and the changed-set
                 // nudge classify a symlink-to-dir the same way (WS31-review walk-2).
                 if path.is_dir() {
+                    // Teaching moment 4: the pattern resolved a directory; record
+                    // its display path so the CLI hands over the listing spelling
+                    // (`catenary glob '<dir>/*'`). Matches the listing's own
+                    // display: cwd-relative when cwd-scoped, else absolute.
+                    let hint = glob_display_path(path, cwd);
+                    if !dir_hints.contains(&hint) {
+                        dir_hints.push(hint);
+                    }
                     let output = self
                         .handle_glob_dir(path, input, exclude, cwd, parent_id, cancel)
                         .await?;
@@ -475,8 +503,8 @@ impl GlobServer {
                 } else if path_is_file_or_symlink_with_retry(path) {
                     // Re-stat with a bounded retry: a transient
                     // `is_file()`/`is_symlink()` miss (an atomic-rename write racing
-                    // this fresh stat) must not silently skip a named file that
-                    // `expand_search_paths` already confirmed present on disk.
+                    // this fresh stat) must not silently skip a matched file that
+                    // the pattern expansion already confirmed present on disk.
                     self.client_manager
                         .ensure_and_wait_for_paths(std::slice::from_ref(path))
                         .await;
@@ -494,15 +522,20 @@ impl GlobServer {
                 // shouldn't produce them, but be defensive.
             }
         }
-        Ok((full, no_match_indices))
+        Ok(RenderedGlob {
+            output: full,
+            no_match_indices,
+            dir_hints,
+            metachar_names,
+        })
     }
 
     /// Routes glob's scoped changed-set nudge (WS31 ticket 04,
     /// [`WalkBreadth::Scoped`](crate::lsp::WalkBreadth::Scoped)).
     ///
     /// `resolved` is the glob pattern's resolved path set (from
-    /// [`expand_search_paths`](super::session::expand_search_paths)). The breadth
-    /// of a glob walk is exactly the
+    /// [`expand_glob_patterns_grouped_cancellable`](super::session::expand_glob_patterns_grouped_cancellable)).
+    /// The breadth of a glob walk is exactly the
     /// pattern, so the observation set is: each resolved file, and each resolved
     /// directory's **immediate** entries (the files glob lists) — the same
     /// visibility (`include_gitignored`/`include_hidden`) and `exclude` filters
@@ -812,57 +845,6 @@ impl GlobServer {
         Ok(entries)
     }
 
-    /// Counts the immediate children of a directory `--count` would list —
-    /// the content-free twin of [`Self::collect_dir_entries`] (misc 159).
-    ///
-    /// Applies the identical visibility (hidden), gitignore, and `exclude`
-    /// filters as [`Self::collect_dir_entries`], so the tally equals that
-    /// function's `.len()` exactly — but it never builds a `GlobEntry` and,
-    /// crucially, never calls [`Self::file_info`]. `file_info` reads each text
-    /// file end-to-end for its line count (`FilesystemManager::line_count` →
-    /// `scan_file`); a count throws that away. Under `--count` those reads were
-    /// pure waste, and for a resolved directory of many files they were the
-    /// runaway's dominant cost (bug 78: a single-star pattern that resolves a
-    /// large directory paid N full-file reads). This reads **zero** file
-    /// content bytes.
-    ///
-    /// The walk is `max_depth(1)` and `cancel` is checked per entry, exactly as
-    /// [`Self::collect_dir_entries`], so a wide directory stays bounded and a
-    /// disconnected client stops it promptly.
-    fn count_dir_entries(
-        canonical: &Path,
-        include_gitignored: bool,
-        include_hidden: bool,
-        exclude: &ExcludeSet,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> usize {
-        let walker = WalkBuilder::new(canonical)
-            .max_depth(Some(1))
-            .git_ignore(!include_gitignored)
-            .hidden(!include_hidden)
-            .build();
-
-        let mut count = 0usize;
-        for entry in walker.flatten() {
-            #[cfg(test)]
-            probe::COLLECT_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if cancel.is_cancelled() {
-                break;
-            }
-            let entry_path = entry.into_path();
-            if entry_path.as_path() == canonical {
-                continue;
-            }
-            // Same entry-level exclude filter `collect_dir_entries` applies, so
-            // the count and the listing agree under an exclude (bug 73).
-            if exclude.is_match(&entry_path, canonical) {
-                continue;
-            }
-            count += 1;
-        }
-        count
-    }
-
     /// Runs [`Self::collect_dir_entries`] on a blocking thread (misc 140 phase 2).
     ///
     /// The one-level directory enumeration is synchronous; left on an async
@@ -902,29 +884,23 @@ impl GlobServer {
 
     /// Counts the filesystem paths a glob query resolves to (`--count`).
     ///
-    /// A **glob-pattern argument** contributes its match set — each match
-    /// counts once, file or directory alike — exactly the tally the plain
-    /// output's cardinality header reports (misc 184). The listing
-    /// legitimately descends into a matched directory to render its contents;
-    /// the count must not, or the two surfaces disagree whenever a pattern
-    /// matches directories.
+    /// Under the one-verb form every positional is a **pattern**, so the count is
+    /// the pattern's match set — each match counted once, file or directory
+    /// alike (misc 184: one pattern, one set, one number). The listing
+    /// legitimately descends into a matched directory to render its contents; the
+    /// count must not, or the two surfaces disagree whenever a pattern matches
+    /// directories. With arity 1 the whole tally reduces to the single group's
+    /// match-set size; the old shape branch (a directly-named directory counting
+    /// by its listed entries) died with the name/pattern distinction.
     ///
-    /// A **directly-named argument** mirrors [`Self::handle_literal_paths`]
-    /// dispatch — **directories first**, so a symlink-to-dir (which `is_dir()`
-    /// follows) contributes its listed entry count, exactly as the listing
-    /// renders it, rather than counting as a single file/symlink (WS31-review
-    /// D1/T1). Each named directory contributes the same filtered set
-    /// [`Self::handle_glob_dir`] renders — tallied by the content-free
-    /// [`Self::count_dir_entries`], which applies the identical filters but
-    /// reads no file content (misc 159); each remaining resolved file or
-    /// symlink-to-file counts once. LSP enrichment is skipped — a count is
-    /// pure filesystem, and reads **zero** file content bytes.
+    /// LSP enrichment is skipped — a count is pure filesystem, and reads **zero**
+    /// file content bytes.
     ///
     /// A free helper over [`FilesystemManager`] (not `&self`) so
     /// [`Self::count_paths_off_thread`] can run it in a `spawn_blocking` task —
-    /// the pattern expansion and per-directory walks are then cancellable
-    /// mid-walk once off the runtime thread (misc 140 phase 2). Every walk is the
-    /// cancellable form, so a fired token stops it promptly.
+    /// the pattern expansion is then cancellable mid-walk once off the runtime
+    /// thread (misc 140 phase 2). The expansion walk is the cancellable form, so
+    /// a fired token stops it promptly.
     fn count_paths(
         fs_manager: &FilesystemManager,
         paths: &[PathBuf],
@@ -932,13 +908,12 @@ impl GlobServer {
         include_hidden: bool,
         exclude: &ExcludeSet,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<usize> {
-        // Resolve per-argument so the exclude filter distinguishes a glob
-        // pattern's matches (filtered) from a directly-named path (never filtered
-        // — a named directory's entries are filtered downstream). This mirrors
-        // the rendered listing exactly, so `--count` and the listing agree under
-        // an exclude (bug 73).
-        let mut groups = expand_search_paths_grouped_cancellable(
+    ) -> usize {
+        // Resolve every positional as a pattern (the one-verb form), apply the
+        // exclude to each match set, and tally the survivors. This mirrors the
+        // rendered listing's match set exactly, so `--count` and the listing
+        // agree under an exclude (bug 73).
+        let mut groups = expand_glob_patterns_grouped_cancellable(
             paths,
             include_gitignored,
             include_hidden,
@@ -950,51 +925,21 @@ impl GlobServer {
             if cancel.is_cancelled() {
                 break;
             }
-            // A pattern's count is its match set — the same set the plain
-            // output's `N files match <pattern>` header reports (misc 184). A
-            // matched directory counts once; only the listing descends into it.
-            if group.is_pattern {
-                total += group.resolved.len();
-                continue;
-            }
-            for path in &group.resolved {
-                if cancel.is_cancelled() {
-                    break;
-                }
-                if path.is_dir() {
-                    let canonical = path
-                        .canonicalize()
-                        .map_err(|e| anyhow!("Path does not exist: {}: {e}", path.display()))?;
-                    // Content-free count: mirrors the listing's filtered set exactly
-                    // but never reads a file's content for a line count it would
-                    // discard (misc 159 — the free win and the runaway's dominant
-                    // cost). `fs_manager` is no longer needed here.
-                    total += Self::count_dir_entries(
-                        &canonical,
-                        include_gitignored,
-                        include_hidden,
-                        exclude,
-                        cancel,
-                    );
-                } else if path.is_file() || path.is_symlink() {
-                    total += 1;
-                }
-            }
+            total += group.resolved.len();
         }
-        Ok(total)
+        total
     }
 
     /// Runs [`Self::count_paths`] on a blocking thread (misc 140 phase 2).
     ///
-    /// Same rationale as [`Self::collect_dir_entries_off_thread`]: the count walks
-    /// (pattern expansion + per-directory enumeration) are synchronous, so
-    /// `spawn_blocking` keeps the router's disconnect `select!` pollable and lets
-    /// the cancel token actually fire mid-walk.
+    /// Same rationale as [`Self::collect_dir_entries_off_thread`]: the count's
+    /// pattern-expansion walk is synchronous, so `spawn_blocking` keeps the
+    /// router's disconnect `select!` pollable and lets the cancel token actually
+    /// fire mid-walk.
     ///
     /// # Errors
     ///
-    /// Returns an error if a path cannot be canonicalized or the blocking task
-    /// panics.
+    /// Returns an error if the blocking task panics.
     async fn count_paths_off_thread(
         &self,
         paths: Vec<PathBuf>,
@@ -1016,25 +961,8 @@ impl GlobServer {
             )
         })
         .await
-        .map_err(|e| anyhow!("glob count walk task failed: {e}"))?
+        .map_err(|e| anyhow!("glob count walk task failed: {e}"))
     }
-}
-
-// ─── Glob pattern cardinality header ──────────────────────────────────
-
-/// Formats a glob pattern's cardinality header — one line, printed before the
-/// pattern's per-file listings so a `| head`-truncated view still shows the
-/// true count (misc 121). Singular grammar for a lone match: `1 file matches
-/// <pattern>`; plural otherwise: `N files match <pattern>`. `count` is always
-/// ≥1 (a zero-match pattern renders the `no matches for pattern` report
-/// instead).
-fn match_count_header(count: usize, display: &str) -> String {
-    let (noun, verb) = if count == 1 {
-        ("file", "matches")
-    } else {
-        ("files", "match")
-    };
-    format!("{count} {noun} {verb} {display}")
 }
 
 // ─── Outline eligibility ──────────────────────────────────────────────
@@ -1063,6 +991,19 @@ fn is_outline_suppressed(
 /// Returns `true` if the filename matches the snapshot sidecar pattern.
 fn is_snapshot(name: &str) -> bool {
     name.contains(".catenary_snapshot_")
+}
+
+/// The display form a matched path renders as — cwd-relative when the query was
+/// cwd-scoped, else absolute — matching the listing headers
+/// ([`GlobServer::handle_glob_dir`] / [`GlobServer::handle_glob_file`]).
+///
+/// Used for teaching moment 4's directory-listing hint so the
+/// `catenary glob '<dir>/*'` suggestion reads the way the agent's own paths do.
+fn glob_display_path(path: &Path, cwd: Option<&Path>) -> String {
+    cwd.and_then(|cwd| path.strip_prefix(cwd).ok()).map_or_else(
+        || path.to_string_lossy().into_owned(),
+        |rel| rel.to_string_lossy().into_owned(),
+    )
 }
 
 // ─── Outline kind filter (types and callables only) ──────────────────
@@ -1661,24 +1602,6 @@ mod tests {
         assert_eq!(pluralize_lines(1), "1 line");
         assert_eq!(pluralize_lines(2), "2 lines");
         assert_eq!(pluralize_lines(92), "92 lines");
-    }
-
-    #[test]
-    fn test_match_count_header() {
-        // Singular grammar for a lone match; plural for the rest. `count` is
-        // always ≥1 here (a zero-match pattern renders the loud report instead).
-        assert_eq!(
-            match_count_header(1, "src/lsp/glob.rs"),
-            "1 file matches src/lsp/glob.rs"
-        );
-        assert_eq!(
-            match_count_header(2, "src/lsp/*.rs"),
-            "2 files match src/lsp/*.rs"
-        );
-        assert_eq!(
-            match_count_header(42, "src/**/*.rs"),
-            "42 files match src/**/*.rs"
-        );
     }
 
     // ─── exclude filtering (bug 73) ──────────────────────────────────
@@ -2425,12 +2348,14 @@ mod tests {
         }
     }
 
-    /// T1 — `count_paths` must classify a symlink-to-dir the same way the listing
-    /// (`handle_literal_paths`, dir-first since the C1 walk-2 reorder) does:
-    /// follow the link and count the directory's listed entries (`N`), not treat
-    /// it as a single file/symlink (`1`). Pre-fix (file/symlink branch first) the
-    /// symlink-to-dir hits the `is_symlink()` branch → count `1` while the
-    /// listing renders `N` — `glob count:true` desyncs from the listing.
+    /// T1 (retargeted for the VERBS one-verb form) — a symlink-to-dir pattern is
+    /// a single self-matching path, so `--count` is `1` (the match counted once),
+    /// **not** the directory's listed entry count. Under always-pattern there is
+    /// no name/pattern dir-first branch: a matched directory counts once and only
+    /// the listing descends into it (the misc-184 ruling — one pattern, one set,
+    /// one number). The old "count follows the link and counts N entries"
+    /// expectation belonged to the name-based model, whose shape branch retired
+    /// (VERBS Dispositions: the shape refinement is the 184 species).
     #[test]
     #[cfg(unix)]
     #[allow(clippy::expect_used, reason = "test assertions")]
@@ -2467,13 +2392,12 @@ mod tests {
             input.include_hidden,
             &ExcludeSet::default(),
             &tokio_util::sync::CancellationToken::new(),
-        )
-        .expect("count_paths");
+        );
 
         assert_eq!(
-            count, N,
-            "count for a symlink-to-dir arg must equal the listing entry count \
-             (N={N}, the dir's files), not 1 (the symlink-as-file count); got {count}"
+            count, 1,
+            "a self-matching directory pattern counts once (the match set), \
+             not its {N} listed entries; only the listing descends. got {count}"
         );
     }
 
@@ -2541,6 +2465,7 @@ mod tests {
         let GlobOutcome::Rendered {
             output,
             no_match_indices,
+            ..
         } = outcome
         else {
             unreachable!("a non-count glob yields Rendered");
@@ -2670,8 +2595,7 @@ mod tests {
             false,
             &ExcludeSet::default(),
             &cancel,
-        )
-        .expect("count small b*");
+        );
         let small_expand = probe::expand_entries();
 
         // Big fixture (50× the descendants): same single-star `b*`.
@@ -2683,8 +2607,7 @@ mod tests {
             false,
             &ExcludeSet::default(),
             &cancel,
-        )
-        .expect("count big b*");
+        );
         let big_expand = probe::expand_entries();
 
         // The expansion walk is bounded by the pattern's depth (base + its
@@ -2705,11 +2628,12 @@ mod tests {
         );
     }
 
-    /// The free win (regardless of root cause) — `--count` reads ZERO file
-    /// content bytes, and issues zero line-count reads (`file_info`), even when
-    /// a directly-named directory holds thousands of files. (A *pattern* no
-    /// longer enumerates matched directories at all — misc 184 — so the named
-    /// dir is the leg where enumeration still happens.)
+    /// The free win — `--count` reads ZERO file content bytes and issues zero
+    /// line-count reads (`file_info`), even when the pattern's match set is
+    /// thousands of files. Under the one-verb form a directory pattern
+    /// self-matches once (misc 184 — no enumeration of matched dirs at all), so
+    /// this exercises the many-file leg with a `big/*` pattern that matches every
+    /// child directly.
     #[test]
     #[allow(clippy::expect_used, reason = "test assertions")]
     fn pathology_count_reads_zero_content_bytes() {
@@ -2717,25 +2641,21 @@ mod tests {
         use tokio_util::sync::CancellationToken;
 
         let n = 3000;
-        let (_guard, _base, big) = pathology_fixture(3, n);
+        let (_guard, base, _big) = pathology_fixture(3, n);
         let server = test_glob_server();
         let cancel = CancellationToken::new();
 
         probe::reset();
         let count = GlobServer::count_paths(
             &server.fs_manager,
-            &[big],
+            &[base.join("big/*")],
             false,
             false,
             &ExcludeSet::default(),
             &cancel,
-        )
-        .expect("count named big dir");
-
-        assert_eq!(
-            count, n,
-            "sanity: the named directory's children are counted"
         );
+
+        assert_eq!(count, n, "sanity: big/*'s children are each counted once");
         assert_eq!(
             probe::file_info_calls(),
             0,
@@ -2778,8 +2698,7 @@ mod tests {
             false,
             &ExcludeSet::default(),
             &cancel,
-        )
-        .expect("count b*/*");
+        );
 
         assert_eq!(
             count, constructed,
@@ -2787,11 +2706,11 @@ mod tests {
              (got {count}, expected {constructed}) — completeness, never partial"
         );
 
-        // Total entries touched: the bounded expansion walk plus one depth-1
-        // enumeration per resolved directory. That sums to `O(N)` — every
-        // resolved directory's direct children counted once — with no
-        // superlinear interaction between the sibling count and the big
-        // directory's size.
+        // Total entries touched: under the one-verb form `--count` is a single
+        // gitignore-aware expansion walk — no per-resolved-directory enumeration
+        // (a matched directory counts once, never descended). The walk stays
+        // `O(N)` — every matched path visited once — with no superlinear
+        // interaction between the sibling count and the big directory's size.
         let touched = probe::expand_entries() + probe::collect_entries();
         let budget = 3 * constructed;
         assert!(
@@ -2804,11 +2723,13 @@ mod tests {
     // ─── `--count` reports the match set (misc 184) ─────────────────────
     //
     // The sighting: `catenary glob 'tickets/*' --count` answered 753 for a
-    // pattern whose plain output's own header said `45 files match` (45
-    // subdirectories, 0 loose files). The count leg descended into matched
-    // directories (tallying their entries) while the header counted the match
-    // set. These tests mirror the ticket's probe table over a temp fixture and
-    // pin both surfaces to the same set.
+    // pattern that matched 45 subdirectories and 0 loose files. The count leg
+    // descended into matched directories (tallying their entries) instead of
+    // counting the match set. Under the VERBS one-verb form `--count` is the
+    // *sole* tally (the divergent cardinality header retired), so the divergence
+    // class is structurally impossible — these tests pin `count_paths` to an
+    // independent match-set oracle over the ticket's probe fixture, keeping the
+    // "count must not descend" tooth.
 
     /// Builds the misc-184 fixture mirroring the ticket's probe table:
     /// `tickets/` holds three subdirectories (two files each) and no loose
@@ -2842,7 +2763,6 @@ mod tests {
     }
 
     /// Runs [`GlobServer::count_paths`] for a single pattern argument.
-    #[allow(clippy::expect_used, reason = "test helper")]
     fn misc184_count(server: &GlobServer, pattern: PathBuf) -> usize {
         GlobServer::count_paths(
             &server.fs_manager,
@@ -2852,46 +2772,35 @@ mod tests {
             &ExcludeSet::default(),
             &tokio_util::sync::CancellationToken::new(),
         )
-        .expect("count_paths")
     }
 
-    /// Extracts the tally from the plain output's cardinality header — the
-    /// leading `N` of `N files match <pattern>` (or `1 file matches`) — by
-    /// running the real render pipeline (`execute`, count off).
+    /// Independent match-set oracle: the number of paths the glob pattern
+    /// resolves to, computed straight from the daemon-side expansion (not
+    /// `count_paths`). This is the "one set" the ticket cares about — every
+    /// match counted once, a matched directory *not* descended into. Comparing
+    /// `count_paths` against it pins that the count leg reports the match set,
+    /// never the descended contents (the misc-184 double-count).
     #[allow(clippy::expect_used, reason = "test helper")]
-    fn misc184_header_tally(
-        server: &GlobServer,
-        rt: &tokio::runtime::Runtime,
-        pattern: &Path,
-    ) -> usize {
-        let params = serde_json::json!({ "paths": [pattern.to_string_lossy()] });
+    fn misc184_match_set(pattern: &Path) -> usize {
         let cancel = tokio_util::sync::CancellationToken::new();
-        let outcome = rt
-            .block_on(server.execute(&params, None, &cancel))
-            .expect("execute glob");
-        let GlobOutcome::Rendered { output, .. } = outcome else {
-            unreachable!("a non-count glob yields Rendered");
-        };
-        output
-            .lines()
-            .next()
-            .expect("cardinality header line")
-            .split_whitespace()
-            .next()
-            .expect("header tally")
-            .parse()
-            .expect("header tally is a number")
+        let groups = crate::bridge::session::expand_glob_patterns_grouped_cancellable(
+            std::slice::from_ref(&pattern.to_path_buf()),
+            false,
+            false,
+            &cancel,
+        );
+        groups.iter().map(|g| g.resolved.len()).sum()
     }
 
-    /// A pattern matching only directories counts the match set — the tally the
-    /// plain header reports — not the directories' contents. Also covers the
-    /// ticket's mixed `archive/*` probe: loose files and subdirectories each
-    /// count once.
+    /// A pattern matching only directories counts the match set — one number —
+    /// not the directories' contents. Also covers the ticket's mixed
+    /// `archive/*` probe: loose files and subdirectories each count once. Under
+    /// the one-verb form `--count` is the sole tally, so the retained tooth is
+    /// `count_paths` == the independent match-set oracle (the header the old
+    /// version compared against retired with the VERBS streams ruling).
     #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn misc184_dir_match_count_equals_header_tally() {
+    fn misc184_dir_match_count_equals_match_set() {
         let (_guard, base) = misc184_fixture();
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let server = test_glob_server();
 
         // Directory-only match set: 3 dirs, 0 loose files — the sighting's
@@ -2899,10 +2808,10 @@ mod tests {
         let pattern = base.join("tickets/*");
         let count = misc184_count(&server, pattern.clone());
         assert_eq!(count, 3, "tickets/* matches 3 dirs — each counts once");
-        let header = misc184_header_tally(&server, &rt, &pattern);
         assert_eq!(
-            count, header,
-            "--count ({count}) and the plain header ({header}) report the same set"
+            count,
+            misc184_match_set(&pattern),
+            "--count reports the match set, not the descended dir contents"
         );
 
         // Mixed match set (the archive probe): 2 files + 2 dirs = 4, not
@@ -2910,40 +2819,36 @@ mod tests {
         let pattern = base.join("archive/*");
         let count = misc184_count(&server, pattern.clone());
         assert_eq!(count, 4, "archive/* matches 2 files + 2 dirs — each once");
-        let header = misc184_header_tally(&server, &rt, &pattern);
         assert_eq!(
-            count, header,
-            "--count ({count}) and the plain header ({header}) report the same set"
+            count,
+            misc184_match_set(&pattern),
+            "--count reports the match set, not the descended dir contents"
         );
     }
 
     /// A flat all-files pattern was correct before the fix and stays so — the
     /// common case that let the bug survive.
     #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
     fn misc184_flat_file_match_count_unchanged() {
         let (_guard, base) = misc184_fixture();
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let server = test_glob_server();
 
         let pattern = base.join("misc/*");
         let count = misc184_count(&server, pattern.clone());
         assert_eq!(count, 4, "misc/* matches the 4 flat files");
-        let header = misc184_header_tally(&server, &rt, &pattern);
         assert_eq!(
-            count, header,
-            "--count ({count}) and the plain header ({header}) report the same set"
+            count,
+            misc184_match_set(&pattern),
+            "--count reports the match set"
         );
     }
 
     /// Recursive `**/*` over a nested tree carries the same mechanism — dirs at
-    /// depth ≥1 also match, and each counts once, exactly as the header tallies
-    /// it (the ticket's unverified probe, confirmed here).
+    /// depth ≥1 also match, and each counts once (the ticket's unverified probe,
+    /// confirmed here).
     #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn misc184_recursive_count_equals_header_tally() {
+    fn misc184_recursive_count_equals_match_set() {
         let (_guard, base) = misc184_fixture();
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let server = test_glob_server();
 
         // tickets/**/* matches every path below tickets/: 3 dirs + 6 files.
@@ -2955,10 +2860,10 @@ mod tests {
             count, 9,
             "tickets/**/* matches 3 dirs + 6 files — each path once"
         );
-        let header = misc184_header_tally(&server, &rt, &pattern);
         assert_eq!(
-            count, header,
-            "--count ({count}) and the plain header ({header}) report the same set"
+            count,
+            misc184_match_set(&pattern),
+            "--count reports the match set, not the descended dir contents"
         );
     }
 }

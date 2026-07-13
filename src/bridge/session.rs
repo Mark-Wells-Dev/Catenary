@@ -228,6 +228,18 @@ impl ResolvedGlob {
         if let Some(depth) = self.max_depth {
             builder.max_depth(Some(depth));
         }
+        // A fully-literal pattern (`max_depth == Some(0)`: no glob part, so
+        // `base` IS the exact target) roots the walk *at* the target, which the
+        // `ignore` walker never gitignore-filters — its own root always yields.
+        // For glob's always-pattern form that would be a metachar-free gitignore
+        // bypass (VERBS: no metachar-free bypass; `--include-gitignored` is the
+        // one lever), file or directory alike. Gate the root explicitly. The
+        // *hidden* dimension is deliberately NOT gated here: an explicitly named
+        // dot-leading target matches natively (misc 45 — the wildcard language
+        // only refuses to *cross* a leading dot; an explicit name is not a
+        // wildcard), so `include_hidden` governs only wildcard traversal.
+        let gate_literal_gitignore = self.max_depth == Some(0) && !include_gitignored;
+        let mut visible: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
         let mut matches: Vec<PathBuf> = Vec::new();
         for entry in builder.build().flatten() {
             #[cfg(test)]
@@ -238,6 +250,9 @@ impl ResolvedGlob {
             }
             let path = entry.into_path();
             if self.is_match(&path, base) {
+                if gate_literal_gitignore && is_gitignored(&path, &mut visible) {
+                    continue;
+                }
                 matches.push(path);
             }
         }
@@ -349,21 +364,23 @@ pub fn expand_search_paths_cancellable(
 /// One search-path argument's resolution: the concrete paths it contributed and
 /// whether it was a glob pattern (as opposed to an existing file/directory).
 ///
-/// [`expand_search_paths_grouped`] returns one of these per argument, in
-/// argument order, so callers that render per-argument structure — glob's
-/// cardinality header (misc 121) and its `no matches for pattern` report
-/// (misc 118) — know which resolved paths belong to which argument and whether
-/// that argument was a pattern worth announcing.
+/// [`expand_search_paths_grouped`] (grep names) and
+/// [`expand_glob_patterns_grouped_cancellable`] (glob patterns) return one of
+/// these per argument, in argument order, so callers that render per-argument
+/// structure — glob's `no matches for pattern` report (misc 118) — know which
+/// resolved paths belong to which argument and whether that argument was a
+/// pattern worth reporting.
 pub struct ArgResolution {
     /// The paths this argument resolved to: a single existing file/directory,
     /// or the (sorted) matches of a glob pattern. Empty when the argument
     /// contributed nothing — a zero-match pattern, a metachar-free absent, or a
     /// named gitignored directory the gate dropped.
     pub resolved: Vec<PathBuf>,
-    /// True when the argument was a glob pattern expanded daemon-side — a
-    /// metachar-bearing argument with no literal path on disk. False for an
-    /// existing file/directory or a metachar-free absent. Only a pattern earns a
-    /// cardinality header (≥1 match) or a `no matches for pattern` report (0).
+    /// True when the argument was a glob pattern expanded daemon-side. On grep's
+    /// name path this is a metachar-bearing argument with no literal path on
+    /// disk (false for an existing file/directory or a metachar-free absent); on
+    /// glob's one-verb path *every* argument is a pattern. Only a pattern earns a
+    /// `no matches for pattern` report (0 matches).
     pub is_pattern: bool,
 }
 
@@ -375,9 +392,8 @@ pub struct ArgResolution {
 /// directory), a metachar-bearing glob pattern expanded via
 /// [`ResolvedGlob::expand`], or a metachar-free absent that contributes nothing
 /// — but the results stay grouped by argument. Callers that render per-argument
-/// structure (glob's cardinality header and zero-match report) need to know
-/// which resolved paths came from which argument; callers that only want the
-/// flat set fold the groups.
+/// structure (glob's zero-match report) need to know which resolved paths came
+/// from which argument; callers that only want the flat set fold the groups.
 #[must_use]
 pub fn expand_search_paths_grouped(
     paths: &[PathBuf],
@@ -459,6 +475,52 @@ pub fn expand_search_paths_grouped_cancellable(
                 is_pattern: false,
             });
         }
+    }
+    groups
+}
+
+/// Resolves each `catenary glob` positional as a **pure pattern**, always —
+/// no disk probe deciding semantics (VERBS ruling, the one-verb form).
+///
+/// The glob positional is a pattern decoded syntactically, always: every
+/// argument compiles to a [`ResolvedGlob`] and expands gitignore-aware, with no
+/// `is_pattern` content sniffing and no bug-13 literal-first carve-out. A
+/// metachar-free argument like `src/main.rs` is a self-matching literal — the
+/// glob whose only match is that exact path — so `glob src/main.rs` still
+/// answers, but it goes through the same gitignore-aware walk as `src/*.rs`
+/// (uniform gitignore: no metachar-free bypass; `--include-gitignored` is the
+/// one lever). A directory pattern like `src` self-matches the directory entry,
+/// which the listing then descends into.
+///
+/// Every group is `is_pattern: true` — the whole point of the one-verb form is
+/// that there is no name/pattern branch. A zero-match argument is reported
+/// loudly per-argument by the CLI (misc 118) with a raw-string gitignore/hidden
+/// disclosure (VERBS streams ruling); nothing is ever silently classified as a
+/// "path does not exist" the way a grep name operand is.
+///
+/// Callers absolutize each relative positional against the request `cwd` before
+/// dispatch (`GlobRequest::to_params`), so `expand_cancellable` sees the
+/// absolute form it needs.
+#[must_use]
+pub fn expand_glob_patterns_grouped_cancellable(
+    paths: &[PathBuf],
+    include_gitignored: bool,
+    include_hidden: bool,
+    cancel: &CancellationToken,
+) -> Vec<ArgResolution> {
+    let mut groups = Vec::with_capacity(paths.len());
+    for path in paths {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let mut resolved = Vec::new();
+        if let Ok(glob) = ResolvedGlob::new(&path.to_string_lossy()) {
+            resolved.extend(glob.expand_cancellable(include_gitignored, include_hidden, cancel));
+        }
+        groups.push(ArgResolution {
+            resolved,
+            is_pattern: true,
+        });
     }
     groups
 }
@@ -1870,6 +1932,137 @@ mod tests {
             groups[3].resolved.is_empty(),
             "metachar-free absent contributes nothing: {:?}",
             groups[3].resolved
+        );
+    }
+
+    // ── expand_glob_patterns_grouped_cancellable (VERBS one-verb form) ──
+
+    #[test]
+    fn expand_glob_patterns_every_group_is_a_pattern() {
+        // The one-verb form has no name/pattern branch: every positional is a
+        // pattern, `is_pattern: true`, always — a metachar-free self-matching
+        // literal and a wildcard alike.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("real.rs"), "x").expect("write");
+        std::fs::write(root.join("other.rs"), "x").expect("write");
+
+        let args = vec![
+            root.join("real.rs"),
+            root.join("*.rs"),
+            root.join("ghost.rs"),
+        ];
+        let groups = expand_glob_patterns_grouped_cancellable(
+            &args,
+            false,
+            false,
+            &CancellationToken::new(),
+        );
+        assert_eq!(groups.len(), 3, "one group per argument, in order");
+        assert!(
+            groups.iter().all(|g| g.is_pattern),
+            "every group is a pattern"
+        );
+
+        // Arg 0: metachar-free existing file self-matches (exactly itself).
+        assert_eq!(groups[0].resolved, vec![root.join("real.rs")]);
+        // Arg 1: wildcard matches both `.rs` files.
+        assert_eq!(groups[1].resolved.len(), 2, "{:?}", groups[1].resolved);
+        // Arg 2: metachar-free absent is a zero-match pattern (not a "missing").
+        assert!(
+            groups[2].resolved.is_empty(),
+            "a metachar-free absent is a zero-match pattern: {:?}",
+            groups[2].resolved
+        );
+    }
+
+    #[test]
+    fn expand_glob_patterns_metachar_free_honors_gitignore() {
+        // VERBS uniform gitignore: a metachar-free pattern pointing straight at
+        // a gitignored file gets NO bypass — the file is filtered out (the
+        // walker's file-root bypass is closed), and `--include-gitignored`
+        // surfaces it. This is the "no metachar-free bypass" leg.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        git_init(root);
+        std::fs::write(root.join(".gitignore"), "secret.env\n").expect("write");
+        std::fs::write(root.join("secret.env"), "K=V").expect("write");
+
+        let arg = vec![root.join("secret.env")];
+
+        let default =
+            expand_glob_patterns_grouped_cancellable(&arg, false, false, &CancellationToken::new());
+        assert!(
+            default[0].resolved.is_empty(),
+            "a metachar-free gitignored file is a zero-match, not a bypass: {:?}",
+            default[0].resolved
+        );
+
+        let lifted =
+            expand_glob_patterns_grouped_cancellable(&arg, true, false, &CancellationToken::new());
+        assert_eq!(
+            lifted[0].resolved,
+            vec![root.join("secret.env")],
+            "--include-gitignored is the one lever: {:?}",
+            lifted[0].resolved
+        );
+    }
+
+    #[test]
+    fn expand_glob_patterns_metachar_free_dir_honors_gitignore() {
+        // The bypass fix covers gitignored *directories* too (not just files): a
+        // metachar-free `target` pattern where `target/` is gitignored is a
+        // zero-match, and only `--include-gitignored` lists it. Rooting the walk
+        // at a directory (the walker's own root) is where a naive fix would leak.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        git_init(root);
+        std::fs::write(root.join(".gitignore"), "target/\n").expect("write");
+        std::fs::create_dir(root.join("target")).expect("mkdir");
+        std::fs::write(root.join("target/built.o"), "x").expect("write");
+
+        let arg = vec![root.join("target")];
+
+        let default =
+            expand_glob_patterns_grouped_cancellable(&arg, false, false, &CancellationToken::new());
+        assert!(
+            default[0].resolved.is_empty(),
+            "a metachar-free gitignored directory is a zero-match, not a bypass: {:?}",
+            default[0].resolved
+        );
+
+        let lifted =
+            expand_glob_patterns_grouped_cancellable(&arg, true, false, &CancellationToken::new());
+        assert_eq!(
+            lifted[0].resolved,
+            vec![root.join("target")],
+            "--include-gitignored surfaces the directory: {:?}",
+            lifted[0].resolved
+        );
+    }
+
+    #[test]
+    fn expand_glob_patterns_metachar_free_hidden_needs_no_flag_for_explicit_dotname() {
+        // misc-45 preserved natively: `*` does not cross a leading dot, but an
+        // explicit dot-leading component matches without `--include-hidden`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        git_init(root);
+        std::fs::create_dir(root.join(".github")).expect("mkdir");
+        std::fs::write(root.join(".github/ci.yml"), "x").expect("write");
+
+        // Explicit `.github/ci.yml` self-matches with no hidden flag.
+        let explicit = expand_glob_patterns_grouped_cancellable(
+            &[root.join(".github/ci.yml")],
+            false,
+            false,
+            &CancellationToken::new(),
+        );
+        assert_eq!(
+            explicit[0].resolved,
+            vec![root.join(".github/ci.yml")],
+            "an explicit dot-leading component matches natively: {:?}",
+            explicit[0].resolved
         );
     }
 

@@ -641,11 +641,12 @@ fn test_doctor_piped_no_ansi() -> Result<()> {
 
 // ── non-existent path tests ───────────────────────────────────────
 
-/// A plain path that does not exist is a soft condition: grep/glob must
-/// exit 0 with a loud `path does not exist` on stdout, never a non-zero
-/// exit that would cancel sibling tool calls in a parallel batch
-/// (`bugs/13`). A bogus path with no glob metacharacter resolves
-/// client-side, so no daemon is required.
+/// A grep name operand that does not exist is a soft condition: grep must exit
+/// 0 with a loud `path does not exist` — never a non-zero exit that would cancel
+/// sibling tool calls in a parallel batch (`bugs/13`). Under the VERBS streams
+/// ruling this teaching rides **stderr** (stdout is results only); an explicit
+/// `2>/dev/null` is consent to lose it. A bogus path with no glob metacharacter
+/// resolves client-side, so no daemon is required.
 #[test]
 fn test_grep_nonexistent_path_exits_zero_loud() -> Result<()> {
     let tmp = tempfile::tempdir()?;
@@ -662,16 +663,21 @@ fn test_grep_nonexistent_path_exits_zero_loud() -> Result<()> {
         "catenary grep on a non-existent path must exit 0, got {:?}",
         output.status.code()
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("path does not exist"),
-        "stdout should loudly report the missing path, got:\n{stdout}"
+        stderr.contains("path does not exist"),
+        "stderr should loudly report the missing path, got:\n{stderr}"
     );
     Ok(())
 }
 
 #[test]
 fn test_glob_nonexistent_path_exits_zero_loud() -> Result<()> {
+    // Under the VERBS one-verb form the glob positional is a pattern, always: a
+    // metachar-free absent is not a `path does not exist` (that is grep's
+    // name-operand teaching) but a pattern that matched nothing — the loud
+    // `no matches for pattern` report, on stderr, exit 0 (the bug-13 soft
+    // condition). stdout stays empty (the zero-match shape).
     let tmp = tempfile::tempdir()?;
     let bogus = tmp.path().join("no_such_dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
@@ -683,13 +689,18 @@ fn test_glob_nonexistent_path_exits_zero_loud() -> Result<()> {
     let output = cmd.output().context("failed to run catenary glob")?;
     assert!(
         output.status.success(),
-        "catenary glob on a non-existent path must exit 0, got {:?}",
+        "catenary glob on a non-existent pattern must exit 0, got {:?}",
         output.status.code()
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("path does not exist"),
-        "stdout should loudly report the missing path, got:\n{stdout}"
+        stdout.trim().is_empty(),
+        "zero-match stdout must be empty (results only), got:\n{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no matches for pattern"),
+        "stderr should loudly report the zero-match pattern, got:\n{stderr}"
     );
     Ok(())
 }
@@ -721,9 +732,11 @@ fn test_help_exits_zero_for_agent_subcommands() -> Result<()> {
 // ── quoted-glob exit-code contract ────────────────────────────────
 
 /// End-to-end: a quoted glob that matches nothing must exit 0 with a
-/// loud `no matches for pattern` on stdout. The `catenary glob` binary talks
-/// to a live daemon (the pattern is expanded daemon-side), so a sibling
-/// tool call in the same parallel batch is never cancelled (`bugs/13`).
+/// loud `no matches for pattern` on **stderr** (the VERBS streams ruling — the
+/// zero-match shape is empty stdout, exit 0, teaching on stderr). The
+/// `catenary glob` binary talks to a live daemon (the pattern is expanded
+/// daemon-side), so a sibling tool call in the same parallel batch is never
+/// cancelled (`bugs/13`).
 #[test]
 fn test_glob_quoted_zero_match_exits_zero_loud() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
@@ -767,19 +780,117 @@ fn test_glob_quoted_zero_match_exits_zero_loud() -> Result<()> {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("no matches for pattern: **/*.rs (relative patterns anchor at cwd)"),
-        "stdout should loudly report the zero-match pattern, got:\n{stdout}"
+        stdout.trim().is_empty(),
+        "zero-match stdout must be empty (results only), got:\n{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no matches for pattern: **/*.rs (relative patterns anchor at cwd)"),
+        "stderr should loudly report the zero-match pattern, got:\n{stderr}"
     );
 
     drop(bridge);
     Ok(())
 }
 
+// ── glob arity is grammar (VERBS moment 1) ────────────────────────
+
+/// `catenary glob` takes exactly one pattern: the bare form and N>1 are usage
+/// errors — teaching on stderr, exit 2 (clap's invalid-arg class). N>1 is the
+/// shape an unquoted pattern the shell expanded leaves.
+#[test]
+fn test_glob_arity_bare_and_multi_exit_2() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let home = tmp.path().to_str().context("tempdir path")?;
+
+    // Bare form.
+    let mut bare = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut bare, home);
+    bare.current_dir(tmp.path())
+        .args(["glob"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = bare.output().context("run bare glob")?;
+    assert_eq!(out.status.code(), Some(2), "bare glob exits 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("takes one pattern") && stderr.contains("nullglob"),
+        "bare form teaches the nullglob rationale on stderr, got:\n{stderr}"
+    );
+
+    // N>1 (the shell-expansion shape).
+    let mut multi = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut multi, home);
+    multi
+        .current_dir(tmp.path())
+        .args(["glob", "a.rs", "b.rs"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = multi.output().context("run multi glob")?;
+    assert_eq!(out.status.code(), Some(2), "N>1 glob exits 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("got 2 arguments") && stderr.contains("*.rs"),
+        "N>1 names the likely expansion on stderr, got:\n{stderr}"
+    );
+    Ok(())
+}
+
+// ── invalid regex is a usage error (bug 105) ──────────────────────
+
+/// Bug 105: an invalid grep pattern is a **usage error** — the parse error
+/// prints on stderr and the command exits **2**, on the bare AND `--count`
+/// forms (ripgrep parity). Never a zero indistinguishable from a genuine
+/// no-match, never a swallowed parse error the exit code hides. Runs through
+/// the daemon-less in-process path (no daemon), which sets the same `error`
+/// field the daemon-served path does.
+#[test]
+fn test_grep_invalid_regex_is_usage_error_exit_2() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    // An unclosed character class is an uncompilable regex.
+    for extra in [&[][..], &["--count"][..]] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+        isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+        cmd.current_dir(tmp.path())
+            .args(["grep", "a["])
+            .args(extra)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = cmd.output().context("failed to run catenary grep")?;
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "invalid regex must exit 2 (form: {extra:?}); stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("0 matches"),
+            "the count leg must not swallow the parse error into a zero (form: {extra:?}), got:\n{stdout}"
+        );
+        assert!(
+            stdout.trim().is_empty(),
+            "no results on stdout for an uncompilable pattern (form: {extra:?}), got:\n{stdout}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.to_lowercase().contains("regex") || stderr.to_lowercase().contains("pattern"),
+            "the parse error prints on stderr (form: {extra:?}), got:\n{stderr}"
+        );
+    }
+    Ok(())
+}
+
 // ── --count path counting ─────────────────────────────────────────
 
-/// End-to-end: `catenary glob <dir> --count` reports "N paths" for the
-/// directory's listed entries. The `glob` binary talks to a live daemon;
-/// no LSP server is needed because the count is pure filesystem.
+/// End-to-end: `catenary glob '<dir>/*' --count` reports "N paths" for the
+/// directory's listed entries. Under the one-verb form a directory's listing is
+/// `glob 'dir/*'` (the positional is a pattern); the count is the pattern's
+/// match set. The `glob` binary talks to a live daemon; no LSP server is needed
+/// because the count is pure filesystem.
 #[test]
 fn test_glob_count_reports_paths() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
@@ -806,10 +917,11 @@ fn test_glob_count_reports_paths() -> Result<()> {
         thread::sleep(Duration::from_millis(50));
     }
 
+    let dir_pattern = format!("{root_str}/*");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     isolate_env(&mut cmd, state_home);
     cmd.current_dir(root.path())
-        .args(["glob", root_str, "--count"])
+        .args(["glob", &dir_pattern, "--count"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let output = cmd
@@ -826,20 +938,20 @@ fn test_glob_count_reports_paths() -> Result<()> {
     assert_eq!(
         stdout.trim(),
         "3 paths",
-        "expected the three listed files counted, got:\n{stdout}"
+        "expected the three matched files counted, got:\n{stdout}"
     );
 
     drop(bridge);
     Ok(())
 }
 
-// ── pattern cardinality header ────────────────────────────────────
+// ── stdout is results only; --count is the sole tally ─────────────
 
-/// End-to-end: `catenary glob 'src/**/*.rs'` opens its output with the
-/// `N files match <pattern>` cardinality header (misc 121), spelled as the
-/// agent typed it, and the count agrees with `--count`. The header lands on the
-/// first line so a `| head`-truncated view still shows the true count even when
-/// the first file's outline is large.
+/// End-to-end (retargeted for the VERBS streams ruling): `catenary glob
+/// 'src/**/*.rs'` prints **results only** on stdout — no cardinality header
+/// leads the output (the header retired; `--count` is the sole tally). The
+/// first line is a result, and `--count` reports the same match set. This pins
+/// the bug-184 divergence class shut structurally: one bookkeeper.
 #[test]
 fn test_glob_pattern_header_matches_count_via_binary() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
@@ -868,7 +980,7 @@ fn test_glob_pattern_header_matches_count_via_binary() -> Result<()> {
         thread::sleep(Duration::from_millis(50));
     }
 
-    // The rendered pattern glob opens with the header on line 1.
+    // The rendered pattern glob carries no header — results only on stdout.
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     isolate_env(&mut cmd, state_home);
     cmd.current_dir(root.path())
@@ -883,13 +995,17 @@ fn test_glob_pattern_header_matches_count_via_binary() -> Result<()> {
         String::from_utf8_lossy(&output.stderr),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("files match") && !stdout.contains("file matches"),
+        "stdout carries no cardinality header (results only), got:\n{stdout}"
+    );
     let first_line = stdout.lines().next().unwrap_or_default();
-    assert_eq!(
-        first_line, "3 files match src/**/*.rs",
-        "the cardinality header (original spelling) leads the output, got:\n{stdout}"
+    assert!(
+        first_line.contains("a.rs") || first_line.contains("cwd:"),
+        "the first line is a result, not a banner, got:\n{stdout}"
     );
 
-    // The header count agrees with `--count`.
+    // `--count` is the sole tally and reports the same match set.
     let mut count_cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
     isolate_env(&mut count_cmd, state_home);
     count_cmd
@@ -904,7 +1020,7 @@ fn test_glob_pattern_header_matches_count_via_binary() -> Result<()> {
     assert_eq!(
         count_stdout.trim(),
         "3 paths",
-        "the header count matches --count, got:\n{count_stdout}"
+        "--count reports the match set, got:\n{count_stdout}"
     );
 
     drop(bridge);

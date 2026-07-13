@@ -191,6 +191,12 @@ impl OutputWriter for io::Stdout {
     }
 }
 
+impl OutputWriter for io::Stderr {
+    fn into_bytes(self: Box<Self>) -> Option<Vec<u8>> {
+        None
+    }
+}
+
 impl OutputWriter for Vec<u8> {
     fn into_bytes(self: Box<Self>) -> Option<Vec<u8>> {
         Some(*self)
@@ -216,6 +222,22 @@ impl Output {
     pub fn stdout(nocolor: bool) -> Self {
         Self {
             w: Box::new(io::stdout()),
+            colors: ColorConfig::new(nocolor),
+            width: terminal_width(),
+        }
+    }
+
+    /// Create an `Output` that writes to stderr.
+    ///
+    /// The teaching stream for the search surface (VERBS streams ruling): the
+    /// pipe-friendly `grep`/`glob` carry results on stdout and *everything about
+    /// them* — the loud zero-match line, the four teaching moments, pagination
+    /// meta — on stderr, so a `| head` never truncates results with prose and an
+    /// explicit `2>/dev/null` is consent to lose the teaching.
+    #[must_use]
+    pub fn stderr(nocolor: bool) -> Self {
+        Self {
+            w: Box::new(io::stderr()),
             colors: ColorConfig::new(nocolor),
             width: terminal_width(),
         }

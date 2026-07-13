@@ -389,11 +389,12 @@ fn test_glob_quoted_pattern_zero_match_is_empty() -> Result<()> {
     Ok(())
 }
 
-/// A glob **pattern** argument opens with a `N files match <pattern>` header,
-/// printed before the per-file listings, echoing the original spelling — so a
-/// `| head`-truncated view still shows the true count (misc 121).
+/// A glob **pattern** argument renders its per-file listings with **no**
+/// cardinality header — stdout is results only (the VERBS streams ruling; the
+/// `N files match` header retired, `--count` is the sole tally). The daemon
+/// `output` (what `call_tool_text` captures) lists the matched files directly.
 #[test]
-fn test_glob_pattern_opens_with_match_count_header() -> Result<()> {
+fn test_glob_pattern_output_has_no_header() -> Result<()> {
     let dir = common::canonical_tempdir()?;
     std::fs::create_dir_all(dir.path().join("src/inner"))?;
     std::fs::write(dir.path().join("src/main.rs"), "fn main() {}")?;
@@ -406,23 +407,23 @@ fn test_glob_pattern_opens_with_match_count_header() -> Result<()> {
     let text = bridge.call_tool_text("glob", &json!({ "paths": ["src/**/*.rs"] }))?;
 
     assert!(
-        text.contains("2 files match src/**/*.rs"),
-        "plural cardinality header with original spelling: {text}"
+        !text.contains("files match") && !text.contains("file matches"),
+        "stdout carries no cardinality header (results only): {text}"
     );
-    let header_pos = text
-        .find("2 files match")
-        .expect("header present in output");
-    let main_pos = text.find("main.rs").expect("main.rs listed in output");
     assert!(
-        header_pos < main_pos,
-        "header precedes the per-file listings: {text}"
+        text.contains("main.rs"),
+        "the matched files are listed: {text}"
+    );
+    assert!(
+        text.contains("lib.rs"),
+        "the matched files are listed: {text}"
     );
     Ok(())
 }
 
-/// A pattern with exactly one match uses singular grammar: `1 file matches`.
+/// A pattern with exactly one match still lists that file with no header.
 #[test]
-fn test_glob_pattern_header_singular_for_one_match() -> Result<()> {
+fn test_glob_pattern_single_match_has_no_header() -> Result<()> {
     let dir = common::canonical_tempdir()?;
     std::fs::create_dir(dir.path().join("src"))?;
     std::fs::write(dir.path().join("src/only.rs"), "fn only() {}")?;
@@ -434,15 +435,18 @@ fn test_glob_pattern_header_singular_for_one_match() -> Result<()> {
     let text = bridge.call_tool_text("glob", &json!({ "paths": ["src/**/*.rs"] }))?;
 
     assert!(
-        text.contains("1 file matches src/**/*.rs"),
-        "singular grammar for a lone match: {text}"
+        !text.contains("files match") && !text.contains("file matches"),
+        "no cardinality header for a lone match: {text}"
     );
+    assert!(text.contains("only.rs"), "the lone match is listed: {text}");
     Ok(())
 }
 
-/// Multiple pattern arguments each get their own header, in argument order.
+/// The daemon still accepts multiple pattern positionals (arity 1 is enforced
+/// CLI-side, not daemon-side): each pattern's matches are listed, with no header
+/// on any of them.
 #[test]
-fn test_glob_multiple_patterns_each_get_a_header() -> Result<()> {
+fn test_glob_multiple_patterns_list_without_headers() -> Result<()> {
     let dir = common::canonical_tempdir()?;
     std::fs::write(dir.path().join("a.rs"), "fn a() {}")?;
     std::fs::write(dir.path().join("b.txt"), "b")?;
@@ -453,28 +457,16 @@ fn test_glob_multiple_patterns_each_get_a_header() -> Result<()> {
     let text = bridge.call_tool_text("glob", &json!({ "paths": ["*.rs", "*.txt"] }))?;
 
     assert!(
-        text.contains("1 file matches *.rs"),
-        "*.rs header present: {text}"
+        !text.contains("files match") && !text.contains("file matches"),
+        "no cardinality header on any pattern: {text}"
     );
-    assert!(
-        text.contains("1 file matches *.txt"),
-        "*.txt header present: {text}"
-    );
-    let rs_pos = text
-        .find("1 file matches *.rs")
-        .expect("*.rs header present");
-    let txt_pos = text
-        .find("1 file matches *.txt")
-        .expect("*.txt header present");
-    assert!(
-        rs_pos < txt_pos,
-        "one header each, in argument order: {text}"
-    );
+    assert!(text.contains("a.rs"), "*.rs match listed: {text}");
+    assert!(text.contains("b.txt"), "*.txt match listed: {text}");
     Ok(())
 }
 
-/// A directory argument renders unchanged — no cardinality header (only glob
-/// **pattern** arguments earn one; a directory shows its own structure).
+/// A directory-matching pattern renders unchanged — no cardinality header (the
+/// header retired entirely; stdout is results only).
 #[test]
 fn test_glob_directory_argument_has_no_match_header() -> Result<()> {
     let dir = common::canonical_tempdir()?;

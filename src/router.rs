@@ -256,6 +256,13 @@ pub struct GrepResponse {
     /// byte unchanged on the wire (the field is omitted when empty).
     #[serde(default, skip_serializing_if = "GrepSkips::is_empty")]
     pub skipped: GrepSkips,
+    /// A usage error — an uncompilable pattern (bug 105) or invalid argument —
+    /// that the search never ran. `Some` routes the CLI to stderr + exit 2 on
+    /// both the bare and `--count` forms (rg's exit-2 parity), instead of a
+    /// zero indistinguishable from a genuine no-match. Omitted (None) for every
+    /// successful query, so a normal response is byte-for-byte unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// One frame of a chunked `catenary grep` response (misc 140 phase 2).
@@ -292,6 +299,11 @@ pub enum GrepFrame {
         /// Files in the search scope skipped instead of searched.
         #[serde(default, skip_serializing_if = "GrepSkips::is_empty")]
         skipped: GrepSkips,
+        /// A usage error (uncompilable pattern, bug 105) that aborted the
+        /// search. `Some` routes the CLI to stderr + exit 2. Omitted for every
+        /// successful query.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 }
 
@@ -388,17 +400,6 @@ impl GlobRequest {
         );
         params["include_hidden"] = serde_json::Value::Bool(include_hidden);
 
-        // Preserve each argument's original spelling (pre-absolutization) so the
-        // glob pipeline can echo a pattern in a cardinality header exactly as the
-        // agent typed it (misc 121) — the same original-spelling contract the
-        // zero-match report uses. 1:1 with `params["paths"]` above.
-        params["display_paths"] = serde_json::Value::Array(
-            self.paths
-                .iter()
-                .map(|p| serde_json::Value::String(p.to_string_lossy().into_owned()))
-                .collect(),
-        );
-
         if !self.exclude.is_empty() {
             // `--exclude-pattern` is repeatable (bug 89): resolve each pattern
             // independently — a basename (no `/`) becomes a depth-independent
@@ -471,6 +472,21 @@ pub struct GlobResponse {
     /// `--count` response and for any query where every pattern matched.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub no_match_patterns: Vec<String>,
+    /// Display paths of matched directories, for the CLI's teaching moment 4
+    /// hint (`for its listing: catenary glob '<dir>/*'`, on stderr). Empty for a
+    /// `--count` response and when no pattern matched a directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dir_hints: Vec<String>,
+    /// Result basenames carrying a glob metacharacter, for the CLI's teaching
+    /// moment 3 note (the escaped `'\*.md'` spelling, on stderr). Empty for a
+    /// `--count` response and when no matched name bore a metacharacter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metachar_names: Vec<String>,
+    /// A usage error (an invalid pattern or argument the query never ran on).
+    /// `Some` routes the CLI to stderr + exit 2. Omitted for every successful
+    /// query, so a normal response is byte-for-byte unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Resolves a pattern path against a base directory if it is relative.
@@ -4250,6 +4266,7 @@ where
                     matches: Some(matches),
                     files: Some(files),
                     skipped,
+                    error: None,
                 },
             )
             .await?;
@@ -4279,26 +4296,22 @@ where
                     matches: None,
                     files: None,
                     skipped,
+                    error: None,
                 },
             )
             .await?;
         }
         Err(e) => {
-            // A grep error becomes the rendered output, exactly as the legacy
-            // envelope carried it — one chunk, then a bare terminator.
-            write_grep_frame(
-                writer,
-                &GrepFrame::Chunk {
-                    data: format!("grep error: {e}"),
-                },
-            )
-            .await?;
+            // A grep error is a usage error (bug 105): no chunk, and the
+            // terminator carries the parse error so the CLI prints it on stderr
+            // and exits 2 — never a zero indistinguishable from a no-match.
             write_grep_frame(
                 writer,
                 &GrepFrame::End {
                     matches: None,
                     files: None,
                     skipped: GrepSkips::default(),
+                    error: Some(format!("{e:#}")),
                 },
             )
             .await?;
@@ -4397,6 +4410,7 @@ pub async fn run_grep_daemon_less(req: &GrepRequest) -> Result<GrepResponse> {
             matches: None,
             files: None,
             skipped,
+            error: None,
         },
         Ok(GrepOutcome::Count {
             matches,
@@ -4407,12 +4421,16 @@ pub async fn run_grep_daemon_less(req: &GrepRequest) -> Result<GrepResponse> {
             matches: Some(matches),
             files: Some(files),
             skipped,
+            error: None,
         },
+        // A usage error (uncompilable pattern, bug 105): stderr + exit 2 at the
+        // CLI, on both bare and `--count`, matching the daemon-served path.
         Err(e) => GrepResponse {
-            output: format!("grep error: {e}"),
+            output: String::new(),
             matches: None,
             files: None,
             skipped: GrepSkips::default(),
+            error: Some(format!("{e:#}")),
         },
     })
 }
@@ -4439,6 +4457,8 @@ pub async fn run_glob_daemon_less(req: &GlobRequest) -> Result<GlobResponse> {
         Ok(GlobOutcome::Rendered {
             output,
             no_match_indices,
+            dir_hints,
+            metachar_names,
         }) => {
             let no_match_patterns = no_match_indices
                 .into_iter()
@@ -4449,17 +4469,27 @@ pub async fn run_glob_daemon_less(req: &GlobRequest) -> Result<GlobResponse> {
                 output,
                 paths: None,
                 no_match_patterns,
+                dir_hints,
+                metachar_names,
+                error: None,
             }
         }
         Ok(GlobOutcome::Count { paths }) => GlobResponse {
             output: String::new(),
             paths: Some(paths),
             no_match_patterns: Vec::new(),
+            dir_hints: Vec::new(),
+            metachar_names: Vec::new(),
+            error: None,
         },
+        // A usage error (invalid pattern/argument): stderr + exit 2 at the CLI.
         Err(e) => GlobResponse {
-            output: format!("glob error: {e}"),
+            output: String::new(),
             paths: None,
             no_match_patterns: Vec::new(),
+            dir_hints: Vec::new(),
+            metachar_names: Vec::new(),
+            error: Some(format!("{e:#}")),
         },
     })
 }
@@ -5256,6 +5286,7 @@ async fn handle_hook_dispatch(
                 matches: None,
                 files: None,
                 skipped,
+                error: None,
             },
             Ok(GrepOutcome::Count {
                 matches,
@@ -5266,12 +5297,14 @@ async fn handle_hook_dispatch(
                 matches: Some(matches),
                 files: Some(files),
                 skipped,
+                error: None,
             },
             Err(e) => GrepResponse {
-                output: format!("grep error: {e}"),
+                output: String::new(),
                 matches: None,
                 files: None,
                 skipped: GrepSkips::default(),
+                error: Some(format!("{e:#}")),
             },
         };
 
@@ -5382,6 +5415,8 @@ async fn handle_hook_dispatch(
             Ok(GlobOutcome::Rendered {
                 output,
                 no_match_indices,
+                dir_hints,
+                metachar_names,
             }) => {
                 // Map each zero-match index back to the argument's
                 // ORIGINAL spelling. `to_params` resolves `glob_req.paths`
@@ -5398,17 +5433,26 @@ async fn handle_hook_dispatch(
                     output,
                     paths: None,
                     no_match_patterns,
+                    dir_hints,
+                    metachar_names,
+                    error: None,
                 }
             }
             Ok(GlobOutcome::Count { paths }) => GlobResponse {
                 output: String::new(),
                 paths: Some(paths),
                 no_match_patterns: Vec::new(),
+                dir_hints: Vec::new(),
+                metachar_names: Vec::new(),
+                error: None,
             },
             Err(e) => GlobResponse {
-                output: format!("glob error: {e}"),
+                output: String::new(),
                 paths: None,
                 no_match_patterns: Vec::new(),
+                dir_hints: Vec::new(),
+                metachar_names: Vec::new(),
+                error: Some(format!("{e:#}")),
             },
         };
 
@@ -13471,16 +13515,22 @@ mod tests {
             matches: None,
             files: None,
             skipped: GrepSkips::default(),
+            error: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize");
         // An all-searched response omits `skipped` entirely — the wire is byte-
         // for-byte what it was before misc 135.
         assert!(!json.contains("skipped"), "empty skips are omitted: {json}");
+        assert!(
+            !json.contains("error"),
+            "a successful response omits the error field: {json}"
+        );
         let parsed: GrepResponse = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.output, "file.rs:10 matched line");
         assert!(parsed.matches.is_none());
         assert!(parsed.files.is_none());
         assert!(parsed.skipped.is_empty());
+        assert!(parsed.error.is_none());
     }
 
     /// Chunked grep frames (misc 140 phase 2) roundtrip, carry the `"frame"`
@@ -13507,6 +13557,7 @@ mod tests {
             matches: Some(3),
             files: Some(2),
             skipped: GrepSkips::default(),
+            error: None,
         };
         let end_line = serde_json::to_string(&end).expect("serialize end");
         assert!(
@@ -13521,6 +13572,7 @@ mod tests {
             matches: None,
             files: None,
             skipped: GrepSkips::default(),
+            error: None,
         };
         let legacy_json = serde_json::to_string(&legacy).expect("serialize legacy");
         assert!(
@@ -13610,12 +13662,26 @@ mod tests {
             output: "src/\n  main.rs (42 lines)".to_string(),
             paths: None,
             no_match_patterns: vec!["src/**/none.rs".to_string()],
+            dir_hints: vec!["src".to_string()],
+            metachar_names: Vec::new(),
+            error: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(
+            !json.contains("metachar_names"),
+            "an empty teaching vec is omitted: {json}"
+        );
+        assert!(
+            !json.contains("error"),
+            "a successful response omits the error field: {json}"
+        );
         let parsed: GlobResponse = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.output, "src/\n  main.rs (42 lines)");
         assert!(parsed.paths.is_none());
         assert_eq!(parsed.no_match_patterns, vec!["src/**/none.rs".to_string()]);
+        assert_eq!(parsed.dir_hints, vec!["src".to_string()]);
+        assert!(parsed.metachar_names.is_empty());
+        assert!(parsed.error.is_none());
     }
 
     /// IPC method constants match expected wire values.

@@ -82,9 +82,9 @@ Work in isolated subagents
 Navigate through Catenary
   Search contents with `catenary grep`, find files with `catenary glob`. Quote
   glob patterns so Catenary expands them gitignore-aware, not the shell
-  (`catenary grep 'fn main' 'src/**/*.rs'`, `catenary glob 'src/**/*.rs'`); the
-  pattern is itself the path, so there is no separate directory argument
-  (`catenary glob '/abs/dir/**/*.md'`). Where a code intelligence source
+  (`catenary grep 'fn main' 'src/**/*.rs'`, `catenary glob 'src/**/*.rs'`).
+  `catenary glob`'s positional IS a pattern — one pattern, quoted; list a
+  directory with `catenary glob 'dir/*'`. Where a code intelligence source
   covers a hit its enrichment rides along; where none does, `catenary grep`
   still returns the match. With no path argument, `… | catenary grep PAT` is a
   plain pass over the stream — complete matches, no enrichment — so matches
@@ -507,7 +507,8 @@ mod tests {
             "Bare-only vs pipe-friendly",
             "pipe-friendly",
             "catenary glob 'src/**/*.rs'",
-            "no separate directory argument",
+            "positional IS a pattern",
+            "catenary glob 'dir/*'",
         ] {
             assert!(
                 body.contains(needle),

@@ -86,6 +86,14 @@ files — and composes freely with pipes and redirects (`catenary grep p |
 head` works). Ask for a total with `--count`, narrow with `--type` or
 `--glob`, and exclude with `--exclude-pattern`.
 
+**stdout carries results only** (the VERBS streams ruling). A search with no
+matches prints nothing on stdout (empty set, exit 0) and reports the
+`no matches for: <pattern>` echo plus its `searched:` scope on **stderr**; a
+skipped file (binary) and a missing named path likewise ride stderr. An
+**invalid pattern is a usage error** — the parse error prints on stderr and
+the command exits 2 (on the bare *and* `--count` forms, ripgrep parity),
+never a zero indistinguishable from a genuine no-match.
+
 | Flag | Description |
 |------|-------------|
 | `[PATH]...` | File or directory path(s) to scope the search (quoted globs allowed) |
@@ -107,24 +115,30 @@ head` works). Ask for a total with `--count`, narrow with `--type` or
 
 ### `catenary glob`
 
-Browse the workspace: file outline, directory listing, or glob pattern
-match. Auto-detects intent from each PATH — a file path shows a symbol
-outline, a directory path shows a listing with symbols, and a glob
-pattern shows matching files.
+Browse the workspace by **glob pattern**. The single positional is a
+pattern, decoded syntactically, always — quote it so Catenary expands it
+gitignore-aware, not the shell (`catenary glob 'src/**/*.rs'`). A
+metachar-free spelling is a **self-matching literal**: `catenary glob
+src/main.rs` outlines that file, `catenary glob 'src/*'` lists the
+directory. Patterns may be absolute or cwd-relative, and the anchor belongs
+*in the pattern* (`catenary glob '/abs/dir/**/*.md'`); there is no separate
+directory argument.
 
-A PATH may be a **glob pattern**: quote it so the shell doesn't expand it
-and Catenary walks it gitignore-aware instead. Patterns may be absolute or
-cwd-relative, and the anchor belongs *in the pattern* — there is no
-separate directory argument (`catenary glob 'src/**/*.rs'`,
-`catenary glob '/abs/dir/**/*.md'`). Each pattern argument's results open
-with a one-line cardinality header — `N files match <pattern>` (singular
-grammar for one) — printed *before* the per-file listings, so a
-`| head`-truncated view still shows the true count. A pattern that expands
-to nothing is never silent either: it reports `no matches for pattern:
-<pattern> (relative patterns anchor at cwd)`, per argument, even when
-sibling arguments render. (Directory and single-file arguments render
-unchanged — a directory shows its own structure, a named file is its own
-answer.)
+**Exactly one pattern.** Multiple patterns are a brace alternation
+(`catenary glob '{src,tests}/**/*.rs'`); a bare `glob`, or an unquoted
+pattern the shell expanded to several words, is a usage error with teaching
+(stderr, exit 2). Gitignore semantics are uniform regardless of shape:
+`--include-gitignored` is the one lever, `--include-hidden` relaxes wildcard
+traversal.
+
+**stdout carries results only** (the VERBS streams ruling). There is no
+cardinality header — `--count` is the sole tally. A pattern that expands to
+nothing prints nothing on stdout (empty set, exit 0) and reports `no matches
+for pattern: <pattern> (relative patterns anchor at cwd)` on **stderr**,
+followed by a raw-string disclosure when the target exists but is
+gitignored/hidden. Teaching — the metachar-bearing matched-name note and the
+`for its listing: catenary glob '<dir>/*'` hint — rides stderr too; an
+explicit `2>/dev/null` is consent to lose it.
 
 The outline is a **map, not a mirror** — it renders **types and callables
 only**. It recurses into containers (modules/namespaces/packages and
@@ -137,12 +151,13 @@ module-level constant stays. (The underlying symbol index is unfiltered;
 only the outline render applies this map.)
 
 ```bash
-catenary glob "src/"
-catenary glob "src/main.rs"
-catenary glob "**/*.toml"                 # opens "N files match **/*.toml"
+catenary glob "src/*"                     # list a directory
+catenary glob src/main.rs                  # outline one file (self-matching literal)
+catenary glob "**/*.toml"                  # results only — no header
 catenary glob "**/*.rs" --exclude-pattern "tests/**"
-catenary glob "**/*.rs" | head -3        # header shows the true count first
-catenary glob "**/*.rs" --count          # "N paths"
+catenary glob "**/*.rs" | head -3         # stdout is pure results — safe to pipe
+catenary glob "**/*.rs" --count           # "N paths" — the sole tally
+catenary glob "{src,tests}/**/*.rs"        # multiple patterns: brace alternation
 ```
 
 Like `catenary grep`, glob emits complete output — pipe or redirect it
@@ -150,9 +165,9 @@ freely — and `--count` answers "how many" without the listing.
 
 | Flag | Description |
 |------|-------------|
-| `[PATH]...` | File, directory, or quoted glob pattern(s) — absolute or cwd-relative, anchor in the pattern |
+| `PATH` | A single glob pattern (quoted) — absolute or cwd-relative, anchor in the pattern; a metachar-free spelling is a self-matching literal |
 | `--exclude-pattern <pat>` | Glob pattern to exclude from results (repeatable; a path is dropped when any matches) |
-| `--count` | Report the path count instead of results |
+| `--count` | Report the path count instead of results (the sole tally) |
 | `--include-gitignored` | Include files ignored by .gitignore |
 | `--include-hidden` | Include hidden files and directories |
 
