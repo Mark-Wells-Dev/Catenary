@@ -340,7 +340,23 @@ impl GrepServer {
         // case would add upkeep for no measurable gain).
 
         // cwd-scoped search: present when no glob or relative glob.
-        let cwd = input.cwd.clone();
+        //
+        // Canonicalize the incoming cwd at this ingestion seam: roots are
+        // canonical (the daemon canonicalizes `CATENARY_ROOTS` and every
+        // ephemeral mount), but the host passes its raw invoking directory. On a
+        // symlinked-tempdir host (macOS `$TMPDIR` → `/private/var/…`, or any
+        // symlinked prefix) the two spellings differ, so a raw cwd would make the
+        // walk emit raw-spelled paths that fail `resolve_root`'s canonical prefix
+        // check — the changed-set nudge then silently no-ops (no didChange, no
+        // didChangeWatchedFiles). Canonicalizing here, once, keeps the walk,
+        // `resolve_root`, the nudge, and the display `strip_prefix` all canonical-
+        // to-canonical, matching the convention `handle_file_accumulation` and
+        // `ensure_ephemeral_mounts` already follow. A not-yet-existing cwd keeps
+        // its spelling (canonicalize can't resolve it).
+        let cwd = input
+            .cwd
+            .as_ref()
+            .map(|c| c.canonicalize().unwrap_or_else(|_| c.clone()));
 
         // Resolve path arguments into concrete search roots: existing paths
         // pass through, unexpanded glob patterns expand daemon-side via the
