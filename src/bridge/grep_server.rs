@@ -332,9 +332,12 @@ impl GrepServer {
         let input: GrepInput = serde_json::from_value(params.clone())
             .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
-        if input.pattern.is_empty() {
-            return Err(anyhow!("pattern must be non-empty"));
-        }
+        // No empty-pattern short-circuit: ripgrep parity means the empty pattern
+        // matches every line, and `--count` on it is the line count (bug 83). The
+        // matcher stack handles it — the regex engine fast-paths trivial patterns
+        // and empty-pattern matching is O(1) per line, so no dedicated fast path
+        // is warranted (maintainer ruling: a second code path for the degenerate
+        // case would add upkeep for no measurable gain).
 
         // cwd-scoped search: present when no glob or relative glob.
         let cwd = input.cwd.clone();
@@ -2781,6 +2784,92 @@ mod tests {
             "the md file is filtered out by --type rust: {:?}",
             rg.file_lines
         );
+    }
+
+    // ─── empty pattern: ripgrep parity (bug 83) ────────────────────────
+
+    impl GrepOutcome {
+        /// The `(matches, files)` totals of a `--count` outcome, else `None` —
+        /// the `Option`-accessor idiom this module uses to avoid a denied bare
+        /// `panic!` on the wrong variant.
+        const fn count(&self) -> Option<(usize, usize)> {
+            if let Self::Count { matches, files, .. } = self {
+                Some((*matches, *files))
+            } else {
+                None
+            }
+        }
+
+        /// The reconstructed rendered string of a `Rendered` outcome, else `None`.
+        fn rendered(&self) -> Option<String> {
+            if let Self::Rendered { output, .. } = self {
+                Some(output.materialize())
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Build a daemon-less [`GrepServer`] (LSP-manager-empty, no roots) and run
+    /// `execute` over `params`. The exact server the daemon serves, so this
+    /// drives the real `execute` path where the empty-pattern short-circuit was
+    /// removed (bug 83).
+    fn execute_daemon_less(params: &serde_json::Value) -> GrepOutcome {
+        let search = crate::bridge::DaemonlessSearch::from_config(crate::config::Config::default());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(search.grep.execute(params, None, &cancel))
+            .expect("grep execute")
+    }
+
+    /// Bug 83: `catenary grep '' --count` has ripgrep parity — the empty pattern
+    /// matches every line, so the count is the file's line count (not the silent
+    /// zero the removed short-circuit produced).
+    #[test]
+    fn empty_pattern_count_equals_line_count() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A fixture with a known line count: five lines, each `\n`-terminated.
+        let fixture = tmp.path().join("fixture.txt");
+        std::fs::write(&fixture, "alpha\nbeta\ngamma\ndelta\nepsilon\n").expect("write fixture");
+
+        let outcome = execute_daemon_less(&serde_json::json!({
+            "pattern": "",
+            "paths": [fixture.to_string_lossy()],
+            "count": true,
+        }));
+
+        let (matches, files) = outcome.count().expect("count query yields a Count outcome");
+        assert_eq!(matches, 5, "empty pattern counts every line");
+        assert_eq!(files, 1, "the single fixture file matched");
+    }
+
+    /// Bug 83: without `--count`, the empty pattern returns every line (enrichment
+    /// riding along where covered is fine — asserted here is only that no line is
+    /// dropped, so every fixture line appears in the rendered output).
+    #[test]
+    fn empty_pattern_returns_every_line() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fixture = tmp.path().join("fixture.txt");
+        let lines = ["alpha", "beta", "gamma", "delta", "epsilon"];
+        std::fs::write(&fixture, format!("{}\n", lines.join("\n"))).expect("write fixture");
+
+        let outcome = execute_daemon_less(&serde_json::json!({
+            "pattern": "",
+            "paths": [fixture.to_string_lossy()],
+        }));
+
+        let rendered = outcome
+            .rendered()
+            .expect("non-count query yields a Rendered outcome");
+        for line in lines {
+            assert!(
+                rendered.contains(line),
+                "empty pattern must return every line; `{line}` missing from:\n{rendered}"
+            );
+        }
     }
 
     // ─── stdin (stream) mode ────────────────────────────────────────────
