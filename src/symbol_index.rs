@@ -9,14 +9,30 @@
 //! Callers are responsible for requesting `documentSymbol` from the LSP
 //! server and feeding the response to the index.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use anyhow::{Context, Result};
 
 use crate::bridge::filesystem_manager::mtime_nanos;
+
+/// Non-cryptographic 64-bit content hash of `bytes` via std's [`DefaultHasher`].
+///
+/// Staleness detection, not security: a same-second external write that leaves
+/// the mtime unchanged still changes the bytes, so a differing hash catches the
+/// slip the mtime backstop misses (bug #26). Zero-dep by design — the
+/// page-cache-warm read dominates the cost, so the hash algorithm is off the
+/// hot path and an xxh3-class dependency buys nothing measurable here.
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// A symbol extracted from the symbol index.
 #[derive(Clone)]
@@ -205,7 +221,7 @@ pub const fn symbol_kind_to_string(kind: u32) -> &'static str {
 /// persistent store.
 pub struct SymbolIndex {
     /// Per-file symbol lists, each kept sorted by start `line`, plus the
-    /// on-disk mtime each file was populated from.
+    /// on-disk mtime and content hash each file was populated from.
     ///
     /// Wrapped in a [`RefCell`] so
     /// [`populate_from_document_symbols`](Self::populate_from_document_symbols)
@@ -213,17 +229,33 @@ pub struct SymbolIndex {
     /// live caller holds the index behind a `Mutex`, which already serializes
     /// access, so the cell is never borrowed concurrently.
     files: RefCell<HashMap<PathBuf, FileEntry>>,
+    /// Test-only tally of content hashes computed by
+    /// [`symbols_outdated`](Self::symbols_outdated) — one per same-mtime hit
+    /// that falls through to the content check. Per-index (not a global static)
+    /// so the scope test can assert a query touching N files hashes exactly N
+    /// without racing parallel tests. A [`Cell`] mirrors the `&self` interior
+    /// mutability of `files`.
+    #[cfg(test)]
+    hash_count: Cell<usize>,
 }
 
-/// A file's cached symbols and the on-disk mtime they were populated from.
+/// A file's cached symbols and the on-disk mtime and content hash they were
+/// populated from.
 struct FileEntry {
     /// Flattened symbols, sorted ascending by start `line`. At most one symbol
     /// is kept per start line, mirroring the old `PRIMARY KEY (file_path, line)`.
     symbols: Vec<Symbol>,
     /// On-disk `mtime_nanos` recorded at population time, or `None` when the
-    /// path could not be stat-ed. Drives
-    /// [`symbols_outdated`](SymbolIndex::symbols_outdated).
+    /// path could not be stat-ed. The cheap first leg of
+    /// [`symbols_outdated`](SymbolIndex::symbols_outdated): a moved mtime is
+    /// stale outright, no hash needed.
     mtime: Option<i64>,
+    /// 64-bit content hash of the file bytes recorded at population time, or
+    /// `None` when the path could not be read. The second leg of
+    /// [`symbols_outdated`](SymbolIndex::symbols_outdated): when the mtime is
+    /// unchanged, a differing hash catches a same-second external write the
+    /// mtime backstop misses (bug #26).
+    hash: Option<u64>,
 }
 
 impl SymbolIndex {
@@ -239,6 +271,8 @@ impl SymbolIndex {
     pub fn new() -> Result<Self> {
         Ok(Self {
             files: RefCell::new(HashMap::new()),
+            #[cfg(test)]
+            hash_count: Cell::new(0),
         })
     }
 
@@ -251,13 +285,15 @@ impl SymbolIndex {
     /// is kept per start line (mirrors the old `PRIMARY KEY (file_path, line)`
     /// with `INSERT OR IGNORE`: the first symbol seen at a given line wins).
     ///
-    /// Records the file's current on-disk mtime alongside the symbols so a later
-    /// external write (host `Edit`/`Write`, `git checkout`, formatter) that
-    /// leaves the symbols untouched is detected as stale by
-    /// [`symbols_outdated`](Self::symbols_outdated) (bug #26). Capturing it here
-    /// means every populate path — `grep`/`glob` and the diagnostics batch —
-    /// records it uniformly. A path that cannot be stat-ed (a synthetic test
-    /// path) records no mtime, degrading to the prior absence-only behavior.
+    /// Records the file's current on-disk mtime *and* content hash alongside the
+    /// symbols so a later external write (host `Edit`/`Write`, `git checkout`,
+    /// formatter) that leaves the symbols untouched is detected as stale by
+    /// [`symbols_outdated`](Self::symbols_outdated) (bug #26). The hash closes
+    /// the same-second slip the mtime alone misses. Capturing both here means
+    /// every populate path — `grep`/`glob` and the diagnostics batch — records
+    /// them uniformly. A path that cannot be stat-ed or read (a synthetic test
+    /// path) records no mtime/hash, degrading to the prior absence-only
+    /// behavior.
     ///
     /// The `symbols` parameter is the JSON array from the LSP response.
     ///
@@ -277,12 +313,17 @@ impl SymbolIndex {
             }
         }
 
-        // Stat before storing. The recorded mtime is the version the server saw
+        // Stat and hash before storing. Both describe the version the server saw
         // (the caller opened the document from disk before requesting
-        // `documentSymbol`), so a write landing after this point advances the
-        // mtime and is caught on the next access.
+        // `documentSymbol`), so a write landing after this point either advances
+        // the mtime (cheap-path stale) or, landing within the same second,
+        // changes the content hash (bug #26 same-second slip) and is caught on
+        // the next access.
         let recorded_mtime: Option<i64> =
             std::fs::metadata(file_path).ok().map(|m| mtime_nanos(&m));
+        let recorded_hash: Option<u64> = std::fs::read(file_path)
+            .ok()
+            .map(|bytes| hash_bytes(&bytes));
 
         // One symbol per start line, kept ascending — the old store keyed rows
         // on `(file_path, line)` with `INSERT OR IGNORE`, so the first symbol
@@ -297,6 +338,7 @@ impl SymbolIndex {
             FileEntry {
                 symbols: by_line.into_values().collect(),
                 mtime: recorded_mtime,
+                hash: recorded_hash,
             },
         );
         Ok(())
@@ -349,23 +391,68 @@ impl SymbolIndex {
         self.files.borrow_mut().retain(|p, _| !p.starts_with(root));
     }
 
-    /// Returns `true` when `path` has cached symbols whose recorded mtime is
-    /// older than `current_mtime` — an external write the daemon never
-    /// invalidated (host `Edit`/`Write`, `git checkout`, formatter; bug #26).
+    /// Returns `true` when `path` has cached symbols that no longer match the
+    /// file on disk — an external write the daemon never invalidated (host
+    /// `Edit`/`Write`, `git checkout`, formatter; bug #26).
+    ///
+    /// Staleness is `(mtime, content hash)`, checked cheapest-first:
+    /// - **mtime moved** (`current_mtime > recorded`) → stale outright, no hash
+    ///   (the cheap direction stays cheap).
+    /// - **mtime unchanged** → read the bytes and hash them; a differing hash
+    ///   catches a same-second write the mtime backstop misses. An equal hash
+    ///   short-circuits — no repopulation.
+    ///
+    /// The hash runs **only** on this per-file serve/hit path, which sees only
+    /// the query's fan-out files — the index is never swept. `current_mtime` is
+    /// the file's current `mtime_nanos` (nanoseconds since epoch), already
+    /// stat-ed by the caller; the bytes are read here, lazily, only when the
+    /// mtime is unchanged.
     ///
     /// Reports *staleness* of present symbols; *absence* is reported by
     /// [`needs_population`](Self::needs_population). A file with no recorded
     /// mtime (never populated, or populated from a path that could not be
     /// stat-ed) returns `false`: there is nothing to compare against, and
-    /// absence already forces population. `current_mtime` is the file's
-    /// current `mtime_nanos` (nanoseconds since epoch).
+    /// absence already forces population. When the mtime is unchanged but no
+    /// hash was recorded, or the bytes cannot be read now, staleness degrades to
+    /// `false` — the same conservative "nothing to compare, absence handles it"
+    /// stance.
     #[must_use]
     pub fn symbols_outdated(&self, path: &Path, current_mtime: i64) -> bool {
-        self.files
-            .borrow()
-            .get(path)
-            .and_then(|entry| entry.mtime)
-            .is_some_and(|recorded| current_mtime > recorded)
+        let files = self.files.borrow();
+        let Some(entry) = files.get(path) else {
+            return false;
+        };
+        let Some(recorded_mtime) = entry.mtime else {
+            return false;
+        };
+        // Cheap leg: a moved mtime is stale outright, no hash needed.
+        if current_mtime > recorded_mtime {
+            return true;
+        }
+        // Same-mtime leg: hash the current bytes to catch the same-second slip.
+        // No recorded hash → nothing to compare against, so not stale.
+        let Some(recorded_hash) = entry.hash else {
+            return false;
+        };
+        let Ok(bytes) = std::fs::read(path) else {
+            return false;
+        };
+        #[cfg(test)]
+        self.hash_count.set(self.hash_count.get() + 1);
+        hash_bytes(&bytes) != recorded_hash
+    }
+
+    /// Test-only reader for the per-index content-hash tally — the number of
+    /// hashes computed by [`symbols_outdated`](Self::symbols_outdated).
+    #[cfg(test)]
+    const fn hash_count(&self) -> usize {
+        self.hash_count.get()
+    }
+
+    /// Test-only reset of the per-index content-hash tally to zero.
+    #[cfg(test)]
+    fn reset_hash_count(&self) {
+        self.hash_count.set(0);
     }
 
     /// Query the index for symbols whose names match a regex pattern.
@@ -975,6 +1062,150 @@ mod tests {
         assert!(
             !index.symbols_outdated(path, i64::MAX),
             "no recorded mtime → never reported outdated"
+        );
+    }
+
+    /// Misc 190 — the same-second slip pin. A file is populated, then rewritten
+    /// with DIFFERENT content while its mtime is forced back equal to the
+    /// populated version (`filetime`, standing in for a same-second host write
+    /// the mtime backstop can't see). The mtime leg reports "unchanged", so
+    /// `symbols_outdated` falls through to the content-hash leg — which sees the
+    /// differing bytes and reports the symbols stale. This is the slip the
+    /// bug-26 mtime-only backstop missed.
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn same_mtime_different_content_is_outdated_via_hash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("slip.rs");
+        std::fs::write(&file, "fn original() {}\n").expect("write original");
+
+        let index = SymbolIndex::new().expect("create index");
+        let symbols = serde_json::json!([{
+            "name": "original",
+            "kind": 12,
+            "range": { "start": { "line": 0 }, "end": { "line": 0 } },
+            "selectionRange": { "start": { "line": 0 }, "end": { "line": 0 } }
+        }]);
+        index
+            .populate_from_document_symbols(&file, &symbols)
+            .expect("populate");
+
+        // The mtime the population recorded (and the version we pin back to).
+        let recorded_mtime = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(&file).expect("metadata"),
+        );
+
+        // Rewrite with different content, then force the mtime back to the
+        // recorded value — the same-second slip the mtime backstop misses.
+        std::fs::write(&file, "fn rewritten() {}\n").expect("rewrite");
+        filetime::set_file_mtime(&file, recorded_mtime).expect("pin mtime back");
+
+        let current_mtime = crate::bridge::filesystem_manager::mtime_nanos(
+            &std::fs::metadata(&file).expect("metadata after rewrite"),
+        );
+
+        index.reset_hash_count();
+        assert!(
+            index.symbols_outdated(&file, current_mtime),
+            "same mtime but different content → stale via the content-hash leg"
+        );
+        assert_eq!(
+            index.hash_count(),
+            1,
+            "the same-mtime path hashes exactly once"
+        );
+    }
+
+    /// Misc 190 — an unchanged re-serve does not repopulate. The file is
+    /// untouched, so the mtime leg reports "unchanged", the hash leg recomputes
+    /// an equal hash, and `symbols_outdated` short-circuits to `false`. One hash
+    /// is computed (the same-mtime fall-through), and it reports current.
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn unchanged_reserve_short_circuits_on_equal_hash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("stable.rs");
+        std::fs::write(&file, "fn stable() {}\n").expect("write file");
+
+        let index = SymbolIndex::new().expect("create index");
+        let symbols = serde_json::json!([{
+            "name": "stable",
+            "kind": 12,
+            "range": { "start": { "line": 0 }, "end": { "line": 0 } },
+            "selectionRange": { "start": { "line": 0 }, "end": { "line": 0 } }
+        }]);
+        index
+            .populate_from_document_symbols(&file, &symbols)
+            .expect("populate");
+
+        let current_mtime = crate::bridge::filesystem_manager::mtime_nanos(
+            &std::fs::metadata(&file).expect("metadata"),
+        );
+
+        index.reset_hash_count();
+        assert!(
+            !index.symbols_outdated(&file, current_mtime),
+            "unchanged file at the same mtime → equal hash → not stale"
+        );
+        assert_eq!(
+            index.hash_count(),
+            1,
+            "the equal-hash short-circuit still performs exactly one hash"
+        );
+    }
+
+    /// Misc 190 — scope pin. A query touching N same-mtime files hashes exactly
+    /// N times: the check runs once per fan-out file and never sweeps the index.
+    /// Here the index holds a spare file the "query" does not touch; checking
+    /// the N queried files leaves the spare unhashed.
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    #[test]
+    fn scoped_check_hashes_exactly_n_fanout_files() {
+        // The fan-out width: N files a query names, plus one spare it does not.
+        const N: usize = 4;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let symbols = serde_json::json!([{
+            "name": "s",
+            "kind": 12,
+            "range": { "start": { "line": 0 }, "end": { "line": 0 } },
+            "selectionRange": { "start": { "line": 0 }, "end": { "line": 0 } }
+        }]);
+
+        let index = SymbolIndex::new().expect("create index");
+
+        // Populate N fan-out files plus one spare the query never names.
+        let mut fanout = Vec::new();
+        for i in 0..N {
+            let file = dir.path().join(format!("f{i}.rs"));
+            std::fs::write(&file, format!("fn f{i}() {{}}\n")).expect("write fanout");
+            index
+                .populate_from_document_symbols(&file, &symbols)
+                .expect("populate fanout");
+            fanout.push(file);
+        }
+        let spare = dir.path().join("spare.rs");
+        std::fs::write(&spare, "fn spare() {}\n").expect("write spare");
+        index
+            .populate_from_document_symbols(&spare, &symbols)
+            .expect("populate spare");
+
+        // Serve path: check staleness for exactly the N fan-out files (all at
+        // their recorded, unchanged mtime, so each falls through to the hash).
+        index.reset_hash_count();
+        for file in &fanout {
+            let current_mtime = crate::bridge::filesystem_manager::mtime_nanos(
+                &std::fs::metadata(file).expect("metadata"),
+            );
+            assert!(
+                !index.symbols_outdated(file, current_mtime),
+                "unchanged fan-out file is not stale"
+            );
+        }
+        assert_eq!(
+            index.hash_count(),
+            N,
+            "a query touching N files hashes exactly N — the spare is never swept"
         );
     }
 

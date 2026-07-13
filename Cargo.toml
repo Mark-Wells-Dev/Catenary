@@ -137,6 +137,14 @@ uuid = { version = "1", features = ["v4"] }
 # it in via the `fuzzing` feature; this dev-dependency copy is what lets the
 # `cfg(test)` `proptest` layer reach the oracle with no feature flag.
 brush-parser = "0.4.0"
+# `filetime` forces a file's mtime back to an earlier value so the SymbolIndex
+# same-second-slip test can rewrite content while pinning the mtime equal —
+# proving the content-hash staleness leg catches a write the mtime backstop
+# misses (misc 190). Dev-only: it never enters the runtime / `cargo deny`
+# *runtime* graph and never ships. MIT OR Apache-2.0 — deny.toml-clean; its
+# transitive deps (cfg-if, libc, windows-sys) are all already in-tree, so it
+# adds only itself.
+filetime = "0.2"
 proptest = "1.11"
 
 [workspace.lints.rust]
