@@ -64,6 +64,18 @@ const TEMPLATE: &str = r#"#:schema https://twowells.github.io/catenary/schemas/c
 # [commands]
 # # client_enforcement_only = true
 # build = "make"
+# # Build-command alternatives — pick the one your ecosystem uses. `build`
+# # is a single value, so keep exactly one active line (above) and leave the
+# # rest commented; set it per-project in .catenary.toml. Uncomment one:
+# #   build = "just"
+# #   build = "cargo"
+# #   build = "npm"
+# #   build = "yarn"
+# #   build = "pnpm"
+# #   build = "go"
+# #   build = "gradle"
+# #   build = "mvn"
+# #   build = "cmake"
 # # `allow` includes read/stdout-only tools (cat, head, less, diff,
 # # echo, ...): reads aren't a write vector, and a redirected write
 # # (`cat > f`) is resolved and attributed, not blocked by denying cat.
@@ -82,8 +94,19 @@ const TEMPLATE: &str = r#"#:schema https://twowells.github.io/catenary/schemas/c
 # sqlite3 = ["-cmd"]
 #
 # [commands.deny_flags]
+# # These deny the flags that redirect the tool to operate outside the project root
+# # — adapt to your ecosystem. make/cargo below are the shipped pair; uncomment
+# # the line for whatever `build` you set above (and drop the others).
 # make = ["-C"]
 # cargo = ["--manifest-path"]
+# #   npm    = ["--prefix"]                    # --prefix (alias -C) runs npm elsewhere
+# #   yarn   = ["--cwd"]                        # --cwd sets the working directory
+# #   pnpm   = ["-C", "--dir"]                  # -C / --dir run pnpm elsewhere
+# #   go     = ["-C"]                           # -C dir: chdir before the command
+# #   gradle = ["-p", "--project-dir"]          # -p / --project-dir set the start dir
+# #   mvn    = ["-f", "--file"]                 # -f / --file: alternate POM / dir
+# #   just   = ["-f", "--justfile", "-d", "--working-directory"]  # justfile + working dir
+# #   cmake  = ["-S", "-B"]                     # -S source dir / -B build dir
 #
 # # allow_flags — the allow-side dual of deny_flags: a keyed command must be
 # # invoked in one of the listed forms or it is denied naming them. Forms are
@@ -185,6 +208,23 @@ const TEMPLATE: &str = r#"#:schema https://twowells.github.io/catenary/schemas/c
 #
 # [lsp.language.python]
 # root_markers = []                        # disable for python
+
+# ── Companion roots ──────────────────────────────────────────────
+#
+# [roots.companions] auto-mounts a derived sibling root alongside each
+# workspace root a host declares — so opening a project also mounts its
+# planning/companion repo for LSP intelligence, no manual `catenary pin`.
+#
+# OFF BY DEFAULT and USER-CONFIG ONLY: Catenary ships no table and assumes no
+# naming convention (an active `"*" = "{root}Internal"` would auto-mount
+# strangers' coincidentally-named siblings). It is read only from this user
+# config, never from a project `.catenary.toml` — a public repo must not be
+# able to leak a private sibling path. The example below is a template only;
+# uncomment to enable.
+#
+# [roots.companions]
+# "*"                  = "{root}Internal"          # any root → its <path>Internal sibling
+# "~/Projects/homelab" = "~/.local/share/chezmoi"  # explicit, unrelated path
 
 # ── Tools (`catenary grep`/`glob`/`diagnostics`) ─────────────────
 #
@@ -454,6 +494,133 @@ mod tests {
         assert!(
             test_recommended::config().script_hosts.is_none(),
             "recommended config must not activate script_hosts",
+        );
+    }
+
+    #[test]
+    fn template_companions_example_present_but_inactive() {
+        // misc 199: the [roots.companions] example is discoverable in the
+        // template but NEVER active in the recommended config (decisions
+        // 001/002 — an active `"*" = "{root}Internal"` would auto-mount
+        // strangers' coincidentally-named siblings). Twin of
+        // `template_mentions_script_hosts_lever`.
+        assert!(
+            TEMPLATE.contains("[roots.companions]"),
+            "template should mention the [roots.companions] example",
+        );
+        assert!(
+            TEMPLATE.contains("{root}Internal"),
+            "template companions example should show the {{root}}Internal derivation",
+        );
+        // The whole template parses as an empty doc — everything is commented.
+        // Prove no active [roots] table (hence no active companions) leaked in.
+        let doc: toml::Value =
+            toml::from_str(TEMPLATE).expect("template is valid TOML (empty doc)");
+        assert!(
+            doc.get("roots").is_none(),
+            "recommended config must show no active [roots]/companions table",
+        );
+    }
+
+    #[test]
+    fn template_lists_build_alternatives() {
+        // misc 199 deliverable 2: the common-ecosystem build alternatives are
+        // present as commented, uncommentable lines. The active build stays
+        // `make` (exactly one active build line).
+        for build in [
+            "just", "cargo", "npm", "yarn", "pnpm", "go", "gradle", "mvn", "cmake",
+        ] {
+            assert!(
+                TEMPLATE.contains(&format!("build = \"{build}\"")),
+                "template should list the `{build}` build alternative",
+            );
+        }
+        // Exactly one active build line survives in the uncommented block.
+        let active_builds = test_recommended::block()
+            .lines()
+            .filter(|l| l.trim_start().starts_with("build ="))
+            .count();
+        assert_eq!(
+            active_builds, 1,
+            "recommended [commands] block must keep exactly one active build line",
+        );
+    }
+
+    #[test]
+    fn template_deny_flags_examples_present_and_active_pair_only() {
+        // misc 199 deliverable 3: per-ecosystem escape-root deny_flags examples
+        // are present as commented candidates, with the principle named; only
+        // the shipped make/cargo pair is active.
+        assert!(
+            TEMPLATE.contains("redirect the tool to operate outside the project root"),
+            "deny_flags block must name the escape-root principle",
+        );
+        for candidate in [
+            "npm    = [\"--prefix\"]",
+            "yarn   = [\"--cwd\"]",
+            "pnpm   = [\"-C\", \"--dir\"]",
+            "go     = [\"-C\"]",
+            "gradle = [\"-p\", \"--project-dir\"]",
+            "mvn    = [\"-f\", \"--file\"]",
+            "just   = [\"-f\", \"--justfile\", \"-d\", \"--working-directory\"]",
+            "cmake  = [\"-S\", \"-B\"]",
+        ] {
+            assert!(
+                TEMPLATE.contains(candidate),
+                "template deny_flags should list the candidate `{candidate}`",
+            );
+        }
+        // Only make + cargo are active in the recommended config.
+        let deny_flags = test_recommended::config()
+            .deny_flags
+            .expect("recommended config has deny_flags");
+        let mut keys: Vec<&String> = deny_flags.keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![&"cargo".to_string(), &"make".to_string()],
+            "only make + cargo deny_flags stay active (the shipped pair)",
+        );
+        assert_eq!(deny_flags.get("make"), Some(&vec!["-C".to_string()]));
+        assert_eq!(
+            deny_flags.get("cargo"),
+            Some(&vec!["--manifest-path".to_string()]),
+        );
+    }
+
+    #[test]
+    fn template_commented_alternatives_parse_in_isolation() {
+        // misc 199 deliverable 5: every commented build/deny_flags alternative,
+        // when uncommented alone, is valid TOML. The candidates are seeded as
+        // double-commented, three-space-indented lines (`# #   key = value`);
+        // strip that exact prefix and parse each as a standalone TOML fragment.
+        // Keying off the `# #   ` shape avoids matching prose comment lines
+        // elsewhere in the template.
+        let mut checked = 0usize;
+        for raw in TEMPLATE.lines() {
+            let Some(line) = raw.strip_prefix("# #   ") else {
+                continue;
+            };
+            let is_build = line.starts_with("build = \"");
+            let is_deny = [
+                "npm", "yarn", "pnpm", "go", "gradle", "mvn", "just", "cmake",
+            ]
+            .iter()
+            .any(|k| line.starts_with(&format!("{k} ")) || line.starts_with(&format!("{k}=")));
+            if !(is_build || is_deny) {
+                continue;
+            }
+            let parsed = toml::from_str::<toml::Value>(line);
+            assert!(
+                parsed.is_ok(),
+                "commented alternative is not valid TOML: {line:?}: {parsed:?}",
+            );
+            checked += 1;
+        }
+        // Sanity: we exercised all seeded candidates (9 builds + 8 deny_flags).
+        assert_eq!(
+            checked, 17,
+            "expected to check all 17 commented alternatives, saw {checked}",
         );
     }
 

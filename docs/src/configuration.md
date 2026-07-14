@@ -755,7 +755,13 @@ which projects are open. `build` is exempt: it only names a build tool and
 relaxes nothing.
 
 Run `catenary config` to generate a recommended config template with
-a commented-out `[commands]` section.
+a commented-out `[commands]` section. The template carries the fuller
+reference the short block above elides: commented `build` alternatives for the
+common ecosystems (`just`, `cargo`, `npm`/`yarn`/`pnpm`, `go`, `gradle`/`mvn`,
+`cmake`), per-ecosystem `deny_flags` examples that deny the escape-root flags
+each build tool exposes (`make -C`, `cargo --manifest-path`, `npm --prefix`,
+… — adapt to your ecosystem), and a commented [`[roots.companions]`](#companion-roots)
+example (off by default, user-config only).
 
 ## Global Options
 
