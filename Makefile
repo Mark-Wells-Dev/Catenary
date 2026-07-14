@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: bench bench-test build-release check conformance conformance-matrix deny fuzz install machete mdbook mockgrep mockglob mdgrep mdglob refresh-recipes registry-selftest rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish publish-check tag-current
+.PHONY: bench bench-test build-release check conformance conformance-matrix deny flake-hunt fuzz install machete mdbook mockgrep mockglob mdgrep mdglob refresh-recipes registry-selftest rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish publish-check tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -229,6 +229,36 @@ test-ignored:
 test:
 	@if [ "$(MEMLIMIT_KB)" != unlimited ]; then ulimit -v $(MEMLIMIT_KB); fi; \
 	 cargo nextest run --workspace --features mockls --status-level fail --final-status-level slow --cargo-quiet $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
+
+# ── flake hunt (misc 194) ─────────────────────────────────────────────
+# Loop the FULL parallel test suite up to N times, stopping on the FIRST red
+# run. Some flakes (conformance_taplo's "dirty fixture renders [clean]") only
+# fire under the peak-parallel full-suite load, and pass standalone — so a single
+# `make test` cannot reproduce them; this hunts by repetition. On a catch the
+# keep-on-panic guard (tests/common/mod.rs) has ALREADY preserved the failing
+# test's tempdirs (daemon firehose, daemon.log, bridge_stderr*.log) and eprintln'd
+# their paths into nextest's captured failure output shown below — no rerun, so the
+# evidence is not lost to a passing retry. N= overrides the iteration cap (default
+# 10); each iteration is one full suite (~90s), so budget accordingly. Default
+# nextest capture is deliberate: it keeps the run fully parallel (the flake's
+# precondition) while still printing a failing test's captured output.
+#   make flake-hunt            # up to 10 full-suite passes, stop on first red
+#   make flake-hunt N=12       # up to 12
+#   make flake-hunt N=1        # one full pass
+HUNT_N ?= $(if $(N),$(N),10)
+flake-hunt:
+	@if [ "$(MEMLIMIT_KB)" != unlimited ]; then ulimit -v $(MEMLIMIT_KB); fi; \
+	 i=1; while [ $$i -le $(HUNT_N) ]; do \
+	   echo "── flake-hunt: iteration $$i/$(HUNT_N) ──"; \
+	   start=$$(date +%s); \
+	   if ! cargo nextest run --workspace --features mockls --no-fail-fast --cargo-quiet; then \
+	     echo "── flake-hunt: RED on iteration $$i (evidence pinned above by keep-on-panic) ──"; \
+	     exit 1; \
+	   fi; \
+	   echo "── flake-hunt: iteration $$i green in $$(( $$(date +%s) - start ))s ──"; \
+	   i=$$((i + 1)); \
+	 done; \
+	 echo "── flake-hunt: $(HUNT_N) full-suite passes all green — no catch ──"
 
 # ── conformance harness (tui-rework 07) ───────────────────────────────
 # Runs ONLY the language-server conformance harness. On the maintainer host the

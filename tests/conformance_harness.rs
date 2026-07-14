@@ -502,8 +502,12 @@ fn run_conformance(case: &Case, require: bool) -> Result<()> {
         return Ok(());
     }
 
-    let mut root = tempfile::tempdir().context("create fixture root")?;
-    common::keep_for_triage(&mut root);
+    // KeepOnPanic folds in `keep_for_triage` (CI's unconditional keep) and adds
+    // the failure-only keep: on a panicking assertion — every conformance
+    // assertion is an `assert!` — the fixture root (its copied fixture, and the
+    // daemon evidence written under it) survives the unwind, and the kept path
+    // is eprintln'd into nextest's captured failure output (misc 194).
+    let root = common::KeepOnPanic::new(tempfile::tempdir().context("create fixture root")?);
     let src = fixture_dir(case);
     if !src.is_dir() {
         bail!("fixture `{}` missing at {}", case.fixture, src.display());

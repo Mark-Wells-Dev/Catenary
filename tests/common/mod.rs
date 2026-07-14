@@ -9,6 +9,11 @@
 //! copy-pasting.
 
 #![allow(dead_code, reason = "each test crate compiles common separately")]
+#![allow(
+    clippy::print_stderr,
+    reason = "keep-on-panic (misc 194) eprintlns the preserved evidence path so \
+              nextest's captured failure output names the flaking shard"
+)]
 
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -122,6 +127,64 @@ pub fn keep_for_triage(dir: &mut tempfile::TempDir) {
     }
 }
 
+/// A [`tempfile::TempDir`] wrapper that self-pins its directory **on panic**
+/// (misc 194's keep-on-panic), so a flaking test's evidence — the daemon's
+/// isolated JSONL firehose, `daemon.log`, and `bridge_stderr*.log` — survives
+/// the unwind instead of being wiped by the inner `TempDir`'s `Drop`.
+///
+/// The `CATENARY_CONFORMANCE_KEEP` env var stays as CI's *unconditional* keep
+/// (folded in at construction, replacing a bare [`keep_for_triage`] call). This
+/// guard adds the local, failure-only keep the ticket calls for: a green run
+/// pins nothing (zero litter), but when a test panics — every conformance
+/// assertion is an `assert!`, so `std::thread::panicking()` sees it — the guard
+/// disables the inner cleanup and eprintlns the kept path. That line lands in
+/// nextest's captured failure output, so the failing shard names its own
+/// evidence directory (`make flake-hunt` then reads it).
+///
+/// **Drop order is load-bearing.** This is a newtype with the `TempDir` as its
+/// field, so on drop the guard's own `Drop::drop` runs *first* (deciding whether
+/// to keep) and only then does the inner `TempDir` drop — by which point cleanup
+/// is already disabled if we are unwinding. A `Deref` to `TempDir` keeps every
+/// `.path()` / `.disable_cleanup(…)` call site unchanged.
+pub struct KeepOnPanic(tempfile::TempDir);
+
+impl KeepOnPanic {
+    /// Wraps `dir`, applying the `CATENARY_CONFORMANCE_KEEP` unconditional keep
+    /// (CI's escape hatch) immediately. The panic keep is applied by [`Drop`].
+    pub fn new(mut dir: tempfile::TempDir) -> Self {
+        keep_for_triage(&mut dir);
+        Self(dir)
+    }
+}
+
+impl std::ops::Deref for KeepOnPanic {
+    type Target = tempfile::TempDir;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KeepOnPanic {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for KeepOnPanic {
+    fn drop(&mut self) {
+        // Runs BEFORE the inner `TempDir::drop` (field drop order). Only pin on
+        // an unwind — a green run leaves nothing behind.
+        if std::thread::panicking() {
+            self.0.disable_cleanup(true);
+            eprintln!(
+                "keep-on-panic: preserved test evidence at {}",
+                self.0.path().display()
+            );
+        }
+    }
+}
+
 /// A [`tempfile::tempdir`] whose `path()` is already **canonical**.
 ///
 /// The daemon canonicalizes every root it tracks (`CATENARY_ROOTS`, ephemeral
@@ -200,8 +263,10 @@ pub struct BridgeProcess {
     stderr_log: Option<PathBuf>,
     state_home: String,
     /// Internal tempdir for XDG state/config isolation.
-    /// `None` when using a shared (externally-owned) state dir.
-    _state_dir: Option<tempfile::TempDir>,
+    /// `None` when using a shared (externally-owned) state dir. Wrapped in
+    /// [`KeepOnPanic`] so a failing test's daemon firehose / `daemon.log` /
+    /// `bridge_stderr*.log` survive the unwind (misc 194).
+    _state_dir: Option<KeepOnPanic>,
     /// Isolated workspace root dir, owned by this process.
     root_dir: Option<tempfile::TempDir>,
     /// Working directory for IPC tool queries.
@@ -347,8 +412,11 @@ impl BridgeProcess {
         configure: impl FnOnce(&mut Command),
         setup: impl FnOnce(&str) -> Result<()>,
     ) -> Result<Self> {
-        let mut state_dir = tempfile::tempdir().context("Failed to create state dir")?;
-        keep_for_triage(&mut state_dir);
+        // KeepOnPanic folds in `keep_for_triage` (CI's unconditional keep) and
+        // adds the failure-only keep: a panicking test's daemon firehose /
+        // `daemon.log` / `bridge_stderr.log` survive the unwind (misc 194).
+        let state_dir =
+            KeepOnPanic::new(tempfile::tempdir().context("Failed to create state dir")?);
         let state_home = state_dir
             .path()
             .to_str()
