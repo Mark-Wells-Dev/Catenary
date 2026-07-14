@@ -844,3 +844,67 @@ fn glob_routes_changed_then_queries_outline() -> Result<()> {
     );
     Ok(())
 }
+
+/// The raw-vs-canonical seam guard (misc 193, mirroring grep's b9145d5 cwd
+/// guard): a glob whose raw-absolute pattern path enters under a **symlinked**
+/// prefix must resolve its root and enrich the file, not fall back to the
+/// `(no LSP)` / `no outline` degradation.
+///
+/// The root the daemon tracks is canonical (`CATENARY_ROOTS` is canonicalized),
+/// but the host passes its raw pattern spelling. On a symlinked-tempdir host
+/// (macOS `$TMPDIR` → `/private/var/…`, or any symlinked prefix — Linux
+/// reproduces via `TMPDIR` pointed at a symlink, misc 164's recipe) the two
+/// spellings differ. A raw pattern base makes glob's expansion walk emit
+/// raw-spelled paths that fail `resolve_root`'s canonical prefix check: the file
+/// then renders `(no LSP)` under its raw spelling and its
+/// `ensure_and_wait_for_paths` / `ensure_symbols` never spawn a server for it,
+/// so the outline is lost (`no outline`). Canonicalizing at glob's ingestion
+/// seam keeps the walk, `resolve_root`, the display `strip_prefix`, and the
+/// enrichment all canonical-to-canonical, so the file resolves to its root and
+/// its symbols are queried.
+///
+/// This test deliberately uses a **raw** `tempfile::tempdir()` (NOT
+/// `canonical_tempdir`) — the raw tempdir IS the regression guard. On a
+/// non-symlinked host it is identical to the canonical-tempdir variant
+/// (canonicalizing an already-canonical base is a no-op), so it is a permanent
+/// guard, not a symlink-only branch. `mockls` extracts a `documentSymbol` from
+/// the `fn <name>` line, so a served file's outline names that symbol.
+#[test]
+fn glob_enriches_file_under_symlinked_pattern_prefix() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join(format!("outline.{MOCK_LANG_A}"));
+    std::fs::write(&file, "fn original() {}\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG_A, "");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    // Glob the file by its raw (symlinked-prefix) absolute path — the spelling
+    // the host passes. It must resolve to its canonical root and enrich.
+    let file_str = file.to_str().context("file path")?;
+    let out = bridge.call_tool_text("glob", &json!({ "paths": [file_str] }))?;
+
+    // resolve_root must succeed for the in-root file: no `(no LSP)` degradation.
+    assert!(
+        !out.contains("no LSP"),
+        "glob of an in-root file under a symlinked prefix must resolve its root, \
+         not render `(no LSP)`. Pre-fix the raw path fails `resolve_root`. out:\n{out}"
+    );
+    // The file is served: `resolve_root` succeeded, the server was ensured for
+    // the canonical path, and `documentSymbol` returned the `fn original` symbol.
+    assert!(
+        out.contains("original") && !out.contains("no outline"),
+        "glob under a symlinked prefix must enrich the file (outline names \
+         `original`), not degrade to `no outline`. Pre-fix the raw path is never \
+         ensured on the server. out:\n{out}"
+    );
+    // The rendered path is canonical (the daemon's spelling), matching the
+    // canonical root — not the raw `.tlink`-style symlinked prefix.
+    let canonical_file = file.canonicalize().context("canonicalize file")?;
+    assert!(
+        out.contains(&canonical_file.to_string_lossy().into_owned()),
+        "glob must render the file at its canonical path. out:\n{out}"
+    );
+    Ok(())
+}

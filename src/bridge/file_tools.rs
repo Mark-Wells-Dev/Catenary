@@ -225,12 +225,40 @@ impl GlobServer {
         parent_id: Option<&str>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<GlobOutcome> {
-        let input: GlobInput = serde_json::from_value(params.clone())
+        let mut input: GlobInput = serde_json::from_value(params.clone())
             .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
 
         if input.paths.is_empty() {
             return Err(anyhow!("no paths provided"));
         }
+
+        // Canonicalize the incoming pattern paths and cwd at this ingestion seam,
+        // once (misc 193, mirroring grep's cwd canonicalization in `b9145d5`):
+        // roots are canonical (the daemon canonicalizes `CATENARY_ROOTS` and every
+        // ephemeral mount), but the host passes its raw pattern spelling. On a
+        // symlinked-tempdir host (macOS `$TMPDIR` → `/private/var/…`, or any
+        // symlinked prefix) the two spellings differ, so a raw pattern base makes
+        // the expansion walk emit raw-spelled resolved paths that fail
+        // `resolve_root`'s canonical prefix check. Each in-root file then renders
+        // `(no LSP)` under its raw spelling, and its `ensure_and_wait_for_paths` /
+        // `ensure_symbols` never spawn a server for the canonical root, so the
+        // outline is lost (`no outline`) even though the root is served. (The
+        // scoped changed-set nudge already survives this: its observations are
+        // canonicalized in `collect_scoped_observations`; the display and
+        // enrichment are the legs that read the raw resolved path directly.)
+        // Canonicalizing each pattern's metachar-free base here keeps the walk,
+        // `resolve_root`, the display `strip_prefix`, and the enrichment all
+        // canonical-to-canonical, matching the convention `handle_file_accumulation`
+        // / `ensure_ephemeral_mounts` already follow. A not-yet-existing base keeps
+        // its spelling (canonicalize can't resolve it), so a zero-match pattern
+        // still reports honestly.
+        for path in &mut input.paths {
+            *path = canonicalize_pattern_base(path);
+        }
+        input.cwd = input
+            .cwd
+            .as_ref()
+            .map(|c| c.canonicalize().unwrap_or_else(|_| c.clone()));
 
         tracing::debug!("glob: {} path(s)", input.paths.len());
 
@@ -1529,10 +1557,150 @@ fn canonical_key(path: &Path) -> Option<PathBuf> {
     path.canonicalize().ok()
 }
 
+/// Whether a path component carries a glob metacharacter (`* ? [ {`).
+///
+/// Mirrors [`ResolvedGlob::base_dir`](crate::bridge::session::ResolvedGlob)'s
+/// split point (`crate::bridge::session`), so the metachar-free prefix this
+/// helper canonicalizes lines up with the base the expansion walk actually roots
+/// at.
+fn component_has_metachar(component: &std::ffi::OsStr) -> bool {
+    let s = component.to_string_lossy();
+    s.contains(['*', '?', '[', '{'])
+}
+
+/// Canonicalizes a glob pattern's metachar-free base, preserving the glob
+/// remainder, and falls back to the raw pattern when the base can't be resolved.
+///
+/// This is glob's ingestion-seam canonicalization (misc 193, mirroring grep's
+/// cwd canonicalization in `b9145d5`). The daemon tracks canonical roots, but the
+/// host passes its raw pattern spelling; under a symlinked prefix the two differ,
+/// so a raw base makes the expansion walk emit raw-spelled paths that fail
+/// `resolve_root`'s canonical prefix check — collapsing enrichment and the scoped
+/// nudge. The pattern is split at its first metachar-bearing component (the same
+/// point `ResolvedGlob::base_dir` uses to root the walk); the metachar-free
+/// prefix is canonicalized and the glob remainder re-appended verbatim.
+///
+/// A relative pattern (no absolute base) or one whose base does not yet exist
+/// keeps its spelling (`canonicalize` can't resolve it) — a zero-match pattern
+/// still reports honestly, and a relative pattern carries no base to resolve.
+fn canonicalize_pattern_base(pattern: &Path) -> PathBuf {
+    // Split into the metachar-free prefix (the walk's base) and the glob
+    // remainder, mirroring `ResolvedGlob::base_dir`.
+    let mut base = PathBuf::new();
+    let mut remainder = PathBuf::new();
+    let mut in_remainder = false;
+    for component in pattern.components() {
+        if in_remainder || component_has_metachar(component.as_os_str()) {
+            in_remainder = true;
+            remainder.push(component);
+        } else {
+            base.push(component);
+        }
+    }
+
+    // A pattern that is metachar-first (no metachar-free prefix) carries no base
+    // to canonicalize — return it unchanged.
+    if base.as_os_str().is_empty() {
+        return pattern.to_path_buf();
+    }
+
+    // Canonicalize the base once; on failure keep the raw pattern (a not-yet-
+    // existing base, or a relative one canonicalize can't resolve).
+    let Ok(canonical_base) = base.canonicalize() else {
+        return pattern.to_path_buf();
+    };
+    if remainder.as_os_str().is_empty() {
+        canonical_base
+    } else {
+        canonical_base.join(remainder)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use globset::Glob;
+
+    // ─── canonicalize_pattern_base — glob's ingestion-seam canonicalization (misc 193) ──
+
+    /// A fully-literal absolute pattern reached through a symlinked prefix
+    /// component canonicalizes to its real path — the spelling `resolve_root`,
+    /// the display, and enrichment all agree on.
+    #[test]
+    #[cfg(unix)]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn canonicalize_pattern_base_resolves_symlinked_prefix() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize base");
+        let realdir = base.join("realdir");
+        std::fs::create_dir(&realdir).expect("create realdir");
+        let real_file = realdir.join("x.rs");
+        std::fs::write(&real_file, "fn x() {}\n").expect("write file");
+        let linkdir = base.join("linkdir");
+        symlink(&realdir, &linkdir).expect("create linkdir symlink");
+
+        // A file pattern reached through the symlinked prefix.
+        let raw = linkdir.join("x.rs");
+        assert_eq!(
+            canonicalize_pattern_base(&raw),
+            real_file,
+            "a literal pattern under a symlinked prefix must canonicalize to its \
+             real path"
+        );
+    }
+
+    /// The metachar-free base is canonicalized; the glob remainder is preserved
+    /// verbatim (the base is where `resolve_root`/enrichment key, the remainder
+    /// is the walk's matcher).
+    #[test]
+    #[cfg(unix)]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn canonicalize_pattern_base_preserves_glob_remainder() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize base");
+        let realdir = base.join("realdir");
+        std::fs::create_dir(&realdir).expect("create realdir");
+        let linkdir = base.join("linkdir");
+        symlink(&realdir, &linkdir).expect("create linkdir symlink");
+
+        // `<linkdir>/**/*.rs`: base `<linkdir>` canonicalizes, `**/*.rs` rides along.
+        let pattern = linkdir.join("**").join("*.rs");
+        let expected = realdir.join("**").join("*.rs");
+        assert_eq!(
+            canonicalize_pattern_base(&pattern),
+            expected,
+            "the metachar-free base canonicalizes while the glob remainder is kept"
+        );
+    }
+
+    /// A not-yet-existing base keeps its raw spelling (canonicalize can't resolve
+    /// it), so a zero-match pattern still reports honestly rather than erroring.
+    #[test]
+    fn canonicalize_pattern_base_absent_base_keeps_spelling() {
+        let pattern = Path::new("/no/such/dir/*.rs");
+        assert_eq!(
+            canonicalize_pattern_base(pattern),
+            pattern.to_path_buf(),
+            "an absent base must keep its raw spelling"
+        );
+    }
+
+    /// A relative pattern whose base does not exist relative to the daemon cwd
+    /// keeps its spelling (canonicalize can't resolve it). The router absolutizes
+    /// relative patterns before dispatch, so this only guards the defensive path;
+    /// a clearly-nonexistent base keeps the assertion independent of the test's
+    /// working directory.
+    #[test]
+    fn canonicalize_pattern_base_relative_pattern_unchanged() {
+        let pattern = Path::new("no_such_relative_base_193/**/*.rs");
+        assert_eq!(
+            canonicalize_pattern_base(pattern),
+            pattern.to_path_buf(),
+            "a relative pattern with an absent base is returned unchanged"
+        );
+    }
 
     #[test]
     fn ws31_review_r2_live_retry_recovers_transient_miss() {
