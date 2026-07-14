@@ -448,12 +448,11 @@ fn spawn_land_daemon(repo: &Path) -> BridgeProcess {
 
 /// Pins `path` as a tracked root via `tool/roots-add` (the `catenary pin` path).
 ///
-/// Both the owning repo AND the worktree are pinned as tracker roots so both
-/// survive the `sync_roots` a pin triggers (which rebuilds the primary session's
-/// roots from tracker contributors only — a `CATENARY_ROOTS`-seeded root that is
-/// not also a tracker contributor would be dropped). The owner's edits then
-/// accumulate as covered inside the worktree, and the landed files map onto the
-/// still-tracked owning repo.
+/// Only the worktree needs pinning: the owning repo is the `CATENARY_ROOTS` seed,
+/// registered as the `seed:env` tracker contributor at boot (misc 192), so it
+/// survives the `sync_roots` this pin triggers (which rebuilds the primary
+/// session's roots from tracker contributors). Before misc 192 both had to be
+/// pinned — the seed was not a contributor and the worktree pin evicted it.
 fn pin_root(socket: &Path, path: &Path) {
     ipc_request(
         socket,
@@ -552,8 +551,8 @@ fn land_of_a_paid_worktree_arms_nothing() {
     let socket = bridge.wait_for_ipc_socket().expect("daemon socket");
 
     let worktree = create_worktree(&state_home, &repo);
-    // Pin both the owning repo and the worktree as tracker roots (see `pin_root`).
-    pin_root(&socket, &repo);
+    // Pin the worktree as a tracker root; the owning repo is the seed:env
+    // contributor and survives on its own (see `pin_root`).
     pin_root(&socket, &worktree);
 
     // The worker edits a covered file in the worktree, then PAYS its gate.
@@ -610,8 +609,8 @@ fn land_of_an_unpaid_worktree_transfers_exactly_its_unpaid_files() {
     let socket = bridge.wait_for_ipc_socket().expect("daemon socket");
 
     let worktree = create_worktree(&state_home, &repo);
-    // Pin both the owning repo and the worktree as tracker roots (see `pin_root`).
-    pin_root(&socket, &repo);
+    // Pin the worktree as a tracker root; the owning repo is the seed:env
+    // contributor and survives on its own (see `pin_root`).
     pin_root(&socket, &worktree);
 
     // The worker edits two covered files in the worktree and NEVER pays — a

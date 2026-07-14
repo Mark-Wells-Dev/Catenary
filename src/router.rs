@@ -1153,6 +1153,10 @@ pub const WORKTREE_ROOT_GC_INTERVAL: Duration = Duration::from_hours(1);
 /// Contributor keys:
 /// - `"mcp:{fd}"` — roots from MCP `roots/list` for a connection
 /// - `"hook"` — roots from `catenary add-root` CLI commands
+/// - `"seed:env"` — the daemon's boot roots from `CATENARY_ROOTS` (misc 192),
+///   registered once at boot so the env seed is a first-class contributor: every
+///   re-sync rebuilds the same union (the seed survives any pin/unpin) and the
+///   seed has an honest roots-board presence instead of a phantom membership.
 /// - `"worktree:{session_id}:{canonical path}"` — a subagent's worktree mounted
 ///   at `SubagentStart` and torn down at `WorktreeRemove` (workstream 30, ticket
 ///   03); keyed by the canonical worktree path (not `agent_id`, which
@@ -1567,6 +1571,47 @@ fn persist_unpin(canonical: &Path) -> bool {
             false
         }
     }
+}
+
+/// Contributor key for the daemon's `CATENARY_ROOTS` boot seed (misc 192).
+///
+/// A single fixed key (not a `{...}`-parameterized namespace like `mcp:{fd}` or
+/// `worktree:*`) — there is exactly one env seed per daemon. Registered once at
+/// boot in [`register_env_seed`], so every re-sync (a pin via `tool/roots-add`,
+/// an MCP disconnect, a worktree reap) rebuilds a union that still carries the
+/// seed instead of silently evicting it.
+#[cfg(unix)]
+const SEED_ENV_CONTRIBUTOR: &str = "seed:env";
+
+/// Register the daemon's `CATENARY_ROOTS` boot roots as the `seed:env` tracker
+/// contributor (misc 192).
+///
+/// The session is born (in `main::run_daemon_main`) with the canonicalized
+/// `CATENARY_ROOTS` set already installed in its `FilesystemManager`/
+/// `LspClientManager`, but those roots are *not* tracker contributors: a later
+/// re-sync that rebuilds the served union from `tracker.global_roots_rich()`
+/// (e.g. `tool/roots-add`) would replace the session's roots with the
+/// contributor union and silently drop the seed. Registering the seed here
+/// closes that gap — the seed survives any pin/unpin and gains an honest
+/// roots-board line instead of a phantom membership.
+///
+/// Zero-cost, mirroring [`restore_pinned_roots`]: `set_roots` births a
+/// config-loaded [`Root`] per path but spawns nothing (the session's own
+/// `spawn_all` at boot already covers these roots), and no `sync_roots` push is
+/// needed — the session already serves the seed. An empty seed (never the case:
+/// `CATENARY_ROOTS` defaults to `["."]`, canonicalized) is a benign no-op.
+#[cfg(unix)]
+fn register_env_seed(tracker: &RootTracker, session: &Arc<Session>) {
+    let seed = session.roots();
+    if seed.is_empty() {
+        return;
+    }
+    let count = seed.len();
+    tracker.set_roots(SEED_ENV_CONTRIBUTOR, seed);
+    info!(
+        source = Source::DaemonLifecycle.as_str(),
+        count, "registered CATENARY_ROOTS boot seed as tracker contributor",
+    );
 }
 
 /// Restore persisted pins at daemon boot (misc 175): re-add each `[roots]
@@ -2677,6 +2722,16 @@ impl SessionManager {
         self.lsp = Some(session.lsp_client_manager().clone());
         let root_tracker = RootTracker::new();
         self.root_tracker = Some(root_tracker.clone());
+
+        // Env-seed registration (misc 192): register the daemon's
+        // `CATENARY_ROOTS` boot roots as the `seed:env` tracker contributor so a
+        // later re-sync that rebuilds the served union from tracker contributors
+        // (a pin via `tool/roots-add`, an MCP disconnect) does not silently evict
+        // the seed. Runs before `restore_pinned_roots` so the seed is already in
+        // the union that the pin-restore re-sync pushes down. Zero-cost — the
+        // session already serves these roots (its own boot `spawn_all`), so this
+        // adds a tracker entry + roots-board line and spawns nothing.
+        register_env_seed(&root_tracker, &session);
 
         // Persisted-pin restore (misc 175): re-add each `[roots] pinned` config
         // entry as a `hook` contributor so a pin survives a daemon restart. A

@@ -132,6 +132,27 @@ fn status_of(resp: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Returns the sorted contributor sources `roots-ls` reports for `target`, or
+/// `None` when `target` is not a tracked root at all.
+///
+/// The env-seed survival tests (misc 192) assert both that the seed root stays
+/// tracked across a pin/unpin AND that it is attributed to the `seed:env`
+/// contributor — an honest board presence, not a phantom membership.
+fn roots_ls_sources(socket: &Path, target: &str) -> Result<Option<Vec<String>>> {
+    let resp = ipc_request(socket, &json!({ "method": "tool/roots-ls" }))?;
+    let roots: serde_json::Value = serde_json::from_str(resp.trim()).context("roots-ls json")?;
+    Ok(roots["roots"].as_array().and_then(|arr| {
+        arr.iter()
+            .find(|e| e["path"].as_str() == Some(target))
+            .and_then(|e| e["sources"].as_array())
+            .map(|s| {
+                s.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+    }))
+}
+
 /// Reads the daemon's `state.json` snapshot from the isolated runtime dir.
 fn read_snapshot(state_home: &str) -> Option<serde_json::Value> {
     let state_json = xdg_runtime_dir(state_home)
@@ -448,6 +469,106 @@ fn boot_restore_spawns_no_servers() -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+
+    drop(bridge);
+    stop_daemon(state_home)?;
+    Ok(())
+}
+
+/// A `CATENARY_ROOTS`-seeded root survives a later pin (misc 192).
+///
+/// Before the fix the env seed was set on the primary session but never
+/// registered as a `RootTracker` contributor, so pinning a *different* root
+/// triggered a `sync_roots` rebuilt from tracker contributors only — silently
+/// evicting the seed from the served union (no retire log, no board change the
+/// user asked for). Registering the seed as the `seed:env` contributor at boot
+/// makes every re-sync rebuild the same union: the seed stays tracked across the
+/// pin AND is attributed to `seed:env` on the roots board.
+///
+/// Red before the fix: the seed root is absent from `roots-ls` entirely (never a
+/// contributor). Green after: it is present with `sources = ["seed:env"]` both
+/// before and after the pin.
+#[test]
+fn env_seed_survives_a_pin() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+
+    // The env seed — canonical, so it matches the daemon's stored form.
+    let seed = common::canonical_tempdir()?;
+    let seed_str = seed.path().to_str().context("seed path")?;
+
+    // A distinct root to pin, which triggers the contributor-union re-sync.
+    let target = common::canonical_tempdir()?;
+    let target_str = target.path().to_str().context("target path")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG, "");
+    let mut bridge = BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_SERVERS", &lsp);
+        cmd.env("CATENARY_ROOTS", seed_str);
+    })?;
+    bridge.initialize()?;
+    let socket = bridge.wait_for_ipc_socket()?;
+
+    // The seed is a first-class tracked root from boot — attributed to seed:env.
+    bridge.wait_for_root(seed_str, Duration::from_secs(5))?;
+    assert_eq!(
+        roots_ls_sources(&socket, seed_str)?,
+        Some(vec!["seed:env".to_string()]),
+        "env seed is tracked as the seed:env contributor at boot"
+    );
+
+    // Pin the distinct target — this is the re-sync that used to evict the seed.
+    assert_eq!(pin(&socket, target_str)?, "ok", "pin succeeds");
+    bridge.wait_for_root(target_str, Duration::from_secs(5))?;
+
+    // The seed is STILL tracked after the pin (the eviction is fixed), still
+    // attributed to seed:env — not dropped, not silently reclassified.
+    assert_eq!(
+        roots_ls_sources(&socket, seed_str)?,
+        Some(vec!["seed:env".to_string()]),
+        "env seed survives the pin"
+    );
+
+    drop(bridge);
+    stop_daemon(state_home)?;
+    Ok(())
+}
+
+/// A `CATENARY_ROOTS`-seeded root survives an unpin too (misc 192).
+///
+/// The unpin path (`tool/roots-rm`) runs the same contributor-union re-sync as a
+/// pin, so it is the mirror eviction risk. Pinning then unpinning a distinct
+/// root must leave the seed tracked throughout.
+#[test]
+fn env_seed_survives_an_unpin() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+
+    let seed = common::canonical_tempdir()?;
+    let seed_str = seed.path().to_str().context("seed path")?;
+
+    let target = common::canonical_tempdir()?;
+    let target_str = target.path().to_str().context("target path")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG, "");
+    let mut bridge = BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_SERVERS", &lsp);
+        cmd.env("CATENARY_ROOTS", seed_str);
+    })?;
+    bridge.initialize()?;
+    let socket = bridge.wait_for_ipc_socket()?;
+    bridge.wait_for_root(seed_str, Duration::from_secs(5))?;
+
+    // Pin then unpin the distinct target; the unpin re-sync must not evict the seed.
+    assert_eq!(pin(&socket, target_str)?, "ok");
+    bridge.wait_for_root(target_str, Duration::from_secs(5))?;
+    assert_eq!(unpin(&socket, target_str)?, "ok", "unpin succeeds");
+
+    assert_eq!(
+        roots_ls_sources(&socket, seed_str)?,
+        Some(vec!["seed:env".to_string()]),
+        "env seed survives the unpin"
+    );
 
     drop(bridge);
     stop_daemon(state_home)?;
