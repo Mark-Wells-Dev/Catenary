@@ -1434,6 +1434,64 @@ mod tests {
     }
 
     #[test]
+    fn blessed_servers_all_rowed() {
+        // The misc-196 invariant, structural: EVERY blessed server carries a
+        // `[discipline.<server>]` row. A blessed-but-rowless server used to get the
+        // most-trusting treatment there is — its silence read `[clean]` through the
+        // misc-153 residual — inverting the manifest's directional-safety doctrine
+        // ("missing data only ever makes Catenary noisier, never more trusting").
+        // The ruling retires that residual by making the shipped data structurally
+        // incapable of holding a rowless blessed server: this test fails CI the
+        // moment a future blessing lands without a row.
+        //
+        // The parse is `default_blessed_manifest()`, so this covers BOTH the
+        // committed seed AND — under `feature = "mockls"` (the test build) — the
+        // concatenated persona fragment (`defaults/mockls-personas.toml`): every
+        // `[blessed.mockls-*.*]` persona must carry its `[discipline.mockls-*]` row
+        // too, so a future persona cannot ship blessed-but-rowless either.
+        let manifest = default_blessed_manifest().expect("manifest parses");
+        let rowless: Vec<&String> = manifest
+            .blessed
+            .keys()
+            .filter(|server| !manifest.discipline.contains_key(*server))
+            .collect();
+        assert!(
+            rowless.is_empty(),
+            "every blessed server must carry a `[discipline.<server>]` row \
+             (misc 196 — blessed ⊆ rowed); rowless: {rowless:?}",
+        );
+    }
+
+    #[test]
+    fn removing_a_blessed_row_breaks_the_invariant() {
+        // The invariant's teeth, demonstrated: a manifest with a blessed server but
+        // NO discipline row for it is exactly the rowless residual misc 196 retires,
+        // so the `blessed ⊆ rowed` check must catch it. This is the "demonstrably
+        // red if a row is removed" leg — it proves the guard fails on the condition
+        // it exists to forbid, not merely passes on the shipped data.
+        let mut manifest = default_blessed_manifest().expect("manifest parses");
+        // Drop rust-analyzer's discipline row while leaving it blessed.
+        assert!(
+            manifest.discipline.remove("rust-analyzer").is_some(),
+            "rust-analyzer must have had a row to remove",
+        );
+        assert!(
+            manifest.is_blessed("rust-analyzer"),
+            "rust-analyzer stays blessed after only its discipline row is removed",
+        );
+        let rowless: Vec<&String> = manifest
+            .blessed
+            .keys()
+            .filter(|server| !manifest.discipline.contains_key(*server))
+            .collect();
+        assert!(
+            rowless.iter().any(|s| s.as_str() == "rust-analyzer"),
+            "a blessed server with its row removed must trip the blessed ⊆ rowed \
+             check — the invariant is demonstrably red when a row is missing",
+        );
+    }
+
+    #[test]
     fn engine_supports_gates_on_min_schema() {
         // The shipped seed carries no `[manifest]` floor ⇒ schema 0 ⇒ always
         // supported. A manifest requiring a schema this binary implements is

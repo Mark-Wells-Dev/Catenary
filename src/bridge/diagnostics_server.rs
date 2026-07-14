@@ -351,6 +351,27 @@ struct RoundDoc {
     synced: bool,
 }
 
+/// What a diagnostics round delivered to one server — the retrieval evidence
+/// bar's arming input plus the diff floor arm's trigger signal (diagnostics-debt
+/// 01 / misc 196).
+///
+/// Returned by [`DiagnosticsServer::settle_and_save`] on a round that reached
+/// retrieval. `stimulated` (the pre-existing signal) is `true` when the round
+/// sent any traffic (sync or save). `saved` is `true` when a `didSave` was
+/// delivered to the server this round — the diff-discipline server's contractual
+/// trigger: an alive diff server silent after a delivered save violates its
+/// contract, while a diff round that delivered no save owes nothing (the floor's
+/// diff arm, DESIGN §"Publisher-discipline metadata").
+#[derive(Debug, Clone, Copy, Default)]
+struct RoundStimulus {
+    /// The round sent any traffic (sync or save) — arms the retrieval evidence
+    /// bar (unchanged from the prior `stimulated` bool).
+    stimulated: bool,
+    /// A `didSave` was delivered to the server this round — the diff floor arm's
+    /// trigger.
+    saved: bool,
+}
+
 /// The routing decision for a scoped diagnostics request (workstream 37
 /// ticket 04, decision 5).
 ///
@@ -437,15 +458,25 @@ impl DiagnosticsServer {
         // no-capability directories expanded to their covered files. Also yields
         // the per-file server assignment, so a file that dies before producing a
         // result can name the server(s) that owed it one (bug 56).
-        let (mut canonical_paths, uncovered, out_of_scope, path_servers, stuck_servers) = self
-            .fan_out(&plan.fan_out, parent_id, owner, &mut feeds)
-            .await;
+        let (mut canonical_paths, uncovered, out_of_scope, mut path_servers, mut stuck_servers) =
+            self.fan_out(&plan.fan_out, parent_id, owner, &mut feeds)
+                .await;
 
         // Whole-root + capable scopes: one workspace/diagnostic request each,
-        // merged into the same per-file map the fan-out populated.
+        // merged into the same per-file map the fan-out populated. A scan server
+        // that refuses/fails its whole-workspace pull while alive feeds a
+        // verified-contract violation into the same `stuck_servers` / `path_servers`
+        // maps the fan-out populates — the floor's scan arm (misc 196).
         for (root, clients) in &plan.workspace_targets {
-            self.workspace_pull(root, clients, &mut feeds, &mut canonical_paths)
-                .await;
+            self.workspace_pull(
+                root,
+                clients,
+                &mut feeds,
+                &mut canonical_paths,
+                &mut path_servers,
+                &mut stuck_servers,
+            )
+            .await;
         }
 
         // ── Phase 2c: cross-feeder aggregation (ticket 02) ─────────
@@ -929,12 +960,28 @@ impl DiagnosticsServer {
     /// `canonical_paths` so the receipt classifies and collapses it. The
     /// server's own project scope bounds the report to `root`; a stray report
     /// outside `root` is dropped defensively.
+    ///
+    /// **The scan floor arm (misc 196).** A [`scan`-discipline](crate::recipes::Discipline::Scan)
+    /// server (marksman-class) owes its **whole-workspace answer**: this pull is
+    /// its contractual trigger. When `workspace/diagnostic` goes unanswered or
+    /// refused while the server is **alive**, that is a verified-contract violation
+    /// (DESIGN's scan row: "silence ≠ clean; fault attribution below"). The arm
+    /// records the strike (the same ledger a crash feeds) and surfaces a
+    /// root-scoped `[unverified — … did not answer]` line via `stuck_servers` /
+    /// `path_servers`, so a scan server's refused pull can never collapse to
+    /// `[clean]` over its genuinely-unscanned root — it names the server, the
+    /// cause, and the re-run action. A NON-scan server that merely fails the
+    /// workspace pull (or a dead server — its unavailability is the fan-out's
+    /// respawn-dead territory, not this seam) is left as the prior skip: not every
+    /// server owes a workspace answer.
     async fn workspace_pull(
         &self,
         root: &std::path::Path,
         clients: &[Arc<Mutex<LspClient>>],
         feeds: &mut BTreeMap<String, FileFeed>,
         canonical_paths: &mut Vec<PathBuf>,
+        path_servers: &mut BTreeMap<String, BTreeSet<String>>,
+        stuck_servers: &mut BTreeMap<String, UnverifiedCause>,
     ) {
         for client_mutex in clients {
             let client = client_mutex.lock().await;
@@ -948,10 +995,42 @@ impl DiagnosticsServer {
             let reports = match client.workspace_diagnostics().await {
                 Ok(reports) => reports,
                 Err(e) => {
-                    debug!(
-                        server = %server_name,
-                        "workspace/diagnostic failed, skipping: {e}",
-                    );
+                    // The scan floor arm (misc 196): an ALIVE scan server that
+                    // refuses/fails its owed whole-workspace answer is a
+                    // verified-contract violation — never a silent skip that lets
+                    // the root read `[clean]`. A dead server, or a non-scan server
+                    // that merely fails the pull, keeps the prior skip.
+                    let scan_violation = client.server().is_scan() && client.is_alive();
+                    drop(client);
+                    if scan_violation {
+                        warn!(
+                            server = %server_name,
+                            "scan server refused its owed workspace/diagnostic pull: {e} \
+                             — attributing as a verified-contract violation",
+                        );
+                        if let Some(key) = &served_key {
+                            self.client_manager.record_contract_violation(key);
+                        }
+                        // Surface the root itself as an unverified line naming the
+                        // scan server: the root is in `canonical_paths` + owed by
+                        // the server (`path_servers`) but absent from `feeds`, so it
+                        // classifies `NoResults` and renders the ContractViolation
+                        // wording.
+                        let key = root.to_string_lossy().to_string();
+                        path_servers
+                            .entry(key)
+                            .or_default()
+                            .insert(server_name.clone());
+                        stuck_servers.insert(server_name, UnverifiedCause::ContractViolation);
+                        if !canonical_paths.contains(&root.to_path_buf()) {
+                            canonical_paths.push(root.to_path_buf());
+                        }
+                    } else {
+                        debug!(
+                            server = %server_name,
+                            "workspace/diagnostic failed, skipping: {e}",
+                        );
+                    }
                     continue;
                 }
             };
@@ -1292,7 +1371,8 @@ impl DiagnosticsServer {
         owner: Option<&str>,
         feeds: &mut BTreeMap<String, FileFeed>,
     ) -> Option<BatchFault> {
-        self.run_server_batch(client_mutex, paths, parent_id, owner, feeds)
+        let saved_this_round = self
+            .run_server_batch(client_mutex, paths, parent_id, owner, feeds)
             .await;
 
         let remainder: Vec<PathBuf> = paths
@@ -1310,14 +1390,27 @@ impl DiagnosticsServer {
             // is not an unavailability.
             if client.is_alive() && !client.lifecycle().is_terminal() {
                 // Alive but with an unretrieved remainder: a verified-contract
-                // violation iff the server's discipline OWED an answer this round
-                // (declared-push, or debounce) — the fault floor's third arm
-                // (diagnostics-debt 05). An alive server that owes no contract
-                // (the rust-analyzer never-republishes residual, an
-                // undeclared-silent server) is left `None` — its silence is not a
-                // fault. A server violating its adapter is sick the same way a
-                // crashing one is, so it feeds the SAME strike ledger.
-                if client.server().owes_answer() {
+                // violation iff the server's discipline OWED an answer this round.
+                // Three arms:
+                //   • the static owed-answer contract — declared-push (misc 187)
+                //     or debounce (diagnostics-debt 05): a stimulated round owes a
+                //     per-round response unconditionally;
+                //   • the DIFF arm (misc 196): a diff server owes a publish on any
+                //     round that delivered its save TRIGGER — our lifecycle sends
+                //     `didSave` for changed files, so an alive diff server silent
+                //     after that delivered save violates its contract; a diff round
+                //     that delivered NO save owes nothing (silence is not a fault).
+                // An alive server that owes no contract on this round (the
+                // rust-analyzer never-republishes residual, an undeclared-silent
+                // server, or a diff server that got no trigger) is left `None` —
+                // its silence is not a fault. The scan arm lives at the
+                // workspace-pull seam (`workspace_pull`), not here: scan servers
+                // answer a whole-workspace pull, not a per-file batch. A server
+                // violating its adapter is sick the same way a crashing one is, so
+                // it feeds the SAME strike ledger.
+                let owes = client.server().owes_answer()
+                    || (client.server().is_diff() && saved_this_round);
+                if owes {
                     if let Some(key) = client.server().key() {
                         drop(client);
                         self.client_manager.record_contract_violation(&key);
@@ -1339,7 +1432,11 @@ impl DiagnosticsServer {
         // (degrade — no further attempts this run; the next demand retries,
         // strikes permitting).
         if let Some(fresh) = self.client_manager.revive_server(&key).await {
-            self.run_server_batch(&fresh, &remainder, parent_id, owner, feeds)
+            // The revive is for a DEAD server (the alive-silent diff/contract arms
+            // already resolved above), so its own save-trigger return is not a
+            // fault input here — the respawn-dead verdict is the remainder check.
+            let _ = self
+                .run_server_batch(&fresh, &remainder, parent_id, owner, feeds)
                 .await;
             // Respawn-dead iff any of the remainder is *still* unretrieved after
             // the fresh instance ran: the process-state evidence that the server
@@ -1374,6 +1471,11 @@ impl DiagnosticsServer {
     /// diagnostics-debt wave; until it lands, every configured server gets
     /// this held-open batch lifecycle uniformly — this is where 04 will
     /// branch.
+    ///
+    /// Returns whether a `didSave` was delivered to the server this round — the
+    /// diff floor arm's trigger signal (misc 196). `false` on any early bail
+    /// (server dead, no files opened, settle failed): a round that delivered no
+    /// save trigger leaves a diff server owing nothing.
     async fn run_server_batch(
         &self,
         client_mutex: &Arc<Mutex<LspClient>>,
@@ -1381,9 +1483,9 @@ impl DiagnosticsServer {
         parent_id: Option<&str>,
         owner: Option<&str>,
         feeds: &mut BTreeMap<String, FileFeed>,
-    ) {
+    ) -> bool {
         let Some(baseline) = self.pre_open_settle(client_mutex).await else {
-            return;
+            return false;
         };
 
         // The changed-set nudge (Phase 1b) sends didChangeWatchedFiles for
@@ -1408,11 +1510,13 @@ impl DiagnosticsServer {
 
         let docs = self.open_files(client_mutex, paths, parent_id, owner).await;
         if docs.is_empty() {
-            return;
+            return false;
         }
 
         // Settle + save + retrieve. Any bail → skip retrieve.
-        if let Ok(stimulated) = self.settle_and_save(client_mutex, &docs, baseline).await {
+        let mut saved_this_round = false;
+        if let Ok(stimulus) = self.settle_and_save(client_mutex, &docs, baseline).await {
+            saved_this_round = stimulus.saved;
             // Drain any in-flight publishDiagnostics still in the stdio
             // pipe buffer before reading the diagnostic cache.
             let server = client_mutex.lock().await.server().clone();
@@ -1427,7 +1531,7 @@ impl DiagnosticsServer {
             // working request channel to ask instead — hold retrieval until
             // that publish lands. URIs whose evidence never arrives come back
             // in `evidence_expired` and must not render `[clean]`.
-            let evidence_expired = await_publish_evidence(client_mutex, &docs, stimulated).await;
+            let evidence_expired = await_publish_evidence(client_mutex, &docs, stimulus).await;
 
             self.retrieve_diagnostics(client_mutex, &docs, feeds, &evidence_expired)
                 .await;
@@ -1436,6 +1540,7 @@ impl DiagnosticsServer {
         // End of round: documents stay open (the held-open lifecycle); only
         // the causation scope is cleared.
         client_mutex.lock().await.set_parent_id(None);
+        saved_this_round
     }
 
     /// Settles the server before opening files.
@@ -1524,10 +1629,12 @@ impl DiagnosticsServer {
     /// its last saved send gets no `didSave` — no sync traffic at all
     /// (diagnostics-debt 01).
     ///
-    /// Returns `Ok(stimulated)` when the server is ready for retrieval —
-    /// `stimulated` is `true` when the round sent any traffic (sync or
-    /// save), the retrieval evidence bar's arming input — or `Err(())` if
-    /// the server died or a critical step failed (caller skips retrieval).
+    /// Returns `Ok(RoundStimulus)` when the server is ready for retrieval — its
+    /// `stimulated` is `true` when the round sent any traffic (sync or save), the
+    /// retrieval evidence bar's arming input, and its `saved` is `true` when a
+    /// `didSave` was delivered this round (the diff floor arm's trigger, misc 196)
+    /// — or `Err(())` if the server died or a critical step failed (caller skips
+    /// retrieval).
     ///
     /// The client lock is held across settle calls so that no other
     /// operation can send requests to the server between stimulus and
@@ -1542,7 +1649,7 @@ impl DiagnosticsServer {
         client_mutex: &Arc<Mutex<LspClient>>,
         docs: &[RoundDoc],
         post_open_baseline: u64,
-    ) -> Result<bool, ()> {
+    ) -> Result<RoundStimulus, ()> {
         let mut client = client_mutex.lock().await;
 
         if matches!(
@@ -1615,7 +1722,10 @@ impl DiagnosticsServer {
             }
         }
 
-        Ok(synced_any || saved_any)
+        Ok(RoundStimulus {
+            stimulated: synced_any || saved_any,
+            saved: saved_any,
+        })
     }
 
     /// Retrieves raw diagnostics for each opened file on the server and merges
@@ -2053,17 +2163,28 @@ fn debounce_budget_samples(server: &LspServer) -> u32 {
 /// `[clean]` from absence. An empty set means every URI was heard or the bar
 /// never armed.
 ///
-/// `stimulated` is whether the round sent the server any traffic (sync or
-/// save). An **unstimulated** round (every file unchanged and saved — the
-/// held-open repeat run) owes the server no wait: nothing was sent, so no
-/// publish is coming, and the still-never-heard set expires immediately —
-/// keeping a file that expired `[unverified]` last round honestly
-/// `[unverified]` on the repeat run instead of flipping to a false
+/// The **diff floor arm** (misc 196) also arms the bar: a
+/// [`diff`-discipline](crate::recipes::Discipline::Diff) server owes a publish on
+/// any round that delivered its save trigger (`stimulus.saved`). A diff server
+/// declares no push and may not have published on this connection, so without this
+/// arm its never-heard file would fall through to the misc-153 silent residual and
+/// render `[clean]` over a delivered-but-unanswered save. Arming holds collection,
+/// and on expiry the file returns never-heard (into `evidence_expired`), so it
+/// stays absent from `feeds` and the per-file batch's contract-violation arm
+/// (`run_server_batch_with_recovery`) attributes the fault. A diff round that
+/// delivered NO save does not arm here — silence is not owed, so not a fault.
+///
+/// `stimulus` carries whether the round sent the server any traffic (`stimulated`)
+/// and whether a `didSave` was delivered (`saved`). An **unstimulated** round
+/// (every file unchanged and saved — the held-open repeat run) owes the server no
+/// wait: nothing was sent, so no publish is coming, and the still-never-heard set
+/// expires immediately — keeping a file that expired `[unverified]` last round
+/// honestly `[unverified]` on the repeat run instead of flipping to a false
 /// `[clean]` (diagnostics-debt 01).
 async fn await_publish_evidence(
     client_mutex: &Arc<Mutex<LspClient>>,
     docs: &[RoundDoc],
-    stimulated: bool,
+    stimulus: RoundStimulus,
 ) -> HashSet<String> {
     let (server, server_name, mut pending) = {
         let client = client_mutex.lock().await;
@@ -2091,10 +2212,17 @@ async fn await_publish_evidence(
     // and daemon bounce, which is exactly the first-run false-`[clean]` window
     // both close. The debounce bound is what the gate awaits (data riding the
     // pin), so a debounce server owes an echo within it from turn zero.
+    // The diff floor arm (misc 196): a diff-discipline server owes a publish on a
+    // round that delivered its save trigger, so arm the bar for it too — otherwise
+    // its never-heard file falls through to the misc-153 silent residual and reads
+    // `[clean]` over a delivered-but-unanswered save. A diff round with NO delivered
+    // save does not owe an answer, so it does not arm here.
+    let diff_owes_this_round = server.is_diff() && stimulus.saved;
     if pending.is_empty()
         || !(server.declares_push()
             || server.has_ever_published()
-            || server.debounce_ms().is_some())
+            || server.debounce_ms().is_some()
+            || diff_owes_this_round)
         || server.has_answered_probe()
     {
         return HashSet::new();
@@ -2102,7 +2230,7 @@ async fn await_publish_evidence(
 
     // No stimulus this round → no publish is owed or coming; the never-heard
     // set expires without a wait (see the doc comment).
-    if !stimulated {
+    if !stimulus.stimulated {
         debug!(
             server = %server_name,
             pending = pending.len(),

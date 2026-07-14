@@ -184,6 +184,24 @@ pub struct LspServer {
     /// [`super::server_behavior::ServerProfile::owes_answer`], immutable
     /// thereafter.
     owes_answer: bool,
+    /// Engine-internal casing: the server is a **scan-discipline** server
+    /// (marksman-class; misc 196). A scan server owes its whole-workspace answer,
+    /// so a `workspace/diagnostic` pull that goes unanswered/refused while the
+    /// server is alive is a verified-contract violation (the floor's scan arm).
+    /// Round-conditional — unlike [`Self::owes_answer`] it is read at the
+    /// workspace-pull seam together with the pull's outcome. Set once at
+    /// construction from [`super::server_behavior::ServerProfile::is_scan`],
+    /// immutable thereafter.
+    is_scan: bool,
+    /// Engine-internal casing: the server is a **diff-discipline** server
+    /// (marksman diff-only; misc 196). A diff server owes a publish on any round
+    /// that delivered its save trigger, so an alive diff server silent after a
+    /// delivered `didSave` is a verified-contract violation (the floor's diff arm);
+    /// a round with no delivered trigger owes nothing. Round-conditional — read at
+    /// the per-file batch seam together with the "a save was delivered this round"
+    /// signal. Set once at construction from
+    /// [`super::server_behavior::ServerProfile::is_diff`], immutable thereafter.
+    is_diff: bool,
     /// Blessed/unverified classification: when set, this server is an unverified
     /// custom def and is **enrichment-only** (diagnostics-debt 04b / DESIGN
     /// §"The blessed set") — never a diagnostics source. [`Self::supports_diagnostics`]
@@ -306,6 +324,8 @@ impl LspServer {
         let declares_push = profile.declares_push();
         let debounce_ms = profile.debounce_ms();
         let owes_answer = profile.owes_answer();
+        let is_scan = profile.is_scan();
+        let is_diff = profile.is_diff();
         let enrichment_only = profile.is_enrichment_only();
         Self {
             capabilities: OnceLock::new(),
@@ -314,6 +334,8 @@ impl LspServer {
             declares_push,
             debounce_ms,
             owes_answer,
+            is_scan,
+            is_diff,
             enrichment_only,
             supports_workspace_diagnostics: OnceLock::new(),
             supports_text_document_sync: OnceLock::new(),
@@ -581,6 +603,33 @@ impl LspServer {
     /// see [`super::server_behavior::ServerProfile::owes_answer`].
     pub(crate) const fn owes_answer(&self) -> bool {
         self.owes_answer
+    }
+
+    /// Whether this server is a **scan-discipline** server (marksman-class; misc
+    /// 196).
+    ///
+    /// A scan server owes its whole-workspace answer, so a `workspace/diagnostic`
+    /// pull that goes unanswered/refused while the server is alive is a
+    /// verified-contract violation (the floor's scan arm). Round-conditional, read
+    /// at the workspace-pull seam together with the pull's outcome — unlike the
+    /// static [`Self::owes_answer`]. Set once at construction; see
+    /// [`super::server_behavior::ServerProfile::is_scan`].
+    pub(crate) const fn is_scan(&self) -> bool {
+        self.is_scan
+    }
+
+    /// Whether this server is a **diff-discipline** server (marksman diff-only;
+    /// misc 196).
+    ///
+    /// A diff server owes a publish on any round that delivered its save trigger,
+    /// so an alive diff server silent after a delivered `didSave` is a
+    /// verified-contract violation (the floor's diff arm); a round with no
+    /// delivered trigger owes nothing. Round-conditional, read at the per-file
+    /// batch seam together with the "a save was delivered this round" signal. Set
+    /// once at construction; see
+    /// [`super::server_behavior::ServerProfile::is_diff`].
+    pub(crate) const fn is_diff(&self) -> bool {
+        self.is_diff
     }
 
     /// Returns whether any `textDocument/publishDiagnostics` has been heard on
@@ -1486,12 +1535,49 @@ mod tests {
     /// `test-server` is an unverified name, so it classifies enrichment-only and
     /// [`LspServer::supports_diagnostics`] is `false` regardless of advertised
     /// capability (diagnostics-debt 04b). The push/pull OR-logic tests below need
-    /// a diagnostics-eligible server, so they use `clangd` — blessed and fully
-    /// uncased (no discipline row, so not pull-suppressed and not enrichment-only).
+    /// a diagnostics-eligible server, so they use `clangd` — blessed and casing-free
+    /// (its misc-196 row is plain `event`: not pull-suppressed, not enrichment-only,
+    /// and neither scan nor diff).
     fn blessed_server_with_caps(caps: Value) -> LspServer {
         let server = LspServer::new("c".to_string(), "clangd".to_string(), None);
         server.set_capabilities(caps);
         server
+    }
+
+    #[test]
+    fn scan_and_diff_casing_projects_from_the_personas() {
+        // misc 196: the round-conditional disciplines reach the retrieval seams via
+        // the `LspServer` casing flags, set once at construction from the profile.
+        // The scan/diff personas project them; every other discipline (and the
+        // unverified `test-server`) is neither. The static `owes_answer` stays
+        // false for scan/diff — their arms are round-conditional, read at the seam.
+        let scan = LspServer::new("mockls-scan".to_string(), "mockls-scan".to_string(), None);
+        assert!(scan.is_scan(), "the scan persona casts is_scan");
+        assert!(!scan.is_diff());
+        assert!(
+            !scan.owes_answer(),
+            "scan owes nothing to the static contract"
+        );
+
+        let diff = LspServer::new("mockls-diff".to_string(), "mockls-diff".to_string(), None);
+        assert!(diff.is_diff(), "the diff persona casts is_diff");
+        assert!(!diff.is_scan());
+        assert!(
+            !diff.owes_answer(),
+            "diff owes nothing to the static contract"
+        );
+
+        // A declared-push persona (lattice shape) and an unverified name are neither.
+        let declared = LspServer::new("m".to_string(), "mockls-declared".to_string(), None);
+        assert!(!declared.is_scan() && !declared.is_diff());
+        assert!(
+            declared.owes_answer(),
+            "declared-push still owes statically"
+        );
+
+        let unverified = test_server();
+        assert!(!unverified.is_scan() && !unverified.is_diff());
+        assert!(!unverified.owes_answer());
     }
 
     // ── ParsedWatcher::covers tests (WS31 changed-set routing) ────────

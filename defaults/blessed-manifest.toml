@@ -365,3 +365,169 @@ declares_push = true
 discipline = "debounce"
 debounce_ms = 850
 
+# ── The rest of the blessed fleet (misc 196) ─────────────────────────────────
+#
+# Every blessed server carries a discipline row — the misc-196 ruling: a blessed
+# server WITHOUT a row got the most-trusting treatment (its silence read
+# `[clean]` through the misc-153 residual), inverting the manifest's "missing data
+# only ever makes Catenary noisier" doctrine. The `blessed_servers_all_rowed`
+# invariant test (src/recipes.rs) enforces `blessed ⊆ rowed` structurally, so a
+# future blessing without a row fails CI.
+#
+# Evidence bar (misc 196 ruling): a bare `discipline = "event"` row is grounded by
+# the server's conformance-green history (green means it demonstrably published
+# its fixture's intentional diagnostic). Trust-INCREASING claims (`declares_push`,
+# scan/diff/debounce constants) are set only where verified directly against the
+# real binary, cited in the row comment. Servers not on this host's PATH ship the
+# conformance-grounded bare `event` row with a note that the stronger contract is
+# unverified.
+
+# taplo — event + DECLARED PUSH (misc 196 verified live 2026-07-14 against taplo
+# 0.10.0 `lsp stdio`; closes misc 194's verify-then-declare candidate). Direct
+# probe: taplo publishes UNVERSIONED on didOpen — an explicit empty `[]` for a
+# clean file AND the syntax diagnostic for a broken one, ~1.3 s after open, once
+# the client answers taplo's `workspace/configuration` request (an unanswered
+# config request blocks the publish — the earlier "publishes nothing" reading was
+# a probe that skipped the config reply). No `diagnosticProvider`; the pull answers
+# `-32601`. The publish-per-didOpen-including-clean IS the misc-187 `declares_push`
+# contract, so declaring it arms the retrieval evidence bar from turn zero and
+# closes misc 194's double-miss window structurally (the late unversioned publish
+# no longer races a `[clean]` residual). This is exactly the sharpened candidate
+# misc 194 named, now verified.
+[discipline.taplo]
+discipline = "event"
+declares_push = true
+
+# yaml-language-server — event + DECLARED PUSH (misc 196 verified live 2026-07-14).
+# Direct probe: no `diagnosticProvider`; publishes UNVERSIONED on didOpen — an
+# explicit empty `[]` for a clean YAML file and the schema/syntax diagnostics for a
+# dirty one, ~1.5 s after open. The pull answers `-32601` (the bug-99-family
+# push-only shape). Publish-per-didOpen-including-explicit-`[]`-for-clean is the
+# `declares_push` contract (misc 187), so it arms the evidence bar from turn zero.
+[discipline.yaml-language-server]
+discipline = "event"
+declares_push = true
+
+# docker-langserver — event + DECLARED PUSH (misc 196 verified live 2026-07-14).
+# Direct probe: no `diagnosticProvider`; publishes UNVERSIONED on didOpen — an
+# explicit empty `[]` for a clean Dockerfile and its lint diagnostics for a dirty
+# one, ~1.4 s after open. Pull answers `-32601`. The per-didOpen explicit-`[]`
+# clean is the `declares_push` contract (misc 187).
+[discipline.docker-langserver]
+discipline = "event"
+declares_push = true
+
+# clangd — event, VERSIONED (misc 196 verified live 2026-07-14). Direct probe: no
+# `diagnosticProvider`; publishes VERSIONED on didOpen — version-1 empty `[]` for a
+# clean translation unit and the version-1 diagnostic for a broken one, ~1.4 s after
+# open. Pull answers `-32601`. Versioned settlement is the authority (a versioned
+# empty publish is an authoritative clean — ledger 03), so this is the rust-analyzer
+# shape MINUS the pull suppression: clangd advertises no pull to withhold, and its
+# native pushes are the sole channel. Plain `event`, not `declares_push` (that arm
+# is the UNVERSIONED lattice contract; clangd's versioned publish settles by echo).
+[discipline.clangd]
+discipline = "event"
+
+# bash-language-server — event, VERSIONED (misc 196 verified live 2026-07-14).
+# Direct probe: no `diagnosticProvider`; publishes VERSIONED on didOpen — version-1
+# empty `[]` for a clean script and version-1 shellcheck-fed diagnostics for a
+# flagged one, ~1.9 s after open. Pull answers `-32601`. Versioned event; the
+# shellcheck findings ride the versioned publish (the make-check sentinel leans on
+# the shellcheck linter feeder, conformance_bash_ls).
+[discipline.bash-language-server]
+discipline = "event"
+
+# lua-language-server — event, VERSIONED (misc 196 verified live 2026-07-14 against
+# lua-language-server 3.18.2). Direct probe: no `diagnosticProvider`; publishes
+# VERSIONED on didOpen for a file with a diagnostic (~1.7 s, the bug-99 debounced
+# shape — the publish lands after the process samples idle), pull answers `-32601`.
+# Versioned event: a versioned empty publish is the authoritative clean, a versioned
+# non-empty carries the finding. NOT `declares_push` — the clean-file explicit `[]`
+# did not arrive inside the probe window, so the trust-increasing declaration is
+# unverified; the versioned settlement is the authority regardless.
+[discipline.lua-language-server]
+discipline = "event"
+
+# ansible-language-server — event (misc 196 verified live 2026-07-14). Direct probe:
+# no `diagnosticProvider`; publishes UNVERSIONED but heavily ASYNC — its ansible-lint
+# subprocess pass lands the publish 6–12 s after didOpen, well past a normal settle.
+# Pull answers `-32601`. Grounded as bare `event` (conformance-green + the observed
+# push): the extreme async-lint timing means the stronger `declares_push` contract
+# is NOT cleanly verified (the clean-file explicit `[]` and the dirty finding did not
+# both arrive deterministically in-window), so it is left unarmed — the honest,
+# trust-neutral choice for silence.
+[discipline.ansible-language-server]
+discipline = "event"
+
+# vscode-json-language-server — PULL discipline (misc 196 verified live 2026-07-14).
+# Direct probe: advertises `diagnosticProvider` (interFileDependencies=false,
+# workspaceDiagnostics=false); publishes NOTHING on didOpen; answers
+# `textDocument/diagnostic` with a full report (empty items for valid JSON, the
+# "Expected comma or closing brace" error for invalid). A pull settles the debt
+# directly (DESIGN's pull row); a pull error would leave it unsettled (bug 84).
+[discipline.vscode-json-language-server]
+discipline = "pull"
+
+# vscode-css-language-server — PULL discipline (misc 196 verified live 2026-07-14).
+# Direct probe: advertises `diagnosticProvider`; publishes nothing on didOpen;
+# answers `textDocument/diagnostic` with a full report. Same vscode-langservers-
+# extracted pull family as the json/html servers. A pull settles the debt directly.
+[discipline.vscode-css-language-server]
+discipline = "pull"
+
+# vscode-html-language-server — PULL discipline (misc 196 verified live 2026-07-14).
+# Direct probe: advertises `diagnosticProvider`; publishes nothing on didOpen;
+# answers `textDocument/diagnostic` with a full report. Same pull family as the
+# json/css servers. A pull settles the debt directly.
+[discipline.vscode-html-language-server]
+discipline = "pull"
+
+# pyright-langserver — PULL discipline (misc 196 verified live 2026-07-14 against
+# pyright 1.1.411). Direct probe: does not advertise `diagnosticProvider` in the
+# init response but SERVES `textDocument/diagnostic` — a full report with empty items
+# for valid Python and the type/syntax errors for invalid (the first pull may answer
+# a transient cancel, then the retry settles: exactly the ServerCancelled
+# re-trigger ledger-02 handles). Pull-first: the pull is the sole channel and settles
+# the debt directly.
+[discipline.pyright-langserver]
+discipline = "pull"
+
+# elm-language-server — event, UNVERIFIED-stronger (misc 196; conformance-grounded,
+# NOT on this host's PATH). elm-ls is the ticket's motivating incident
+# (conformance run 29305353386, pinned shard
+# ~/.local/state/catenary/incidents/conformance-29305353386-elm): its ASYNC WORKSPACE
+# SCAN lost the race with our didOpen — 2.5 s after open it logged
+# `NoWorkspaceContainsError: No Elm workspace contains …/src/Main.elm`, REFUSED the
+# file, and published NOTHING (0 publishDiagnostics in the whole shard); the pull
+# probe answered `-32601` ("best-effort pull went unanswered"). Grounded as bare
+# `event` by its conformance-green history (a warm ELM_HOME publishes its fixture's
+# diagnostic on didOpen); the async-workspace-scan behavior above means a stronger
+# push contract is unverified and deliberately unarmed — with the row present its
+# silence now reads through the event residual, not the rowless most-trusting
+# `[clean]` that rendered the dirty fixture clean in the incident.
+[discipline.elm-language-server]
+discipline = "event"
+
+# intelephense — event (misc 196; conformance-grounded, NOT on this host's PATH).
+# intelephense is a PHP push-diagnostics server (`--stdio`) that publishes on
+# document events; grounded as bare `event` by its conformance-green history. Not on
+# this host's PATH, so the stronger `declares_push`/versioning contract is unverified
+# and left unarmed — the trust-neutral choice for silence.
+[discipline.intelephense]
+discipline = "event"
+
+# ruby-lsp — event (misc 196; conformance-grounded, NOT on this host's PATH). ruby-lsp
+# is a push-diagnostics server that publishes on document events; grounded as bare
+# `event` by its conformance-green history (its full-matrix blessing ran with a
+# provisioned GEM_HOME). Not on PATH here, so the stronger push contract is
+# unverified and left unarmed.
+[discipline.ruby-lsp]
+discipline = "event"
+
+# svelteserver — event (misc 196; conformance-grounded, NOT on this host's PATH). The
+# Svelte language server publishes diagnostics on document events; grounded as bare
+# `event` by its conformance-green history. Not on PATH here, so the stronger push
+# contract is unverified and left unarmed.
+[discipline.svelteserver]
+discipline = "event"
+

@@ -131,6 +131,19 @@ pub struct ServerProfile {
     /// by this declared constant — data riding the pin, re-verified at every
     /// re-pin, never a measured guess. `None` for every non-debounce discipline.
     debounce_ms: Option<u64>,
+    /// The server's publisher discipline, projected verbatim from the manifest's
+    /// [`crate::recipes::DisciplineRecord::discipline`] (misc 196). `None` for a
+    /// server with no discipline row (an unverified custom def, or a casing-only
+    /// row). The static [`Self::owes_answer`] contract (declared-push / debounce)
+    /// is captured by the dedicated fields above; this field carries the
+    /// **round-conditional** disciplines whose owed-answer depends on what the
+    /// round delivered — [`crate::recipes::Discipline::Scan`] (owes its
+    /// whole-workspace answer when the workspace pull is stimulated) and
+    /// [`crate::recipes::Discipline::Diff`] (owes a publish on a round that
+    /// delivered its save trigger). The floor's scan/diff arms read this via
+    /// [`Self::is_scan`] / [`Self::is_diff`] together with the round context the
+    /// static predicate cannot see (DESIGN §"Publisher-discipline metadata").
+    discipline: Option<crate::recipes::Discipline>,
 }
 
 impl ServerProfile {
@@ -179,6 +192,7 @@ impl ServerProfile {
             )
             .then_some(record.debounce_ms)
             .flatten(),
+            discipline: record.discipline,
         }
     }
 
@@ -241,22 +255,61 @@ impl ServerProfile {
         self.debounce_ms
     }
 
-    /// Whether the server's **verified discipline owes an answer** for a round
-    /// that stimulated it (diagnostics-debt 05).
+    /// Whether the server's **verified discipline STATICALLY owes an answer** for
+    /// a round that stimulated it (diagnostics-debt 05).
     ///
-    /// True for a server whose blessed adapter contracts a per-round response:
-    /// a [`Self::declares_push`] server (a publish on every `didOpen`, explicit
-    /// `[]` for clean — misc 187) or a debounce-discipline server
-    /// ([`Self::debounce_ms`] — the version echo is owed within the declared
-    /// bound). When the retrieval evidence bar arms and expires for such a
-    /// server, the discipline said an answer was owed and none came — a
-    /// **verified-contract violation**, the fault floor's third arm (DESIGN §"The
-    /// floor is fault attribution"). A merely *demonstrated*-push server (has
-    /// published before but declares nothing) owes no verified contract, so its
-    /// expiry stays the softer silent wording, not a fault.
+    /// True for a server whose blessed adapter contracts a per-round response
+    /// *unconditionally on stimulus*: a [`Self::declares_push`] server (a publish
+    /// on every `didOpen`, explicit `[]` for clean — misc 187) or a
+    /// debounce-discipline server ([`Self::debounce_ms`] — the version echo is
+    /// owed within the declared bound). When the retrieval evidence bar arms and
+    /// expires for such a server, the discipline said an answer was owed and none
+    /// came — a **verified-contract violation**, the fault floor's third arm
+    /// (DESIGN §"The floor is fault attribution"). A merely *demonstrated*-push
+    /// server (has published before but declares nothing) owes no verified
+    /// contract, so its expiry stays the softer silent wording, not a fault.
+    ///
+    /// This predicate is deliberately **round-context-free**, so the
+    /// [`crate::recipes::Discipline::Scan`] and [`crate::recipes::Discipline::Diff`]
+    /// disciplines are NOT covered here: their owed-answer is conditional on what
+    /// the round delivered (a stimulated workspace pull for scan, a delivered save
+    /// trigger for diff — DESIGN's table). Those arms live at their retrieval seams
+    /// ([`super::super::bridge::diagnostics_server`]) and read [`Self::is_scan`] /
+    /// [`Self::is_diff`] together with that round context; folding them in here
+    /// would fire on the wrong rounds (a diff server that received no trigger owes
+    /// nothing). Keeping this predicate static preserves ledger 05's
+    /// declared-push/debounce arms and the unverified-never-fires boundary exactly.
     #[must_use]
     pub const fn owes_answer(&self) -> bool {
         self.declares_push || self.debounce_ms.is_some()
+    }
+
+    /// Whether the server is a [`crate::recipes::Discipline::Scan`] server
+    /// (marksman-class scan-once; DESIGN §"Publisher-discipline metadata").
+    ///
+    /// A scan server owes its **whole-workspace answer**: when the round's
+    /// `workspace/diagnostic` pull goes unanswered or refused by an alive scan
+    /// server, that is a verified-contract violation (the floor's scan arm, misc
+    /// 196). Round-conditional, so it is read at the workspace-pull seam rather
+    /// than folded into the static [`Self::owes_answer`].
+    #[must_use]
+    pub fn is_scan(&self) -> bool {
+        self.discipline == Some(crate::recipes::Discipline::Scan)
+    }
+
+    /// Whether the server is a [`crate::recipes::Discipline::Diff`] server
+    /// (marksman diff-only; DESIGN §"Publisher-discipline metadata").
+    ///
+    /// A diff server owes a publish on any round that **delivered its trigger**
+    /// (our lifecycle sends `didSave` for changed files): an alive diff server
+    /// silent after its delivered save trigger violates its contract (the floor's
+    /// diff arm, misc 196). A diff server with NO delivered trigger this round owes
+    /// nothing. Round-conditional, so it is read at the per-file batch seam
+    /// together with the "a save was delivered this round" signal rather than
+    /// folded into the static [`Self::owes_answer`].
+    #[must_use]
+    pub fn is_diff(&self) -> bool {
+        self.discipline == Some(crate::recipes::Discipline::Diff)
     }
 
     /// Applies the profile's client-capability shaping to a built `capabilities`
@@ -389,7 +442,9 @@ mod tests {
             "rust-analyzer",
             "gopls",
             "marksman",
-            "taplo",
+            // clangd is a VERSIONED-event server (misc 196 verified live): its
+            // versioned publish settles by echo, so it does not carry the
+            // UNVERSIONED `declares_push` contract (that is the lattice/taplo shape).
             "clangd",
             "yX4Za",
         ] {
@@ -397,6 +452,66 @@ mod tests {
                 !ServerProfile::for_server(name).declares_push(),
                 "{name} must not declare push without conformance evidence",
             );
+        }
+    }
+
+    #[test]
+    fn taplo_declares_push_verified_live() {
+        // misc 196 (subsuming misc 194's verify-then-declare candidate): taplo was
+        // verified live against the real 0.10.0 binary — it publishes UNVERSIONED
+        // on didOpen, an explicit empty `[]` for a clean file and the diagnostic for
+        // a broken one, ~1.3 s after open (once the client answers taplo's
+        // `workspace/configuration` request). That publish-per-didOpen-including-
+        // clean IS the `declares_push` contract, so the evidence bar arms from turn
+        // zero and misc 194's double-miss `[clean]`-when-dirty window closes
+        // structurally.
+        assert!(ServerProfile::for_server("taplo").declares_push());
+    }
+
+    #[test]
+    fn scan_and_diff_disciplines_project_from_the_personas() {
+        // misc 196: the round-conditional disciplines surface through
+        // `is_scan`/`is_diff` (read at the retrieval seams with round context), and
+        // are DISTINCT from the static `owes_answer` contract — a scan/diff row owes
+        // nothing unconditionally, so `owes_answer` stays false for them (ledger
+        // 05's boundary, unregressed).
+        let scan = ServerProfile::for_server("mockls-scan");
+        assert!(
+            scan.is_scan(),
+            "the scan persona projects the scan discipline"
+        );
+        assert!(!scan.is_diff(), "a scan server is not a diff server");
+        assert!(
+            !scan.owes_answer(),
+            "scan owes nothing to the STATIC contract — its arm is round-conditional",
+        );
+
+        let diff = ServerProfile::for_server("mockls-diff");
+        assert!(
+            diff.is_diff(),
+            "the diff persona projects the diff discipline"
+        );
+        assert!(!diff.is_scan(), "a diff server is not a scan server");
+        assert!(
+            !diff.owes_answer(),
+            "diff owes nothing to the STATIC contract — its arm is round-conditional",
+        );
+
+        // Every other discipline (and an unverified name) is neither scan nor diff.
+        for name in [
+            "rust-analyzer",
+            "gopls",
+            "lattice",
+            "taplo",
+            "mockls-event",
+            "mockls-pull",
+            "mockls-debounce",
+            "mockls-declared",
+            "yX4Za",
+        ] {
+            let p = ServerProfile::for_server(name);
+            assert!(!p.is_scan(), "{name} must not be scan");
+            assert!(!p.is_diff(), "{name} must not be diff");
         }
     }
 

@@ -1065,6 +1065,91 @@ fn conformance_mockls_violator() -> Result<()> {
     Ok(())
 }
 
+/// `mockls-scan` withholding twin — the SCAN floor arm (misc 196). The scan
+/// persona owes its WHOLE-WORKSPACE answer: the `workspace/diagnostic` pull is its
+/// contractual trigger. Here the persona bundle's workspace-diagnostic serving is
+/// overridden by `--fail-on workspace/diagnostic`, so the ALIVE scan server refuses
+/// the pull it owes. That refusal must be DETECTED as a verified-contract violation
+/// — the fault-attribution wording, naming the server + cause + action — never a
+/// `[clean]` collapse over the genuinely-unscanned root. Uses the root-scoped
+/// diagnose (the whole-workspace pull's entry point), mirroring `conformance_mockls_scan`.
+#[test]
+fn conformance_mockls_scan_withholding_is_a_fault() -> Result<()> {
+    let dir = tempfile::tempdir().context("scan-withhold tempdir")?;
+    // A dirty document: were the pull served it would report `DIRTY`. The refusal
+    // means the round has NO answer for it — which must not read `[clean]`.
+    std::fs::write(dir.path().join("case.mockls-scan"), "DIRTY marker line\n")
+        .context("write scan-withhold fixture")?;
+
+    // The scan persona, but its owed workspace pull is refused by an alive server.
+    let lsp = mockls_lsp_arg("mockls-scan", "--fail-on workspace/diagnostic");
+    let root = dir.path().to_str().context("root")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+    let receipt = bridge.call_diagnostics_scoped(&[root])?;
+    bridge
+        .shutdown_clean(SHUTDOWN_GRACE)
+        .context("clean shutdown for persona `mockls-scan` withholding")?;
+
+    // A refused workspace answer NEVER renders [clean] over the unscanned root.
+    assert!(
+        !receipt.contains("[clean]"),
+        "a scan server refusing its owed workspace pull must never render \
+         [clean]:\n{receipt}"
+    );
+    // It renders the fault-attribution wording (the verified-contract-violation
+    // arm), naming the server + evidenced cause + action.
+    assert!(
+        receipt.contains("mockls-scan did not answer for this round")
+            && receipt.contains("its verified behavior requires a response")
+            && receipt.contains("treating as a server fault, re-run to retry"),
+        "a scan server's refused workspace pull must render the fault-attribution \
+         wording (server + cause + action):\n{receipt}"
+    );
+    assert!(
+        !receipt.contains("publishes on its own schedule"),
+        "the retired v1 shrug must never be written:\n{receipt}"
+    );
+    eprintln!("conformance: `mockls-scan` withholding PASSED");
+    Ok(())
+}
+
+/// `mockls-diff` withholding twin — the DIFF floor arm (misc 196). The diff persona
+/// owes a publish on any round that DELIVERED its trigger; our editing lifecycle
+/// always sends `didSave` for a changed file, so the save is delivered. Here the
+/// persona bundle's save-triggered publish is suppressed by `--no-push-diagnostics`,
+/// so the ALIVE diff server receives its trigger and stays silent — a violation of
+/// its contract. That must be DETECTED as a verified-contract violation, never a
+/// `[clean]` collapse. (The complementary "no trigger ⇒ owes nothing" boundary is a
+/// unit-level fact — a diff round that delivered no save is not a fault — pinned by
+/// the profile's round-conditional design; this leg proves the delivered-trigger
+/// violation end to end.)
+#[test]
+fn conformance_mockls_diff_withholding_is_a_fault() -> Result<()> {
+    // The diff persona, but its save-triggered publish is withheld. The editing
+    // lifecycle's didSave IS delivered (the file is written fresh), so the diff
+    // server owes a publish and gives none.
+    let receipt = persona_receipt("mockls-diff", "--no-push-diagnostics", "echo hello\n")?;
+    assert!(
+        !receipt.contains("[clean]"),
+        "a diff server silent after its delivered save trigger must never render \
+         [clean]:\n{receipt}"
+    );
+    assert!(
+        receipt.contains("mockls-diff did not answer for this round")
+            && receipt.contains("its verified behavior requires a response")
+            && receipt.contains("treating as a server fault, re-run to retry"),
+        "a diff server's silence after a delivered save must render the \
+         fault-attribution wording (server + cause + action):\n{receipt}"
+    );
+    assert!(
+        !receipt.contains("publishes on its own schedule"),
+        "the retired v1 shrug must never be written:\n{receipt}"
+    );
+    eprintln!("conformance: `mockls-diff` withholding PASSED");
+    Ok(())
+}
+
 // ── tui-rework 10 coverage sentinel (skip-if-binary-missing) ──────────
 //
 // clangd is a common, apt-provisioned server that publishes a hard parse error
