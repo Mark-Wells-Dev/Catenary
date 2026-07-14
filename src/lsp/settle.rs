@@ -152,6 +152,22 @@ impl IdleDetector {
                 self.active_pids.insert(ts.pid);
             }
 
+            // Per-child cumulative-ticks admission (bug 107). A child that
+            // spawns after the first snapshot, does all its work inside one
+            // 50ms poll window, then sleeps forever never shows a sampled
+            // delta — `is_active` is false on every poll — so the per-child
+            // gate below could never admit it and settle spun "quiet but not
+            // settled" unbounded. Its cumulative counter is nonzero, though:
+            // proof it has run. Admit on that evidence, the per-child
+            // counterpart of phase 1's `cumulative_advanced`. Evidence-based,
+            // not a timeout: a genuinely new PID with zero cumulative work
+            // (spawned, never scheduled) is not admitted here and still blocks,
+            // and a runnable/blocked child is still caught by `any_pending`
+            // below regardless of this admission (bugs 28/55 preserved).
+            if ts.cumulative_ticks > 0 {
+                self.active_pids.insert(ts.pid);
+            }
+
             // Scheduler-state ground truth (bug 55): a live process that is
             // runnable or blocked has pending work by definition, independent
             // of the sampled deltas. Under CPU pressure a starved child sits
@@ -507,13 +523,18 @@ mod tests {
             delta_utime: 5,
             delta_stime: 2,
             delta_pfc: 10,
+            // An actively-working process has run: nonzero cumulative.
+            cumulative_ticks: 17,
             state: ProcessState::Running,
         }
     }
 
-    /// A quiescent sample: zero deltas and a sleep-class state. Quiet means
-    /// sleep-class — a zero-delta `Running`/`Blocked` process is pending work,
-    /// not idle (bug 55), so quiet fixtures must be `Sleeping`.
+    /// A quiescent sample: zero deltas, zero cumulative, and a sleep-class
+    /// state. Quiet means sleep-class — a zero-delta `Running`/`Blocked`
+    /// process is pending work, not idle (bug 55), so quiet fixtures must be
+    /// `Sleeping`. Zero cumulative means "no proven work yet" — a PID that
+    /// only ever appears via `quiet_sample` has shown no evidence it ran, so
+    /// the per-child gate (delta or cumulative) is not satisfied for it.
     fn quiet_sample(pid: u32) -> TreeSample {
         TreeSample {
             pid,
@@ -521,13 +542,15 @@ mod tests {
             delta_utime: 0,
             delta_stime: 0,
             delta_pfc: 0,
+            cumulative_ticks: 0,
             state: ProcessState::Sleeping,
         }
     }
 
-    /// A zero-delta sample in an arbitrary state — for the scheduler-state
-    /// regression tests that assert Running/Blocked block idle while Sleeping
-    /// settles.
+    /// A zero-delta, zero-cumulative sample in an arbitrary state — for the
+    /// scheduler-state regression tests that assert Running/Blocked block idle
+    /// while Sleeping settles. Zero cumulative keeps those tests exercising the
+    /// scheduler-state predicate rather than the cumulative admission.
     fn zero_delta_sample(pid: u32, state: ProcessState) -> TreeSample {
         TreeSample {
             pid,
@@ -535,6 +558,7 @@ mod tests {
             delta_utime: 0,
             delta_stime: 0,
             delta_pfc: 0,
+            cumulative_ticks: 0,
             state,
         }
     }
@@ -635,6 +659,110 @@ mod tests {
         assert!(detector.check(&snap5));
     }
 
+    // ── Per-child cumulative-ticks admission (bug 107) ───────────────
+
+    /// A fast-quiet child: zero deltas but a nonzero cumulative counter and a
+    /// sleep-class state. It did all its work inside one poll window (so no
+    /// window ever caught a delta) and now sleeps forever, but its cumulative
+    /// counter proves it ran. This is the shape that spun settle unbounded.
+    fn fast_quiet_sample(pid: u32) -> TreeSample {
+        TreeSample {
+            pid,
+            ppid: 1,
+            delta_utime: 0,
+            delta_stime: 0,
+            delta_pfc: 0,
+            cumulative_ticks: 42,
+            state: ProcessState::Sleeping,
+        }
+    }
+
+    #[test]
+    fn fast_quiet_child_settles_on_cumulative_evidence() {
+        // Bug 107: a child spawns after the first snapshot, does all its work
+        // inside one 50ms poll window, then sleeps forever. No poll ever catches
+        // a nonzero delta for it — so before the fix the per-child gate could
+        // never admit it and settle spun "quiet but not settled" unbounded. Its
+        // cumulative counter is nonzero, proving it ran: admit on that evidence.
+        let mut detector = IdleDetector::after_activity(0);
+
+        // PID 100 (the root) shows activity — phase 1 satisfied.
+        assert!(!detector.check(&make_snapshot(vec![active_sample(100)])));
+
+        // Fast-quiet child 200 appears: new PID this poll → blocked (new_pids),
+        // but its nonzero cumulative admits it to the per-child gate now.
+        let appears = make_snapshot(vec![quiet_sample(100), fast_quiet_sample(200)]);
+        assert!(
+            !detector.check(&appears),
+            "a genuinely new PID blocks idle for the poll it first appears"
+        );
+
+        // Next poll: 200 is no longer new, still zero deltas, still Sleeping,
+        // cumulative still nonzero. Root 100 was admitted by its delta; 200 is
+        // admitted by cumulative evidence — so idle is now reachable.
+        let settled = make_snapshot(vec![quiet_sample(100), fast_quiet_sample(200)]);
+        assert!(
+            detector.check(&settled),
+            "a fast-quiet child that never showed a delta but has run \
+             (nonzero cumulative) must not block idle forever"
+        );
+    }
+
+    #[test]
+    fn starved_child_stays_blocked_despite_cumulative() {
+        // Bug 55 must survive the cumulative admission: a live runnable child
+        // has pending work regardless of deltas OR cumulative. Even with a
+        // nonzero cumulative counter, a Running (starved) child blocks idle via
+        // any_pending wherever scheduler state is observable — cumulative
+        // admission satisfies the per-child gate, but any_pending gates first.
+        let mut detector = IdleDetector::after_activity(0);
+
+        assert!(!detector.check(&make_snapshot(vec![active_sample(100)])));
+
+        // PID 100 now zero-delta but Running, with a nonzero cumulative.
+        let starved = make_snapshot(vec![TreeSample {
+            pid: 100,
+            ppid: 1,
+            delta_utime: 0,
+            delta_stime: 0,
+            delta_pfc: 0,
+            cumulative_ticks: 99,
+            state: ProcessState::Running,
+        }]);
+        assert_eq!(
+            detector.check(&starved),
+            !SCHEDULER_STATE_OBSERVABLE,
+            "a starved-but-runnable child blocks idle where scheduler state is \
+             observable, even with a nonzero cumulative counter (bug 55)"
+        );
+    }
+
+    #[test]
+    fn zero_cumulative_new_pid_stays_blocked() {
+        // A genuinely new PID with zero cumulative work (spawned, never
+        // scheduled) has shown no evidence it ran — neither a delta nor a
+        // nonzero cumulative — so the per-child gate must keep blocking idle
+        // until it shows evidence either way. The cumulative admission is
+        // strictly evidence-based, not a timeout: no evidence, no admission.
+        let mut detector = IdleDetector::after_activity(0);
+
+        assert!(!detector.check(&make_snapshot(vec![active_sample(100)])));
+
+        // New PID 200 with zero cumulative appears → blocked (new_pids).
+        let appears = make_snapshot(vec![quiet_sample(100), quiet_sample(200)]);
+        assert!(!detector.check(&appears));
+
+        // Next poll: 200 no longer new, zero deltas, zero cumulative, Sleeping.
+        // No evidence it ever ran → per-child gate keeps blocking, unbounded
+        // until it either shows work (admit) or dies (bypass).
+        let still = make_snapshot(vec![quiet_sample(100), quiet_sample(200)]);
+        assert!(
+            !detector.check(&still),
+            "a new PID with zero cumulative work has shown no evidence and must \
+             keep blocking idle — cumulative admission is evidence-based only"
+        );
+    }
+
     #[test]
     fn dead_process_bypasses_gate() {
         let mut detector = IdleDetector::after_activity(0);
@@ -652,6 +780,7 @@ mod tests {
                 delta_utime: 0,
                 delta_stime: 0,
                 delta_pfc: 0,
+                cumulative_ticks: 0,
                 state: ProcessState::Dead,
             },
         ]);
@@ -667,6 +796,7 @@ mod tests {
                 delta_utime: 0,
                 delta_stime: 0,
                 delta_pfc: 0,
+                cumulative_ticks: 0,
                 state: ProcessState::Dead,
             },
         ]);
@@ -684,6 +814,7 @@ mod tests {
             delta_utime: 0,
             delta_stime: 0,
             delta_pfc: 5,
+            cumulative_ticks: 5,
             state: ProcessState::Running,
         }]);
         assert!(
@@ -838,6 +969,7 @@ mod tests {
             delta_utime: 0,
             delta_stime: 0,
             delta_pfc: 0,
+            cumulative_ticks: 0,
             state: ProcessState::Dead,
         }]);
         assert_eq!(
@@ -928,6 +1060,7 @@ mod tests {
                 delta_utime: 0,
                 delta_stime: 0,
                 delta_pfc: 0,
+                cumulative_ticks: 0,
                 state: ProcessState::Dead,
             }],
             process_count: 1,
@@ -951,6 +1084,7 @@ mod tests {
                 delta_utime: 5,
                 delta_stime: 2,
                 delta_pfc: 100,
+                cumulative_ticks: 107,
                 state: ProcessState::Running,
             }],
             process_count: 1,

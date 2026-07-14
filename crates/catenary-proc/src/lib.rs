@@ -171,6 +171,16 @@ pub struct TreeSample {
     pub delta_stime: u64,
     /// Page fault count delta since last sample.
     pub delta_pfc: u64,
+    /// Sum of this process's cumulative `utime + stime + pfc + csw` from the
+    /// most recent sample (see [`ProcessMonitor::cumulative_ticks`]).
+    ///
+    /// Monotonically increasing. Nonzero proves this PID has been scheduled at
+    /// least once since monitoring began, even if no single sampling window
+    /// ever caught a nonzero delta — a child that does all its work inside one
+    /// poll interval then sleeps forever leaves every delta at zero but carries
+    /// a nonzero cumulative counter. Per-PID counterpart of
+    /// [`TreeSnapshot::cumulative_ticks`], which sums this across the tree.
+    pub cumulative_ticks: u64,
     /// Current scheduling/execution state.
     pub state: ProcessState,
 }
@@ -264,6 +274,8 @@ impl TreeMonitor {
                     delta_utime: delta.delta_utime,
                     delta_stime: delta.delta_stime,
                     delta_pfc: delta.delta_pfc,
+                    // Read after sampling: reflects this poll's counters.
+                    cumulative_ticks: monitor.cumulative_ticks(),
                     state: delta.state,
                 });
             }
@@ -1377,6 +1389,29 @@ mod tests {
         let snap = tm.sample();
         let root = snap.samples.iter().find(|s| s.pid == pid);
         assert!(root.is_some(), "Root PID should appear in samples");
+    }
+
+    #[test]
+    fn tree_sample_carries_per_pid_cumulative_ticks() {
+        // The per-PID cumulative counter (bug 107) reflects the same absolute
+        // utime + stime + pfc + csw as ProcessMonitor::cumulative_ticks. Our
+        // own process has faulted pages and been scheduled, so the root
+        // sample's cumulative_ticks is nonzero even on the first tree sample
+        // (it reads absolute counters, not deltas). This is the evidence the
+        // per-child settle gate admits a fast-quiet child on.
+        let pid = std::process::id();
+        let mut tm = TreeMonitor::new(pid).expect("Should monitor own process tree");
+        let snap = tm.sample();
+        let root = snap
+            .samples
+            .iter()
+            .find(|s| s.pid == pid)
+            .expect("Root PID should appear in samples");
+        assert!(
+            root.cumulative_ticks > 0,
+            "own process has run — its per-PID cumulative_ticks must be nonzero, got {}",
+            root.cumulative_ticks
+        );
     }
 
     #[test]
