@@ -743,9 +743,11 @@ pub struct DisciplineRecord {
     #[serde(default, skip_serializing_if = "is_false")]
     pub declares_push: bool,
     /// Forced `initializationOptions` overlaid onto — and winning over — the
-    /// user's options at initialize time (gopls's `pullDiagnostics: false`, bug
-    /// 87). A raw TOML value serialized as an inline table / sub-table. Absent ⇒
-    /// no forced options.
+    /// user's options at initialize time. A raw TOML value serialized as an inline
+    /// table / sub-table. Absent ⇒ no forced options. (gopls's `pullDiagnostics:
+    /// false` was the motivating case for bug 87, retired in diagnostics-debt 05
+    /// when its pull was re-enabled; the mechanism stands for any future forced
+    /// lever.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forced_init_options: Option<toml::Value>,
     /// Top-level `initializationOptions` keys enforced absent — stripped after the
@@ -1289,20 +1291,19 @@ mod tests {
         assert!(!ra.compress.is_empty(), "rust-analyzer carries strip rules");
         assert_eq!(ra.compress_versions, vec!["1.".to_owned()]);
 
-        // gopls: forces pullDiagnostics off, forbids diagnosticsDelay.
+        // gopls: PULL discipline (diagnostics-debt 05 re-enabled pull — bug 87's
+        // `pullDiagnostics = false` override is retired). Still forbids
+        // diagnosticsDelay (run 9), but forces no options.
         let gopls = manifest.discipline_for("gopls");
         assert!(!gopls.suppress_pull);
+        assert_eq!(gopls.discipline, Some(Discipline::Pull));
         assert_eq!(
             gopls.forbidden_init_options,
             vec!["diagnosticsDelay".to_owned()]
         );
-        let forced = gopls
-            .forced_init_options
-            .as_ref()
-            .expect("gopls forces init options");
-        assert_eq!(
-            forced.get("pullDiagnostics").and_then(toml::Value::as_bool),
-            Some(false)
+        assert!(
+            gopls.forced_init_options.is_none(),
+            "gopls no longer forces pullDiagnostics off (bug 87 re-enabled)",
         );
 
         // lattice: declares push.
@@ -1656,11 +1657,12 @@ mod tests {
 
     #[test]
     fn conformed_and_exempt_partition_the_shipped_data() {
-        // The shipped exemptions (tui-rework 13): cmake-language-server /
-        // typescript-language-server / vscode-eslint-language-server recipes and
-        // the marksman provision. Everything else that is not pending is
-        // conformed. The two sets are disjoint and neither contains a pending
-        // server.
+        // The shipped exemptions: cmake-language-server /
+        // vscode-eslint-language-server recipes and the marksman provision
+        // (tui-rework 13). typescript-language-server was in this set until
+        // diagnostics-debt 05 un-exempted it behind the declared-constant gate.
+        // Everything else that is not pending is conformed. The two sets are
+        // disjoint and neither contains a pending server.
         let recipes = default_recipes().expect("recipes parse");
         let provisions = default_provisioning().expect("provisioning parses");
 
@@ -1669,7 +1671,6 @@ mod tests {
 
         for name in [
             "cmake-language-server",
-            "typescript-language-server",
             "vscode-eslint-language-server",
             "marksman",
         ] {
@@ -1682,6 +1683,16 @@ mod tests {
                 "`{name}` must not be in the conformed set"
             );
         }
+        // typescript-language-server is now CONFORMED (diagnostics-debt 05
+        // un-exempted it behind the declared-constant gate), not exempt.
+        assert!(
+            conformed.iter().any(|c| c == "typescript-language-server"),
+            "typescript-language-server conforms after the ledger-05 un-exemption"
+        );
+        assert!(
+            !exempt.iter().any(|e| e == "typescript-language-server"),
+            "typescript-language-server is no longer conformance-exempt"
+        );
         // A representative conformed server (ansible-language-server,
         // class-D-fixed) is present.
         assert!(

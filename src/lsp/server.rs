@@ -162,6 +162,28 @@ pub struct LspServer {
     /// [`super::server_behavior::ServerProfile::declares_push`], immutable
     /// thereafter.
     declares_push: bool,
+    /// Engine-internal casing: the declared debounce window for a
+    /// [`crate::recipes::Discipline::Debounce`] server (diagnostics-debt 05).
+    /// `Some(ms)` only for a debounce-discipline manifest row carrying the
+    /// declared `debounce_ms` constant — the retrieval evidence bar awaits the
+    /// version echo bounded by this constant (data riding the pin, never a
+    /// measured guess), rather than by the generic dead-air budget. Set once at
+    /// construction from
+    /// [`super::server_behavior::ServerProfile::debounce_ms`], immutable
+    /// thereafter.
+    debounce_ms: Option<u64>,
+    /// Engine-internal casing: the server's **verified discipline owes an
+    /// answer** for a round that stimulated it (diagnostics-debt 05) — a
+    /// declared-push server (misc 187) or a debounce-discipline server. When the
+    /// retrieval evidence bar arms and expires for such a server, the discipline
+    /// said an answer was owed and none came, so the file resolves the
+    /// fault floor's verified-contract-violation wording (DESIGN §"The floor is
+    /// fault attribution") and the round strikes the ledger — never a false
+    /// `[clean]`. A merely demonstrated-push server owes no contract, so its
+    /// expiry stays the softer silent wording. Set once at construction from
+    /// [`super::server_behavior::ServerProfile::owes_answer`], immutable
+    /// thereafter.
+    owes_answer: bool,
     /// Blessed/unverified classification: when set, this server is an unverified
     /// custom def and is **enrichment-only** (diagnostics-debt 04b / DESIGN
     /// §"The blessed set") — never a diagnostics source. [`Self::supports_diagnostics`]
@@ -282,12 +304,16 @@ impl LspServer {
         let profile = super::server_behavior::ServerProfile::for_server(server_name.as_str());
         let pull_suppressed = profile.suppresses_pull_diagnostics();
         let declares_push = profile.declares_push();
+        let debounce_ms = profile.debounce_ms();
+        let owes_answer = profile.owes_answer();
         let enrichment_only = profile.is_enrichment_only();
         Self {
             capabilities: OnceLock::new(),
             supports_pull_diagnostics: AtomicBool::new(false),
             pull_suppressed,
             declares_push,
+            debounce_ms,
+            owes_answer,
             enrichment_only,
             supports_workspace_diagnostics: OnceLock::new(),
             supports_text_document_sync: OnceLock::new(),
@@ -526,6 +552,35 @@ impl LspServer {
     /// [`super::server_behavior::ServerProfile::declares_push`].
     pub(crate) const fn declares_push(&self) -> bool {
         self.declares_push
+    }
+
+    /// The declared debounce window for a debounce-discipline server, or `None`
+    /// (diagnostics-debt 05).
+    ///
+    /// `Some(ms)` only for a [`crate::recipes::Discipline::Debounce`] manifest row
+    /// carrying the declared `debounce_ms` constant. The retrieval evidence bar
+    /// awaits the version echo bounded by this constant (converted to a
+    /// sample budget) rather than by the generic dead-air budget — an
+    /// arrival-based gate on the declared bound, never silence-interpretation. Set
+    /// once at construction; see
+    /// [`super::server_behavior::ServerProfile::debounce_ms`].
+    pub(crate) const fn debounce_ms(&self) -> Option<u64> {
+        self.debounce_ms
+    }
+
+    /// Whether this server's **verified discipline owes an answer** for a round
+    /// that stimulated it (diagnostics-debt 05).
+    ///
+    /// True for a declared-push server (misc 187) or a debounce-discipline
+    /// server. When the retrieval evidence bar arms and expires for such a
+    /// server, the discipline said an answer was owed this round and none came —
+    /// the fault floor's verified-contract-violation arm (DESIGN §"The floor is
+    /// fault attribution"): the file resolves that wording and the round strikes
+    /// the ledger. A merely demonstrated-push server owes no verified contract,
+    /// so its expiry stays the softer silent wording. Set once at construction;
+    /// see [`super::server_behavior::ServerProfile::owes_answer`].
+    pub(crate) const fn owes_answer(&self) -> bool {
+        self.owes_answer
     }
 
     /// Returns whether any `textDocument/publishDiagnostics` has been heard on

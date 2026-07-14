@@ -169,10 +169,16 @@ struct Case {
 /// that defines + routes a language the shipped defaults do not carry).
 /// The servers that cannot satisfy the intentional-diagnostic contract
 /// through the shipped lifecycle — `cmake-language-server` (no diagnostics at all),
-/// `typescript-language-server` and `marksman` (debounced/scan-based push with no pull
-/// fallback), `vscode-eslint-language-server` (needs eslint co-install + settings) — are
+/// `marksman` (scan-based push with no pull fallback),
+/// `vscode-eslint-language-server` (needs eslint co-install + settings) — are
 /// `conformance = false` in the recipe/provision data with an honest `note`, so
 /// they are absent here BY the guard, not by omission.
+///
+/// `typescript-language-server` was in that exempt set (a debounced push with no
+/// pull fallback) until diagnostics-debt 05 un-exempted it behind the
+/// declared-constant gate (`discipline = "debounce"`, `debounce_ms = 850`): the
+/// ledger awaits the version echo bounded by the declared constant, so its
+/// debounced publish is collected instead of lost to silence. It now has a case.
 ///
 /// The tui-rework 10 tranche (rust-analyzer, clangd, jdtls, ruby-lsp, lattice
 /// dogfood) is obtained in CI via `defaults/ci-provision.toml`; jdtls is
@@ -327,6 +333,21 @@ const CASES: &[Case] = &[
                 filenames: &["playbook.yml"],
             }),
         }),
+        slow_start: false,
+    },
+    // ── diagnostics-debt 05: ts-ls un-exempted behind the declared-constant gate ──
+    // typescript-language-server was `conformance = false` (tui-rework 13) because
+    // its first diagnostic lands on an internal debounce AFTER the process goes
+    // scheduler-idle, past the settle-then-collect window. Ledger 05's
+    // declared-constant gate awaits the version echo bounded by the manifest's
+    // `debounce_ms` (850 ms), so ts-ls now conforms. Routed purely through the
+    // shipped defaults (`.ts` → typescript → typescript-language-server); the
+    // fixture carries a `tsconfig.json` root marker so tsserver type-checks.
+    Case {
+        server: "typescript-language-server",
+        fixture: "typescript",
+        file: "broken.ts",
+        binding: None,
         slow_start: false,
     },
 ];
@@ -848,20 +869,24 @@ fn conformance_mockls_declared() -> Result<()> {
     Ok(())
 }
 
-/// `mockls-debounce` — debounce discipline (the ts-ls shape). The manifest
-/// declares `discipline = "debounce"` with a `debounce_ms` constant; the binary's
-/// bundle fires a versioned publish on the save event AFTER that declared window
-/// (a sleeping timer the settle activity model cannot see), and answers no pull.
+/// `mockls-debounce` — debounce discipline (the ts-ls shape), the declared-constant
+/// gate's synthetic harness (diagnostics-debt 05). The manifest declares
+/// `discipline = "debounce"` with `debounce_ms = 300`; the binary's bundle fires a
+/// versioned publish on the save event AFTER that declared window (a sleeping timer
+/// the settle activity model cannot see), and answers no pull.
 ///
-/// The demonstration follows the settled two-round shape (matching
-/// `delayed_publish_after_settle_reaches_the_receipt`): round 1 is first contact
-/// — the debounced publish lands shortly after, arming the retrieval evidence
-/// bar; round 2 (after a real edit) is never-heard at settle, but the armed bar
-/// holds retrieval until the version-echoing debounced publish arrives, so the
-/// receipt carries the diagnostic rather than a false `[clean]`. (The full
-/// await-echo-bounded-by-the-declared-constant machinery is ledger 05's; this leg
-/// pins that the persona's bounded debounced publish is collected, not lost to
-/// silence.)
+/// **Single-round await-echo-within-bound (the upgrade).** On a cold diagnose the
+/// file is never-heard at settle. The debounce discipline arms the retrieval
+/// evidence bar from turn zero — it does not wait for a demonstrated publish
+/// (05's arming change) — and holds collection, bounded by the declared 300 ms
+/// constant read off the pin. The version-echoing publish lands inside that bound,
+/// so the round settles the moment the echo arrives: the receipt carries the
+/// diagnostic, never a false `[clean]`, in ONE round. This directly demonstrates
+/// the machinery ledger 04c's two-round seed shape stood in for.
+///
+/// Contention doctrine: no seed round, no `sleep` — `call_diagnostics` runs the
+/// pipeline (settle + the bounded await) to completion, so the receipt is
+/// authoritative. The declared window is the only wait, and it is finite.
 #[test]
 fn conformance_mockls_debounce() -> Result<()> {
     let dir = tempfile::tempdir().context("debounce tempdir")?;
@@ -873,16 +898,9 @@ fn conformance_mockls_debounce() -> Result<()> {
     bridge.initialize()?;
     let file_str = file.to_str().context("file")?;
 
-    // Round 1 — first contact seeds the push evidence; the debounced publish
-    // lands shortly after this round's didSave. Give the timer thread time to
-    // dispatch so round 2's evidence bar is deterministically armed.
-    let _seed = bridge.call_diagnostics(file_str)?;
-    std::thread::sleep(Duration::from_millis(600));
-
-    // Round 2 — a real edit relays didChange+didSave through the held-open gate,
-    // scheduling a fresh debounced publish. The armed bar holds retrieval until
-    // that version-echoing publish arrives.
-    std::fs::write(&file, "echo changed\necho more\n").context("edit debounce fixture")?;
+    // One round: never-heard at settle, the declared-constant gate awaits the
+    // echo bounded by 300 ms, the version-echoing publish arrives inside the
+    // bound, and the round settles on its arrival — no seed, no sleep.
     let receipt = bridge.call_diagnostics(file_str)?;
     bridge
         .shutdown_clean(SHUTDOWN_GRACE)
@@ -890,16 +908,71 @@ fn conformance_mockls_debounce() -> Result<()> {
 
     assert!(
         receipt.contains("mock diagnostic"),
-        "`mockls-debounce` declares a bounded debounce window — the delayed \
-         versioned publish must be awaited and collected, never lost to \
-         silence:\n{receipt}"
+        "`mockls-debounce` declares a bounded debounce window — the version echo \
+         must be awaited within the declared bound and collected in one round, \
+         never lost to silence:\n{receipt}"
     );
     assert!(
         !receipt.contains("[clean]"),
-        "the receipt must not render [clean] over a pending debounced \
-         publish:\n{receipt}"
+        "the receipt must not render [clean] over a debounced publish awaited \
+         within the bound:\n{receipt}"
     );
     eprintln!("conformance: `mockls-debounce` PASSED");
+    Ok(())
+}
+
+/// `mockls-debounce` bound-expiry twin — the other half of the declared-constant
+/// gate (diagnostics-debt 05). The SAME debounce persona, but the test pins an
+/// explicit `--diagnostics-delay` past the declared 300 ms bound: the version echo
+/// is scheduled to land AFTER the gate's window (declared window + dead-air slack)
+/// closes. So the round must NOT hang waiting forever, and must NOT render a false
+/// `[clean]` over the pending publish — bound expiry renders the fault-attribution
+/// wording (the verified-contract-violation arm): the discipline said an answer was
+/// owed this round and none came inside the bound.
+///
+/// Contention doctrine: the delay is generous-but-finite and the bound is finite,
+/// so the round completes when the bound expires (well before the delayed publish),
+/// never hangs. The subject is precisely the bound, so real time is sanctioned here.
+#[test]
+fn conformance_mockls_debounce_bound_expiry() -> Result<()> {
+    let dir = tempfile::tempdir().context("debounce-expiry tempdir")?;
+    let file = dir.path().join("case.mockls-debounce");
+    std::fs::write(&file, "echo hello\n").context("write debounce-expiry fixture")?;
+
+    // A publish scheduled 4 s out — comfortably past the ~1.8 s gate bound
+    // (declared 300 ms window + dead-air slack), so the echo cannot land inside
+    // the bound and the gate must expire to the fault, not wait for the publish.
+    let lsp = mockls_lsp_arg("mockls-debounce", "--diagnostics-delay 4000");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], dir.path().to_str().context("root")?)?;
+    bridge.initialize()?;
+    let file_str = file.to_str().context("file")?;
+
+    let receipt = bridge.call_diagnostics(file_str)?;
+    bridge
+        .shutdown_clean(SHUTDOWN_GRACE)
+        .context("clean shutdown for persona `mockls-debounce` bound-expiry")?;
+
+    // Bound expiry NEVER renders [clean] — the pending echo is not evidence.
+    assert!(
+        !receipt.contains("[clean]"),
+        "bound expiry must never render [clean] over a pending debounced \
+         publish:\n{receipt}"
+    );
+    // It renders the fault-attribution wording (the verified-contract-violation
+    // arm): a debounce server whose echo missed the declared bound is a fault
+    // attributed to the server, named + caused + actioned. The retired v1 shrug
+    // stays unwritten.
+    assert!(
+        receipt.contains("did not answer for this round")
+            && receipt.contains("treating as a server fault, re-run to retry"),
+        "bound expiry must render the fault-attribution wording, naming the \
+         server + evidenced cause + action:\n{receipt}"
+    );
+    assert!(
+        !receipt.contains("publishes on its own schedule"),
+        "the retired v1 shrug must never be written:\n{receipt}"
+    );
+    eprintln!("conformance: `mockls-debounce` bound-expiry PASSED");
     Ok(())
 }
 
@@ -958,22 +1031,31 @@ fn conformance_mockls_diff() -> Result<()> {
 /// The manifest row DECLARES the push contract (`declares_push = true`, like
 /// `mockls-declared`), but the binary's bundle (`--no-push-diagnostics
 /// --reject-pull`) WITHHOLDS — it never publishes and answers no pull, breaking
-/// its own contract. The declared-vs-implemented pairing must therefore DETECT
-/// the violation: the debt stays unsettled and the file resolves
-/// `[unverified — … returned no result]`, NEVER a false `[clean]`. (Full
-/// fault-attribution wording is ledger 05's; today detection = the debt is not
-/// falsely settled.)
+/// its own contract. Its discipline OWED an answer this round (a declared-push
+/// server) and gave none, so bound expiry renders the verified-contract-violation
+/// arm of the fault floor (diagnostics-debt 05): the DESIGN's exact wording,
+/// naming the server + evidenced cause + action, and the round strikes the same
+/// ledger a crashing server feeds. NEVER a false `[clean]`.
 #[test]
 fn conformance_mockls_violator() -> Result<()> {
     let receipt = persona_receipt("mockls-violator", "", "echo hello\n")?;
+    // The fault-attribution wording (the DESIGN's exact phrasing): the discipline
+    // required a response, none came, so it is treated as a server fault.
     assert!(
-        receipt.contains("[unverified"),
-        "`mockls-violator` declares push but withholds — the violation must be \
-         DETECTED as an unsettled debt, not a false clean:\n{receipt}"
+        receipt.contains("mockls-violator did not answer for this round")
+            && receipt.contains("its verified behavior requires a response")
+            && receipt.contains("treating as a server fault, re-run to retry"),
+        "`mockls-violator` declares push but withholds — the violation must render \
+         the fault-attribution wording (server + cause + action):\n{receipt}"
     );
     assert!(
         !receipt.contains("[clean]"),
         "a contract violation must never render [clean] over absence:\n{receipt}"
+    );
+    // The retired v1 shrug ("publishes on its own schedule") stays unwritten.
+    assert!(
+        !receipt.contains("publishes on its own schedule"),
+        "the retired v1 shrug must never be written:\n{receipt}"
     );
     eprintln!("conformance: `mockls-violator` PASSED");
     Ok(())
@@ -991,6 +1073,45 @@ fn conformance_mockls_violator() -> Result<()> {
 #[test]
 fn conformance_clangd() -> Result<()> {
     sentinel("clangd")
+}
+
+// ── gopls pull-first gate (diagnostics-debt 05, re-enabling bug 87) ────
+//
+// Bug 87 forced gopls's `pullDiagnostics` OFF because its pull-mode empty
+// placeholder pushes were read as authoritative heard-empty, defeating the pull
+// that would fetch the real results. Ledger 03's version-echo settlement retired
+// that defeat structurally (an unversioned placeholder echoes no version → settles
+// nothing), so ledger 05 re-enables the pull: gopls's manifest discipline is now
+// `pull` and `pullDiagnostics = false` is lifted. That re-enable ships ONLY behind
+// this conformance gate proving pull-first collection against the pin.
+//
+// gopls now advertises `diagnosticProvider`, so Catenary's retrieval takes the
+// pull path (`supports_pull_diagnostics()` → `pull_settling`); a green diagnose of
+// the go fixture's intentional type error is therefore pull-first collection. This
+// is a skip-if-binary-missing sentinel like clangd: where gopls is on PATH it runs
+// (and gates the re-enable on this host), and a host lacking it stays green — the
+// CI matrix's `CATENARY_CONFORMANCE=gopls` job requires the binary against the pin.
+#[test]
+fn conformance_gopls_pull_mode() -> Result<()> {
+    sentinel("gopls")
+}
+
+// ── ts-ls declared-constant gate (diagnostics-debt 05, un-exemption) ───
+//
+// typescript-language-server was `conformance = false` (tui-rework 13): a
+// push-only publisher whose first didOpen/didSave diagnostic lands on an internal
+// debounce timer AFTER the process has gone scheduler-idle, past the
+// settle-then-collect window — a deterministic false `[clean]`. Ledger 05's
+// declared-constant gate closes it: with `discipline = "debounce"` and
+// `debounce_ms = 850` on the pin, the retrieval evidence bar arms from turn zero
+// and AWAITS the version echo bounded by the declared constant, so the debounced
+// publish is collected rather than lost to silence. This sentinel is
+// skip-if-binary-missing like gopls/clangd; where ts-ls is on PATH it gates the
+// un-exemption on this host, and the CI matrix's `CATENARY_CONFORMANCE=typescript-language-server`
+// job requires the binary against the pin.
+#[test]
+fn conformance_typescript_ls() -> Result<()> {
+    sentinel("typescript-language-server")
 }
 
 // ── CI-matrix entry point (exact-server selection) ────────────────────

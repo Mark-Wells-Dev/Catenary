@@ -506,19 +506,22 @@ mod tests {
     }
 
     #[test]
-    fn initialize_forces_gopls_conformance_levers() {
-        // gopls carries the forced conformance lever even when the user supplies
-        // no initializationOptions. Pull is forced OFF (bug 87: pull mode stops
-        // real pushes; the empty placeholder publishes read as heard-empty), and
-        // the debounce key is enforced absent (run 9 + ruling).
+    fn initialize_gopls_forces_no_options_with_pull_re_enabled() {
+        // diagnostics-debt 05 re-enabled gopls's pull (bug 87's `pullDiagnostics:
+        // false` override retired — ledger 03 killed the placeholder defeat
+        // structurally). With the user supplying no options, gopls now forces
+        // nothing, so `initializationOptions` is absent entirely — it rides its
+        // native pull mode. The `diagnosticsDelay` enforcement (run 9) is a
+        // forbidden key, inert until a layer actually supplies it.
         let ours = initialize(7, &[("file:///ws", "ws")], "gopls", None);
-        let opts = &ours["initializationOptions"];
-        assert_eq!(opts["pullDiagnostics"], json!(false));
-        assert!(opts.get("diagnosticsDelay").is_none());
+        assert!(
+            ours.get("initializationOptions").is_none(),
+            "gopls forces no init options when the user supplies none: {ours}",
+        );
     }
 
     #[test]
-    fn initialize_gopls_conformance_wins_over_user_options() {
+    fn initialize_gopls_pull_re_enabled_keeps_user_pull_but_forbids_delay() {
         let user = json!({
             "diagnosticsDelay": "0s",
             "pullDiagnostics": true,
@@ -526,10 +529,11 @@ mod tests {
         });
         let ours = initialize(7, &[("file:///ws", "ws")], "gopls", Some(&user));
         let opts = &ours["initializationOptions"];
-        // Conformance wins: the pull footgun is overwritten and the delay key
-        // is stripped outright (enforced absent — run 9: "0s" decoupled
-        // publishing from analysis; only gopls's own default may apply).
-        assert_eq!(opts["pullDiagnostics"], json!(false));
+        // Pull re-enabled (05): the user's `pullDiagnostics` is no longer
+        // overridden. The delay key is still stripped outright (enforced absent —
+        // run 9: "0s" decoupled publishing from analysis; only gopls's own default
+        // may apply).
+        assert_eq!(opts["pullDiagnostics"], json!(true));
         assert!(opts.get("diagnosticsDelay").is_none());
         // The user's unrelated key survives.
         assert_eq!(opts["buildFlags"], json!(["-tags=x"]));

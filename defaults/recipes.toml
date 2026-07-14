@@ -103,8 +103,7 @@ version = "5.3.0"
 tier = "npm-tarball-sha512"
 draft = true
 hash = "sha512-5puofxZHgFdAYtfNpmwCAvgtaYgg8wrUnH30m7Ze3QuguId5RNRadKASpOpyDxTyUdAF51FjhTdjntLw/EuWcQ=="
-conformance = false
-note = "resolves transitive deps at install time within the pinned version; the engine's --ignore-scripts install caps the residual to non-executing dep code. conformance = false (tui-rework 13): typescript-language-server is a push-only publisher (no textDocument/diagnostic pull) whose first didOpen/didSave diagnostic lands on an internal debounce AFTER the process has gone scheduler-idle, so the settle-then-collect window (and even the product's warm re-diagnose round) closes before the publish — verified locally, deterministic [clean]. This is the residual push-only tail of bug 74 the best-effort pull cannot cover (see the tui-rework 13 report's class C product observation); excluded until the settle/publish gap is closed product-side rather than shipped as a guaranteed-red job."
+note = "resolves transitive deps at install time within the pinned version; the engine's --ignore-scripts install caps the residual to non-executing dep code. UN-EXEMPTED (diagnostics-debt 05): typescript-language-server is a push-only publisher (no textDocument/diagnostic pull) whose first didOpen/didSave diagnostic lands on an internal debounce AFTER the process has gone scheduler-idle. That settle/publish gap made it conformance = false (tui-rework 13); ledger 05's declared-constant gate closes it — the ledger AWAITS the version echo bounded by the debounce_ms constant declared in the blessed manifest ([discipline.typescript-language-server], debounce = 850 ms), never interpreting silence. Conformed against the pin by conformance_typescript_ls."
 
 # pyright's npm package is bundled (ships its own bundled node code); minimal
 # residual install-time dependency risk. The pyright class (findings 5/6) is why

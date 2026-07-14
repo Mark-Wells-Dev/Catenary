@@ -252,6 +252,19 @@ enum UnverifiedCause {
     /// The owing server was alive and simply produced nothing:
     /// `[unverified — <server> returned no result]`.
     Silent,
+    /// The owing server's **verified discipline required a response this round**
+    /// and none arrived — a declared-push server that never published, or a
+    /// debounce-discipline server whose version echo never landed inside the
+    /// declared bound (diagnostics-debt 05 / DESIGN §"The floor is fault
+    /// attribution"). A blessed-set privilege: the discipline is the evidence, so
+    /// the fault is attributed to the server and the round strikes the ledger
+    /// (`[<server> did not answer for this round — its verified behavior requires
+    /// a response; treating as a server fault, re-run to retry]`). Softer than the
+    /// process-state faults below (their terminal lifecycle is harder evidence)
+    /// but harder than [`Self::Silent`]: it survives the softest-`min` only when
+    /// every owing server at least owed an answer, so a merely-silent co-owner
+    /// still keeps `Silent`'s wording.
+    ContractViolation,
     /// Process-state evidence types the owing server as stuck (respawn-dead /
     /// init-hung) with strikes remaining, so the next demand retries
     /// (misc 167): `[unverified — <server> stuck; will retry on demand]`.
@@ -292,6 +305,33 @@ enum FileOutcome {
     /// File was validated but absent from server results (server died
     /// during the pipeline before producing results).
     NoResults,
+}
+
+/// The fault a server's batch (with recovery) exhibited this round, driving the
+/// receipt's `[unverified — …]` cause and the strike ledger
+/// (diagnostics-debt 05).
+///
+/// Returned by [`DiagnosticsServer::run_server_batch_with_recovery`]. A healthy
+/// run — or one whose bounded revive recovered the whole remainder — yields
+/// `None`; the two fault arms are mutually exclusive per server per round,
+/// process-state death taking precedence over a contract violation (a dead
+/// server can't be judged for not answering).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchFault {
+    /// The server died (terminal lifecycle) with an unretrieved remainder and
+    /// the one bounded, strike-gated revive could not bring it back this run —
+    /// process-state evidence it is stuck (misc 160 leg 1 / misc 167). `fan_out`
+    /// types it with the server's [`crate::lsp::manager::ReviveVerdict`].
+    RespawnDead,
+    /// The server stayed **alive** but its **verified discipline owed an answer
+    /// this round and none came** ([`LspServer::owes_answer`]): a declared-push
+    /// server that never published, or a debounce-discipline server whose version
+    /// echo never landed inside the declared bound (diagnostics-debt 05 / DESIGN
+    /// §"The floor is fault attribution"). `fan_out` renders the
+    /// [`UnverifiedCause::ContractViolation`] wording and strikes the same ledger
+    /// a crashing server feeds — a server violating its adapter is sick the same
+    /// way a crashing one is.
+    ContractViolation,
 }
 
 /// One batch file's state within a diagnostics round on one server
@@ -693,7 +733,7 @@ impl DiagnosticsServer {
         // Rendering is deferred to Phase 2c so dedup/precedence run on canonical
         // JSON, feeder-blind (ticket 02).
         for (name, (client_mutex, paths)) in &server_groups {
-            if self
+            match self
                 .run_server_batch_with_recovery(client_mutex, paths, parent_id, owner, feeds)
                 .await
             {
@@ -701,13 +741,24 @@ impl DiagnosticsServer {
                 // the one bounded respawn could not revive it this run
                 // (respawn-dead) — typed with its strike-ledger verdict
                 // (misc 167): stuck-but-retried-next-demand, or benched.
-                let verdict = {
-                    let key = client_mutex.lock().await.server().key();
-                    key.map_or(crate::lsp::manager::ReviveVerdict::Revivable, |k| {
-                        self.client_manager.revive_verdict(&k)
-                    })
-                };
-                stuck_servers.insert(name.clone(), UnverifiedCause::from_verdict(verdict));
+                Some(BatchFault::RespawnDead) => {
+                    let verdict = {
+                        let key = client_mutex.lock().await.server().key();
+                        key.map_or(crate::lsp::manager::ReviveVerdict::Revivable, |k| {
+                            self.client_manager.revive_verdict(&k)
+                        })
+                    };
+                    stuck_servers.insert(name.clone(), UnverifiedCause::from_verdict(verdict));
+                }
+                // The server stayed alive but its verified discipline owed an
+                // answer this round and gave none (declared-push or debounce) —
+                // a verified-contract violation (diagnostics-debt 05). The
+                // strike already landed in `run_server_batch_with_recovery`;
+                // render the fault-attribution wording.
+                Some(BatchFault::ContractViolation) => {
+                    stuck_servers.insert(name.clone(), UnverifiedCause::ContractViolation);
+                }
+                None => {}
             }
         }
 
@@ -1214,14 +1265,25 @@ impl DiagnosticsServer {
     /// An alive, non-terminal server that merely failed to open a file is left
     /// as-is — that is not an unavailability, and a respawn would not change it.
     ///
-    /// Returns `true` when the server is **respawn-dead**: it died (terminal
-    /// lifecycle) with a non-empty unretrieved remainder and the one bounded,
-    /// strike-gated revive could not bring it back this run — process-state
-    /// evidence the server is stuck, so its `NoResults` files earn the typed
-    /// unverified wording (`stuck; will retry on demand`, or the terminal
-    /// benched labels — misc 160 leg 1 / misc 167). Returns `false` for a
-    /// clean run, an alive server, or a revive that recovered the whole
-    /// remainder.
+    /// Returns [`BatchFault::RespawnDead`] when the server is **respawn-dead**:
+    /// it died (terminal lifecycle) with a non-empty unretrieved remainder and
+    /// the one bounded, strike-gated revive could not bring it back this run —
+    /// process-state evidence the server is stuck, so its `NoResults` files earn
+    /// the typed unverified wording (`stuck; will retry on demand`, or the
+    /// terminal benched labels — misc 160 leg 1 / misc 167).
+    ///
+    /// Returns [`BatchFault::ContractViolation`] when the server stayed **alive**
+    /// but its **verified discipline owed an answer this round and none came**
+    /// ([`LspServer::owes_answer`]) — a declared-push server that never published
+    /// or a debounce server whose version echo never landed inside the declared
+    /// bound (diagnostics-debt 05). The remainder is the same unretrieved set the
+    /// respawn-dead path reads; here the server is alive, so the fault is the
+    /// contract, not the process. It feeds the same strike ledger a crashing
+    /// server does.
+    ///
+    /// Returns `None` for a clean run, an alive server that owes no contract
+    /// (its silence is the misc-153 residual, not a fault), or a revive that
+    /// recovered the whole remainder.
     async fn run_server_batch_with_recovery(
         &self,
         client_mutex: &Arc<Mutex<LspClient>>,
@@ -1229,7 +1291,7 @@ impl DiagnosticsServer {
         parent_id: Option<&str>,
         owner: Option<&str>,
         feeds: &mut BTreeMap<String, FileFeed>,
-    ) -> bool {
+    ) -> Option<BatchFault> {
         self.run_server_batch(client_mutex, paths, parent_id, owner, feeds)
             .await;
 
@@ -1239,7 +1301,7 @@ impl DiagnosticsServer {
             .cloned()
             .collect();
         if remainder.is_empty() {
-            return false;
+            return None;
         }
 
         let key = {
@@ -1247,14 +1309,29 @@ impl DiagnosticsServer {
             // Recover only from an actual death; an alive, non-terminal server
             // is not an unavailability.
             if client.is_alive() && !client.lifecycle().is_terminal() {
-                return false;
+                // Alive but with an unretrieved remainder: a verified-contract
+                // violation iff the server's discipline OWED an answer this round
+                // (declared-push, or debounce) — the fault floor's third arm
+                // (diagnostics-debt 05). An alive server that owes no contract
+                // (the rust-analyzer never-republishes residual, an
+                // undeclared-silent server) is left `None` — its silence is not a
+                // fault. A server violating its adapter is sick the same way a
+                // crashing one is, so it feeds the SAME strike ledger.
+                if client.server().owes_answer() {
+                    if let Some(key) = client.server().key() {
+                        drop(client);
+                        self.client_manager.record_contract_violation(&key);
+                    }
+                    return Some(BatchFault::ContractViolation);
+                }
+                return None;
             }
             client.server().key()
         };
         let Some(key) = key else {
             // Terminal, but no respawnable key (a `SingleFile` scope): the
             // remainder degrades against a dead server — respawn-dead.
-            return true;
+            return Some(BatchFault::RespawnDead);
         };
 
         // One bounded, strike-gated revive + re-run of the remainder (misc
@@ -1270,9 +1347,10 @@ impl DiagnosticsServer {
             remainder
                 .iter()
                 .any(|p| !feeds.contains_key(p.to_string_lossy().as_ref()))
+                .then_some(BatchFault::RespawnDead)
         } else {
             // Respawn itself failed to produce a live instance — dead again.
-            true
+            Some(BatchFault::RespawnDead)
         }
     }
 
@@ -1900,6 +1978,34 @@ async fn drain_pipe(server: &LspServer) {
 /// an unchanged document.
 const DEBOUNCE_DEAD_ZONE_SAMPLES: u32 = 30;
 
+/// The dead-air budget in poll samples for the batch's owing server — the
+/// declared-constant gate (diagnostics-debt 05).
+///
+/// A debounce-discipline server declares its window in the manifest
+/// ([`LspServer::debounce_ms`], data riding the pin — never a measured guess).
+/// For such a server the evidence bar awaits the version echo bounded by that
+/// declared constant: the window converted to [`POLL_INTERVAL`]-cadence samples
+/// (rounded up) PLUS the generic [`DEBOUNCE_DEAD_ZONE_SAMPLES`] slack for the
+/// publish to land and be read after the timer fires. The wait is still
+/// **arrival-based** — the loop returns the moment the echo lands inside the
+/// bound; the bound only caps how long a *silent* server holds collection before
+/// its expiry renders the fault-attribution wording (never `[clean]`). Every
+/// other server keeps the generic budget: the declared constant governs only the
+/// discipline that reads it.
+fn debounce_budget_samples(server: &LspServer) -> u32 {
+    let poll_ms = u32::try_from(POLL_INTERVAL.as_millis())
+        .unwrap_or(50)
+        .max(1);
+    server
+        .debounce_ms()
+        .map_or(DEBOUNCE_DEAD_ZONE_SAMPLES, |window_ms| {
+            // ceil(window_ms / poll_ms), saturating — the declared window in samples.
+            let window_ms = u32::try_from(window_ms).unwrap_or(u32::MAX);
+            let window_samples = window_ms.div_ceil(poll_ms);
+            window_samples.saturating_add(DEBOUNCE_DEAD_ZONE_SAMPLES)
+        })
+}
+
 /// Holds retrieval until a declared- or demonstrated-push server's publishes
 /// arrive for the batch's never-heard URIs, or the dead-air budget drains —
 /// the retrieval evidence bar (bug 99 residual / bug 101 / misc 156 / misc
@@ -1912,22 +2018,26 @@ const DEBOUNCE_DEAD_ZONE_SAMPLES: u32 = 30;
 ///
 /// - at least one opened URI is **never-heard** after the post-didSave settle
 ///   and drain (no cached publish, not even an empty one);
-/// - the server is a push server by **declaration OR demonstration**: either
-///   its conformance profile carries the publish contract
+/// - the server is a push server by **declaration, demonstration, OR debounce
+///   discipline**: either its conformance profile carries the publish contract
 ///   ([`LspServer::declares_push`] — a publish on every didOpen, explicit
-///   `[]` for clean, misc 187) or it **has published** on this connection
-///   ([`LspServer::has_ever_published`]). Either way, the didOpen/didSave it
+///   `[]` for clean, misc 187), or it **has published** on this connection
+///   ([`LspServer::has_ever_published`]), or its manifest discipline is
+///   `debounce` with a declared bound ([`LspServer::debounce_ms`],
+///   diagnostics-debt 05 — the version echo is owed within the declared window,
+///   so the gate awaits it from turn zero). Either way, the didOpen/didSave it
 ///   just received will produce a publish (possibly empty — the heard-empty
 ///   clean, misc 153). Demonstration alone left a first-run false-`[clean]`
 ///   window on every fresh connection, since `has_ever_published` resets with
-///   the connection; the declaration closes it from turn zero;
+///   the connection; the declaration and the declared debounce bound each close
+///   it from turn zero;
 /// - it advertises **no pull channel** and has **never answered a probe**
 ///   ([`LspServer::has_answered_probe`]) — a working request channel is
 ///   per-file evidence on demand, so no wait is owed where one exists.
 ///
-/// A server that neither declares push nor has ever pushed is left untouched
-/// to the misc-153 silent-server contract downstream (one best-effort probe →
-/// clean).
+/// A server that neither declares push, has ever pushed, nor declares a debounce
+/// bound is left untouched to the misc-153 silent-server contract downstream
+/// (one best-effort probe → clean).
 ///
 /// The wait wakes on every publish ([`LspServer::diagnostics_notify`]
 /// registered before each cache re-check, so no publish is missed) and never
@@ -1974,13 +2084,17 @@ async fn await_publish_evidence(
         )
     };
 
-    // Declaration OR demonstration (misc 187): a declared-push server arms the
-    // bar even before this connection's first publish — `has_ever_published`
-    // is per-connection state that resets on every respawn and daemon bounce,
-    // which is exactly the first-run false-`[clean]` window the declaration
-    // closes.
+    // Declaration OR demonstration OR debounce discipline: a declared-push
+    // server (misc 187) and a debounce-discipline server (diagnostics-debt 05)
+    // each arm the bar even before this connection's first publish —
+    // `has_ever_published` is per-connection state that resets on every respawn
+    // and daemon bounce, which is exactly the first-run false-`[clean]` window
+    // both close. The debounce bound is what the gate awaits (data riding the
+    // pin), so a debounce server owes an echo within it from turn zero.
     if pending.is_empty()
-        || !(server.declares_push() || server.has_ever_published())
+        || !(server.declares_push()
+            || server.has_ever_published()
+            || server.debounce_ms().is_some())
         || server.has_answered_probe()
     {
         return HashSet::new();
@@ -1997,9 +2111,16 @@ async fn await_publish_evidence(
         return pending;
     }
 
+    // The bound: the declared debounce constant (converted to a sample budget)
+    // for a debounce-discipline server, else the generic dead-air budget
+    // (diagnostics-debt 05). Data riding the pin, never a measured guess; the
+    // window itself never surfaces to the agent — the gate holds collection.
+    let budget = debounce_budget_samples(&server);
     debug!(
         server = %server_name,
         pending = pending.len(),
+        budget,
+        debounce_ms = server.debounce_ms(),
         "evidence bar armed: never-heard files on a declared- or demonstrated-push server",
     );
 
@@ -2021,7 +2142,7 @@ async fn await_publish_evidence(
         if server.lifecycle().is_terminal() {
             return pending;
         }
-        if quiet_samples >= DEBOUNCE_DEAD_ZONE_SAMPLES {
+        if quiet_samples >= budget {
             break;
         }
 
@@ -2707,11 +2828,21 @@ fn render_out_of_scope(entries: &[OutOfScopeEntry]) -> String {
 /// stuck process from a server that was alive and simply produced nothing
 /// (misc 160 leg 1), and the strike ledger's terminal states carry the
 /// ticket's cause-distinguishing labels (misc 167) — `broken` (config /
-/// environment: fix the server) vs `unstable` (instability, not config).
+/// environment: fix the server) vs `unstable` (instability, not config). The
+/// verified-contract-violation arm renders the DESIGN's exact wording
+/// (diagnostics-debt 05 / DESIGN §"The floor is fault attribution"): a blessed
+/// server whose discipline owed a response this round and gave none is a fault,
+/// attributed to the server, not a Catenary shrug.
 fn unverified_label(server: &str, cause: UnverifiedCause) -> String {
     match cause {
         UnverifiedCause::Silent => {
             format!("unverified \u{2014} {server} returned no result")
+        }
+        UnverifiedCause::ContractViolation => {
+            format!(
+                "{server} did not answer for this round \u{2014} its verified behavior \
+                 requires a response; treating as a server fault, re-run to retry"
+            )
         }
         UnverifiedCause::Stuck => {
             format!("unverified \u{2014} {server} stuck; will retry on demand")
@@ -3337,6 +3468,92 @@ mod tests {
         assert!(
             !output.contains("returned no result"),
             "a stuck server must not read as merely silent: {output}"
+        );
+    }
+
+    #[test]
+    fn format_contract_violation_renders_the_designs_exact_wording() {
+        // The fault floor's third arm (diagnostics-debt 05 / DESIGN §"The floor
+        // is fault attribution"): a blessed server whose verified discipline owed
+        // an answer this round and gave none renders the DESIGN's exact wording —
+        // a server fault, attributed to the server, never a Catenary shrug and
+        // never a false `[clean]`. The retired v1 "publishes on its own schedule"
+        // wording stays unwritten.
+        let unverified = vec![ue_cause(
+            "case.ts",
+            "/project",
+            "typescript-language-server",
+            UnverifiedCause::ContractViolation,
+        )];
+        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        assert_eq!(
+            output.trim(),
+            "unavailable: typescript-language-server\n\
+             /project/case.ts [typescript-language-server did not answer for this round \u{2014} \
+             its verified behavior requires a response; treating as a server fault, \
+             re-run to retry]",
+            "output: {output}"
+        );
+        assert!(
+            !output.contains("publishes on its own schedule"),
+            "the retired v1 shrug must never be written: {output}"
+        );
+        assert!(
+            !output.contains("[clean]"),
+            "a fault is never clean: {output}"
+        );
+    }
+
+    #[test]
+    fn contract_violation_ordering_between_silent_and_stuck() {
+        // The softest-`min` ordering is load-bearing (diagnostics-debt 05): a
+        // contract violation is harder than a plain silence (the discipline is
+        // the evidence) but softer than a process-state death (a terminal
+        // lifecycle is harder evidence still). So a file owed by a silent co-owner
+        // keeps `Silent`'s wording, while a stuck co-owner wins over a violation.
+        assert!(UnverifiedCause::Silent < UnverifiedCause::ContractViolation);
+        assert!(UnverifiedCause::ContractViolation < UnverifiedCause::Stuck);
+        let with_silent = [UnverifiedCause::ContractViolation, UnverifiedCause::Silent]
+            .into_iter()
+            .min();
+        assert_eq!(with_silent, Some(UnverifiedCause::Silent));
+        let with_stuck = [UnverifiedCause::ContractViolation, UnverifiedCause::Stuck]
+            .into_iter()
+            .min();
+        assert_eq!(with_stuck, Some(UnverifiedCause::ContractViolation));
+    }
+
+    #[test]
+    fn debounce_budget_rides_the_declared_constant() {
+        // The declared-constant gate (diagnostics-debt 05): a debounce server's
+        // await is bounded by its declared window (converted to poll samples)
+        // PLUS the generic dead-air slack — data riding the pin, never a hardcoded
+        // number. `mockls-debounce` declares 300 ms; at the 50 ms poll cadence
+        // that is 6 window samples + the generic slack. Every non-debounce server
+        // keeps the generic budget. A pure state assertion — no wall clock.
+        let debounce = LspServer::new(
+            "mockls-debounce".to_string(),
+            "mockls-debounce".to_string(),
+            None,
+        );
+        let poll_ms = u32::try_from(POLL_INTERVAL.as_millis())
+            .expect("poll interval fits u32")
+            .max(1);
+        let window_samples = 300u32.div_ceil(poll_ms);
+        assert_eq!(
+            debounce_budget_samples(&debounce),
+            window_samples + DEBOUNCE_DEAD_ZONE_SAMPLES,
+            "the declared 300 ms window must set the bound, not the hardcoded budget",
+        );
+
+        // A non-debounce server (rust-analyzer: event discipline, no bound) keeps
+        // the generic dead-air budget — the declared constant governs only the
+        // discipline that reads it.
+        let event = LspServer::new("rust".to_string(), "rust-analyzer".to_string(), None);
+        assert_eq!(
+            debounce_budget_samples(&event),
+            DEBOUNCE_DEAD_ZONE_SAMPLES,
+            "a non-debounce server keeps the generic dead-air budget",
         );
     }
 

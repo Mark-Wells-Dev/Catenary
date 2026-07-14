@@ -475,6 +475,28 @@ impl LspClientManager {
         }
     }
 
+    /// Records one **verified-contract violation** (`+1`) for an instance
+    /// (diagnostics-debt 05): a blessed server whose discipline owed an answer
+    /// this diagnostics round and gave none — a declared-push server that never
+    /// published, or a debounce server whose version echo never landed inside its
+    /// declared bound.
+    ///
+    /// A server violating its adapter is sick the same way a crashing one is
+    /// (DESIGN §"The floor is fault attribution"), so it feeds the **same** strike
+    /// ledger a crash does: the same `+1`, the same bench-at-cap, the same
+    /// pay-down on the next served round. Delegates to [`Self::record_server_strike`]
+    /// — no rival ledger.
+    pub fn record_contract_violation(&self, key: &InstanceKey) {
+        debug!(
+            source = Source::LspLifecycle.as_str(),
+            server = key.server.as_str(),
+            scope_root = key.scope.root_path().map(|p| p.display().to_string()),
+            "Verified-contract violation for {key}: discipline owed an answer this \
+             round and none came — striking the ledger",
+        );
+        self.record_server_strike(key);
+    }
+
     /// The instance's current [`ReviveVerdict`] from the strike ledger.
     ///
     /// An instance the ledger has never seen is [`ReviveVerdict::Revivable`].
@@ -5346,6 +5368,51 @@ mod tests {
         manager.record_server_service(&fresh);
         assert!(manager.revive_verdict(&fresh).is_revivable());
         assert!(!manager.strikes_recorded(&fresh), "no entry allocated");
+    }
+
+    #[test]
+    fn contract_violation_feeds_the_same_strike_ledger() {
+        // diagnostics-debt 05: a verified-contract violation (a blessed server
+        // whose discipline owed an answer this round and gave none) feeds the
+        // SAME strike ledger a crash does — the same `+1`, the same bench at the
+        // cap, the same pay-down on the next served round. No rival ledger.
+        let manager = LspClientManager::new(test_config(), test_logging(), test_fs());
+        let key = InstanceKey::new(
+            "typescript".to_string(),
+            "typescript-language-server".to_string(),
+            Scope::Root(PathBuf::from("/p")),
+        );
+        assert!(manager.revive_verdict(&key).is_revivable());
+
+        // A violation records a strike, exactly like a crash.
+        manager.record_contract_violation(&key);
+        assert!(
+            manager.strikes_recorded(&key),
+            "the violation struck the ledger"
+        );
+        assert!(
+            manager.revive_verdict(&key).is_revivable(),
+            "one strike: still revivable"
+        );
+
+        // A served round pays it back down — the same ledger a crash feeds.
+        manager.record_server_service(&key);
+        assert!(
+            !manager.strikes_recorded(&key),
+            "served work paid the violation strike down — one ledger, not two"
+        );
+
+        // Repeated violations bench at the cap. This key has served once (the
+        // pay-down above set `ever_served`), so the terminal cause is `unstable`
+        // — the same axis a crashing-after-serving server lands on.
+        for _ in 0..MAX_SERVER_STRIKES {
+            manager.record_contract_violation(&key);
+        }
+        assert_eq!(
+            manager.revive_verdict(&key),
+            ReviveVerdict::BenchedUnstable,
+            "chronic contract violations bench the server the same way crashes do"
+        );
     }
 
     #[test]

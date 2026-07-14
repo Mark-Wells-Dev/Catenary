@@ -148,6 +148,12 @@ platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
+[blessed.typescript-language-server.linux-x86_64]
+version = "5.1.3"
+platform = "linux-x86_64"
+date = "2026-07-13"
+tier = "verified-on-linux"
+
 [blessed.yaml-language-server.linux-x86_64]
 version = "1.23.0"
 platform = "linux-x86_64"
@@ -321,15 +327,21 @@ contains_all = ["implied by"]
 prefix = "to override"
 contains_any = ["`#[allow(", "`#[warn("]
 
-# gopls — event-publishing, but the pull mode is a footgun (bug 87): pull mode
-# stops real pushes and publishes empty placeholders read as authoritative
-# heard-empty, so `pullDiagnostics` is forced FALSE. `diagnosticsDelay` is
-# enforced ABSENT (run 9): at "0s" every publish fires instantly-and-empty on
-# the unchecked snapshot, so only gopls's own default may apply.
+# gopls — PULL discipline (diagnostics-debt 05, re-enabling bug 87's suppression).
+# Bug 87 forced `pullDiagnostics` FALSE because in pull mode gopls stopped real
+# pushes and published empty placeholders that the then-unconditional heard-empty
+# rule (misc 153) read as authoritative — so the pull that would fetch the real
+# results was suppressed and dirty files read `[clean]`. Ledger 03's version-echo
+# settlement retired that defeat STRUCTURALLY: an unversioned empty placeholder
+# echoes no version, so it settles nothing — the debt stays open and the pull
+# (`textDocument/diagnostic`) is what settles it, pull-first. So the suppression
+# is lifted (no `pullDiagnostics = false`) and gopls rides its native pull mode,
+# conformance-gated against the pin (`conformance_gopls_pull_mode`).
+# `diagnosticsDelay` stays enforced ABSENT (run 9): at "0s" the coupling between
+# analysis completion and publishing breaks, so only gopls's own default may apply.
 [discipline.gopls]
-discipline = "event"
+discipline = "pull"
 forbidden_init_options = ["diagnosticsDelay"]
-forced_init_options = { pullDiagnostics = false }
 
 # lattice — declared push (misc 187): the contract, pinned cross-repo in misc
 # 153 / Lattice ticket 16 / its decision 022 and re-verified per re-pin, is a
@@ -338,4 +350,18 @@ forced_init_options = { pullDiagnostics = false }
 [discipline.lattice]
 discipline = "event"
 declares_push = true
+
+# typescript-language-server — DEBOUNCE discipline (diagnostics-debt 05). ts-ls
+# is a push-only publisher (no textDocument/diagnostic pull) whose first
+# didOpen/didSave diagnostic lands on an internal debounce timer AFTER the process
+# has gone scheduler-idle — the exact settle/publish gap that made it
+# `conformance = false` (tui-rework 13). Ledger 05's declared-constant gate closes
+# it: the ledger AWAITS the version echo bounded by this declared constant, never
+# interpreting silence. The window is the DESIGN's pinned range upper bound
+# (300–800 ms + 50 ms); `debounce_ms = 850` is the constant the gate awaits, data
+# riding the pin and re-verified at every re-pin. The un-exemption rides this gate
+# (`conformance_typescript_ls`).
+[discipline.typescript-language-server]
+discipline = "debounce"
+debounce_ms = 850
 

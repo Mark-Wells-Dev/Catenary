@@ -49,25 +49,30 @@
 //!   `textDocument.diagnostic` client capability *and* gates the client-side pull
 //!   path, so RA's native pushes are the sole diagnostic channel — airtight even
 //!   if RA spontaneously advertises `diagnosticProvider`.
-//! - **gopls** — [`ServerProfile::forced_initialization_options`] +
-//!   [`ServerProfile::forbidden_initialization_options`].
-//!   `pullDiagnostics: false` — **forced off** (bug 87, conformance run 8): in
-//!   pull mode gopls stops pushing real diagnostics and publishes empty
-//!   placeholders, which the heard-empty-is-evidence rule (misc 153) treats as
-//!   authoritative — so the pull that would fetch the real results is suppressed
-//!   and dirty files read `[clean]`. `diagnosticsDelay` — **enforced absent**
-//!   (maintainer ruling after conformance run 9): `"0s"` decouples publishing
-//!   from analysis — every publish fired ~1 ms after its document event, empty,
-//!   on the not-yet-checked snapshot, and the completed type-check never got a
-//!   publish of its own. The debounce is not a blind window to zero out; it is
-//!   the coupling between analysis completion and the publish. A user reasoning
-//!   "zero the delay to minimize latency" would reintroduce exactly that, so the
-//!   key is stripped from whatever the config layers produce and gopls's own
-//!   default is the only value that can ever reach the server. These are
-//!   conformance settings, not `defaults/servers.toml` entries, because a user
+//! - **gopls** — [`ServerProfile::forbidden_initialization_options`] +
+//!   `discipline = "pull"`. Pull is **re-enabled** (diagnostics-debt 05): bug 87
+//!   had forced `pullDiagnostics: false` (conformance run 8) because in pull mode
+//!   gopls stopped pushing real diagnostics and published empty placeholders the
+//!   then-unconditional heard-empty rule (misc 153) read as authoritative — the
+//!   pull that would fetch the real results was suppressed and dirty files read
+//!   `[clean]`. Ledger 03's version-echo settlement retired that defeat
+//!   **structurally**: an unversioned empty placeholder echoes no version, so it
+//!   settles nothing; the debt stays open and the pull (`textDocument/diagnostic`)
+//!   is what settles it, pull-first. So the `pullDiagnostics: false` override is
+//!   lifted and gopls rides its native pull mode, conformance-gated against the
+//!   pin (`conformance_gopls_pull_mode`). `diagnosticsDelay` stays **enforced
+//!   absent** (maintainer ruling after conformance run 9): `"0s"` decouples
+//!   publishing from analysis — every publish fired ~1 ms after its document
+//!   event, empty, on the not-yet-checked snapshot, and the completed type-check
+//!   never got a publish of its own. The debounce is not a blind window to zero
+//!   out; it is the coupling between analysis completion and the publish. A user
+//!   reasoning "zero the delay to minimize latency" would reintroduce exactly
+//!   that, so the key is stripped from whatever the config layers produce and
+//!   gopls's own default is the only value that can ever reach the server. This
+//!   is a conformance setting, not a `defaults/servers.toml` entry, because a user
 //!   `[lsp.server.gopls]` replaces the shipped default wholesale (no field merge —
-//!   see `test_builtin_no_merge`), which would silently drop them; and because
-//!   they must win over a user who sets them otherwise.
+//!   see `test_builtin_no_merge`), which would silently drop it; and because it
+//!   must win over a user who sets it otherwise.
 //! - **lattice** — [`ServerProfile::declares_push`] (misc 187). Its publish
 //!   contract is pinned cross-repo (misc 153 / Lattice ticket 16 / its decision
 //!   022): a publish on **every** `didOpen`, including unchanged files, with an
@@ -118,6 +123,14 @@ pub struct ServerProfile {
     /// this declaration alone, before the connection has demonstrated a single
     /// publish (misc 187).
     declares_push: bool,
+    /// The declared debounce window in milliseconds for a
+    /// [`crate::recipes::Discipline::Debounce`] server (ts-ls's declared
+    /// 300–800 ms + 50 ms), projected from the manifest's `debounce_ms`
+    /// (diagnostics-debt 05). `Some` only for a debounce-discipline row carrying
+    /// the constant: the retrieval evidence bar awaits the version echo bounded
+    /// by this declared constant — data riding the pin, re-verified at every
+    /// re-pin, never a measured guess. `None` for every non-debounce discipline.
+    debounce_ms: Option<u64>,
 }
 
 impl ServerProfile {
@@ -155,6 +168,17 @@ impl ServerProfile {
             forced_initialization_options: record.forced_init_options.as_ref().map(toml_to_json),
             forbidden_initialization_options: record.forbidden_init_options.clone(),
             declares_push: record.declares_push,
+            // The declared debounce bound rides the pin only for a debounce
+            // discipline row (diagnostics-debt 05): the evidence bar awaits the
+            // version echo bounded by this constant, never interpreting silence.
+            // A `debounce_ms` present on a non-debounce row is ignored — the
+            // constant governs only the discipline that reads it.
+            debounce_ms: matches!(
+                record.discipline,
+                Some(crate::recipes::Discipline::Debounce)
+            )
+            .then_some(record.debounce_ms)
+            .flatten(),
         }
     }
 
@@ -202,6 +226,37 @@ impl ServerProfile {
     #[must_use]
     pub const fn declares_push(&self) -> bool {
         self.declares_push
+    }
+
+    /// The declared debounce window for a debounce-discipline server, or `None`
+    /// (diagnostics-debt 05).
+    ///
+    /// `Some(ms)` only when the manifest classifies the server
+    /// [`crate::recipes::Discipline::Debounce`] and carries the declared
+    /// `debounce_ms` constant. The retrieval evidence bar awaits the version echo
+    /// bounded by this constant rather than by the generic dead-air budget — an
+    /// arrival-based gate on the declared bound, never silence-interpretation.
+    #[must_use]
+    pub const fn debounce_ms(&self) -> Option<u64> {
+        self.debounce_ms
+    }
+
+    /// Whether the server's **verified discipline owes an answer** for a round
+    /// that stimulated it (diagnostics-debt 05).
+    ///
+    /// True for a server whose blessed adapter contracts a per-round response:
+    /// a [`Self::declares_push`] server (a publish on every `didOpen`, explicit
+    /// `[]` for clean — misc 187) or a debounce-discipline server
+    /// ([`Self::debounce_ms`] — the version echo is owed within the declared
+    /// bound). When the retrieval evidence bar arms and expires for such a
+    /// server, the discipline said an answer was owed and none came — a
+    /// **verified-contract violation**, the fault floor's third arm (DESIGN §"The
+    /// floor is fault attribution"). A merely *demonstrated*-push server (has
+    /// published before but declares nothing) owes no verified contract, so its
+    /// expiry stays the softer silent wording, not a fault.
+    #[must_use]
+    pub const fn owes_answer(&self) -> bool {
+        self.declares_push || self.debounce_ms.is_some()
     }
 
     /// Applies the profile's client-capability shaping to a built `capabilities`
@@ -345,6 +400,125 @@ mod tests {
         }
     }
 
+    // ── declared-constant gate: debounce_ms + owes_answer (diagnostics-debt 05) ──
+
+    #[test]
+    fn debounce_persona_projects_the_declared_constant() {
+        // The `mockls-debounce` manifest row declares `discipline = "debounce"`
+        // with `debounce_ms = 300` (defaults/mockls-personas.toml, present under
+        // the `mockls` feature the test build carries). The projection surfaces
+        // the declared constant so the evidence bar can bound its await by it —
+        // data riding the pin, never a measured guess.
+        let profile = ServerProfile::for_server("mockls-debounce");
+        assert_eq!(
+            profile.debounce_ms(),
+            Some(300),
+            "the debounce persona must project its declared window"
+        );
+        // A debounce server owes an answer per round — the fault floor arms on it.
+        assert!(
+            profile.owes_answer(),
+            "a debounce server's discipline owes a per-round response"
+        );
+    }
+
+    #[test]
+    fn non_debounce_servers_carry_no_debounce_bound() {
+        // Only a debounce-discipline row projects a bound; every other discipline
+        // (event, pull, scan, diff, or an unverified name) carries `None`, so the
+        // generic dead-air budget governs them.
+        for name in [
+            "rust-analyzer",
+            "gopls",
+            "lattice",
+            "mockls-event",
+            "mockls-pull",
+            "mockls-scan",
+            "mockls-diff",
+            "yX4Za",
+        ] {
+            assert_eq!(
+                ServerProfile::for_server(name).debounce_ms(),
+                None,
+                "{name} must carry no debounce bound",
+            );
+        }
+    }
+
+    #[test]
+    fn owes_answer_arms_on_declaration_or_debounce_only() {
+        // A verified contract that owes a per-round answer: declared-push (misc
+        // 187) OR debounce discipline (the version echo owed within the bound).
+        for name in [
+            "lattice",
+            "mockls-declared",
+            "mockls-debounce",
+            "mockls-violator",
+        ] {
+            assert!(
+                ServerProfile::for_server(name).owes_answer(),
+                "{name} owes a per-round answer (declared-push or debounce)",
+            );
+        }
+        // A merely event / pull / scan / diff server owes no verified per-round
+        // contract — its silence is the misc-153 residual, never a fault. An
+        // unverified name (enrichment-only) never owes anything.
+        for name in [
+            "rust-analyzer",
+            "gopls",
+            "mockls-event",
+            "mockls-pull",
+            "mockls-scan",
+            "mockls-diff",
+            "yX4Za",
+        ] {
+            assert!(
+                !ServerProfile::for_server(name).owes_answer(),
+                "{name} owes no verified per-round contract",
+            );
+        }
+    }
+
+    #[test]
+    fn unverified_server_never_owes_an_answer_so_the_floor_never_fires() {
+        // The fault floor is a blessed-set privilege (diagnostics-debt 04b/05 /
+        // DESIGN §"The floor is fault attribution"): an UNVERIFIED custom def is
+        // enrichment-only, so it is never a diagnostics source and its profile
+        // owes no per-round answer — the contract-violation arm (which arms on
+        // `owes_answer`) can never fire for it. Both facts pinned together.
+        for name in ["some-custom-server", "yX4Za"] {
+            let profile = ServerProfile::for_server(name);
+            assert!(
+                profile.is_enrichment_only(),
+                "{name} must be enrichment-only",
+            );
+            assert!(
+                !profile.owes_answer(),
+                "{name} is unverified — it can never trigger the fault floor",
+            );
+            assert_eq!(profile.debounce_ms(), None, "{name} carries no bound");
+        }
+    }
+
+    #[test]
+    fn debounce_ms_on_a_non_debounce_row_is_ignored() {
+        // The constant governs only the discipline that reads it: a `debounce_ms`
+        // present on a non-debounce record projects to `None` (belt-and-braces —
+        // the manifest never ships such a row, but the projection must not honour
+        // a stray constant on the wrong discipline).
+        use crate::recipes::{Discipline, DisciplineRecord};
+        let record = DisciplineRecord {
+            discipline: Some(Discipline::Event),
+            debounce_ms: Some(500),
+            ..DisciplineRecord::default()
+        };
+        assert_eq!(
+            ServerProfile::from_record(&record).debounce_ms(),
+            None,
+            "a debounce_ms on a non-debounce row must not project a bound",
+        );
+    }
+
     #[test]
     fn shape_removes_diagnostic_for_suppressed_server() {
         let mut caps = json!({
@@ -443,21 +617,27 @@ mod tests {
     }
 
     #[test]
-    fn gopls_forces_pull_off_when_user_supplies_none() {
-        let opts = ServerProfile::for_server("gopls")
-            .effective_initialization_options(None)
-            .expect("gopls forces initialization options");
-        // Pull is forced OFF (bug 87: pull mode stops real pushes and the empty
-        // placeholder publishes read as authoritative heard-empty).
-        assert_eq!(opts["pullDiagnostics"], json!(false));
-        // The debounce key never ships (enforced absent — run 9 + ruling).
-        assert!(opts.get("diagnosticsDelay").is_none());
+    fn gopls_no_longer_forces_pull_off_but_forbids_the_delay() {
+        // diagnostics-debt 05 re-enabled gopls's pull (bug 87's suppression is
+        // lifted — ledger 03's version-echo settlement retired the placeholder
+        // defeat structurally). So `pullDiagnostics` is NO LONGER forced: with no
+        // user options there are no forced options at all, and gopls rides its
+        // native pull mode. The `diagnosticsDelay` enforcement (run 9) stands: it
+        // is a forbidden key, so an absent user options set stays `None`.
+        assert_eq!(
+            ServerProfile::for_server("gopls").effective_initialization_options(None),
+            None,
+            "gopls no longer forces any init option when the user supplies none",
+        );
     }
 
     #[test]
-    fn gopls_conformance_wins_over_user_options() {
-        // A user tries the bug-87 footgun (`pullDiagnostics: true`) and the
-        // run-9 footgun ("zero the delay to minimize latency").
+    fn gopls_pull_mode_leaves_pull_diagnostics_to_the_user_but_forbids_the_delay() {
+        // Pull is re-enabled (05), so a user MAY set `pullDiagnostics` — Catenary
+        // no longer overrides it (the bug-87 override is retired structurally by
+        // ledger 03). The run-9 footgun ("zero the delay to minimize latency")
+        // stays enforced absent: `diagnosticsDelay` is stripped whatever the user
+        // set, so gopls's own default is the only value that can ever apply.
         let user = json!({
             "diagnosticsDelay": "0s",
             "pullDiagnostics": true,
@@ -468,18 +648,37 @@ mod tests {
             .expect("merged options");
         assert_eq!(
             opts["pullDiagnostics"],
-            json!(false),
-            "a user cannot reintroduce the bug-87 false-clean",
+            json!(true),
+            "with pull re-enabled, the user's pullDiagnostics is no longer overridden",
         );
-        // The delay key is enforced ABSENT — stripped whatever the user set,
-        // so gopls's own default is the only value that can ever apply (run 9:
-        // "0s" decoupled publishing from analysis — instant empty publishes).
         assert!(
             opts.get("diagnosticsDelay").is_none(),
-            "a user cannot deliver diagnosticsDelay at all",
+            "a user cannot deliver diagnosticsDelay at all (run 9)",
         );
         // The user's unrelated key survives.
         assert_eq!(opts["buildFlags"], json!(["-tags=integration"]));
+    }
+
+    #[test]
+    fn gopls_is_pull_discipline_carrying_no_debounce_bound() {
+        // The re-enable makes gopls a pull-discipline server (DESIGN's table row):
+        // a pull settles the debt directly. It owes no per-round push contract and
+        // carries no debounce bound — the fault floor never arms on it (a pull
+        // error leaves the debt unsettled, bug 84's honesty, not the floor).
+        let profile = ServerProfile::for_server("gopls");
+        assert!(
+            !profile.owes_answer(),
+            "a pull server owes no per-round push answer"
+        );
+        assert_eq!(
+            profile.debounce_ms(),
+            None,
+            "gopls carries no debounce bound"
+        );
+        assert!(
+            !profile.declares_push(),
+            "gopls is pull-discipline, not declared-push",
+        );
     }
 
     #[test]

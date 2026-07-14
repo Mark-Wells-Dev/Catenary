@@ -1072,7 +1072,8 @@ fn heard_dirty_push_wins_no_pull() -> Result<()> {
 // ─── Declared push (misc 187) ─────────────────────────────────────────
 
 /// A declared-push server arms the retrieval evidence bar on a FRESH
-/// connection with zero prior publishes (misc 187).
+/// connection with zero prior publishes (misc 187), and its silence renders the
+/// verified-contract-violation fault attribution (diagnostics-debt 05).
 ///
 /// The server is registered under the name `lattice`, whose conformance
 /// profile carries the publish contract (`declares_push`), but the binary is
@@ -1082,9 +1083,10 @@ fn heard_dirty_push_wins_no_pull() -> Result<()> {
 /// closes: per-connection demonstration (`has_ever_published`) is false, so
 /// pre-187 the bar could not arm and the file rendered a false `[clean]`
 /// from absence. With the declaration the bar arms from turn zero, the
-/// dead-air budget drains with no publish, the rejected probe is no
-/// evidence, and the file resolves to the honest
-/// `[unverified — … returned no result]`.
+/// dead-air budget drains with no publish, and the rejected probe is no
+/// evidence. Its verified discipline OWED a publish this round and gave none, so
+/// diagnostics-debt 05 renders the fault-attribution wording (upgrading the
+/// generic `[unverified — … returned no result]`) — never a false `[clean]`.
 #[test]
 fn declared_push_server_arms_bar_with_zero_prior_publishes() -> Result<()> {
     let logs = tempfile::tempdir()?;
@@ -1113,9 +1115,12 @@ fn declared_push_server_arms_bar_with_zero_prior_publishes() -> Result<()> {
     let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
     assert!(
-        text.contains("[unverified") && text.contains("returned no result"),
-        "a declared-push server that stays silent must resolve unverified even \
-         on a fresh connection with zero prior publishes (misc 187). Got: {text}"
+        text.contains("did not answer for this round")
+            && text.contains("treating as a server fault, re-run to retry"),
+        "a declared-push server that stays silent owed a publish and gave none — \
+         its silence must resolve the verified-contract-violation fault attribution \
+         (diagnostics-debt 05), even on a fresh connection with zero prior publishes \
+         (misc 187). Got: {text}"
     );
     assert!(
         !text.contains("[clean]"),

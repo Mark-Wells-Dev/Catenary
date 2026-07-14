@@ -73,6 +73,15 @@ note = "diagnostics come from shellcheck; the macOS job provisions it via brew t
 kind = "homebrew"
 formula = "yaml-language-server"
 
+# typescript-language-server un-exempted (diagnostics-debt 05). Provisioned via
+# its Linux npm recipe, reused unchanged — the npm package is cross-platform and
+# the homebrew-core formula name is unconfirmed against the macOS leg, so the
+# recipe reference is the honest, verification-safe choice (matches the
+# intelephense/svelteserver/elm rulings).
+[provision.typescript-language-server]
+kind = "linux-recipe"
+note = "no confirmed homebrew-core formula; reuses the Linux npm recipe (defaults/recipes.toml)."
+
 # One vscode-langservers-extracted formula carries all three conformed
 # servers, mirroring the one-npm-package/three-recipes shape on Linux.
 [provision.vscode-json-language-server]
