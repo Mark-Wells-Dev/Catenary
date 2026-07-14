@@ -61,7 +61,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use common::BridgeProcess;
+use common::{BridgeProcess, mockls_lsp_arg};
 use serde_json::json;
 
 /// The generous-but-finite wall bound the settle must reach idle within.
@@ -753,6 +753,229 @@ fn conformance_lattice_declared_push() -> Result<()> {
         .context("clean shutdown for `lattice` declared-push")?;
 
     eprintln!("conformance: `lattice` declared-push PASSED");
+    Ok(())
+}
+
+// ── Synthetic mockls-persona legs (diagnostics-debt 04c) ──────────────
+//
+// Each persona incarnates one publisher discipline from the DESIGN's taxonomy as
+// a blessed manifest row (`defaults/mockls-personas.toml`, gated behind
+// `feature = "mockls"`) paired with a default mockls behaviour bundle
+// (`tools/mockls.rs::persona_bundle`) selected from the server key. These legs
+// generalize misc 187's "mockls twins isolate the declaration as the sole
+// variable" to the whole taxonomy: the manifest row DECLARES X, the binary
+// (spawned under the persona key with NO flags) demonstrably DOES X — and the
+// violator demonstrably does NOT.
+//
+// Unlike the real-server cases they need no binary on PATH: mockls is a workspace
+// binary built by the same `--features mockls` test build that carries the
+// persona rows, so these run everywhere `make check` runs. They spawn via a
+// `CATENARY_SERVERS` mockls spec (the persona key doubles as the language + file
+// extension), NOT the shipped-defaults `spawn_conformance` path the real cases
+// use. Contention doctrine: `call_diagnostics` runs the pipeline to completion
+// (settle + collect) before returning, so the receipt is authoritative with no
+// sleep or poll.
+
+/// Spawns a bridge whose sole server is mockls under the persona server `key`
+/// (its default behaviour bundle, plus any extra `flags`), diagnoses a file with
+/// the persona's extension, and returns the receipt.
+fn persona_receipt(key: &str, flags: &str, content: &str) -> Result<String> {
+    let dir = tempfile::tempdir().context("persona tempdir")?;
+    let file = dir.path().join(format!("case.{key}"));
+    std::fs::write(&file, content).context("write persona fixture")?;
+
+    let lsp = mockls_lsp_arg(key, flags);
+    let mut bridge = BridgeProcess::spawn(&[&lsp], dir.path().to_str().context("root")?)?;
+    bridge.initialize()?;
+    let receipt = bridge.call_diagnostics(file.to_str().context("file")?)?;
+    bridge
+        .shutdown_clean(SHUTDOWN_GRACE)
+        .with_context(|| format!("clean shutdown for persona `{key}`"))?;
+    Ok(receipt)
+}
+
+/// `mockls-pull` — pull discipline (the gopls shape). The manifest declares
+/// `discipline = "pull"`; the binary's bundle (`--pull-diagnostics
+/// --no-push-diagnostics`) makes the pull the sole channel, so a dirty file's
+/// diagnostic is retrieved via the pull that settles the debt.
+#[test]
+fn conformance_mockls_pull() -> Result<()> {
+    let receipt = persona_receipt("mockls-pull", "", "echo hello\n")?;
+    assert!(
+        receipt.contains("mock diagnostic"),
+        "`mockls-pull` declares pull discipline — the pull must retrieve and \
+         settle the diagnostic:\n{receipt}"
+    );
+    eprintln!("conformance: `mockls-pull` PASSED");
+    Ok(())
+}
+
+/// `mockls-event` — event discipline, versioned publishes (the rust-analyzer
+/// shape). The manifest declares `discipline = "event"`; the binary publishes on
+/// didOpen and (with the leg's `--publish-version`) echoes the version, so the
+/// versioned publish settles and the diagnostic reaches the receipt.
+#[test]
+fn conformance_mockls_event() -> Result<()> {
+    let receipt = persona_receipt("mockls-event", "--publish-version", "echo hello\n")?;
+    assert!(
+        receipt.contains("mock diagnostic"),
+        "`mockls-event` declares event discipline — a versioned publish must \
+         settle the debt and carry the diagnostic:\n{receipt}"
+    );
+    eprintln!("conformance: `mockls-event` PASSED");
+    Ok(())
+}
+
+/// `mockls-declared` — event discipline, unversioned + `declares_push` (the
+/// lattice shape). The manifest declares the contractual publish-per-didOpen with
+/// an explicit `[]` for clean; the binary's bundle (`--push-empty`) publishes
+/// exactly that empty set, so a clean file resolves to a publish-backed `[clean]`
+/// — never a probe-backed one, never `[unverified]`.
+#[test]
+fn conformance_mockls_declared() -> Result<()> {
+    let receipt = persona_receipt("mockls-declared", "", "echo hello\n")?;
+    assert!(
+        !receipt.contains("[unverified"),
+        "`mockls-declared` declares push (explicit [] for clean) — the empty \
+         publish must arrive, never resolve to absence:\n{receipt}"
+    );
+    assert!(
+        receipt.contains("[clean]"),
+        "the declared-push clean file must resolve to a publish-backed \
+         [clean]:\n{receipt}"
+    );
+    eprintln!("conformance: `mockls-declared` PASSED");
+    Ok(())
+}
+
+/// `mockls-debounce` — debounce discipline (the ts-ls shape). The manifest
+/// declares `discipline = "debounce"` with a `debounce_ms` constant; the binary's
+/// bundle fires a versioned publish on the save event AFTER that declared window
+/// (a sleeping timer the settle activity model cannot see), and answers no pull.
+///
+/// The demonstration follows the settled two-round shape (matching
+/// `delayed_publish_after_settle_reaches_the_receipt`): round 1 is first contact
+/// — the debounced publish lands shortly after, arming the retrieval evidence
+/// bar; round 2 (after a real edit) is never-heard at settle, but the armed bar
+/// holds retrieval until the version-echoing debounced publish arrives, so the
+/// receipt carries the diagnostic rather than a false `[clean]`. (The full
+/// await-echo-bounded-by-the-declared-constant machinery is ledger 05's; this leg
+/// pins that the persona's bounded debounced publish is collected, not lost to
+/// silence.)
+#[test]
+fn conformance_mockls_debounce() -> Result<()> {
+    let dir = tempfile::tempdir().context("debounce tempdir")?;
+    let file = dir.path().join("case.mockls-debounce");
+    std::fs::write(&file, "echo hello\n").context("write debounce fixture")?;
+
+    let lsp = mockls_lsp_arg("mockls-debounce", "");
+    let mut bridge = BridgeProcess::spawn(&[&lsp], dir.path().to_str().context("root")?)?;
+    bridge.initialize()?;
+    let file_str = file.to_str().context("file")?;
+
+    // Round 1 — first contact seeds the push evidence; the debounced publish
+    // lands shortly after this round's didSave. Give the timer thread time to
+    // dispatch so round 2's evidence bar is deterministically armed.
+    let _seed = bridge.call_diagnostics(file_str)?;
+    std::thread::sleep(Duration::from_millis(600));
+
+    // Round 2 — a real edit relays didChange+didSave through the held-open gate,
+    // scheduling a fresh debounced publish. The armed bar holds retrieval until
+    // that version-echoing publish arrives.
+    std::fs::write(&file, "echo changed\necho more\n").context("edit debounce fixture")?;
+    let receipt = bridge.call_diagnostics(file_str)?;
+    bridge
+        .shutdown_clean(SHUTDOWN_GRACE)
+        .context("clean shutdown for persona `mockls-debounce`")?;
+
+    assert!(
+        receipt.contains("mock diagnostic"),
+        "`mockls-debounce` declares a bounded debounce window — the delayed \
+         versioned publish must be awaited and collected, never lost to \
+         silence:\n{receipt}"
+    );
+    assert!(
+        !receipt.contains("[clean]"),
+        "the receipt must not render [clean] over a pending debounced \
+         publish:\n{receipt}"
+    );
+    eprintln!("conformance: `mockls-debounce` PASSED");
+    Ok(())
+}
+
+/// `mockls-scan` — scan discipline (marksman-class scan-once). The manifest
+/// declares `discipline = "scan"`; the binary's bundle (`--workspace-diagnostics
+/// --scan-roots`) answers one whole-workspace pull off the scanned model, so a
+/// root-scoped diagnose reports the `DIRTY`-marked document. Silence would NOT be
+/// clean (the fault floor's job), but here the scan reports the diagnostic, which
+/// reaches the receipt. Uses the root-scoped diagnose (the whole-workspace pull's
+/// entry point), not the per-file path.
+#[test]
+fn conformance_mockls_scan() -> Result<()> {
+    let dir = tempfile::tempdir().context("scan tempdir")?;
+    // The scan reports a document dirty only when its content carries `DIRTY`.
+    std::fs::write(dir.path().join("case.mockls-scan"), "DIRTY marker line\n")
+        .context("write scan fixture")?;
+
+    let lsp = mockls_lsp_arg("mockls-scan", "");
+    let root = dir.path().to_str().context("root")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+    let receipt = bridge.call_diagnostics_scoped(&[root])?;
+    bridge
+        .shutdown_clean(SHUTDOWN_GRACE)
+        .context("clean shutdown for persona `mockls-scan`")?;
+
+    assert!(
+        receipt.contains("workspace diagnostic"),
+        "`mockls-scan` declares scan discipline — the one workspace pull must \
+         report the DIRTY document:\n{receipt}"
+    );
+    eprintln!("conformance: `mockls-scan` PASSED");
+    Ok(())
+}
+
+/// `mockls-diff` — diff discipline (marksman diff-only). The manifest declares
+/// `discipline = "diff"`; the binary's bundle (`--diagnostics-on-save
+/// --advertise-save --reject-pull`) publishes only on the save event the editing
+/// batch triggers — never on the ambient didOpen the eager health probe fires —
+/// and answers no pull. The saved file's single publish is the sole channel and
+/// reaches the receipt; a never-saved file would stay silent (silence is NOT
+/// clean — the fault floor's job, ledger 05).
+#[test]
+fn conformance_mockls_diff() -> Result<()> {
+    let receipt = persona_receipt("mockls-diff", "", "echo hello\n")?;
+    assert!(
+        receipt.contains("mock diagnostic"),
+        "`mockls-diff` declares diff discipline — its save-triggered publish must \
+         reach the receipt:\n{receipt}"
+    );
+    eprintln!("conformance: `mockls-diff` PASSED");
+    Ok(())
+}
+
+/// `mockls-violator` — the violating twin (ledger 05's fault-attribution dummy).
+/// The manifest row DECLARES the push contract (`declares_push = true`, like
+/// `mockls-declared`), but the binary's bundle (`--no-push-diagnostics
+/// --reject-pull`) WITHHOLDS — it never publishes and answers no pull, breaking
+/// its own contract. The declared-vs-implemented pairing must therefore DETECT
+/// the violation: the debt stays unsettled and the file resolves
+/// `[unverified — … returned no result]`, NEVER a false `[clean]`. (Full
+/// fault-attribution wording is ledger 05's; today detection = the debt is not
+/// falsely settled.)
+#[test]
+fn conformance_mockls_violator() -> Result<()> {
+    let receipt = persona_receipt("mockls-violator", "", "echo hello\n")?;
+    assert!(
+        receipt.contains("[unverified"),
+        "`mockls-violator` declares push but withholds — the violation must be \
+         DETECTED as an unsettled debt, not a false clean:\n{receipt}"
+    );
+    assert!(
+        !receipt.contains("[clean]"),
+        "a contract violation must never render [clean] over absence:\n{receipt}"
+    );
+    eprintln!("conformance: `mockls-violator` PASSED");
     Ok(())
 }
 

@@ -2918,8 +2918,85 @@ fn parse_symbol_line(trimmed: &str) -> Option<(u32, usize)> {
     }
 }
 
+/// The default debounce window a `mockls-debounce` persona publishes on when the
+/// test supplies no explicit `--diagnostics-delay`.
+///
+/// Mirrors the `debounce_ms` constant declared for `mockls-debounce` in the
+/// blessed manifest (`defaults/mockls-personas.toml`, diagnostics-debt 04c), so
+/// the synthetic harness's implemented window matches the pinned declared one —
+/// the declared-vs-implemented pairing the persona exists to prove.
+const MOCKLS_DEBOUNCE_MS: u64 = 300;
+
+/// Applies the persona's default behavior bundle, selected from the server key
+/// (`args.name`) mockls was spawned under (diagnostics-debt 04c deliverable 2).
+///
+/// Each persona name incarnates one publisher discipline from the DESIGN's
+/// taxonomy, so a mock spawned under a persona key needs no flags to demonstrate
+/// its discipline — the bundle is the default behavior, and per-test flags ride
+/// on top (**extend/override**). The bundle only ever *adds* behavior (turns a
+/// boolean on, fills the debounce window when unset), so an explicit flag a test
+/// passes is never silently cancelled; a non-persona name (the ordinary
+/// `mockls_lsp_arg` extension) selects no bundle and the mock behaves exactly as
+/// its flags say. `mockls-event` needs no bundle — default mockls already
+/// publishes on didOpen/didChange, which *is* the event discipline.
+fn persona_bundle(args: &mut Args) {
+    match args.name.as_str() {
+        // pull discipline: the pull channel is the sole diagnostic source.
+        "mockls-pull" => {
+            args.pull_diagnostics = true;
+            args.no_push_diagnostics = true;
+        }
+        // event discipline, unversioned + declared push (the lattice shape):
+        // an explicit empty publish per didOpen is the contractual clean.
+        "mockls-declared" => {
+            args.push_empty = true;
+        }
+        // debounce discipline: a versioned publish delayed by the declared window
+        // (unless the test pins its own delay), fired on the save event — a
+        // sleeping timer thread the settle activity model cannot see, exactly the
+        // ts-ls debounce shape. No pull, so the version-echoing push is the sole
+        // channel the ledger must await bounded by the declared constant.
+        "mockls-debounce" => {
+            args.publish_version = true;
+            args.diagnostics_on_save = true;
+            args.advertise_save = true;
+            args.reject_pull = true;
+            if args.diagnostics_delay == 0 {
+                args.diagnostics_delay = MOCKLS_DEBOUNCE_MS;
+            }
+        }
+        // scan discipline: one whole-workspace pull off the scanned model.
+        "mockls-scan" => {
+            args.workspace_diagnostics = true;
+            args.scan_roots = true;
+        }
+        // diff discipline: publishes only on a save event (its "diff" trigger),
+        // never on the ambient didOpen/didChange, and answers no pull — so a
+        // never-saved file stays silent (silence is NOT clean, the fault floor's
+        // job) while a saved file's single publish is the sole channel.
+        "mockls-diff" => {
+            args.diagnostics_on_save = true;
+            args.advertise_save = true;
+            args.reject_pull = true;
+        }
+        // the violating twin: DECLARES push (manifest row) but the binary
+        // withholds — never publishes, answers no pull — so it breaks its own
+        // contract and the debt must stay unsettled (detected, never a false
+        // clean). Full fault-attribution wording is ledger 05's.
+        "mockls-violator" => {
+            args.no_push_diagnostics = true;
+            args.reject_pull = true;
+        }
+        // `mockls-event` (default mockls push IS the event discipline) and every
+        // non-persona name (the ordinary `mockls_lsp_arg` extension) select no
+        // bundle: the mock behaves exactly as its flags say.
+        _ => {}
+    }
+}
+
 fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    persona_bundle(&mut args);
     let writer = stdout_writer();
     let mut server = MockServer::new(args, writer);
     let mut stdin = std::io::stdin().lock();

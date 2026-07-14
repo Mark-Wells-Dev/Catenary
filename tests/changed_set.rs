@@ -28,8 +28,16 @@ use common::{
     wait_for_change, watched_file_notification_count,
 };
 
-const MOCK_LANG_A: &str = "yX4Za";
-const MOCK_LANG_B: &str = "d5apI";
+// Blessed personas as the mock server keys (diagnostics-debt 04c): manifest
+// membership — not the retired bless-list wildcard — is what makes
+// a mock a covering diagnostics source. `mockls-event`'s behavior bundle is empty,
+// so this rename changes zero wire behavior; these tests assert on
+// `didChangeWatchedFiles` routing (not diagnostics content), so the persona's
+// push discipline is irrelevant here. `MOCK_LANG_B` is the second, distinct key
+// for the tests that run two servers at once; `mockls-declared` is the standard
+// second persona.
+const MOCK_LANG_A: &str = "mockls-event";
+const MOCK_LANG_B: &str = "mockls-declared";
 
 /// Cold baseline ⇒ the first enriched grep sends every registered-glob file
 /// once as `Changed` (`FileChangeType` 2). The first walk *is* the snapshot.

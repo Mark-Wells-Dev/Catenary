@@ -22,7 +22,11 @@ use anyhow::{Context, Result};
 
 use common::BridgeProcess;
 
-const MOCK_LANG_A: &str = "yX4Za";
+// The `mockls-event` persona is the blessed base (diagnostics-debt 04c):
+// renaming the key to a manifest persona makes the mock a diagnostics source
+// (replacing the retired bless-list wildcard) while its empty
+// behavior bundle keeps the wire behavior identical.
+const MOCK_LANG_A: &str = "mockls-event";
 
 /// Simulates the flycheck pattern: file change → diagnostics request.
 ///

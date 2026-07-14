@@ -22,8 +22,15 @@ use anyhow::{Context, Result};
 
 use common::BridgeProcess;
 
-const MOCK_LANG_A: &str = "bDq7A";
-const MOCK_LANG_B: &str = "bDq7B";
+// Blessed personas as the mock server keys (diagnostics-debt 04c): membership in
+// the seed manifest — not the retired bless-list wildcard — is
+// what makes a mock a diagnostics source. `mockls-event`'s behavior bundle is
+// empty, so this rename changes zero wire behavior. `MOCK_LANG_B` is the second,
+// distinct key for the one test that runs two servers at once
+// (`test_batch_multi_file_different_servers`); `mockls-declared` is the standard
+// second persona.
+const MOCK_LANG_A: &str = "mockls-event";
+const MOCK_LANG_B: &str = "mockls-declared";
 
 /// Spawns a bridge with mockls configured for `MOCK_LANG_A`.
 fn spawn_mockls(mockls_args: &[&str], root: &str) -> Result<BridgeProcess> {

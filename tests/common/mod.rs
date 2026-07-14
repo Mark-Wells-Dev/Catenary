@@ -93,16 +93,16 @@ pub fn isolate_env(cmd: &mut Command, root: &str) {
     // maintainer's desktop once per daemon-spawning test. `CATENARY_NOTIFY=0`
     // is the sink's own suppression knob; must come after the clearing loop.
     cmd.env("CATENARY_NOTIFY", "0");
-    // Bless every configured server for the integration harness (diagnostics-debt
-    // 04b). Env-derived (`CATENARY_SERVERS`) servers and mockls stand-ins have
-    // names absent from the blessed manifest, so without this they would classify
-    // as unverified/enrichment-only and produce no diagnostics — every mock-driven
-    // diagnostics test would go silent. The `*` wildcard blesses all, so a test
-    // need not enumerate its mock names. A test that specifically exercises the
-    // enrichment-only branch overrides this after the call (e.g.
-    // `cmd.env("CATENARY_BLESS_SERVERS", "")` to bless nothing). Must come after
-    // the clearing loop.
-    cmd.env("CATENARY_BLESS_SERVERS", "*");
+    // NOTE (diagnostics-debt 04c): the operator bless-list wildcard that used to
+    // bless every mock server retired here. Blessing is now pure manifest
+    // membership: under `feature = "mockls"` (which every `make test`/`make
+    // check` run enables) the seed manifest carries one blessed persona per
+    // publisher discipline (`mockls-pull`/`-event`/`-declared`/`-debounce`/
+    // `-scan`/`-diff`/`-violator`). A mock-driven diagnostics test spawns its
+    // server under the persona key matching the behaviour it exercises (thread it
+    // through `mockls_lsp_arg`), and a mock spawned under any other name
+    // classifies enrichment-only — which is exactly the strictness the
+    // classification tests pin, no per-test opt-out needed.
 }
 
 /// CI triage escape hatch: with `CATENARY_CONFORMANCE_KEEP` set in the

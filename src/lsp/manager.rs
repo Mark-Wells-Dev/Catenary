@@ -8299,7 +8299,10 @@ mod tests {
     /// Config with workspace-folder-capable server AND root markers.
     fn mockls_workspace_folders_markers_config(markers: Vec<String>) -> Arc<Config> {
         let bin = mockls_bin();
-        let server_name = format!("mockls-{MOCK_LANG_A}-wfm");
+        // The `mockls-event` persona (blessed, event discipline; diagnostics-debt
+        // 04c) so `get_servers(supports_diagnostics)` counts this instance — the
+        // fallback test asserts on the diagnostics-covered set.
+        let server_name = "mockls-event".to_string();
         let mut server = HashMap::new();
         server.insert(
             server_name.clone(),

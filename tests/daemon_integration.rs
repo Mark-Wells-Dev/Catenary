@@ -262,7 +262,12 @@ fn daemon_starts_with_servers_configured() {
 
 // ── Multi-session integration tests (ticket 13) ───────────────────
 
-const MOCK_LANG: &str = "daemon_test";
+// The `mockls-event` persona (blessed, event discipline; diagnostics-debt 04c)
+// so the mock is a diagnostics source by manifest membership — the scoped-receipt
+// and cross-session-guardrail tests need real coverage. Its bundle is empty, so
+// the extra `--scan-roots` some tests pass still drives behaviour. Doubles as the
+// server key, language, and file extension.
+const MOCK_LANG: &str = "mockls-event";
 
 /// Returns the IPC socket path for a given state home.
 fn ipc_socket_in(state_home: &str) -> PathBuf {

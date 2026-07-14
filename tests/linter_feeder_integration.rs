@@ -324,12 +324,12 @@ fn write_cross_feeder_config(dir: &Path) -> Result<PathBuf> {
     std::fs::write(
         &config_path,
         format!(
-            "[lsp.server.mockls-{MOCK_LANG}]\n\
+            "[lsp.server.mockls-event]\n\
              path = \"{mockls}\"\n\
              args = [\"{MOCK_LANG}\", \"--log-pid-suffix\", \
              \"--extra-diagnostic\", \"shellcheck|SC2086|wrapped by language server\"]\n\n\
              [lsp.language.{MOCK_LANG}]\n\
-             servers = [\"mockls-{MOCK_LANG}\"]\n\n\
+             servers = [\"mockls-event\"]\n\n\
              [linter.rule.shellcheck]\n\
              command = \"{mocklint}\"\n\
              args = [\"--format\", \"shellcheck\", \
@@ -404,12 +404,12 @@ fn cross_feeder_heavier_source_wins_over_first_seen() -> Result<()> {
         std::fs::write(
             &config_path,
             format!(
-                "[lsp.server.mockls-{MOCK_LANG}]\n\
+                "[lsp.server.mockls-event]\n\
                  path = \"{mockls}\"\n\
                  args = [\"{MOCK_LANG}\", \"--log-pid-suffix\", \
                  \"--extra-diagnostic\", \"native-analysis|SC2086|server-side preview\"]\n\n\
                  [lsp.language.{MOCK_LANG}]\n\
-                 servers = [\"mockls-{MOCK_LANG}\"]\n\n\
+                 servers = [\"mockls-event\"]\n\n\
                  [linter.rule.shellcheck]\n\
                  command = \"{mocklint}\"\n\
                  args = [\"--format\", \"shellcheck\", \"--diag\", \"SC2086|1|1|standalone finding\"]\n\

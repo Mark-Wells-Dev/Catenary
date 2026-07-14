@@ -54,13 +54,13 @@ fn write_config(dir: &Path, extra_diagnostics: &[&str]) -> Result<PathBuf> {
     std::fs::write(
         &config_path,
         format!(
-            "[lsp.server.mockls-{MOCK_LANG}]\n\
+            "[lsp.server.mockls-event]\n\
              path = \"{mockls_bin}\"\n\
              args = [{args_line}]\n\n\
-             [lsp.server.mockls-{MOCK_LANG}.sources]\n\
+             [lsp.server.mockls-event.sources]\n\
              mockls = 1\n\n\
              [lsp.language.{MOCK_LANG}]\n\
-             servers = [\"mockls-{MOCK_LANG}\"]\n"
+             servers = [\"mockls-event\"]\n"
         ),
     )?;
     Ok(config_path)

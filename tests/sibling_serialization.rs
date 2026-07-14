@@ -39,8 +39,14 @@ use serde_json::json;
 
 use common::BridgeProcess;
 
-const MOCK_LANG_A: &str = "sib104a";
-const MOCK_LANG_B: &str = "sib104b";
+// Blessed personas as server keys (diagnostics-debt 04c): membership in the seed
+// manifest is what makes a mock a diagnostics source. Two roots run two live
+// servers at once, so they need two DISTINCT persona keys. `mockls-event` (empty
+// behavior bundle — default mockls push) carries root A's flycheck discipline
+// unchanged; `mockls-pull` makes root B's server a diagnostics source via the
+// pull channel, still emitting the "mock diagnostic" the prober asserts.
+const MOCK_LANG_A: &str = "mockls-event";
+const MOCK_LANG_B: &str = "mockls-pull";
 
 /// Promptness bound for queries scoped to the un-held root. Generous against
 /// CPU contention (a normal probe completes in well under a second), but far

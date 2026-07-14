@@ -24,7 +24,13 @@ use serde_json::{Value, json};
 
 use common::{BridgeProcess, ipc_request, ipc_request_progress_aware, read_merged_log};
 
-const MOCK_LANG_A: &str = "yX4Za";
+// The `mockls-event` persona is the blessed base for this file (diagnostics-debt
+// 04c): default mockls push IS the event discipline, so its persona bundle is
+// empty and every flag-driven test behaves exactly as it did under the retired
+// operator bless-list wildcard — only now the server is a diagnostics source by
+// manifest membership. The value doubles as the server key (via `mockls_lsp_arg`),
+// the language, and the file extension.
+const MOCK_LANG_A: &str = "mockls-event";
 
 /// Spawns a bridge with mockls configured for `MOCK_LANG_A`.
 ///
@@ -1196,14 +1202,14 @@ fn test_diagnostics_multi_server_concatenation() -> Result<()> {
         std::fs::write(
             &config_path,
             format!(
-                "[lsp.server.mockls-a]\n\
+                "[lsp.server.mockls-event]\n\
                  path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\"]\n\n\
-                 [lsp.server.mockls-b]\n\
+                 [lsp.server.mockls-declared]\n\
                  path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\"]\n\n\
                  [lsp.language.{MOCK_LANG_A}]\n\
-                 servers = [\"mockls-a\", \"mockls-b\"]\n"
+                 servers = [\"mockls-event\", \"mockls-declared\"]\n"
             ),
         )?;
         Ok(config_path)
@@ -1240,14 +1246,14 @@ fn test_diagnostics_one_server_suppressed() -> Result<()> {
         std::fs::write(
             &config_path,
             format!(
-                "[lsp.server.mockls-diag]\n\
+                "[lsp.server.mockls-event]\n\
                  path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\"]\n\n\
-                 [lsp.server.mockls-nodiag]\n\
+                 [lsp.server.mockls-declared]\n\
                  path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\"]\n\n\
                  [lsp.language.{MOCK_LANG_A}]\n\
-                 servers = [\"mockls-diag\", {{ name = \"mockls-nodiag\", diagnostics = false }}]\n"
+                 servers = [\"mockls-event\", {{ name = \"mockls-declared\", diagnostics = false }}]\n"
             ),
         )?;
         Ok(config_path)
@@ -1278,15 +1284,15 @@ fn test_diagnostics_per_server_min_severity() -> Result<()> {
         std::fs::write(
             &config_path,
             format!(
-                "[lsp.server.mockls-strict]\n\
+                "[lsp.server.mockls-event]\n\
                  path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\"]\n\
                  min_severity = \"error\"\n\n\
-                 [lsp.server.mockls-lax]\n\
+                 [lsp.server.mockls-declared]\n\
                  path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\"]\n\n\
                  [lsp.language.{MOCK_LANG_A}]\n\
-                 servers = [\"mockls-strict\", \"mockls-lax\"]\n"
+                 servers = [\"mockls-event\", \"mockls-declared\"]\n"
             ),
         )?;
         Ok(config_path)
@@ -1296,9 +1302,9 @@ fn test_diagnostics_per_server_min_severity() -> Result<()> {
     let file = bridge.root_path().join(format!("test.{MOCK_LANG_A}"));
     let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
-    // mockls emits severity 2 (warning). mockls-strict filters it out,
-    // mockls-lax passes it through. We should see diagnostics from the
-    // lax server.
+    // mockls emits severity 2 (warning). mockls-event (min_severity=error)
+    // filters it out, mockls-declared passes it through. We should see
+    // diagnostics from the lax (mockls-declared) server.
     assert!(
         text.contains("mock diagnostic"),
         "Lax server's warnings should pass through. Got:\n{text}"
@@ -1318,12 +1324,12 @@ fn test_diagnostics_no_servers() -> Result<()> {
         std::fs::write(
             &config_path,
             format!(
-                "[lsp.server.mockls-only]\n\
+                "[lsp.server.mockls-event]\n\
                  path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\"]\n\n\
                  [lsp.language.{MOCK_LANG_A}]\n\
                  diagnostics = false\n\
-                 servers = [\"mockls-only\"]\n"
+                 servers = [\"mockls-event\"]\n"
             ),
         )?;
         Ok(config_path)
@@ -1361,14 +1367,14 @@ fn test_diagnostics_one_server_dies() -> Result<()> {
         std::fs::write(
             &config_path,
             format!(
-                "[lsp.server.mockls-crash]\n\
+                "[lsp.server.mockls-event]\n\
                  path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\", \"--drop-after\", \"3\"]\n\n\
-                 [lsp.server.mockls-stable]\n\
+                 [lsp.server.mockls-declared]\n\
                  path = \"{mockls_bin}\"\n\
                  args = [\"{MOCK_LANG_A}\"]\n\n\
                  [lsp.language.{MOCK_LANG_A}]\n\
-                 servers = [\"mockls-crash\", \"mockls-stable\"]\n"
+                 servers = [\"mockls-event\", \"mockls-declared\"]\n"
             ),
         )?;
         Ok(config_path)
@@ -1378,9 +1384,10 @@ fn test_diagnostics_one_server_dies() -> Result<()> {
     let file = bridge.root_path().join(format!("test.{MOCK_LANG_A}"));
     let text = bridge.call_diagnostics(file.to_str().context("path")?)?;
 
-    // mockls-crash dies after 3 responses (initialize response +
-    // initialized ack + didOpen). mockls-stable should still produce
-    // diagnostics (or list the file `[clean]` if it verified no diagnostics).
+    // The crash server (mockls-event, --drop-after 3) dies after 3 responses
+    // (initialize response + initialized ack + didOpen). The stable server
+    // (mockls-declared) should still produce diagnostics (or list the file
+    // `[clean]` if it verified no diagnostics).
     assert!(
         text.contains("mock diagnostic") || text.contains("[clean]"),
         "Surviving server should still contribute. Got:\n{text}"

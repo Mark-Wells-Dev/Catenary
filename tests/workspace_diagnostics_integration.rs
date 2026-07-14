@@ -23,7 +23,13 @@ use anyhow::{Context, Result};
 
 use common::{BridgeProcess, POLL_BACKSTOP, POLL_SPACING, mockls_lsp_arg, read_merged_log};
 
-const MOCK_LANG: &str = "wsDiaG";
+// The `mockls-event` persona is the blessed base (diagnostics-debt 04c): its
+// bundle is empty, so a test that exercises the workspace/scan behaviour passes
+// `--workspace-diagnostics --scan-roots` explicitly (extending the base) and the
+// no-capability fallback test passes neither — the persona blesses without
+// forcing any discipline. The value doubles as the server key, language, and
+// file extension.
+const MOCK_LANG: &str = "mockls-event";
 
 /// Counts JSON-RPC request-log lines whose `method` equals `method`.
 fn count_request_method(log: &str, method: &str) -> usize {

@@ -1,0 +1,122 @@
+# mockls personas — the publisher-discipline taxonomy made flesh
+# (diagnostics-debt 04c). Compile-time gated behind the `mockls` cargo feature:
+# this fragment is concatenated onto the seed manifest ONLY when the feature is
+# on (the conformance + integration test build), so a production binary carries
+# ZERO mockls rows — no name-spoof surface, nothing shipped. Without the feature
+# the seed parse is byte-identical to `blessed-manifest.toml` alone.
+#
+# mockls is one binary wearing many disciplines via flags, so a single
+# `[discipline.mockls]` row could say nothing true. Instead: ONE persona per
+# discipline row, mirroring the DESIGN's taxonomy exactly, each blessed so the
+# harness's mock stand-in is a diagnostics source without an env lever. The
+# server key a mockls instance is spawned under selects its default behavior
+# bundle (see `tools/mockls.rs::persona_bundle`); per-test flags override/extend.
+#
+# The blessed rows carry a `synthetic` platform token — these servers conformed
+# nowhere real; the version string names them mock stand-ins. The declared-vs-
+# implemented pairing is conformance-verified the same way it is for a real
+# server (`tests/conformance_harness.rs` persona legs): the manifest row says X,
+# the binary demonstrably does X — and the violator demonstrably does NOT.
+
+# ── pull discipline (the gopls shape) ────────────────────────────────────────
+# A pull settles the debt directly. Bundle: `--pull-diagnostics
+# --no-push-diagnostics` — the pull channel is the sole diagnostic source.
+[blessed.mockls-pull.synthetic]
+version = "mockls-persona"
+platform = "synthetic"
+date = "2026-07-13"
+tier = "synthetic-persona"
+
+[discipline.mockls-pull]
+discipline = "pull"
+
+# ── event discipline, versioned publishes (the rust-analyzer shape) ───────────
+# A versioned publish settles; a versioned empty publish is an authoritative
+# clean. Bundle: EMPTY — default mockls push (publish on didOpen/didChange) IS
+# the event discipline, which keeps the mass test rename wire-neutral; the
+# conformance leg passes `--publish-version` explicitly to demonstrate the
+# versioned-settlement shape.
+[blessed.mockls-event.synthetic]
+version = "mockls-persona"
+platform = "synthetic"
+date = "2026-07-13"
+tier = "synthetic-persona"
+
+[discipline.mockls-event]
+discipline = "event"
+
+# ── event discipline, unversioned publishes + declared push (lattice shape) ───
+# The contractual empty-is-clean: a publish on every didOpen, explicit `[]` for
+# clean, unversioned. `declares_push` arms the retrieval evidence bar from turn
+# zero. Kept separate from `mockls-event` deliberately — each settlement leg is
+# the sole authority path for a real server (ledger 03). Bundle: `--push-empty`.
+[blessed.mockls-declared.synthetic]
+version = "mockls-persona"
+platform = "synthetic"
+date = "2026-07-13"
+tier = "synthetic-persona"
+
+[discipline.mockls-declared]
+discipline = "event"
+declares_push = true
+
+# ── debounce discipline (the ts-ls shape) ────────────────────────────────────
+# The ledger awaits the version echo, bounded by the declared `debounce_ms`
+# constant — arrival-based, never silence-interpretation. The constant is
+# declared here and re-verified per re-pin (ledger 05's declared-constant gate
+# gets its synthetic harness here). Bundle: a versioned publish on the save event,
+# delayed by the window, with no pull — `--publish-version --diagnostics-on-save
+# --advertise-save --reject-pull --diagnostics-delay <debounce_ms>`.
+[blessed.mockls-debounce.synthetic]
+version = "mockls-persona"
+platform = "synthetic"
+date = "2026-07-13"
+tier = "synthetic-persona"
+
+[discipline.mockls-debounce]
+discipline = "debounce"
+debounce_ms = 300
+
+# ── scan discipline (marksman-class scan-once) ───────────────────────────────
+# Silence is NOT clean; a missing answer is a fault, not evidence. Bundle:
+# `--workspace-diagnostics --scan-roots` — one whole-workspace pull off the
+# scanned project model.
+[blessed.mockls-scan.synthetic]
+version = "mockls-persona"
+platform = "synthetic"
+date = "2026-07-13"
+tier = "synthetic-persona"
+
+[discipline.mockls-scan]
+discipline = "scan"
+
+# ── diff discipline (marksman diff-only) ─────────────────────────────────────
+# Like scan, silence is not clean — the server publishes only on a save event
+# (its "diff" trigger), never on the ambient didOpen/didChange, and answers no
+# pull. Bundle: `--diagnostics-on-save --advertise-save --reject-pull`.
+[blessed.mockls-diff.synthetic]
+version = "mockls-persona"
+platform = "synthetic"
+date = "2026-07-13"
+tier = "synthetic-persona"
+
+[discipline.mockls-diff]
+discipline = "diff"
+
+# ── the violating twin (ledger 05's fault-attribution dummy) ─────────────────
+# Declares the push contract (`declares_push = true`, like `mockls-declared`)
+# but the binary WITHHOLDS on the persona's default bundle: it never publishes
+# and answers no pull, so it breaks its own contract. The declared-vs-implemented
+# pairing must therefore DETECT the violation — today that means the debt stays
+# unsettled and the file resolves `[unverified — … returned no result]`, never a
+# false `[clean]`. Full fault-attribution wording is ledger 05's. Bundle:
+# `--no-push-diagnostics --reject-pull`.
+[blessed.mockls-violator.synthetic]
+version = "mockls-persona"
+platform = "synthetic"
+date = "2026-07-13"
+tier = "synthetic-persona"
+
+[discipline.mockls-violator]
+discipline = "event"
+declares_push = true

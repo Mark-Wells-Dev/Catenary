@@ -29,13 +29,13 @@ fn write_marker_config(dir: &Path, markers: &[&str]) -> Result<std::path::PathBu
     std::fs::write(
         &config_path,
         format!(
-            "[lsp.server.mockls-{MOCK_LANG}]\n\
+            "[lsp.server.mockls-event]\n\
              path = \"{mockls_bin}\"\n\
              args = [\"{MOCK_LANG}\"]\n\
              root_markers = [{markers}]\n\n\
              [lsp.language.{MOCK_LANG}]\n\
              extensions = [\"{MOCK_LANG}\"]\n\
-             servers = [\"mockls-{MOCK_LANG}\"]\n",
+             servers = [\"mockls-event\"]\n",
             markers = markers_toml.join(", "),
         ),
     )?;
@@ -49,13 +49,13 @@ fn write_no_marker_config(dir: &Path) -> Result<std::path::PathBuf> {
     std::fs::write(
         &config_path,
         format!(
-            "[lsp.server.mockls-{MOCK_LANG}]\n\
+            "[lsp.server.mockls-event]\n\
              path = \"{mockls_bin}\"\n\
              args = [\"{MOCK_LANG}\"]\n\
              root_markers = []\n\n\
              [lsp.language.{MOCK_LANG}]\n\
              extensions = [\"{MOCK_LANG}\"]\n\
-             servers = [\"mockls-{MOCK_LANG}\"]\n",
+             servers = [\"mockls-event\"]\n",
         ),
     )?;
     Ok(config_path)

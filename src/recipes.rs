@@ -57,6 +57,19 @@ pub const DEFAULT_CI_PROVISION: &str = include_str!("../defaults/ci-provision.to
 /// Embedded committed blessed-manifest (`defaults/blessed-manifest.toml`).
 pub const DEFAULT_BLESSED_MANIFEST: &str = include_str!("../defaults/blessed-manifest.toml");
 
+/// Embedded mockls-persona rows (`defaults/mockls-personas.toml`), concatenated
+/// onto the seed manifest **only** under `feature = "mockls"` (diagnostics-debt
+/// 04c).
+///
+/// One blessed+discipline row per persona — the publisher-discipline taxonomy
+/// made flesh, so the conformance/integration harness's mock stand-ins are
+/// diagnostics sources by manifest membership rather than an env lever. The
+/// production build never enables the feature, so it carries zero persona rows:
+/// no name-spoof surface, nothing shipped, and the seed parse is byte-identical
+/// to `DEFAULT_BLESSED_MANIFEST` alone.
+#[cfg(feature = "mockls")]
+pub const MOCKLS_PERSONAS: &str = include_str!("../defaults/mockls-personas.toml");
+
 /// The package ecosystem a recipe installs from.
 ///
 /// The four ecosystems whose native verification the recipe schema records
@@ -942,12 +955,32 @@ pub fn parse_blessed_manifest(contents: &str) -> Result<BlessedManifest> {
 
 /// Parse the embedded default blessed-manifest.
 ///
+/// Under `feature = "mockls"` the mockls-persona rows
+/// ([`MOCKLS_PERSONAS`]) are concatenated onto the committed manifest before the
+/// parse, so the conformance/integration harness's mock stand-ins classify as
+/// diagnostics sources by manifest membership (diagnostics-debt 04c). Without the
+/// feature the parse is byte-identical to [`DEFAULT_BLESSED_MANIFEST`] alone — a
+/// production binary carries zero persona rows.
+///
 /// # Errors
 ///
-/// Returns an error if the embedded `defaults/blessed-manifest.toml` is
-/// malformed.
+/// Returns an error if the embedded `defaults/blessed-manifest.toml` (or, under
+/// the feature, the concatenated persona fragment) is malformed.
 pub fn default_blessed_manifest() -> Result<BlessedManifest> {
-    parse_blessed_manifest(DEFAULT_BLESSED_MANIFEST)
+    // Under the feature the persona fragment is concatenated onto the committed
+    // manifest before the single parse. The fragment uses only distinct
+    // `[blessed.mockls-*.*]` / `[discipline.mockls-*]` tables, so the concat
+    // merges into the committed manifest's maps without a key clash; the leading
+    // newline guards against the fragment landing on the committed file's last
+    // line. Without the feature the source is `DEFAULT_BLESSED_MANIFEST` verbatim
+    // — a `Cow` so the no-feature path never allocates and the parse is
+    // byte-identical.
+    #[cfg(feature = "mockls")]
+    let source = std::borrow::Cow::Owned(format!("{DEFAULT_BLESSED_MANIFEST}\n{MOCKLS_PERSONAS}"));
+    #[cfg(not(feature = "mockls"))]
+    let source = std::borrow::Cow::Borrowed(DEFAULT_BLESSED_MANIFEST);
+
+    parse_blessed_manifest(&source)
 }
 
 /// The embedded seed manifest, parsed once and cached — the offline
@@ -1014,82 +1047,25 @@ fn active_slot() -> &'static std::sync::RwLock<std::sync::Arc<BlessedManifest>> 
     SLOT.get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(seed_manifest().clone())))
 }
 
-/// The env var naming extra servers to treat as **blessed**, colon-separated —
-/// the deliberate operator opt-in (diagnostics-debt 04b).
-///
-/// A server named here classifies as a diagnostics source even though it is
-/// absent from the manifest's blessed set. Two intended uses: a power user who has
-/// personally verified a custom server and accepts its diagnostics, and the
-/// integration/conformance harness, whose mock servers stand in for real (blessed)
-/// servers to exercise the diagnostics lifecycle. The sentinel `*` blesses **every**
-/// server — the harness's wildcard, so a mockls stand-in with a random name is a
-/// diagnostics source without the test enumerating it.
-///
-/// It only ever makes Catenary **more** trusting, and only when explicitly set —
-/// unlike a missing manifest, which must degrade to noisier (directional safety
-/// governs the *automatic* direction; an operator opt-in is a separate,
-/// deliberate act).
-const BLESS_SERVERS_ENV: &str = "CATENARY_BLESS_SERVERS";
-
 /// Whether `server_name` is **blessed** — a diagnostics source — per the active
-/// manifest OR the [`BLESS_SERVERS_ENV`] operator override (diagnostics-debt 04b).
+/// manifest (diagnostics-debt 04, 04c).
 ///
 /// The single classification predicate every seam consults
 /// ([`crate::lsp::server_behavior::ServerProfile::for_server`], the manager's
-/// coverage gate, the doctor disclosure), so the manifest membership and the
-/// opt-in stay in one place. A server absent from both is unverified —
-/// enrichment-only, never a diagnostics source.
+/// coverage gate, the doctor disclosure), so manifest membership stays the one
+/// classifier. A server absent from the manifest is unverified — enrichment-only,
+/// never a diagnostics source.
+///
+/// Blessing is purely manifest membership now: the operator bless-list env lever
+/// and the `cfg(test)` mock-prefix rule (both diagnostics-debt 04b) retired in
+/// 04c. Under `feature = "mockls"` the seed manifest carries the mockls-persona
+/// rows (see [`MOCKLS_PERSONAS`]), so a harness mock spawned under a persona
+/// server key is a diagnostics source by membership, and a mock spawned under any
+/// other name classifies enrichment-only — the strictness the classification
+/// tests pin.
 #[must_use]
 pub fn is_server_blessed(server_name: &str) -> bool {
     active_manifest().is_blessed(server_name)
-        || env_blessed(server_name)
-        || test_blessed(server_name)
-}
-
-/// The `#[cfg(test)]` blessing rule — in-process unit tests that exercise the
-/// diagnostics *lifecycle* with a mock server (a name absent from the manifest)
-/// must have it treated as a diagnostics source, not downgraded to
-/// enrichment-only.
-///
-/// `std::env::set_var` is `unsafe` under Rust 2024 and this crate forbids
-/// `unsafe`, so the subprocess env override ([`env_blessed`]) — the harness's
-/// mechanism — is unreachable from an in-process test. The in-process twin is the
-/// **`mockls-` prefix**: every unit-test mock server is named `mockls-…` (the
-/// shared convention across the `manager`/`hook_router` fixtures), so the prefix
-/// blesses them all without each test enumerating a name. It only ever *adds*
-/// blessed names, so the classification tests — which assert a name
-/// (`test-server`, `yX4Za`, `some-custom-server`, none `mockls-` prefixed) is
-/// enrichment-only — stay strict.
-#[cfg(test)]
-fn test_blessed(server_name: &str) -> bool {
-    server_name.starts_with("mockls-")
-}
-
-/// Non-test build: no test blessing, so classification is manifest + env only.
-#[cfg(not(test))]
-const fn test_blessed(_server_name: &str) -> bool {
-    false
-}
-
-/// Whether [`BLESS_SERVERS_ENV`] blesses `server_name` — the `*` wildcard blesses
-/// all, otherwise an exact colon-separated entry match (empty/whitespace entries
-/// ignored).
-fn env_blessed(server_name: &str) -> bool {
-    std::env::var(BLESS_SERVERS_ENV).is_ok_and(|raw| bless_list_matches(&raw, server_name))
-}
-
-/// The pure matcher behind [`env_blessed`]: whether the colon-separated `raw`
-/// bless list covers `server_name`.
-///
-/// `*` blesses everything; otherwise an entry matches `server_name` exactly.
-/// Empty/whitespace-only entries are ignored, so a trailing colon or a blank list
-/// blesses nothing. Split out (rather than inlined) because `std::env::set_var` is
-/// `unsafe` under Rust 2024 and this crate forbids `unsafe`, so the matcher is
-/// tested directly on strings.
-fn bless_list_matches(raw: &str, server_name: &str) -> bool {
-    raw.split(':')
-        .map(str::trim)
-        .any(|entry| entry == "*" || (!entry.is_empty() && entry == server_name))
 }
 
 #[cfg(test)]
@@ -1282,20 +1258,6 @@ mod tests {
     }
 
     #[test]
-    fn bless_list_matches_wildcard_and_exact_entries() {
-        // The operator opt-in (diagnostics-debt 04b): `*` blesses everything;
-        // otherwise an exact colon-separated entry matches; blank entries are
-        // ignored so a trailing colon or an empty list blesses nothing.
-        assert!(super::bless_list_matches("*", "anything"));
-        assert!(super::bless_list_matches("foo:*:bar", "whatever"));
-        assert!(super::bless_list_matches("mockls:my-server", "my-server"));
-        assert!(super::bless_list_matches(" my-server ", "my-server"));
-        assert!(!super::bless_list_matches("foo:bar", "my-server"));
-        assert!(!super::bless_list_matches("", "my-server"));
-        assert!(!super::bless_list_matches(":", "my-server"));
-    }
-
-    #[test]
     fn is_blessed_classifies_membership() {
         // Manifest membership is the classifier: a blessed server (rust-analyzer)
         // is blessed; a name absent from the blessed set (a custom def) is not.
@@ -1350,6 +1312,67 @@ mod tests {
         // An unruled/unverified server projects the empty record.
         let unknown = manifest.discipline_for("some-custom-server");
         assert_eq!(unknown, DisciplineRecord::default());
+    }
+
+    #[test]
+    fn mockls_personas_incarnate_the_discipline_taxonomy() {
+        // Under `feature = "mockls"` (which every `make check`/`make test` run
+        // enables) the seed manifest carries one blessed persona per discipline
+        // — the taxonomy made flesh (diagnostics-debt 04c). Each persona is
+        // blessed AND carries the discipline row its name advertises, so a
+        // harness mock spawned under the key is a diagnostics source by
+        // membership, no env lever.
+        let manifest = default_blessed_manifest().expect("manifest parses");
+
+        for name in [
+            "mockls-pull",
+            "mockls-event",
+            "mockls-declared",
+            "mockls-debounce",
+            "mockls-scan",
+            "mockls-diff",
+            "mockls-violator",
+        ] {
+            assert!(manifest.is_blessed(name), "`{name}` must be blessed");
+        }
+
+        assert_eq!(
+            manifest.discipline_for("mockls-pull").discipline,
+            Some(Discipline::Pull)
+        );
+        assert_eq!(
+            manifest.discipline_for("mockls-event").discipline,
+            Some(Discipline::Event)
+        );
+
+        // The declared-push persona (the lattice shape): event discipline PLUS
+        // the contractual publish declaration.
+        let declared = manifest.discipline_for("mockls-declared");
+        assert_eq!(declared.discipline, Some(Discipline::Event));
+        assert!(declared.declares_push, "`mockls-declared` declares push");
+
+        // The debounce persona carries its declared constant (ledger 05's gate).
+        let debounce = manifest.discipline_for("mockls-debounce");
+        assert_eq!(debounce.discipline, Some(Discipline::Debounce));
+        assert_eq!(debounce.debounce_ms, Some(300));
+
+        assert_eq!(
+            manifest.discipline_for("mockls-scan").discipline,
+            Some(Discipline::Scan)
+        );
+        assert_eq!(
+            manifest.discipline_for("mockls-diff").discipline,
+            Some(Discipline::Diff)
+        );
+
+        // The violating twin DECLARES the push contract (its manifest row) — the
+        // binary is what breaks it (`persona_bundle` withholds), so the row here
+        // mirrors `mockls-declared` and the conformance leg proves the violation.
+        let violator = manifest.discipline_for("mockls-violator");
+        assert!(
+            violator.declares_push,
+            "`mockls-violator` DECLARES push — the binary breaks the contract"
+        );
     }
 
     #[test]

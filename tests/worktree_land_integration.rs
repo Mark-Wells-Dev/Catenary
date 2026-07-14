@@ -382,7 +382,10 @@ fn land_nongit_refuses_naming_the_vcs() {
 
 /// The mock language: files with this extension are covered by mockls, so the
 /// owner's edits accumulate and land's transfer set enters the landing batch.
-const LAND_LANG: &str = "wLnd1";
+/// The server key is the blessed `mockls-event` persona (diagnostics-debt 04c):
+/// manifest membership is what makes the mock a diagnostics source, and its
+/// empty behavior bundle is plain default-push mockls — no wire change.
+const LAND_LANG: &str = "mockls-event";
 
 /// The owner subagent's identity — the session the worktree records in its
 /// sidecar (the parent session) and its agent id (the worktree's leaf dirname).
@@ -418,7 +421,7 @@ fn pre_tool_land(state_home: &str, session_id: &str, command: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// Spawns the daemon with mockls covering `.wLnd1`, the repo as the sole root,
+/// Spawns the daemon with mockls covering `.mockls-event`, the repo as the sole root,
 /// and an active `[commands]` allowlist (so the land command's write resolver
 /// runs — an absent section short-circuits resolution). Returns the bridge.
 fn spawn_land_daemon(repo: &Path) -> BridgeProcess {

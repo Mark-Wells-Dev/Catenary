@@ -27,8 +27,12 @@ use common::{BridgeProcess, mockls_lsp_arg, read_merged_log};
 
 /// The cased server name: the engine table suppresses pull for `rust-analyzer`.
 const CASED: &str = "rust-analyzer";
-/// An un-cased server name (random, so it can never collide with a cased entry).
-const UNCASED: &str = "yX4Za";
+/// An un-cased but BLESSED server: the `mockls-event` persona (event discipline,
+/// no pull suppression; diagnostics-debt 04c). It must be blessed, not merely
+/// unknown — an enrichment-only (unverified) server would ALSO lose the
+/// `diagnostic` capability, which would conflate "un-cased" with "unverified" and
+/// defeat this file's isolation of the rust-analyzer casing as the sole variable.
+const UNCASED: &str = "mockls-event";
 
 /// Counts request-log lines whose `method` equals `method`. mockls's
 /// `--request-log` appends one `{"method":"..."}` object per handled request;

@@ -1426,7 +1426,11 @@ mod tests {
     /// `.yX4Za` resolve to this via the raw-extension fallback in
     /// `language_id()`.
     const SF_LANG: &str = "yX4Za";
-    const SF_SERVER: &str = "mockls-sf";
+    // The `mockls-event` persona (blessed, event discipline; diagnostics-debt
+    // 04c) so the single-file server counts as diagnostics coverage — the
+    // editing-entry/coverage tests below assert on the blessed set. The language
+    // stays `yX4Za`; only the server key is the persona.
+    const SF_SERVER: &str = "mockls-event";
 
     /// Build a config with a single language+server for single-file
     /// cache tests. No real LSP binary needed — these tests only check

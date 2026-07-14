@@ -20,8 +20,8 @@ use serde_json::json;
 
 use common::{BridgeProcess, mockls_lsp_arg, read_merged_log};
 
-const MOCK_LANG_A: &str = "yX4Za";
-const MOCK_LANG_B: &str = "d5apI";
+const MOCK_LANG_A: &str = "mockls-event";
+const MOCK_LANG_B: &str = "mockls-declared";
 
 #[test]
 fn test_mcp_initialize() -> Result<()> {

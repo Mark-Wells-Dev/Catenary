@@ -41,7 +41,16 @@ use common::{
     read_merged_log, rewrite_advancing_mtime, wait_for_change, wait_for_change_in_root,
 };
 
-const MOCK_LANG: &str = "yX4Za";
+// `MOCK_LANG`'s server key is the blessed `mockls-event` persona
+// (diagnostics-debt 04c): manifest membership is what makes a mock a diagnostics
+// source, so the two diagnostics-surface guards (C4, D) that drive
+// `call_diagnostics` get a real source. The empty behavior bundle is plain
+// default-push mockls — the grep/watcher guards that share `MOCK_LANG` see no
+// wire change. `MOCK_LANG_S` stays a non-persona key: it serves only the L5
+// grep/watcher test (enrichment-only, no diagnostics assertion), and a diagnostics
+// source is not needed — nor could it collide, since it must be a DISTINCT key
+// from `mockls-event` (both servers run at once on nested roots).
+const MOCK_LANG: &str = "mockls-event";
 /// Second mock language for the L5 nested-root test (a distinct server).
 const MOCK_LANG_S: &str = "z9Qw7";
 

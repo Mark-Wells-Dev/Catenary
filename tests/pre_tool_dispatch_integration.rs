@@ -24,7 +24,11 @@ use serde_json::{Value, json};
 
 use common::{BridgeProcess, diagnostics_output, ipc_request, ipc_request_long, mockls_lsp_arg};
 
-const MOCK_LANG: &str = "pTd9X";
+// The `mockls-event` persona is the blessed base (diagnostics-debt 04c):
+// renaming the key to a manifest persona makes the mock a diagnostics source
+// (replacing the retired bless-list wildcard) while its empty
+// behavior bundle keeps the wire behavior identical.
+const MOCK_LANG: &str = "mockls-event";
 
 /// Parse a Claude `PreToolUse` hook stdout into `(decision, reason)`, or `None`
 /// when it is not a deny envelope (an allow is silent → empty stdout).
