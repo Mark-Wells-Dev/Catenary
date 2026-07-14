@@ -90,6 +90,24 @@ pub fn isolate_env(cmd: &mut Command, root: &str) {
     cmd.env("CATENARY_RUNTIME_DIR", xdg_runtime_dir(root));
     cmd.env("CATENARY_CACHE_DIR", xdg_cache_home(root));
     cmd.env("CATENARY_CONFIG_DIR", xdg_config_home(root));
+    // Config-WRITE isolation (bug 109) is complete on every platform via the line
+    // above: `paths::config_dir()` resolves `CATENARY_CONFIG_DIR` FIRST — before
+    // the `dirs` crate's `XDG_CONFIG_HOME` (Linux) / `~/Library/Application
+    // Support` (macOS) fallbacks — so every subprocess `pin`/`unpin` writes
+    // `<root>/config/catenary/config.toml`, never the operator's real file. We
+    // deliberately do NOT also redirect `$HOME` here: it would land in the
+    // tempdir as a belt-and-braces tripwire for a hypothetical HOME-resolved write
+    // seam, but it collides with tests that legitimately inherit the real `$HOME`
+    // — `rust_toolchain_spawn` / `ra_double_spawn_probe` need it so rustup's
+    // `RUSTUP_HOME` resolves, and `pin_persistence` / `grep_freshness` compare the
+    // daemon's `~`-home-compressed spelling against the harness-side real `$HOME`.
+    // The real bug-109 escape was in-process (router unit tests, which
+    // `isolate_env` never touches), now sealed by injecting the pin-write path;
+    // the residual subprocess seam is covered by the `CATENARY_CONFIG_DIR` above
+    // AND by the `subprocess_pin_never_touches_the_real_user_config` poison guard,
+    // which reads the real config before/after an isolated pin and fails loudly on
+    // any change — a stronger, platform-agnostic net than a HOME redirect (it
+    // catches XDG- and HOME-resolved leaks alike, not just HOME-based ones).
     // Suppress the desktop-notification sink (misc 179): test daemons resolve
     // `$HOME` (which isolate_env does not redirect) and so read the user's
     // REAL `~/.claude` plugin cache — whenever the dev tree's hooks.json

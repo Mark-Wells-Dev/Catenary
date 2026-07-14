@@ -919,6 +919,16 @@ struct HookDispatchContext {
     /// `SubagentStart`, pruned at `SubagentStop` / `SessionEnd`; shared with the
     /// session board so `state.json` carries subagent sub-rows.
     subagents: SubagentRegistry,
+    /// The user config file `pin`/`unpin` persist `[roots] pinned` to (bug 109).
+    ///
+    /// Resolved once in [`SessionManager::with_session`]: production uses
+    /// [`user_config_path`] (`~/.config/catenary/config.toml`); a test injects a
+    /// tempdir path via [`SessionManager::config_path_override`] so an in-process
+    /// pin can never touch the operator's real config. Threaded into
+    /// [`persist_pin`] / [`persist_unpin`] instead of each re-resolving
+    /// [`crate::paths::config_dir`], which no in-process test can redirect
+    /// (`std::env::set_var` is forbidden under Rust 2024).
+    user_config_path: PathBuf,
 }
 
 /// A staged hook→CLI handoff, deposited under a [`HandoffKey`] by the
@@ -1513,10 +1523,17 @@ fn user_config_path() -> PathBuf {
 /// error is logged at `warn!()` (a TUI health finding, no interrupt) rather than
 /// failing the command: the operator's live pin still holds, only its
 /// persistence is impaired.
+///
+/// `config_path` is the file to write, injected from
+/// [`HookDispatchContext`]'s resolved config path (bug 109). Production resolves
+/// it once via [`user_config_path`]; in-process tests inject a tempdir path so a
+/// test pin can never reach the operator's real
+/// `~/.config/catenary/config.toml`. Rust 2024 forbids `std::env::set_var` in
+/// this crate, so an in-process test cannot redirect `config_dir()` — the write
+/// target must be injected, not env-resolved, or the test writes the user's file.
 #[cfg(unix)]
-fn persist_pin(canonical: &Path) {
-    let path = user_config_path();
-    match crate::config::pin_config(&path, canonical) {
+fn persist_pin(config_path: &Path, canonical: &Path) {
+    match crate::config::pin_config(config_path, canonical) {
         Ok(true) => debug!(
             source = Source::DaemonDispatch.as_str(),
             path = %canonical.display(),
@@ -1542,10 +1559,11 @@ fn persist_pin(canonical: &Path) {
 /// is non-fatal and logged at `warn!()`. Returns `true` when an entry was
 /// removed — the caller folds this into the `unpin` outcome so a config-only
 /// entry (a pin whose path was missing at boot) still reports success.
+///
+/// `config_path` is injected (bug 109) exactly as in [`persist_pin`].
 #[cfg(unix)]
-fn persist_unpin(canonical: &Path) -> bool {
-    let path = user_config_path();
-    match crate::config::unpin_config(&path, canonical) {
+fn persist_unpin(config_path: &Path, canonical: &Path) -> bool {
+    match crate::config::unpin_config(config_path, canonical) {
         Ok(true) => {
             debug!(
                 source = Source::DaemonDispatch.as_str(),
@@ -2339,6 +2357,14 @@ pub struct SessionManager {
     worktree_watch_rx: std::sync::Mutex<
         Option<tokio::sync::mpsc::UnboundedReceiver<crate::worktree_watch::WorktreeDeleted>>,
     >,
+    /// Override for the `[roots] pinned` persistence file (bug 109). `None` in
+    /// production — [`Self::with_session`] then resolves [`user_config_path`]
+    /// (`~/.config/catenary/config.toml`). An in-process test sets it via
+    /// [`Self::config_path_override`] to a tempdir path so a test pin/unpin can
+    /// never write the operator's real config (the pin write path is otherwise
+    /// unredirectable in-process: `std::env::set_var` is forbidden under Rust
+    /// 2024, so `config_dir()` always resolves the real `~/.config`).
+    config_path_override: Option<PathBuf>,
 }
 
 #[cfg(unix)]
@@ -2376,6 +2402,7 @@ impl SessionManager {
             shutdown: CancellationToken::new(),
             disconnect: Arc::new(tokio::sync::Notify::new()),
             worktree_watch_rx: std::sync::Mutex::new(None),
+            config_path_override: None,
         }
     }
 
@@ -2423,6 +2450,7 @@ impl SessionManager {
             shutdown: CancellationToken::new(),
             disconnect: Arc::new(tokio::sync::Notify::new()),
             worktree_watch_rx: std::sync::Mutex::new(None),
+            config_path_override: None,
         })
     }
 
@@ -2710,6 +2738,21 @@ impl SessionManager {
         &self.ipc_socket_path
     }
 
+    /// Redirect `pin`/`unpin` config persistence to `path` (bug 109, test-only).
+    ///
+    /// Must be called **before** [`Self::with_session`], which reads the override
+    /// into [`HookDispatchContext`]'s resolved config path. In-process router
+    /// tests point this at a tempdir file so a `tool/roots-add` dispatched over
+    /// the test's IPC socket persists there instead of the operator's real
+    /// `~/.config/catenary/config.toml`. There is no production caller: the daemon
+    /// leaves the override `None` and resolves [`user_config_path`].
+    #[cfg(test)]
+    #[must_use]
+    fn config_path_override(mut self, path: PathBuf) -> Self {
+        self.config_path_override = Some(path);
+        self
+    }
+
     /// Enables session-aware hook dispatch.
     ///
     /// Once set, hook connections create per-`session_id` [`Session`]
@@ -2812,6 +2855,13 @@ impl SessionManager {
             worktree_registry,
             worktree_mounts: WorktreeMounts::new(),
             subagents,
+            // Bug 109: production resolves the real user config; a test injects a
+            // tempdir path via `config_path_override` so an in-process pin/unpin
+            // can never reach the operator's `~/.config/catenary/config.toml`.
+            user_config_path: self
+                .config_path_override
+                .clone()
+                .unwrap_or_else(user_config_path),
         });
         self
     }
@@ -5993,8 +6043,10 @@ async fn handle_hook_dispatch(
                 // Persistence leg (misc 175): record the pin in the user config's
                 // `[roots] pinned` list so it survives a daemon restart. The
                 // runtime pin above already took effect; a config-write failure is
-                // non-fatal and warned, never bounced back to the command.
-                persist_pin(&canonical);
+                // non-fatal and warned, never bounced back to the command. The
+                // config path is injected (bug 109) so an in-process test writes a
+                // tempdir, never the operator's real config.
+                persist_pin(&ctx.user_config_path, &canonical);
             }
             serde_json::json!({"status": "ok", "path": canonical.display().to_string()})
         } else {
@@ -6053,8 +6105,10 @@ async fn handle_hook_dispatch(
                 // (keep-with-doctor-finding), so `unpin` must be able to remove a
                 // config-only entry. `unpin` succeeds when EITHER the live pin OR
                 // the config entry was removed; only when NEITHER existed is it
-                // the benign idempotent `not_found`.
-                let config_removed = persist_unpin(&canonical);
+                // the benign idempotent `not_found`. The config path is injected
+                // (bug 109) so an in-process test writes a tempdir, not the real
+                // config.
+                let config_removed = persist_unpin(&ctx.user_config_path, &canonical);
                 if removed || config_removed {
                     serde_json::json!({"status": "ok", "path": canonical.display().to_string()})
                 } else {
@@ -8026,8 +8080,19 @@ mod tests {
             None,
         ));
 
+        // Bug 109: pin the config-persistence path INTO this test's tempdir
+        // before `with_session` resolves it. Every in-process hook-dispatch test
+        // funnels through here, so a `tool/roots-add` that reaches `persist_pin`
+        // writes `<dir>/config/catenary/config.toml` (inside the test's own
+        // `TempDir`, cleaned on drop) instead of the maintainer's real
+        // `~/.config/catenary/config.toml`. An in-process test cannot redirect
+        // `config_dir()` via env (Rust 2024 forbids `std::env::set_var`), so the
+        // override is the only leak-proof seam — and routing every test through it
+        // makes the escape structurally unreachable, not merely fixed per-test.
+        let config_path = dir.join("config").join("catenary").join("config.toml");
         SessionManager::bind_at(&mcp_socket_in(dir), &ipc_socket_in(dir), logging)
             .expect("bind")
+            .config_path_override(config_path)
             .with_session(session)
     }
 
@@ -13390,6 +13455,72 @@ mod tests {
             s.1,
             vec!["hook".to_string()],
             "ephemeral contributor dropped on upgrade, hook remains",
+        );
+
+        shutdown.cancel();
+    }
+
+    /// Bug 109 seal: an in-process `tool/roots-add` persists to the INJECTED
+    /// tempdir config, never the operator's real `~/.config/catenary/config.toml`.
+    ///
+    /// Before the fix, `persist_pin` re-resolved [`user_config_path`] through
+    /// [`crate::paths::config_dir`], which no in-process test can redirect (Rust
+    /// 2024 forbids `std::env::set_var`), so every such pin wrote the maintainer's
+    /// real config — the eight-month poison. Here the config path is injected by
+    /// `bind_with_session_config` into this test's tempdir; we assert the pin
+    /// landed there. The whole in-process router suite is protected by that same
+    /// injection; this test names the guarantee and would go red if the injection
+    /// ever regressed (the pin would silently vanish from the tempdir).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_process_pin_persists_to_injected_config_not_the_real_one() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let project = base.join("project");
+        std::fs::create_dir_all(&project).expect("mkdir project");
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "tool/roots-add",
+                "path": project.display().to_string(),
+            }),
+        )
+        .await;
+
+        // The injected config `bind_with_session_config` wired lives under this
+        // test's own tempdir — never `~/.config`.
+        let injected = dir
+            .path()
+            .join("config")
+            .join("catenary")
+            .join("config.toml");
+        assert!(
+            injected.exists(),
+            "the pin persisted to the injected tempdir config at {}",
+            injected.display(),
+        );
+        let text = std::fs::read_to_string(&injected).expect("read injected config");
+        let doc: toml::Value = toml::from_str(&text).expect("valid toml");
+        let pinned = doc["roots"]["pinned"]
+            .as_array()
+            .expect("pinned array in the injected config");
+        // The entry is written home-compressed (`~/…` under `$HOME`), so expand
+        // the tilde back before comparing with the canonical project path.
+        assert!(
+            pinned
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .any(|entry| { Path::new(&crate::bridge::expand_tilde(entry)) == project }),
+            "the injected config carries the pin, proving the real user config was \
+             never the write target: {text}",
         );
 
         shutdown.cancel();

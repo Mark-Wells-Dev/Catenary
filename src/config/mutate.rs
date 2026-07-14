@@ -619,6 +619,15 @@ fn read_document(path: &Path) -> Result<DocumentMut> {
 }
 
 /// Write `doc` to `path`, creating the parent directory if needed.
+///
+/// The write is **atomic**: the rendered document lands in a sibling temp file
+/// which is then renamed over `path` (an atomic replace within one directory on
+/// POSIX). A crash or a concurrent writer therefore leaves either the old file
+/// or the new one intact, never a truncated or interleaved one — closing the
+/// torn-`write(2)` race that could strand the config in the empty/corrupt state
+/// the create-fresh branch of [`read_document`] then rebuilds from scratch (bug
+/// 109's section-destruction vector). The temp name carries the process id so
+/// two writers targeting the same file never share a staging path.
 fn write_document(path: &Path, doc: &DocumentMut) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -626,8 +635,25 @@ fn write_document(path: &Path, doc: &DocumentMut) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create config directory: {}", parent.display()))?;
     }
-    std::fs::write(path, doc.to_string())
-        .with_context(|| format!("failed to write config file: {}", path.display()))
+    let rendered = doc.to_string();
+    // Stage a sibling temp file (`<path>.tmp.<pid>`) in the target's own
+    // directory, so the rename is a same-filesystem atomic replace (a cross-device
+    // rename would fail). Appending to the full path keeps the temp beside the
+    // target regardless of the filename's shape (extension or not); the pid keeps
+    // two writers targeting one file on distinct staging paths.
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(format!(".tmp.{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, &rendered)
+        .with_context(|| format!("failed to write config file: {}", tmp.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // The original file is untouched (the rename never began); drop the
+        // stage so a failed write leaves no litter.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e)
+            .with_context(|| format!("failed to replace config file: {}", path.display()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1098,5 +1124,113 @@ path = \"/usr/bin/rust-analyzer\"
         );
         let out = std::fs::read_to_string(&path).expect("read");
         assert!(!out.contains("[roots]"), "no roots table created: {out}");
+    }
+
+    // ── bug 109: never discard untouched sections; never truncate ────────
+
+    #[test]
+    fn pin_preserves_unrelated_sections_it_did_not_touch() {
+        // The section-destruction guard (bug 109): a pin appends to `[roots]
+        // pinned` and must leave every unrelated section byte-for-byte — in
+        // particular the `[roots.companions]` subtable and the `[commands]`
+        // enforcement block, the two the poison incident destroyed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let original = "\
+# Catenary config — hand tuned.
+
+[roots.companions]
+\"~/Projects/Widget\" = [\"~/Projects/WidgetDocs\"]
+
+[roots]
+pinned = [
+  \"/srv/alpha\",
+]
+
+[commands]
+allow = [\"git\", \"gh\"]
+pipeline = [\"grep\", \"wc\"]
+";
+        let path = write(dir.path(), "config.toml", original);
+        assert!(
+            pin_config(&path, &PathBuf::from("/srv/beta")).expect("pin beta"),
+            "beta is a new entry"
+        );
+        let out = std::fs::read_to_string(&path).expect("read");
+        // The companions subtable and the commands block survive intact.
+        for line in [
+            "# Catenary config — hand tuned.",
+            "[roots.companions]",
+            "\"~/Projects/Widget\" = [\"~/Projects/WidgetDocs\"]",
+            "[commands]",
+            "allow = [\"git\", \"gh\"]",
+            "pipeline = [\"grep\", \"wc\"]",
+            "  \"/srv/alpha\",",
+        ] {
+            assert!(
+                out.contains(line),
+                "unrelated section survives the pin: {line:?}\n{out}"
+            );
+        }
+        // The whole thing still parses under the real loader with both entries.
+        let doc: toml::Value = toml::from_str(&out).expect("valid toml after pin");
+        assert_eq!(
+            doc["roots"]["pinned"].as_array().expect("pinned").len(),
+            2,
+            "alpha + beta: {out}"
+        );
+        assert!(
+            doc["roots"]["companions"].is_table(),
+            "companions table intact: {out}"
+        );
+        assert!(
+            doc["commands"]["allow"].is_array(),
+            "commands intact: {out}"
+        );
+    }
+
+    #[test]
+    fn pin_on_unparseable_config_refuses_and_never_truncates() {
+        // The truncation guard (bug 109): a config that does not parse must make
+        // the mutation FAIL, leaving the file byte-identical — never a
+        // create-fresh replace that discards the operator's content. This pins
+        // that `read_document` refuses (returns `Err`) instead of falling back to
+        // an empty document.
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Invalid TOML: an unterminated array. Also carries a would-be-lost
+        // section so a silent truncation is unmistakable.
+        let broken = "[commands]\nallow = [\"git\"\n\n[roots]\npinned = [\n";
+        let path = write(dir.path(), "config.toml", broken);
+        let before = std::fs::read_to_string(&path).expect("read before");
+
+        let err = pin_config(&path, &PathBuf::from("/srv/x"));
+        assert!(
+            err.is_err(),
+            "a pin against an unparseable config is refused, not applied"
+        );
+
+        let after = std::fs::read_to_string(&path).expect("read after");
+        assert_eq!(
+            before, after,
+            "the unparseable file is left byte-identical — the mutation never truncated it"
+        );
+    }
+
+    #[test]
+    fn write_is_atomic_leaving_no_stage_behind() {
+        // The atomic-write leg (bug 109): a successful mutation leaves exactly the
+        // target file in its directory — the staging temp is renamed away, never
+        // stranded. A leftover `*.tmp.*` would signal a torn write.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        assert!(pin_config(&path, &PathBuf::from("/srv/only")).expect("pin"));
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["config.toml".to_string()],
+            "only the target file remains, no staging temp: {entries:?}"
+        );
     }
 }

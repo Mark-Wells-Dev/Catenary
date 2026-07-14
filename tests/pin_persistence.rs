@@ -574,3 +574,88 @@ fn env_seed_survives_an_unpin() -> Result<()> {
     stop_daemon(state_home)?;
     Ok(())
 }
+
+/// The REAL user config the harness itself resolves — the one bug 109 poisoned.
+///
+/// Resolved through the library's own [`catenary_cli::paths::config_dir`] so it
+/// honors the harness process's `CATENARY_CONFIG_DIR` / `XDG_CONFIG_HOME` /
+/// `$HOME` exactly as the daemon would with the *unisolated* environment. This
+/// is the file a leaking test would write; the guard only ever READS it.
+fn real_user_config_path() -> PathBuf {
+    catenary_cli::paths::config_dir()
+        .join("catenary")
+        .join("config.toml")
+}
+
+/// Snapshot the real user config's bytes (or `None` when it does not exist), for
+/// a before/after equality assertion. Never creates or writes the file.
+fn snapshot_real_user_config() -> Option<Vec<u8>> {
+    std::fs::read(real_user_config_path()).ok()
+}
+
+/// Poison guard (bug 109): a subprocess pin driven under `isolate_env` must land
+/// **only** in the isolated tempdir config and leave the operator's REAL
+/// `~/.config/catenary/config.toml` byte-identical.
+///
+/// This is the tripwire the sighting demanded: for eight months a
+/// `tool/roots-add` reaching `persist_pin` wrote the user's real config because
+/// the write target was env-resolved, not injected. Here the write path runs
+/// end-to-end through a real daemon under `isolate_env`; we snapshot the real
+/// file before and after and assert it never changed. It fails loudly if any
+/// isolation leg regresses (the subprocess's `CATENARY_CONFIG_DIR`, or a future
+/// escape through `$HOME`), and it can never itself write the real file — it only
+/// reads it. The in-process router-test escape is sealed structurally by the
+/// injected config path; this covers the subprocess seam the same guarantee.
+#[test]
+fn subprocess_pin_never_touches_the_real_user_config() -> Result<()> {
+    // Snapshot the real config BEFORE. Absent is a valid snapshot (`None`); the
+    // guard asserts absent-stays-absent just as it asserts bytes-stay-equal, so a
+    // leak that *creates* the file is caught too.
+    let before = snapshot_real_user_config();
+
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+
+    let base = tempfile::tempdir()?;
+    let base_str = base.path().to_str().context("base path")?;
+
+    let target = common::canonical_tempdir()?;
+    let target_str = target.path().to_str().context("target path")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG, "");
+    let mut bridge = BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_SERVERS", &lsp);
+        cmd.env("CATENARY_ROOTS", base_str);
+    })?;
+    bridge.initialize()?;
+    let socket = bridge.wait_for_ipc_socket()?;
+
+    // Drive the exact IPC the poison came from.
+    assert_eq!(pin(&socket, target_str)?, "ok", "pin succeeds");
+    bridge.wait_for_root(target_str, Duration::from_secs(5))?;
+
+    // The pin DID land — in the ISOLATED config, proving the write path ran.
+    assert!(
+        config_pins_target(state_home, target.path()),
+        "the pin must persist to the ISOLATED config:\n{}",
+        read_user_config(state_home)
+    );
+
+    // …and unpin round-trips through the same seam.
+    assert_eq!(unpin(&socket, target_str)?, "ok", "unpin succeeds");
+
+    drop(bridge);
+    stop_daemon(state_home)?;
+
+    // The REAL user config is byte-identical (or still absent). A poison would
+    // have appended a `~/.claude/tmp/.tmp…/…` entry or replaced the file wholesale.
+    let after = snapshot_real_user_config();
+    assert_eq!(
+        before,
+        after,
+        "bug 109 poison guard: the REAL user config at {} changed across an \
+         isolated pin/unpin — a test escaped isolation and wrote the operator's file",
+        real_user_config_path().display(),
+    );
+    Ok(())
+}
