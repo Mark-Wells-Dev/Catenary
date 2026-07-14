@@ -98,6 +98,41 @@ const fn change_kind_wire_type(kind: ChangeKind) -> u8 {
     }
 }
 
+/// RAII lifetime for an in-flight cold-spawn marker (misc 191).
+///
+/// The owner of a `(lang, server, root)` cold spawn holds one of these across
+/// the whole spawn+`initialize` handshake. On `Drop` — success, failure, an
+/// early `?` return, or a cancelled/dropped spawn future — it removes the
+/// marker from the [`LspClientManager::spawning`] map and wakes every waiter
+/// via [`tokio::sync::Notify::notify_waiters`]. Binding removal to the future's
+/// lifetime is the failure semantics: a marker can never outlive its spawner,
+/// so an abandoned or panicking spawn clears the key instead of wedging it
+/// forever. Woken waiters re-check the registry and retry fresh.
+///
+/// The `Notify` handle stored here is the SAME `Arc` inserted into the map;
+/// waiters clone it under the registry lock, so a waiter that took its clone
+/// just before the guard drops still observes the wake (`notify_waiters` wakes
+/// all *currently registered* waiters, and a duplicate requester registers
+/// before releasing the registry lock).
+struct SpawnMarkerGuard<'a> {
+    spawning: &'a std::sync::Mutex<HashMap<InstanceKey, Arc<tokio::sync::Notify>>>,
+    key: InstanceKey,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for SpawnMarkerGuard<'_> {
+    fn drop(&mut self) {
+        // Tiny sync section: remove the marker, then wake waiters. Never held
+        // across an await (bug 104's lock-ordering doctrine is about the
+        // async client/registry mutexes; this std mutex touches neither).
+        self.spawning
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+        self.notify.notify_waiters();
+    }
+}
+
 /// One alive rooted server covering a walked root, with its registered file
 /// watchers (WS31 Consumer A). Produced by
 /// [`LspClientManager::covering_watchers`] and consumed by the changed-set
@@ -335,6 +370,22 @@ impl ReviveVerdict {
 pub struct LspClientManager {
     config: Arc<Config>,
     clients: Mutex<HashMap<InstanceKey, Arc<Mutex<LspClient>>>>,
+    /// In-flight cold-spawn markers, one per `InstanceKey` (misc 191). A
+    /// per-root spawn+`initialize` handshake is slow (rust-analyzer-class:
+    /// hundreds of ms to seconds); holding the `clients` registry lock across
+    /// it — the old anti-duplicate-spawn hold — stalled every manager lookup
+    /// daemon-wide for the coldest server's latency (a self-inflicted mini-104).
+    /// Now `spawn_inner` holds the registry lock only long enough to look up or
+    /// insert a marker here, then drops it and runs the handshake unlocked.
+    /// Duplicate requesters of the SAME key find the marker and await its
+    /// [`Notify`](tokio::sync::Notify), never launching a second spawn; different
+    /// keys and plain lookups take the registry lock unblocked. The marker's
+    /// lifetime is bound to the spawner future by [`SpawnMarkerGuard`], whose
+    /// `Drop` removes the entry and wakes waiters — so a spawn failure, an early
+    /// return, or a cancelled/dropped spawn future all clear the key rather than
+    /// wedging it forever; woken waiters re-check the registry and retry fresh.
+    /// `std::sync::Mutex`: tiny critical sections, never held across `await`.
+    spawning: std::sync::Mutex<HashMap<InstanceKey, Arc<tokio::sync::Notify>>>,
     /// The per-instance strike ledger (misc 167): the activity-driven revive
     /// gate. Keyed by the full `(language, server, root)` instance key and
     /// held OUTSIDE the client map so it survives tombstone removal and
@@ -377,6 +428,7 @@ impl LspClientManager {
         Self {
             config,
             clients: Mutex::new(HashMap::new()),
+            spawning: std::sync::Mutex::new(HashMap::new()),
             strikes: std::sync::Mutex::new(HashMap::new()),
             single_file_failures: std::sync::Mutex::new(HashSet::new()),
             marker_cache: std::sync::Mutex::new(HashMap::new()),
@@ -521,6 +573,28 @@ impl LspClientManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         ledger.get(key).is_some_and(|e| e.strikes > 0)
+    }
+
+    /// Whether an in-flight cold-spawn marker (misc 191) is currently held for
+    /// `key` — the state-based "this key's cold spawn is mid-handshake" signal
+    /// tests poll to detect the window without a wall-clock sleep.
+    #[cfg(test)]
+    fn is_spawning(&self, key: &InstanceKey) -> bool {
+        self.spawning
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(key)
+    }
+
+    /// How many cold-spawn markers (misc 191) are in flight right now. Tests
+    /// assert this is `0` after a spawn completes or fails — the guard cleared
+    /// the key, never wedging it.
+    #[cfg(test)]
+    fn spawning_len(&self) -> usize {
+        self.spawning
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Mirrors the instance's ledger standing onto the `state.json` board so
@@ -1684,27 +1758,107 @@ impl LspClientManager {
                 .clone()
         };
 
-        let mut clients = self.clients.lock().await;
+        // Double-check under the registry lock, then decide the cold-spawn
+        // marker (misc 191). The registry lock is held only for the found-check
+        // and the marker lookup/insert — never across the spawn+`initialize`
+        // handshake below, so a cold spawn no longer stalls unrelated manager
+        // lookups daemon-wide (the pre-191 hold was a self-inflicted mini-104).
+        // Three outcomes per iteration:
+        //   found      → return the live instance (or bail on a tombstone),
+        //   marker set → another task owns this key's spawn; wait its Notify,
+        //                then loop to re-check (never a duplicate spawn),
+        //   no marker  → claim the marker and break out to spawn as the owner.
+        // The `_marker` guard clears the key on every exit of the owner path.
+        let _marker = loop {
+            let clients = self.clients.lock().await;
 
-        // Double-check: another task may have spawned this server
-        // while we waited. Both arms diverge, so the registry guard is
-        // dropped before the client lock is awaited (bug 104) — the
-        // not-found path below keeps the guard, which is what prevents a
-        // duplicate concurrent spawn.
-        if let Some(found) = find_instance(&clients, lang, server_name, root) {
-            drop(clients);
-            let key = {
-                let locked = found.lock().await;
-                if !locked.is_alive() {
-                    anyhow::bail!("LSP server '{server_name}' ({lang}) is dead");
+            // Both arms diverge, so the registry guard is dropped before any
+            // client lock is awaited (bug 104).
+            if let Some(found) = find_instance(&clients, lang, server_name, root) {
+                drop(clients);
+                let key = {
+                    let locked = found.lock().await;
+                    if !locked.is_alive() {
+                        anyhow::bail!("LSP server '{server_name}' ({lang}) is dead");
+                    }
+                    locked
+                        .server()
+                        .key()
+                        .ok_or_else(|| anyhow!("Existing server missing instance key"))?
+                };
+                return Ok((key, found));
+            }
+
+            // Marker decision, atomic with the found-check above (both under
+            // the registry guard). Either claim the key and spawn as its owner,
+            // or wait on the marker another task already holds — never a second
+            // spawn of the same key.
+            //
+            // The subtle leg is the wait's wake-safety. `enable()` arms the
+            // `Notified` future (registers as a waiter) without awaiting, and
+            // the owner's guard-drop removes the marker and calls
+            // `notify_waiters` under the SAME std lock. Doing the presence-check
+            // AND the `enable()` under one lock hold means: if the marker is
+            // still present, the owner has not notified yet (notify follows
+            // remove, both under the lock we hold), so our registration is
+            // guaranteed to catch the coming wake; if the marker is gone, the
+            // owner already finished and we drop straight through to re-check
+            // the registry. Either way there is no missed-wake hang.
+            let notify = self
+                .spawning
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&ledger_key)
+                .cloned();
+
+            if let Some(notify) = notify {
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                let still_pending = {
+                    let spawning = self
+                        .spawning
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if spawning.contains_key(&ledger_key) {
+                        // Register under the lock — the owner cannot notify
+                        // until we release it.
+                        notified.as_mut().enable();
+                        true
+                    } else {
+                        // Owner finished between our clone and this recheck.
+                        false
+                    }
+                };
+                drop(clients);
+                if still_pending {
+                    notified.await;
                 }
-                locked
-                    .server()
-                    .key()
-                    .ok_or_else(|| anyhow!("Existing server missing instance key"))?
-            };
-            return Ok((key, found));
-        }
+                // Loop: re-check the registry (fresh instance, tombstone, or a
+                // cleared key to claim).
+                continue;
+            }
+
+            // No marker: claim the key. Concurrent claimants serialize on the
+            // std lock, so exactly one wins the insert; a loser gets back the
+            // winner's marker and waits on it next iteration.
+            let ours = Arc::new(tokio::sync::Notify::new());
+            let claimed = self
+                .spawning
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(ledger_key.clone())
+                .or_insert_with(|| ours.clone())
+                .clone();
+            drop(clients);
+            if Arc::ptr_eq(&claimed, &ours) {
+                break SpawnMarkerGuard {
+                    spawning: &self.spawning,
+                    key: ledger_key.clone(),
+                    notify: ours,
+                };
+            }
+            // Lost the claim race — loop and wait on the winner's marker.
+        };
 
         let program = server_def.program(server_name);
         info!(
@@ -1833,14 +1987,25 @@ impl LspClientManager {
             // `Some` on subsequent calls.  `ensure_clients_for_paths` skips
             // bindings that already have an entry (dead or alive), and
             // `ensure_server` bails with "is dead" — the retry path is the
-            // strike-gated demand revive (`get_servers`, misc 167).
-            clients.insert(key, Arc::new(Mutex::new(client)));
+            // strike-gated demand revive (`get_servers`, misc 167). Re-acquire
+            // the registry only to insert (the marker held our claim across the
+            // handshake, misc 191); dropping `_marker` afterward wakes any
+            // waiters, who find the tombstone and bail "is dead".
+            self.clients
+                .lock()
+                .await
+                .insert(key, Arc::new(Mutex::new(client)));
             return Err(e);
         }
 
         let client_mutex = Arc::new(Mutex::new(client));
-        clients.insert(key.clone(), client_mutex.clone());
-        drop(clients);
+        // Re-acquire the registry only to publish the live instance (misc 191:
+        // the marker, not the registry lock, held our claim across the
+        // handshake). No client mutex is awaited under this guard (bug 104).
+        self.clients
+            .lock()
+            .await
+            .insert(key.clone(), client_mutex.clone());
 
         // Eager health probe: transition Probing → Healthy before the
         // snapshot seed so the TUI shows "ready" immediately.
@@ -8811,6 +8976,286 @@ mod tests {
         manager.sync_roots(rich_bufs(vec![root.clone()])).await?;
         let set = fs.diff_and_update(&root, &[(PathBuf::from("a.rs"), 100)]);
         assert_eq!(set.changes.len(), 1, "re-added root ⇒ fresh first walk");
+
+        Ok(())
+    }
+
+    // ---- misc 191: per-key in-flight cold-spawn markers ----
+
+    /// A mockls config whose one server for `MOCK_LANG_A` carries the given
+    /// extra CLI args (e.g. `--response-delay`, `--request-log`). The first
+    /// positional is always the language name mockls filters on.
+    fn mockls_config_with_args(extra_args: &[&str]) -> Arc<Config> {
+        let bin = mockls_bin();
+        let server_name = format!("mockls-{MOCK_LANG_A}");
+        let mut args = vec![MOCK_LANG_A.to_string()];
+        args.extend(extra_args.iter().map(ToString::to_string));
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                path: Some(bin.to_string_lossy().to_string()),
+                args,
+                ..ServerDef::default()
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new(server_name)]),
+                ..LanguageConfig::default()
+            },
+        );
+        Arc::new(Config {
+            language,
+            server,
+            ..test_config_raw()
+        })
+    }
+
+    /// The server name `mockls_config_with_args` binds for `MOCK_LANG_A`.
+    fn mockls_server_name() -> String {
+        format!("mockls-{MOCK_LANG_A}")
+    }
+
+    /// The `Scope::Root` instance key for the one mockls server at `root`.
+    fn root_key(root: &Path) -> InstanceKey {
+        InstanceKey::new(
+            MOCK_LANG_A.to_string(),
+            mockls_server_name(),
+            Scope::Root(root.to_path_buf()),
+        )
+    }
+
+    /// Yield-polls `cond` until it holds, cooperatively (no wall-clock
+    /// assertion): a courtesy 1 ms spacing keeps the poll off a hot spin while
+    /// the concurrent spawn tasks make progress on other worker threads. The
+    /// bounded backstop turns a genuine wedge (the very regression under test)
+    /// into a failure instead of a hang.
+    async fn poll_until(mut cond: impl FnMut() -> bool) -> Result<()> {
+        for _ in 0..2_000 {
+            if cond() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        anyhow::bail!("condition never held within the poll backstop")
+    }
+
+    /// Concurrent requests for the SAME cold key spawn exactly one process —
+    /// the anti-duplicate property, preserved keyed instead of registry-locked
+    /// (misc 191). Every requester either owns the spawn or awaits its marker;
+    /// none launches a second `initialize`. `--request-log --log-pid-suffix`
+    /// makes each mockls process write its own file, so the file count is the
+    /// process count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_key_spawns_exactly_once() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_path_buf();
+        let log = dir.path().join("requests.jsonl");
+        // A slow init widens the concurrent window so every requester arrives
+        // while the owner's spawn is still in flight.
+        let config = mockls_config_with_args(&[
+            "--response-delay",
+            "200",
+            "--request-log",
+            log.to_str().expect("log path"),
+            "--log-pid-suffix",
+        ]);
+        let manager = Arc::new(LspClientManager::new(
+            config,
+            test_logging(),
+            test_fs_with_roots(&[root.to_str().expect("root")]),
+        ));
+
+        let server = mockls_server_name();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let manager = Arc::clone(&manager);
+            let server = server.clone();
+            let root = root.clone();
+            handles.push(tokio::spawn(async move {
+                manager.spawn(&server, MOCK_LANG_A, &root).await
+            }));
+        }
+
+        let mut clients = Vec::new();
+        for handle in handles {
+            let (_key, client) = handle
+                .await
+                .expect("spawn task panicked")
+                .expect("spawn succeeded");
+            clients.push(client);
+        }
+
+        // Every requester got the SAME instance.
+        let first = &clients[0];
+        for client in &clients[1..] {
+            assert!(
+                Arc::ptr_eq(first, client),
+                "all concurrent requesters must share one instance"
+            );
+        }
+        assert_eq!(
+            manager.clients().await.len(),
+            1,
+            "the registry holds exactly one instance for the key"
+        );
+        // Exactly one process handled a request ⇒ exactly one spawn.
+        let log_files: Vec<_> = std::fs::read_dir(dir.path())?
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("requests.jsonl.")
+            })
+            .collect();
+        assert_eq!(
+            log_files.len(),
+            1,
+            "exactly one mockls process spawned (anti-duplicate); found {} request-log files",
+            log_files.len()
+        );
+        // The marker cleared once the spawn landed.
+        assert_eq!(manager.spawning_len(), 0, "marker cleared after spawn");
+
+        manager.shutdown_all().await;
+        Ok(())
+    }
+
+    /// A cold spawn of one key must not stall a DIFFERENT key's spawn — the
+    /// whole point of misc 191. Proof is purely operation/state based: two
+    /// different-key cold spawns are driven to be in flight *simultaneously*
+    /// (both markers present at once). Under the pre-191 hold — the registry
+    /// lock kept across spawn+`initialize` — the second spawn could not even
+    /// reach its marker insert (it would block acquiring the registry lock),
+    /// so both markers being live at once is impossible there and decisive here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cold_spawn_does_not_stall_a_different_key() -> Result<()> {
+        let dir_a = tempfile::tempdir()?;
+        let dir_b = tempfile::tempdir()?;
+        let root_a = dir_a.path().to_path_buf();
+        let root_b = dir_b.path().to_path_buf();
+        // Slow init on both roots so each spawn dwells in its handshake window.
+        let config = mockls_config_with_args(&["--response-delay", "400"]);
+        let manager = Arc::new(LspClientManager::new(
+            config,
+            test_logging(),
+            test_fs_with_roots(&[
+                root_a.to_str().expect("root a"),
+                root_b.to_str().expect("root b"),
+            ]),
+        ));
+        let server = mockls_server_name();
+        let key_a = root_key(&root_a);
+        let key_b = root_key(&root_b);
+
+        // Owner A: a cold spawn on root A, in flight in the background.
+        let spawn_a = {
+            let manager = Arc::clone(&manager);
+            let server = server.clone();
+            let root_a = root_a.clone();
+            tokio::spawn(async move { manager.spawn(&server, MOCK_LANG_A, &root_a).await })
+        };
+        // Wait — by state, not by clock — until A is provably mid-handshake
+        // (marker present, registry lock already dropped).
+        poll_until(|| manager.is_spawning(&key_a)).await?;
+
+        // Owner B: a cold spawn on root B, started while A is still in flight.
+        let spawn_b = {
+            let manager = Arc::clone(&manager);
+            let server = server.clone();
+            let root_b = root_b.clone();
+            tokio::spawn(async move { manager.spawn(&server, MOCK_LANG_A, &root_b).await })
+        };
+        // B reaches its own marker while A's is still live: two cold spawns in
+        // flight at once. The pre-191 registry hold makes this unreachable.
+        poll_until(|| manager.is_spawning(&key_b) && manager.is_spawning(&key_a)).await?;
+
+        // Both complete; both land distinct live instances.
+        let (_ka, client_a) = spawn_a.await.expect("A task").expect("A spawned");
+        let (_kb, client_b) = spawn_b.await.expect("B task").expect("B spawned");
+        assert!(!Arc::ptr_eq(&client_a, &client_b), "distinct instances");
+        assert_eq!(manager.clients().await.len(), 2, "two roots, two instances");
+        assert_eq!(manager.spawning_len(), 0, "both markers cleared");
+
+        manager.shutdown_all().await;
+        Ok(())
+    }
+
+    /// A spawn failure clears the marker (the pinned failure semantic): the key
+    /// is not wedged, and the next request retries fresh. A process that never
+    /// starts (bogus program) fails before any tombstone insert, so the retry
+    /// sees an empty registry and spawns anew rather than short-circuiting on a
+    /// tombstone.
+    #[tokio::test]
+    async fn spawn_failure_clears_marker_and_retries_fresh() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_path_buf();
+        let server_name = mockls_server_name();
+        // A program that cannot start: `LspClient::spawn` errors before the
+        // tombstone path, so no instance is inserted.
+        let bogus = dir.path().join("does-not-exist-mockls");
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                path: Some(bogus.to_string_lossy().to_string()),
+                args: vec![MOCK_LANG_A.to_string()],
+                ..ServerDef::default()
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new(server_name.clone())]),
+                ..LanguageConfig::default()
+            },
+        );
+        let config = Arc::new(Config {
+            language,
+            server,
+            ..test_config_raw()
+        });
+        let manager = LspClientManager::new(
+            config,
+            test_logging(),
+            test_fs_with_roots(&[root.to_str().expect("root")]),
+        );
+        let key = root_key(&root);
+
+        // First attempt fails (process won't start); the marker is cleared and
+        // no instance is left behind.
+        assert!(
+            manager
+                .spawn(&server_name, MOCK_LANG_A, &root)
+                .await
+                .is_err(),
+            "a bogus program fails to spawn"
+        );
+        assert!(
+            !manager.is_spawning(&key),
+            "the marker is cleared on failure — the key is not wedged"
+        );
+        assert_eq!(manager.spawning_len(), 0, "no marker left in flight");
+        assert!(
+            manager.clients().await.is_empty(),
+            "a process-spawn failure leaves no tombstone"
+        );
+
+        // Second attempt retries fresh (re-claims the marker, fails again the
+        // same way) — the failure did not lock the key out. Two attempts stay
+        // below the misc-167 strike cap.
+        assert!(
+            manager
+                .spawn(&server_name, MOCK_LANG_A, &root)
+                .await
+                .is_err(),
+            "the next request retries fresh and fails the same way"
+        );
+        assert_eq!(manager.spawning_len(), 0, "marker cleared after the retry");
 
         Ok(())
     }
