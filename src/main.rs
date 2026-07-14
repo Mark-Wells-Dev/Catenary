@@ -17,10 +17,10 @@ use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use catenary_mcp::cli::{self, HostFormat, QueryFormat};
-use catenary_mcp::logging::LoggingServer;
+use catenary_cli::cli::{self, HostFormat, QueryFormat};
+use catenary_cli::logging::LoggingServer;
 
-use catenary_mcp::source::Source;
+use catenary_cli::source::Source;
 
 /// Command-line arguments for Catenary.
 #[derive(Parser, Debug)]
@@ -809,7 +809,7 @@ fn main() -> Result<()> {
             } else {
                 #[cfg(unix)]
                 {
-                    catenary_mcp::router::run_bridge()
+                    catenary_cli::router::run_bridge()
                 }
                 #[cfg(not(unix))]
                 {
@@ -851,7 +851,7 @@ fn main() -> Result<()> {
             let paths = to_literal_paths(scope);
             // `-C N` sets both sides; `-A`/`-B` override their side (ripgrep
             // precedence — the more specific flag wins).
-            let flags = catenary_mcp::bridge::GrepFlags {
+            let flags = catenary_cli::bridge::GrepFlags {
                 ignore_case,
                 case_sensitive,
                 word,
@@ -1115,7 +1115,7 @@ fn main() -> Result<()> {
             tracing_subscriber::registry()
                 .with(hook_logging.clone())
                 .init();
-            let desktop_sink = catenary_mcp::notify::DesktopNotificationSink::new();
+            let desktop_sink = catenary_cli::notify::DesktopNotificationSink::new();
             hook_logging.activate(vec![desktop_sink]);
 
             match command {
@@ -1559,8 +1559,8 @@ fn build_runtime() -> Result<tokio::runtime::Runtime> {
 ///
 /// Returns an error if configuration loading or TUI initialisation fails.
 fn run_dashboard() -> Result<()> {
-    let config = catenary_mcp::config::Config::load()?;
-    catenary_mcp::tui::run(config.icons.unwrap_or_default())
+    let config = catenary_cli::config::Config::load()?;
+    catenary_cli::tui::run(config.icons.unwrap_or_default())
 }
 
 /// Runs the Catenary daemon on a dedicated thread with a 16 MB stack.
@@ -1595,7 +1595,7 @@ fn run_daemon() -> Result<()> {
     reason = "SessionManager lifetime is correct — explicit drop(manager) at function end"
 )]
 fn run_daemon_main() -> Result<()> {
-    use catenary_mcp::router::SessionManager;
+    use catenary_cli::router::SessionManager;
 
     // Build runtime first — bind_daemon_sockets needs the tokio
     // reactor for UnixListener::bind.
@@ -1607,7 +1607,7 @@ fn run_daemon_main() -> Result<()> {
 
     // Bind sockets immediately so bridge proxies can connect while
     // heavy initialization (config, DB, LSP servers) proceeds.
-    let sockets = catenary_mcp::router::bind_daemon_sockets()?;
+    let sockets = catenary_cli::router::bind_daemon_sockets()?;
 
     let logging = LoggingServer::new();
     // Floor the tracing stream before it reaches the DB sink. Without a filter
@@ -1618,10 +1618,10 @@ fn run_daemon_main() -> Result<()> {
     // scans). The bridge tags each event with its ORIGIN MODULE PATH as the
     // tracing target (`ignore::walk`, …), NOT a literal `log` target — so the old
     // `debug,log=warn` directive never matched it. Default everything to `warn` and
-    // allowlist Catenary's own crates (`catenary` bin, `catenary_mcp` lib) at
+    // allowlist Catenary's own crates (`catenary` bin, `catenary_cli` lib) at
     // `debug`. Override with CATENARY_LOG.
     let filter = tracing_subscriber::EnvFilter::try_from_env("CATENARY_LOG").unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new("warn,catenary=debug,catenary_mcp=debug")
+        tracing_subscriber::EnvFilter::new("warn,catenary=debug,catenary_cli=debug")
     });
     tracing_subscriber::registry()
         .with(filter)
@@ -1632,13 +1632,13 @@ fn run_daemon_main() -> Result<()> {
     // Safe here: the socket bind above proved we are the sole daemon.
     drain_legacy_db();
 
-    let mut config = catenary_mcp::config::Config::load()?;
+    let mut config = catenary_cli::config::Config::load()?;
 
     // Materialize the JSON Schemas to a local cache path and associate them with
     // the config files at the taplo server Catenary spawns, so config edits get
     // live validation + unknown-key squiggles offline, with zero setup (misc
     // 133). Best-effort — a filesystem error leaves the config untouched.
-    catenary_mcp::config::schema::install_toml_schema_association(&mut config);
+    catenary_cli::config::schema::install_toml_schema_association(&mut config);
 
     let raw_roots: Vec<PathBuf> = match std::env::var("CATENARY_ROOTS") {
         Ok(val) if !val.is_empty() => std::env::split_paths(&val).collect(),
@@ -1672,25 +1672,25 @@ fn run_daemon_main() -> Result<()> {
         // Parent-agent additionalContext side channel (misc 151): the
         // dirty-worktree "kept" notice queues here for delivery on the parent's
         // next hook response. Shared by every per-session `Session`.
-        let parent_context = catenary_mcp::bridge::ParentContextQueue::new();
+        let parent_context = catenary_cli::bridge::ParentContextQueue::new();
 
         // Daemon-owned live-state snapshot. Mirrors server lifecycle/progress
         // and the alert ring to runtime_dir()/catenary/state.json — the
         // out-of-process surface that replaces the language_servers table.
-        let snapshot = catenary_mcp::state_snapshot::SnapshotWriter::new(
+        let snapshot = catenary_cli::state_snapshot::SnapshotWriter::new(
             rt.handle(),
-            &catenary_mcp::paths::runtime_dir().join("catenary"),
+            &catenary_cli::paths::runtime_dir().join("catenary"),
             // `DaemonInfo::current` sources the recorded version from the same
             // `CATENARY_VERSION` the skew check compares against, so a non-tag
             // build is never falsely flagged stale (tui-rework 09, item 1).
-            catenary_mcp::state_snapshot::DaemonInfo::current(
+            catenary_cli::state_snapshot::DaemonInfo::current(
                 instance_id.to_string(),
                 std::process::id(),
-                catenary_mcp::state_snapshot::now_iso(),
+                catenary_cli::state_snapshot::now_iso(),
             ),
         );
 
-        let session = Arc::new(catenary_mcp::bridge::session::Session::new(
+        let session = Arc::new(catenary_cli::bridge::session::Session::new(
             config,
             roots,
             logging.clone(),
@@ -1709,10 +1709,10 @@ fn run_daemon_main() -> Result<()> {
         // host) — then schedule the periodic staleness sweep. On-write reaping
         // (rotation + per-tool byte budget) rides the JSONL sink itself.
         {
-            let cache_root = catenary_mcp::paths::cache_dir().join("catenary");
+            let cache_root = catenary_cli::paths::cache_dir().join("catenary");
             let self_inst = instance_id.to_string();
             rt.spawn_blocking(move || {
-                catenary_mcp::logging::reaper::reap_instances(
+                catenary_cli::logging::reaper::reap_instances(
                     &cache_root,
                     &self_inst,
                     reap_policy,
@@ -1720,22 +1720,22 @@ fn run_daemon_main() -> Result<()> {
                 );
             });
 
-            let firehose_root = catenary_mcp::paths::cache_dir()
+            let firehose_root = catenary_cli::paths::cache_dir()
                 .join("catenary")
                 .join(instance_id.as_ref());
-            let state_json = catenary_mcp::paths::runtime_dir()
+            let state_json = catenary_cli::paths::runtime_dir()
                 .join("catenary")
                 .join("state.json");
             rt.spawn(async move {
                 let mut ticker =
-                    tokio::time::interval(catenary_mcp::logging::reaper::STALENESS_SWEEP_INTERVAL);
+                    tokio::time::interval(catenary_cli::logging::reaper::STALENESS_SWEEP_INTERVAL);
                 ticker.tick().await; // consume the immediate first tick
                 loop {
                     ticker.tick().await;
                     let root = firehose_root.clone();
                     let state = state_json.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        catenary_mcp::logging::reaper::sweep_stale(
+                        catenary_cli::logging::reaper::sweep_stale(
                             &root,
                             &state,
                             retention_days,
@@ -1854,13 +1854,13 @@ fn run_daemon_main() -> Result<()> {
 /// One-time reclaim of the legacy `SQLite` database (observability ticket 07).
 ///
 /// Older daemons left a `catenary.db` (plus its `-wal` / `-shm` siblings) under
-/// [`state_dir`](catenary_mcp::paths::state_dir). `SQLite` is gone; the file is
+/// [`state_dir`](catenary_cli::paths::state_dir). `SQLite` is gone; the file is
 /// regenerable telemetry the daemon owned, so it is deleted outright on startup
 /// — no prompt, no migration. Safe here: the socket bind earlier proved this is
 /// the sole daemon.
 #[cfg(unix)]
 fn drain_legacy_db() {
-    let db = catenary_mcp::paths::state_dir()
+    let db = catenary_cli::paths::state_dir()
         .join("catenary")
         .join("catenary.db");
     let reclaimed = drain_db_at(&db);
@@ -1894,7 +1894,7 @@ fn drain_db_at(db: &Path) -> u64 {
 
 /// Starts the Catenary daemon explicitly and idempotently (bug 80, leg 2).
 ///
-/// Delegates to [`catenary_mcp::router::ensure_daemon_running`] — the same
+/// Delegates to [`catenary_cli::router::ensure_daemon_running`] — the same
 /// single-instance start path the bridge init uses — and prints whether a daemon
 /// was already up or a fresh one was started. Synchronous (no tokio runtime):
 /// the start path is blocking socket I/O and a process spawn.
@@ -1904,9 +1904,9 @@ fn drain_db_at(db: &Path) -> u64 {
 /// Returns an error if the daemon cannot be started.
 #[cfg(unix)]
 fn run_start(out: &mut cli::Output) -> Result<()> {
-    use catenary_mcp::router::DaemonStartOutcome;
+    use catenary_cli::router::DaemonStartOutcome;
 
-    match catenary_mcp::router::ensure_daemon_running()? {
+    match catenary_cli::router::ensure_daemon_running()? {
         DaemonStartOutcome::AlreadyRunning => {
             let _ = out.writeln(format_args!("Daemon already running"));
         }
@@ -1952,7 +1952,7 @@ async fn run_stop(out: &mut cli::Output, force: bool) -> Result<()> {
         }
     }
 
-    let ipc_path = catenary_mcp::router::socket_path();
+    let ipc_path = catenary_cli::router::socket_path();
 
     let Ok(stream) = tokio::net::UnixStream::connect(&ipc_path).await else {
         let _ = out.writeln(format_args!("No daemon running"));
@@ -2006,8 +2006,8 @@ async fn run_stop(out: &mut cli::Output, force: bool) -> Result<()> {
 /// daemon round-trip. A missing or unparseable snapshot yields an empty board,
 /// so `catenary stop` never prompts when it cannot see any sessions.
 #[cfg(unix)]
-fn live_session_board() -> Vec<catenary_mcp::state_snapshot::SessionEntry> {
-    use catenary_mcp::tui::data::{DataSource, StateJsonDataSource};
+fn live_session_board() -> Vec<catenary_cli::state_snapshot::SessionEntry> {
+    use catenary_cli::tui::data::{DataSource, StateJsonDataSource};
 
     StateJsonDataSource::new()
         .load()
@@ -2022,8 +2022,8 @@ fn live_session_board() -> Vec<catenary_mcp::state_snapshot::SessionEntry> {
 /// drawn from the daemon's `state.json` snapshot (feedback 08 finding 3).
 /// Returns the board as a multi-line string with no trailing prompt.
 #[cfg(unix)]
-fn render_stop_board(sessions: &[catenary_mcp::state_snapshot::SessionEntry]) -> String {
-    use catenary_mcp::tui::format::elapsed_short;
+fn render_stop_board(sessions: &[catenary_cli::state_snapshot::SessionEntry]) -> String {
+    use catenary_cli::tui::format::elapsed_short;
 
     let n = sessions.len();
     let plural = if n == 1 { "" } else { "s" };
@@ -2109,9 +2109,9 @@ async fn run_grep(
     count: bool,
     include_gitignored: bool,
     include_hidden: bool,
-    flags: catenary_mcp::bridge::GrepFlags,
+    flags: catenary_cli::bridge::GrepFlags,
 ) -> Result<()> {
-    use catenary_mcp::router::{GrepRequest, METHOD_GREP};
+    use catenary_cli::router::{GrepRequest, METHOD_GREP};
 
     // stdin mode: no paths + a readable piped/redirected stream. A plain
     // ripgrep pass over the stream, same flags, no enrichment, no daemon.
@@ -2161,7 +2161,7 @@ async fn run_grep(
         if let Some(stream) = connect_daemon_ipc().await {
             search_ipc_on(stream, METHOD_GREP, &request).await?
         } else {
-            let resp = catenary_mcp::router::run_grep_daemon_less(&request).await?;
+            let resp = catenary_cli::router::run_grep_daemon_less(&request).await?;
             emit_no_daemon_marker();
             SearchResponse::from(resp)
         }
@@ -2264,10 +2264,10 @@ fn run_grep_stdin(
     out: &mut cli::Output,
     input: &[u8],
     pattern: &str,
-    flags: &catenary_mcp::bridge::GrepFlags,
+    flags: &catenary_cli::bridge::GrepFlags,
     count: bool,
 ) -> Result<()> {
-    use catenary_mcp::bridge::{StreamOutcome, grep_stream};
+    use catenary_cli::bridge::{StreamOutcome, grep_stream};
 
     let outcome = grep_stream(input, pattern, flags, count)?;
     match outcome {
@@ -2324,7 +2324,7 @@ struct SearchResponse {
     /// grep: files in the search scope skipped instead of searched (misc 135,
     /// bug 62). Empty for a normal all-searched query.
     #[serde(default)]
-    skipped: catenary_mcp::bridge::GrepSkips,
+    skipped: catenary_cli::bridge::GrepSkips,
     /// A usage error (uncompilable pattern, bug 105) that aborted the search.
     /// `Some` routes the CLI to stderr + exit 2 on both the bare and `--count`
     /// forms; `None` for every successful query.
@@ -2332,12 +2332,12 @@ struct SearchResponse {
     error: Option<String>,
 }
 
-/// Adapts a daemon-less [`GrepResponse`](catenary_mcp::router::GrepResponse) into
+/// Adapts a daemon-less [`GrepResponse`](catenary_cli::router::GrepResponse) into
 /// the CLI's [`SearchResponse`] so the daemon-served and in-process paths render
 /// through the identical code (bug 80, leg 4).
 #[cfg(unix)]
-impl From<catenary_mcp::router::GrepResponse> for SearchResponse {
-    fn from(r: catenary_mcp::router::GrepResponse) -> Self {
+impl From<catenary_cli::router::GrepResponse> for SearchResponse {
+    fn from(r: catenary_cli::router::GrepResponse) -> Self {
         Self {
             output: r.output,
             matches: r.matches,
@@ -2352,11 +2352,11 @@ impl From<catenary_mcp::router::GrepResponse> for SearchResponse {
     }
 }
 
-/// Adapts a daemon-less [`GlobResponse`](catenary_mcp::router::GlobResponse) into
+/// Adapts a daemon-less [`GlobResponse`](catenary_cli::router::GlobResponse) into
 /// the CLI's [`SearchResponse`] (bug 80, leg 4).
 #[cfg(unix)]
-impl From<catenary_mcp::router::GlobResponse> for SearchResponse {
-    fn from(r: catenary_mcp::router::GlobResponse) -> Self {
+impl From<catenary_cli::router::GlobResponse> for SearchResponse {
+    fn from(r: catenary_cli::router::GlobResponse) -> Self {
         Self {
             output: r.output,
             matches: None,
@@ -2365,7 +2365,7 @@ impl From<catenary_mcp::router::GlobResponse> for SearchResponse {
             no_match_patterns: r.no_match_patterns,
             dir_hints: r.dir_hints,
             metachar_names: r.metachar_names,
-            skipped: catenary_mcp::bridge::GrepSkips::default(),
+            skipped: catenary_cli::bridge::GrepSkips::default(),
             error: r.error,
         }
     }
@@ -2382,7 +2382,7 @@ fn render_grep_count(
     out: &mut cli::Output,
     matches: usize,
     files: usize,
-    skipped: &catenary_mcp::bridge::GrepSkips,
+    skipped: &catenary_cli::bridge::GrepSkips,
 ) {
     let suffix = skipped.count_suffix().unwrap_or_default();
     let _ = out.writeln(format_args!("{matches} matches in {files} files{suffix}"));
@@ -2392,7 +2392,7 @@ fn render_grep_count(
 /// result — a named skipped file as `skipped (<reason>): <path>`, walked files
 /// collapsed to `<n> file(s) skipped (<reason>)` (misc 135, bug 62). Emits
 /// nothing when nothing was skipped, so a normal result is unchanged.
-fn render_grep_skips(out: &mut cli::Output, skipped: &catenary_mcp::bridge::GrepSkips) {
+fn render_grep_skips(out: &mut cli::Output, skipped: &catenary_cli::bridge::GrepSkips) {
     for line in skipped.render_lines() {
         let _ = out.writeln(format_args!("{line}"));
     }
@@ -2412,7 +2412,7 @@ fn render_glob_count(out: &mut cli::Output, paths: usize) {
 /// vantage, down.
 #[cfg(unix)]
 async fn connect_daemon_ipc() -> Option<tokio::net::UnixStream> {
-    let ipc_path = catenary_mcp::router::socket_path();
+    let ipc_path = catenary_cli::router::socket_path();
     tokio::net::UnixStream::connect(&ipc_path).await.ok()
 }
 
@@ -2505,7 +2505,7 @@ async fn read_grep_frames<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    use catenary_mcp::router::GrepFrame;
+    use catenary_cli::router::GrepFrame;
     use tokio::io::AsyncBufReadExt;
 
     let mut response = SearchResponse::default();
@@ -2578,7 +2578,7 @@ async fn run_glob(
     include_gitignored: bool,
     include_hidden: bool,
 ) -> Result<()> {
-    use catenary_mcp::router::{GlobRequest, METHOD_GLOB};
+    use catenary_cli::router::{GlobRequest, METHOD_GLOB};
 
     let cwd = std::env::current_dir().context("cannot determine working directory")?;
 
@@ -2604,7 +2604,7 @@ async fn run_glob(
     let response = if let Some(stream) = connect_daemon_ipc().await {
         search_ipc_on(stream, METHOD_GLOB, &request).await?
     } else {
-        let resp = catenary_mcp::router::run_glob_daemon_less(&request).await?;
+        let resp = catenary_cli::router::run_glob_daemon_less(&request).await?;
         emit_no_daemon_marker();
         SearchResponse::from(resp)
     };
@@ -2654,7 +2654,7 @@ async fn run_glob(
 async fn run_start_editing(out: &mut cli::Output) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let ipc_path = catenary_mcp::router::socket_path();
+    let ipc_path = catenary_cli::router::socket_path();
 
     let stream = tokio::net::UnixStream::connect(&ipc_path)
         .await
@@ -2753,7 +2753,7 @@ struct DiagnosticsResponse {
 async fn run_done_editing(out: &mut cli::Output, paths: &[String]) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let ipc_path = catenary_mcp::router::socket_path();
+    let ipc_path = catenary_cli::router::socket_path();
 
     // Resolve relative scoped paths against the CLI's cwd (the daemon runs under
     // a different cwd). Bare form (no paths) sends an empty set → the daemon
@@ -2864,7 +2864,7 @@ async fn run_root_command(out: &mut cli::Output, path: PathBuf, method: &str) ->
 
     let resolved = cli::commands::resolve_root_path(&path);
 
-    let ipc_path = catenary_mcp::router::socket_path();
+    let ipc_path = catenary_cli::router::socket_path();
 
     let stream = tokio::net::UnixStream::connect(&ipc_path)
         .await
@@ -3629,7 +3629,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stop_board_lists_client_roots_and_connected_since() {
-        use catenary_mcp::state_snapshot::{ClientInfo, SessionEntry, now_iso};
+        use catenary_cli::state_snapshot::{ClientInfo, SessionEntry, now_iso};
 
         let sessions = vec![
             SessionEntry {
@@ -3673,7 +3673,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stop_board_singular_and_missing_roots() {
-        use catenary_mcp::state_snapshot::{ClientInfo, SessionEntry, now_iso};
+        use catenary_cli::state_snapshot::{ClientInfo, SessionEntry, now_iso};
 
         let sessions = vec![SessionEntry {
             client: ClientInfo {
@@ -5136,14 +5136,14 @@ mod tests {
     #[test]
     fn grep_count_matches_in_files() {
         let mut out = cli::Output::buffer(80);
-        render_grep_count(&mut out, 12, 3, &catenary_mcp::bridge::GrepSkips::default());
+        render_grep_count(&mut out, 12, 3, &catenary_cli::bridge::GrepSkips::default());
         assert_eq!(out.into_string(), "12 matches in 3 files\n");
     }
 
     #[test]
     fn grep_count_zero_is_well_formed() {
         let mut out = cli::Output::buffer(80);
-        render_grep_count(&mut out, 0, 0, &catenary_mcp::bridge::GrepSkips::default());
+        render_grep_count(&mut out, 0, 0, &catenary_cli::bridge::GrepSkips::default());
         assert_eq!(out.into_string(), "0 matches in 0 files\n");
     }
 
@@ -5152,7 +5152,7 @@ mod tests {
         // A named file skipped (binary content) is a skip, not a no-match: the
         // `--count` line reports it in a suffix, never as `0 … 0` silence
         // (misc 135, bug 62).
-        let skipped = catenary_mcp::bridge::GrepSkips {
+        let skipped = catenary_cli::bridge::GrepSkips {
             named: vec![("blob.bin".to_string(), "binary".to_string())],
             walked: vec![],
         };
@@ -5168,7 +5168,7 @@ mod tests {
     fn grep_count_skip_suffix_aggregates_binary_reason() {
         // Content classification leaves a single skip reason (misc 140): named
         // and walked binary skips fold into one honest `binary` tally.
-        let skipped = catenary_mcp::bridge::GrepSkips {
+        let skipped = catenary_cli::bridge::GrepSkips {
             named: vec![("blob.bin".to_string(), "binary".to_string())],
             walked: vec![("binary".to_string(), 2)],
         };
@@ -5183,7 +5183,7 @@ mod tests {
     #[test]
     fn grep_skips_render_named_and_walked_lines() {
         // A named file gets a per-file line; walked files aggregate by reason.
-        let skipped = catenary_mcp::bridge::GrepSkips {
+        let skipped = catenary_cli::bridge::GrepSkips {
             named: vec![("blob.bin".to_string(), "binary".to_string())],
             walked: vec![("binary".to_string(), 3)],
         };
@@ -5199,7 +5199,7 @@ mod tests {
     fn grep_skips_empty_renders_nothing() {
         // Nothing skipped → no lines, so a normal result is byte-identical.
         let mut out = cli::Output::buffer(80);
-        render_grep_skips(&mut out, &catenary_mcp::bridge::GrepSkips::default());
+        render_grep_skips(&mut out, &catenary_cli::bridge::GrepSkips::default());
         assert_eq!(out.into_string(), "");
     }
 
@@ -5345,7 +5345,7 @@ mod tests {
         // Genuine stream mode survives the buffer refactor: a non-empty byte
         // buffer produces the same plain-ripgrep line output as before, with no
         // enrichment. This is the path a real (non-empty) pipe reaches.
-        let flags = catenary_mcp::bridge::GrepFlags::default();
+        let flags = catenary_cli::bridge::GrepFlags::default();
         let mut out = cli::Output::buffer(80);
         run_grep_stdin(&mut out, b"alpha\nbeta\ngamma\n", "beta", &flags, false)
             .expect("stream search succeeds");
@@ -5363,7 +5363,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn grep_stdin_over_buffered_bytes_counts_and_lists() {
-        let flags = catenary_mcp::bridge::GrepFlags::default();
+        let flags = catenary_cli::bridge::GrepFlags::default();
 
         // --count over the buffer tallies matching lines.
         let mut out = cli::Output::buffer(80);
@@ -5372,7 +5372,7 @@ mod tests {
         assert!(out.into_string().contains("3 matches"));
 
         // -l over a buffer that matched prints the nameless-stream marker.
-        let list_flags = catenary_mcp::bridge::GrepFlags {
+        let list_flags = catenary_cli::bridge::GrepFlags {
             files_with_matches: true,
             ..Default::default()
         };

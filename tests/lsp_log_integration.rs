@@ -11,7 +11,7 @@
 
 use anyhow::Result;
 
-use catenary_mcp::logging::test_support::{
+use catenary_cli::logging::test_support::{
     MsgRow, query_all_messages, setup_logging, spawn_initialized_client,
 };
 

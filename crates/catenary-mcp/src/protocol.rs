@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! MCP (Model Context Protocol) type definitions.
+//! Bridge↔daemon wire-protocol definition.
+//!
+//! The MCP (Model Context Protocol) JSON-RPC message types that cross the
+//! Unix domain socket between the host-spawned bridge process and the
+//! Catenary daemon, plus their serialization. Both sides link this one
+//! definition (see the crate root), so they cannot disagree about the
+//! protocol's shape — only about which crate version they were built from.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

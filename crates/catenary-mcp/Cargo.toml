@@ -1,0 +1,22 @@
+[package]
+name = "catenary-mcp"
+version = "2.0.2"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Catenary's bridge crate: the bridge↔daemon wire-protocol definition (MCP JSON-RPC message types, their serialization, and the protocol version constant) shared by the host-spawned bridge process and the Catenary daemon."
+repository = "https://github.com/TwoWells/Catenary"
+documentation = "https://twowells.github.io/catenary/"
+readme = "../../README.md"
+keywords = ["mcp", "lsp", "protocol", "bridge", "ipc"]
+categories = ["development-tools"]
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+anyhow = "1.0.100"

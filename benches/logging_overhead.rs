@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use catenary_mcp::logging::{LogEvent, LoggingServer, Sink};
+use catenary_cli::logging::{LogEvent, LoggingServer, Sink};
 use tracing_subscriber::layer::SubscriberExt;
 
 /// No-op sink for measuring pure dispatch overhead.

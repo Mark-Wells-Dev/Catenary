@@ -11,12 +11,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
-use super::types::{
+use crate::logging::LoggingServer;
+use catenary_mcp::protocol::{
     CancelledParams, INTERNAL_ERROR, InitializeParams, InitializeResult, METHOD_NOT_FOUND,
     Notification, Request, RequestId, Response, Root, RootsListResult, ServerCapabilities,
     ServerInfo,
 };
-use crate::logging::LoggingServer;
 
 /// Map an MCP method to its tracing severity level.
 ///

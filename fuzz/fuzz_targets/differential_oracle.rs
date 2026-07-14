@@ -23,7 +23,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use catenary_mcp::cli::command_filter::oracle;
+use catenary_cli::cli::command_filter::oracle;
 
 fuzz_target!(|data: &[u8]| {
     // The gate receives its input as a JSON string field — always valid UTF-8 —

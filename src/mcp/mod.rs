@@ -3,8 +3,9 @@
 
 /// MCP server implementation (transport-agnostic).
 mod server;
-/// MCP type definitions and JSON-RPC messages.
-mod types;
 
 pub use server::{McpServer, RootsChangedCallback};
-pub use types::*;
+// The MCP JSON-RPC message types (the bridge↔daemon wire-protocol definition)
+// now live in the `catenary-mcp` bridge crate; re-export them here so the
+// daemon's existing `crate::mcp::*` consumers keep resolving unchanged.
+pub use catenary_mcp::protocol::*;

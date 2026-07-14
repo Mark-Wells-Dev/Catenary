@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/catenary-proc"]
+members = ["crates/catenary-mcp", "crates/catenary-proc"]
 # The cargo-fuzz crate (tokenizer ticket 06) is its own detached workspace
 # (`fuzz/Cargo.toml` declares `[workspace]`) and requires the nightly toolchain +
 # `libfuzzer-sys`. Excluded here so the stable `make check` run, `cargo deny`, and
@@ -15,12 +15,12 @@ members = ["crates/catenary-proc"]
 exclude = ["fuzz", "tests/fixtures/rust_repo", "tests/fixtures/conformance/rust"]
 
 [package]
-name = "catenary-mcp"
+name = "catenary-cli"
 version = "2.0.2"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 default-run = "catenary"
-description = "A high-performance multiplexing bridge between MCP (Model Context Protocol) and LSP (Language Server Protocol). Enables LLMs to access IDE-grade code intelligence across multiple languages simultaneously with smart routing and UTF-8 accuracy."
+description = "Catenary's multi-surface intelligence router: the `catenary` binary (CLI search, the LSP-multiplexing daemon, editing hooks, and the observability TUI). Gives AI coding agents IDE-grade code intelligence across many languages at once, with smart routing and UTF-8 accuracy."
 repository = "https://github.com/TwoWells/Catenary"
 documentation = "https://twowells.github.io/catenary/"
 keywords = ["mcp", "lsp", "language-server", "llm", "ai"]
@@ -64,6 +64,7 @@ mockls = []
 fuzzing = ["dep:brush-parser"]
 
 [dependencies]
+catenary-mcp = { path = "crates/catenary-mcp", version = "2.0.2" }
 catenary-proc = { path = "crates/catenary-proc", version = "0.2.0" }
 anyhow = "1.0.100"
 # `brush-parser` is the bash-fidelity reference parse for the differential oracle

@@ -368,7 +368,7 @@ fn lookup(server: &str) -> Option<&'static Case> {
 /// failing). In CI the workflow links the real component ahead of the shim, so
 /// the resolved binary is the component and the gate passes.
 fn on_path(name: &str) -> bool {
-    catenary_mcp::health::servers::server_binary_installed(name, name)
+    catenary_cli::health::servers::server_binary_installed(name, name)
 }
 
 /// Renders `values` as a TOML array of double-quoted strings (`["a", "b"]`).
@@ -1259,7 +1259,7 @@ fn every_case_fixture_exists() {
 fn matrix_and_cases_have_no_drift() {
     use std::collections::BTreeSet;
 
-    use catenary_mcp::recipes::{
+    use catenary_cli::recipes::{
         conformance_exempt_names, conformed_server_names, default_provisioning, default_recipes,
         provisioning_pending,
     };
@@ -1334,7 +1334,7 @@ fn matrix_and_cases_have_no_drift() {
 fn macos_provisioning_partitions_the_conformed_set() {
     use std::collections::BTreeSet;
 
-    use catenary_mcp::recipes::{conformed_server_names, default_provisioning, default_recipes};
+    use catenary_cli::recipes::{conformed_server_names, default_provisioning, default_recipes};
 
     let doc: toml::Value = toml::from_str(include_str!("../defaults/ci-provision-macos.toml"))
         .expect("ci-provision-macos.toml parses");

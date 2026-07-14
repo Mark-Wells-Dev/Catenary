@@ -153,7 +153,7 @@ SCCACHE := $(shell command -v sccache 2>/dev/null)
 mutants:
 	@mkdir -p $(CURDIR)/../.catenary-mutants-tmp && ulimit -v 16777216 && { \
 	   $(MUTANTS_MEMCAP_WRAP) env $(if $(SCCACHE),RUSTC_WRAPPER=$(SCCACHE) CARGO_INCREMENTAL=0 ,)NEXTEST_TEST_THREADS=$(TT) TMPDIR=$$(realpath $(CURDIR)/../.catenary-mutants-tmp) \
-	     cargo mutants --test-tool nextest $(if $(T),--package catenary-mcp -F $(T),) --timeout 1200 --jobs $(J) --features mockls $(if $(ITERATE),--iterate,) ; \
+	     cargo mutants --test-tool nextest $(if $(T),--package catenary-cli -F $(T),) --timeout 1200 --jobs $(J) --features mockls $(if $(ITERATE),--iterate,) ; \
 	   rc=$$? ; \
 	   out=$(CURDIR)/mutants.out ; \
 	   if [ -d $$out/log ]; then \

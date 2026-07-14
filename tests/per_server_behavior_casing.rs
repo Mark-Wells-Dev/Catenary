@@ -9,7 +9,7 @@
 //! Integration tests for per-server behavior casing (misc 157).
 //!
 //! The engine-internal per-server table
-//! (`catenary_mcp::lsp::server_behavior`) shapes each server's `initialize`:
+//! (`catenary_cli::lsp::server_behavior`) shapes each server's `initialize`:
 //! rust-analyzer is cased to never receive the `textDocument.diagnostic` client
 //! capability and never be sent `textDocument/diagnostic` (advertised pull *or*
 //! best-effort probe), while every other server receives today's shape unchanged.

@@ -2,12 +2,12 @@
 # (ADR 020 §6, tokenizer ticket 06).
 #
 # This is a DETACHED workspace: the empty `[workspace]` table below makes `fuzz/`
-# its own workspace root, so the parent `catenary-mcp` workspace — and therefore
+# its own workspace root, so the parent `catenary-cli` workspace — and therefore
 # `make check`, `cargo deny`, and `cargo machete` on stable — never descends into
 # it (the parent also `exclude`s it explicitly). It needs the nightly toolchain
 # and is run out-of-band (`make fuzz` / see `README.md`), never in CI-stable.
 #
-# The fuzz target body IS `catenary_mcp::cli::command_filter::oracle::check` —
+# The fuzz target body IS `catenary_cli::cli::command_filter::oracle::check` —
 # reused verbatim through the parent crate's `fuzzing` feature, so there is one
 # copy of the differential oracle, driven two ways (`proptest` on stable CI here,
 # `cargo-fuzz` for the nightly soak). `brush-parser` rides in transitively via the
@@ -29,7 +29,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.catenary-mcp]
+[dependencies.catenary-cli]
 path = ".."
 features = ["fuzzing"]
 

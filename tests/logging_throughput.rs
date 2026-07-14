@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 
-use catenary_mcp::logging::test_support::{message_count, setup_logging, spawn_initialized_client};
+use catenary_cli::logging::test_support::{message_count, setup_logging, spawn_initialized_client};
 
 const MOCK_LANG_A: &str = "yX4Za";
 

@@ -24,12 +24,12 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use catenary_mcp::source::Source;
+use catenary_cli::source::Source;
 use tempfile::tempdir;
 use tracing_subscriber::layer::SubscriberExt;
 
-use catenary_mcp::logging::LoggingServer;
-use catenary_mcp::logging::test_support::{
+use catenary_cli::logging::LoggingServer;
+use catenary_cli::logging::test_support::{
     MessageRecorder, MsgRow, message_count, query_all_messages,
 };
 
@@ -93,7 +93,7 @@ async fn lsp_request_scope_chain() -> Result<()> {
 
     let dir = tempdir()?;
     let bin = env!("CARGO_BIN_EXE_mockls");
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
+    let mut client = catenary_cli::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A],
         MOCK_LANG_A,
@@ -164,7 +164,7 @@ async fn pair_merge_still_works() -> Result<()> {
 
     let dir = tempdir()?;
     let bin = env!("CARGO_BIN_EXE_mockls");
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
+    let mut client = catenary_cli::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A],
         MOCK_LANG_A,
@@ -282,7 +282,7 @@ async fn stderr_captured_with_source_and_server() -> Result<()> {
     let dir = tempdir()?;
     let bin = env!("CARGO_BIN_EXE_mockls");
     let stderr_text = "mockls: test stderr capture line";
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
+    let mut client = catenary_cli::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A, "--stderr-message", stderr_text],
         MOCK_LANG_A,

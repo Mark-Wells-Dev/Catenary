@@ -30,6 +30,7 @@ allow = [
 # AGPL-3.0-or-later is allowed for Catenary's own crates via exceptions.
 
 exceptions = [
+    { name = "catenary-cli", allow = ["AGPL-3.0-or-later"] },
     { name = "catenary-mcp", allow = ["AGPL-3.0-or-later"] },
     { name = "catenary-proc", allow = ["AGPL-3.0-or-later"] },
     { name = "catenary-ts", allow = ["AGPL-3.0-or-later"] },

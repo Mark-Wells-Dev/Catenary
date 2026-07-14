@@ -41,8 +41,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio_util::sync::CancellationToken;
 
-use catenary_mcp::lsp::LspServer;
-use catenary_mcp::lsp::settle::{ProfileSample, ProfileSink, profile_loop};
+use catenary_cli::lsp::LspServer;
+use catenary_cli::lsp::settle::{ProfileSample, ProfileSink, profile_loop};
 
 // ── Constants ────────────────────────────────────────────────────────
 

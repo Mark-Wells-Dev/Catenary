@@ -9,7 +9,7 @@
 //! Integration tests for LSP client functionality using mockls.
 
 use anyhow::Result;
-use catenary_mcp::logging::LoggingServer;
+use catenary_cli::logging::LoggingServer;
 use tempfile::tempdir;
 
 fn test_logging() -> LoggingServer {
@@ -23,7 +23,7 @@ async fn test_mockls_initialize() -> Result<()> {
     let dir = tempdir()?;
     let bin = env!("CARGO_BIN_EXE_mockls");
 
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
+    let mut client = catenary_cli::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A],
         MOCK_LANG_A,
@@ -49,7 +49,7 @@ async fn test_mockls_initialize_workspace_folders() -> Result<()> {
     let dir = tempdir()?;
     let bin = env!("CARGO_BIN_EXE_mockls");
 
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
+    let mut client = catenary_cli::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A, "--workspace-folders"],
         MOCK_LANG_A,
@@ -81,7 +81,7 @@ async fn test_mockls_document_lifecycle() -> Result<()> {
 
     let bin = env!("CARGO_BIN_EXE_mockls");
 
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
+    let mut client = catenary_cli::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A],
         MOCK_LANG_A,
@@ -129,7 +129,7 @@ async fn test_client_capabilities() -> Result<()> {
     let bin = env!("CARGO_BIN_EXE_mockls");
 
     let log_path = init_log.to_str().ok_or_else(|| anyhow::anyhow!("path"))?;
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
+    let mut client = catenary_cli::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A, "--log-init-params", log_path],
         MOCK_LANG_A,
@@ -240,7 +240,7 @@ async fn enrichment_only_server_gets_no_diagnostics_advertisement() -> Result<()
 
     let log_path = init_log.to_str().ok_or_else(|| anyhow::anyhow!("path"))?;
     // `yX4Za` is absent from the blessed manifest ⇒ unverified ⇒ enrichment-only.
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
+    let mut client = catenary_cli::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A, "--log-init-params", log_path],
         MOCK_LANG_A,
@@ -290,14 +290,14 @@ async fn enrichment_only_server_gets_no_diagnostics_advertisement() -> Result<()
 /// walking, then resumes after `Healthy` and detects quiet.
 #[tokio::test]
 async fn test_settle_waits_through_busy_to_healthy() -> Result<()> {
-    use catenary_mcp::lsp::settle::{IdleDetector, SettleResult, await_idle};
+    use catenary_cli::lsp::settle::{IdleDetector, SettleResult, await_idle};
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
     let dir = tempdir()?;
     let bin = env!("CARGO_BIN_EXE_mockls");
 
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
+    let mut client = catenary_cli::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A, "--indexing-delay", "200"],
         MOCK_LANG_A,
@@ -334,14 +334,14 @@ async fn test_settle_waits_through_busy_to_healthy() -> Result<()> {
 /// then detect silence once the burn ends.
 #[tokio::test]
 async fn test_settle_returns_settled_on_quiet_tree() -> Result<()> {
-    use catenary_mcp::lsp::settle::{IdleDetector, SettleResult, await_idle};
+    use catenary_cli::lsp::settle::{IdleDetector, SettleResult, await_idle};
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
     let dir = tempdir()?;
     let bin = env!("CARGO_BIN_EXE_mockls");
 
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
+    let mut client = catenary_cli::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A, "--cpu-on-initialized", "100"],
         MOCK_LANG_A,
@@ -383,7 +383,7 @@ async fn test_content_modified_retry() -> Result<()> {
 
     let bin = env!("CARGO_BIN_EXE_mockls");
 
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
+    let mut client = catenary_cli::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A, "--content-modified-once"],
         MOCK_LANG_A,
@@ -418,7 +418,7 @@ async fn test_content_modified_retry() -> Result<()> {
 /// request transitions it to `Healthy`.
 #[tokio::test]
 async fn test_lifecycle_probing_to_healthy_on_tool_request() -> Result<()> {
-    use catenary_mcp::lsp::state::ServerLifecycle;
+    use catenary_cli::lsp::state::ServerLifecycle;
 
     let dir = tempdir()?;
     let script_path = dir.path().join(format!("probe.{MOCK_LANG_A}"));
@@ -426,7 +426,7 @@ async fn test_lifecycle_probing_to_healthy_on_tool_request() -> Result<()> {
 
     let bin = env!("CARGO_BIN_EXE_mockls");
 
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
+    let mut client = catenary_cli::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A],
         MOCK_LANG_A,
@@ -461,7 +461,7 @@ async fn test_lifecycle_probing_to_healthy_on_tool_request() -> Result<()> {
 /// Verifies the health probe transitions Probing → Healthy.
 #[tokio::test]
 async fn test_health_probe_transitions_to_healthy() -> Result<()> {
-    use catenary_mcp::lsp::state::ServerLifecycle;
+    use catenary_cli::lsp::state::ServerLifecycle;
 
     let dir = tempdir()?;
     let script_path = dir.path().join(format!("probe.{MOCK_LANG_A}"));
@@ -469,7 +469,7 @@ async fn test_health_probe_transitions_to_healthy() -> Result<()> {
 
     let bin = env!("CARGO_BIN_EXE_mockls");
 
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
+    let mut client = catenary_cli::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A],
         MOCK_LANG_A,
@@ -507,7 +507,7 @@ async fn test_server_env_passed_to_process() -> Result<()> {
         "hello_from_config".to_string(),
     );
 
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
+    let mut client = catenary_cli::lsp::LspClient::spawn(
         bin,
         &[MOCK_LANG_A, "--report-env", "CATENARY_TEST_ENV_VAR"],
         MOCK_LANG_A,
@@ -548,7 +548,7 @@ async fn test_real_rust_analyzer_initialize() -> Result<()> {
     std::fs::create_dir_all(dir.path().join("src"))?;
     std::fs::write(dir.path().join("src/lib.rs"), "")?;
 
-    let mut client = catenary_mcp::lsp::LspClient::spawn(
+    let mut client = catenary_cli::lsp::LspClient::spawn(
         "rustup",
         &["run", "stable", "rust-analyzer"],
         "rust",
