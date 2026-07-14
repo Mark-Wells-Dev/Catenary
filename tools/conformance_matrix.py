@@ -13,9 +13,16 @@ Each entry carries a `source` (`recipe` | `provision`) that the workflow branche
 on, plus the fields that source's install step needs:
 
     recipe:    { server, source, ecosystem, package, version, tier, hash,
-                 runtime_name, runtime_version }
+                 co_install, runtime_name, runtime_version }
     provision: { server, source, kind, version, component, apt, repo, asset,
                  sha256, bin, git, rev, url, gem, runtime_name, runtime_version }
+
+`co_install` (misc 195) is a list of `{package, version, hash}` pinned npm
+packages the server needs at runtime but does not bundle
+(typescript-language-server → typescript). The install step fetches, verifies,
+and installs each alongside the server by the same npm-tarball-sha512 mechanics,
+so the gate rides a KNOWN version, not the runner image's ambient one. Empty for
+every other recipe.
 
 A provisioning stanza marked `pending` (a required pin that could not be resolved
 mechanically — never invented) is SKIPPED with a stderr note: it cannot be
@@ -31,7 +38,7 @@ entry:
 
     macos homebrew:        { server, source, kind, formula, bin }
     macos linux-recipe:    { server, source, kind, ecosystem, package, version,
-                             hash }
+                             hash, co_install }
     macos linux-provision: { server, source, kind, prov_kind, git, rev, version }
 
 Before emitting, the macOS file is validated as a PARTITION of the
@@ -86,6 +93,25 @@ def _scoped(entries: dict[str, dict], base: Path | None, table: str) -> set[str]
     return {n for n, e in entries.items() if base_entries.get(n) != e}
 
 
+def co_installs(recipe: dict) -> list[dict]:
+    """The recipe's pinned npm co-installs (misc 195), each `{package, version,
+    hash}`, or `[]`.
+
+    Carried on the matrix entry (Linux recipe AND macOS linux-recipe) so the
+    install step can fetch, verify, and install each one alongside the server by
+    the same npm-tarball-sha512 mechanics — a KNOWN co-installed version on both
+    platforms instead of the runner image's ambient one.
+    """
+    return [
+        {
+            "package": co.get("package", ""),
+            "version": co.get("version", ""),
+            "hash": co.get("hash", ""),
+        }
+        for co in recipe.get("co_install", [])
+    ]
+
+
 def recipe_entry(name: str, recipe: dict) -> dict:
     """One `source = recipe` matrix entry."""
     runtime = recipe.get("runtime") or {}
@@ -97,6 +123,7 @@ def recipe_entry(name: str, recipe: dict) -> dict:
         "version": recipe.get("version", ""),
         "tier": recipe.get("tier", ""),
         "hash": recipe.get("hash", ""),
+        "co_install": co_installs(recipe),
         "runtime_name": runtime.get("name", ""),
         "runtime_version": runtime.get("version", ""),
     }
@@ -161,6 +188,7 @@ def macos_entry(
         "package": "",
         "version": "",
         "hash": "",
+        "co_install": [],
         "prov_kind": "",
         "git": "",
         "rev": "",
@@ -174,6 +202,10 @@ def macos_entry(
         entry["package"] = recipe.get("package", "")
         entry["version"] = recipe.get("version", "")
         entry["hash"] = recipe.get("hash", "")
+        # A linux-recipe rides the Linux npm recipe, so its co-installs flow
+        # through here too (misc 195) — a Linux pin bump reaches macOS with no
+        # second pin to maintain.
+        entry["co_install"] = co_installs(recipe)
     elif kind == MACOS_LINUX_PROVISION:
         source = provisions[name]
         entry["prov_kind"] = source.get("kind", "")

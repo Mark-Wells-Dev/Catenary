@@ -322,6 +322,38 @@ jobs:
               echo "unknown ecosystem: ${{ matrix.ecosystem }}"; exit 1 ;;
           esac
 
+      # Co-install a pinned npm package the server needs at runtime but does
+      # not bundle (ts-ls → typescript/tsserver; misc 195). Same
+      # npm-tarball-sha512 mechanics as the server itself: fetch the exact
+      # tarball, verify OUR pinned sha512, install --ignore-scripts. So the gate
+      # verifies against a KNOWN typescript version instead of the ubuntu runner
+      # image's ambient global (an unpinned tsserver behind a pinned gate — the
+      # exact thing the pin doctrine forbids). `matrix.co_install` is a JSON
+      # list; `[]` for every other recipe makes the loop a no-op.
+      - name: Install pinned co-installs (${{ matrix.server }})
+        if: matrix.source == 'recipe' && toJson(matrix.co_install) != '[]'
+        env:
+          CO_INSTALL: ${{ toJson(matrix.co_install) }}
+        run: |
+          set -euo pipefail
+          echo "$CO_INSTALL" | jq -c '.[]' | while read -r co; do
+            copkg="$(echo "$co" | jq -r '.package')"
+            cover="$(echo "$co" | jq -r '.version')"
+            cowant="$(echo "$co" | jq -r '.hash')"
+            spec="$copkg@$cover"
+            tarball="$(npm view "$spec" dist.tarball)"
+            curl -sSL "$tarball" -o co.tgz
+            digest="$(openssl dgst -sha512 -binary co.tgz | base64 -w0)"
+            actual="sha512-$digest"
+            if [ -n "$cowant" ] && [ "$actual" != "$cowant" ]; then
+              echo "integrity mismatch for co-install $spec"
+              echo "  expected $cowant"
+              echo "  actual   $actual"
+              exit 1
+            fi
+            npm install -g --ignore-scripts ./co.tgz
+          done
+
       # CI-only provisioning (tui-rework 10): obtain a server that no user-grade
       # ecosystem recipe can carry. One branch per provisioning `kind`. Pending
       # stanzas never reach here — conformance_matrix.py drops them (an
@@ -655,6 +687,37 @@ jobs:
               echo "unsupported linux-recipe ecosystem: ${{ matrix.ecosystem }}"
               exit 1 ;;
           esac
+
+      # Co-install the recipe's pinned npm packages on the macOS leg too (misc
+      # 195): the linux-recipe rides the Linux npm recipe, so its co-installs
+      # flow through with it. This is the whole point of the ticket — the
+      # macos-latest image ships NO ambient typescript, so ts-ls died
+      # deterministically at initialize ("Could not find a valid TypeScript
+      # installation") until this step pinned tsserver. Same BSD-base64 handling
+      # as the server install above (no -w0; strip newlines). `[]` → no-op.
+      - name: Install pinned co-installs (linux-recipe ${{ matrix.server }})
+        if: matrix.kind == 'linux-recipe' && toJson(matrix.co_install) != '[]'
+        env:
+          CO_INSTALL: ${{ toJson(matrix.co_install) }}
+        run: |
+          set -euo pipefail
+          echo "$CO_INSTALL" | jq -c '.[]' | while read -r co; do
+            copkg="$(echo "$co" | jq -r '.package')"
+            cover="$(echo "$co" | jq -r '.version')"
+            cowant="$(echo "$co" | jq -r '.hash')"
+            spec="$copkg@$cover"
+            tarball="$(npm view "$spec" dist.tarball)"
+            curl -sSL "$tarball" -o co.tgz
+            raw="$(openssl dgst -sha512 -binary co.tgz | base64)"
+            actual="sha512-$(printf '%s' "$raw" | tr -d '\n')"
+            if [ -n "$cowant" ] && [ "$actual" != "$cowant" ]; then
+              echo "integrity mismatch for co-install $spec"
+              echo "  expected $cowant"
+              echo "  actual   $actual"
+              exit 1
+            fi
+            npm install -g --ignore-scripts ./co.tgz
+          done
 
       # A neutral-kind `linux-provision` server: reuse the referenced Linux
       # provision's mechanics. The lattice dogfood is `cargo-git-locked` — a

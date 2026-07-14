@@ -164,6 +164,38 @@ pub struct Runtime {
     pub version: Option<String>,
 }
 
+/// A pinned npm package co-installed **alongside** a recipe's own server.
+///
+/// The motivating case (misc 195) is a server that needs an npm package
+/// resolvable at runtime but does not bundle it — typescript-language-server →
+/// the `typescript` package that supplies `tsserver`.
+///
+/// It is NOT a separate recipe (it keys no `[lsp.server.*]` and is never
+/// installed-and-conformed on its own) and NOT a `runtime` toolchain (node is
+/// already the npm host); it is an extra pinned npm artifact the conformance
+/// install step fetches, verifies, and installs by the SAME
+/// `npm-tarball-sha512` mechanics as the server itself — exact `version` plus
+/// the registry `dist.integrity` (SRI sha512), installed `--ignore-scripts`. So
+/// the gate verifies against a KNOWN co-installed version on both platforms
+/// instead of riding whatever the runner image happens to ship. The schema is
+/// deliberately generic (any recipe may carry a `co_install` list): the exempt
+/// `vscode-eslint-language-server` case, which needs an `eslint` co-install,
+/// could later reuse this mechanism (it stays exempt for now — it also needs a
+/// settings block).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoInstall {
+    /// The npm package identifier (e.g. `typescript`).
+    pub package: String,
+    /// The exact pinned version (never a range).
+    pub version: String,
+    /// The registry `dist.integrity` SRI sha512 for the pinned version, in the
+    /// same `sha512-<base64>` form the recipe `hash` carries. Absent only at
+    /// draft stage (filled mechanically by `refresh-recipes`), never fabricated;
+    /// [`recipes_missing_hash`] reports a co-install still lacking one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+}
+
 /// One CI-internal install recipe for a shipped server.
 ///
 /// `version` and `tier` are required by the schema: a recipe missing either
@@ -208,6 +240,15 @@ pub struct InstallRecipe {
     /// exempt one must NOT. The `note` records the honest reason (tui-rework 13).
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub conformance: bool,
+    /// Pinned npm packages co-installed alongside this server because it needs
+    /// them resolvable at runtime but does not bundle them (misc 195). Empty for
+    /// the common case. TOML serializes a `Vec<struct>` as `[[recipe.<name>.co_install]]`
+    /// array-of-tables, which — like [`Self::runtime`] — must follow every scalar
+    /// key of the parent table, so it is declared among the trailing composite
+    /// fields (an array-of-tables precedes a sub-table, so `co_install` sits
+    /// before `runtime`, and any recipe round-trips through `toml::to_string`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub co_install: Vec<CoInstall>,
     /// An additional runtime dependency (e.g. a JDK), if any.
     ///
     /// A struct-valued field, so it is declared **last**: TOML serializes a
@@ -303,20 +344,36 @@ pub fn validate_recipes(recipes: &BTreeMap<String, InstallRecipe>) -> Vec<String
                  exemption must state honestly why the shipped lifecycle cannot conform it"
             ));
         }
+        for co in &recipe.co_install {
+            if co.package.trim().is_empty() {
+                errors.push(format!("recipe `{name}` co-install has an empty package"));
+            }
+            if co.version.trim().is_empty() {
+                errors.push(format!(
+                    "recipe `{name}` co-install `{}` has an empty version",
+                    co.package
+                ));
+            }
+        }
     }
     errors
 }
 
-/// Names of hash-carrying-tier recipes that have no `hash` yet.
+/// Names of hash-carrying-tier recipes that have no `hash` yet — including a
+/// recipe whose npm co-install is still hashless.
 ///
-/// These are the drafts `refresh-recipes` still needs to resolve a hash for.
-/// Reported (not errored) so the draft set can ship version-pinned but hashless
-/// without a fabricated hash.
+/// These are the drafts `refresh-recipes` still needs to resolve a hash for. A
+/// co-install always pins by npm SRI sha512 (its `hash`), so a recipe with a
+/// hashless co-install is reported here too. Reported (not errored) so the draft
+/// set can ship version-pinned but hashless without a fabricated hash.
 #[must_use]
 pub fn recipes_missing_hash(recipes: &BTreeMap<String, InstallRecipe>) -> Vec<String> {
     recipes
         .iter()
-        .filter(|(_, r)| r.tier.carries_hash() && r.hash.is_none())
+        .filter(|(_, r)| {
+            (r.tier.carries_hash() && r.hash.is_none())
+                || r.co_install.iter().any(|co| co.hash.is_none())
+        })
         .map(|(name, _)| name.clone())
         .collect()
 }
@@ -1509,6 +1566,63 @@ mod tests {
     }
 
     #[test]
+    fn recipe_parses_and_roundtrips_a_co_install() {
+        // The `co_install` field (misc 195) pins an extra npm artifact the server
+        // needs at runtime but does not bundle. It parses from the inline
+        // array-of-tables form and round-trips as `[[recipe.<name>.co_install]]`,
+        // and — with a `runtime` also set — the array-of-tables serializes BEFORE
+        // the `runtime` sub-table (both trailing composites), so the whole recipe
+        // still round-trips through `toml::to_string`.
+        let toml = "[recipe.demo]\necosystem = \"npm\"\npackage = \"x\"\n\
+                    version = \"1.0.0\"\ntier = \"npm-tarball-sha512\"\ndraft = true\n\
+                    co_install = [{ package = \"typescript\", version = \"6.0.3\", \
+                    hash = \"sha512-abc==\" }]\n\
+                    runtime = { name = \"jdk\", version = \">=17\" }\n";
+        let recipes = parse_recipes(toml).expect("parses a co-install");
+        let co = &recipes["demo"].co_install;
+        assert_eq!(co.len(), 1, "one co-install");
+        assert_eq!(co[0].package, "typescript");
+        assert_eq!(co[0].version, "6.0.3");
+        assert_eq!(co[0].hash.as_deref(), Some("sha512-abc=="));
+
+        let serialized = toml::to_string(&Wrap { recipe: &recipes }).expect("serialize");
+        let reparsed = parse_recipes(&serialized).expect("reparse");
+        assert_eq!(recipes, reparsed, "a co-install-bearing recipe round-trips");
+    }
+
+    #[test]
+    fn co_install_with_empty_package_or_version_fails_validation() {
+        // A co-install pins exactly like a recipe: an empty package or version is a
+        // validation error, caught structurally rather than at install time.
+        let toml = "[recipe.demo]\necosystem = \"npm\"\npackage = \"x\"\n\
+                    version = \"1.0.0\"\ntier = \"npm-tarball-sha512\"\ndraft = true\n\
+                    co_install = [{ package = \"\", version = \"\" }]\n";
+        let recipes = parse_recipes(toml).expect("parses");
+        let errors = validate_recipes(&recipes);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("co-install") && e.contains("empty package")),
+            "an empty co-install package must fail validation: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_hashless_co_install_is_reported_missing_hash() {
+        // A co-install pins by npm SRI sha512, so a hashless one is a draft the
+        // refresh tooling still owes a hash — reported (never fabricated).
+        let toml = "[recipe.demo]\necosystem = \"npm\"\npackage = \"x\"\n\
+                    version = \"1.0.0\"\ntier = \"npm-tarball-sha512\"\n\
+                    hash = \"sha512-present==\"\ndraft = true\n\
+                    co_install = [{ package = \"typescript\", version = \"6.0.3\" }]\n";
+        let recipes = parse_recipes(toml).expect("parses");
+        assert!(
+            recipes_missing_hash(&recipes).contains(&"demo".to_owned()),
+            "a recipe whose co-install lacks a hash is reported missing a hash"
+        );
+    }
+
+    #[test]
     fn every_present_hash_is_well_formed_for_its_tier() {
         // A missing hash is allowed (drafts may ship version-pinned but hashless),
         // but any hash that IS present must match its tier's canonical form so a
@@ -1536,6 +1650,19 @@ mod tests {
                     recipe.hash.is_none(),
                     "recipe `{name}` tier delegates verification and must carry no hash"
                 ),
+            }
+        }
+        // A co-install always pins by npm SRI sha512 (regardless of the parent
+        // recipe's tier), so any present co-install hash must be well-formed too.
+        for (name, recipe) in &recipes {
+            for co in &recipe.co_install {
+                if let Some(hash) = co.hash.as_deref() {
+                    assert!(
+                        hash.starts_with("sha512-") && hash.len() > "sha512-".len(),
+                        "co-install `{}` of recipe `{name}` hash must be SRI sha512: {hash}",
+                        co.package
+                    );
+                }
             }
         }
     }

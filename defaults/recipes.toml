@@ -12,6 +12,13 @@
 #              feeds any recommendation, and a draft never enters it.
 #   hash       (optional) the pinned content hash for hash-carrying tiers
 #   note       (optional) residual supply-chain risk, stated honestly
+#   co_install (optional) pinned npm package(s) the server needs resolvable at
+#              runtime but does not bundle, co-installed alongside it (misc 195):
+#              [[recipe.<server>.co_install]] with package + version + hash, each
+#              pinned + verified by the SAME npm-tarball-sha512 mechanics. An
+#              array-of-tables, so it trails the scalars (and precedes runtime).
+#              ts-ls carries one (typescript → tsserver); no other draft needs
+#              one yet.
 #   runtime    (optional) an extra runtime dep, e.g.
 #              runtime = { name = "jdk", version = ">=17" } — declared LAST in a
 #              stanza (it is a sub-table). No tranche-1/2 draft needs one yet.
@@ -104,6 +111,22 @@ tier = "npm-tarball-sha512"
 draft = true
 hash = "sha512-5puofxZHgFdAYtfNpmwCAvgtaYgg8wrUnH30m7Ze3QuguId5RNRadKASpOpyDxTyUdAF51FjhTdjntLw/EuWcQ=="
 note = "resolves transitive deps at install time within the pinned version; the engine's --ignore-scripts install caps the residual to non-executing dep code. UN-EXEMPTED (diagnostics-debt 05): typescript-language-server is a push-only publisher (no textDocument/diagnostic pull) whose first didOpen/didSave diagnostic lands on an internal debounce AFTER the process has gone scheduler-idle. That settle/publish gap made it conformance = false (tui-rework 13); ledger 05's declared-constant gate closes it — the ledger AWAITS the version echo bounded by the debounce_ms constant declared in the blessed manifest ([discipline.typescript-language-server], debounce = 850 ms), never interpreting silence. Conformed against the pin by conformance_typescript_ls."
+# ts-ls does NOT bundle tsserver — it needs the `typescript` package resolvable
+# (workspace or global) or it dies at initialize with `-32603: Could not find a
+# valid TypeScript installation` (misc 195). The Linux conformance leg was
+# passing only by accident on the ubuntu runner image's ambient global
+# typescript — an UNPINNED, image-supplied tsserver behind a pinned gate — and
+# the macOS image ships none, so its leg died deterministically. This co-install
+# pins typescript the same way everything else is pinned (exact version + the
+# npm registry dist.integrity sha512), and the conformance install fetches,
+# verifies, and installs it globally --ignore-scripts alongside ts-ls on BOTH
+# platforms, so the gate verifies against a KNOWN tsserver version everywhere.
+# The pin is 6.0.3 — the version resolvable on the maintainer host, which the
+# ledger-05 un-exemption gate was validated against locally.
+[[recipe.typescript-language-server.co_install]]
+package = "typescript"
+version = "6.0.3"
+hash = "sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw=="
 
 # pyright's npm package is bundled (ships its own bundled node code); minimal
 # residual install-time dependency risk. The pyright class (findings 5/6) is why

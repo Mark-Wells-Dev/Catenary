@@ -922,6 +922,7 @@ mod tests {
             hash: None,
             note: None,
             conformance: true,
+            co_install: Vec::new(),
             runtime: None,
         }
     }
