@@ -408,55 +408,43 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Drives the editing lifecycle for `file` and consumes the diagnostics batch
-/// **with settle**, bounded by a hard `wall` clock.
+/// Drives a diagnostics serve for `file` **with settle**, bounded by a hard
+/// `wall` clock.
 ///
-/// The editing preamble (start → accumulate → prepare-handoff) uses the ordinary
-/// short-timeout IPC; the consuming `tool/editing-stop` — the step that settles
-/// and pulls — is read to EOF under the wall bound. The write half is left open
-/// (bug 24: a write-shutdown reads as client-disconnect on the daemon side and
-/// races the response). Exceeding the wall bound is the never-idle failure.
+/// Root-ownership stage 3 retired the two-phase editing handoff: the daemon serves
+/// `tool/editing-stop` against the on-disk ledger (bare) or the named `files`
+/// (scoped). Conformance names its fixture file (the scoped form, served
+/// regardless of ledger state), then reads the settle-and-pull response to EOF
+/// under the wall bound. The write half is left open (bug 24: a write-shutdown
+/// reads as client-disconnect on the daemon side and races the response).
+/// Exceeding the wall bound is the never-idle failure.
 fn run_settle_diagnostics(bridge: &BridgeProcess, file: &Path, wall: Duration) -> Result<String> {
     let socket = bridge.wait_for_ipc_socket()?;
     let file_str = file.to_str().context("fixture path is not UTF-8")?;
-
-    common::ipc_request(
-        &socket,
-        &json!({ "method": "pre-tool/editing-start", "agent_id": "" }),
-    )?;
-    common::ipc_request(
-        &socket,
-        &json!({
-            "method": "pre-tool/editing-state",
-            "tool_name": "Edit",
-            "file_path": file_str,
-            "agent_id": "",
-        }),
-    )?;
-    common::ipc_request(
-        &socket,
-        &json!({ "method": "pre-tool/editing-stop", "agent_id": "" }),
-    )?;
-
-    let raw = read_editing_stop_wall_bounded(&socket, wall)?;
+    let raw = read_editing_stop_wall_bounded(&socket, file_str, wall)?;
     Ok(common::diagnostics_output(&raw))
 }
 
-/// Sends `tool/editing-stop` and reads the settle-and-pull response to EOF,
-/// failing hard if the daemon has not closed the response within `wall`.
+/// Sends a scoped `tool/editing-stop` (naming `file`) and reads the
+/// settle-and-pull response to EOF, failing hard if the daemon has not closed the
+/// response within `wall`.
 ///
 /// The 500 ms per-read timeout is only poll cadence: it lets the loop re-check
 /// the wall clock every window while a blocked read is in flight. Unlike the
 /// progress-aware IPC helpers this carries **no** no-progress escape — the whole
 /// point of conformance is a finite ceiling on total settle time, so a server
 /// that keeps its tree hot forever (never-idle) is caught, not excused.
-fn read_editing_stop_wall_bounded(socket: &Path, wall: Duration) -> Result<String> {
+fn read_editing_stop_wall_bounded(socket: &Path, file: &str, wall: Duration) -> Result<String> {
     let mut stream = UnixStream::connect(socket).context("connect diagnostics socket")?;
     stream
         .set_read_timeout(Some(Duration::from_millis(500)))
         .context("set poll-cadence read timeout")?;
-    writeln!(stream, "{}", json!({ "method": "tool/editing-stop" }))
-        .context("write tool/editing-stop")?;
+    writeln!(
+        stream,
+        "{}",
+        json!({ "method": "tool/editing-stop", "files": [file] })
+    )
+    .context("write tool/editing-stop")?;
     // Do NOT shut down the write half (bug 24).
 
     let deadline = Instant::now() + wall;

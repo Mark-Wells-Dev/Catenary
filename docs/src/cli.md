@@ -176,13 +176,16 @@ freely — and `--count` answers "how many" without the listing.
 Print LSP diagnostics for the files you've edited, or lint the paths you
 name. Editing is tracked automatically — the first edit to a
 server-covered file starts it, there is no start step. Bare, this command
-diagnoses the current **batch**: it opens every modified file on its server,
-waits for each to settle, and prints a **per-file receipt** — every
-diagnosed file listed, its errors and warnings beneath it, or `[clean]`
-beside it when the file is clean. The batch is durable, not consumed: run
-bare again with no intervening edit and it re-diagnoses the same set, fresh
-(the `git status` idiom). Your next covered edit after a fully-diagnosed
-batch starts a new one. When a file's
+diagnoses the current **ledger** — the durable, on-disk set of files edited
+since their last diagnosis, kept per workspace root (the "kitchen"): it opens
+every due file on its server, waits for each to settle, and prints a
+**per-file receipt** — every diagnosed file listed, its errors and warnings
+beneath it, or `[clean]` beside it when the file is clean. Diagnosing a file
+pays it off: it leaves the ledger. So once you have run bare and served the
+edited set, the debt is paid — a repeat bare run with no intervening edit
+finds an empty ledger and answers `[no edited files]`. To re-check specific
+files, name them with the scoped form. Your next covered edit re-arms the
+ledger. When a file's
 server dies before answering — mid-run, or by failing to start at all —
 Catenary makes **one bounded, in-run attempt** to respawn it and re-run the
 remainder (a slight stall, never an unbounded wait); if that fails, coverage
@@ -214,40 +217,46 @@ truthful. The gate releases the degraded file exactly as a paid one — editing
 it again re-arms it, and a server that is back next run resumes the normal
 contract. When nothing was edited it prints `[no edited files]`.
 
-**The batch survives a killed client.** A `catenary diagnostics` run pays its
-debt by *delivery*, not at dispatch: the batch's per-file flags flip only after
+**The ledger survives a killed client.** A `catenary diagnostics` run pays its
+debt by *delivery*, not at dispatch: a file's ledger entry is unlinked only after
 the daemon's response reaches the CLI. So an invocation killed after dispatch (a
 backgrounded command reaped by the host, a tool-call timeout, a Ctrl-C) leaves
-the flags unflipped and the gate armed — the batch is intact, and the next bare
-run re-diagnoses it in full. A kill *after* a successful write recovers the same
-way: the batch is retained, so re-running bare re-serves it. Recovery is always
-"run it again."
+the ledger intact and the gate armed — the next bare run re-diagnoses it in full.
+Recovery is always "run it again."
 
-**The batch does not survive the daemon.** It is in-memory state keyed by
-`(session_id, agent_id)`: durable *across runs within a daemon instance*, but
-**released when the instance dies** (maintainer ruling, bug 79). On daemon death
-the debt is dropped, never spooled — a fresh daemon starts with a disarmed gate,
-and a bare run answers `[no edited files]`. This is deliberate: an unstable
-daemon must never lock a session out of the shell. The cost is that unpaid debt
-across a restart is forgotten silently; the benefit is that a wedged daemon is
-always recoverable by restart, never a permanent lockout.
+**The ledger survives the daemon.** It is durable on-disk state under the
+workspace root's lock directory, not in-memory: it outlives daemon restarts,
+machine reboots, and its author. A fresh daemon serves the same durable ledger,
+so unpaid debt is never silently forgotten across a restart. Enforcement,
+however, is **payability-gated** (the nag-never-hostage rule): the edit-debt
+Bash gate blocks non-edit commands only while the daemon is reachable and can
+actually serve a `catenary diagnostics`. When the daemon is down the gate stands
+down and work proceeds — a healthy daemon resuming the nag against the durable
+ledger is the contract working, never a hostage-taking. This supersedes the old
+drop-debt-on-daemon-death behavior: its intent (never lock a session out) is
+preserved by payability, while the debt itself now persists.
 
-**With and without hooks.** The batch is populated by the `PreToolUse` hook,
-which tracks every file the agent edits. In a **hooked** session (the plugin
-installed) `catenary diagnostics` behaves exactly as above — the bare form pays
-the tracked batch, and a scoped form pays the named files' debt. On a
-**hookless** box (no plugin, e.g. a scripted or CI invocation, or a bare shell)
-there is no tracked batch, so the two forms split:
+**Reading the receipt.** `catenary diagnostics` is a diagnose, not a verdict:
+its exit code is `0` whether the receipt is clean or dirty. Conditioning on the
+receipt content is the caller's job, not Catenary's — a `catenary diagnostics`
+followed by a commit proceeds regardless of what the receipt reports.
 
-- **Bare** `catenary diagnostics` is the gate verb, and there is no gate to pay:
-  it **errors** with a teaching message and exits `2` (a fault, not a clean
-  empty receipt). Naming what you want diagnosed is the fix.
+**Ownership.** The ledger is a property of the root, and each root has at most
+one editor (the durable lock, one-cook-per-kitchen). Only the lock **holder** may
+pull a locked root's ledger with the **bare** form: a non-owner's bare
+`catenary diagnostics` is denied, naming the owed root and teaching `catenary
+claim <root>` to take it (and its debt) over. The **scoped** form serves named
+paths regardless of ownership — a diagnose of a named file is a read, not a
+payment against someone else's kitchen. On a **hookless** box (no plugin, a
+scripted or CI invocation) the bare owner gate does not apply; the scoped form is
+the CLI-only lint surface — `doctor` → `pin` → `diagnostics .` works with no host
+plugin at all:
+
+- **Bare** `catenary diagnostics` pays the edited set for the current root's
+  ledger; on an empty ledger it answers `[no edited files]`.
 - **Scoped** `catenary diagnostics <path…>` — including `catenary diagnostics .`
-  — has no debt to settle, so it simply **serves the diagnostics on demand**:
-  it diagnoses the named paths (mounting an enclosing project root ephemerally
-  when needed) and prints the receipt, with no gate machinery. This is the
-  CLI-only lint surface — `doctor` → `pin` → `diagnostics .` works with no host
-  plugin at all.
+  — **serves the diagnostics on demand**: it diagnoses the named paths (mounting
+  an enclosing project root ephemerally when needed) and prints the receipt.
 
 ```bash
 catenary diagnostics                 # the whole edited set (hooked)

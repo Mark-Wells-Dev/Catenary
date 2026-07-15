@@ -21,7 +21,6 @@ use tracing::{Instrument, debug, error, info, warn};
 
 use crate::bridge::EditingGuardrail;
 use crate::bridge::HookRouter;
-use crate::bridge::editing_manager::SkippedEdits;
 use crate::bridge::filesystem_manager::Root;
 use crate::bridge::session::Session;
 use crate::bridge::{GlobOutcome, GrepFlags, GrepOutcome, GrepSkips, HunkChunk, ShapedOutput};
@@ -930,24 +929,24 @@ impl SearchLimiter {
     }
 }
 
-/// Same-identity diagnose admission control (misc 197 stage 1).
+/// Per-root diagnose admission control (misc 197 stage 1, re-keyed to the root in
+/// root-ownership stage 3).
 ///
 /// The host harness auto-backgrounds a slow `catenary diagnostics` and retries
 /// it; each retry opens a fresh daemon connection, so N concurrent rounds can
-/// stack for ONE agent. Left unbounded they all fan out to the shared LSP pool
+/// stack for ONE root. Left unbounded they all fan out to the shared LSP pool
 /// at once, and — as the beta sighting showed — the whole daemon can go quiet
-/// for an extended stretch. This registry admits one round per editing identity
-/// at a time: a second same-identity round waits for the in-flight one to
-/// finish, then runs its own (with a one-line note), rather than stacking a
-/// concurrent execution.
+/// for an extended stretch. This registry admits one round per ROOT at a time: a
+/// second same-root round waits for the in-flight one to finish, then runs its
+/// own (with a one-line note), rather than stacking a concurrent execution.
 ///
 /// It is the misc-191 in-flight-marker shape (`Mutex<HashMap<Key, Arc<Notify>>>`
 /// with an RAII guard) transplanted from the cold-spawn seat to the diagnose
-/// seat, keyed by the editing identity string (`session_id\0agent_id`, via
-/// [`crate::bridge::editing_manager::editing_key`]). Same-identity rounds
-/// serialize; DIFFERENT identities never collide (distinct keys), so today's
-/// cross-identity behavior is untouched — the redesign that adds cross-identity
-/// denial later reworks the *key*, not this admission mechanism.
+/// seat, keyed by the ROOT string (the serve resolves the diagnosed files' lock
+/// root — no identity below the hook). Same-root rounds serialize; DIFFERENT
+/// roots never collide (distinct keys). The one-cook-per-kitchen durable lock
+/// means a root has a single editor, so per-root serialization is the natural
+/// bound (the earlier per-identity keying is superseded).
 ///
 /// Cloneable: the `Arc` inner map is shared across every hook-connection handler
 /// (each connection gets a `HookDispatchContext` clone).
@@ -1085,6 +1084,18 @@ impl Drop for DiagRoundGuard<'_> {
 #[cfg(unix)]
 const DIAG_FOLLOWED_NOTE: &str = "another diagnose was in flight; this run followed it";
 
+/// The one-line breadcrumb a diagnose receipt leads with on the first serve
+/// after a `catenary claim` takeover (root-ownership stage 3, deliverable 7).
+///
+/// The serve path reads-and-removes the takeover marker
+/// ([`crate::lock::take_claim_marker`]) the claim dropped, so the inheriting
+/// editor's first receipt announces it is looking at work it took over — one
+/// line, then the per-file receipt (or a bare no-debt answer for a claimed paid
+/// root). One-shot: the marker is consumed here, so a later serve on the same
+/// root (no new claim) does not repeat it.
+#[cfg(unix)]
+const CLAIMED_RECEIPT_LEAD: &str = "root claimed from a prior editor";
+
 /// Shared context for session-aware hook dispatch.
 ///
 /// When set on [`SessionManager`], hook connections are routed to
@@ -1171,16 +1182,14 @@ struct HookDispatchContext {
 /// A staged hook→CLI handoff, deposited under a [`HandoffKey`] by the
 /// `PreToolUse` hook and consumed by the matching CLI command.
 ///
-/// The payload (see [`HandoffPayload`]) is *data-back*: `diagnostics` snapshots
-/// the drained file set for the CLI command to retrieve.
+/// The payload (see [`HandoffPayload`]) is *data-back*: the surviving `claim`
+/// payload carries the rendered answer the identity-less `catenary claim` CLI
+/// drains (root-ownership stage 3 demolished the `diagnostics` payload with the
+/// two-phase identity handoff).
 ///
 /// Dropping this struct drops the owned semaphore permit, releasing the key's
 /// serialization lock for the next same-key stage.
 struct HandoffContext {
-    /// Scope UUID minted at prepare time. Used as `parent_id` for the
-    /// IPC request/response events and all LSP children, linking them into
-    /// one TUI scope.
-    parent_id: String,
     /// The staged payload, keyed by direction.
     payload: HandoffPayload,
     /// Owned semaphore permit — dropped when the `HandoffContext`
@@ -1191,37 +1200,13 @@ struct HandoffContext {
 }
 
 /// The payload of a staged [`HandoffContext`].
+///
+/// Root-ownership stage 3 demolished the identity-correlation `Diagnostics`
+/// payload: diagnostics no longer stages an identity-keyed batch snapshot — the
+/// daemon serves against the durable ledger by pure path algebra. The one
+/// surviving payload is `Claim`, re-seated on the handoff machinery as the claim
+/// answer transport (identity lives at the hook, root-ownership stage 2).
 enum HandoffPayload {
-    /// `diagnostics` — *data-back*: the hook snapshots the batch and the
-    /// `catenary diagnostics` CLI command retrieves it. The batch is never
-    /// mutated at prepare *or* consume until delivery (misc 141): its `delivered`
-    /// flags flip only after the response's socket write succeeds, so a failed
-    /// attempt that never delivers leaves the batch and its gate intact for a
-    /// retry. The `editing_session`/`agent_id` key rides the handoff so the flip
-    /// targets the right `EditingManager` bucket.
-    Diagnostics {
-        /// The batch's files snapshotted from the editing session (delivered
-        /// ones included — a bare pull re-diagnoses the whole batch).
-        files: Vec<PathBuf>,
-        /// Edits skipped at accumulation time, split by predicate (misc 173; the
-        /// unverified bucket added in diagnostics-debt 04b): outside tracked
-        /// roots, in-root with no covering feeder, or in-root covered only by an
-        /// unverified (enrichment-only) server. The bare-run receipt renders each
-        /// bucket as its own advisory line.
-        skipped: SkippedEdits,
-        /// Host session id (from the staging hook). The bare `catenary
-        /// diagnostics` process is identity-less, so the session id rides the
-        /// handoff — the daemon looks the session up to flip its batch.
-        session_id: String,
-        /// `EditingManager` session key (the raw `session_id` Option, absent →
-        /// `None`) used to flip the batch on delivery. Distinct from the
-        /// `"default"`-fallback `session_id` above; mirrors how the prepare
-        /// snapshot was keyed.
-        editing_session: Option<String>,
-        /// Agent id used to flip the batch's per-agent bucket on delivery
-        /// (bug 37 scoping — touch only the requesting agent's batch).
-        agent_id: String,
-    },
     /// `claim` — *data-back*: the `PreToolUse` hook performs the atomic owner-file
     /// rename (identity lives at the hook, root-ownership stage 2) and stages the
     /// rendered answer; the identity-less `catenary claim` CLI drains it. The
@@ -1236,15 +1221,14 @@ enum HandoffPayload {
 /// Correlation key for the hook→CLI handoff — the catenary subcommand alone
 /// (ADR 014).
 ///
-/// `cwd`, pattern, and path are recorded for observability bucketing but are
-/// *not* key material. Only the load-bearing, bare-only `diagnostics` command
-/// stages a handoff; stateless `grep`/`glob` self-scope with a daemon-minted
-/// UUID and never correlate here.
+/// Root-ownership stage 3 demolished the `Diagnostics` key with its
+/// identity-correlation handoff (diagnostics now serves against the ledger). The
+/// sole surviving key is `Claim`: the hook performs the owner-file rename and
+/// stages the rendered answer, the identity-less CLI drains it. The registry
+/// stays keyed so the claim flow plugs into the mechanism rather than rebuilding
+/// a bespoke one.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum HandoffKey {
-    /// `catenary diagnostics` — data-back: the hook stages the accumulated
-    /// file set, the CLI drains it.
-    Diagnostics,
     /// `catenary claim` — data-back: the hook performs the owner-file rename and
     /// stages the rendered answer, the CLI drains it (root-ownership stage 2).
     Claim,
@@ -1252,9 +1236,9 @@ enum HandoffKey {
 
 impl HandoffKey {
     /// Every handoff key — used to eagerly create the per-key semaphores.
-    /// The registry stays keyed so each correlated command plugs into the
-    /// mechanism rather than rebuilding it.
-    const ALL: [Self; 2] = [Self::Diagnostics, Self::Claim];
+    /// The registry stays keyed so the claim flow plugs into the mechanism
+    /// rather than rebuilding it.
+    const ALL: [Self; 1] = [Self::Claim];
 }
 
 /// Per-key handoff self-heal timeout.
@@ -2135,16 +2119,7 @@ fn ephemeral_root_to_mount(
 /// outside any repository (no lock root) unlink nothing. Best-effort throughout.
 #[cfg(unix)]
 fn unlink_delivered_locks(files: &[PathBuf]) {
-    use std::collections::HashMap;
-    let mut by_root: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
-    for file in files {
-        if let Some(root) = crate::lock::resolve_lock_root(file) {
-            by_root.entry(root).or_default().push(file.clone());
-        }
-    }
-    for (root, served) in &by_root {
-        crate::lock::unlink_delivered(root, served);
-    }
+    crate::lock::unlink_delivered_by_root(files);
 }
 
 /// Reaps every ephemeral root idle beyond `idle` as of `now`, returning the
@@ -3770,131 +3745,6 @@ fn get_or_create_router(
     router
 }
 
-/// Appends the skipped-edits advisories to a diagnostics `output` when edits
-/// were dropped from the batch at accumulation time.
-///
-/// This keeps the diagnostics batch honest. A mixed batch — some edited
-/// files covered, some not — otherwise renders results for the covered
-/// files alone, with no signal that the rest went unchecked; a silent,
-/// incomplete batch is the "lying batch" the editing workflow exists to
-/// avoid. The all-skipped case (empty `output`, non-empty `skipped`) reduces
-/// to the notes alone — so a bare `catenary diagnostics` after only skipped
-/// edits never renders the bare `[no edited files]` lie (bug 58). Returns
-/// `output` unchanged when nothing was skipped.
-///
-/// The buckets are different predicates and render as distinct lines
-/// (misc 173; the unverified bucket added in diagnostics-debt 04b) — collapsing
-/// them claimed "outside tracked roots" for an in-root `Makefile` while naming
-/// its containing root in the same parenthesis:
-///
-/// - **In-root, no covering feeder** (`skipped.uncovered`): the root is
-///   tracked, but no server or linter covers the file (`Makefile`, `.txt`,
-///   logs). The note names the files — "(2 edits had no covering server when
-///   made (Makefile) — not checked)" — so it teaches what went unchecked.
-/// - **In-root, only an unverified server** (`skipped.unverified`): a
-///   diagnostics server IS configured for the file's language, but it is an
-///   unverified custom def (enrichment-only), so Catenary withholds its
-///   diagnostics. The note DECLARES "not diagnostics-covered" — a server exists
-///   (never "no covering server"), and the wording never blames Catenary
-///   (DESIGN's footgun ruling).
-/// - **Outside tracked roots** (`skipped.outside`): `skipped.outside_roots`
-///   carries the distinct enclosing project roots of those edits (walk
-///   repository markers up from each). When non-empty the note names them —
-///   "(roots: `~/Projects/Lattice`)" — pointing at what a `catenary pin`
-///   would mount (ephemeral-roots ticket 01); when empty (no detectable
-///   root) it falls back to the plain count.
-///
-/// Every wording is past-tense event language — the edits *were* outside /
-/// *had* no covering server / *were* not diagnostics-covered *when made*, not a
-/// claim about current server state (bug 170).
-#[cfg(unix)]
-fn with_skipped_edits_note(output: String, skipped: &SkippedEdits) -> String {
-    if skipped.is_empty() {
-        return output;
-    }
-    let mut notes: Vec<String> = Vec::new();
-    if skipped.uncovered > 0 {
-        let count = skipped.uncovered;
-        let plural = if count == 1 { "" } else { "s" };
-        if skipped.uncovered_files.is_empty() {
-            notes.push(format!(
-                "({count} edit{plural} had no covering server when made \u{2014} not checked)",
-            ));
-        } else {
-            let named = skipped
-                .uncovered_files
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            notes.push(format!(
-                "({count} edit{plural} had no covering server when made ({named}) \u{2014} not checked)",
-            ));
-        }
-    }
-    if skipped.unverified > 0 {
-        // The third rendering (diagnostics-debt 04b): a diagnostics server IS
-        // configured for these files, but it is unverified (a custom
-        // `[lsp.server.*]` def, enrichment-only), so Catenary withholds its
-        // diagnostics. The wording DECLARES the fact plainly ("not
-        // diagnostics-covered") — never "no covering server" (a server exists) and
-        // never uncertainty language that would read as a Catenary quirk. DESIGN's
-        // footgun ruling: receipts only speak where we can vouch; unknowns get
-        // declaration, not interpretation.
-        let count = skipped.unverified;
-        let plural = if count == 1 { "" } else { "s" };
-        if skipped.unverified_files.is_empty() {
-            notes.push(format!(
-                "({count} edit{plural} not diagnostics-covered when made \u{2014} only an unverified server covers them, not checked)",
-            ));
-        } else {
-            let named = skipped
-                .unverified_files
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            notes.push(format!(
-                "({count} edit{plural} not diagnostics-covered when made ({named}) \u{2014} only an unverified server covers them, not checked)",
-            ));
-        }
-    }
-    if skipped.outside > 0 {
-        // Past-tense event language: each record is an edit that WAS outside
-        // tracked roots when it was made, not a claim about the roots' current
-        // state. Batch-scoped and honest — a present-tense "no servers running
-        // for X" contradicts its own receipt when the same root is diagnosed in
-        // the same run, and names dead roots as if live (bug 170).
-        let count = skipped.outside;
-        let (verb, plural) = if count == 1 {
-            ("was", "")
-        } else {
-            ("were", "s")
-        };
-        if skipped.outside_roots.is_empty() {
-            notes.push(format!(
-                "({count} edit{plural} {verb} outside tracked roots when made \u{2014} not checked; see `catenary roots -h`)",
-            ));
-        } else {
-            let named = skipped
-                .outside_roots
-                .iter()
-                .map(|root| crate::bridge::compress_home(root))
-                .collect::<Vec<_>>()
-                .join(", ");
-            notes.push(format!(
-                "({count} edit{plural} {verb} outside tracked roots when made (roots: {named}) \u{2014} not checked; see `catenary roots -h`)",
-            ));
-        }
-    }
-    let notes = notes.join("\n");
-    if output.is_empty() {
-        notes
-    } else {
-        format!("{output}\n{notes}")
-    }
-}
-
 /// Decides whether an edited file should auto-mount its enclosing git worktree.
 ///
 /// Implements the subagent auto-mount predicate (workstream 30, ticket 1a): a
@@ -4156,7 +4006,6 @@ async fn handle_claim_stage(
         ctx.handoff.stage(
             HandoffKey::Claim,
             HandoffContext {
-                parent_id: uuid::Uuid::new_v4().to_string(),
                 payload: HandoffPayload::Claim {
                     answer: answer.clone(),
                 },
@@ -4217,6 +4066,16 @@ async fn retire_root(ctx: &HookDispatchContext, tracker: &RootTracker, worktree:
         && canonical != worktree
     {
         crate::lock::retire(&canonical);
+    }
+    // Close the root's held-open documents (root-ownership stage 3): a diagnose
+    // round tags its documents with the root, so root retirement is their
+    // teardown edge — the identity-keyed Stop close retired with the handoff.
+    // Both spellings, matching the ledger retire above.
+    ctx.primary.close_root_docs(worktree).await;
+    if let Ok(canonical) = worktree.canonicalize()
+        && canonical != worktree
+    {
+        ctx.primary.close_root_docs(&canonical).await;
     }
     let global = tracker.global_roots_rich();
     if let Err(e) = ctx.primary.sync_roots(global).await {
@@ -6069,147 +5928,22 @@ async fn handle_hook_dispatch(
         return Ok(());
     }
 
-    // ── Done editing handoff: prepare ────────────────────────────
+    // ── Diagnostics serve: the ledger is the batch ───────────────
     //
-    // `pre-tool/editing-stop` is sent by the PreToolUse hook when
-    // the agent runs `catenary diagnostics` (internal method name
-    // unchanged). Acquires the handoff lock and deposits a snapshot of the
-    // batch for the subsequent CLI command — the batch is neither drained nor
-    // its flags flipped here (misc 141): delivery, at consume, does that.
-    if method == "pre-tool/editing-stop" {
-        let scope_id = uuid::Uuid::new_v4().to_string();
-
-        let router = get_or_create_router(&ctx, &session_id, &raw);
-
-        // The PreToolUse hook forwards the real `agent_id` from the host CLI.
-        // Snapshot only the requesting agent's batch — reading every agent's
-        // bucket would surface a sibling subagent's set, since subagents share
-        // the parent's `session_id` and differ only by `agent_id` (bug 37).
-        let agent_id = raw
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        // Derive the EditingManager session key the same way the accumulation
-        // path does: the raw `session_id` Option (absent → None), NOT the
-        // `"default"`-fallback `session_id` used for the handoff payload and
-        // guardrail. The accumulation hook (`pre-tool/editing-state`) keys via
-        // `HookRequest.session_id.as_deref()`, so the drain must match exactly
-        // or it would look up the wrong key and drain nothing.
-        let editing_session = raw.get("session_id").and_then(|v| v.as_str());
-
-        // Acquire the `diagnostics` handoff permit. Blocks only behind another
-        // in-flight *diagnostics* handoff (per-key, ADR 014) — never daemon-wide
-        // — and holds for milliseconds at most.
-        let permit = ctx.handoff.acquire(HandoffKey::Diagnostics).await?;
-
-        // Reconcile the batch against disk before snapshotting it (bug 76): a
-        // write set is resolved and recorded at `PreToolUse`, before the command
-        // runs, so a command that failed wholesale left phantom targets that
-        // never came to exist. Dropping them here keeps the receipt from
-        // printing `[path does not exist]` lines for files nothing ever touched,
-        // while a real edit written and later deleted survives (observed on disk
-        // once) to render its honest `[path does not exist]` line. The
-        // `delivered` flags are untouched — reconciliation is membership truth,
-        // not the delivery transaction. This mutates *membership* only; the
-        // flag-flip deferral below is unaffected.
-        router
-            .session
-            .editing
-            .reconcile(editing_session, &agent_id, Path::exists);
-
-        // Snapshot the whole of this agent's batch (misc 141): the bare form
-        // re-diagnoses every batch file, delivered or not, so `files()` returns
-        // all of them. The batch is never mutated here — its `delivered` flags
-        // flip only when the consume step's response reaches the client, so a
-        // failed or never-connecting `catenary diagnostics` (clap reject,
-        // host-killed subprocess) leaves the batch and its gate exactly as they
-        // were, ready for a retry. The `editing_session`/`agent_id` key rides the
-        // handoff so the consume step flips exactly this bucket.
-        let files = router.session.editing.files(editing_session, &agent_id);
-        let skipped = router.session.editing.skipped(editing_session, &agent_id);
-
-        debug!(
-            source = Source::DaemonDispatch.as_str(),
-            session_id = %session_id,
-            agent_id = %agent_id,
-            file_count = files.len(),
-            skipped_outside = skipped.outside,
-            skipped_uncovered = skipped.uncovered,
-            skipped_unverified = skipped.unverified,
-            "diagnostics: snapshotted batch from EditingManager (flip deferred to delivery)",
-        );
-
-        // The editing guardrail is NOT released here (ws37 ticket 02, decision 3;
-        // misc 141). The gate is a debt paid by *delivered* diagnostics, so the
-        // release moves to the consume step and goes conditional: release iff no
-        // undelivered debt remains once the response reaches the client. Prepare
-        // only snapshots — a scoped pull that leaves debt keeps the gate armed,
-        // and a faulted attempt that never delivers leaves both the batch and the
-        // lock intact.
-
-        // Mint the scope UUID for the done-editing IPC execution.
-        // This is separate from the prepare handler's own scope_id —
-        // the prepare hook is one scope, the IPC execution is another.
-        let handoff_parent_id = uuid::Uuid::new_v4().to_string();
-
-        // Stage the file set under `diagnostics` and arm the per-key timeout
-        // (cleared if the CLI never connects). Dropping the context — on
-        // consume or timeout — releases the permit.
-        ctx.handoff.stage(
-            HandoffKey::Diagnostics,
-            HandoffContext {
-                parent_id: handoff_parent_id,
-                payload: HandoffPayload::Diagnostics {
-                    files,
-                    skipped,
-                    session_id: session_id.clone(),
-                    editing_session: editing_session.map(str::to_string),
-                    agent_id: agent_id.clone(),
-                },
-                permit,
-            },
-        );
-
-        debug!(
-            source = Source::DaemonDispatch.as_str(),
-            session_id = %session_id,
-            "diagnostics handoff prepared",
-        );
-
-        emit_hook_event(
-            tracing::Level::DEBUG,
-            &session_id,
-            &method,
-            Some(&scope_id),
-            &raw.to_string(),
-            "incoming hook",
-        );
-        emit_hook_event(
-            tracing::Level::DEBUG,
-            &session_id,
-            &method,
-            Some(&scope_id),
-            "{\"status\":\"ok\"}",
-            "outgoing hook response",
-        );
-
-        writer.write_all(b"{\"status\":\"ok\"}\n").await?;
-        writer.shutdown().await?;
-        return Ok(());
-    }
-
-    // ── Done editing handoff: run ────────────────────────────────
-    //
-    // `tool/editing-stop` is sent by the `catenary diagnostics` CLI
-    // command (internal method name unchanged). Takes the file list from the
-    // handoff slot, runs process_files_batched, and returns diagnostics.
+    // `tool/editing-stop` is sent by the `catenary diagnostics` CLI command
+    // (internal method name unchanged). Root-ownership stage 3 retired the
+    // two-phase identity handoff (`pre-tool/editing-stop` prepare + staged
+    // snapshot): the daemon now serves diagnoses against the on-disk lock
+    // ledger — the durable touch-tree the edit seam booked — so the batch a bare
+    // run computes over IS the due set read from disk (`crate::lock::due_files`),
+    // keyed by the caller's cwd → root by pure path algebra (no identity below
+    // the hook). There is no mirror and therefore no drift.
     if method == "tool/editing-stop" {
-        // Scoped paths from the consume request (ws37 ticket 02). The CLI
-        // resolves relative paths against its cwd before dispatch, so these are
-        // absolute. The bare form sends an empty set → the whole batch is
-        // re-diagnosed and its flags flipped; a non-empty set means the agent
-        // named files to diagnose on demand and pay their debt (misc 141).
+        // Scoped paths from the request. The CLI resolves relative paths against
+        // its cwd before dispatch, so these are absolute. The bare form sends an
+        // empty set → the whole ledger due set (the batch) is diagnosed; a
+        // non-empty set names files to diagnose on demand (the pull-anything
+        // form — served regardless of debt).
         let scoped_files: Vec<PathBuf> = raw
             .get("files")
             .and_then(serde_json::Value::as_array)
@@ -6221,63 +5955,83 @@ async fn handle_hook_dispatch(
             .unwrap_or_default();
         let scoped = !scoped_files.is_empty();
 
-        // Take the file list and parent_id from the `diagnostics` slot,
-        // releasing the permit immediately. The permit must not be held during
-        // the diagnostics pipeline (which may take seconds). Consuming the
-        // HandoffContext drops it, releasing the owned semaphore permit.
-        let handoff = ctx
-            .handoff
-            .consume(HandoffKey::Diagnostics)
-            .and_then(|h| match h.payload {
-                HandoffPayload::Diagnostics {
-                    files,
-                    skipped,
-                    session_id,
-                    editing_session,
-                    agent_id,
-                } => Some((
-                    files,
-                    skipped,
-                    session_id,
-                    editing_session,
-                    agent_id,
-                    h.parent_id,
-                )),
-                // The Diagnostics slot only ever holds a Diagnostics payload;
-                // any mismatch drops to no handoff (a fault, not a panic).
-                HandoffPayload::Claim { .. } => None,
-            });
+        // The caller's cwd (root-ownership stage 3): the bare form resolves its
+        // due set by pure path algebra — cwd → enclosing root → ledger. The CLI
+        // sends its cwd; an absent cwd falls back to the daemon's (degrades the
+        // bare form to "no root here → no debt", never a false serve).
+        let caller_cwd = raw.get("cwd").and_then(|v| v.as_str()).map_or_else(
+            || std::env::current_dir().unwrap_or_default(),
+            PathBuf::from,
+        );
 
-        // The batch is NOT mutated here (misc 141): a `catenary diagnostics` run
-        // pays its debt by *delivery*, not on consume, so the `delivered` flags
-        // flip only after the response's socket write succeeds (below) — a failed
-        // write must leave the flags false and the gate armed. The keys needed to
-        // flip the right `(editing_session, agent_id)` bucket ride the handoff and
-        // are captured before the borrow-consuming match. Uses the
-        // handoff-carried `session_id` (the value prepare staged — the bare
-        // consume request itself carries no session identity).
-        let flip_keys: Option<(String, Option<String>, String)> = handoff
-            .as_ref()
-            .map(|h| (h.2.clone(), h.3.clone(), h.4.clone()));
+        // Resolve the kitchen the bare form pays: the enclosing lock root of the
+        // caller's cwd. The batch a bare run computes over IS this root's due set
+        // read from disk. A scoped run names its own files and needs no root
+        // resolution for the diagnose set (delivery groups by each file's root).
+        let bare_root: Option<PathBuf> = crate::lock::resolve_lock_root(&caller_cwd);
 
-        // The held-open document owner (diagnostics-debt 01): the same
-        // `(editing_session, agent_id)` key the batch accumulates under.
-        // Batch-opened documents are tagged with it so the owning agent's
-        // Stop/SubagentStop closes exactly its documents. The hookless
-        // scoped form carries no identity — its documents open untagged.
-        let doc_owner: Option<String> = flip_keys.as_ref().map(|(_, editing_session, agent_id)| {
-            crate::bridge::editing_manager::editing_key(editing_session.as_deref(), agent_id)
-        });
-
-        // Extract scope_id early so we can emit the incoming hook
-        // event before running the diagnostics pipeline. This ensures
-        // the tool/editing-stop event is the first message in the
-        // parent_id group, making it the scope header in the TUI
-        // (matching the grep/glob pattern).
-        let scope_id = match &handoff {
-            Some((_, _, _, _, _, parent_id)) => parent_id.clone(),
-            None => uuid::Uuid::new_v4().to_string(),
+        // The diagnose set:
+        // - scoped: exactly the named paths (served regardless of debt);
+        // - bare:   the root's ledger due set (`crate::lock::due_files`), the
+        //           single source of truth — no in-memory mirror.
+        let diag_files: Vec<PathBuf> = if scoped {
+            scoped_files.clone()
+        } else {
+            bare_root
+                .as_deref()
+                .map(crate::lock::due_files)
+                .unwrap_or_default()
         };
+
+        // The held-open document owner (root-ownership stage 3): the ROOT, not an
+        // identity key. Documents a diagnose round opens are tagged with their
+        // root, so root retirement / the paid-idle reap closes them — no identity
+        // below the hook. A scoped run tags each file's own root; the bare run
+        // tags the resolved kitchen. `process_files_batched` takes one owner for
+        // the whole round, so a scoped run spanning roots tags them all under the
+        // first resolved root — acceptable: the reap closes the union on teardown.
+        let doc_owner: Option<String> = if scoped {
+            scoped_files
+                .first()
+                .and_then(|f| crate::lock::resolve_lock_root(f))
+                .map(|r| r.to_string_lossy().into_owned())
+        } else {
+            bare_root.as_ref().map(|r| r.to_string_lossy().into_owned())
+        };
+
+        // The takeover breadcrumb (root-ownership stage 3, deliverable 7): the
+        // first serve after a `catenary claim` reads-and-removes the marker and
+        // leads its receipt with the claimed line. Bare pays the resolved
+        // kitchen; a scoped run checks the roots it names. One-shot — a later
+        // serve on the same root (no new claim) sees nothing.
+        let claimed_roots: Vec<PathBuf> = if scoped {
+            let mut roots: Vec<PathBuf> = scoped_files
+                .iter()
+                .filter_map(|f| crate::lock::resolve_lock_root(f))
+                .collect();
+            roots.sort();
+            roots.dedup();
+            roots
+        } else {
+            bare_root.iter().cloned().collect()
+        };
+        let claimed = claimed_roots
+            .iter()
+            .any(|r| crate::lock::take_claim_marker(r));
+
+        // The identity-less session tag used for board reflection / ephemeral
+        // mounts / milestones (observability only, never gating): `"default"`
+        // when the request carries none, matching the convention hook dispatch
+        // applies elsewhere.
+        let session_id = raw
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default")
+            .to_string();
+
+        // Mint the scope UUID for this run. (The old prepare-hook parent_id is
+        // gone with the two-phase handoff — the serve is one scope.)
+        let scope_id = uuid::Uuid::new_v4().to_string();
 
         emit_hook_event(
             tracing::Level::INFO,
@@ -6291,66 +6045,23 @@ async fn handle_hook_dispatch(
         // `dirty` is a status label only (ws37 ticket 01): the CLI exits `0`
         // whether clean or dirty — the clean/dirty distinction lives in the
         // per-file receipt (`output`), where clean files carry `[clean]` and
-        // dirty files their diagnostics. Faults (no daemon, IPC/parse failure)
-        // are detected CLI-side and exit `2`; a bare consume against an empty
-        // slot is a daemon-detected fault carried in the envelope's `error`
-        // field (bug 100). `covered` is the count of covered files in the
-        // handoff: it lets the CLI print `[no edited files]` for a genuinely
-        // empty set (covered == 0, empty receipt).
-        //
-        // Resolve the run's file set and session identity. A scoped pull
-        // diagnoses exactly the named paths; the bare form re-diagnoses the
-        // whole batch snapshot (delivered files included). The
-        // accumulation-time `skipped` buckets (edits skipped for lack of
-        // coverage) apply only to the bare form — a scoped pull names files
-        // explicitly, so an uncovered named file renders its own out-of-scope
-        // line in the receipt and the accumulation notes are suppressed. Clone
-        // `scoped_files` for the pipeline — the originals are needed after the
-        // response write to flip exactly the named files on delivery.
-        //
-        // A scoped pull against an EMPTY slot is the hookless on-demand form
-        // (bug 100): no hook staged a prepare, but the request names its files,
-        // so the run is constructed without a handoff snapshot. There is no
-        // debt to pay — `flip_keys` is `None`, so nothing is marked delivered
-        // and the editing guardrail is untouched. Session identity falls back
-        // to `"default"`, the same convention the hook dispatch applies to
-        // requests that carry no `session_id`. A BARE consume against an empty
-        // slot resolves to `None` and is answered with the fault envelope
-        // below.
-        let run = match handoff {
-            Some((files, skipped, session_id, _, _, _)) => Some(if scoped {
-                (scoped_files.clone(), SkippedEdits::default(), session_id)
-            } else {
-                (files, skipped, session_id)
-            }),
-            None if scoped => Some((
-                scoped_files.clone(),
-                SkippedEdits::default(),
-                "default".to_string(),
-            )),
-            None => None,
-        };
-
-        let (dirty, output, covered, fault) = if let Some((diag_files, skipped, session_id)) = run {
+        // dirty files their diagnostics. `covered` is the diagnosed file count:
+        // it lets the CLI print `[no edited files]` for a genuinely empty set
+        // (covered == 0). The bare-rerun contract retired (root-ownership stage
+        // 3, deliverable 6): a bare run after full payment finds an empty ledger
+        // and honestly answers `[no edited files]` — no debt, no fault.
+        let (dirty, output, covered, fault) = {
             let covered = diag_files.len();
             if diag_files.is_empty() {
-                // Nothing covered to diagnose — the notes (if any) stand alone.
-                // If edits were made but none had feeder coverage, the editing
-                // session still ended: record an `editing_done` milestone so the
-                // activity ring shows the transition (ticket 08).
-                if !skipped.is_empty() {
-                    ctx.primary.record_milestone(
-                        crate::state_snapshot::MilestoneKind::EditingDone,
-                        "editing done · no covered files",
-                        Some(session_id.clone()),
-                    );
-                }
-                (
-                    false,
-                    with_skipped_edits_note(String::new(), &skipped),
-                    covered,
-                    None,
-                )
+                // Nothing due to diagnose — the honest no-debt answer (the new
+                // bare-rerun contract). A `claimed` breadcrumb still leads even an
+                // empty receipt so a takeover of a paid root is announced.
+                let output = if claimed {
+                    CLAIMED_RECEIPT_LEAD.to_string()
+                } else {
+                    String::new()
+                };
+                (false, output, covered, None::<String>)
             } else {
                 // Ephemeral mount (ticket 02): any diagnosed file outside
                 // every mounted root mounts its enclosing project root so the
@@ -6374,20 +6085,19 @@ async fn handle_hook_dispatch(
                 if let Some(s) = &board_session {
                     s.set_diagnostics_in_flight(true);
                 }
-                // Same-identity join (misc 197 stage 1): admit one round per
-                // editing identity at a time. The host harness auto-backgrounds a
-                // slow `catenary diagnostics` and retries it, stacking a fresh
-                // concurrent round per retry; left unbounded they all fan out to
-                // the shared LSP pool at once. A round whose identity already has
-                // one in flight WAITS for it here, then runs its own — never a
-                // second concurrent execution. Only identity-bearing rounds
-                // (`doc_owner` = the hooked `session_id\0agent_id`) take a seat;
-                // the hookless scoped form carries no identity and no debt, so it
-                // keeps today's behavior (no admission). The guard is held across
-                // the whole pipeline below and freed on drop (completion, an early
-                // return, or a cancelled future) so a wedged round never locks the
-                // identity out. `followed` ⇒ this run waited on a prior round, so
-                // its receipt earns the one-line note.
+                // Per-root diagnose admission (misc 197 stage 1, re-keyed to the
+                // root in stage 3): admit one round per ROOT at a time. The host
+                // harness auto-backgrounds a slow `catenary diagnostics` and
+                // retries it, stacking a fresh concurrent round per retry; left
+                // unbounded they all fan out to the shared LSP pool at once. A
+                // round whose root already has one in flight WAITS for it here,
+                // then runs its own — never a second concurrent execution. The
+                // seat is keyed by `doc_owner` (the resolved root); a run with no
+                // resolvable root takes none. The guard is held across the whole
+                // pipeline below and freed on drop (completion, an early return, or
+                // a cancelled future) so a wedged round never locks the root out.
+                // `followed` ⇒ this run waited on a prior round, so its receipt
+                // earns the one-line note.
                 let (_round_guard, followed) = match doc_owner.as_deref() {
                     Some(key) => {
                         let (guard, waited) = ctx.diag_rounds.claim(key).await;
@@ -6453,44 +6163,27 @@ async fn handle_hook_dispatch(
                     ),
                     Some(session_id.clone()),
                 );
-                // Surface any skipped edits alongside the covered-file results,
-                // so a mixed batch never silently hides the unchecked files. When
-                // this round followed another same-identity round (misc 197), lead
-                // the receipt with the one-line note so the caller can tell "my own
-                // prior round was working" from a silent gate.
-                let receipt = with_skipped_edits_note(outcome.output, &skipped);
-                let receipt = if followed {
-                    if receipt.is_empty() {
+                // Lead the receipt with the one-line takeover breadcrumb when
+                // this is the first serve after a `catenary claim` (root-ownership
+                // stage 3, deliverable 7), then the misc-197 followed note when
+                // this round waited on a prior same-root round.
+                let mut receipt = outcome.output;
+                if followed {
+                    receipt = if receipt.is_empty() {
                         DIAG_FOLLOWED_NOTE.to_string()
                     } else {
                         format!("{DIAG_FOLLOWED_NOTE}\n{receipt}")
-                    }
-                } else {
-                    receipt
-                };
-                (outcome.dirty, receipt, covered, None)
+                    };
+                }
+                if claimed {
+                    receipt = if receipt.is_empty() {
+                        CLAIMED_RECEIPT_LEAD.to_string()
+                    } else {
+                        format!("{CLAIMED_RECEIPT_LEAD}\n{receipt}")
+                    };
+                }
+                (outcome.dirty, receipt, covered, None::<String>)
             }
-        } else {
-            // Bare consume against an empty slot (bug 100): with no hook
-            // there is no gate and no debt, so the run is a misuse, not a
-            // completed-empty run. A hooked prepare whose TTL blew is the
-            // same shape — the run never happened, so a fault is more
-            // honest than the old exit-0 "handoff expired" text, which read
-            // like a trustworthy empty receipt. A user mistake, not a
-            // daemon health finding: the fault rides the envelope (CLI →
-            // stderr + exit 2) and stays out of the `warn!`/`error!`
-            // surfaces.
-            (
-                false,
-                String::new(),
-                0,
-                Some(
-                    "no diagnostics run staged — bare `catenary diagnostics` pays the edit \
-                         gate inside a hooked session; use `catenary diagnostics <path…>` to \
-                         diagnose named files or directories on demand"
-                        .to_string(),
-                ),
-            )
         };
 
         emit_hook_event(
@@ -6506,12 +6199,11 @@ async fn handle_hook_dispatch(
         // the rendered per-file receipt the CLI prints verbatim. `status` is a
         // clean/dirty label the CLI no longer maps to an exit code (ws37 ticket
         // 01) — it is retained for telemetry. `covered` (the diagnosed file
-        // count — the scoped paths, or the whole batch for a bare pull) lets the
-        // CLI print `[no edited files]` for a genuinely empty set (covered == 0,
-        // empty receipt; scoped pulls are always non-empty). A fault (bare
-        // consume, empty slot — bug 100) carries `status: "error"` plus the
-        // `error` message instead of a receipt; the CLI maps it to stderr +
-        // exit 2 rather than printing a receipt-shaped success.
+        // count) lets the CLI print `[no edited files]` for a genuinely empty set
+        // (covered == 0) — the honest no-debt answer of the new bare-rerun
+        // contract (root-ownership stage 3). The `fault` arm is retired: a bare
+        // run against a paid/empty ledger is not a fault, it is `[no edited
+        // files]`, so this always renders a receipt-shaped success.
         let envelope = fault.as_ref().map_or_else(
             || {
                 serde_json::json!({
@@ -6532,72 +6224,29 @@ async fn handle_hook_dispatch(
         payload.push(b'\n');
         writer.write_all(&payload).await?;
 
-        // The response bytes reached the client — flip the `delivered` flags now
-        // (misc 141). `delivered` is a transport fact: a run pays its debt by
-        // delivery, so a bare pull marks the whole batch delivered and a scoped
-        // pull marks exactly the named files. A failed `write_all` above returned
-        // early via `?`, leaving the flags false and the gate armed (the bug-60
-        // killed-client shape recovers by re-running — the next bare re-serves the
-        // batch, fresh). Once no undelivered debt remains, release the cross-
-        // session editing guardrail so another session can claim the root.
-        if let Some((session_id, editing_session, agent_id)) = &flip_keys {
-            let editing = ctx
-                .sessions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(session_id)
-                .map(|e| e.router.session.clone());
-            if let Some(session) = editing {
-                // The files this run served — the scoped set, or the whole batch
-                // snapshot for a bare pull. Captured before the flag-flip so the
-                // durable-lock ledger unlink (below) covers exactly what was
-                // delivered.
-                let delivered: Vec<PathBuf> = if scoped {
-                    scoped_files.clone()
-                } else {
-                    session.editing.files(editing_session.as_deref(), agent_id)
-                };
-                if scoped {
-                    session.editing.mark_delivered(
-                        editing_session.as_deref(),
-                        agent_id,
-                        &scoped_files,
-                    );
-                } else {
-                    session
-                        .editing
-                        .mark_delivered_all(editing_session.as_deref(), agent_id);
-                }
-                // Delivery deletes: unlink each served file's touch entry from
-                // the durable root lock's on-disk ledger (root-ownership stage 2).
-                // Empty `dir/` = paid = the daemon's idle countdown starts. This
-                // is daemon-side unlink of ledger entries — only the EDIT seam
-                // must stay daemon-free; delivery already runs here. Payment is
-                // parole, not release: the lock dir survives (the paid-idle
-                // reaper removes it after the window). Grouped by the file's
-                // resolved lock root so a multi-root batch pays each kitchen.
-                unlink_delivered_locks(&delivered);
-                debug!(
-                    source = Source::DaemonDispatch.as_str(),
-                    session_id = %session_id,
-                    agent_id = %agent_id,
-                    scoped,
-                    "diagnostics: batch flags flipped on delivery (misc 141)",
-                );
-                if !session
-                    .editing
-                    .has_undelivered(editing_session.as_deref(), agent_id)
-                {
-                    ctx.editing_guardrail.release_all(session_id);
-                    debug!(
-                        source = Source::DaemonDispatch.as_str(),
-                        session_id = %session_id,
-                        agent_id = %agent_id,
-                        "diagnostics: batch fully delivered — editing guardrail released",
-                    );
-                }
-            }
-        }
+        // The response bytes reached the client — pay the debt now (root-ownership
+        // stage 3). Delivery deletes: unlink each served file's touch entry from
+        // the durable root lock's on-disk ledger — the SOLE payment mechanism now
+        // that the ledger is the source of truth (the in-memory identity-keyed
+        // batch and its `delivered` flags retired with the handoff). Empty `dir/`
+        // = paid = the daemon's idle countdown starts; payment is parole, not
+        // release (the lock dir survives, the paid-idle reaper removes it after
+        // the window). `unlink_delivered_locks` groups by each file's resolved
+        // lock root, so a scoped set spanning kitchens pays each. A failed
+        // `write_all` above returned early via `?`, leaving every touch file in
+        // place and the gate armed — the killed-client shape recovers by
+        // re-running (the next bare re-serves the still-due set, fresh).
+        //
+        // The delivered set: the scoped named files, or the whole due set the
+        // bare run diagnosed. Both were already resolved into `diag_files`.
+        unlink_delivered_locks(&diag_files);
+        debug!(
+            source = Source::DaemonDispatch.as_str(),
+            session_id = %session_id,
+            scoped,
+            delivered = diag_files.len(),
+            "diagnostics: served files unlinked from the ledger (root-ownership stage 3)",
+        );
 
         writer.shutdown().await?;
         return Ok(());
@@ -6638,11 +6287,6 @@ async fn handle_hook_dispatch(
         let response = match ctx.handoff.consume(HandoffKey::Claim).map(|h| h.payload) {
             Some(HandoffPayload::Claim { answer }) => {
                 serde_json::json!({"status": "ok", "answer": answer})
-            }
-            // The Claim slot only ever holds a Claim payload; a mismatch is a
-            // programming error, surfaced as a fault rather than a panic.
-            Some(_) => {
-                serde_json::json!({"status": "error", "message": "handoff payload mismatch"})
             }
             None => serde_json::json!({"status": "not_staged"}),
         };
@@ -6849,35 +6493,16 @@ async fn handle_hook_dispatch(
         result.result = Some(crate::hook::HookResult::Block(nag));
     }
 
-    // ── Held-open batch teardown at stop (diagnostics-debt 01) ──────────
+    // ── Held-open batch teardown: root retirement, not identity (stage 3) ──
     //
-    // Both Stop and SubagentStop reach the daemon as `post-agent/require-release`.
-    // An **allowed** stop is batch end: close the stopping `(session, agent)`'s
-    // held-open documents on every server connection — exactly that agent's, no
-    // other's. A `Block` means the agent is NOT stopping (it is about to run
-    // `catenary diagnostics`, which reuses the held-open docs), so they stay
-    // open. Backgrounded: a client mutex can be held across a sibling's full
-    // diagnose settle (bug 104), and the stop response must not queue behind
-    // it. Daemon death closes implicitly (bug 79, unchanged).
-    if method == "post-agent/require-release"
-        && !matches!(&result.result, Some(crate::hook::HookResult::Block(_)))
-    {
-        let agent_id = raw
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let editing_session = raw
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let session = ctx.primary.clone();
-        tokio::spawn(async move {
-            session
-                .close_agent_docs(editing_session.as_deref(), &agent_id)
-                .await;
-        });
-    }
+    // The identity-keyed Stop/SubagentStop document close retired with the
+    // handoff demolition: documents a diagnose round opens are now tagged with
+    // their ROOT (root-ownership stage 3), so they are closed at root retirement
+    // (worktree removal — see `retire_root`) and by daemon death (bug 79,
+    // unchanged), never by a `(session, agent)` correlation below the hook. The
+    // one-cook-per-kitchen durable lock (stage 2) means a root's held-open
+    // documents belong to exactly one editor, so root-lifetime teardown closes
+    // exactly the right set.
 
     // ── Subagent worktree teardown at stop (misc 150) ──────────
     //
@@ -9217,11 +8842,9 @@ mod tests {
             let _ = m.accept_loop().await;
         });
 
-        // Session A enters editing mode and accumulates a covered file. The
-        // boundary block gates on a non-empty *covered* tracked set, not the
-        // mode bit, so a file must be tracked for the gate to fire. This
-        // harness configures no covered root, so accumulate via the session's
-        // editing manager directly.
+        // Session A enters editing mode and accumulates a covered file into its
+        // in-memory batch. The batch is per-session (`EditingManager` keyed by
+        // `(session_id, agent_id)`), so this must not appear under session B.
         let req = serde_json::json!({
             "method": "pre-tool/editing-start",
             "agent_id": "",
@@ -9239,10 +8862,28 @@ mod tests {
                 std::path::PathBuf::from("/src/main.rs"),
                 true,
             );
+
+            // The in-memory editing batch is per-session: session A holds the
+            // file, session B holds nothing. (Root-ownership stage 3 moved the
+            // diagnostics DEBT GATE off this in-memory batch onto the durable
+            // ledger; the batch survives only for its non-gate roles — this
+            // per-session isolation is one of them.)
+            assert!(
+                router_a.session.editing.has_files(Some("session-a"), ""),
+                "session A's batch holds its covered file"
+            );
+            assert!(
+                !router_a.session.editing.has_files(Some("session-b"), ""),
+                "session B's batch is empty — editing state does not leak across sessions"
+            );
         }
 
-        // Session A has a covered set pending: a non-filesystem Bash command is
-        // gated (the agent must run `catenary diagnostics` first).
+        // The Bash nag now reads the ledger (stage 3), not this in-memory batch.
+        // A `pre-tool/editing-state` request carrying no `cwd` resolves to no
+        // root, so the gate stands down and the non-filesystem Bash is allowed
+        // (payability): with the daemon reachable but no resolvable kitchen there
+        // is nothing to gate. Ledger-based gating is covered in
+        // tests/root_lock_integration.rs.
         let req = serde_json::json!({
             "method": "pre-tool/editing-state",
             "tool_name": "Bash",
@@ -9251,27 +8892,10 @@ mod tests {
             "session_id": "session-a"
         });
         let line = hook_roundtrip(&ipc_path, &req).await;
-        let envelope: crate::hook::HookResponseEnvelope =
-            serde_json::from_str(line.trim()).expect("parse response");
-        assert!(
-            matches!(envelope.result, Some(crate::hook::HookResult::Deny(_))),
-            "session A (covered set pending) should gate non-filesystem Bash, got: {envelope:?}"
-        );
-
-        // Session B never entered editing mode: the same command is allowed,
-        // proving editing state does not leak across sessions.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-state",
-            "tool_name": "Bash",
-            "command": "cargo build",
-            "agent_id": "",
-            "session_id": "session-b"
-        });
-        let line = hook_roundtrip(&ipc_path, &req).await;
         assert_eq!(
             line.trim(),
             "",
-            "session B (not editing) should allow Bash — editing state is per-session"
+            "the ledger gate stands down with no resolvable cwd (stage 3 payability)"
         );
 
         shutdown.cancel();
@@ -9302,1251 +8926,6 @@ mod tests {
             line.trim(),
             "",
             "subagent hook should pass through (empty response)"
-        );
-
-        shutdown.cancel();
-    }
-
-    // ── Done editing handoff tests ────────────────────────────────────
-
-    /// Send a hook JSON request and read all response data (may be
-    /// multi-line, unlike `hook_roundtrip` which reads a single line).
-    ///
-    /// Does NOT shutdown the write side after sending. `tool/editing-stop`
-    /// races its diagnostics pipeline against client disconnect (bug 24); a
-    /// write-shutdown reads as EOF on the daemon side and would trip the
-    /// disconnect branch before the response is sent. EOF still arrives — the
-    /// daemon shuts down its write half after every response. Mirrors the
-    /// production client, which keeps the write half open while reading.
-    async fn hook_roundtrip_full(ipc_path: &Path, request: &serde_json::Value) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let mut stream = tokio::net::UnixStream::connect(ipc_path)
-            .await
-            .expect("connect to IPC socket");
-
-        let mut payload = serde_json::to_string(request).expect("serialize");
-        payload.push('\n');
-        stream.write_all(payload.as_bytes()).await.expect("write");
-
-        let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .await
-            .expect("read response");
-        response
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn done_editing_handoff_no_files() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        // Enter editing mode.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-start",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req).await;
-
-        // Prepare handoff (no files accumulated).
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let line = hook_roundtrip(&ipc_path, &req).await;
-        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
-
-        // Execute done_editing/run — no edits at all. The response is the JSON
-        // envelope with a clean status and empty diagnostics output.
-        let req = serde_json::json!({"method": "tool/editing-stop"});
-        let response = hook_roundtrip_full(&ipc_path, &req).await;
-        let parsed: serde_json::Value =
-            serde_json::from_str(response.trim()).expect("valid diagnostics envelope");
-        assert_eq!(
-            parsed["status"], "clean",
-            "no edits is clean, got: {response}"
-        );
-        assert_eq!(
-            parsed["output"], "",
-            "expected empty diagnostics output for no edits, got: {response}",
-        );
-
-        shutdown.cancel();
-    }
-
-    #[test]
-    fn out_of_roots_note_appended_to_mixed_batch() {
-        // A dirty covered-file receipt (the note-appension is orthogonal to how
-        // clean/dirty files render in the receipt itself).
-        let covered = "src/main.rs:\n\t:1:1 [error] e: boom";
-
-        // Nothing skipped → output is untouched.
-        assert_eq!(
-            with_skipped_edits_note(covered.to_string(), &SkippedEdits::default()),
-            covered
-        );
-
-        // Mixed batch: the covered-file results are preserved and the note
-        // is appended so the unchecked edits are not silently hidden.
-        let outside_two = SkippedEdits {
-            outside: 2,
-            ..SkippedEdits::default()
-        };
-        let mixed = with_skipped_edits_note(covered.to_string(), &outside_two);
-        assert!(mixed.starts_with(&format!("{covered}\n")), "got: {mixed}");
-        assert!(
-            mixed.contains("2 edits were outside tracked roots when made"),
-            "got: {mixed}"
-        );
-        assert!(mixed.contains("not checked"), "got: {mixed}");
-
-        // All-skipped batch with no detectable roots: the plain note stands
-        // alone, no stray leading newline. Past-tense event wording (bug 170).
-        let outside_one = SkippedEdits {
-            outside: 1,
-            ..SkippedEdits::default()
-        };
-        let alone = with_skipped_edits_note(String::new(), &outside_one);
-        assert_eq!(
-            alone,
-            "(1 edit was outside tracked roots when made \u{2014} not checked; see `catenary roots -h`)",
-        );
-    }
-
-    #[test]
-    fn out_of_roots_note_names_detected_roots() {
-        use std::collections::BTreeSet;
-
-        // When the tracking carries the enclosing project root(s), the bare-run
-        // note names them (root-aware wording, ephemeral-roots ticket 01). The
-        // wording is past-tense event language — it names the roots the edits
-        // were outside, not a live "no servers running" claim (bug 170).
-        let skipped = SkippedEdits {
-            outside: 1,
-            outside_roots: BTreeSet::from([PathBuf::from("/home/dev/Projects/Lattice")]),
-            ..SkippedEdits::default()
-        };
-        let note = with_skipped_edits_note(String::new(), &skipped);
-        assert!(
-            note.contains("was outside tracked roots when made"),
-            "past-tense event wording: {note}"
-        );
-        assert!(
-            note.contains("(roots: "),
-            "root-aware wording names the roots: {note}"
-        );
-        assert!(
-            note.contains("Projects/Lattice"),
-            "names the detected root: {note}"
-        );
-        assert!(
-            note.contains("see `catenary roots -h`"),
-            "points at the mount command: {note}"
-        );
-        assert!(
-            !note.contains("no language servers running"),
-            "the present-tense live-state claim is gone (bug 170): {note}"
-        );
-    }
-
-    #[test]
-    fn no_covering_server_note_names_files() {
-        use std::collections::BTreeSet;
-
-        // Misc 173: an in-root edit no feeder covers renders its OWN line —
-        // naming the files — and never the out-of-roots claim. This is the
-        // Makefile reproducer: the old note said "outside tracked roots
-        // (roots: ~/Projects/Catenary)" for a file INSIDE that root.
-        let skipped = SkippedEdits {
-            uncovered: 1,
-            uncovered_files: BTreeSet::from(["Makefile".to_string()]),
-            ..SkippedEdits::default()
-        };
-        let note = with_skipped_edits_note(String::new(), &skipped);
-        assert_eq!(
-            note,
-            "(1 edit had no covering server when made (Makefile) \u{2014} not checked)",
-        );
-        assert!(
-            !note.contains("outside tracked roots"),
-            "an in-root uncovered edit must not claim out-of-roots: {note}"
-        );
-
-        // Plural form, several distinct names — sorted, comma-joined.
-        let skipped = SkippedEdits {
-            uncovered: 3,
-            uncovered_files: BTreeSet::from(["Makefile".to_string(), "notes.txt".to_string()]),
-            ..SkippedEdits::default()
-        };
-        let note = with_skipped_edits_note(String::new(), &skipped);
-        assert!(
-            note.contains("3 edits had no covering server when made (Makefile, notes.txt)"),
-            "got: {note}"
-        );
-    }
-
-    #[test]
-    fn skipped_note_renders_both_buckets_distinctly() {
-        use std::collections::BTreeSet;
-
-        // A batch mixing all three skip predicates renders three distinct lines
-        // (misc 173; the unverified bucket added in diagnostics-debt 04b): the
-        // in-root uncovered files by name, the unverified-only files under the
-        // "not diagnostics-covered" declaration, and the outside edits by root —
-        // never one conflated claim.
-        let covered = "src/main.rs [clean]";
-        let skipped = SkippedEdits {
-            outside: 2,
-            outside_roots: BTreeSet::from([PathBuf::from("/home/dev/Projects/homelab")]),
-            uncovered: 1,
-            uncovered_files: BTreeSet::from(["Makefile".to_string()]),
-            unverified: 1,
-            unverified_files: BTreeSet::from(["widget.zig".to_string()]),
-        };
-        let receipt = with_skipped_edits_note(covered.to_string(), &skipped);
-        assert!(
-            receipt.starts_with(&format!("{covered}\n")),
-            "covered receipt preserved: {receipt}"
-        );
-        assert!(
-            receipt.contains("1 edit had no covering server when made (Makefile)"),
-            "the uncovered bucket renders its own named line: {receipt}"
-        );
-        assert!(
-            receipt.contains("1 edit not diagnostics-covered when made (widget.zig)"),
-            "the unverified bucket declares 'not diagnostics-covered' by name: {receipt}"
-        );
-        assert!(
-            receipt.contains("only an unverified server covers them"),
-            "the unverified line states a server exists, unblessed: {receipt}"
-        );
-        // The footgun ruling: the wording never blames Catenary and never says
-        // "no covering server" for the unverified bucket (a server DOES exist).
-        assert!(
-            !receipt.contains("Catenary"),
-            "the note never reads as a Catenary quirk: {receipt}"
-        );
-        assert!(
-            receipt.contains("2 edits were outside tracked roots when made (roots: "),
-            "the outside bucket keeps the root-aware wording: {receipt}"
-        );
-        let uncovered_pos = receipt
-            .find("had no covering server")
-            .expect("uncovered line present");
-        let unverified_pos = receipt
-            .find("not diagnostics-covered")
-            .expect("unverified line present");
-        let outside_pos = receipt
-            .find("outside tracked roots")
-            .expect("outside line present");
-        assert!(
-            uncovered_pos < unverified_pos && unverified_pos < outside_pos,
-            "the three notes render in order (uncovered, unverified, outside): {receipt}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn done_editing_handoff_out_of_roots() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        // Enter editing mode.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-start",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req).await;
-
-        // Edit a file outside workspace roots — filtered, not accumulated.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-state",
-            "tool_name": "Edit",
-            "file_path": "/outside/some/file.rs",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req).await;
-
-        // Prepare handoff — files empty but filtered > 0.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let line = hook_roundtrip(&ipc_path, &req).await;
-        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
-
-        // Execute done_editing/run — should get out-of-roots message.
-        let req = serde_json::json!({"method": "tool/editing-stop"});
-        let response = hook_roundtrip_full(&ipc_path, &req).await;
-        assert!(
-            response.contains("outside tracked roots"),
-            "expected out-of-roots message, got: {response}",
-        );
-        assert!(
-            response.contains("1 edit "),
-            "out-of-roots message should report the filtered count, got: {response}",
-        );
-
-        shutdown.cancel();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bare_diagnostics_after_standalone_out_of_root_edit_is_not_no_edited_files() {
-        // Bug 58 regression: an out-of-root edit that arrives with NO covered
-        // edit alongside it (no prior `editing-start`, no in-root edit to open
-        // the editing entry) used to vanish — `handle_enforce_editing` let it
-        // flow free without entering editing mode, and the skipped-count bump
-        // was then a no-op because no entry existed. A later bare `catenary
-        // diagnostics` saw no skipped edits and lied with `[no edited files]`.
-        // `record_outside_edit` now creates the entry so the skipped note
-        // survives.
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        // Edit a file outside every root as the FIRST action — no editing-start,
-        // no covered edit to open the entry.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-state",
-            "tool_name": "Edit",
-            "file_path": "/outside/some/file.rs",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req).await;
-
-        // Prepare + run bare diagnostics.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let line = hook_roundtrip(&ipc_path, &req).await;
-        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
-
-        let req = serde_json::json!({"method": "tool/editing-stop"});
-        let response = hook_roundtrip_full(&ipc_path, &req).await;
-        assert!(
-            response.contains("outside tracked roots"),
-            "the standalone out-of-root edit must surface the filtered note, got: {response}",
-        );
-        assert!(
-            response.contains("1 edit "),
-            "the filtered count must be 1, got: {response}",
-        );
-        // The receipt output must NOT be the bare `[no edited files]` lie.
-        let parsed: serde_json::Value =
-            serde_json::from_str(response.trim()).expect("valid diagnostics envelope");
-        let output = parsed["output"].as_str().unwrap_or_default();
-        assert!(
-            !output.trim().is_empty(),
-            "output must carry the filtered note, not empty (→ CLI [no edited files]): {response}",
-        );
-
-        shutdown.cancel();
-    }
-
-    /// Misc 173 reproducer: an edit INSIDE a tracked root whose file no feeder
-    /// covers (the Catenary `Makefile`) must render the no-covering-server
-    /// note naming the file — never "outside tracked roots", which the old
-    /// conflated note claimed while printing the containing root in the same
-    /// parenthesis.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn done_editing_handoff_in_root_uncovered_names_file() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        // A registered workspace root, so the edited file is IN-root; its
-        // type (Makefile — no extension, no configured server) is uncovered.
-        let root = dir.path().join("workspace");
-        std::fs::create_dir_all(&root).expect("create workspace dir");
-        let manager = Arc::new(bind_with_session_roots(dir.path(), vec![root.clone()]));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        // Edit the in-root Makefile — no feeder covers it.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-state",
-            "tool_name": "Edit",
-            "file_path": root.join("Makefile").display().to_string(),
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req).await;
-
-        // Prepare + run bare diagnostics.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let line = hook_roundtrip(&ipc_path, &req).await;
-        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
-
-        let req = serde_json::json!({"method": "tool/editing-stop"});
-        let response = hook_roundtrip_full(&ipc_path, &req).await;
-        assert!(
-            response.contains("had no covering server"),
-            "in-root uncovered edit renders the no-covering-server note, got: {response}",
-        );
-        assert!(
-            response.contains("Makefile"),
-            "the note names the uncovered file, got: {response}",
-        );
-        assert!(
-            !response.contains("outside tracked roots"),
-            "an in-root edit must not be misattributed to root coverage (misc 173), got: {response}",
-        );
-
-        shutdown.cancel();
-    }
-
-    /// diagnostics-debt 04b: an in-root edit whose only covering server is an
-    /// UNVERIFIED custom def must NOT arm the gate, and its receipt must render
-    /// the "not diagnostics-covered" bucket (a server exists, unblessed) — never
-    /// "no covering server" (which would deny a server exists) and never a claim
-    /// that reads as a Catenary quirk (the footgun ruling). This is the
-    /// end-to-end pin: gate silent + receipt bucket wording, together.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn done_editing_handoff_unverified_only_declares_not_diagnostics_covered() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let root = dir.path().join("workspace");
-        std::fs::create_dir_all(&root).expect("create workspace dir");
-
-        // A config binding a custom extension to an UNVERIFIED server (a name
-        // absent from the blessed manifest). No blessing env here — the daemon
-        // classifies it enrichment-only.
-        let config_path = dir.path().join("config.toml");
-        std::fs::write(
-            &config_path,
-            "[lsp.server.qqz-ls]\npath = \"/nonexistent/qqz-ls\"\n\n\
-             [lsp.language.qqz]\nextensions = [\"qqz\"]\nservers = [\"qqz-ls\"]\n",
-        )
-        .expect("write config");
-        let config =
-            crate::config::Config::load_from_sources(&[config_path]).expect("config loads");
-
-        let manager = Arc::new(bind_with_session_config(
-            dir.path(),
-            vec![root.clone()],
-            config,
-        ));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        // Edit an in-root file whose only covering server is unverified.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-state",
-            "tool_name": "Edit",
-            "file_path": root.join("widget.qqz").display().to_string(),
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req).await;
-
-        // Prepare + run bare diagnostics.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let line = hook_roundtrip(&ipc_path, &req).await;
-        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
-
-        let req = serde_json::json!({"method": "tool/editing-stop"});
-        let response = hook_roundtrip_full(&ipc_path, &req).await;
-        assert!(
-            response.contains("not diagnostics-covered"),
-            "an unverified-only edit declares 'not diagnostics-covered', got: {response}",
-        );
-        assert!(
-            response.contains("widget.qqz"),
-            "the note names the unverified-only file, got: {response}",
-        );
-        assert!(
-            !response.contains("had no covering server"),
-            "a server DOES exist — the note must not deny it (uncovered wording), got: {response}",
-        );
-        assert!(
-            !response.contains("outside tracked roots"),
-            "an in-root edit is not outside a root, got: {response}",
-        );
-
-        shutdown.cancel();
-    }
-
-    /// Misc 173 sibling: the skipped-edits note clears once a bare receipt
-    /// delivers it. One outside edit, pay the batch, then a fresh bare run
-    /// must carry NO trailer — before the fix the bucket never cleared and
-    /// the note rode every later receipt for the rest of the session.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn skipped_note_clears_once_paid() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        // One out-of-root edit.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-state",
-            "tool_name": "Edit",
-            "file_path": "/outside/some/file.rs",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req).await;
-
-        // First bare run: the note is delivered — the debt is paid.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let line = hook_roundtrip(&ipc_path, &req).await;
-        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
-        let req = serde_json::json!({"method": "tool/editing-stop"});
-        let response = hook_roundtrip_full(&ipc_path, &req).await;
-        assert!(
-            response.contains("outside tracked roots"),
-            "the first receipt carries the note, got: {response}",
-        );
-
-        // Second bare run, no further edits: the paid note must NOT repeat.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let line = hook_roundtrip(&ipc_path, &req).await;
-        assert!(
-            line.contains("ok"),
-            "re-prepare should succeed, got: {line}"
-        );
-        let req = serde_json::json!({"method": "tool/editing-stop"});
-        let response = hook_roundtrip_full(&ipc_path, &req).await;
-        let parsed: serde_json::Value =
-            serde_json::from_str(response.trim()).expect("valid diagnostics envelope");
-        let output = parsed["output"].as_str().unwrap_or_default();
-        assert!(
-            !output.contains("outside tracked roots"),
-            "a paid note must not ride the next receipt (misc 173), got: {response}",
-        );
-        assert_eq!(
-            output, "",
-            "nothing new was edited or skipped — the receipt is empty, got: {response}",
-        );
-
-        shutdown.cancel();
-    }
-
-    /// Bug 100 ruling 1: a bare consume against an empty slot — no hook ever
-    /// staged a prepare (hookless box), or the prepare's TTL blew — is a fault,
-    /// not a completed-empty run. The envelope carries `status: "error"` and a
-    /// teaching `error` message the CLI maps to stderr + exit 2, replacing the
-    /// old exit-0 "handoff expired" text that read like an empty receipt.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn done_editing_handoff_expired() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        // Call done-editing/run without preparing a handoff.
-        let req = serde_json::json!({"method": "tool/editing-stop"});
-        let response = hook_roundtrip_full(&ipc_path, &req).await;
-        let parsed: serde_json::Value =
-            serde_json::from_str(response.trim()).expect("consume response is JSON");
-        assert_eq!(
-            parsed.get("status").and_then(serde_json::Value::as_str),
-            Some("error"),
-            "a bare consume on an empty slot is a fault envelope, got: {response}",
-        );
-        let message = parsed
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .expect("fault envelope carries an error message");
-        assert!(
-            message.contains("hooked session") && message.contains("catenary diagnostics"),
-            "the fault teaches the correct next step, got: {message}",
-        );
-
-        shutdown.cancel();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn done_editing_handoff_with_accumulated_files() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        // Enter editing mode.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-start",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req).await;
-
-        // Accumulate a file via pre-tool hook (file tracking).
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-state",
-            "tool_name": "Edit",
-            "file_path": "/tmp/nonexistent_file.rs",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req).await;
-
-        // Prepare handoff — snapshots the accumulated file.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let line = hook_roundtrip(&ipc_path, &req).await;
-        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
-
-        // Execute done_editing/run — diagnostics pipeline runs on
-        // the files. Since there's no real LSP server, the output
-        // depends on whether the file exists and has LSP coverage.
-        // The key test: the handoff consumed the files successfully.
-        let req = serde_json::json!({"method": "tool/editing-stop"});
-        let response = hook_roundtrip_full(&ipc_path, &req).await;
-        // With no LSP servers the file is uncovered (rendered as
-        // "[no LSP coverage]", not "[clean]" — a `[clean]` line is for a
-        // covered file a feeder verified, not an uncovered one). The response
-        // should not be the expired message.
-        assert!(
-            !response.contains("handoff expired"),
-            "handoff should not be expired, got: {response}",
-        );
-
-        shutdown.cancel();
-    }
-
-    /// Regression guard for bug 37 (under the misc-141 batch model): two agents
-    /// share one Catenary session (a subagent and the main agent, distinguished
-    /// only by `agent_id`). A `catenary diagnostics` for one `agent_id` must flip
-    /// ONLY that agent's batch — the sibling agent's batch must stay armed so its
-    /// own later `catenary diagnostics` still reports its edits. Two
-    /// `(session_id, agent_id)` pairs never share a batch.
-    ///
-    /// The flip is deferred to *delivery* (the consume step's socket write), not
-    /// the prepare (`pre-tool/editing-stop`): the prepare only snapshots. So the
-    /// assertion runs after the consume.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn done_editing_handoff_flips_only_requesting_agent() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        // Both agents enter editing mode under the same session. Sending the
-        // editing-start hooks creates the session and its EditingManager.
-        for agent in ["sub-a", ""] {
-            let req = serde_json::json!({
-                "method": "pre-tool/editing-start",
-                "agent_id": agent,
-                "session_id": "sess-1"
-            });
-            let _ = hook_roundtrip(&ipc_path, &req).await;
-        }
-
-        // Stage distinct accumulated files per agent. This harness configures
-        // no covered root, so accumulate via the session's editing manager
-        // directly (mirrors session_state_editing_per_session).
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            router.session.editing.record_covered_edit(
-                Some("sess-1"),
-                "sub-a",
-                std::path::PathBuf::from("/src/a.rs"),
-                true,
-            );
-            router.session.editing.record_covered_edit(
-                Some("sess-1"),
-                "",
-                std::path::PathBuf::from("/src/b.rs"),
-                true,
-            );
-        }
-
-        // Prepare the handoff for the subagent only — this snapshots the
-        // subagent's batch.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "sub-a",
-            "session_id": "sess-1"
-        });
-        let line = hook_roundtrip(&ipc_path, &req).await;
-        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
-
-        // Consume the handoff — delivery flips the subagent's batch. The identity
-        // rides the staged payload, so the bare consume request carries none.
-        let req = serde_json::json!({"method": "tool/editing-stop"});
-        let _ = hook_roundtrip_full(&ipc_path, &req).await;
-
-        // The subagent's batch is delivered (gate disarmed); the main agent's
-        // batch stays armed — the two never shared state.
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            assert!(
-                !router
-                    .session
-                    .editing
-                    .has_undelivered(Some("sess-1"), "sub-a"),
-                "subagent's batch is delivered after its consume — gate disarmed"
-            );
-            assert!(
-                router.session.editing.has_undelivered(Some("sess-1"), ""),
-                "the main agent's batch stays armed (bug 37 / misc 141)"
-            );
-            assert_eq!(
-                router.session.editing.files(Some("sess-1"), ""),
-                vec![std::path::PathBuf::from("/src/b.rs")],
-                "main agent's batch is untouched by the subagent's delivery"
-            );
-        }
-
-        shutdown.cancel();
-    }
-
-    /// Core regression for bug 32 (under the misc-141 batch model): a failed
-    /// `catenary diagnostics <path>` attempt fires `pre-tool/editing-stop`
-    /// (prepare) but never consumes the slot (clap rejects it before the IPC, or
-    /// the host kills the subprocess). The prepare only SNAPSHOTS — it never
-    /// mutates the batch — so the batch survives the abandoned attempt armed, and
-    /// a subsequent valid `catenary diagnostics` still reports the edited files.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn failed_diagnostics_attempt_preserves_edited_set() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        // Enter editing mode and accumulate a tracked file.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-start",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req).await;
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            router.session.editing.record_covered_edit(
-                Some("sess-1"),
-                "",
-                std::path::PathBuf::from("/src/edited.rs"),
-                true,
-            );
-        }
-
-        // The FAILED attempt: the PreToolUse hook fires prepare, but the
-        // malformed `catenary diagnostics <path>` exits before connecting, so
-        // the slot is never consumed. The set must survive.
-        let prepare = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let line = hook_roundtrip(&ipc_path, &prepare).await;
-        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
-
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            assert!(
-                router.session.editing.has_undelivered(Some("sess-1"), ""),
-                "snapshot prepare must NOT flip — the batch stays armed after the failed attempt"
-            );
-            assert_eq!(
-                router.session.editing.files(Some("sess-1"), ""),
-                vec![std::path::PathBuf::from("/src/edited.rs")],
-                "the batch survives the failed attempt intact"
-            );
-        }
-
-        // The corrective VALID attempt: prepare again (re-snapshots the still
-        // present batch), then consume. The batch is still reported, then flipped
-        // to delivered on the successful response write.
-        let line = hook_roundtrip(&ipc_path, &prepare).await;
-        assert!(
-            line.contains("ok"),
-            "second prepare should succeed, got: {line}"
-        );
-
-        let consume = serde_json::json!({"method": "tool/editing-stop"});
-        let response = hook_roundtrip_full(&ipc_path, &consume).await;
-        assert!(
-            !response.contains("handoff expired"),
-            "valid consume must find the staged files, got: {response}",
-        );
-
-        // After delivery the batch is retained but delivered — the gate disarms
-        // (misc 141), while the batch stays available for a repeat bare re-run.
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            assert!(
-                !router.session.editing.has_undelivered(Some("sess-1"), ""),
-                "delivery disarms the gate (flags flip, batch retained)"
-            );
-            assert_eq!(
-                router.session.editing.files(Some("sess-1"), ""),
-                vec![std::path::PathBuf::from("/src/edited.rs")],
-                "the batch is retained for a repeat bare re-diagnosis"
-            );
-        }
-
-        shutdown.cancel();
-    }
-
-    /// ws37 ticket 02 (under the misc-141 batch model): a scoped
-    /// `catenary diagnostics <path>` pays only the named file's debt. The consume
-    /// carries an explicit `files` param; the daemon flips ONLY those flags on
-    /// delivery and, because undelivered debt remains, keeps the editing guardrail
-    /// armed. The batch retains every file.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scoped_diagnostics_pays_partial_debt_keeps_gate_armed() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-start",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req).await;
-
-        let root = dir.path().to_path_buf();
-        let file_a = root.join("a.rs");
-        let file_b = root.join("b.rs");
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            router
-                .session
-                .editing
-                .record_covered_edit(Some("sess-1"), "", file_a.clone(), true);
-            router
-                .session
-                .editing
-                .record_covered_edit(Some("sess-1"), "", file_b.clone(), true);
-            // Arm the guardrail on the root the way a covered edit would.
-            ctx.editing_guardrail
-                .try_acquire(&root, "sess-1")
-                .expect("arm guardrail");
-        }
-
-        let prepare = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let line = hook_roundtrip(&ipc_path, &prepare).await;
-        assert!(line.contains("ok"), "prepare should succeed, got: {line}");
-
-        // Scoped consume: pay only file_a's debt.
-        let consume = serde_json::json!({
-            "method": "tool/editing-stop",
-            "files": [file_a.to_string_lossy()],
-        });
-        let response = hook_roundtrip_full(&ipc_path, &consume).await;
-        assert!(
-            !response.contains("handoff expired"),
-            "scoped consume must find the staged handoff, got: {response}",
-        );
-
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            assert_eq!(
-                router.session.editing.undelivered_files(Some("sess-1"), ""),
-                vec![file_b.clone()],
-                "a scoped pull flips only the named file; the rest stays undelivered",
-            );
-            assert_eq!(
-                router.session.editing.files(Some("sess-1"), "").len(),
-                2,
-                "the batch retains both files",
-            );
-            // Debt remains → the guardrail stays armed: another session can't
-            // claim the root.
-            assert!(
-                ctx.editing_guardrail.try_acquire(&root, "other").is_err(),
-                "a partial pull leaves debt, so the gate stays armed",
-            );
-        }
-
-        shutdown.cancel();
-    }
-
-    /// ws37 ticket 02 (under the misc-141 batch model): a bare
-    /// `catenary diagnostics` pays the whole debt. The guardrail release is
-    /// conditional on delivery — the bare form flips every flag, so nothing stays
-    /// undelivered and the gate releases. The batch itself is retained.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bare_diagnostics_pays_all_debt_releases_gate() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-start",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req).await;
-
-        let root = dir.path().to_path_buf();
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            router
-                .session
-                .editing
-                .record_covered_edit(Some("sess-1"), "", root.join("a.rs"), true);
-            router
-                .session
-                .editing
-                .record_covered_edit(Some("sess-1"), "", root.join("b.rs"), true);
-            ctx.editing_guardrail
-                .try_acquire(&root, "sess-1")
-                .expect("arm guardrail");
-        }
-
-        let prepare = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &prepare).await;
-
-        // Bare consume (no `files`): re-diagnoses the whole batch and flips
-        // every flag on delivery.
-        let consume = serde_json::json!({"method": "tool/editing-stop"});
-        let _ = hook_roundtrip_full(&ipc_path, &consume).await;
-
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            assert!(
-                !router.session.editing.has_undelivered(Some("sess-1"), ""),
-                "a bare pull delivers the whole batch — nothing stays undelivered",
-            );
-            assert_eq!(
-                router.session.editing.files(Some("sess-1"), "").len(),
-                2,
-                "the batch is retained for a repeat bare re-diagnosis",
-            );
-            // No undelivered debt → the guardrail released: another session can
-            // claim the root.
-            assert!(
-                ctx.editing_guardrail.try_acquire(&root, "other").is_ok(),
-                "the bare form delivers everything, so the gate releases on delivery",
-            );
-        }
-
-        shutdown.cancel();
-    }
-
-    /// misc 141 (idiom fix): a bare `catenary diagnostics` run over a completed
-    /// batch re-diagnoses the SAME batch instead of `[no edited files]`. The
-    /// batch is durable daemon state; delivery flips its flags but retains it, so
-    /// a repeat bare run (no intervening edit) computes fresh over the same scope.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn repeat_bare_re_diagnoses_the_same_batch() {
-        // Drive a bare run (prepare + consume) and return its parsed envelope.
-        async fn bare_run(ipc_path: &Path) -> serde_json::Value {
-            let prepare = serde_json::json!({
-                "method": "pre-tool/editing-stop",
-                "agent_id": "",
-                "session_id": "sess-1"
-            });
-            let _ = hook_roundtrip(ipc_path, &prepare).await;
-            let response = hook_roundtrip_full(
-                ipc_path,
-                &serde_json::json!({"method": "tool/editing-stop"}),
-            )
-            .await;
-            serde_json::from_str(response.trim()).expect("valid diagnostics envelope")
-        }
-
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        let start = serde_json::json!({
-            "method": "pre-tool/editing-start",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &start).await;
-
-        let root = dir.path().to_path_buf();
-        let file_a = root.join("a.rs");
-        let file_b = root.join("b.rs");
-        std::fs::write(&file_a, "fn a() {}\n").expect("write a.rs");
-        std::fs::write(&file_b, "fn b() {}\n").expect("write b.rs");
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            router
-                .session
-                .editing
-                .record_covered_edit(Some("sess-1"), "", file_a.clone(), true);
-            router
-                .session
-                .editing
-                .record_covered_edit(Some("sess-1"), "", file_b.clone(), true);
-        }
-
-        // Run 1: covers the whole batch, flips every flag on delivery.
-        let first = bare_run(&ipc_path).await;
-        assert_eq!(
-            first["covered"].as_u64(),
-            Some(2),
-            "run 1 covers the whole batch, got: {first}",
-        );
-        assert!(
-            !first["output"]
-                .as_str()
-                .unwrap_or_default()
-                .trim()
-                .is_empty(),
-            "run 1 renders a receipt, got: {first}",
-        );
-
-        // Run 2, with NO intervening edit: the batch is retained, so a repeat
-        // bare run re-diagnoses the same scope instead of `[no edited files]`.
-        let second = bare_run(&ipc_path).await;
-        assert_eq!(
-            second["covered"].as_u64(),
-            Some(2),
-            "repeat bare re-diagnoses the same batch (not `[no edited files]`), got: {second}",
-        );
-        assert!(
-            !second["output"]
-                .as_str()
-                .unwrap_or_default()
-                .trim()
-                .is_empty(),
-            "run 2 renders a fresh receipt over the same batch, got: {second}",
-        );
-
-        shutdown.cancel();
-    }
-
-    /// misc 141 / bug 60: an undelivered bare run leaves the batch's flags false
-    /// and the gate armed. Deterministic by protocol, not scheduling (bug 90):
-    /// the consume request is written WITHOUT its trailing newline and the
-    /// socket is then fully closed, so the daemon's `read_line` framing can
-    /// only complete at EOF — the handler cannot start until the client's close
-    /// has retired. From there no schedule can deliver: the disconnect probe
-    /// (bug 24) reads an immediate EOF, and if the pipeline branch wins the
-    /// race anyway, the response `write_all` lands on a fully closed peer
-    /// (EPIPE) and returns early — the flip is gated on that write. This models
-    /// the real bug-60 kill shape (a dead process closes both directions), not
-    /// a half-open socket no production client presents. The batch survives,
-    /// and the next bare run re-serves it in full.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn undelivered_run_leaves_flags_false_and_gate_armed() {
-        // Write the request with no trailing newline, then fully close the
-        // socket (both directions). EOF is the request terminator, so the
-        // daemon observes the request only after the close has retired.
-        //
-        // Degradation guard: if request framing ever rejects unterminated
-        // lines, this consume errors without taking the staged handoff, and
-        // the recovery prepare below blocks on the handoff permit until
-        // `HANDOFF_TIMEOUT` — the test goes visibly slow rather than silently
-        // meaningless.
-        async fn send_unterminated_and_close(ipc_path: &Path, request: &serde_json::Value) {
-            use tokio::io::AsyncWriteExt;
-            let mut stream = tokio::net::UnixStream::connect(ipc_path)
-                .await
-                .expect("connect to IPC socket");
-            let payload = serde_json::to_string(request).expect("serialize");
-            stream.write_all(payload.as_bytes()).await.expect("write");
-            drop(stream);
-        }
-
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        let start = serde_json::json!({
-            "method": "pre-tool/editing-start",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &start).await;
-
-        let root = dir.path().to_path_buf();
-        let file_a = root.join("a.rs");
-        std::fs::write(&file_a, "fn a() {}\n").expect("write a.rs");
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            router
-                .session
-                .editing
-                .record_covered_edit(Some("sess-1"), "", file_a.clone(), true);
-        }
-
-        // Prepare, then run a consume whose client is already fully closed by
-        // the time the daemon sees the request: no schedule can deliver a
-        // response, so the batch's flag never flips.
-        let prepare = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &prepare).await;
-        send_unterminated_and_close(
-            &ipc_path,
-            &serde_json::json!({"method": "tool/editing-stop"}),
-        )
-        .await;
-
-        // The flag never flipped: the gate stays armed and the batch is intact.
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            assert!(
-                router.session.editing.has_undelivered(Some("sess-1"), ""),
-                "an undelivered run must leave the gate armed (flags false)"
-            );
-            assert_eq!(
-                router.session.editing.files(Some("sess-1"), ""),
-                vec![file_a.clone()],
-                "the batch survives the undelivered run intact"
-            );
-        }
-
-        // Recovery: the next bare run re-serves the whole batch (the bug-60 shape).
-        let _ = hook_roundtrip(&ipc_path, &prepare).await;
-        let response = hook_roundtrip_full(
-            &ipc_path,
-            &serde_json::json!({"method": "tool/editing-stop"}),
-        )
-        .await;
-        let parsed: serde_json::Value =
-            serde_json::from_str(response.trim()).expect("valid diagnostics envelope");
-        assert_eq!(
-            parsed["covered"].as_u64(),
-            Some(1),
-            "the next bare run covers the batch (bug-60 recovery), got: {response}",
         );
 
         shutdown.cancel();
@@ -10615,561 +8994,18 @@ mod tests {
         );
     }
 
-    /// misc 141: two `(session_id, agent_id)` pairs never share a batch. Each
-    /// session accumulates and delivers its own file; one session's delivery
-    /// leaves the other's batch untouched, and neither batch names the other's
-    /// file.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn two_sessions_never_share_a_batch() {
-        // Drive one session through a full bare run over a single distinctive
-        // file (declared first so it precedes the test's statements).
-        async fn run_session(
-            ipc_path: &Path,
-            manager: &SessionManager,
-            session_id: &str,
-            file: &Path,
-        ) {
-            let start = serde_json::json!({
-                "method": "pre-tool/editing-start",
-                "agent_id": "",
-                "session_id": session_id,
-            });
-            let _ = hook_roundtrip(ipc_path, &start).await;
-            {
-                let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-                let sessions = ctx.sessions.lock().expect("lock");
-                let router = Arc::clone(&sessions.get(session_id).expect("session").router);
-                drop(sessions);
-                router.session.editing.record_covered_edit(
-                    Some(session_id),
-                    "",
-                    file.to_path_buf(),
-                    true,
-                );
-            }
-            let prepare = serde_json::json!({
-                "method": "pre-tool/editing-stop",
-                "agent_id": "",
-                "session_id": session_id,
-            });
-            let _ = hook_roundtrip(ipc_path, &prepare).await;
-            let _ = hook_roundtrip_full(
-                ipc_path,
-                &serde_json::json!({"method": "tool/editing-stop"}),
-            )
-            .await;
-        }
+    // ── Keyed handoff structure tests (ADR 014; re-seated on Claim in ────
+    // root-ownership stage 3 — the Diagnostics key/payload demolished with the
+    // identity-correlation handoff, Claim the sole surviving transport).
 
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        let root = dir.path().to_path_buf();
-        let file_one = root.join("sess_one_file.rs");
-        let file_two = root.join("sess_two_file.rs");
-        std::fs::write(&file_one, "fn one() {}\n").expect("write file one");
-        std::fs::write(&file_two, "fn two() {}\n").expect("write file two");
-
-        run_session(&ipc_path, &manager, "sess-1", &file_one).await;
-        run_session(&ipc_path, &manager, "sess-2", &file_two).await;
-
-        let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-        let sessions = ctx.sessions.lock().expect("lock");
-        let router_one = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-        let router_two = Arc::clone(&sessions.get("sess-2").expect("sess-2").router);
-        drop(sessions);
-
-        // Each session's batch holds only its own file, and each was delivered by
-        // its own run — the two batches never crossed.
-        assert_eq!(
-            router_one.session.editing.files(Some("sess-1"), ""),
-            vec![file_one.clone()],
-            "sess-1's batch holds only its own file",
-        );
-        assert_eq!(
-            router_two.session.editing.files(Some("sess-2"), ""),
-            vec![file_two.clone()],
-            "sess-2's batch holds only its own file",
-        );
-        assert!(
-            !router_one
-                .session
-                .editing
-                .has_undelivered(Some("sess-1"), ""),
-            "sess-1's batch was delivered by its own run",
-        );
-        assert!(
-            !router_two
-                .session
-                .editing
-                .has_undelivered(Some("sess-2"), ""),
-            "sess-2's batch was delivered by its own run",
-        );
-
-        shutdown.cancel();
-    }
-
-    /// misc 141: a fresh session (no edits) still reports `[no edited files]` — a
-    /// bare run over an empty batch is covered 0, exactly as today.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fresh_session_bare_reports_no_edited_files() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        // No editing-start, no edits — a fresh session's first bare run.
-        let prepare = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &prepare).await;
-        let response = hook_roundtrip_full(
-            &ipc_path,
-            &serde_json::json!({"method": "tool/editing-stop"}),
-        )
-        .await;
-        let parsed: serde_json::Value =
-            serde_json::from_str(response.trim()).expect("valid diagnostics envelope");
-        assert_eq!(
-            parsed["covered"].as_u64(),
-            Some(0),
-            "a fresh session's bare run is covered 0 (`[no edited files]`), got: {response}",
-        );
-
-        shutdown.cancel();
-    }
-
-    /// ws37 ticket 02 (under the misc-141 batch model): re-editing a paid file
-    /// re-arms the gate. After a scoped pull delivers the only file and releases
-    /// the guardrail, editing that file again discards the completed batch, starts
-    /// a fresh one with the file undelivered, and re-locks the root.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn re_editing_a_paid_file_rearms_the_gate() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-start",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req).await;
-
-        let root = dir.path().to_path_buf();
-        let file_a = root.join("a.rs");
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            router
-                .session
-                .editing
-                .record_covered_edit(Some("sess-1"), "", file_a.clone(), true);
-            ctx.editing_guardrail
-                .try_acquire(&root, "sess-1")
-                .expect("arm guardrail");
-        }
-
-        let prepare = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &prepare).await;
-
-        // Pay file_a's debt in full (scoped delivery of the only file).
-        let consume = serde_json::json!({
-            "method": "tool/editing-stop",
-            "files": [file_a.to_string_lossy()],
-        });
-        let _ = hook_roundtrip_full(&ipc_path, &consume).await;
-
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            assert!(
-                !router.session.editing.has_undelivered(Some("sess-1"), ""),
-                "delivering the only file disarms the gate (batch now complete)",
-            );
-            // Released: probe then free it so the re-edit below can re-lock.
-            assert!(
-                ctx.editing_guardrail.try_acquire(&root, "other").is_ok(),
-                "delivering the only file releases the guardrail",
-            );
-            ctx.editing_guardrail.release(&root, "other");
-
-            // Re-edit re-arms: the edit hook re-affirms editing mode
-            // (`start_editing` is a no-op — the batch entry is retained), then
-            // records the covered edit. The batch was complete, so this discards
-            // it and starts a fresh, undelivered batch with the file, re-locking
-            // the root.
-            let _ = router.session.editing.start_editing(Some("sess-1"), "");
-            router
-                .session
-                .editing
-                .record_covered_edit(Some("sess-1"), "", file_a.clone(), true);
-            ctx.editing_guardrail
-                .try_acquire(&root, "sess-1")
-                .expect("re-arm guardrail on re-edit");
-            assert_eq!(
-                router.session.editing.files(Some("sess-1"), ""),
-                vec![file_a.clone()],
-                "the re-edited file is the sole member of the fresh batch",
-            );
-            assert!(
-                router.session.editing.has_undelivered(Some("sess-1"), ""),
-                "re-editing a paid file re-arms the gate (undelivered again)",
-            );
-            assert!(
-                ctx.editing_guardrail.try_acquire(&root, "other").is_err(),
-                "re-editing a paid file re-locks the root",
-            );
-        }
-
-        shutdown.cancel();
-    }
-
-    /// ws37 ticket 02 (under the misc-141 batch model): a scoped pull of an
-    /// UNEDITED path reports diagnostics but the flag-flip is a no-op — the batch
-    /// is unchanged and the guardrail stays armed. One pipeline serves "lint this"
-    /// and "verify my edit."
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scoped_diagnostics_unedited_path_is_noop() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-start",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req).await;
-
-        let root = dir.path().to_path_buf();
-        let edited = root.join("edited.rs");
-        let unedited = root.join("unedited.rs");
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            router
-                .session
-                .editing
-                .record_covered_edit(Some("sess-1"), "", edited.clone(), true);
-            ctx.editing_guardrail
-                .try_acquire(&root, "sess-1")
-                .expect("arm guardrail");
-        }
-
-        let prepare = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &prepare).await;
-
-        // Scoped pull of a file NOT in the debt set.
-        let consume = serde_json::json!({
-            "method": "tool/editing-stop",
-            "files": [unedited.to_string_lossy()],
-        });
-        let response = hook_roundtrip_full(&ipc_path, &consume).await;
-        assert!(
-            !response.contains("handoff expired"),
-            "an unedited scoped pull still rides the handoff (attribution fires), got: {response}",
-        );
-
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            assert_eq!(
-                router.session.editing.files(Some("sess-1"), ""),
-                vec![edited.clone()],
-                "querying an unedited file flips nothing — the batch is unchanged",
-            );
-            assert!(
-                router.session.editing.has_undelivered(Some("sess-1"), ""),
-                "the edited file stays undelivered — the gate is unmoved",
-            );
-            assert!(
-                ctx.editing_guardrail.try_acquire(&root, "other").is_err(),
-                "a no-op flip leaves the gate armed",
-            );
-        }
-
-        shutdown.cancel();
-    }
-
-    /// Bug 100 ruling 2: a scoped consume whose handoff was never prepared (a
-    /// hookless box, or a faulted/denied round-trip) is the on-demand form —
-    /// the named paths are diagnosed and the receipt served. But with no
-    /// handoff there are no flip keys: nothing is marked delivered, so the
-    /// batch stays intact and the gate armed.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scoped_diagnostics_without_handoff_leaves_debt_intact() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-start",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req).await;
-
-        let root = dir.path().to_path_buf();
-        let file_a = root.join("a.rs");
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            router
-                .session
-                .editing
-                .record_covered_edit(Some("sess-1"), "", file_a.clone(), true);
-        }
-
-        // Consume WITHOUT a prepared handoff: the run is served hookless (bug
-        // 100) — a real receipt, not a fault — but no flip keys are captured,
-        // so the batch is left untouched.
-        let consume = serde_json::json!({
-            "method": "tool/editing-stop",
-            "files": [file_a.to_string_lossy()],
-        });
-        let response = hook_roundtrip_full(&ipc_path, &consume).await;
-        let parsed: serde_json::Value =
-            serde_json::from_str(response.trim()).expect("consume response is JSON");
-        assert!(
-            parsed.get("error").is_none(),
-            "a hookless scoped pull serves the run, not a fault, got: {response}",
-        );
-        assert_eq!(
-            parsed.get("covered").and_then(serde_json::Value::as_u64),
-            Some(1),
-            "the hookless scoped pull diagnoses exactly the named path, got: {response}",
-        );
-
-        {
-            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
-            let sessions = ctx.sessions.lock().expect("lock");
-            let router = Arc::clone(&sessions.get("sess-1").expect("sess-1").router);
-            drop(sessions);
-            assert_eq!(
-                router.session.editing.files(Some("sess-1"), ""),
-                vec![file_a.clone()],
-                "a hookless scoped pull flips nothing — the batch is intact",
-            );
-            assert!(
-                router.session.editing.has_undelivered(Some("sess-1"), ""),
-                "the batch stays armed after a hookless scoped pull",
-            );
-        }
-
-        shutdown.cancel();
-    }
-
-    /// Bug 100 ruling 2, directory parity: a scoped `catenary diagnostics`
-    /// with a directory argument (the `.` shape after CLI cwd-resolution)
-    /// behaves identically hooked and hookless — the directory rides the same
-    /// `process_files_batched` scope router either way, so the receipt and
-    /// covered count match; only the debt flip differs, and only when hooked.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn hookless_scoped_directory_matches_hooked_scoped() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        let scope_dir = dir.path().join("proj");
-        std::fs::create_dir(&scope_dir).expect("create scope dir");
-        std::fs::write(scope_dir.join("a.rs"), "fn a() {}\n").expect("write file");
-
-        let consume = serde_json::json!({
-            "method": "tool/editing-stop",
-            "files": [scope_dir.to_string_lossy()],
-        });
-
-        // Hooked run: the PreToolUse hook stages the prepare first.
-        let prepare = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &prepare).await;
-        let hooked = hook_roundtrip_full(&ipc_path, &consume).await;
-
-        // Hookless run: the same argument against the now-empty slot.
-        let hookless = hook_roundtrip_full(&ipc_path, &consume).await;
-
-        let hooked: serde_json::Value =
-            serde_json::from_str(hooked.trim()).expect("hooked response is JSON");
-        let hookless: serde_json::Value =
-            serde_json::from_str(hookless.trim()).expect("hookless response is JSON");
-        assert!(
-            hookless.get("error").is_none(),
-            "a hookless scoped directory pull serves the run, not a fault, got: {hookless}",
-        );
-        assert_eq!(
-            hooked.get("output"),
-            hookless.get("output"),
-            "hookless scoped receipt must match the hooked receipt for the same directory",
-        );
-        assert_eq!(
-            hooked.get("covered"),
-            hookless.get("covered"),
-            "hookless covered count must match the hooked count for the same directory",
-        );
-
-        shutdown.cancel();
-    }
-
-    /// Bug 32 secondary: the consume envelope carries a `covered` file count so
-    /// the CLI can synthesize a `[no edited files]` sentinel for the 0-file
-    /// case. A consume over an empty handoff reports `covered: 0`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn done_editing_handoff_reports_covered_zero_when_empty() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        // Enter editing mode but accumulate NO files, then prepare + consume.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-start",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req).await;
-        let prepare = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &prepare).await;
-
-        let consume = serde_json::json!({"method": "tool/editing-stop"});
-        let response = hook_roundtrip_full(&ipc_path, &consume).await;
-        let parsed: serde_json::Value =
-            serde_json::from_str(response.trim()).expect("consume response is JSON");
-        assert_eq!(
-            parsed.get("covered").and_then(serde_json::Value::as_u64),
-            Some(0),
-            "an empty handoff reports covered: 0 for the CLI sentinel, got: {response}",
-        );
-
-        shutdown.cancel();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn done_editing_handoff_double_consume() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let ipc_path = ipc_socket_in(dir.path());
-
-        let manager = Arc::new(bind_with_session(dir.path()));
-        let shutdown = manager.shutdown_token();
-        let m = Arc::clone(&manager);
-        tokio::spawn(async move {
-            let _ = m.accept_loop().await;
-        });
-
-        // Enter editing mode and prepare handoff.
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-start",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req).await;
-
-        let req = serde_json::json!({
-            "method": "pre-tool/editing-stop",
-            "agent_id": "",
-            "session_id": "sess-1"
-        });
-        let _ = hook_roundtrip(&ipc_path, &req).await;
-
-        // First consume should succeed.
-        let req = serde_json::json!({"method": "tool/editing-stop"});
-        let response1 = hook_roundtrip_full(&ipc_path, &req).await;
-        assert!(
-            !response1.contains("handoff expired"),
-            "first consume should succeed, got: {response1}",
-        );
-
-        // Second bare consume sees the empty slot — a fault envelope (bug 100),
-        // not a receipt-shaped success.
-        let response2 = hook_roundtrip_full(&ipc_path, &req).await;
-        let parsed: serde_json::Value =
-            serde_json::from_str(response2.trim()).expect("second consume response is JSON");
-        assert_eq!(
-            parsed.get("status").and_then(serde_json::Value::as_str),
-            Some("error"),
-            "second consume should see the empty-slot fault, got: {response2}",
-        );
-
-        shutdown.cancel();
-    }
-
-    // ── Keyed handoff structure tests (ADR 014) ───────────────────────
-
-    /// The same key serializes in order: a second `diagnostics` acquire blocks
-    /// until the first permit is released (no overwrite, no double-consume).
+    /// The same key serializes in order: a second `claim` acquire blocks until
+    /// the first permit is released (no overwrite, no double-consume).
     #[tokio::test]
     async fn keyed_handoff_same_key_serializes() {
         let handoff = KeyedHandoff::new();
 
         let first = handoff
-            .acquire(HandoffKey::Diagnostics)
+            .acquire(HandoffKey::Claim)
             .await
             .expect("first acquire");
 
@@ -11177,24 +9013,21 @@ mod tests {
         // the timeout elapses rather than completing.
         let blocked = tokio::time::timeout(
             Duration::from_millis(200),
-            handoff.acquire(HandoffKey::Diagnostics),
+            handoff.acquire(HandoffKey::Claim),
         )
         .await;
         assert!(
             blocked.is_err(),
-            "second diagnostics acquire must block while the first is held",
+            "second claim acquire must block while the first is held",
         );
 
         // Releasing the first lets the second proceed.
         drop(first);
-        let second = tokio::time::timeout(
-            Duration::from_secs(1),
-            handoff.acquire(HandoffKey::Diagnostics),
-        )
-        .await;
+        let second =
+            tokio::time::timeout(Duration::from_secs(1), handoff.acquire(HandoffKey::Claim)).await;
         assert!(
             second.is_ok(),
-            "second diagnostics acquire must proceed once the first is released",
+            "second claim acquire must proceed once the first is released",
         );
     }
 
@@ -11204,75 +9037,33 @@ mod tests {
     async fn keyed_handoff_stage_consume_roundtrip() {
         let handoff = KeyedHandoff::new();
 
-        let permit = handoff
-            .acquire(HandoffKey::Diagnostics)
-            .await
-            .expect("acquire");
+        let permit = handoff.acquire(HandoffKey::Claim).await.expect("acquire");
         handoff.stage(
-            HandoffKey::Diagnostics,
+            HandoffKey::Claim,
             HandoffContext {
-                parent_id: "scope-1".to_string(),
-                payload: HandoffPayload::Diagnostics {
-                    files: vec![PathBuf::from("/tmp/a.rs")],
-                    skipped: SkippedEdits {
-                        outside: 2,
-                        outside_roots: std::collections::BTreeSet::from([PathBuf::from(
-                            "/home/dev/Lattice",
-                        )]),
-                        uncovered: 1,
-                        uncovered_files: std::collections::BTreeSet::from(["Makefile".to_string()]),
-                        ..SkippedEdits::default()
-                    },
-                    session_id: "sess-1".to_string(),
-                    editing_session: Some("sess-1".to_string()),
-                    agent_id: String::new(),
+                payload: HandoffPayload::Claim {
+                    answer: "claimed /repo (previous editor last seen 3m ago)".to_string(),
                 },
                 permit,
             },
         );
 
         let consumed = handoff
-            .consume(HandoffKey::Diagnostics)
+            .consume(HandoffKey::Claim)
             .expect("consume staged context");
-        assert_eq!(consumed.parent_id, "scope-1");
-        let HandoffPayload::Diagnostics {
-            files,
-            skipped,
-            session_id,
-            editing_session,
-            agent_id,
-        } = &consumed.payload
-        else {
-            panic!("expected a Diagnostics payload");
-        };
-        assert_eq!(files, &vec![PathBuf::from("/tmp/a.rs")]);
-        assert_eq!(skipped.outside, 2);
-        assert_eq!(
-            skipped.outside_roots,
-            std::collections::BTreeSet::from([PathBuf::from("/home/dev/Lattice")])
-        );
-        assert_eq!(skipped.uncovered, 1);
-        assert_eq!(
-            skipped.uncovered_files,
-            std::collections::BTreeSet::from(["Makefile".to_string()])
-        );
-        assert_eq!(session_id, "sess-1");
-        assert_eq!(editing_session.as_deref(), Some("sess-1"));
-        assert_eq!(agent_id, "");
+        let HandoffPayload::Claim { answer } = &consumed.payload;
+        assert_eq!(answer, "claimed /repo (previous editor last seen 3m ago)");
 
         // Slot is now empty — a second consume yields None.
         assert!(
-            handoff.consume(HandoffKey::Diagnostics).is_none(),
+            handoff.consume(HandoffKey::Claim).is_none(),
             "double consume must yield None",
         );
 
         // Dropping the consumed context frees the permit for the next stage.
         drop(consumed);
-        let reacquire = tokio::time::timeout(
-            Duration::from_secs(1),
-            handoff.acquire(HandoffKey::Diagnostics),
-        )
-        .await;
+        let reacquire =
+            tokio::time::timeout(Duration::from_secs(1), handoff.acquire(HandoffKey::Claim)).await;
         assert!(reacquire.is_ok(), "permit must be free after consume");
     }
 
@@ -11286,20 +9077,12 @@ mod tests {
     async fn keyed_handoff_timeout_clears_stage() {
         let handoff = KeyedHandoff::with_timeout(Duration::from_millis(50));
 
-        let permit = handoff
-            .acquire(HandoffKey::Diagnostics)
-            .await
-            .expect("acquire");
+        let permit = handoff.acquire(HandoffKey::Claim).await.expect("acquire");
         handoff.stage(
-            HandoffKey::Diagnostics,
+            HandoffKey::Claim,
             HandoffContext {
-                parent_id: "x".to_string(),
-                payload: HandoffPayload::Diagnostics {
-                    files: Vec::new(),
-                    skipped: SkippedEdits::default(),
-                    session_id: "x".to_string(),
-                    editing_session: Some("x".to_string()),
-                    agent_id: String::new(),
+                payload: HandoffPayload::Claim {
+                    answer: "claimed /x".to_string(),
                 },
                 permit,
             },
@@ -11311,13 +9094,13 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert!(
-            handoff.consume(HandoffKey::Diagnostics).is_none(),
-            "diagnostics stage must be cleared after its timeout",
+            handoff.consume(HandoffKey::Claim).is_none(),
+            "claim stage must be cleared after its timeout",
         );
 
         // The permit was released on timeout — a fresh acquire proceeds.
-        let _diag = handoff
-            .acquire(HandoffKey::Diagnostics)
+        let _claim = handoff
+            .acquire(HandoffKey::Claim)
             .await
             .expect("permit released on timeout");
     }

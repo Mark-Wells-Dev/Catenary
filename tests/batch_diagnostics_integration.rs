@@ -138,9 +138,12 @@ fn test_batch_multi_file_different_servers() -> Result<()> {
 
 // ─── No diagnostic servers ─────────────────────────────────────────
 
-/// A file whose language has no configured server flows free (bug 44): it is
-/// not accumulated for diagnostics, so it surfaces only via the unchecked-edit
-/// count, never silently dropped. Covered files still produce diagnostics.
+/// A file whose language has no configured server produces no per-file
+/// diagnostics (bug 44): a scoped serve naming both a covered and an uncovered
+/// file diagnoses the covered one and never renders the uncovered one as a
+/// clean/dirty result. (Root-ownership stage 3 retired the identity-keyed
+/// skipped-edits accumulation note — the serve reads the ledger and renders what
+/// it can diagnose; a no-server file simply carries no diagnostics.)
 #[test]
 fn test_batch_uncovered_file() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -162,20 +165,11 @@ fn test_batch_uncovered_file() -> Result<()> {
         text.contains("mock diagnostic"),
         "Covered file should produce diagnostics. Got:\n{text}"
     );
-    // The no-server file is gated out of accumulation (bug 44): it has no
-    // configured server, so it never reaches the diagnostics batch and is not
-    // rendered per-file. It is still accounted for — by name — in the
-    // no-covering-server note (misc 173) so the batch is not a silent, lying
-    // one, and the note never claims "outside tracked roots" for a file
-    // inside the served root.
+    // The no-server file has no configured server, so it never renders as a
+    // clean/dirty per-file diagnostic line — it carries no diagnostics to show.
     assert!(
         !text.contains("mystery.zzz_no_server:"),
-        "No-server file must not be accumulated into per-file diagnostics. Got:\n{text}"
-    );
-    assert!(
-        text.contains("1 edit had no covering server when made (mystery.zzz_no_server)")
-            && text.contains("not checked"),
-        "No-server file should be reported as an unchecked edit, by name. Got:\n{text}"
+        "No-server file must not render as a per-file diagnostic. Got:\n{text}"
     );
     assert!(
         !text.contains("outside tracked roots"),
@@ -667,22 +661,15 @@ fn out_of_band_write_detected_at_round_start() -> Result<()> {
     let opens = count_doc_notifications(&log1, "textDocument/didOpen", &uri);
 
     // Out-of-band: the file changes on disk with NO hook-tracked edit, then a
-    // bare repeat run re-diagnoses the persisted batch.
+    // repeat scoped run re-diagnoses it. The held-open document (opened by the
+    // first run, still in the connection's open set) has its disk change detected
+    // at round start (root-ownership stage 3: the serve names the file directly —
+    // the retired two-phase handoff is gone).
     std::fs::write(&file, "echo out of band\n")?;
-    let socket = bridge.wait_for_ipc_socket()?;
-    common::ipc_request(
-        &socket,
-        &serde_json::json!({"method": "pre-tool/editing-stop", "agent_id": ""}),
-    )?;
-    let text = common::ipc_request_long(
-        &socket,
-        bridge.daemon_pid(),
-        &serde_json::json!({"method": "tool/editing-stop"}),
-    )?;
-    let receipt = common::diagnostics_output(&text);
+    let receipt = bridge.call_diagnostics(file.to_str().context("path")?)?;
     assert!(
         receipt.contains("mock diagnostic"),
-        "the bare repeat run re-diagnoses the batch. Got: {receipt}"
+        "the repeat run re-diagnoses the file. Got: {receipt}"
     );
 
     let log2 = common::read_merged_log(&nlog);
@@ -705,98 +692,57 @@ fn out_of_band_write_detected_at_round_start() -> Result<()> {
     Ok(())
 }
 
-/// Unit tier 3: Stop/SubagentStop close the stopping agent's held-open
-/// documents — and ONLY those. Two agents hold different files open on the
-/// same connection; agent 1's stop closes its file while agent 2's stays
-/// open until its own stop.
+/// Unit tier 3 (re-keyed for root-ownership stage 3): a Stop/SubagentStop no
+/// longer closes held-open documents by identity — that identity-correlation was
+/// demolished. Documents a diagnose round opens are tagged with their ROOT and
+/// close at root retirement (worktree removal) or daemon death, never at an
+/// agent's Stop. This guards the demolition: an allowed Stop must leave the
+/// held-open document OPEN (no `didClose`), so the one-cook-per-kitchen root's
+/// documents survive until the kitchen itself retires.
 #[test]
-fn stop_closes_exactly_the_owning_agents_docs() -> Result<()> {
+fn stop_does_not_close_held_open_docs_by_identity() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let logdir = tempfile::tempdir()?;
     let nlog = logdir.path().join("notifications.jsonl");
     let nlog_arg = nlog.to_str().context("nlog path")?;
-    let file1 = dir.path().join(format!("agent_one.{MOCK_LANG_A}"));
-    let file2 = dir.path().join(format!("agent_two.{MOCK_LANG_A}"));
-    std::fs::write(&file1, "echo one\n")?;
-    std::fs::write(&file2, "echo two\n")?;
+    let file = dir.path().join(format!("held.{MOCK_LANG_A}"));
+    std::fs::write(&file, "echo one\n")?;
 
     let root = dir.path().to_str().context("path")?;
     let mut bridge = spawn_mockls(&["--advertise-save", "--notification-log", nlog_arg], root)?;
     bridge.initialize()?;
-    let uri1 = doc_uri(&file1)?;
-    let uri2 = doc_uri(&file2)?;
+    let uri = doc_uri(&file)?;
     let socket = bridge.wait_for_ipc_socket()?;
 
-    // Each agent edits its own file and pays its gate.
-    for (agent, file) in [("a1", &file1), ("a2", &file2)] {
-        common::ipc_request(
-            &socket,
-            &serde_json::json!({"method": "pre-tool/editing-start", "agent_id": agent}),
-        )?;
-        common::ipc_request(
-            &socket,
-            &serde_json::json!({
-                "method": "pre-tool/editing-state",
-                "tool_name": "Edit",
-                "file_path": file.to_str().context("path")?,
-                "agent_id": agent,
-            }),
-        )?;
-        common::ipc_request(
-            &socket,
-            &serde_json::json!({"method": "pre-tool/editing-stop", "agent_id": agent}),
-        )?;
-        common::ipc_request_long(
-            &socket,
-            bridge.daemon_pid(),
-            &serde_json::json!({"method": "tool/editing-stop"}),
-        )?;
-    }
-
+    // A diagnose serve opens the document (held open across rounds).
+    let _ = bridge.call_diagnostics(file.to_str().context("path")?)?;
     let log0 = common::read_merged_log(&nlog);
-    let closes1 = count_doc_notifications(&log0, "textDocument/didClose", &uri1);
-    let closes2 = count_doc_notifications(&log0, "textDocument/didClose", &uri2);
+    let opens = count_doc_notifications(&log0, "textDocument/didOpen", &uri);
+    let closes = count_doc_notifications(&log0, "textDocument/didClose", &uri);
+    assert!(
+        opens >= 1,
+        "the diagnose serve opened the document; log:\n{log0}"
+    );
 
-    // Agent 1 stops (debt paid → the stop is allowed). The close is a
-    // background side effect, so poll for its signal.
+    // An allowed Stop reaches the daemon. Under stage 3 it triggers NO
+    // identity-keyed document close — the held-open document must survive.
     common::ipc_request(
         &socket,
         &serde_json::json!({
             "method": "post-agent/require-release",
-            "agent_id": "a1",
+            "agent_id": "",
             "stop_hook_active": false,
         }),
     )?;
-    let log_after_a1 = poll_merged_log_until(&nlog, |log| {
-        count_doc_notifications(log, "textDocument/didClose", &uri1) > closes1
-    });
-    assert_eq!(
-        count_doc_notifications(&log_after_a1, "textDocument/didClose", &uri1),
-        closes1 + 1,
-        "agent 1's stop closes its held-open doc; log:\n{log_after_a1}"
-    );
-    assert_eq!(
-        count_doc_notifications(&log_after_a1, "textDocument/didClose", &uri2),
-        closes2,
-        "agent 2's held-open doc survives agent 1's stop; log:\n{log_after_a1}"
-    );
 
-    // Agent 2 stops: now (and only now) its doc closes.
-    common::ipc_request(
-        &socket,
-        &serde_json::json!({
-            "method": "post-agent/require-release",
-            "agent_id": "a2",
-            "stop_hook_active": false,
-        }),
-    )?;
-    let log_after_a2 = poll_merged_log_until(&nlog, |log| {
-        count_doc_notifications(log, "textDocument/didClose", &uri2) > closes2
-    });
+    // Give any (erroneous) background close a chance to land, then confirm none
+    // did — the close count is unchanged and the document is still open.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let log1 = common::read_merged_log(&nlog);
     assert_eq!(
-        count_doc_notifications(&log_after_a2, "textDocument/didClose", &uri2),
-        closes2 + 1,
-        "agent 2's own stop closes its doc; log:\n{log_after_a2}"
+        count_doc_notifications(&log1, "textDocument/didClose", &uri),
+        closes,
+        "an allowed Stop must NOT close the held-open doc by identity (stage 3); log:\n{log1}"
     );
 
     Ok(())

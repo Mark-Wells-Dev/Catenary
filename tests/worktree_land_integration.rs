@@ -438,9 +438,19 @@ fn spawn_land_daemon(repo: &Path) -> BridgeProcess {
     let state_home = bridge.state_home().to_string();
     let cfg_dir = xdg_config_home(&state_home).join("catenary");
     std::fs::create_dir_all(&cfg_dir).expect("mkdir config dir");
+    // Map the mockls persona's extension to its language in the USER config so
+    // both the daemon and the edit-seam hook's `Config::load()` classify
+    // `.mockls-event` files (root-ownership stage 3: the hook-side `Booking`
+    // books a file only when its extension maps to a configured language, and
+    // `CATENARY_SERVERS` alone registers the server binding but no extension).
+    // Without this the `owner_edits` hook could not book the worktree ledger, so
+    // the land debt transfer would read an empty ledger and transfer nothing.
     std::fs::write(
         cfg_dir.join("config.toml"),
-        "[commands]\nallow = [\"git\"]\npipeline = [\"grep\"]\n",
+        format!(
+            "[commands]\nallow = [\"git\"]\npipeline = [\"grep\"]\n\n\
+             [lsp.language.{LAND_LANG}]\nextensions = [\"{LAND_LANG}\"]\n"
+        ),
     )
     .expect("write commands config");
     bridge
@@ -464,70 +474,93 @@ fn pin_root(socket: &Path, path: &Path) {
     .expect("pin root");
 }
 
-/// Records one covered edit into the OWNER's batch (`OWNER_SESSION`/`OWNER_AGENT`)
-/// via the real editing-state hook IPC — the worker touching a file in its
-/// worktree.
-fn owner_edits(socket: &Path, file: &Path) {
-    ipc_request(
-        socket,
-        &json!({
-            "method": "pre-tool/editing-state",
-            "tool_name": "Edit",
-            "file_path": file.to_str().expect("file path"),
-            "session_id": OWNER_SESSION,
-            "agent_id": OWNER_AGENT,
-        }),
-    )
-    .expect("owner edit");
+/// Books one covered edit into the OWNER's worktree LEDGER by driving the real
+/// `catenary hook pre-tool` Edit binary (root-ownership stage 3: the on-disk lock
+/// ledger is the single source of truth for diagnostic debt, and only the real
+/// edit seam — `crate::lock::acquire` inside the hook — books it; the old
+/// `pre-tool/editing-state` IPC booked only the retired in-memory batch and no
+/// longer feeds the worktree-land debt transfer, which reads
+/// `crate::lock::due_files(worktree)`).
+///
+/// Modeled on [`pre_tool_land`], but with a Claude `Edit` payload carrying the
+/// owner's session/agent and the worktree `cwd`. `CATENARY_SERVERS` is set (the
+/// clearing `isolate_env` strips it) so the hook-side `Booking::from_config`
+/// covers `.mockls-event` and the file books; PATH is restored (the hook may
+/// shell out during resolution). `file` must already exist on disk when the hook
+/// runs — the caller writes it first. Since the worktree is a git worktree, its
+/// `.git` marker lets `resolve_lock_root` resolve the enclosing root, so the edit
+/// books into the WORKTREE's ledger.
+fn owner_edits(state_home: &str, worktree: &Path, file: &Path) {
+    let payload = json!({
+        "tool_name": "Edit",
+        "session_id": OWNER_SESSION,
+        "agent_id": OWNER_AGENT,
+        "cwd": worktree.to_str().expect("worktree path"),
+        "tool_input": { "file_path": file.to_str().expect("file path") },
+    });
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, state_home);
+    // The hook-side `Booking` is built from `Config::load()` (defaults ∪ user ∪
+    // env overrides); without `CATENARY_SERVERS` no language binds `.mockls-event`
+    // and `Booking::books` returns false, so the edit would not book the ledger.
+    cmd.env("CATENARY_SERVERS", mockls_lsp_arg(LAND_LANG, ""));
+    if let Some(path) = std::env::var_os("PATH") {
+        cmd.env("PATH", path);
+    }
+    cmd.args(["hook", "pre-tool", "--format=claude"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn pre-tool Edit hook");
+    {
+        let mut stdin = child.stdin.take().expect("hook stdin");
+        writeln!(stdin, "{payload}").expect("write hook payload");
+    }
+    let out = child.wait_with_output().expect("wait for hook");
+    assert!(
+        out.status.success(),
+        "owner Edit hook failed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
 }
 
-/// Pays the OWNER's gate — a bare `catenary diagnostics` for its batch: prepare
-/// the handoff, then consume it, flipping every batch file to delivered.
-fn owner_pays(bridge: &BridgeProcess, socket: &Path) {
-    ipc_request(
-        socket,
-        &json!({
-            "method": "pre-tool/editing-stop",
-            "session_id": OWNER_SESSION,
-            "agent_id": OWNER_AGENT,
-        }),
-    )
-    .expect("owner prepare handoff");
+/// Pays the OWNER's gate — a single BARE `catenary diagnostics` served from the
+/// WORKTREE cwd (root-ownership stage 3 retired the two-phase `pre-tool/editing-stop`
+/// prepare + bare `tool/editing-stop` consume). The daemon resolves `cwd` to the
+/// enclosing lock root (the worktree), diagnoses its ledger due set
+/// (`crate::lock::due_files`), and UNLINKS each delivered file's touch entry — so
+/// the worktree ledger goes empty (paid). A subsequent worktree-land then reads an
+/// empty `due_files(worktree)` and transfers nothing.
+fn owner_pays(bridge: &BridgeProcess, socket: &Path, worktree: &Path) {
     ipc_request_long(
         socket,
         bridge.daemon_pid(),
         &json!({
             "method": "tool/editing-stop",
-            "session_id": OWNER_SESSION,
-            "agent_id": OWNER_AGENT,
+            "cwd": worktree.to_str().expect("worktree path"),
         }),
     )
-    .expect("owner consume handoff");
+    .expect("owner bare diagnose (pay worktree ledger)");
 }
 
-/// The landing agent's bare `catenary diagnostics` receipt for its own batch
-/// (session `OWNER_SESSION`, main agent `""`) after the land — the transfer's
-/// visible effect.
-fn landing_receipt(bridge: &BridgeProcess, socket: &Path) -> String {
-    ipc_request(
-        socket,
-        &json!({
-            "method": "pre-tool/editing-stop",
-            "session_id": OWNER_SESSION,
-            "agent_id": "",
-        }),
-    )
-    .expect("landing prepare handoff");
+/// The landing agent's `catenary diagnostics` receipt after the land — the
+/// transfer's visible effect. A single BARE serve from the LANDING REPO cwd (the
+/// owning repo) — root-ownership stage 3 retired the two-phase handoff. The
+/// daemon resolves `repo` to its enclosing lock root and diagnoses that root's
+/// ledger due set: the debt transfer (`handle_worktree_land_debt_transfer`) has
+/// booked the owner's unpaid landed files into the landing repo's ledger, so a
+/// bare serve there names exactly those transferred files (or an empty receipt
+/// when a paid worktree transferred nothing).
+fn landing_receipt(bridge: &BridgeProcess, socket: &Path, repo: &Path) -> String {
     let text = ipc_request_long(
         socket,
         bridge.daemon_pid(),
         &json!({
             "method": "tool/editing-stop",
-            "session_id": OWNER_SESSION,
-            "agent_id": "",
+            "cwd": repo.to_str().expect("repo path"),
         }),
     )
-    .expect("landing consume handoff");
+    .expect("landing bare diagnose (read landing repo ledger)");
     diagnostics_output(&text)
 }
 
@@ -558,8 +591,8 @@ fn land_of_a_paid_worktree_arms_nothing() {
     // The worker edits a covered file in the worktree, then PAYS its gate.
     let edited = worktree.join(format!("tracked.{LAND_LANG}"));
     std::fs::write(&edited, "echo changed\n").expect("modify tracked");
-    owner_edits(&socket, &edited);
-    owner_pays(&bridge, &socket);
+    owner_edits(&state_home, &worktree, &edited);
+    owner_pays(&bridge, &socket, &worktree);
 
     // The landing agent runs the real land hook, then lands.
     let hook_out = pre_tool_land(
@@ -578,7 +611,7 @@ fn land_of_a_paid_worktree_arms_nothing() {
     // daemon returns an empty receipt for a genuinely empty batch (the CLI is what
     // prints `[no edited files]`), so the diagnostics output is empty and never
     // names the already-paid file.
-    let receipt = landing_receipt(&bridge, &socket);
+    let receipt = landing_receipt(&bridge, &socket, &repo);
     assert!(
         receipt.trim().is_empty(),
         "a paid worktree must arm nothing on the landing agent:\n{receipt}"
@@ -619,8 +652,8 @@ fn land_of_an_unpaid_worktree_transfers_exactly_its_unpaid_files() {
     let created = worktree.join(format!("new.{LAND_LANG}"));
     std::fs::write(&tracked, "echo changed\n").expect("modify tracked");
     std::fs::write(&created, "echo new\n").expect("add untracked");
-    owner_edits(&socket, &tracked);
-    owner_edits(&socket, &created);
+    owner_edits(&state_home, &worktree, &tracked);
+    owner_edits(&state_home, &worktree, &created);
 
     // The landing agent runs the real land hook, then lands.
     let hook_out = pre_tool_land(
@@ -638,7 +671,7 @@ fn land_of_an_unpaid_worktree_transfers_exactly_its_unpaid_files() {
     // The landing agent's batch armed for exactly the two unpaid files, mapped
     // onto the owning repo — the debt transferred (a non-empty receipt naming
     // both files; an empty receipt would mean nothing armed).
-    let receipt = landing_receipt(&bridge, &socket);
+    let receipt = landing_receipt(&bridge, &socket, &repo);
     assert!(
         !receipt.trim().is_empty(),
         "unpaid debt must transfer to the landing agent:\n{receipt}"

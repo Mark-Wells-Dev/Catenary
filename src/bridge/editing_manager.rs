@@ -71,19 +71,24 @@ struct BatchFile {
 /// Per-agent editing accumulator: one **batch** plus the out-of-coverage note
 /// metadata (misc 141).
 ///
+/// **Root-ownership stage 3 retired this as the diagnostics debt source.** The
+/// on-disk lock ledger ([`crate::lock`]) is now the single source of truth for
+/// diagnostic debt: the Bash nag and the diagnose serve read the ledger by pure
+/// path algebra (cwd → root), and delivery unlinks its touch files. This in-memory
+/// batch survives only for its *non-gate* roles — the session board's
+/// editing/working status ([`Self::has_undelivered_any`]/[`is_active`](EditingManager::is_active)),
+/// the Stop-block that nags an agent to diagnose before finishing, and the
+/// worktree-land debt transfer (which reads the owner's still-unpaid set). It is
+/// no longer consulted to gate shell commands or to source the diagnose set, so it
+/// can drift from the ledger without affecting enforcement.
+///
 /// The batch is the set of covered files this agent has edited, each carrying a
 /// `delivered` flag. A covered edit into an *incomplete* batch (some flag false)
 /// joins the file / flips its flag false; a covered edit into a *complete* batch
 /// (non-empty, all flags true) discards the batch and starts a new one with that
-/// file (the flat rule — no inside/outside distinction). Bare `catenary
-/// diagnostics` diagnoses the whole batch and flips every flag; scoped
-/// diagnostics flips exactly the named files. The debt gate is armed while any
-/// flag is false. The batch is **in-memory** daemon state keyed by
-/// `(session_id, agent_id)`: it persists across diagnose runs within a daemon
-/// instance — diagnostics are always recomputed over it, so repeat bare runs
-/// re-diagnose the same scope — and is **released with the instance**. On daemon
-/// death the debt is dropped, never spooled (maintainer ruling, bug 79): a fresh
-/// daemon disarms the gate so an unstable daemon cannot lock a session out.
+/// file (the flat rule). `mark_delivered_all`/`mark_delivered` flip the flags. The
+/// batch is **in-memory** daemon state keyed by `(session_id, agent_id)`, released
+/// with the instance.
 ///
 /// Holds the covered batch alongside the [`SkippedEdits`] buckets — edits
 /// skipped during accumulation because no diagnostic feeder covers them — so a

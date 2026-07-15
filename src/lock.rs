@@ -182,24 +182,35 @@ fn ledger_dir(lock_dir: &Path) -> PathBuf {
     lock_dir.join("dir")
 }
 
+/// The takeover-breadcrumb marker file inside a root's lock directory
+/// (root-ownership stage 3, deliverable 7).
+///
+/// Written by [`claim_in`] on a successful takeover, read-and-removed by the
+/// first diagnose serve after the claim ([`take_claim_marker_in`]). Its presence
+/// is the sole signal that the root was claimed from a prior editor since the
+/// last serve, so the receipt can lead with the claimed line. The `.claimed`
+/// name is filesystem-safe, never owner-shaped (no `+` separators, so
+/// [`read_owner_name`] skips it), and lives beside `dir/` — never inside the
+/// touch-tree, so it is not miscounted as a due file.
+fn claim_marker(lock_dir: &Path) -> PathBuf {
+    lock_dir.join(".claimed")
+}
+
 /// The touch-file path for a due file, mirrored under `dir/` with a `.lock`
 /// suffix: `dir/<root-relative-path>.lock`.
 ///
-/// Callers pass one canonical spelling for both `root` and `file` (the
-/// acquire/unlink seams canonicalize), so the strip succeeds in practice. The
-/// defensive fallback for a file NOT under `root` flattens the absolute path
-/// into a single ledger-safe component — it must never be joined raw, because
-/// joining an absolute path REPLACES the base and would drop the touch file
-/// into the workspace itself (the macOS `/var`→`/private/var` sighting).
+/// When the file is not under `root` (defensive — the caller resolves and
+/// canonicalizes the root first, so this should not happen in practice), the
+/// name flattens to a single ledger-safe component via [`crate::paths::encode_cwd`]
+/// rather than joining the raw absolute path: joining an absolute path REPLACES
+/// the ledger base, which would drop `.lock` files into the workspace (misc 193).
 fn touch_file(lock_dir: &Path, root: &Path, file: &Path) -> PathBuf {
-    let base = ledger_dir(lock_dir);
     let mut name = file.strip_prefix(root).map_or_else(
-        // Flatten: one component, separators encoded, always inside `dir/`.
-        |_| std::ffi::OsString::from(file.to_string_lossy().replace('/', "%2F")),
+        |_| std::ffi::OsString::from(crate::paths::encode_cwd(file)),
         |rel| rel.as_os_str().to_os_string(),
     );
     name.push(".lock");
-    base.join(name)
+    ledger_dir(lock_dir).join(name)
 }
 
 /// Reads the owner file's name from a lock directory, if one exists.
@@ -308,6 +319,120 @@ pub fn due_count(lock_dir: &Path) -> usize {
         total
     }
     count_dir(&ledger_dir(lock_dir))
+}
+
+/// The absolute paths of every file awaiting diagnosis in a root's ledger — the
+/// due set the diagnose round computes over (root-ownership stage 3).
+///
+/// Walks the `dir/` touch-tree under `<locks_base>/<encoded-root>/`, strips each
+/// `.lock` leaf's suffix, and rejoins it onto `root` to reconstruct the absolute
+/// path the edit seam booked. The ledger is now the single source of truth for
+/// the batch: a bare `catenary diagnostics` diagnoses exactly this set. Sorted
+/// for a stable receipt order. Best-effort: an unreadable / absent ledger yields
+/// an empty set (no debt).
+#[must_use]
+pub fn due_files_in(locks_base: &Path, root: &Path) -> Vec<PathBuf> {
+    let lock_dir = root_lock_dir_in(locks_base, root);
+    let base = ledger_dir(&lock_dir);
+    let mut out = Vec::new();
+    collect_due(&base, &base, root, &mut out);
+    out.sort();
+    out
+}
+
+/// Recursive touch-tree walker for [`due_files_in`]: for each `<relpath>.lock`
+/// leaf under `base`, rejoins `<relpath>` (the path relative to `base`, minus the
+/// `.lock` suffix) onto `root`.
+fn collect_due(base: &Path, dir: &Path, root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_due(base, &path, root, out);
+        } else if path.extension().is_some_and(|e| e == "lock")
+            && let Ok(rel) = path.strip_prefix(base)
+        {
+            // Drop the `.lock` suffix from the leaf, keeping the mirrored parents.
+            let stem = rel.with_extension("");
+            out.push(root.join(stem));
+        }
+    }
+}
+
+/// Production wrapper for [`due_files_in`] resolving the base through [`locks_dir`].
+#[must_use]
+pub fn due_files(root: &Path) -> Vec<PathBuf> {
+    due_files_in(&locks_dir(), root)
+}
+
+/// Whether a root's ledger holds any unpaid debt — the gate's "is there
+/// undelivered debt?" question, answered by the ledger (root-ownership stage 3).
+///
+/// A non-empty touch-tree means at least one edited file has not been diagnosed
+/// since its last edit. The lock dir surviving with an empty `dir/` (paid,
+/// inside its idle window) reports `false`. Best-effort: an unreadable ledger
+/// reports `false` (never false-gate on a transient FS error).
+#[must_use]
+pub fn has_debt_in(locks_base: &Path, root: &Path) -> bool {
+    due_count(&root_lock_dir_in(locks_base, root)) > 0
+}
+
+/// Production wrapper for [`has_debt_in`] resolving the base through [`locks_dir`].
+#[must_use]
+pub fn has_debt(root: &Path) -> bool {
+    has_debt_in(&locks_dir(), root)
+}
+
+/// The current owner of a root's lock, or `None` when the root is unlocked or
+/// the lock dir is ownerless (root-ownership stage 3).
+///
+/// The hook-side diagnostics gate (deliverable 4) reads this to answer "does the
+/// caller hold this root?" before allowing a bare `catenary diagnostics` to pull
+/// its ledger. Parsing the owner file name recovers the `<client>+<session>+
+/// <agent>` tuple; an absent owner file (unlocked, or a mid-swing / crashed
+/// acquisition) yields `None` — an ungated serve, since there is no established
+/// holder to protect.
+#[must_use]
+pub fn owner_of_in(locks_base: &Path, root: &Path) -> Option<Owner> {
+    let lock_dir = root_lock_dir_in(locks_base, root);
+    read_owner_name(&lock_dir)
+        .ok()
+        .flatten()
+        .and_then(|name| Owner::parse(&name))
+}
+
+/// Production wrapper for [`owner_of_in`] resolving the base through [`locks_dir`].
+#[must_use]
+pub fn owner_of(root: &Path) -> Option<Owner> {
+    owner_of_in(&locks_dir(), root)
+}
+
+/// Reads-and-removes the takeover breadcrumb for a root, returning `true` when
+/// one was present (root-ownership stage 3, deliverable 7).
+///
+/// The first diagnose serve after a `catenary claim` calls this: a `true` result
+/// leads the receipt with "root claimed from a prior editor", and the removal
+/// makes it one-shot — a later serve on the same root (no new claim) sees no
+/// marker. Best-effort: an absent marker or a removal failure yields `false` (the
+/// breadcrumb is a nicety, never a gate).
+#[must_use]
+pub fn take_claim_marker_in(locks_base: &Path, root: &Path) -> bool {
+    let marker = claim_marker(&root_lock_dir_in(locks_base, root));
+    if marker.exists() {
+        let _ = std::fs::remove_file(&marker);
+        true
+    } else {
+        false
+    }
+}
+
+/// Production wrapper for [`take_claim_marker_in`] resolving the base through
+/// [`locks_dir`].
+#[must_use]
+pub fn take_claim_marker(root: &Path) -> bool {
+    take_claim_marker_in(&locks_dir(), root)
 }
 
 /// How long ago the lock last saw activity, or `None` when no mtime is readable
@@ -478,17 +603,20 @@ pub fn acquire_in(
     booking: &Booking,
     now: SystemTime,
 ) -> Acquired {
-    // One spelling everywhere: canonicalize the edited path up front so the
-    // root key AND the ledger relpath agree on symlinked spellings (macOS
-    // `/var` → `/private/var`, a symlinked ~/Projects). Without this the root
-    // canonicalizes but the file doesn't, `strip_prefix` misses, and the
-    // booking falls back — the misc-193 ingestion-seam rule applied here.
+    // Canonicalize the edited path at the ingestion seam (misc 193): one spelling
+    // everywhere below — `resolve_lock_root`, `booking.books`, and both
+    // `book_file` sites — so a symlinked-prefix alias (macOS `$TMPDIR` →
+    // `/private/var/…`, or any symlinked checkout) books into the SAME canonical
+    // ledger it will be paid against. Since stage 3 makes the ledger the single
+    // source of truth, this spelling rule is load-bearing: a split spelling
+    // splits the debt.
     let file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
-    let Some(root) = resolve_lock_root(&file) else {
+    let file = file.as_path();
+    let Some(root) = resolve_lock_root(file) else {
         // Foreign territory (/tmp, scratch) — never tracked, no lock.
         return Acquired::Ours;
     };
-    let books = booking.books(&file);
+    let books = booking.books(file);
     let lock_dir = root_lock_dir_in(locks_base, &root);
 
     match std::fs::create_dir_all(locks_base).and_then(|()| std::fs::create_dir(&lock_dir)) {
@@ -501,7 +629,7 @@ pub fn acquire_in(
                 return Acquired::Ours;
             }
             let _ = write_owner_atomic(&lock_dir, owner);
-            book_file(&lock_dir, &root, &file);
+            book_file(&lock_dir, &root, file);
             Acquired::Ours
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -509,7 +637,7 @@ pub fn acquire_in(
                 Ok(Some(name)) if name == owner.file_name() => {
                     // Ours — book (idempotent), bump last-activity, allow.
                     if books {
-                        book_file(&lock_dir, &root, &file);
+                        book_file(&lock_dir, &root, file);
                     }
                     touch_owner(&lock_dir, &name);
                     Acquired::Ours
@@ -594,6 +722,11 @@ pub fn claim_in(locks_base: &Path, root: &Path, claimant: &Owner, now: SystemTim
             // The one atomic rename-over: the new title replaces the old, the
             // ledger stays put. A fresh mtime records the takeover instant.
             let _ = write_owner_atomic(&lock_dir, claimant);
+            // Drop the takeover breadcrumb (root-ownership stage 3, deliverable
+            // 7): the first diagnose serve after this claim reads-and-removes it
+            // and leads its receipt with the claimed line. Best-effort — a failed
+            // marker write only loses the one-time breadcrumb, never the takeover.
+            let _ = std::fs::write(claim_marker(&lock_dir), b"");
             Claimed::Ok {
                 previous_age,
                 due,
@@ -662,8 +795,10 @@ pub fn unlink_delivered_in(locks_base: &Path, root: &Path, files: &[PathBuf]) {
     }
     let base = ledger_dir(&lock_dir);
     for file in files {
-        // Same-spelling rule as the acquire seam: canonicalize so the relpath
-        // agrees with the booked touch file on symlinked spellings.
+        // Canonicalize the delivered file at the seam (misc 193): the touch path
+        // must be computed from the same spelling `acquire_in` booked it under,
+        // or a symlinked-prefix alias would compute a different `.lock` leaf and
+        // fail to unlink — leaving phantom debt on a canonical ledger.
         let file = file.canonicalize().unwrap_or_else(|_| file.clone());
         let touch = touch_file(&lock_dir, root, &file);
         let _ = std::fs::remove_file(&touch);
@@ -685,6 +820,65 @@ pub fn unlink_delivered_in(locks_base: &Path, root: &Path, files: &[PathBuf]) {
 /// [`locks_dir`].
 pub fn unlink_delivered(root: &Path, files: &[PathBuf]) {
     unlink_delivered_in(&locks_dir(), root, files);
+}
+
+/// Books a set of files into `root`'s ledger under `owner`, creating the lock
+/// dir + owner file if the root is not yet locked (root-ownership stage 3).
+///
+/// The daemon-side booking seam for the worktree-land debt transfer: a landed
+/// worktree's unpaid files become the landing agent's debt, booked directly into
+/// the owning repo's ledger (identity lives at the land hook, forwarded here) so
+/// a later `catenary diagnostics` in the landing repo serves them. Distinct from
+/// the edit-seam [`acquire_in`] — this is a bulk transfer, not a per-edit
+/// acquisition, so it books unconditionally (the caller already resolved the
+/// transfer set) without the booking/coverage gate. Each file is canonicalized so
+/// its touch leaf matches the canonical ledger a later `due_files`/serve reads
+/// (misc 193). Best-effort: a failed create never blocks the land.
+pub fn book_transferred_in(locks_base: &Path, root: &Path, owner: &Owner, files: &[PathBuf]) {
+    if files.is_empty() {
+        return;
+    }
+    let lock_dir = root_lock_dir_in(locks_base, root);
+    // Ensure the lock dir and an owner file exist (the landing agent owns the
+    // root's inherited debt). `create_dir_all` is idempotent; the owner write is
+    // rename-over, so a re-titled owner on an already-locked root is fine.
+    let _ = std::fs::create_dir_all(&lock_dir);
+    if read_owner_name(&lock_dir).ok().flatten().is_none() {
+        let _ = write_owner_atomic(&lock_dir, owner);
+    }
+    for file in files {
+        let file = file.canonicalize().unwrap_or_else(|_| file.clone());
+        book_file(&lock_dir, root, &file);
+    }
+}
+
+/// Production wrapper for [`book_transferred_in`] resolving the base through
+/// [`locks_dir`].
+pub fn book_transferred(root: &Path, owner: &Owner, files: &[PathBuf]) {
+    book_transferred_in(&locks_dir(), root, owner, files);
+}
+
+/// Unlinks a set of delivered files from their ledgers, grouping each file by its
+/// own resolved lock root ([`resolve_lock_root`]) so a set spanning multiple
+/// kitchens pays each (root-ownership stage 3).
+///
+/// The whole-set convenience over [`unlink_delivered`], used where the caller
+/// holds a flat file list rather than a per-root grouping (the diagnostics
+/// delivery seam and the worktree-land ledger prune). Each file is canonicalized
+/// inside [`unlink_delivered_in`] so a symlinked-prefix alias pays the canonical
+/// ledger it booked against (misc 193). Best-effort: a file that resolves to no
+/// root is skipped.
+pub fn unlink_delivered_by_root(files: &[PathBuf]) {
+    use std::collections::HashMap;
+    let mut by_root: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    for file in files {
+        if let Some(root) = resolve_lock_root(file) {
+            by_root.entry(root).or_default().push(file.clone());
+        }
+    }
+    for (root, served) in &by_root {
+        unlink_delivered(root, served);
+    }
 }
 
 /// Retires a root's lock entirely under `locks_base`: removes
@@ -949,45 +1143,6 @@ mod tests {
             "owner file titled with the tuple"
         );
         assert_eq!(due_count(&lock_dir), 1, "the edited file is booked");
-    }
-
-    /// The macOS `/var` → `/private/var` class, reproduced with a symlink on
-    /// any platform: an edit arriving under a symlinked SPELLING of the root
-    /// must key the same lock and book into its ledger — never fall back to a
-    /// stray `.lock` beside the source file (the CI sighting on `c58b81c`).
-    #[cfg(unix)]
-    #[test]
-    fn symlinked_spelling_books_into_the_same_ledger() {
-        let fx = Fixture::new();
-        let file = fx.file("src/main.rs");
-
-        // An alias spelling of the same root, via a symlink beside it.
-        let alias = fx.dir.path().join("alias");
-        std::os::unix::fs::symlink(&fx.root, &alias).expect("symlink alias");
-        let aliased_file = alias.join("src/main.rs");
-
-        let owner = Owner::new("claude", "sess-a", "");
-        let got = acquire_in(
-            &fx.locks(),
-            &aliased_file,
-            &owner,
-            &rust_booking(),
-            SystemTime::now(),
-        );
-        assert!(matches!(got, Acquired::Ours), "aliased first cook admitted");
-
-        // Books under the CANONICAL root's lock dir, count visible.
-        let lock_dir = root_lock_dir_in(&fx.locks(), &fx.root);
-        assert_eq!(due_count(&lock_dir), 1, "aliased edit booked canonically");
-        // And never as a stray .lock beside the source file.
-        assert!(
-            !file.with_extension("rs.lock").exists(),
-            "no stray lock file lands in the workspace"
-        );
-
-        // Delivery through the alias spelling unlinks the same touch file.
-        unlink_delivered_in(&fx.locks(), &fx.root, &[aliased_file]);
-        assert_eq!(due_count(&lock_dir), 0, "aliased delivery pays the ledger");
     }
 
     #[test]
@@ -1421,5 +1576,216 @@ mod tests {
         let root = Path::new("/home/mark/Projects/Catenary");
         let msg = claim_answer(root, Some(Duration::from_mins(2)), 0, true);
         assert!(msg.contains("no unpaid debt; lock expires shortly."));
+    }
+
+    // ── Ledger as source of truth (root-ownership stage 3) ──────────────
+
+    #[test]
+    fn due_files_reconstructs_absolute_paths_from_the_ledger() {
+        let fx = Fixture::new();
+        let f1 = fx.file("src/main.rs");
+        let f2 = fx.file("src/inner/lib.rs");
+        let owner = Owner::new("claude", "sess-a", "");
+        let booking = rust_booking();
+        let now = SystemTime::now();
+        let locks = fx.locks();
+        assert!(matches!(
+            acquire_in(&locks, &f1, &owner, &booking, now),
+            Acquired::Ours
+        ));
+        assert!(matches!(
+            acquire_in(&locks, &f2, &owner, &booking, now),
+            Acquired::Ours
+        ));
+
+        // The due set read from disk IS the batch — the absolute paths the edit
+        // seam booked, reconstructed from the `.lock` touch-tree.
+        let due = due_files_in(&locks, &fx.root);
+        assert_eq!(
+            due,
+            vec![f2.clone(), f1.clone()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "due_files rebuilds both booked paths (sorted)"
+        );
+        assert!(has_debt_in(&locks, &fx.root), "unpaid debt is present");
+
+        // Delivery unlinks — the ledger empties, so the due set drains and the
+        // debt clears (the new bare-rerun contract: no debt after full payment).
+        unlink_delivered_in(&locks, &fx.root, &[f1, f2]);
+        assert!(
+            due_files_in(&locks, &fx.root).is_empty(),
+            "a fully-paid ledger reports no due files"
+        );
+        assert!(
+            !has_debt_in(&locks, &fx.root),
+            "a fully-paid ledger reports no debt"
+        );
+    }
+
+    #[test]
+    fn due_files_empty_for_unlocked_root() {
+        let fx = Fixture::new();
+        assert!(
+            due_files_in(&fx.locks(), &fx.root).is_empty(),
+            "a root with no lock has no due files"
+        );
+        assert!(
+            !has_debt_in(&fx.locks(), &fx.root),
+            "a root with no lock has no debt"
+        );
+    }
+
+    #[test]
+    fn claim_marker_is_written_and_taken_once() {
+        let fx = Fixture::new();
+        let file = fx.file("src/main.rs");
+        let a = Owner::new("claude", "sess-a", "");
+        let b = Owner::new("claude", "sess-b", "");
+        let now = SystemTime::now();
+        let locks = fx.locks();
+        assert!(matches!(
+            acquire_in(&locks, &file, &a, &rust_booking(), now),
+            Acquired::Ours
+        ));
+        // Before any claim there is no breadcrumb.
+        assert!(
+            !take_claim_marker_in(&locks, &fx.root),
+            "no marker before a claim"
+        );
+
+        // A claim drops the breadcrumb.
+        let claimed = claim_in(&locks, &fx.root, &b, now);
+        assert!(matches!(claimed, Claimed::Ok { .. }), "claim succeeds");
+
+        // The first serve reads-and-removes it (one-shot).
+        assert!(
+            take_claim_marker_in(&locks, &fx.root),
+            "the first serve after a claim sees the breadcrumb"
+        );
+        assert!(
+            !take_claim_marker_in(&locks, &fx.root),
+            "the breadcrumb is one-shot — a later serve sees nothing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_spelling_books_into_the_same_ledger() {
+        // The macOS ingestion-seam rule (misc 193): an edit reached through a
+        // symlinked-prefix alias of the root must book into — and pay off — the
+        // SAME canonical ledger the direct spelling uses. Without canonicalizing
+        // at the seam the two spellings would split the debt.
+        let fx = Fixture::new();
+        // A symlink whose target is the canonical repo root.
+        let alias = fx.dir.path().join("alias");
+        std::os::unix::fs::symlink(&fx.root, &alias).expect("mk symlink");
+        // The file reached through the alias spelling.
+        let real = fx.file("src/main.rs");
+        let via_alias = alias.join("src/main.rs");
+
+        let owner = Owner::new("claude", "sess-a", "");
+        let booking = rust_booking();
+        let now = SystemTime::now();
+        let locks = fx.locks();
+
+        // Book through the alias spelling.
+        assert!(matches!(
+            acquire_in(&locks, &via_alias, &owner, &booking, now),
+            Acquired::Ours
+        ));
+        // The debt landed on the CANONICAL ledger, and the reconstructed due path
+        // is the canonical spelling.
+        assert_eq!(
+            due_files_in(&locks, &fx.root),
+            vec![real],
+            "the aliased edit booked into the canonical ledger"
+        );
+
+        // Paying through the alias spelling clears the canonical ledger.
+        unlink_delivered_in(&locks, &fx.root, std::slice::from_ref(&via_alias));
+        assert!(
+            due_files_in(&locks, &fx.root).is_empty(),
+            "paying through the alias spelling clears the canonical debt"
+        );
+    }
+
+    #[test]
+    fn book_transferred_books_into_the_ledger_under_an_owner() {
+        // The worktree-land debt transfer seam: files become the landing agent's
+        // debt in the owning repo's ledger, served by a later `catenary
+        // diagnostics` there. Booking creates the lock dir + owner file when the
+        // root is not yet locked.
+        let fx = Fixture::new();
+        let f1 = fx.file("src/a.rs");
+        let f2 = fx.file("src/b.rs");
+        let owner = Owner::new("claude", "sess-land", "");
+        let locks = fx.locks();
+
+        assert!(
+            !root_lock_dir_in(&locks, &fx.root).exists(),
+            "no lock before the transfer"
+        );
+        book_transferred_in(&locks, &fx.root, &owner, &[f1.clone(), f2.clone()]);
+
+        let lock_dir = root_lock_dir_in(&locks, &fx.root);
+        assert!(lock_dir.is_dir(), "the transfer creates the lock dir");
+        assert_eq!(
+            read_owner_name(&lock_dir).expect("read owner"),
+            Some(owner.file_name()),
+            "the landing agent owns the inherited debt"
+        );
+        assert_eq!(
+            due_files_in(&locks, &fx.root),
+            {
+                let mut v = vec![f1, f2];
+                v.sort();
+                v
+            },
+            "both transferred files are due in the owning repo's ledger"
+        );
+    }
+
+    #[test]
+    fn book_transferred_empty_is_a_noop() {
+        let fx = Fixture::new();
+        let owner = Owner::new("claude", "sess-land", "");
+        book_transferred_in(&fx.locks(), &fx.root, &owner, &[]);
+        assert!(
+            !root_lock_dir_in(&fx.locks(), &fx.root).exists(),
+            "an empty transfer books nothing and creates no lock"
+        );
+    }
+
+    #[test]
+    fn claim_marker_does_not_count_as_due() {
+        let fx = Fixture::new();
+        let file = fx.file("src/main.rs");
+        let a = Owner::new("claude", "sess-a", "");
+        let b = Owner::new("claude", "sess-b", "");
+        let now = SystemTime::now();
+        let locks = fx.locks();
+        assert!(matches!(
+            acquire_in(&locks, &file, &a, &rust_booking(), now),
+            Acquired::Ours
+        ));
+        let lock_dir = root_lock_dir_in(&locks, &fx.root);
+        assert_eq!(due_count(&lock_dir), 1, "one due file before the claim");
+
+        let _ = claim_in(&locks, &fx.root, &b, now);
+        // The `.claimed` marker lives beside `dir/`, never inside it — the due
+        // count must not change.
+        assert_eq!(
+            due_count(&lock_dir),
+            1,
+            "the breadcrumb is never miscounted as a due file"
+        );
+        assert_eq!(
+            read_owner_name(&lock_dir).expect("read owner"),
+            Some(b.file_name()),
+            "the marker does not confuse owner-file resolution"
+        );
     }
 }

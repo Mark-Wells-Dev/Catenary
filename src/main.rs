@@ -2836,10 +2836,11 @@ struct DiagnosticsResponse {
     /// a silent exit. Absent on a pre-fix daemon → defaults to 0.
     #[serde(default)]
     covered: usize,
-    /// Daemon-detected fault (bug 100): a bare run with no staged handoff —
-    /// no hooked session armed a gate, or the prepare's TTL blew — so the run
-    /// never happened. Present → the CLI surfaces the message on stderr and
-    /// exits `2` instead of printing a receipt-shaped success.
+    /// Daemon-detected fault, surfaced on stderr with exit `2` instead of a
+    /// receipt-shaped success. Root-ownership stage 3 retired the bare-run "no
+    /// staged handoff" fault (a bare run now serves the ledger and answers `[no
+    /// edited files]` on an empty one); this field remains as the CLI's defensive
+    /// channel for any daemon-reported error.
     #[serde(default)]
     error: Option<String>,
 }
@@ -2849,24 +2850,22 @@ struct DiagnosticsResponse {
 /// editing debt.
 ///
 /// Connects to the daemon's IPC socket and sends `tool/editing-stop` (the
-/// internal handoff method name is unchanged by the user-facing rename). In a
-/// hooked session the `PreToolUse` hook has already prepared the handoff — the
-/// bare form retrieves the batch and prints the per-file receipt. When `paths`
-/// is non-empty, they ride the request's `files` param: the daemon diagnoses
-/// exactly those, with no handoff required (bug 100 — the hookless on-demand
-/// form), and flips their gate flags on delivery when a hooked session staged
-/// one. A bare run with no staged handoff is a daemon-detected fault (there is
-/// no gate to pay). Relative paths resolve against the CLI's cwd before
-/// dispatch — the daemon runs under a different cwd — matching how
-/// `grep`/`glob` forward paths. Success (clean *or* dirty) returns `Ok(())`,
-/// which the dispatcher maps to exit `0`.
+/// internal method name is unchanged by the user-facing rename). Root-ownership
+/// stage 3 retired the two-phase identity handoff: the daemon serves against the
+/// durable on-disk ledger. The bare form forwards the CLI's `cwd` — the daemon
+/// resolves its enclosing lock root and diagnoses that root's due set (an empty
+/// ledger answers `[no edited files]`). The scoped form rides the request's
+/// `files` param: the daemon diagnoses exactly those paths, served on demand
+/// regardless of debt. Delivery unlinks each served file's ledger touch entry
+/// (payment). Relative scoped paths resolve against the CLI's cwd before dispatch
+/// — the daemon runs under a different cwd — matching how `grep`/`glob` forward
+/// paths. Success (clean *or* dirty) returns `Ok(())`, mapped to exit `0`.
 ///
 /// # Errors
 ///
 /// Returns an error (mapped to fault exit `2`) if no daemon is running, the
 /// IPC fails, the working directory can't be resolved, the response is
-/// malformed, or the daemon reports a fault (a bare run with no staged
-/// handoff).
+/// malformed, or the daemon reports a fault in the envelope's `error` field.
 #[cfg(unix)]
 async fn run_done_editing(out: &mut cli::Output, paths: &[String]) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -2898,8 +2897,17 @@ async fn run_done_editing(out: &mut cli::Output, paths: &[String]) -> Result<()>
         .await
         .context("catenary daemon not running")?;
 
+    // Forward the CLI's cwd (root-ownership stage 3): the bare form resolves its
+    // due set by pure path algebra — cwd → enclosing lock root → ledger — so the
+    // daemon serves the right kitchen. The daemon runs under a different cwd, so
+    // it cannot infer this. Absent on the rare cwd-resolution failure; the daemon
+    // then falls back to its own cwd (degrades to "no root here → no debt").
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
     let (reader, mut writer) = stream.into_split();
-    let request = serde_json::json!({"method": "tool/editing-stop", "files": files});
+    let request = serde_json::json!({"method": "tool/editing-stop", "files": files, "cwd": cwd});
     let mut payload = serde_json::to_string(&request)?;
     payload.push('\n');
     writer.write_all(payload.as_bytes()).await?;
@@ -5488,10 +5496,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn diagnostics_error_envelope_is_fault_with_teaching_text() {
-        // Bug 100: the daemon answers a bare run with no staged handoff with a
-        // fault envelope. The CLI surfaces the teaching message as the error
-        // (dispatcher → stderr + exit 2) and prints no receipt — the run never
-        // happened, so there is nothing trustworthy to put on stdout.
+        // The CLI's defensive parse of a daemon `error` envelope: whatever the
+        // fault, the CLI surfaces the message as the error (dispatcher → stderr +
+        // exit 2) and prints no receipt. (Root-ownership stage 3 retired the
+        // bare-run "no staged handoff" fault — a bare run now answers `[no edited
+        // files]` — but the CLI keeps this defensive `error`-envelope handling.)
         let mut out = cli::Output::buffer(80);
         let err = emit_diagnostics_response(
             &mut out,

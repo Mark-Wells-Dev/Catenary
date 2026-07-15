@@ -59,25 +59,16 @@ const PROMPT_BOUND: Duration = Duration::from_secs(12);
 /// dwarfing [`PROMPT_BOUND`] so the pre-fix failure mode cannot slip under it.
 const FLYCHECK_TICKS: u64 = 2_000;
 
-/// Runs the scoped `catenary diagnostics <file>` flow as `agent_id`: prepare
-/// via the `PreToolUse` hook (staging the handoff under this agent's
-/// identity), then consume with an explicit `files` set. All agents share the
-/// implicit `"default"` session — the incident's shape: same session, sibling
-/// agents.
+/// Runs the scoped `catenary diagnostics <file>` serve. Root-ownership stage 3
+/// retired the identity handoff — a single scoped `tool/editing-stop` naming the
+/// file serves it. `agent_id` is retained only for the caller's readability of
+/// which round is which (it no longer keys anything on the wire).
 fn scoped_diagnostics(
     socket: &Path,
     daemon_pid: Option<u32>,
-    agent_id: &str,
+    _agent_id: &str,
     file: &Path,
 ) -> Result<String> {
-    common::ipc_request(
-        socket,
-        &json!({ "method": "pre-tool/editing-start", "agent_id": agent_id }),
-    )?;
-    common::ipc_request(
-        socket,
-        &json!({ "method": "pre-tool/editing-stop", "agent_id": agent_id }),
-    )?;
     let text = common::ipc_request_long(
         socket,
         daemon_pid,

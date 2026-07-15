@@ -13,16 +13,18 @@
 //! `run_pre_tool`'s dispatch over the pure filter functions. This test drives
 //! the real `catenary hook pre-tool` binary against a live daemon to prove the
 //! load-bearing ordering (cli-prerelease ticket 11 / ADR 013): a piped
-//! `catenary diagnostics` is DENIED *before* the editing-stop prepare drains
-//! the tracked set — so a denied piped form can never silently clear pending
-//! diagnostics ("denied *and* cleared").
+//! `catenary diagnostics` is DENIED by the client-side matcher (bare-only),
+//! while a bare form is allowed and serves. Root-ownership stage 3 retired the
+//! two-phase prepare-drain (the serve now reads the durable ledger), so the
+//! surviving guard is the bare-only pipe deny — a piped form never reaches the
+//! serve.
 
 mod common;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use common::{BridgeProcess, diagnostics_output, ipc_request, ipc_request_long, mockls_lsp_arg};
+use common::{BridgeProcess, diagnostics_output, ipc_request_long, mockls_lsp_arg};
 
 // The `mockls-event` persona is the blessed base (diagnostics-debt 04c):
 // renaming the key to a manifest persona makes the mock a diagnostics source
@@ -44,12 +46,13 @@ fn parse_decision(stdout: &str) -> Option<(String, String)> {
     Some((decision, reason))
 }
 
-/// Driving the real hook: a piped `catenary diagnostics` denies before the
-/// prepare-drain, so the tracked set survives and a later bare run still
-/// reports its diagnostics. If the deny fired *after* the drain (the bug the
-/// ticket-11 ordering prevents), the bare run would find an empty set.
+/// Driving the real hook: a piped `catenary diagnostics | head` is DENIED by the
+/// client-side matcher (bare-only), never reaching the serve; a bare
+/// `catenary diagnostics` is allowed; and a scoped serve still reports the file's
+/// diagnostics. The deny is the ordering guard — a piped form cannot slip through
+/// to run the serve.
 #[test]
-fn piped_diagnostics_denied_before_prepare_drain() -> Result<()> {
+fn piped_diagnostics_denied_bare_serves() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join(format!("track.{MOCK_LANG}"));
     std::fs::write(&file, "echo hello\n")?;
@@ -61,24 +64,8 @@ fn piped_diagnostics_denied_before_prepare_drain() -> Result<()> {
     bridge.initialize()?;
     let socket = bridge.wait_for_ipc_socket()?;
 
-    // Enter editing mode and accumulate the covered file (raw IPC, agent "").
-    ipc_request(
-        &socket,
-        &json!({"method": "pre-tool/editing-start", "agent_id": ""}),
-    )?;
-    ipc_request(
-        &socket,
-        &json!({
-            "method": "pre-tool/editing-state",
-            "tool_name": "Edit",
-            "file_path": file_str,
-            "agent_id": ""
-        }),
-    )?;
-
     // Drive the REAL run_pre_tool with a PIPED diagnostics command. The matcher
-    // denies it (regime 1) and the dispatch returns *before* contacting the
-    // daemon — no editing-stop prepare, so the tracked set is untouched.
+    // denies it (regime 1, bare-only) before any daemon contact.
     let piped = bridge.run_pre_tool_bash("catenary diagnostics | head")?;
     let (decision, reason) =
         parse_decision(&piped).context("piped diagnostics should produce a deny envelope")?;
@@ -91,27 +78,25 @@ fn piped_diagnostics_denied_before_prepare_drain() -> Result<()> {
         "deny reason should be the diagnostics pipe-deny, got: {reason}",
     );
 
-    // A bare `catenary diagnostics` now routes (the Diagnostics arm): the hook
-    // stages the editing-stop prepare, draining the *surviving* set into the
-    // handoff slot. An allow is silent (empty stdout).
+    // A bare `catenary diagnostics` is allowed (the Diagnostics arm — the owner
+    // gate on an unlocked root allows). An allow is silent (empty stdout).
     let bare = bridge.run_pre_tool_bash("catenary diagnostics")?;
     assert!(
         parse_decision(&bare).is_none(),
         "bare diagnostics should be allowed (no deny), got: {bare}",
     );
 
-    // Claim the staged handoff. A non-empty result proves the set survived the
-    // piped deny and was drained by the bare run; had the piped form drained it,
-    // the bare prepare would have found nothing to report.
-    let claimed = ipc_request_long(
+    // A scoped serve names the file and reports its diagnostics (served regardless
+    // of ledger state — root-ownership stage 3). The piped deny never touched it.
+    let served = ipc_request_long(
         &socket,
         bridge.daemon_pid(),
-        &json!({"method": "tool/editing-stop"}),
+        &json!({"method": "tool/editing-stop", "files": [file_str]}),
     )?;
-    let diag = diagnostics_output(&claimed);
+    let diag = diagnostics_output(&served);
     assert!(
         diag.contains("mock diagnostic"),
-        "tracked set must survive the piped deny and drain on the bare run, got:\n{diag}",
+        "the scoped serve reports the file's diagnostics, got:\n{diag}",
     );
 
     Ok(())

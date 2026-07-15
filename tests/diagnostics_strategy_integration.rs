@@ -22,7 +22,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use common::{BridgeProcess, ipc_request, ipc_request_progress_aware, read_merged_log};
+use common::{BridgeProcess, ipc_request_progress_aware, read_merged_log};
 
 // The `mockls-event` persona is the blessed base for this file (diagnostics-debt
 // 04c): default mockls push IS the event discipline, so its persona bundle is
@@ -581,27 +581,9 @@ fn wedged_daemon_fails_within_no_progress_budget() -> Result<()> {
     let socket = bridge.wait_for_ipc_socket()?;
     let pid = bridge.daemon_pid().context("daemon PID from state.json")?;
 
-    // Stage the editing handoff while the daemon is still alive — the short
-    // `ipc_request` calls `call_diagnostics` makes before the long wait.
-    ipc_request(
-        &socket,
-        &json!({"method": "pre-tool/editing-start", "agent_id": ""}),
-    )?;
-    ipc_request(
-        &socket,
-        &json!({
-            "method": "pre-tool/editing-state",
-            "tool_name": "Edit",
-            "file_path": file_str,
-            "agent_id": ""
-        }),
-    )?;
-    ipc_request(
-        &socket,
-        &json!({"method": "pre-tool/editing-stop", "agent_id": ""}),
-    )?;
-
-    // Freeze the daemon: it can no longer make progress on the pipeline.
+    // Freeze the daemon: it can no longer make progress on the pipeline. (Root-
+    // ownership stage 3 retired the two-phase editing handoff; a single scoped
+    // `tool/editing-stop` naming the file drives the serve.)
     signal_process(pid, "STOP")?;
 
     // The progress-aware wait must give up within the (short) no-progress budget.
@@ -610,7 +592,7 @@ fn wedged_daemon_fails_within_no_progress_budget() -> Result<()> {
     let result = ipc_request_progress_aware(
         &socket,
         Some(pid),
-        &json!({"method": "tool/editing-stop"}),
+        &json!({"method": "tool/editing-stop", "files": [file_str]}),
         budget,
     );
     let elapsed = started.elapsed();

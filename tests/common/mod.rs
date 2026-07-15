@@ -755,137 +755,42 @@ impl BridgeProcess {
     /// Enters editing mode, accumulates a file, then runs `done_editing`
     /// via the handoff protocol to retrieve diagnostics.
     pub fn call_diagnostics(&self, file: &str) -> Result<String> {
-        let socket_path = self.wait_for_ipc_socket()?;
-
-        // Enter editing mode via CLI path
-        ipc_request(
-            &socket_path,
-            &json!({
-                "method": "pre-tool/editing-start",
-                "agent_id": ""
-            }),
-        )?;
-
-        // Accumulate file via PreToolUse file tracking
-        ipc_request(
-            &socket_path,
-            &json!({
-                "method": "pre-tool/editing-state",
-                "tool_name": "Edit",
-                "file_path": file,
-                "agent_id": ""
-            }),
-        )?;
-
-        // Prepare handoff (drains files, deposits in slot)
-        ipc_request(
-            &socket_path,
-            &json!({
-                "method": "pre-tool/editing-stop",
-                "agent_id": ""
-            }),
-        )?;
-
-        // Run diagnostics via handoff slot. Uses the progress-aware wait
-        // because the diagnostics pipeline (settle + flycheck) can take tens of
-        // seconds under CPU contention from parallel tests.
-        let text = ipc_request_long(
-            &socket_path,
-            self.daemon_pid(),
-            &json!({
-                "method": "tool/editing-stop"
-            }),
-        )?;
-
-        Ok(diagnostics_output(&text))
+        self.call_diagnostics_scoped(std::slice::from_ref(&file))
     }
 
-    /// Enters editing mode, accumulates multiple files, then runs
-    /// `done_editing` via the handoff protocol to retrieve batched
-    /// diagnostics.
+    /// Diagnoses multiple files in one serve — the scoped form naming them all.
+    ///
+    /// Root-ownership stage 3 retired the two-phase identity handoff: the daemon
+    /// serves `tool/editing-stop` against the on-disk ledger (bare) or the named
+    /// `files` (scoped). The test harness names its files explicitly (the scoped
+    /// form, served regardless of ledger state), so the diagnostics pipeline runs
+    /// identically without depending on the retired accumulation path.
     pub fn call_diagnostics_multi(&self, files: &[&str]) -> Result<String> {
-        let socket_path = self.wait_for_ipc_socket()?;
-
-        // Enter editing mode via CLI path
-        ipc_request(
-            &socket_path,
-            &json!({
-                "method": "pre-tool/editing-start",
-                "agent_id": ""
-            }),
-        )?;
-
-        // Accumulate all files via PreToolUse file tracking
-        for file in files {
-            ipc_request(
-                &socket_path,
-                &json!({
-                    "method": "pre-tool/editing-state",
-                    "tool_name": "Edit",
-                    "file_path": file,
-                    "agent_id": ""
-                }),
-            )?;
-        }
-
-        // Prepare handoff (drains files, deposits in slot)
-        ipc_request(
-            &socket_path,
-            &json!({
-                "method": "pre-tool/editing-stop",
-                "agent_id": ""
-            }),
-        )?;
-
-        // Run diagnostics via handoff slot. Uses the progress-aware wait
-        // because the diagnostics pipeline (settle + flycheck) can take tens of
-        // seconds under CPU contention from parallel tests.
-        let text = ipc_request_long(
-            &socket_path,
-            self.daemon_pid(),
-            &json!({
-                "method": "tool/editing-stop"
-            }),
-        )?;
-
-        Ok(diagnostics_output(&text))
+        self.call_diagnostics_scoped(files)
     }
 
     /// Runs the **scoped** `catenary diagnostics <paths>` form (ws37 tickets
-    /// 02/04): prepares the handoff, then consumes it with an explicit `files`
-    /// set — a whole-root `.`, a sub-root directory, or explicit files — without
-    /// accumulating any edited set first. Returns the rendered receipt text.
+    /// 02/04; the single serve request as of root-ownership stage 3): sends
+    /// `tool/editing-stop` with an explicit `files` set — a whole-root `.`, a
+    /// sub-root directory, or explicit files — served on demand regardless of the
+    /// ledger. Returns the rendered receipt text.
     pub fn call_diagnostics_scoped(&self, paths: &[&str]) -> Result<String> {
         let socket_path = self.wait_for_ipc_socket()?;
 
-        // Enter editing mode via CLI path (parity with the accumulating helpers;
-        // the scoped pull names its own set, so nothing is accumulated).
-        ipc_request(
-            &socket_path,
-            &json!({
-                "method": "pre-tool/editing-start",
-                "agent_id": ""
-            }),
-        )?;
-
-        // Prepare handoff (stages the slot the consume step drains).
-        ipc_request(
-            &socket_path,
-            &json!({
-                "method": "pre-tool/editing-stop",
-                "agent_id": ""
-            }),
-        )?;
-
-        // Consume with the explicit scoped `files` set.
-        let text = ipc_request_long(
-            &socket_path,
-            self.daemon_pid(),
-            &json!({
-                "method": "tool/editing-stop",
-                "files": paths,
-            }),
-        )?;
+        // A single serve request naming the files. The isolated cwd is injected
+        // (`resolve_ipc_cwd`) so a BARE serve (empty `paths`) resolves this test's
+        // root — never the test process's own cwd (the Catenary checkout), which
+        // would read the wrong ledger (root-ownership stage 3). Uses the
+        // progress-aware wait because the diagnostics pipeline (settle + flycheck)
+        // can take tens of seconds under CPU contention from parallel tests.
+        let mut request = json!({
+            "method": "tool/editing-stop",
+            "files": paths,
+        });
+        if let Some(obj) = request.as_object_mut() {
+            self.resolve_ipc_cwd(obj);
+        }
+        let text = ipc_request_long(&socket_path, self.daemon_pid(), &request)?;
 
         Ok(diagnostics_output(&text))
     }

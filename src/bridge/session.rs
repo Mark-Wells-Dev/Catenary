@@ -1061,16 +1061,17 @@ impl Session {
             .clone()
     }
 
-    /// Closes every held-open document the `(session, agent)` batch owner
-    /// holds, across all server connections — the batch-end leg of the
-    /// held-open lifecycle (diagnostics-debt 01), dispatched from an allowed
-    /// Stop/SubagentStop.
+    /// Closes every held-open document a ROOT owns, across all server
+    /// connections — the batch-end leg of the held-open lifecycle
+    /// (diagnostics-debt 01, re-keyed to the root in root-ownership stage 3).
     ///
-    /// `session_id`/`agent_id` are resolved to the owner key exactly as the
-    /// editing batch resolves them
-    /// ([`editing_key`](super::editing_manager::editing_key)).
-    pub async fn close_agent_docs(&self, session_id: Option<&str>, agent_id: &str) {
-        let owner = super::editing_manager::editing_key(session_id, agent_id);
+    /// Documents a diagnose round opens are tagged with their root
+    /// ([`crate::lsp::manager::LspClientManager::open_document_on`]), so root
+    /// retirement (worktree removal) closes exactly that root's held-open
+    /// documents — no identity below the hook. The owner string is the root's
+    /// display path, the same spelling the serve path tags with.
+    pub async fn close_root_docs(&self, root: &std::path::Path) {
+        let owner = root.to_string_lossy();
         self.client_manager.close_agent_docs(&owner).await;
     }
 

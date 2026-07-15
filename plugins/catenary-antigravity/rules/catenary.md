@@ -10,22 +10,24 @@ call.
 The edit→diagnostics loop
   Editing tracks itself — your first edit starts it, no start step. Every
   edited file a language server covers joins a debt gate. Pay it by running
-  `catenary diagnostics` (bare, its own step): it DIAGNOSES the whole edited
-  set and prints a per-file receipt — each file named, clean ones marked
-  `[clean]`, dirty ones listing their errors and warnings. Paying is
-  diagnosing, not fixing: a file leaves the gate once you look at it, clean or
-  dirty. Exit `0` means the run completed and its receipt is trustworthy,
-  clean or dirty; it never exits `1`, so a dirty result is not a failed call.
-  Scope it — `catenary diagnostics path…` — to diagnose and pay off just those
-  files; the gate stays armed for any edited file left unpaid. Diagnostics are
-  pulled: you see them only when you run it — each run re-diagnoses the set.
+  `catenary diagnostics`: it DIAGNOSES the whole edited set and prints a
+  per-file receipt — each file named, clean ones marked `[clean]`, dirty ones
+  listing their errors and warnings. Paying is diagnosing, not fixing: a file
+  leaves the gate once you look at it, clean or dirty. Exit `0` means the run
+  completed and its receipt is trustworthy, clean or dirty; it never exits `1`,
+  so a dirty result is not a failed call. Scope it —
+  `catenary diagnostics path…` — to diagnose just those files; the gate stays
+  armed for any edited file left unpaid. Diagnostics are pulled: you see them
+  only when you run it. Once you diagnose the edited set the debt is paid — a
+  repeat bare run answers `[no edited files]`; re-check specific files with the
+  scoped form.
 
 Bare-only vs pipe-friendly
   `catenary diagnostics` is bare-only: run it as the sole command — no pipe, no
   `&&`/`;`, no redirect — then read its output. `catenary grep` and
   `catenary glob` are pipe-friendly: they compose freely (`| head`, `| grep`)
   and their output is always complete, so a pipe never drops results (use
-  `--count` for a bare tally).
+  `--count` for a bare tally). `catenary claim` is bare-only too.
 
 Work in isolated subagents
   Coverage is automatic — you never manage roots. Two agents in one workspace

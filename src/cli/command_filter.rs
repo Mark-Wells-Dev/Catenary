@@ -4792,10 +4792,11 @@ mod tests {
     fn diagnostics_deny_precedes_drain() {
         // Ordering constraint (ticket 11): a piped `catenary diagnostics` must
         // classify as `Deny`, never `Diagnostics`. `run_pre_tool` dispatches
-        // `Deny` (print + return) *before* `Diagnostics` (which issues the
-        // `pre-tool/editing-stop` prepare that drains the tracked set), so the
-        // deny fires first and the set stays intact — never "denied *and*
-        // cleared". The bare form still routes to the prepare.
+        // `Deny` (print + return) *before* `Diagnostics` (which runs the hook-side
+        // owner gate and allows the serve). Root-ownership stage 3 retired the
+        // two-phase prepare-drain — the serve reads the durable ledger — so the
+        // surviving guard is that a piped form denies (bare-only) and never
+        // reaches the serve. The bare form is the only one that routes.
         assert!(
             matches!(
                 analyze_catenary_command("catenary diagnostics | head", None),

@@ -247,6 +247,88 @@ fn read_tool_is_never_locked() -> Result<()> {
     Ok(())
 }
 
+/// Drive `catenary hook pre-tool --format=claude` for a `catenary diagnostics`
+/// Bash command (bare or scoped) under the given `session`, with `cwd` set to the
+/// root and NO daemon running. Returns the hook's stdout (empty on the allow
+/// path). Exercises the hook-side diagnostics OWNER gate (root-ownership stage 3,
+/// deliverable 4): the hook reads the lock owner file — a filesystem fact — so it
+/// gates with the daemon down.
+fn run_diagnostics_hook(root: &str, session: &str, command: &str) -> Result<String> {
+    let payload = json!({
+        "session_id": session,
+        "cwd": root,
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+    });
+    run_hook(root, &payload)
+}
+
+/// The hook-side diagnostics owner gate (root-ownership stage 3, deliverable 4):
+/// only the lock holder may pull a locked root's ledger via BARE `catenary
+/// diagnostics`. A non-owner is denied naming the owed root and taught `catenary
+/// claim`; the owner's bare pull is allowed; a scoped pull (naming a path) serves
+/// for anyone regardless of ownership. All daemon-down — the gate reads the owner
+/// file, a filesystem fact.
+#[test]
+fn bare_diagnostics_owner_gate_daemon_down() -> Result<()> {
+    let repo = Repo::new()?;
+    let root = repo.root_str()?;
+    let file = repo.file("src/main.rs")?;
+
+    // Session A locks the root with a covered edit.
+    let a = run_edit_hook(root, "session-a", &file)?;
+    assert!(deny_reason(&a).is_none(), "first cook admitted, got: {a}");
+
+    // Session B — a NON-owner — runs bare `catenary diagnostics` from the root.
+    // Denied: pulling A's ledger would serve work B did not author.
+    let b_bare = run_diagnostics_hook(root, "session-b", "catenary diagnostics")?;
+    let reason = deny_reason(&b_bare).context("a non-owner's bare diagnostics must be denied")?;
+    assert!(
+        reason.contains("root locked:") && reason.contains(root),
+        "the deny names the owed root, got: {reason}"
+    );
+    assert!(
+        reason.contains("catenary claim"),
+        "the deny teaches the takeover path, got: {reason}"
+    );
+
+    // The OWNER's bare pull is allowed (silent).
+    let a_bare = run_diagnostics_hook(root, "session-a", "catenary diagnostics")?;
+    assert!(
+        deny_reason(&a_bare).is_none(),
+        "the owner's bare diagnostics must be allowed, got: {a_bare}"
+    );
+
+    // A SCOPED pull (naming a path) serves for anyone regardless of ownership —
+    // the pull-anything arm (a diagnose of a named file is a read).
+    let b_scoped =
+        run_diagnostics_hook(root, "session-b", &format!("catenary diagnostics {file}"))?;
+    assert!(
+        deny_reason(&b_scoped).is_none(),
+        "a scoped diagnostics serves regardless of ownership, got: {b_scoped}"
+    );
+
+    Ok(())
+}
+
+/// Bare `catenary diagnostics` against an UNLOCKED root is never owner-gated: with
+/// no lock holder to protect, any session may pull. The gate fires only on a root
+/// another agent holds.
+#[test]
+fn bare_diagnostics_on_unlocked_root_is_ungated() -> Result<()> {
+    let repo = Repo::new()?;
+    let root = repo.root_str()?;
+
+    // No prior edit → no lock. A bare diagnostics is allowed.
+    let out = run_diagnostics_hook(root, "session-a", "catenary diagnostics")?;
+    assert!(
+        deny_reason(&out).is_none(),
+        "bare diagnostics on an unlocked root must be allowed, got: {out}"
+    );
+
+    Ok(())
+}
+
 /// An uncovered-extension edit (no configured server for `.txt`) books nothing
 /// and takes no lock — booking honesty: the lock population matches the edit
 /// gate's covered-file population.

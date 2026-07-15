@@ -677,12 +677,13 @@ fn run_cli(state_home: &str, subargs: &[&str]) -> Result<(String, String, Option
     ))
 }
 
-/// Bug 100 ruling 1, CLI level: hookless bare `catenary diagnostics` exits 2
-/// with the teaching message on stderr and nothing on stdout — replacing the
-/// old exit-0 "handoff expired" text that read like a trustworthy empty
-/// receipt for a run that never happened.
+/// Root-ownership stage 3 (the bare-rerun contract retirement, deliverable 6):
+/// a bare `catenary diagnostics` against an empty ledger answers `[no edited
+/// files]` with exit 0 — NOT the old exit-2 "no diagnostics run staged" fault.
+/// The serve reads the durable ledger by pure path algebra; an empty ledger is
+/// an honest no-debt answer, not a misuse.
 #[test]
-fn hookless_bare_diagnostics_cli_exits_2_with_teaching_text() -> Result<()> {
+fn bare_diagnostics_empty_ledger_reports_no_edited_files() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
 
@@ -694,16 +695,12 @@ fn hookless_bare_diagnostics_cli_exits_2_with_teaching_text() -> Result<()> {
 
     assert_eq!(
         code,
-        Some(2),
-        "hookless bare diagnostics is a fault\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        Some(0),
+        "bare diagnostics against an empty ledger is exit 0, not a fault\nstdout:\n{stdout}\nstderr:\n{stderr}",
     );
     assert!(
-        stderr.contains("hooked session"),
-        "stderr must teach the correct next step, got:\n{stderr}",
-    );
-    assert!(
-        stdout.trim().is_empty(),
-        "a faulted run prints no receipt on stdout, got:\n{stdout}",
+        stdout.contains("[no edited files]"),
+        "an empty ledger answers `[no edited files]`, got:\nstdout:\n{stdout}\nstderr:\n{stderr}",
     );
     Ok(())
 }

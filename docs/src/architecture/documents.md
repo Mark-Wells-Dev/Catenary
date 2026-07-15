@@ -170,10 +170,15 @@ runs `catenary diagnostics`. During editing mode:
      survives between rounds: it is still evidence for the text the
      server holds, and the server will not re-publish an unchanged
      document.
-   - **Documents stay open.** Batch end is the owning
-     `(session, agent)`'s Stop/SubagentStop, which closes exactly that
-     agent's held-open documents on every connection. Daemon death
-     closes implicitly (bug 79).
+   - **Documents stay open.** Each held-open document is tagged with its
+     **root** (root-ownership stage 3). Batch end is **root retirement**
+     (worktree removal), which closes exactly that root's held-open
+     documents on every connection; daemon death closes implicitly (bug
+     79). The identity-keyed Stop/SubagentStop close retired with the
+     two-phase handoff — no identity below the hook — and the durable
+     one-cook-per-kitchen lock means a root's held-open documents belong
+     to a single editor, so root-lifetime teardown closes exactly the
+     right set.
 
 4. **Format output.** Results are categorized: files with diagnostics
    get per-line error/warning output, clean files are grouped on one

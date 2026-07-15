@@ -50,29 +50,19 @@ const FLYCHECK_TICKS: u64 = 600;
 /// `DIAG_FOLLOWED_NOTE`).
 const FOLLOWED_NOTE: &str = "another diagnose was in flight; this run followed it";
 
-/// Runs the scoped `catenary diagnostics <file>` flow as `agent_id`: prepare via
-/// the `PreToolUse` hook (staging the handoff under this agent's identity), then
-/// consume with an explicit `files` set. All agents share the implicit
-/// `"default"` session — the incident's shape (same session, per-agent rounds).
-/// The prepared handoff carries `(session_id, agent_id)`, so the consume step's
-/// round is identity-bearing and takes a diagnose seat.
+/// Runs the scoped `catenary diagnostics <file>` serve. Root-ownership stage 3
+/// retired the identity handoff and re-keyed the diagnose seat (misc 197) from
+/// identity to ROOT: one diagnose round per root at a time. The serve names its
+/// file, and the daemon resolves the file's lock root (the fixture carries a
+/// `.git` marker, so it resolves) to take the per-root seat — two rounds over the
+/// same root serialize. `agent_id` no longer distinguishes seats (kept for the
+/// caller's readability of which round is which).
 fn scoped_diagnostics(
     socket: &Path,
     daemon_pid: Option<u32>,
-    agent_id: &str,
+    _agent_id: &str,
     file: &Path,
 ) -> Result<String> {
-    common::ipc_request(
-        socket,
-        &json!({ "method": "pre-tool/editing-start", "agent_id": agent_id }),
-    )?;
-    common::ipc_request(
-        socket,
-        &json!({ "method": "pre-tool/editing-stop", "agent_id": agent_id }),
-    )?;
-    // The consume carries no identity — it takes the identity from the handoff
-    // the prepare staged (mirrors the real `catenary diagnostics` client, which
-    // is identity-less on the wire).
     let text = common::ipc_request_long(
         socket,
         daemon_pid,
@@ -132,13 +122,18 @@ fn spawn_bridge_with_flycheck(root: &Path) -> Result<(BridgeProcess, std::path::
     Ok((bridge, log_path))
 }
 
-/// Two overlapping SAME-identity diagnose rounds must serialize: the second
-/// waits for the first, then runs its own — exactly ONE carries the follow
-/// note. Never two interleaved concurrent executions.
+/// Two overlapping SAME-ROOT diagnose rounds must serialize: the second waits for
+/// the first, then runs its own — exactly ONE carries the follow note. Never two
+/// interleaved concurrent executions. Root-ownership stage 3 re-keyed the diagnose
+/// seat (misc 197) from identity to ROOT, so this is the same-root case; the
+/// fixture carries a `.git` marker so both files resolve to one lock root.
 #[test]
-fn same_identity_diagnose_rounds_serialize_with_note() -> Result<()> {
+fn same_root_diagnose_rounds_serialize_with_note() -> Result<()> {
     let dir = common::canonical_tempdir()?;
     let root = dir.path().to_path_buf();
+    // A repo marker so both files resolve to the same lock root — the per-root
+    // diagnose seat (stage 3) then serializes the two rounds.
+    std::fs::create_dir_all(root.join(".git"))?;
     let file_a = root.join(format!("a.{MOCK_LANG}"));
     let file_b = root.join(format!("b.{MOCK_LANG}"));
     std::fs::write(&file_a, "echo a\n")?;
@@ -195,33 +190,56 @@ fn same_identity_diagnose_rounds_serialize_with_note() -> Result<()> {
     Ok(())
 }
 
-/// Two overlapping DIFFERENT-identity diagnose rounds must NOT join: neither
-/// waits on the other and neither carries the follow note — the cross-identity
-/// behavior the stage-1 change leaves untouched.
+/// Two overlapping DIFFERENT-ROOT diagnose rounds must NOT join: each root has
+/// its own diagnose seat (root-ownership stage 3), so neither waits on the other
+/// and neither carries the follow note. This is the cross-root behavior the
+/// per-root seat leaves independent (the cross-identity-same-root case cannot
+/// happen — one cook per kitchen).
 #[test]
-fn different_identity_diagnose_rounds_do_not_join() -> Result<()> {
-    let dir = common::canonical_tempdir()?;
-    let root = dir.path().to_path_buf();
-    let file_a = root.join(format!("a.{MOCK_LANG}"));
-    let file_b = root.join(format!("b.{MOCK_LANG}"));
+fn different_root_diagnose_rounds_do_not_join() -> Result<()> {
+    let dir_a = common::canonical_tempdir()?;
+    let dir_b = common::canonical_tempdir()?;
+    let root_a = dir_a.path().to_path_buf();
+    let root_b = dir_b.path().to_path_buf();
+    // Each root carries its own repo marker so its files resolve to a distinct
+    // lock root — distinct per-root diagnose seats.
+    std::fs::create_dir_all(root_a.join(".git"))?;
+    std::fs::create_dir_all(root_b.join(".git"))?;
+    let file_a = root_a.join(format!("a.{MOCK_LANG}"));
+    let file_b = root_b.join(format!("b.{MOCK_LANG}"));
     std::fs::write(&file_a, "echo a\n")?;
     std::fs::write(&file_b, "echo b\n")?;
 
-    let (bridge, log_path) = spawn_bridge_with_flycheck(&root)?;
+    // One daemon serving both roots, with a flycheck-burning server so each round
+    // holds its seat for a controlled duration.
+    let log_a = root_a.join("mockls.jsonl");
+    let log_arg = log_a.to_str().context("log path")?;
+    let mockc = env!("CARGO_BIN_EXE_mockc");
+    let lsp = common::mockls_lsp_arg(
+        MOCK_LANG,
+        &format!(
+            "--advertise-save --flycheck-command {mockc} \
+             --flycheck-ticks {FLYCHECK_TICKS} --notification-log {log_arg}"
+        ),
+    );
+    let alpha = root_a.to_str().context("root a")?;
+    let beta = root_b.to_str().context("root b")?;
+    let mut bridge = BridgeProcess::spawn_multi_root(&[&lsp], &[alpha, beta])?;
+    bridge.initialize_with_roots(&[alpha, beta])?;
     let socket = bridge.wait_for_ipc_socket()?;
     let daemon_pid = bridge.daemon_pid();
 
-    // Round 1 as agent `agent-x`; once it is provably executing, round 2 as a
-    // DIFFERENT agent `agent-y` fires while round 1 still burns.
+    // Round 1 over root A; once it is provably executing, round 2 over root B
+    // fires while round 1 still burns. Distinct roots → distinct seats.
     let first = {
         let socket = socket.clone();
         let file = file_a;
-        std::thread::spawn(move || scoped_diagnostics(&socket, daemon_pid, "agent-x", &file))
+        std::thread::spawn(move || scoped_diagnostics(&socket, daemon_pid, "round-a", &file))
     };
-    wait_for_did_save_count(&log_path, 1)?;
+    wait_for_did_save_count(&log_a, 1)?;
     let second = {
         let file = file_b;
-        std::thread::spawn(move || scoped_diagnostics(&socket, daemon_pid, "agent-y", &file))
+        std::thread::spawn(move || scoped_diagnostics(&socket, daemon_pid, "round-b", &file))
     };
 
     let first_out = join_receipt(first, "first")?;
@@ -229,21 +247,21 @@ fn different_identity_diagnose_rounds_do_not_join() -> Result<()> {
 
     assert!(
         first_out.contains("mock diagnostic"),
-        "first (agent-x) round's receipt should carry diagnostics. Got: {first_out}"
+        "first (root A) round's receipt should carry diagnostics. Got: {first_out}"
     );
     assert!(
         second_out.contains("mock diagnostic"),
-        "second (agent-y) round's receipt should carry diagnostics. Got: {second_out}"
+        "second (root B) round's receipt should carry diagnostics. Got: {second_out}"
     );
-    // Different identities keep distinct seats — neither round waited on the
-    // other, so neither carries the follow note.
+    // Distinct roots keep distinct seats — neither round waited on the other, so
+    // neither carries the follow note.
     assert!(
         !first_out.contains(FOLLOWED_NOTE),
-        "different-identity first round must NOT carry the follow note. Got: {first_out}"
+        "different-root first round must NOT carry the follow note. Got: {first_out}"
     );
     assert!(
         !second_out.contains(FOLLOWED_NOTE),
-        "different-identity second round must NOT carry the follow note. Got: {second_out}"
+        "different-root second round must NOT carry the follow note. Got: {second_out}"
     );
 
     Ok(())

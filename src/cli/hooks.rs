@@ -1139,16 +1139,16 @@ pub fn run_pre_tool(format: HostFormat) {
                 print!("{}", format_deny(&reason, format));
                 return;
             }
-            // `editing start` and `diagnostics` send IPC to the daemon, then
-            // allow the command to execute (it prints confirmation /
-            // diagnostics). The internal handoff method (`pre-tool/editing-stop`)
-            // is unchanged — only the user-facing command was renamed.
+            // `editing start` sends IPC to the daemon, then allows the command
+            // to run. `diagnostics` stages nothing (root-ownership stage 3 retired
+            // the prepare handoff) — its hook only runs the owner gate, then
+            // allows so the CLI serves against the ledger.
             CatenaryAction::EditingStart => {
                 handle_start_editing_hook(&hook_json, format);
                 return;
             }
             CatenaryAction::Diagnostics => {
-                handle_done_editing_hook(&hook_json, format);
+                handle_done_editing_hook(&hook_json, Some(shell_cmd.as_str()), format);
                 return;
             }
             CatenaryAction::Claim => {
@@ -1293,6 +1293,13 @@ fn enforce_editing_state(
     }
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
+    }
+    // Forward the host's cwd (root-ownership stage 3): the daemon-side Bash nag
+    // resolves it to the enclosing lock root and reads that root's ledger to
+    // answer "unpaid debt?", so a fresh daemon re-arms the nag against the
+    // durable ledger (debt outlives daemon churn).
+    if let Some(cwd) = extract_cwd_str(hook_json, format) {
+        request["cwd"] = serde_json::json!(cwd);
     }
     if !writes.is_empty() {
         request["writes"] = serde_json::json!(writes);
@@ -1776,39 +1783,98 @@ fn handle_start_editing_hook(hook_json: &serde_json::Value, format: HostFormat) 
     }
 }
 
-/// Handle `PreToolUse` for `catenary diagnostics`.
+/// Handle `PreToolUse` for `catenary diagnostics` (root-ownership stage 3,
+/// deliverable 4: diagnostics gating moves to the hook).
 ///
-/// Sends `pre-tool/editing-stop` IPC to the daemon to prepare the handoff
-/// (the internal method name is unchanged by the user-facing rename): drain
-/// accumulated files, release the editing guardrail, and deposit the file
-/// list in the handoff slot. Returns allow (silent) or deny (prints denial
-/// reason to stdout for the host CLI).
-fn handle_done_editing_hook(hook_json: &serde_json::Value, format: HostFormat) {
-    let Some(stream) = hook_connect(hook_json) else {
+/// The identity-correlation prepare handoff (`pre-tool/editing-stop`) retired
+/// with stage 3 — the daemon now serves diagnoses against the durable ledger, so
+/// this hook stages nothing. Its sole job is the OWNER GATE: only the lock holder
+/// may pull a locked root's ledger via **bare** `catenary diagnostics`. The hook
+/// is the one seam with identity, so it — not the identity-less serve path —
+/// answers "is this the owner?". A non-owner is denied naming the owed root and
+/// taught `catenary claim <root>`; the owner (or an unlocked root) is allowed
+/// silently and the CLI runs `tool/editing-stop`.
+///
+/// **Scoped** `catenary diagnostics <path…>` names explicit paths and serves them
+/// regardless of ownership or debt — the pull-anything arm (a diagnose of a named
+/// file is a read, not a payment against someone's kitchen). Only the bare form,
+/// which pulls the whole ledger for the cwd's root, is owner-gated.
+///
+/// No daemon connection is made here — the lock is a filesystem fact
+/// ([`crate::lock`]), so the gate works with the daemon down (the serve itself
+/// then fails at `tool/editing-stop`, but the gate never false-denies).
+fn handle_done_editing_hook(
+    hook_json: &serde_json::Value,
+    command: Option<&str>,
+    format: HostFormat,
+) {
+    // Scoped iff the command names any path after `diagnostics` — the
+    // pull-anything arm, never owner-gated.
+    if command.is_some_and(diagnostics_is_scoped) {
+        return;
+    }
+
+    // Bare form: resolve the cwd's kitchen and gate on ownership. An unresolvable
+    // cwd (scratch dir, no VCS checkout) resolves to no root — nothing to gate,
+    // allow (the serve then answers `[no edited files]`).
+    let cwd = extract_cwd_str(hook_json, format).map_or_else(
+        || std::env::current_dir().unwrap_or_default(),
+        PathBuf::from,
+    );
+    let Some(root) = crate::lock::resolve_lock_root(&cwd) else {
         return;
     };
 
-    let agent_id = extract_agent_id(hook_json);
-    let session_id = extract_session_id(hook_json, format);
+    let owner = crate::lock::Owner::new(
+        format.as_str(),
+        extract_session_id(hook_json, format).unwrap_or_default(),
+        extract_agent_id(hook_json),
+    );
 
-    let mut request = serde_json::json!({
-        "method": "pre-tool/editing-stop",
-        "agent_id": agent_id,
-        "format": format.as_str(),
-    });
-    if let Some(sid) = session_id {
-        request["session_id"] = serde_json::json!(sid);
-    }
-    request["host_payload"] = prepare_host_payload(hook_json);
-
-    let lines = ipc_exchange(stream, &request);
-
-    if let Some(line) = lines.first()
-        && let Ok(envelope) = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
-        && let Some(crate::hook::HookResult::Deny(reason)) = &envelope.result
+    // Only a LOCKED root held by ANOTHER owner is gated. An unlocked root (no
+    // lock dir), or one this caller owns, serves freely. `owner_of` reads the
+    // owner file by pure path algebra — canonical root, matching the ledger seam.
+    if let Some(holder) = crate::lock::owner_of(&root)
+        && holder != owner
     {
-        print!("{}", format_deny(reason, format));
+        print!("{}", format_deny(&diagnostics_locked_deny(&root), format));
     }
+}
+
+/// Whether a `catenary diagnostics` command line names any path argument (the
+/// scoped, pull-anything form) rather than running bare.
+///
+/// Splits on ASCII whitespace, advances to the `diagnostics` word, and reports
+/// whether any following non-flag token is present. Mirrors [`extract_claim_root`]
+/// for the sibling command.
+fn diagnostics_is_scoped(command: &str) -> bool {
+    let mut toks = command.split_whitespace();
+    for tok in toks.by_ref() {
+        if tok == "diagnostics" {
+            break;
+        }
+    }
+    toks.any(|t| !t.starts_with('-'))
+}
+
+/// The deny briefing shown when a non-owner runs bare `catenary diagnostics`
+/// against a root another agent holds (root-ownership stage 3, deliverable 4).
+///
+/// Names the owed root on its own copy-pasteable line and teaches the takeover
+/// path: pulling another editor's ledger would serve work the reader did not
+/// author, so the gate points at `catenary claim <root>` (which transfers the
+/// root and its debt) or the scoped form (which serves named paths regardless).
+fn diagnostics_locked_deny(root: &std::path::Path) -> String {
+    let root = root.display();
+    format!(
+        "root locked: {root}\n\
+         `catenary diagnostics` (bare) pulls this root's edit ledger, but another agent holds it — \
+         its debt is theirs to diagnose, not yours to read.\n\
+         To take over the root and its diagnostic debt:\n\
+         \x20 catenary claim {root}\n\
+         Or diagnose specific files regardless of ownership:\n\
+         \x20 catenary diagnostics <path…>"
+    )
 }
 
 /// Extract the root-path argument from a `catenary claim <root>` command line.
@@ -1911,6 +1977,31 @@ fn handle_claim_hook(hook_json: &serde_json::Value, command: &str, format: HostF
 mod tests {
     use super::*;
     use anyhow::{Context, Result};
+
+    #[test]
+    fn diagnostics_is_scoped_distinguishes_bare_from_scoped() {
+        // Bare — no path argument follows `diagnostics`.
+        assert!(!diagnostics_is_scoped("catenary diagnostics"));
+        assert!(!diagnostics_is_scoped(
+            "/usr/local/bin/catenary diagnostics"
+        ));
+        // Scoped — a path (or a dir, or `.`) follows.
+        assert!(diagnostics_is_scoped("catenary diagnostics src/main.rs"));
+        assert!(diagnostics_is_scoped("catenary diagnostics ."));
+        assert!(diagnostics_is_scoped("catenary diagnostics src/ lib.rs"));
+        // A flag alone is still bare (the owner gate applies).
+        assert!(!diagnostics_is_scoped("catenary diagnostics --help"));
+    }
+
+    #[test]
+    fn diagnostics_locked_deny_names_root_and_teaches() {
+        let root = std::path::Path::new("/home/mark/Projects/Catenary");
+        let msg = diagnostics_locked_deny(root);
+        assert!(msg.starts_with("root locked: /home/mark/Projects/Catenary\n"));
+        assert!(msg.contains("another agent holds it"));
+        assert!(msg.contains("catenary claim /home/mark/Projects/Catenary"));
+        assert!(msg.contains("catenary diagnostics <path…>"));
+    }
 
     #[test]
     fn extract_claim_root_reads_the_root_argument() {

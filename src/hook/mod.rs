@@ -119,6 +119,14 @@ pub(crate) enum HookRequest {
         /// (`rm`, `cp`, `mv`, etc.) without requiring `done_editing`.
         #[serde(default)]
         command: Option<String>,
+        /// The host's working directory for this tool call (root-ownership
+        /// stage 3). The Bash nag resolves it to the enclosing lock root and
+        /// answers the "unpaid debt?" question from that root's on-disk ledger
+        /// (pure path algebra, no identity below the hook). Absent for hosts /
+        /// events that carry no cwd; the gate then reads no ledger and stands
+        /// down (never a false deny).
+        #[serde(default)]
+        cwd: Option<String>,
         /// Agent ID (empty string for the main agent).
         #[serde(default)]
         agent_id: String,

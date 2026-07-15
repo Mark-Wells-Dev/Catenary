@@ -155,6 +155,7 @@ impl HookRouter {
                 tool_name,
                 file_path,
                 command,
+                cwd,
                 agent_id,
                 session_id,
                 writes,
@@ -163,6 +164,7 @@ impl HookRouter {
                     &tool_name,
                     file_path.as_deref(),
                     command.as_deref(),
+                    cwd.as_deref(),
                     session_id.as_deref(),
                     &agent_id,
                 );
@@ -351,6 +353,7 @@ impl HookRouter {
         tool_name: &str,
         file_path: Option<&str>,
         command: Option<&str>,
+        cwd: Option<&str>,
         session_id: Option<&str>,
         agent_id: &str,
     ) -> Option<HookResult> {
@@ -418,20 +421,26 @@ impl HookRouter {
             return None;
         }
 
-        // Reconcile the batch against disk before consulting the gate (bug 76):
-        // a write set is resolved and recorded at `PreToolUse`, before the
-        // command runs, so a command that then fails wholesale leaves phantom
-        // targets that never came to exist. Dropping them here means a failed
-        // write cannot gate future work on files nothing ever touched, while a
-        // real edit that was written and later deleted survives (it was observed
-        // on disk once) to gate and be reported honestly.
-        self.session
-            .editing
-            .reconcile(session_id, agent_id, Path::exists);
+        // The Bash nag reads the LEDGER (root-ownership stage 3): debt is a
+        // property of the ROOT, answered by the durable on-disk touch-tree, not
+        // the in-memory identity-keyed batch (retired this stage). Resolve the
+        // command's kitchen from the host's cwd by pure path algebra — no
+        // identity below the hook. An unresolvable cwd (no cwd forwarded, or a
+        // scratch dir outside every VCS checkout) resolves to no root, so the
+        // gate reads no ledger and stands down (never a false deny).
+        //
+        // Payability: this gate runs daemon-side, so it enforces only while the
+        // daemon is reachable (the hook cannot reach it otherwise, and the gate
+        // never fires) — the nag-never-hostage invariant. A healthy daemon
+        // resuming the nag against a durable ledger is the contract working: the
+        // debt outlives daemon churn and reboots (the old drop-debt-on-daemon-
+        // death behavior retired consciously, its intent preserved here).
+        let root = cwd
+            .map(std::path::Path::new)
+            .and_then(crate::lock::resolve_lock_root)?;
 
-        // Boundary block gates on undelivered covered debt, not the mode bit.
-        // Nothing undelivered ⇒ nothing to diagnose ⇒ flow free (misc 141).
-        if !self.session.editing.has_undelivered(session_id, agent_id) {
+        // Nothing due in this kitchen ⇒ nothing to diagnose ⇒ flow free.
+        if !crate::lock::has_debt(&root) {
             return None;
         }
 
@@ -460,9 +469,13 @@ impl HookRouter {
             }
         }
 
-        Some(HookResult::Deny(self.boundary_block_message(
-            session_id, agent_id, command, tool_name,
-        )))
+        // The gate fires on ledger debt (root-ownership stage 3): list exactly
+        // the root's due files — the ones that "haven't been diagnosed yet",
+        // read from the durable touch-tree.
+        let files = crate::lock::due_files(&root);
+        Some(HookResult::Deny(
+            self.boundary_block_message(&files, command, tool_name),
+        ))
     }
 
     /// Build the editing-gate message — a helpful next step, not a fault.
@@ -478,18 +491,12 @@ impl HookRouter {
     /// these edited files haven't been diagnosed yet, here's the command.
     fn boundary_block_message(
         &self,
-        session_id: Option<&str>,
-        agent_id: &str,
+        files: &[PathBuf],
         command: Option<&str>,
         tool_name: &str,
     ) -> String {
         use std::collections::BTreeMap;
         use std::fmt::Write as _;
-
-        // The gate fires on undelivered debt, so the message lists exactly the
-        // undelivered files — the ones that "haven't been diagnosed yet"
-        // (misc 141); already-delivered batch files are left out.
-        let files = self.session.editing.undelivered_files(session_id, agent_id);
 
         // Group the outstanding files under each feeder tracking them. A file
         // both a language server and a linter cover appears under both — the
@@ -498,7 +505,7 @@ impl HookRouter {
         // appears (via `unattributed`) so nothing silently drops off the debt.
         let mut by_feeder: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut unattributed: Vec<String> = Vec::new();
-        for file in &files {
+        for file in files {
             let shown = file.display().to_string();
             let feeders = self.session.diagnostic_feeders(file);
             if feeders.is_empty() {
@@ -789,14 +796,14 @@ impl HookRouter {
     /// content-based arm (which armed the whole landed diff regardless of
     /// payment, and split inconsistently at larger file counts — misc 189's dig).
     ///
-    /// Reads the worktree's sidecar for the owner's `(session_id, source_repo)`,
-    /// derives the owner's `agent_id` from the worktree's leaf directory name
-    /// ([`crate::worktree_land::worktree_owner_label`], bug 91), and looks the
-    /// owner's still-undelivered batch up in this session's ledger. The batch is
-    /// keyed `(session_id, agent_id)` and lives with the daemon instance — so a
-    /// worktree whose worker **paid**, whose worker **never edited**, or whose
-    /// batch **died with a bounced daemon** (bug 79) all present the same
-    /// debt-free ledger and arm nothing (the never-lock-out doctrine).
+    /// Reads the worktree's sidecar for the owner's `source_repo`, then reads the
+    /// worktree ROOT's durable lock ledger ([`crate::lock::due_files`]) for the
+    /// owner's still-unpaid debt — the files edited in the worktree but never
+    /// diagnosed (root-ownership stage 3: debt is a property of the root, read by
+    /// pure path algebra — no identity below the hook). A worktree whose worker
+    /// **paid** (empty ledger), whose worker **never edited** (no lock dir), or
+    /// whose lock **retired** all present the same debt-free ledger and arm
+    /// nothing (the never-lock-out doctrine).
     ///
     /// `landed` is the land's resolved write-set (the applied files, mapped onto
     /// the owning repo). The transfer is the owner-unpaid set intersected with
@@ -829,21 +836,22 @@ impl HookRouter {
         else {
             return; // not a registered worktree — nothing to transfer
         };
-        let owner_label = crate::worktree_land::worktree_owner_label(&worktree);
-
-        // The owner's still-unpaid batch (debt-free if empty — paid, un-edited, or
-        // died with a bounced daemon). Keyed on the owner's recorded session.
-        let owner_session = (!meta.session_id.is_empty()).then_some(meta.session_id.as_str());
-        let owner_unpaid = self
-            .session
-            .editing
-            .undelivered_files(owner_session, &owner_label);
+        // The owner's still-unpaid debt, read from the WORKTREE ROOT's durable
+        // ledger (root-ownership stage 3): debt is a property of the root, so a
+        // land inherits exactly the touch files the worker left in the worktree's
+        // lock dir — the files edited but never diagnosed. A worktree whose worker
+        // paid (empty ledger), never edited (no lock dir), or whose lock retired
+        // all present a debt-free ledger and arm nothing (the never-lock-out
+        // doctrine). This supersedes the in-memory `(session, agent)` batch read:
+        // no identity below the hook, and the ledger survives daemon churn.
+        let owner_unpaid = crate::lock::due_files(&worktree);
         if owner_unpaid.is_empty() {
             return;
         }
 
-        // Transfer exactly the unpaid files that actually landed, mapped onto the
-        // owning repo.
+        // The unpaid files that actually landed, mapped onto the owning repo —
+        // the exact debt to transfer (misc 189: debt follows unpaid content and
+        // transfers, never duplicates).
         let landed_set: std::collections::BTreeSet<PathBuf> = landed.iter().cloned().collect();
         let transfer = crate::worktree_land::owner_unpaid_landed(
             &owner_unpaid,
@@ -852,6 +860,37 @@ impl HookRouter {
             &landed_set,
         );
 
+        if transfer.is_empty() {
+            return;
+        }
+
+        // Book the transferred (unpaid-landed) files into the owning repo's
+        // durable LEDGER under the landing agent's identity (root-ownership stage
+        // 3). Debt is a property of the root: the landing agent now owes exactly
+        // these files in the owning repo, so a later `catenary diagnostics` there
+        // serves them. The owner is `<client>+<session>+<agent>` — the same tuple
+        // the landing agent's own edit seam acquires with (`self.client_name` is
+        // the host `format`), so the transfer never leaves the landing agent
+        // denied on its own root. Files are canonicalized inside `book_transferred`
+        // so they land on the canonical ledger the serve reads (misc 193).
+        let owner = crate::lock::Owner::new(
+            self.client_name.clone(),
+            session_id.unwrap_or_default(),
+            agent_id,
+        );
+        // Canonicalize the owning-repo root so its ledger encoding matches the one
+        // a later cwd → root serve resolves (misc 193).
+        let landing_root = meta
+            .source_repo
+            .canonicalize()
+            .unwrap_or_else(|_| meta.source_repo.clone());
+        let transfer_files: Vec<PathBuf> = transfer.iter().cloned().collect();
+        crate::lock::book_transferred(&landing_root, &owner, &transfer_files);
+
+        // Also record the transferred files into the in-memory batch (the board's
+        // editing/working status and the Stop-block still read it), the first one
+        // entering editing mode. The LEDGER is the debt source of truth; this
+        // keeps the observability surface in step.
         let mut started = self.session.editing.is_editing(session_id, agent_id);
         for path in &transfer {
             // Canonicalize (when it exists) before the coverage check and record,
@@ -995,7 +1034,7 @@ mod tests {
         // edit with "run `catenary editing start`"; implicit start now
         // allows it.
         let in_root = format!("{}/src/main.rs", root.display());
-        let result = router.handle_enforce_editing("Edit", Some(&in_root), None, None, "");
+        let result = router.handle_enforce_editing("Edit", Some(&in_root), None, None, None, "");
         assert!(
             result.is_none(),
             "in-root edit should be allowed without explicit start, got {result:?}"
@@ -1005,90 +1044,54 @@ mod tests {
     #[test]
     fn test_hook_enforce_editing_allow() {
         let router = test_router();
-        // Enter editing mode with a covered file pending — the boundary block
-        // gates on a non-empty tracked set, so a file must be accumulated for a
-        // non-edit command to be denied.
-        let _ = router.session.editing.start_editing(None, "");
-        router
-            .session
-            .editing
-            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
 
         // Edit tool — should allow during editing mode
-        let result = router.handle_enforce_editing("Edit", None, None, None, "");
+        let result = router.handle_enforce_editing("Edit", None, None, None, None, "");
         assert!(result.is_none(), "expected allow, got {result:?}");
 
         // Read tool — always allowed during editing
-        let result = router.handle_enforce_editing("Read", None, None, None, "");
+        let result = router.handle_enforce_editing("Read", None, None, None, None, "");
         assert!(result.is_none(), "expected allow for Read, got {result:?}");
 
-        // Non-edit, non-read tool with a covered set pending — should deny
-        let result = router.handle_enforce_editing("Bash", None, None, None, "");
-        let Some(HookResult::Deny(reason)) = result else {
-            unreachable!("expected Deny for Bash, got {result:?}");
-        };
-        assert!(reason.contains("diagnostics"));
+        // Non-edit, non-read tool: the Bash nag reads the ledger now (stage 3);
+        // with no cwd it stands down (payability).
+        let result = router.handle_enforce_editing("Bash", None, None, None, None, "");
+        assert!(result.is_none());
     }
 
     #[test]
     fn test_hook_enforce_editing_piped_catenary_bugs16() {
+        // The daemon-side classifier fallback only ran inside the old in-memory
+        // gate; the gate now reads the ledger and the client-side matcher owns
+        // pipe-denials. The daemon-side path only confirms that bare canonical
+        // lifecycle commands are allowed.
         let router = test_router();
-        // A covered file must be pending for the boundary block to fire.
-        let _ = router.session.editing.start_editing(None, "");
-        router
-            .session
-            .editing
-            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
 
-        // bugs/16: a piped lifecycle command during editing must get a clear
-        // pipe-deny from the canonical-form matcher, not the boundary block
-        // that echoes the command the agent just ran.
+        // A bare canonical catenary command is allowed.
         let result = router.handle_enforce_editing(
             "Bash",
             None,
-            Some("catenary editing start | head"),
+            Some("catenary editing start"),
+            None,
             None,
             "",
         );
-        let Some(HookResult::Deny(reason)) = result else {
-            unreachable!("expected Deny, got {result:?}");
-        };
-        assert!(
-            !reason.contains("is blocked"),
-            "should not be the boundary block, got: {reason}"
-        );
-        assert!(
-            reason.contains("bare") || reason.contains("owns its output"),
-            "should be the matcher pipe-deny, got: {reason}"
-        );
-
-        // A bare canonical catenary command is allowed during editing.
-        let result =
-            router.handle_enforce_editing("Bash", None, Some("catenary editing start"), None, "");
         assert!(
             result.is_none(),
-            "bare editing start allowed during editing, got {result:?}"
+            "bare editing start allowed, got {result:?}"
         );
 
         // `catenary diagnostics` (the renamed boundary command) is likewise
-        // allowed during editing — it ends the session and prints diagnostics.
-        let result =
-            router.handle_enforce_editing("Bash", None, Some("catenary diagnostics"), None, "");
-        assert!(
-            result.is_none(),
-            "bare diagnostics allowed during editing, got {result:?}"
+        // allowed — it ends the session and prints diagnostics.
+        let result = router.handle_enforce_editing(
+            "Bash",
+            None,
+            Some("catenary diagnostics"),
+            None,
+            None,
+            "",
         );
-
-        // A foreign non-edit command still hits the boundary block, which now
-        // names the command and lists the tracked file.
-        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, "");
-        let Some(HookResult::Deny(reason)) = result else {
-            unreachable!("expected Deny for make test, got {result:?}");
-        };
-        assert!(
-            reason.contains("make test") && reason.contains("catenary diagnostics"),
-            "foreign cmd → boundary block names the command and the fix, got: {reason}"
-        );
+        assert!(result.is_none(), "bare diagnostics allowed, got {result:?}");
     }
 
     #[test]
@@ -1225,7 +1228,7 @@ mod tests {
 
         // Edit tool should now be allowed.
         let in_root = format!("{}/src/main.rs", root.display());
-        let result = router.handle_enforce_editing("Edit", Some(&in_root), None, None, "");
+        let result = router.handle_enforce_editing("Edit", Some(&in_root), None, None, None, "");
         assert!(
             result.is_none(),
             "Edit should be allowed after start_editing CLI, got {result:?}"
@@ -1239,8 +1242,14 @@ mod tests {
         let router = test_router();
         // Edit on a file outside workspace roots while not editing →
         // should allow (no diagnostics will come for out-of-root files).
-        let result =
-            router.handle_enforce_editing("Edit", Some("/outside/some/file.rs"), None, None, "");
+        let result = router.handle_enforce_editing(
+            "Edit",
+            Some("/outside/some/file.rs"),
+            None,
+            None,
+            None,
+            "",
+        );
         assert!(
             result.is_none(),
             "out-of-root edit should be allowed without start_editing, got {result:?}"
@@ -1262,6 +1271,7 @@ mod tests {
             tool_name: "Edit".to_string(),
             file_path: Some(in_root.clone()),
             command: None,
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: Vec::new(),
@@ -1297,6 +1307,7 @@ mod tests {
             tool_name: "Edit".to_string(),
             file_path: Some(f1.clone()),
             command: None,
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: Vec::new(),
@@ -1305,6 +1316,7 @@ mod tests {
             tool_name: "Edit".to_string(),
             file_path: Some(f2.clone()),
             command: None,
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: Vec::new(),
@@ -1345,6 +1357,7 @@ mod tests {
             tool_name: "Edit".to_string(),
             file_path: Some("/outside/some/file.rs".to_string()),
             command: None,
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: Vec::new(),
@@ -1378,7 +1391,7 @@ mod tests {
         // Edit with no file path (e.g., host didn't supply it): there is
         // no path to test for coverage, so the edit is allowed and enters
         // editing mode like any other first edit.
-        let result = router.handle_enforce_editing("Edit", None, None, None, "");
+        let result = router.handle_enforce_editing("Edit", None, None, None, None, "");
         assert!(
             result.is_none(),
             "edit with no file path should be allowed, got {result:?}"
@@ -1506,7 +1519,7 @@ mod tests {
         // implicit start (previously gated with "catenary editing start").
         let router = test_router_with_sf_config(false);
         let path = format!("/outside/file.{SF_LANG}");
-        let result = router.handle_enforce_editing("Edit", Some(&path), None, None, "");
+        let result = router.handle_enforce_editing("Edit", Some(&path), None, None, None, "");
         assert!(
             result.is_none(),
             "single_file-covered edit should enter editing, got {result:?}"
@@ -1519,7 +1532,7 @@ mod tests {
         // single_file = true but server rejected at runtime → skip gate.
         let router = test_router_with_sf_config(true);
         let path = format!("/outside/file.{SF_LANG}");
-        let result = router.handle_enforce_editing("Edit", Some(&path), None, None, "");
+        let result = router.handle_enforce_editing("Edit", Some(&path), None, None, None, "");
         assert!(
             result.is_none(),
             "runtime-failed out-of-root edit should be allowed, got {result:?}"
@@ -1530,8 +1543,14 @@ mod tests {
     fn test_enforce_editing_skips_out_of_root_without_single_file_config() {
         // No single_file config at all → skip gate.
         let router = test_router();
-        let result =
-            router.handle_enforce_editing("Edit", Some("/outside/some/file.rs"), None, None, "");
+        let result = router.handle_enforce_editing(
+            "Edit",
+            Some("/outside/some/file.rs"),
+            None,
+            None,
+            None,
+            "",
+        );
         assert!(
             result.is_none(),
             "out-of-root edit without single_file config should be allowed, got {result:?}"
@@ -1631,7 +1650,8 @@ mod tests {
             .record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
 
         // Filesystem-only Bash — should allow during editing
-        let result = router.handle_enforce_editing("Bash", None, Some("rm -rf target/"), None, "");
+        let result =
+            router.handle_enforce_editing("Bash", None, Some("rm -rf target/"), None, None, "");
         assert!(
             result.is_none(),
             "filesystem-only Bash should be allowed during editing, got {result:?}"
@@ -1643,6 +1663,7 @@ mod tests {
             None,
             Some("mkdir -p src/new_module"),
             None,
+            None,
             "",
         );
         assert!(
@@ -1652,44 +1673,35 @@ mod tests {
     }
 
     #[test]
-    fn test_enforce_editing_denies_non_filesystem_bash() {
+    fn non_filesystem_bash_stands_down_without_cwd() {
         let router = test_router();
-        // Covered set pending → non-filesystem Bash is gated.
-        let _ = router.session.editing.start_editing(None, "");
-        router
-            .session
-            .editing
-            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
-
-        // Non-filesystem Bash — should deny during editing
-        let result = router.handle_enforce_editing("Bash", None, Some("cargo build"), None, "");
-        let Some(HookResult::Deny(reason)) = result else {
-            unreachable!("expected Deny for non-filesystem Bash, got {result:?}");
-        };
-        assert!(reason.contains("diagnostics"));
+        // With no cwd the daemon-side ledger gate cannot resolve a root, so a
+        // non-filesystem Bash command stands down (payability, stage 3).
+        let result =
+            router.handle_enforce_editing("Bash", None, Some("cargo build"), None, None, "");
+        assert!(
+            result.is_none(),
+            // The ledger gate stands down with no cwd (payability, stage 3).
+            "no-cwd Bash stands down, got {result:?}"
+        );
     }
 
     #[test]
-    fn test_enforce_editing_denies_bash_without_command() {
+    fn bash_without_command_stands_down_without_cwd() {
         let router = test_router();
-        // Covered set pending → a Bash call we cannot inspect must deny.
-        let _ = router.session.editing.start_editing(None, "");
-        router
-            .session
-            .editing
-            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
-
-        // Bash without command string — cannot verify, must deny
-        let result = router.handle_enforce_editing("Bash", None, None, None, "");
-        let Some(HookResult::Deny(_)) = result else {
-            unreachable!("expected Deny for Bash without command, got {result:?}");
-        };
+        // A Bash call with no command and no cwd: the daemon-side ledger gate
+        // cannot resolve a root, so it stands down (payability, stage 3).
+        let result = router.handle_enforce_editing("Bash", None, None, None, None, "");
+        assert!(
+            result.is_none(),
+            "no-cwd Bash without command stands down, got {result:?}"
+        );
     }
 
     // ── Boundary block (covered-set gate) tests ─────────────────────────
 
     #[test]
-    fn boundary_blocks_on_covered_set() {
+    fn covered_edit_accumulates_and_bash_stands_down_without_cwd() {
         let (router, root) = test_router_with_root();
         let in_root = format!("{}/src/main.rs", root.display());
         // The Edit targets a real file — Edit acts on an existing file, and the
@@ -1701,31 +1713,21 @@ mod tests {
         // accumulates the file.
         router.dispatch(crate::hook::HookRequest::PreTool {
             tool_name: "Edit".to_string(),
-            file_path: Some(in_root.clone()),
+            file_path: Some(in_root),
             command: None,
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: Vec::new(),
         });
         assert!(router.session.editing.has_files(None, ""));
 
-        // A non-edit command is now blocked; the message names the command,
-        // lists the tracked file, and points at `catenary diagnostics`.
-        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, "");
-        let Some(HookResult::Deny(reason)) = result else {
-            unreachable!("expected boundary block, got {result:?}");
-        };
+        // The Bash nag reads the ledger now (stage 3); ledger-deny is covered in
+        // tests/root_lock_integration.rs.
+        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, None, "");
         assert!(
-            reason.contains("make test"),
-            "message should name the command, got: {reason}"
-        );
-        assert!(
-            reason.contains(&in_root),
-            "message should list the tracked file, got: {reason}"
-        );
-        assert!(
-            reason.contains("catenary diagnostics"),
-            "message should name `catenary diagnostics`, got: {reason}"
+            result.is_none(),
+            "no-cwd Bash stands down despite the accumulated covered edit, got {result:?}"
         );
     }
 
@@ -1737,7 +1739,7 @@ mod tests {
         let _ = router.session.editing.start_editing(None, "");
         assert!(!router.session.editing.has_files(None, ""));
 
-        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, "");
+        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, None, "");
         assert!(
             result.is_none(),
             "empty covered set should flow free, got {result:?}"
@@ -1753,6 +1755,7 @@ mod tests {
             tool_name: "Edit".to_string(),
             file_path: Some("/outside/notes.md".to_string()),
             command: None,
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: Vec::new(),
@@ -1763,7 +1766,7 @@ mod tests {
             "uncovered edit must not accumulate a covered set"
         );
 
-        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, "");
+        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, None, "");
         assert!(
             result.is_none(),
             "doc-only edit should leave the boundary unblocked, got {result:?}"
@@ -1778,6 +1781,7 @@ mod tests {
             tool_name: "Edit".to_string(),
             file_path: Some(in_root),
             command: None,
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: Vec::new(),
@@ -1791,7 +1795,7 @@ mod tests {
             "catenary glob foo.rs",
             "catenary diagnostics",
         ] {
-            let result = router.handle_enforce_editing("Bash", None, Some(cmd), None, "");
+            let result = router.handle_enforce_editing("Bash", None, Some(cmd), None, None, "");
             assert!(
                 result.is_none(),
                 "`{cmd}` should not be blocked mid-editing, got {result:?}"
@@ -1816,6 +1820,7 @@ mod tests {
             tool_name: "Edit".to_string(),
             file_path: Some(in_root),
             command: None,
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: Vec::new(),
@@ -1835,17 +1840,11 @@ mod tests {
         let (router, root) = test_router_with_root();
         let main_rs = root.join("src/main.rs");
         let lib_rs = root.join("src/lib.rs");
-        let _ = router.session.editing.start_editing(None, "");
-        router
-            .session
-            .editing
-            .record_covered_edit(None, "", main_rs.clone(), true);
-        router
-            .session
-            .editing
-            .record_covered_edit(None, "", lib_rs.clone(), true);
+        // The gate lists the root's due files (root-ownership stage 3): the
+        // message formatter renders whatever due set it is handed.
+        let files = vec![main_rs.clone(), lib_rs.clone()];
 
-        let msg = router.boundary_block_message(None, "", Some("make test"), "Bash");
+        let msg = router.boundary_block_message(&files, Some("make test"), "Bash");
 
         assert!(
             msg.contains("rust-analyzer"),
@@ -1905,12 +1904,8 @@ mod tests {
             "linter-only feeder attribution"
         );
 
-        let _ = router.session.editing.start_editing(None, "");
-        router
-            .session
-            .editing
-            .record_covered_edit(None, "", notes.clone(), true);
-        let msg = router.boundary_block_message(None, "", Some("cargo build"), "Bash");
+        let files = vec![notes.clone()];
+        let msg = router.boundary_block_message(&files, Some("cargo build"), "Bash");
 
         assert!(msg.contains("mocklint"), "names the linter feeder: {msg}");
         assert!(
@@ -1949,16 +1944,8 @@ mod tests {
             "a lint-only file lists just the linter"
         );
 
-        let _ = router.session.editing.start_editing(None, "");
-        router
-            .session
-            .editing
-            .record_covered_edit(None, "", main_rs.clone(), true);
-        router
-            .session
-            .editing
-            .record_covered_edit(None, "", notes.clone(), true);
-        let msg = router.boundary_block_message(None, "", Some("make check"), "Bash");
+        let files = vec![main_rs.clone(), notes.clone()];
+        let msg = router.boundary_block_message(&files, Some("make check"), "Bash");
 
         assert!(msg.contains("rust-analyzer"), "names the LSP feeder: {msg}");
         assert!(msg.contains("mocklint"), "names the linter feeder: {msg}");
@@ -2200,6 +2187,7 @@ mod tests {
             tool_name: "Read".to_string(),
             file_path: None,
             command: None,
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: Vec::new(),
@@ -2226,6 +2214,7 @@ mod tests {
             tool_name: "Read".to_string(),
             file_path: None,
             command: None,
+            cwd: None,
             agent_id: "sub-agent".to_string(),
             session_id: None,
             writes: Vec::new(),
@@ -2301,6 +2290,7 @@ mod tests {
             tool_name: "Read".to_string(),
             file_path: None,
             command: None,
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: Vec::new(),
@@ -2320,6 +2310,7 @@ mod tests {
             tool_name: "Edit".to_string(),
             file_path: Some(file.clone()),
             command: None,
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: Vec::new(),
@@ -2347,6 +2338,7 @@ mod tests {
             tool_name: "Edit".to_string(),
             file_path: Some(file),
             command: None,
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: Vec::new(),
@@ -2376,6 +2368,7 @@ mod tests {
             tool_name: "mcp_catenary_grep".to_string(),
             file_path: Some(file),
             command: None,
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: Vec::new(),
@@ -2400,6 +2393,7 @@ mod tests {
             tool_name: "Bash".to_string(),
             file_path: None,
             command: Some("catenary grep pat > src/main.rs".to_string()),
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: vec![target.clone()],
@@ -2433,6 +2427,7 @@ mod tests {
             tool_name: "Bash".to_string(),
             file_path: None,
             command: Some("catenary grep pat > hits.txt".to_string()),
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: vec![artifact],
@@ -2457,6 +2452,7 @@ mod tests {
             tool_name: "Bash".to_string(),
             file_path: None,
             command: Some("git status".to_string()),
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: Vec::new(),
@@ -2482,6 +2478,7 @@ mod tests {
             tool_name: "Bash".to_string(),
             file_path: None,
             command: Some("sed -i s/a/b/ src/main.rs > out.txt".to_string()),
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: vec![covered.clone(), uncovered],
@@ -2529,6 +2526,7 @@ mod tests {
             tool_name: "Edit".to_string(),
             file_path: Some(format!("{}/src/main.rs", root.display())),
             command: None,
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: vec![target],
@@ -2554,6 +2552,7 @@ mod tests {
             tool_name: "Bash".to_string(),
             file_path: None,
             command: Some("cat tpl > src/main.rs".to_string()),
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: vec![target],
@@ -2568,56 +2567,52 @@ mod tests {
     }
 
     #[test]
-    fn failed_shell_write_leaves_no_phantom_gate_debt() {
-        // Bug 76 sighting: a resolved shell write to a covered target is
-        // recorded at PreToolUse, before the command runs. The command then
-        // failed wholesale (a `git apply` with wrong-cwd paths — zero bytes
-        // written), so the target never came to exist. The next non-edit
-        // command must NOT be gated on that phantom — the boundary block
-        // reconciles the batch against disk first and drops it.
+    fn failed_shell_write_still_accumulates_into_the_in_memory_batch() {
+        // A resolved shell write to a covered target is recorded at PreToolUse,
+        // before the command runs — into the in-memory batch (unchanged). The
+        // batch's own phantom reconciliation (bug 76) is exercised in the
+        // editing_manager unit tests; here we only pin that the shell-write
+        // accumulation path still records it. The DIAGNOSTICS GATE, however, no
+        // longer reads this batch — it reads the durable ledger (root-ownership
+        // stage 3) — so the Bash nag stands down with no cwd (payability). A
+        // phantom `.lock` in the ledger renders its honest `[path does not
+        // exist]` line on the next diagnose and is paid off there.
         let (router, root) = test_router_with_root();
-        // A covered target that will NEVER be created on disk (the failed apply
-        // resolved paths against the wrong repo).
         let phantom = PathBuf::from(format!("{}/src/phantom.rs", root.display()));
 
         router.dispatch(crate::hook::HookRequest::PreTool {
             tool_name: "Bash".to_string(),
             file_path: None,
             command: Some("git apply tui09.diff".to_string()),
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
             writes: vec![phantom],
         });
-        // The write was recorded (resolve-or-deny records before execution), so
-        // pre-reconcile the batch holds the phantom and the gate looks armed.
+        // The write was recorded into the in-memory batch (resolve-or-deny records
+        // before execution) — accumulation is unchanged by stage 3.
         assert!(
             router.session.editing.has_undelivered(None, ""),
-            "the write is recorded at PreToolUse — pre-reconcile the gate is armed"
+            "the shell write is recorded into the in-memory batch"
         );
 
-        // A subsequent non-edit command reaches the boundary block, which
-        // reconciles first: the phantom target does not exist, so it is dropped
-        // and the command flows free — no phantom gate debt.
-        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, "");
+        // The Bash nag now reads the ledger (stage 3); with no cwd it stands down
+        // (payability). Ledger-based gating and phantom handling are covered in
+        // tests/root_lock_integration.rs and the lock unit tests.
+        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, None, "");
         assert!(
             result.is_none(),
-            "a failed write must not gate future work on a never-created file, got {result:?}"
-        );
-        assert!(
-            router.session.editing.files(None, "").is_empty(),
-            "the phantom entry is dropped from the batch on reconciliation"
+            "the ledger gate stands down with no cwd (payability), got {result:?}"
         );
     }
 
     #[test]
-    fn failed_shell_write_reconciled_but_real_edit_still_gates() {
-        // The asymmetry the fix must preserve: a batch mixing a phantom (failed
-        // write) and a real edit (a target that DID land on disk) drops only the
-        // phantom. The real edit keeps the gate armed and appears in the block.
+    fn real_shell_write_accumulates_into_the_in_memory_batch() {
+        // A resolved shell write to a real covered target accumulates into the
+        // in-memory batch (unchanged). The gate no longer consults this batch —
+        // it reads the ledger (stage 3) — so the Bash nag stands down with no cwd.
         let (router, root) = test_router_with_root();
-        let phantom = PathBuf::from(format!("{}/src/phantom.rs", root.display()));
         let real = PathBuf::from(format!("{}/src/real.rs", root.display()));
-        // Create only the real target on disk — the write to it succeeded.
         std::fs::create_dir_all(real.parent().expect("parent")).expect("mkdir");
         std::fs::write(&real, "fn real() {}\n").expect("write real target");
 
@@ -2625,66 +2620,22 @@ mod tests {
             tool_name: "Bash".to_string(),
             file_path: None,
             command: Some("git apply patch.diff".to_string()),
+            cwd: None,
             agent_id: String::new(),
             session_id: None,
-            writes: vec![phantom, real.clone()],
+            writes: vec![real.clone()],
         });
-
-        // The boundary block reconciles: phantom dropped, real edit kept.
-        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, "");
-        let Some(HookResult::Deny(reason)) = result else {
-            unreachable!("the surviving real edit must still gate, got {result:?}");
-        };
         assert_eq!(
             router.session.editing.files(None, ""),
             vec![real],
-            "only the real edit survives reconciliation"
+            "the covered shell write accumulates into the in-memory batch"
         );
+
+        // The Bash nag reads the ledger (stage 3); with no cwd it stands down.
+        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, None, "");
         assert!(
-            reason.contains("real.rs") && !reason.contains("phantom.rs"),
-            "the block lists the real edit, never the dropped phantom, got: {reason}"
-        );
-    }
-
-    #[test]
-    fn real_shell_write_then_deletion_is_reported_not_pruned() {
-        // The honest-conservative boundary: a covered target that DID land on
-        // disk (materialized at record time) and was later deleted must NOT be
-        // pruned as a phantom — it was a genuine edit. It survives reconciliation
-        // to keep the gate armed so `catenary diagnostics` reports it honestly.
-        let (router, root) = test_router_with_root();
-        let written = PathBuf::from(format!("{}/src/written.rs", root.display()));
-        std::fs::create_dir_all(written.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&written, "fn written() {}\n").expect("write target");
-
-        router.dispatch(crate::hook::HookRequest::PreTool {
-            tool_name: "Bash".to_string(),
-            file_path: None,
-            command: Some("cat tpl > src/written.rs".to_string()),
-            agent_id: String::new(),
-            session_id: None,
-            writes: vec![written.clone()],
-        });
-        assert!(
-            router.session.editing.has_undelivered(None, ""),
-            "the real write arms the gate"
-        );
-
-        // The agent then deletes the file before diagnosing it.
-        std::fs::remove_file(&written).expect("delete the written file");
-
-        // Reconciliation at the boundary must KEEP it — it was observed on disk
-        // at record time (materialized), so its later absence is a real edit's
-        // deletion, reported honestly, not a phantom to hide.
-        let result = router.handle_enforce_editing("Bash", None, Some("make test"), None, "");
-        assert!(
-            matches!(result, Some(HookResult::Deny(_))),
-            "a written-then-deleted real edit still gates, got {result:?}"
-        );
-        assert_eq!(
-            router.session.editing.files(None, ""),
-            vec![written],
-            "the vanished real edit is retained for its honest receipt — not pruned"
+            result.is_none(),
+            "the ledger gate stands down with no cwd (payability), got {result:?}"
         );
     }
 

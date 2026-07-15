@@ -2347,8 +2347,9 @@ impl LspClientManager {
     /// full-text relay for a moved open document is the query-side half of
     /// the watch-before-query invariant (see [`Self::nudge_changed_set`]).
     ///
-    /// `owner` tags the document as held by a `(session, agent)` batch, so
-    /// Stop/SubagentStop can close exactly that agent's documents
+    /// `owner` tags the document as held by a ROOT (root-ownership stage 3): the
+    /// diagnose serve passes the root the file belongs to, so root retirement
+    /// (worktree removal) closes exactly that root's held-open documents
     /// ([`Self::close_agent_docs`]); query callers pass `None`.
     ///
     /// Returns the document URI and the [`DocSync`] action taken.
@@ -2427,10 +2428,10 @@ impl LspClientManager {
         Ok((uri, action))
     }
 
-    /// Closes every held-open document `owner` (a `(session, agent)` editing
-    /// key) holds, across every server connection — the batch-end leg of the
-    /// held-open lifecycle (diagnostics-debt 01), dispatched from
-    /// Stop/SubagentStop. Daemon death closes implicitly (bug 79, unchanged).
+    /// Closes every held-open document `owner` (a ROOT path, root-ownership stage
+    /// 3) holds, across every server connection — the batch-end leg of the
+    /// held-open lifecycle (diagnostics-debt 01), dispatched from root retirement
+    /// (worktree removal). Daemon death closes implicitly (bug 79, unchanged).
     ///
     /// Bug 104 discipline: the clients registry lock is held only to snapshot
     /// instance handles — each client lock is awaited after the guard drops.
