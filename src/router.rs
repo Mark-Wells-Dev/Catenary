@@ -6606,20 +6606,26 @@ async fn handle_hook_dispatch(
         }
     }
 
-    // Edit tracking is a qualifying activity (ticket 02 / root-ownership 04): a
-    // `PreToolUse` edit of a file under an ephemeral or kept-worktree root
-    // refreshes its idle clock / kept countdown, so an agent actively editing
-    // under it never has it expire mid-work; the covering worktree's
-    // blocked-on-permission flag clears too. This is a belt-and-suspenders refresh
-    // on the specific edited `file_path` (the one hook seam above already
-    // refreshed on the hook's cwd); it only *refreshes* — edits never mount (a
-    // query does), keeping the edit hook fast.
+    // Edit-mount preheat (root-ownership stage 6, deliverable 3 — the bug-108
+    // absorption completes here): the FIRST edit of a file fires the ensure path
+    // so a cold root's server starts BEFORE the first `catenary diagnostics`. A
+    // no-op in the common case — grep/glob already warmed the server via their
+    // own `ensure_ephemeral_mounts` — but an agent that opens with an edit (no
+    // prior read) no longer pays the spawn latency inside the diagnose.
+    //
+    // This rides the EXISTING `pre-tool/editing-state` hook IPC and never gates
+    // the edit decision (stage 2's binding constraint): the hook made the
+    // one-cook allow/deny call hook-side, filesystem-only, BEFORE any daemon
+    // contact, and the edit proceeds identically when the daemon is down (the
+    // hook silently no-ops on an unreachable socket). Reaching the daemon here is
+    // advisory preheat only. `ensure_ephemeral_mounts` is idempotent per path —
+    // an already-mounted root only has its idle clock / kept countdown refreshed,
+    // which subsumes the belt-and-suspenders refresh the old code did — so a
+    // cold root mounts (server spawns) and a warm one is merely touched.
     if let Some(file_path) = raw.get("file_path").and_then(|v| v.as_str()) {
-        let path = Path::new(file_path);
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let now = Instant::now();
-        ctx.ephemeral_mounts.touch_covering(&canonical, now);
-        ctx.worktree_mounts.touch_covering(&canonical, now);
+        let touched =
+            resolve_touched_paths(&[PathBuf::from(file_path)], hook_cwd(&raw).map(Path::new));
+        ensure_ephemeral_mounts(&ctx, &touched, Instant::now(), &session_id).await;
     }
 
     let envelope = HookResponseEnvelope {
@@ -12271,6 +12277,66 @@ mod tests {
                 .iter()
                 .any(|(p, eph)| Path::new(p) == project && *eph),
             "the ephemeral root survives under hook activity",
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn first_edit_preheats_the_cold_root_before_any_diagnose() {
+        // Acceptance (root-ownership stage 6, deliverable 3 — the bug-108
+        // absorption): the FIRST edit in a cold root — no prior grep/glob warmed
+        // it — fires the ensure path so the enclosing project root mounts (its
+        // server starts) BEFORE the first `catenary diagnostics`. Observed via the
+        // daemon's root board (`tool/roots-ls`): the cold root is mounted right
+        // after the edit hook, with no query in between.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, file) = marker_project(&base, "Cold");
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // The root is cold: no query has mounted it.
+        assert!(
+            !roots_ls_classes(&ipc_path)
+                .await
+                .iter()
+                .any(|(p, _)| Path::new(p) == project),
+            "the root is cold before the first edit — no prior query warmed it",
+        );
+
+        // A single Edit PreToolUse for a file in the cold root. The hook cwd sits
+        // OUTSIDE the project (so only the edited file_path can drive the mount —
+        // proving the preheat rides the edit path, not the cwd seam).
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "pre-tool/editing-state",
+                "tool_name": "Edit",
+                "session_id": "sess-1",
+                "file_path": file.display().to_string(),
+                "cwd": base.display().to_string(),
+                "host_payload": { "cwd": base.display().to_string() },
+            }),
+        )
+        .await;
+
+        // The edit preheated the cold root: it is now mounted (ephemeral),
+        // BEFORE any diagnose ran.
+        let entry = roots_ls_classes(&ipc_path)
+            .await
+            .into_iter()
+            .find(|(p, _)| Path::new(p) == project);
+        let (_, ephemeral) = entry.expect("the first edit mounted the enclosing cold root");
+        assert!(
+            ephemeral,
+            "the preheat mount is an ephemeral activity mount",
         );
 
         shutdown.cancel();

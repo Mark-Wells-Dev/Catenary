@@ -371,6 +371,18 @@ fn root_parts(
         );
         left.push(Span::styled(format!("  {idle}"), theme.timestamp));
     }
+    // The durable-lock badge (root-ownership stage 6): a root a cook holds shows
+    // `[locked N]` when N files await diagnosis, `[locked]` when the lock is paid
+    // (inside its idle window). Read from the state dir at rebuild time — a
+    // filesystem fact indifferent to daemon lifecycle.
+    if let Some(lock) = &r.lock {
+        let badge = if lock.due > 0 {
+            format!("[locked {}↑]", lock.due)
+        } else {
+            "[locked]".to_string()
+        };
+        left.push(Span::styled(format!("  {badge}"), theme.accent));
+    }
     let mut right = Vec::new();
     if let Some(w) = r.worst {
         right.push(Span::styled(
@@ -1004,6 +1016,38 @@ fn root_detail(path: &str, snapshot: &Snapshot, theme: &Theme) -> Vec<Line<'stat
             lines.push(kv("idle", idle, theme));
         }
     }
+    // The durable-lock facts (root-ownership stage 6, deliverable 1): the owner
+    // label, the due count, and the last-activity age — read fresh from the
+    // state dir's lock dir, not daemon memory, so a daemon bounce changes
+    // nothing here. Best-effort: a root with no lock dir simply omits the block.
+    if let Some(facts) =
+        crate::lock::facts_for(std::path::Path::new(path), std::time::SystemTime::now())
+    {
+        lines.push(kv(
+            "lock owner",
+            facts.owner.as_ref().map_or_else(
+                || "(interrupted acquisition)".to_string(),
+                crate::lock::owner_label,
+            ),
+            theme,
+        ));
+        let due = if facts.due == 1 {
+            "1 file awaiting diagnosis".to_string()
+        } else {
+            format!("{} files awaiting diagnosis", facts.due)
+        };
+        lines.push(kv("lock debt", due, theme));
+        let activity = facts.age.map_or_else(
+            || "unknown".to_string(),
+            |age| {
+                format!(
+                    "{} ago",
+                    format_elapsed_secs(i64::try_from(age.as_secs()).unwrap_or(i64::MAX))
+                )
+            },
+        );
+        lines.push(kv("lock activity", activity, theme));
+    }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
         "  Routing (why a file is covered)".to_string(),
@@ -1391,6 +1435,74 @@ mod tests {
         );
         let long = vec!["mcp:0123456789a76a".to_string()];
         assert_eq!(contributor_label(&long), "[mcp:…a76a]");
+    }
+
+    /// Root-ownership stage 6, deliverable 1: a held root renders the durable-lock
+    /// badge on its tree row — `[locked N↑]` with the due count when debt is
+    /// pending, `[locked]` for a paid lock inside its idle window. An unlocked
+    /// root (`lock: None`) carries no badge.
+    #[test]
+    fn root_row_renders_the_lock_badge_from_filesystem_facts() {
+        use super::super::model::LockRow;
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+
+        let base = RootRow {
+            path: "/home/mark/Projects/Catenary".to_string(),
+            sources: vec!["hook".to_string()],
+            ephemeral: false,
+            idle_remaining_secs: None,
+            expanded: false,
+            up: 1,
+            total: 1,
+            worst: None,
+            companion_of: None,
+            lock: None,
+        };
+
+        // Unlocked → no lock badge.
+        let (left, _) = root_parts(&base, &theme, &icons);
+        let text: String = left.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !text.contains("locked"),
+            "an unlocked root shows no badge: {text}"
+        );
+
+        // Held with debt → `[locked N↑]`.
+        let with_debt = RootRow {
+            lock: Some(LockRow {
+                owner: Some("claude+sess-a+".to_string()),
+                due: 3,
+                age_secs: Some(43),
+            }),
+            ..base.clone()
+        };
+        let (left, _) = root_parts(&with_debt, &theme, &icons);
+        let text: String = left.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("[locked 3↑]"),
+            "held-with-debt badge shows the due count: {text}"
+        );
+
+        // Paid (inside its idle window) → `[locked]`, no count.
+        let paid = RootRow {
+            lock: Some(LockRow {
+                owner: Some("claude+sess-a+".to_string()),
+                due: 0,
+                age_secs: Some(120),
+            }),
+            ..base
+        };
+        let (left, _) = root_parts(&paid, &theme, &icons);
+        let text: String = left.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("[locked]"),
+            "a paid lock shows the bare badge: {text}"
+        );
+        assert!(
+            !text.contains('↑'),
+            "a paid lock shows no due count: {text}"
+        );
     }
 
     /// Item 6c: the lifetime badge names the root's lifetime class; an MCP-only

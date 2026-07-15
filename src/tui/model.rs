@@ -121,6 +121,30 @@ pub struct RootRow {
     /// nests under; `None` for a primary or a standalone root (tui-rework 14,
     /// item 6a). A companion row renders nested and marked.
     pub companion_of: Option<String>,
+    /// The durable-lock facts for this root, read from the state dir's lock dir
+    /// at rebuild time (root-ownership stage 6). `None` when the root holds no
+    /// lock. These are filesystem reads — indifferent to daemon lifecycle, so a
+    /// daemon bounce never changes them.
+    pub lock: Option<LockRow>,
+}
+
+/// A root's durable-lock facts as the board renders them (root-ownership stage
+/// 6, deliverable 1).
+///
+/// Filled at rebuild time from [`crate::lock::facts_for`] — a pure state-dir
+/// read keyed by the root path, never daemon memory. The owner string is a
+/// display **label** (the owner-file name); labels are OK on the board, keys are
+/// not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockRow {
+    /// The owner label (`<client>+<session>+<agent>`), or `None` for an
+    /// ownerless lock dir (a crashed / mid-swing acquisition).
+    pub owner: Option<String>,
+    /// Files awaiting diagnosis — the ledger's touch-tree leaf count.
+    pub due: usize,
+    /// Seconds since the lock last saw activity, or `None` when no mtime is
+    /// readable. Quantized at render time so an idle row stays byte-identical.
+    pub age_secs: Option<u64>,
 }
 
 /// A client header row (session tree) — grouped by host CLI.
@@ -361,6 +385,23 @@ fn worst(sevs: impl Iterator<Item = Severity>) -> Option<Severity> {
     sevs.min_by_key(|s| s.rank())
 }
 
+/// Reads a root's durable-lock facts from the state dir into a [`LockRow`], or
+/// `None` when the root holds no lock (root-ownership stage 6, deliverable 1).
+///
+/// A pure filesystem read via [`crate::lock::facts_for`] — the board renders
+/// lock facts sourced from the lock dir, never daemon memory, so a daemon bounce
+/// changes nothing here. The age is captured against the wall clock at rebuild
+/// time and quantized at render time (byte-identical within a bucket). The owner
+/// is a display **label**, never a routing key.
+fn read_lock_row(path: &str) -> Option<LockRow> {
+    let facts = crate::lock::facts_for(std::path::Path::new(path), std::time::SystemTime::now())?;
+    Some(LockRow {
+        owner: facts.owner.as_ref().map(crate::lock::owner_label),
+        due: facts.due,
+        age_secs: facts.age.map(|d| d.as_secs()),
+    })
+}
+
 /// Build the top-left root/server tree from the snapshot + findings.
 ///
 /// Roots are the collapse unit: healthy roots aggregate to one line
@@ -457,6 +498,7 @@ pub fn build_root_tree(
                 total: servers.len(),
                 worst: w,
                 companion_of: companion_of.get(path).cloned(),
+                lock: read_lock_row(path),
             }
         })
         .collect();

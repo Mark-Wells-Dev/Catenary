@@ -459,6 +459,124 @@ pub fn last_activity_age(lock_dir: &Path, now: SystemTime) -> Option<Duration> {
     now.duration_since(mtime).ok()
 }
 
+/// A read-only snapshot of a root's lock state — the filesystem facts the board
+/// renders (root-ownership stage 6, deliverable 1).
+///
+/// Built by [`facts_for_in`] from the lock dir alone: the owner **label** (read
+/// from the owner-file name — a display label, never a routing key), the due
+/// count (the touch-tree leaf count), and the last-activity age (the owner
+/// file's mtime against `now`). This is the whole read surface the board needs,
+/// so the TUI never re-derives lock internals. Best-effort: an unreadable /
+/// absent lock dir yields `None`, so the board renders such a root as unlocked
+/// rather than erroring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockFacts {
+    /// The owner label, `<client>+<session>+<agent>` (a display label read from
+    /// the owner-file name). `None` for an ownerless lock dir (a crashed or
+    /// mid-swing acquisition).
+    pub owner: Option<Owner>,
+    /// Files awaiting diagnosis in this root's ledger (the touch-tree leaf
+    /// count). `0` for a paid lock inside its idle window.
+    pub due: usize,
+    /// How long ago the lock last saw activity, or `None` when no mtime is
+    /// readable.
+    pub age: Option<Duration>,
+}
+
+/// Reads the lock facts for a single `root` under `locks_base`, or `None` when
+/// the root holds no lock dir (root-ownership stage 6, deliverable 1).
+///
+/// A pure filesystem read keyed by the root's canonical path — no daemon
+/// contact — so the board's lock facts are indifferent to daemon lifecycle:
+/// killing and restarting the daemon changes nothing here, since every field
+/// comes from the durable lock dir. Best-effort: an unreadable owner name or
+/// ledger degrades a field to its empty reading ([`None`] owner / `0` due /
+/// [`None`] age) rather than erroring.
+#[must_use]
+pub fn facts_for_in(locks_base: &Path, root: &Path, now: SystemTime) -> Option<LockFacts> {
+    let lock_dir = root_lock_dir_in(locks_base, root);
+    if !lock_dir.is_dir() {
+        return None;
+    }
+    Some(LockFacts {
+        owner: read_owner_name(&lock_dir)
+            .ok()
+            .flatten()
+            .and_then(|name| Owner::parse(&name)),
+        due: due_count(&lock_dir),
+        age: last_activity_age(&lock_dir, now),
+    })
+}
+
+/// Production wrapper for [`facts_for_in`] resolving the base through [`locks_dir`].
+///
+/// The `root` is canonicalized at this ingestion seam (the spelling rule): the
+/// board queries with the snapshot's stored root path, and a symlinked-prefix
+/// alias must read the SAME canonical lock dir the edit seam booked under, or a
+/// held root would render as unlocked. Pin: [`facts_read_through_aliased_spelling`].
+#[must_use]
+pub fn facts_for(root: &Path, now: SystemTime) -> Option<LockFacts> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    facts_for_in(&locks_dir(), &root, now)
+}
+
+/// Enumerates every lock dir under `locks_base`, returning each root's encoded
+/// dir name paired with its facts (root-ownership stage 6, deliverable 1).
+///
+/// A read-only sweep of the lock dirs — the board's "what roots are locked
+/// right now?" answer, keyed off the filesystem rather than daemon memory. The
+/// encoding ([`crate::paths::encode_cwd`]) is lossy, so this cannot reconstruct
+/// the absolute root path; the board pairs the encoded name against a known root
+/// via [`root_lock_dir_in`] (or reads facts per-root through [`facts_for`]). Used
+/// where the caller wants the full lock inventory (a daemon-down board that has
+/// no root list to key against). Best-effort: an unreadable `locks_base` yields
+/// an empty list.
+#[must_use]
+pub fn list_locks_in(locks_base: &Path, now: SystemTime) -> Vec<(String, LockFacts)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(locks_base) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let lock_dir = entry.path();
+        if !lock_dir.is_dir() {
+            continue;
+        }
+        let Some(name) = lock_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        out.push((
+            name.to_string(),
+            LockFacts {
+                owner: read_owner_name(&lock_dir)
+                    .ok()
+                    .flatten()
+                    .and_then(|n| Owner::parse(&n)),
+                due: due_count(&lock_dir),
+                age: last_activity_age(&lock_dir, now),
+            },
+        ));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Production wrapper for [`list_locks_in`] resolving the base through [`locks_dir`].
+#[must_use]
+pub fn list_locks(now: SystemTime) -> Vec<(String, LockFacts)> {
+    list_locks_in(&locks_dir(), now)
+}
+
+/// Renders an owner as a compact display label — `<client>+<session>+<agent>`.
+///
+/// This is the board's owner LABEL (design: labels are OK, keys are not). It is
+/// the owner-file name verbatim, so it round-trips with the lock dir's title and
+/// never invents a correlation the plane invariant forbids.
+#[must_use]
+pub fn owner_label(owner: &Owner) -> String {
+    owner.file_name()
+}
+
 /// Resolves the root a file belongs to for locking purposes, or `None` when the
 /// file is in genuinely-foreign territory (no repository marker above it).
 ///
@@ -467,6 +585,14 @@ pub fn last_activity_age(lock_dir: &Path, now: SystemTime) -> Option<Duration> {
 /// resolution): edits in `/tmp`, scratch dirs, or anywhere outside a VCS
 /// checkout resolve to `None`, so no lock is taken. The root is canonicalized so
 /// its encoding matches the daemon's canonical roots.
+///
+/// **Innermost covered root wins** — the same resolution queries use
+/// ([`crate::companions::enclosing_worktree_root`] stops at the *nearest*
+/// enclosing marker). A nested inner root (its own `.git`/marker) is resolved,
+/// not the outer repo, so an edit inside it books against the INNER kitchen's
+/// ledger and the outer root's lock is untouched. The lock, the ledger, and the
+/// briefing therefore all agree which kitchen a nested path belongs to. Pin:
+/// [`edit_in_nested_inner_root_books_inner_not_outer`].
 #[must_use]
 pub fn resolve_lock_root(file: &Path) -> Option<PathBuf> {
     let canonical = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
@@ -2125,5 +2251,181 @@ mod tests {
             vec![real],
             "the aliased still-modified file is NOT wrongly unbooked (same canonical spelling)"
         );
+    }
+
+    // ── The board's lock-facts read surface (root-ownership stage 6) ────────
+
+    #[test]
+    fn facts_for_reads_owner_due_and_age_from_the_lock_dir() {
+        let fx = Fixture::new();
+        let f1 = fx.file("src/a.rs");
+        let f2 = fx.file("src/b.rs");
+        let owner = Owner::new("claude", "sess-a", "");
+        let booking = rust_booking();
+        let now = SystemTime::now();
+        let locks = fx.locks();
+
+        // Unlocked → no facts (the board renders such a root as absent-of-lock).
+        assert!(
+            facts_for_in(&locks, &fx.root, now).is_none(),
+            "an unlocked root has no lock facts"
+        );
+
+        assert!(matches!(
+            acquire_in(&locks, &f1, &owner, &booking, now),
+            Acquired::Ours
+        ));
+        assert!(matches!(
+            acquire_in(&locks, &f2, &owner, &booking, now),
+            Acquired::Ours
+        ));
+
+        // Read facts against a `now` after the acquisition (the owner file's
+        // mtime is stamped during `acquire_in`, so a `now` captured before it
+        // would read the activity as "in the future" — a test artifact, not a
+        // real one; production reads a fresh wall clock).
+        let after = now + Duration::from_secs(1);
+        let facts = facts_for_in(&locks, &fx.root, after).expect("locked root has facts");
+        assert_eq!(
+            facts.owner.as_ref().map(Owner::file_name),
+            Some(owner.file_name()),
+            "the owner label is read from the owner-file name"
+        );
+        assert_eq!(facts.due, 2, "the due count is the touch-tree leaf count");
+        assert!(facts.age.is_some(), "the last-activity age is readable");
+
+        // Payment drains the due set; the lock (and its facts) survive.
+        unlink_delivered_in(&locks, &fx.root, &[f1, f2]);
+        let paid = facts_for_in(&locks, &fx.root, after).expect("paid lock still has facts");
+        assert_eq!(paid.due, 0, "a paid lock reports zero due");
+        assert_eq!(
+            paid.owner.as_ref().map(Owner::file_name),
+            Some(owner.file_name()),
+            "the owner label survives payment (parole, not release)"
+        );
+    }
+
+    #[test]
+    fn list_locks_enumerates_every_lock_dir() {
+        let fx = Fixture::new();
+        // A second root beside the first, each with its own lock.
+        let other = fx.dir.path().join("other");
+        std::fs::create_dir_all(other.join(".git")).expect("mk other .git");
+        let other = other.canonicalize().expect("canon other");
+        std::fs::write(other.join("main.rs"), b"").expect("write");
+
+        let owner_a = Owner::new("claude", "sess-a", "");
+        let owner_b = Owner::new("claude", "sess-b", "");
+        let booking = rust_booking();
+        let now = SystemTime::now();
+        let locks = fx.locks();
+
+        assert!(matches!(
+            acquire_in(&locks, &fx.file("src/main.rs"), &owner_a, &booking, now),
+            Acquired::Ours
+        ));
+        assert!(matches!(
+            acquire_in(&locks, &other.join("main.rs"), &owner_b, &booking, now),
+            Acquired::Ours
+        ));
+
+        let inventory = list_locks_in(&locks, now);
+        assert_eq!(inventory.len(), 2, "both lock dirs are enumerated");
+        // Facts pair with the encoded dir name; each carries its own owner label.
+        let owners: std::collections::BTreeSet<String> = inventory
+            .iter()
+            .filter_map(|(_, f)| f.owner.as_ref().map(Owner::file_name))
+            .collect();
+        assert!(owners.contains(&owner_a.file_name()));
+        assert!(owners.contains(&owner_b.file_name()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn facts_read_through_aliased_spelling() {
+        // The spelling rule at the board's read seam (misc 193): the board reads
+        // facts through `facts_for`, which canonicalizes the queried root. A
+        // symlinked-prefix alias of the root must read the SAME canonical lock dir
+        // the edit seam booked under, or a held root would render as unlocked. A
+        // green real-dir run masks this — the symlink alias is the regression pin.
+        let fx = Fixture::new();
+        let alias = fx.dir.path().join("alias");
+        std::os::unix::fs::symlink(&fx.root, &alias).expect("mk symlink");
+        let via_alias = alias.join("src/main.rs");
+        let owner = Owner::new("claude", "sess-a", "");
+        let booking = rust_booking();
+        let now = SystemTime::now();
+        let locks = fx.locks();
+
+        assert!(matches!(
+            acquire_in(&locks, &via_alias, &owner, &booking, now),
+            Acquired::Ours
+        ));
+
+        // Reading facts for the ALIASED root path resolves to the canonical lock
+        // dir — the held root renders as held, not unlocked.
+        let facts =
+            facts_for_in(&locks, &alias.canonicalize().unwrap_or(alias), now).expect("facts");
+        assert_eq!(
+            facts.owner.as_ref().map(Owner::file_name),
+            Some(owner.file_name()),
+            "the aliased read resolves to the canonical held lock"
+        );
+        assert_eq!(facts.due, 1, "the canonical ledger's due count");
+    }
+
+    // ── Nested-root resolution: innermost covered root wins (stage 6) ───────
+
+    #[test]
+    fn edit_in_nested_inner_root_books_inner_not_outer() {
+        // The nested-root pin (deliverable 4): an inner covered root (its own
+        // `.git` marker) nested inside an outer repo. An edit inside the inner
+        // root books against the INNER kitchen; the outer root's lock is untouched.
+        // The lock, the ledger, and the briefing all agree which kitchen the
+        // nested path belongs to — the same innermost resolution queries use.
+        let fx = Fixture::new();
+        // An inner repo at `<outer>/inner/` with its own marker.
+        let inner = fx.root.join("inner");
+        std::fs::create_dir_all(inner.join(".git")).expect("mk inner .git");
+        std::fs::create_dir_all(inner.join("src")).expect("mk inner src");
+        let inner = inner.canonicalize().expect("canon inner");
+        let inner_file = inner.join("src/lib.rs");
+        std::fs::write(&inner_file, b"").expect("write inner file");
+
+        let owner = Owner::new("claude", "sess-a", "");
+        let booking = rust_booking();
+        let now = SystemTime::now();
+        let locks = fx.locks();
+
+        // The edit resolves to the INNER root (nearest enclosing marker).
+        assert_eq!(
+            resolve_lock_root(&inner_file).as_deref(),
+            Some(inner.as_path()),
+            "the nested edit resolves to the innermost covered root"
+        );
+
+        assert!(matches!(
+            acquire_in(&locks, &inner_file, &owner, &booking, now),
+            Acquired::Ours
+        ));
+
+        // The inner kitchen booked the file.
+        assert_eq!(
+            due_files_in(&locks, &inner),
+            vec![inner_file],
+            "the inner kitchen books the nested edit"
+        );
+        assert!(has_debt_in(&locks, &inner), "inner has debt");
+
+        // The OUTER root's lock is untouched — no dir, no owner, no debt.
+        assert!(
+            !root_lock_dir_in(&locks, &fx.root).exists(),
+            "the outer root's lock is untouched by a nested-inner edit"
+        );
+        assert!(
+            facts_for_in(&locks, &fx.root, now).is_none(),
+            "the outer root renders as unlocked"
+        );
+        assert!(!has_debt_in(&locks, &fx.root), "outer has no debt");
     }
 }
