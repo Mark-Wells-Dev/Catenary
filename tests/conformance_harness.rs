@@ -1194,6 +1194,67 @@ fn conformance_clangd() -> Result<()> {
     sentinel("clangd")
 }
 
+/// The macOS `$TMPDIR` prefix-alias spelling, reproduced with a symlink on any
+/// platform (the `ee12779` macOS CI red). The session speaks an ALIAS spelling
+/// of the fixture root — `CATENARY_ROOTS` and the scoped serve's named file —
+/// while the daemon's fs roots canonicalize to the real one. The serve's
+/// on-demand spawn (`ensure_clients_for_paths`) received the raw spelling,
+/// missed the canonical roots, and ensured nothing; the coverage lookup then
+/// read a cold registry and answered `[no LSP coverage]`. The fixture file is
+/// created AFTER the bridge boots so the boot-time `spawn_all` cannot mask the
+/// miss (it did on fast hosts — the Linux legs stayed green on timing luck;
+/// macOS's slower spawn lost the race). Real-server shaped deliberately: mockls
+/// routes via `CATENARY_SERVERS` and never exercised the miss.
+#[test]
+fn conformance_clangd_aliased_root_spelling() -> Result<()> {
+    let Some(case) = lookup("clangd") else {
+        bail!("no conformance case for `clangd`");
+    };
+    if !on_path(case.server) {
+        eprintln!(
+            "conformance: skipping `{} (aliased root)` — binary not on PATH",
+            case.server
+        );
+        return Ok(());
+    }
+
+    // The alias sits on an ANCESTOR (macOS aliases `/var`, not the tempdir
+    // itself): the fixture root is a REAL directory reached through an aliased
+    // prefix, so the root path is not a symlink — only its spelling is.
+    let base = common::KeepOnPanic::new(tempfile::tempdir().context("create alias base")?);
+    let real = base.path().join("real");
+    std::fs::create_dir(&real).context("create real prefix")?;
+    let alias = base.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).context("create alias symlink")?;
+    let root = alias.join("fixture-root");
+    std::fs::create_dir(&root).context("create fixture root via alias")?;
+
+    // Boot against the EMPTY root: no .c file exists yet, so no boot-time
+    // clangd spawn can win the race for the serve below.
+    let mut bridge = BridgeProcess::spawn_conformance(&root)?;
+    bridge.initialize()?;
+
+    // Now the fixture arrives, spelled through the alias. The scoped serve's
+    // ensure-spawn leg is the only thing that can bring clangd up for it.
+    let src = fixture_dir(case);
+    copy_dir(&src, &root)?;
+    let file = root.join(case.file);
+
+    let receipt = run_settle_diagnostics(&bridge, &file, CONFORMANCE_WALL_BOUND)
+        .context("aliased-root settle")?;
+    assert!(
+        !receipt.contains("[no LSP coverage]"),
+        "the aliased spelling lost coverage the canonical spelling has:\n{receipt}"
+    );
+    assert!(
+        receipt.contains("broken.c"),
+        "receipt does not diagnose the fixture file:\n{receipt}"
+    );
+
+    bridge.shutdown_clean(Duration::from_secs(10))?;
+    Ok(())
+}
+
 // ── gopls pull-first gate (diagnostics-debt 05, re-enabling bug 87) ────
 //
 // Bug 87 forced gopls's `pullDiagnostics` OFF because its pull-mode empty

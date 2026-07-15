@@ -5944,12 +5944,22 @@ async fn handle_hook_dispatch(
         // empty set → the whole ledger due set (the batch) is diagnosed; a
         // non-empty set names files to diagnose on demand (the pull-anything
         // form — served regardless of debt).
+        //
+        // Canonicalize each named path at this ingestion seam, once (misc 193,
+        // the grep/glob/file-accumulation rule): fs roots are canonical, but the
+        // caller passes its raw spelling. On a symlinked-prefix host (macOS
+        // `$TMPDIR` → `/private/var/…`) the raw spelling misses the canonical
+        // roots inside `ensure_clients_for_paths`, so the serve never ensures the
+        // spawn and a cold registry reads as `[no LSP coverage]` (the `ee12779`
+        // macOS CI red). A nonexistent path keeps its spelling — the pipeline's
+        // out-of-scope classifier names it `missing` as before.
         let scoped_files: Vec<PathBuf> = raw
             .get("files")
             .and_then(serde_json::Value::as_array)
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str().map(PathBuf::from))
+                    .map(|p| p.canonicalize().unwrap_or(p))
                     .collect()
             })
             .unwrap_or_default();
