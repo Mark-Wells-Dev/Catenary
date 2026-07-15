@@ -570,6 +570,12 @@ build = "make"
 # `allow` includes read/stdout-only tools (cat, head, less, diff, ...):
 # reads aren't a write vector, and a redirected write (`cat > f`) is
 # resolved and attributed by the write resolver, not blocked by denying cat.
+# The digest tools (sha256sum, sha1sum, md5sum, b2sum, cksum) are the same
+# class — read-only, stdout-only, zero write vector. `sqlite3` is granted
+# with `-cmd` denied (below): a read tool we have no alternative for (like
+# `git log`), the `-cmd` carve-out closing its arbitrary-exec lever. `tar`
+# is granted as an archiver, its exec/traversal levers denied via
+# `deny_flags` (below).
 # `sed` and `perl` are allowed as bulk writers: their in-place edits
 # (`sed -i`, `perl -i -pe`) are script-checked and resolved into the
 # diagnostics batch; an unparseable/executing script is surgically denied.
@@ -579,12 +585,28 @@ build = "make"
 allow = ["git", "gh", "cp", "rm", "mkdir", "mv", "touch",
          "chmod", "sleep", "cd", "true", "false", "which",
          "cat", "head", "tail", "less", "more", "diff",
-         "echo", "printf", "seq", "sed", "perl"]
+         "echo", "printf", "seq", "sed", "perl", "sqlite3",
+         "sha256sum", "sha1sum", "md5sum", "b2sum", "cksum",
+         "tar"]
 pipeline = ["grep", "wc", "jq", "sort", "tr", "cut", "uniq"]
 
 [commands.deny]
 git = ["grep", "ls-files", "ls-tree"]
 sqlite3 = ["-cmd"]
+
+[commands.deny_flags]
+make = ["-C"]
+# tar is granted as an archiver, not a command host: allowed to pack/unpack,
+# denied the flags that turn it into an exec or traversal lever. Without
+# -P / --absolute-names, GNU tar strips leading `/` and refuses `..` members,
+# so extraction is cwd-contained; the rest each run an arbitrary program.
+# `-C` is deliberately allowed (extraction destination — `cd dir && tar -xf`
+# is the trivially-allowed equivalent). Residual: an extraction's write-set
+# lives inside the archive, invisible to argv, so extracted covered files
+# don't arm the diagnostics gate.
+tar = ["-P", "--absolute-names", "--to-command", "--checkpoint-action",
+       "-I", "--use-compress-program", "-F", "--info-script",
+       "--rmt-command", "--rsh-command"]
 ```
 
 Read and stdout-only tools (`cat`, `head`, `tail`, `less`, `diff`, …)
@@ -758,10 +780,12 @@ Run `catenary config` to generate a recommended config template with
 a commented-out `[commands]` section. The template carries the fuller
 reference the short block above elides: commented `build` alternatives for the
 common ecosystems (`just`, `cargo`, `npm`/`yarn`/`pnpm`, `go`, `gradle`/`mvn`,
-`cmake`), per-ecosystem `deny_flags` examples that deny the escape-root flags
-each build tool exposes (`make -C`, `cargo --manifest-path`, `npm --prefix`,
-… — adapt to your ecosystem), and a commented [`[roots.companions]`](#companion-roots)
-example (off by default, user-config only).
+`cmake`), per-ecosystem `deny_flags` **candidates** that deny the escape-root
+flags each build tool exposes (`cargo --manifest-path`, `npm --prefix`, … —
+uncomment the one matching your `build` and drop the rest; `make -C` is the
+active pair for the shipped `build = "make"`), and a commented
+[`[roots.companions]`](#companion-roots) example (off by default,
+user-config only).
 
 ## Global Options
 

@@ -27,7 +27,7 @@ use crate::logging::reaper::ReapPolicy;
 
 pub use commands::{
     BuildContext, BuildGuidance, CommandsConfig, GuidanceEntry, PROJECT_IGNORED_COMMAND_KEYS,
-    ResolvedCommands,
+    ResolvedCommands, validate as validate_commands,
 };
 pub use language::{DispatchMethod, LanguageConfig, ServerBinding};
 pub use linter::LinterConfig;

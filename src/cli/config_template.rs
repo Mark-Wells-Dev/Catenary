@@ -79,6 +79,11 @@ const TEMPLATE: &str = r#"#:schema https://twowells.github.io/catenary/schemas/c
 # # `allow` includes read/stdout-only tools (cat, head, less, diff,
 # # echo, ...): reads aren't a write vector, and a redirected write
 # # (`cat > f`) is resolved and attributed, not blocked by denying cat.
+# # The digest tools (sha256sum, sha1sum, md5sum, b2sum, cksum) join them:
+# # read-only, stdout-only, zero write vector — the same class as cat/diff.
+# # `sqlite3` is granted with `-cmd` denied (see [commands.deny] below):
+# # it's a read tool we have no alternative for (like `git log`), and the
+# # `-cmd` carve-out closes its arbitrary-exec lever.
 # # `sed` and `perl` are allowed as bulk writers: their in-place edits
 # # (`sed -i`, `perl -i -pe`) are script-checked and resolved into the
 # # diagnostics batch, and an unparseable/executing script (`sed -i 'w …'`,
@@ -86,7 +91,9 @@ const TEMPLATE: &str = r#"#:schema https://twowells.github.io/catenary/schemas/c
 # allow = ["git", "gh", "cp", "rm", "mkdir", "mv", "touch",
 #          "chmod", "sleep", "cd", "true", "false", "which",
 #          "cat", "head", "tail", "less", "more", "diff",
-#          "echo", "printf", "seq", "sed", "perl"]
+#          "echo", "printf", "seq", "sed", "perl", "sqlite3",
+#          "sha256sum", "sha1sum", "md5sum", "b2sum", "cksum",
+#          "tar"]
 # pipeline = ["grep", "wc", "jq", "sort", "tr", "cut", "uniq"]
 #
 # [commands.deny]
@@ -95,10 +102,26 @@ const TEMPLATE: &str = r#"#:schema https://twowells.github.io/catenary/schemas/c
 #
 # [commands.deny_flags]
 # # These deny the flags that redirect the tool to operate outside the project root
-# # — adapt to your ecosystem. make/cargo below are the shipped pair; uncomment
-# # the line for whatever `build` you set above (and drop the others).
+# # — adapt to your ecosystem. make is the shipped build-tool pair; uncomment
+# # the candidate for whatever `build` you set above (and drop the others).
 # make = ["-C"]
-# cargo = ["--manifest-path"]
+# # tar is granted as an archiver, not a command host: allowed to pack/unpack,
+# # denied the flags that turn it into an exec or traversal lever. Without -P /
+# # --absolute-names, GNU tar strips leading `/` and refuses `..` members, so
+# # extraction is cwd-contained by construction; the rest below each run an
+# # arbitrary program (--to-command pipes every member to a command;
+# # --checkpoint-action runs exec= on checkpoints; -I / --use-compress-program
+# # runs an arbitrary "decompressor"; -F / --info-script runs a per-volume
+# # script; --rmt-command / --rsh-command override the remote-tape/remote-shell
+# # command). `-C` is deliberately NOT denied (unlike make -C): for tar it just
+# # names the extraction destination, `cd dir && tar -xf` is the trivially-allowed
+# # equivalent, and denying it buys friction not safety. Known residual: an
+# # extraction's write-set lives inside the archive, invisible to argv, so
+# # extracted covered files don't arm the diagnostics gate.
+# tar = ["-P", "--absolute-names", "--to-command", "--checkpoint-action",
+#        "-I", "--use-compress-program", "-F", "--info-script",
+#        "--rmt-command", "--rsh-command"]
+# #   cargo  = ["--manifest-path"]              # --manifest-path builds elsewhere
 # #   npm    = ["--prefix"]                    # --prefix (alias -C) runs npm elsewhere
 # #   yarn   = ["--cwd"]                        # --cwd sets the working directory
 # #   pnpm   = ["-C", "--dir"]                  # -C / --dir run pnpm elsewhere
@@ -549,14 +572,17 @@ mod tests {
 
     #[test]
     fn template_deny_flags_examples_present_and_active_pair_only() {
-        // misc 199 deliverable 3: per-ecosystem escape-root deny_flags examples
-        // are present as commented candidates, with the principle named; only
-        // the shipped make/cargo pair is active.
+        // misc 199 deliverable 3 (amended by bug 110): per-ecosystem escape-root
+        // deny_flags examples are present as commented candidates, with the
+        // principle named; only make + tar are active. `cargo` demoted to a
+        // commented candidate (bug 110) — build = "make" is the active pair, so
+        // its deny_flags must be make-only; tar is the shaped archiver grant.
         assert!(
             TEMPLATE.contains("redirect the tool to operate outside the project root"),
             "deny_flags block must name the escape-root principle",
         );
         for candidate in [
+            "cargo  = [\"--manifest-path\"]",
             "npm    = [\"--prefix\"]",
             "yarn   = [\"--cwd\"]",
             "pnpm   = [\"-C\", \"--dir\"]",
@@ -571,7 +597,8 @@ mod tests {
                 "template deny_flags should list the candidate `{candidate}`",
             );
         }
-        // Only make + cargo are active in the recommended config.
+        // Only make + tar are active in the recommended config (bug 110): make
+        // for the shipped build tool, tar as the shaped archiver.
         let deny_flags = test_recommended::config()
             .deny_flags
             .expect("recommended config has deny_flags");
@@ -579,13 +606,30 @@ mod tests {
         keys.sort();
         assert_eq!(
             keys,
-            vec![&"cargo".to_string(), &"make".to_string()],
-            "only make + cargo deny_flags stay active (the shipped pair)",
+            vec![&"make".to_string(), &"tar".to_string()],
+            "only make + tar deny_flags stay active (build tool + shaped archiver)",
         );
         assert_eq!(deny_flags.get("make"), Some(&vec!["-C".to_string()]));
+        // tar's shaped denial carves out the exec/traversal levers, verified
+        // against GNU tar's docs; `-C` is deliberately absent (extraction dest).
         assert_eq!(
-            deny_flags.get("cargo"),
-            Some(&vec!["--manifest-path".to_string()]),
+            deny_flags.get("tar"),
+            Some(&vec![
+                "-P".to_string(),
+                "--absolute-names".to_string(),
+                "--to-command".to_string(),
+                "--checkpoint-action".to_string(),
+                "-I".to_string(),
+                "--use-compress-program".to_string(),
+                "-F".to_string(),
+                "--info-script".to_string(),
+                "--rmt-command".to_string(),
+                "--rsh-command".to_string(),
+            ]),
+        );
+        assert!(
+            !deny_flags["tar"].iter().any(|f| f == "-C"),
+            "tar -C must stay allowed (extraction destination, not an escape)",
         );
     }
 
@@ -604,7 +648,7 @@ mod tests {
             };
             let is_build = line.starts_with("build = \"");
             let is_deny = [
-                "npm", "yarn", "pnpm", "go", "gradle", "mvn", "just", "cmake",
+                "cargo", "npm", "yarn", "pnpm", "go", "gradle", "mvn", "just", "cmake",
             ]
             .iter()
             .any(|k| line.starts_with(&format!("{k} ")) || line.starts_with(&format!("{k}=")));
@@ -618,10 +662,11 @@ mod tests {
             );
             checked += 1;
         }
-        // Sanity: we exercised all seeded candidates (9 builds + 8 deny_flags).
+        // Sanity: we exercised all seeded candidates (9 builds + 9 deny_flags —
+        // cargo joined the deny_flags candidates in bug 110).
         assert_eq!(
-            checked, 17,
-            "expected to check all 17 commented alternatives, saw {checked}",
+            checked, 18,
+            "expected to check all 18 commented alternatives, saw {checked}",
         );
     }
 
@@ -664,6 +709,104 @@ mod tests {
                 "recommended allow should contain {cmd}",
             );
         }
+    }
+
+    #[test]
+    fn template_allows_digest_family() {
+        // bug 110: the digest tools are read-only, stdout-only, zero write
+        // vector — the same class as cat/diff — so they join `allow`.
+        let allow = test_recommended::config()
+            .allow
+            .expect("recommended config has an allow list");
+        for cmd in ["sha256sum", "sha1sum", "md5sum", "b2sum", "cksum"] {
+            assert!(
+                allow.iter().any(|c| c == cmd),
+                "recommended allow should contain the digest tool {cmd}",
+            );
+        }
+    }
+
+    #[test]
+    fn template_grants_sqlite3_with_cmd_denied() {
+        // bug 110: sqlite3 is granted (a read tool we have no alternative for,
+        // like `git log`) with `-cmd` denied — the `-cmd` carve-out closes the
+        // arbitrary-exec lever. `deny.sqlite3` must be ACTIVE (not commented).
+        let config = test_recommended::config();
+        let allow = config.allow.expect("recommended config has an allow list");
+        assert!(
+            allow.iter().any(|c| c == "sqlite3"),
+            "recommended allow should contain sqlite3",
+        );
+        let deny = config.deny.expect("recommended config has a deny table");
+        assert_eq!(
+            deny.get("sqlite3"),
+            Some(&vec!["-cmd".to_string()]),
+            "deny.sqlite3 = [\"-cmd\"] must be active in the recommendation",
+        );
+    }
+
+    #[test]
+    fn template_grants_tar_shaped_as_archiver() {
+        // bug 110: tar is granted as an archiver, not a command host — allowed
+        // to pack/unpack, its exec/traversal levers denied via deny_flags.tar
+        // (ACTIVE). `-C` stays allowed (extraction destination).
+        let config = test_recommended::config();
+        let allow = config.allow.expect("recommended config has an allow list");
+        assert!(
+            allow.iter().any(|c| c == "tar"),
+            "recommended allow should contain tar",
+        );
+        let deny_flags = config
+            .deny_flags
+            .expect("recommended config has deny_flags");
+        let tar = deny_flags
+            .get("tar")
+            .expect("deny_flags.tar must be active in the recommendation");
+        // Every shaped lever, verified against GNU tar's own docs.
+        for flag in [
+            "-P",
+            "--absolute-names",
+            "--to-command",
+            "--checkpoint-action",
+            "-I",
+            "--use-compress-program",
+            "-F",
+            "--info-script",
+            "--rmt-command",
+            "--rsh-command",
+        ] {
+            assert!(
+                tar.iter().any(|f| f == flag),
+                "deny_flags.tar should carve out {flag}",
+            );
+        }
+        assert!(
+            !tar.iter().any(|f| f == "-C"),
+            "tar -C must stay allowed (extraction destination, not an escape)",
+        );
+    }
+
+    #[test]
+    fn template_recommendation_passes_the_real_validator() {
+        // bug 110 keystone: the recommendation must not merely deserialize — it
+        // must pass the loader's actual semantic cross-reference validator
+        // (`commands::validate`). This is the gap that let a self-inconsistent
+        // template ship: `deny.sqlite3` and `deny_flags.cargo` named commands
+        // that were never granted, so the loader quarantined [commands] at load.
+        // Asserting ZERO errors here makes an inconsistent template unshippable.
+        let (errors, warnings) = crate::config::validate_commands(&test_recommended::config());
+        assert!(
+            errors.is_empty(),
+            "recommended [commands] must pass the loader's validator with no \
+             errors, got: {errors:?}",
+        );
+        // No warnings are legitimately expected from the recommendation either;
+        // pin that too so a future template change that trips a warning surfaces.
+        assert!(
+            warnings.is_empty(),
+            "recommended [commands] should raise no validator warnings, got: \
+             {warnings:?}",
+        );
     }
 
     #[test]
