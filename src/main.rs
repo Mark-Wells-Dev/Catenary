@@ -1694,6 +1694,22 @@ fn serve_daemon(
 
     let mut config = catenary_cli::config::Config::load()?;
 
+    // Section-scoped quarantine (bug 110): a semantically-invalid config section
+    // no longer aborts the boot — `Config::load` defaults it out and records it,
+    // and the daemon comes up on the valid remainder. Fire ONE desktop
+    // notification naming the quarantined section(s) and the first error, so the
+    // user learns the boot degraded. Point-blank via `notify_desktop` (not
+    // `error!()`) for the same reason the boot-refusal is: the desktop sink is
+    // not registered until `Session::new` succeeds below, so an interrupt here
+    // has no sink to ride. Exactly-once by construction — a single boot fires a
+    // single load.
+    if let Some(summary) = config.quarantined.summary() {
+        catenary_cli::notify::notify_desktop(
+            "Catenary started with a quarantined config section",
+            &format!("{summary} — run: catenary doctor"),
+        );
+    }
+
     // Materialize the JSON Schemas to a local cache path and associate them with
     // the config files at the taplo server Catenary spawns, so config edits get
     // live validation + unknown-key squiggles offline, with zero setup (misc
@@ -2221,9 +2237,10 @@ async fn run_grep(
         if let Some(stream) = connect_daemon_ipc().await {
             search_ipc_on(stream, METHOD_GREP, &request).await?
         } else {
-            let resp = catenary_cli::router::run_grep_daemon_less(&request).await?;
+            let outcome = catenary_cli::router::run_grep_daemon_less(&request).await?;
             emit_no_daemon_marker();
-            SearchResponse::from(resp)
+            emit_quarantine_marker(outcome.quarantine_warning.as_deref());
+            SearchResponse::from(outcome.response)
         }
     } else {
         SearchResponse::default()
@@ -2488,6 +2505,22 @@ fn emit_no_daemon_marker() {
     eprintln!("[no daemon \u{2014} results unenriched; start one with catenary start]");
 }
 
+/// The daemon-less config-quarantine advisory (bug 110).
+///
+/// `catenary grep`/`glob` never consume the `[commands]` section, so a config
+/// section that failed validation must only DEGRADE them, never kill them: the
+/// search runs on the valid remainder and this prints a single stderr line
+/// naming the quarantined section(s). Follows [`emit_no_daemon_marker`]'s
+/// contract — stderr only (stdout stays byte-identical), once per invocation, and
+/// never a `tracing` event (no desktop interrupt, no TUI finding). A `None`
+/// warning (clean load) prints nothing.
+#[cfg(unix)]
+fn emit_quarantine_marker(warning: Option<&str>) {
+    if let Some(warning) = warning {
+        eprintln!("[config {warning} \u{2014} run: catenary doctor]");
+    }
+}
+
 /// Sends a search request over an already-connected daemon IPC `stream` and
 /// returns the parsed [`SearchResponse`].
 ///
@@ -2664,9 +2697,10 @@ async fn run_glob(
     let response = if let Some(stream) = connect_daemon_ipc().await {
         search_ipc_on(stream, METHOD_GLOB, &request).await?
     } else {
-        let resp = catenary_cli::router::run_glob_daemon_less(&request).await?;
+        let outcome = catenary_cli::router::run_glob_daemon_less(&request).await?;
         emit_no_daemon_marker();
-        SearchResponse::from(resp)
+        emit_quarantine_marker(outcome.quarantine_warning.as_deref());
+        SearchResponse::from(outcome.response)
     };
 
     // A usage error (an invalid pattern the query never ran on) is stderr +

@@ -138,6 +138,10 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
     // duplicate extensions.
     let sources = crate::config::config_sources();
     let mut config_findings = crate::health::config_checks::validation_findings(&config);
+    // Section-scoped quarantine (bug 110): a section the load defaulted out
+    // (e.g. an invalid [commands]) surfaces here with its full error list — the
+    // doctor read of the loud degrade grep/glob/hook only summarize.
+    config_findings.extend(crate::health::config_checks::quarantine_findings(&config));
     config_findings.extend(crate::health::config_checks::unknown_key_findings(&sources));
     config_findings.extend(crate::health::config_checks::unreferenced_server_findings(
         &config,

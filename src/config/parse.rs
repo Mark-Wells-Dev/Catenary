@@ -210,21 +210,36 @@ pub fn load_from_sources(sources: &[PathBuf]) -> Result<Config> {
     for source in sources {
         let contents = std::fs::read_to_string(source)
             .with_context(|| format!("Failed to read config file: {}", source.display()))?;
-        let layer = deserialize_source(&contents)
+        // A document-level TOML parse failure (torn file, invalid syntax) is
+        // still a full refusal — quarantine (bug 110) salvages semantically-
+        // invalid SECTIONS of a syntactically-valid document, and a file that
+        // does not parse has no valid remainder to salvage.
+        let mut layer = deserialize_source(&contents)
             .with_context(|| format!("Failed to parse config file: {}", source.display()))?;
 
-        // Validate commands config per-layer (before merging destroys the raw form).
+        // Validate the [commands] section per-layer (before merging destroys the
+        // raw form). Section-scoped quarantine (bug 110): validation errors no
+        // longer abort the whole load — the section is dropped from this layer
+        // (defaulted out, never merged) and recorded on `config.quarantined`, so
+        // the load returns `Ok` on the valid remainder. Consumers of `[commands]`
+        // (the PreToolUse hook) degrade loudly; non-consumers (`grep`/`glob`) and
+        // the daemon proceed on what parsed. Warnings still trace as before.
         if let Some(ref cmds) = layer.commands {
             let (errors, warnings) = commands::validate(cmds);
-            if !errors.is_empty() {
-                bail!(
-                    "Configuration errors in {}:\n{}",
-                    source.display(),
-                    errors.join("\n"),
+            if errors.is_empty() {
+                for warning in warnings {
+                    tracing::warn!(source = %source.display(), "{warning}");
+                }
+            } else {
+                tracing::warn!(
+                    source = Source::ConfigValidation.as_str(),
+                    path = %source.display(),
+                    "[commands] quarantined ({} error(s)) — command filtering is OFF \
+                     until the config is fixed. Run `catenary doctor`.",
+                    errors.len(),
                 );
-            }
-            for warning in warnings {
-                tracing::warn!(source = %source.display(), "{warning}");
+                config.quarantined.record("commands", errors);
+                layer.commands = None;
             }
         }
 

@@ -4515,27 +4515,49 @@ fn shaped_to_string(output: ShapedOutput) -> Result<String> {
 // is the CLI's responsibility and lives on stderr only; these produce the
 // stdout body unchanged.
 
+/// A daemon-less search result paired with an optional config-degradation
+/// advisory (bug 110).
+///
+/// `grep`/`glob` never consume the `[commands]` section, so a quarantined
+/// section must only degrade *loudly*, never fatally: the search still runs on
+/// the valid config remainder, and `quarantine_warning` — when present — carries
+/// the single stderr line the CLI prints once per invocation to name the
+/// quarantined section(s). Kept off the wire [`GrepResponse`]/[`GlobResponse`]
+/// types: the advisory is a daemon-less-CLI concern, printed at the `print_stderr`
+/// boundary in `main.rs`, not part of the daemon protocol.
+#[cfg(unix)]
+pub struct DaemonlessOutcome<T> {
+    /// The search response the daemon would have built.
+    pub response: T,
+    /// A single stderr advisory naming any quarantined config section(s), or
+    /// `None` on a clean load. Printed once per CLI invocation.
+    pub quarantine_warning: Option<String>,
+}
+
 /// Runs a `catenary grep` request in-process, daemon-less (bug 80, leg 4).
 ///
 /// Builds a [`DaemonlessSearch`] from the loaded config, resolves the request
 /// with the same [`GrepRequest::to_params`] the daemon uses, and runs the grep
 /// pipeline in-process. Returns the same [`GrepResponse`] the daemon would build
-/// for a tree with no LSP coverage. `cancel` never fires (no client-disconnect
-/// race — the CLI awaits its own result).
+/// for a tree with no LSP coverage, paired with any config-quarantine advisory
+/// (bug 110) — grep never consumes `[commands]`, so a quarantined section only
+/// degrades loudly. `cancel` never fires (no client-disconnect race — the CLI
+/// awaits its own result).
 ///
 /// # Errors
 ///
 /// Returns an error if the config cannot be loaded or the grep pipeline faults.
 #[cfg(unix)]
-pub async fn run_grep_daemon_less(req: &GrepRequest) -> Result<GrepResponse> {
+pub async fn run_grep_daemon_less(req: &GrepRequest) -> Result<DaemonlessOutcome<GrepResponse>> {
     let config = crate::config::Config::load().context("load config for daemon-less grep")?;
+    let quarantine_warning = config.quarantined.summary();
     let search = crate::bridge::DaemonlessSearch::from_config(config);
 
     let params = req.to_params();
     let cancel = CancellationToken::new();
     let outcome = search.grep.execute(&params, None, &cancel).await;
 
-    Ok(match outcome {
+    let response = match outcome {
         Ok(GrepOutcome::Rendered { output, skipped }) => GrepResponse {
             output: shaped_to_string(output)?,
             matches: None,
@@ -4563,6 +4585,11 @@ pub async fn run_grep_daemon_less(req: &GrepRequest) -> Result<GrepResponse> {
             skipped: GrepSkips::default(),
             error: Some(format!("{e:#}")),
         },
+    };
+
+    Ok(DaemonlessOutcome {
+        response,
+        quarantine_warning,
     })
 }
 
@@ -4570,21 +4597,24 @@ pub async fn run_grep_daemon_less(req: &GrepRequest) -> Result<GrepResponse> {
 ///
 /// The in-process twin of the `METHOD_GLOB` daemon arm: same [`GlobRequest::to_params`],
 /// same `execute`, same zero-match index→original-spelling remap. Returns the
-/// [`GlobResponse`] the daemon would build for a tree with no LSP coverage.
+/// [`GlobResponse`] the daemon would build for a tree with no LSP coverage,
+/// paired with any config-quarantine advisory (bug 110) — glob never consumes
+/// `[commands]`, so a quarantined section only degrades loudly.
 ///
 /// # Errors
 ///
 /// Returns an error if the config cannot be loaded or the glob pipeline faults.
 #[cfg(unix)]
-pub async fn run_glob_daemon_less(req: &GlobRequest) -> Result<GlobResponse> {
+pub async fn run_glob_daemon_less(req: &GlobRequest) -> Result<DaemonlessOutcome<GlobResponse>> {
     let config = crate::config::Config::load().context("load config for daemon-less glob")?;
+    let quarantine_warning = config.quarantined.summary();
     let search = crate::bridge::DaemonlessSearch::from_config(config);
 
     let params = req.to_params();
     let cancel = CancellationToken::new();
     let outcome = search.glob.execute(&params, None, &cancel).await;
 
-    Ok(match outcome {
+    let response = match outcome {
         Ok(GlobOutcome::Rendered {
             output,
             no_match_indices,
@@ -4622,6 +4652,11 @@ pub async fn run_glob_daemon_less(req: &GlobRequest) -> Result<GlobResponse> {
             metachar_names: Vec::new(),
             error: Some(format!("{e:#}")),
         },
+    };
+
+    Ok(DaemonlessOutcome {
+        response,
+        quarantine_warning,
     })
 }
 

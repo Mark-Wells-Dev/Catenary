@@ -171,6 +171,44 @@ fn test_doctor_no_suggestions_when_config_with_commands() -> Result<()> {
     Ok(())
 }
 
+/// A config with a quarantined `[commands]` section (bug 110): doctor must raise
+/// a finding naming the section and its error(s), pointing at the fix — the
+/// doctor read of the loud degrade the grep/glob/hook only summarize.
+#[test]
+fn test_doctor_surfaces_quarantined_commands_section() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let config_dir = common::xdg_config_home(tmp.path()).join("catenary");
+    std::fs::create_dir_all(&config_dir)?;
+    // The incident shape: deny.sqlite3 references a command absent from allow.
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[commands]\nallow = [\"git\"]\n\n[commands.deny]\nsqlite3 = [\"-cmd\"]\n",
+    )?;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, tmp.path().to_str().context("tempdir path")?);
+    cmd.arg("doctor").arg("--nocolor");
+
+    let output = cmd.output().context("Failed to run catenary doctor")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Doctor booted (did not refuse on the config error — quarantine, not abort)
+    // and named the quarantined section with its error.
+    assert!(
+        stdout.contains("[commands] quarantined"),
+        "doctor must surface the quarantined [commands] section, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("sqlite3"),
+        "the finding must carry the cross-reference error, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Config error:"),
+        "a quarantined section must NOT be rendered as a fatal config error, got:\n{stdout}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_doctor_suggests_commands_when_config_exists_without_commands() -> Result<()> {
     let tmp = tempfile::tempdir()?;

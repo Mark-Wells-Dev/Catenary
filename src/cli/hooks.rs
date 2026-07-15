@@ -1155,12 +1155,38 @@ pub fn run_pre_tool(format: HostFormat) {
     // targets are attributed to the caller like edits (ws38 ticket 02).
     let mut resolved_writes: Vec<PathBuf> = Vec::new();
     if let Some(shell_cmd) = extract_shell_command(&hook_json, tool_name, format) {
-        match foreign_command_outcome(&hook_json, &shell_cmd, format) {
-            Err(reason) => {
-                print!("{}", format_deny(&reason, format));
-                return;
+        // Section-scoped quarantine (bug 110): a `[commands]` that failed
+        // validation must degrade LOUDLY, never silently. `commands_quarantine_verdict`
+        // fires the once-per-config-mtime desktop notification and decides the
+        // stance. `None` ⇒ clean config, proceed with normal enforcement.
+        if let Some(verdict) = commands_quarantine_verdict() {
+            match verdict {
+                // Fail-closed opt-in: deny this (necessarily non-catenary — regime
+                // 1 already returned for catenary commands) command with a teaching
+                // message, on every call.
+                QuarantineVerdict::Deny(reason) => {
+                    print!("{}", format_deny(&reason, format));
+                    return;
+                }
+                // Fail-open: enforcement is off; the command is allowed. On the
+                // onset, tell the agent via `additionalContext` (one line, then
+                // straight to editing-state so file tracking is unaffected). The
+                // resolver never ran, so there is no write-set to attribute.
+                QuarantineVerdict::AllowWithContext { context } => {
+                    if let Some(ctx) = context {
+                        print!("{}", format_additional_context(&ctx, "PreToolUse", format));
+                        return;
+                    }
+                }
             }
-            Ok(writes) => resolved_writes = writes,
+        } else {
+            match foreign_command_outcome(&hook_json, &shell_cmd, format) {
+                Err(reason) => {
+                    print!("{}", format_deny(&reason, format));
+                    return;
+                }
+                Ok(writes) => resolved_writes = writes,
+            }
         }
     }
 
@@ -1253,6 +1279,127 @@ fn enforce_editing_state(
 /// by [`check_command`](crate::cli::command_filter::check_command) — they run
 /// under the canonical-form matcher (regime 1), not the allowlist — but their
 /// resolver-computed write-set still flows through here.
+/// The verdict for a foreign command when `[commands]` is quarantined (bug 110).
+///
+/// The enforcement surface must degrade LOUDLY, never silently. By default the
+/// section is treated as absent (fail-open — enforcement off); the
+/// `client_enforcement_only = true` lever (recoverable best-effort from the
+/// invalid section) flips this to fail-closed: non-catenary commands are denied
+/// with a teaching message.
+enum QuarantineVerdict {
+    /// Fail-open: enforcement is off. `context` is `Some` only on the onset (the
+    /// first hook per config mtime) — the `additionalContext` line telling the
+    /// agent filtering is OFF — and `None` on every later hook, so the agent's
+    /// context is not spammed once per tool call.
+    AllowWithContext { context: Option<String> },
+    /// Fail-closed (`client_enforcement_only = true`): deny with the teaching
+    /// message naming the config error. Fires on EVERY call — a denied command
+    /// must never slip through just because the onset notification already fired.
+    Deny(String),
+}
+
+/// Reads `[commands] client_enforcement_only` best-effort from the raw config
+/// document(s), even when the `[commands]` section is otherwise invalid (bug
+/// 110).
+///
+/// The parsed [`ResolvedCommands`](crate::config::ResolvedCommands) is gone once
+/// `[commands]` is quarantined, so the fail-closed opt-in is recovered by
+/// re-reading the raw TOML: the last source that sets the boolean wins (mirroring
+/// the layered merge). A file that fails to read or parse contributes nothing.
+fn raw_client_enforcement_only() -> bool {
+    let mut flag = false;
+    for source in crate::config::config_sources() {
+        let Ok(contents) = std::fs::read_to_string(&source) else {
+            continue;
+        };
+        let Ok(raw) = toml::from_str::<toml::Value>(&contents) else {
+            continue;
+        };
+        if let Some(value) = raw
+            .get("commands")
+            .and_then(|c| c.get("client_enforcement_only"))
+            .and_then(toml::Value::as_bool)
+        {
+            flag = value;
+        }
+    }
+    flag
+}
+
+/// Whether this hook is the onset for the current config mtime, firing the
+/// once-per-config-mtime desktop notification as a side effect (bug 110).
+///
+/// The `PreToolUse` hook is one short-lived process per tool call, so the
+/// interrupt is deduped across invocations by a [`QuarantineStamp`](crate::notify::QuarantineStamp)
+/// keyed to the config file's mtime — the first hook after the config broke fires
+/// one notification; later hooks against the same config stay silent. Returns
+/// `true` on that onset so the caller also emits the agent-facing
+/// `additionalContext` once, not per call. The loudest honest channel the hook
+/// process has: its tracing subscriber only fires desktop notifications at
+/// `error!()` severity (and an `error!()` here would re-fire on every process,
+/// its per-process debounce useless across hooks), so the notification goes
+/// point-blank through [`notify_desktop`](crate::notify::notify_desktop), which
+/// respects `CATENARY_NOTIFY` and records intent under `CATENARY_NOTIFY_LOG`.
+fn commands_quarantine_onset(summary: &str) -> bool {
+    let Some(config_path) = crate::config::config_sources().into_iter().next() else {
+        // No config file to key the stamp to — treat every sighting as an onset
+        // (a lost warning about broken enforcement is worse than a duplicate).
+        crate::notify::notify_desktop(
+            "Catenary command filtering is OFF",
+            &format!("{summary} — run: catenary doctor"),
+        );
+        return true;
+    };
+    if crate::notify::QuarantineStamp::new().should_notify(&config_path) {
+        crate::notify::notify_desktop(
+            "Catenary command filtering is OFF",
+            &format!("{summary} — run: catenary doctor"),
+        );
+        return true;
+    }
+    false
+}
+
+/// Resolve the quarantine verdict for a foreign shell command, firing the
+/// once-per-mtime desktop notification as a side effect (bug 110).
+///
+/// Returns `None` when `[commands]` loaded cleanly — the caller proceeds with
+/// normal enforcement. `Some(verdict)` when the section is quarantined: either
+/// fail-open (allow, with an onset-gated `additionalContext` warning) or
+/// fail-closed (deny, per the `client_enforcement_only` opt-in). A config that
+/// fails to LOAD entirely (document-fatal) is not a quarantine — `None`, and the
+/// existing fail-open path in [`check_shell_command`] handles it.
+fn commands_quarantine_verdict() -> Option<QuarantineVerdict> {
+    let config = crate::config::Config::load().ok()?;
+    let section = config.quarantined.section("commands")?;
+    let error = section.first_error().to_string();
+    let summary = config
+        .quarantined
+        .summary()
+        .unwrap_or_else(|| format!("[commands] quarantined: {error}"));
+
+    let onset = commands_quarantine_onset(&summary);
+
+    if raw_client_enforcement_only() {
+        // Fail-closed opt-in: the lever doubles as "deny when broken". Deny on
+        // every call, not just the onset.
+        Some(QuarantineVerdict::Deny(format!(
+            "Catenary command filtering could not load: {error}. \
+             `client_enforcement_only = true` is set, so commands are DENIED until the \
+             config is fixed. Run `catenary doctor`.",
+        )))
+    } else {
+        // Fail-open: enforcement is off. Tell the agent so, but only on the onset.
+        let context = onset.then(|| {
+            format!(
+                "[commands] quarantined: {error}. Command filtering is OFF until the \
+                 config is fixed — catenary doctor",
+            )
+        });
+        Some(QuarantineVerdict::AllowWithContext { context })
+    }
+}
+
 fn foreign_command_outcome(
     hook_json: &serde_json::Value,
     shell_cmd: &str,

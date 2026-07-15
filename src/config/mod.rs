@@ -8,6 +8,7 @@ mod linter;
 pub(crate) mod merge;
 pub mod mutate;
 mod parse;
+pub mod quarantine;
 pub mod schema;
 mod server;
 pub(crate) mod validate;
@@ -37,6 +38,7 @@ pub use parse::{
     DEFAULT_LINTERS, DEFAULT_SERVERS, MIGRATION_GUIDANCE_POINTER, ProjectConfig, SERVER_DEF_KEYS,
     config_sources, default_server_names, load_project_config,
 };
+pub use quarantine::{Quarantine, QuarantinedSection};
 pub use server::ServerDef;
 pub use weights::{BASELINE_WEIGHT, DiagnosticWeights};
 
@@ -216,6 +218,17 @@ pub struct Config {
     /// `[linter.rule.*]` — see
     /// [`LspClientManager::effective_linters`](crate::lsp::LspClientManager::effective_linters).
     pub linter: HashMap<String, LinterConfig>,
+
+    /// Config sections quarantined during load (bug 110).
+    ///
+    /// A section that failed semantic validation is defaulted out of this
+    /// `Config` and recorded here with its errors, so the load returns `Ok` on
+    /// the valid remainder instead of aborting. Empty on a clean load. Every
+    /// surface reads the same record: the daemon fires one boot notification,
+    /// `grep`/`glob` print one stderr advisory, the `PreToolUse` hook degrades
+    /// loudly, and `catenary doctor` raises a finding. A document-level TOML
+    /// parse failure is never quarantined — it stays a full load error.
+    pub quarantined: quarantine::Quarantine,
 }
 
 /// Icon preset selecting a base set of icons.
@@ -483,6 +496,7 @@ impl Default for Config {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: quarantine::Quarantine::new(),
         }
     }
 }
@@ -2559,8 +2573,13 @@ client_enforcement_only = true
         Ok(())
     }
 
+    /// Bug 110: a `[commands]` validation error no longer aborts the load — the
+    /// section is QUARANTINED (defaulted out, its error recorded) and the load
+    /// succeeds on the valid remainder. The `commands::validate` unit tests still
+    /// pin that the error itself is generated; these loader tests pin the new
+    /// quarantine disposition.
     #[test]
-    fn commands_client_enforcement_only_with_allow_rejected() {
+    fn commands_client_enforcement_only_with_allow_quarantined() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         fs::write(
@@ -2573,17 +2592,26 @@ allow = ["git"]
         )
         .expect("write config");
 
-        let result = Config::load_from_sources(&[path]);
-        assert!(result.is_err());
-        let err = format!("{:#}", result.expect_err("should error"));
+        let config = Config::load_from_sources(&[path]).expect("load succeeds via quarantine");
+        assert!(config.quarantined.contains("commands"));
+        assert!(
+            config.resolved_commands.is_none(),
+            "the quarantined section is defaulted out"
+        );
+        let err = config
+            .quarantined
+            .section("commands")
+            .expect("commands quarantined")
+            .errors
+            .join(" | ");
         assert!(
             err.contains("client_enforcement_only"),
-            "error should mention client_enforcement_only: {err}",
+            "recorded error should mention client_enforcement_only: {err}",
         );
     }
 
     #[test]
-    fn commands_allow_pipeline_overlap_rejected() {
+    fn commands_allow_pipeline_overlap_quarantined() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         fs::write(
@@ -2596,17 +2624,22 @@ pipeline = ["grep"]
         )
         .expect("write config");
 
-        let result = Config::load_from_sources(&[path]);
-        assert!(result.is_err());
-        let err = format!("{:#}", result.expect_err("should error"));
+        let config = Config::load_from_sources(&[path]).expect("load succeeds via quarantine");
+        assert!(config.quarantined.contains("commands"));
+        let err = config
+            .quarantined
+            .section("commands")
+            .expect("commands quarantined")
+            .errors
+            .join(" | ");
         assert!(
             err.contains("grep") && err.contains("allow") && err.contains("pipeline"),
-            "error should mention grep in both lists: {err}",
+            "recorded error should mention grep in both lists: {err}",
         );
     }
 
     #[test]
-    fn commands_deny_not_in_allow_rejected() {
+    fn commands_deny_not_in_allow_quarantined() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         fs::write(
@@ -2621,12 +2654,17 @@ sqlite3 = ["-cmd"]
         )
         .expect("write config");
 
-        let result = Config::load_from_sources(&[path]);
-        assert!(result.is_err());
-        let err = format!("{:#}", result.expect_err("should error"));
+        let config = Config::load_from_sources(&[path]).expect("load succeeds via quarantine");
+        assert!(config.quarantined.contains("commands"));
+        let err = config
+            .quarantined
+            .section("commands")
+            .expect("commands quarantined")
+            .errors
+            .join(" | ");
         assert!(
             err.contains("sqlite3") && err.contains("not in `allow`"),
-            "error should mention sqlite3 not in allow: {err}",
+            "recorded error should mention sqlite3 not in allow: {err}",
         );
     }
 
@@ -3065,5 +3103,184 @@ servers = ["nonexistent"]
         );
 
         Ok(())
+    }
+
+    // ── Section-scoped [commands] quarantine (bug 110) ───────────────
+
+    /// The EXACT incident config shape: `[commands]` with two cross-reference
+    /// errors — `deny.sqlite3` and `deny_flags.cargo`, both referencing commands
+    /// absent from `allow`/`pipeline`/`build`. The load must SUCCEED (not bail),
+    /// `[commands]` is quarantined and defaulted out (`resolved_commands` is
+    /// `None`), and the quarantine record carries both errors.
+    #[test]
+    fn incident_commands_shape_quarantines_not_aborts() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[commands]\n\
+             allow = [\"git\"]\n\n\
+             [commands.deny]\n\
+             sqlite3 = [\"-cmd\"]\n\n\
+             [commands.deny_flags]\n\
+             cargo = [\"--offline\"]\n",
+        )?;
+
+        // The load succeeds on the valid remainder — no bail.
+        let config = Config::load_from_sources(&[path])?;
+
+        assert!(
+            config.quarantined.contains("commands"),
+            "[commands] must be quarantined"
+        );
+        assert!(
+            config.resolved_commands.is_none(),
+            "the quarantined [commands] must be defaulted out — no resolved_commands"
+        );
+
+        let section = config
+            .quarantined
+            .section("commands")
+            .expect("commands quarantined");
+        let joined = section.errors.join(" | ");
+        assert!(
+            joined.contains("sqlite3"),
+            "the deny.sqlite3 cross-ref error must be recorded: {joined}"
+        );
+        assert!(
+            joined.contains("cargo"),
+            "the deny_flags.cargo cross-ref error must be recorded: {joined}"
+        );
+
+        Ok(())
+    }
+
+    /// A config whose ONLY invalid section is `[commands]` still loads every
+    /// other section normally — the valid remainder is unaffected by the
+    /// quarantine.
+    #[test]
+    fn valid_sections_load_unaffected_by_commands_quarantine() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "log_retention_days = 14\n\n\
+             [notifications]\ndesktop = false\n\n\
+             [lsp.language.rust]\nservers = [\"rust-analyzer\"]\n\n\
+             [commands]\nallow = [\"git\"]\n\n\
+             [commands.deny]\nsqlite3 = [\"-cmd\"]\n",
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+
+        assert!(config.quarantined.contains("commands"));
+        // The rest of the document loaded normally.
+        assert_eq!(config.log_retention_days, 14);
+        assert_eq!(
+            config.notifications.expect("notifications loaded").desktop,
+            Some(false),
+        );
+        assert!(config.language.contains_key("rust"));
+
+        Ok(())
+    }
+
+    /// A fully-valid `[commands]` is NOT quarantined and resolves normally — the
+    /// quarantine path never fires on a clean section.
+    #[test]
+    fn valid_commands_is_not_quarantined() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[commands]\nallow = [\"git\"]\n\n[commands.deny]\ngit = [\"push\"]\n",
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        assert!(
+            config.quarantined.is_empty(),
+            "a valid [commands] must not be quarantined"
+        );
+        assert!(
+            config.resolved_commands.is_some(),
+            "a valid [commands] resolves normally"
+        );
+
+        Ok(())
+    }
+
+    /// Torn / invalid TOML is NEVER quarantined — a document that does not parse
+    /// has no valid remainder, so it stays a full load error (bug 111's refusal
+    /// path is preserved).
+    #[test]
+    fn torn_toml_still_fully_refuses() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "this is = = not valid toml\n").expect("write config");
+
+        let result = Config::load_from_sources(&[path]);
+        assert!(
+            result.is_err(),
+            "a torn TOML document must fully refuse, not quarantine"
+        );
+    }
+
+    /// `client_enforcement_only` is recoverable best-effort from an otherwise
+    /// invalid `[commands]` section by re-reading the raw document — the hook
+    /// reads it this way to honour the fail-closed opt-in. This pins that the raw
+    /// value survives even when the section is quarantined.
+    #[test]
+    fn client_enforcement_only_recoverable_from_invalid_section() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        // `client_enforcement_only = true` alongside enforcement fields is itself
+        // a validation error (contradictory) — so the section is quarantined, yet
+        // the raw boolean is still readable from the document.
+        fs::write(
+            &path,
+            "[commands]\n\
+             client_enforcement_only = true\n\
+             allow = [\"git\"]\n",
+        )?;
+
+        // The section is quarantined (contradictory config).
+        let config = Config::load_from_sources(std::slice::from_ref(&path))?;
+        assert!(config.quarantined.contains("commands"));
+
+        // Best-effort raw read recovers the opt-in even from the invalid section.
+        let raw: toml::Value =
+            toml::from_str(&fs::read_to_string(&path)?).expect("document parses");
+        let flag = raw
+            .get("commands")
+            .and_then(|c| c.get("client_enforcement_only"))
+            .and_then(toml::Value::as_bool);
+        assert_eq!(
+            flag,
+            Some(true),
+            "client_enforcement_only must be recoverable best-effort from the raw section"
+        );
+
+        Ok(())
+    }
+
+    /// The general server/language/linter validation stays FATAL — those are
+    /// entangled (a bad server ref poisons routing), so a broken `[lsp.*]` is not
+    /// quarantined but aborts the load (spec's judgment call, flagged in the
+    /// ticket report).
+    #[test]
+    fn broken_server_ref_stays_fatal_not_quarantined() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[lsp.language.rust]\nservers = [\"nonexistent-server\"]\n",
+        )
+        .expect("write config");
+
+        let result = Config::load_from_sources(&[path]);
+        assert!(
+            result.is_err(),
+            "an undefined server reference stays a fatal load error, not a quarantine"
+        );
     }
 }

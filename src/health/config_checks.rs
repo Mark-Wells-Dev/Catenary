@@ -283,6 +283,40 @@ pub fn validation_findings(config: &Config) -> Vec<Finding> {
         .collect()
 }
 
+/// Quarantined-section findings (bug 110).
+///
+/// A config section that failed validation was defaulted out so the load
+/// succeeded on the valid remainder; each such section produces one
+/// [`Severity::Error`] finding naming the section and its error(s), with a fix-it
+/// pointing the user at the fix. This is the doctor surface for the loud degrade:
+/// `grep`/`glob` warn on stderr and the daemon fires one notification at boot,
+/// but doctor is where the user reads the full error list.
+#[must_use]
+pub fn quarantine_findings(config: &Config) -> Vec<Finding> {
+    config
+        .quarantined
+        .sections()
+        .iter()
+        .map(|section| {
+            let errors = section.errors.join("; ");
+            Finding::new(
+                FindingCode::ConfigSectionQuarantined,
+                Severity::Error,
+                format!(
+                    "[{}] quarantined — the section failed validation and was disabled: {errors}",
+                    section.section,
+                ),
+            )
+            .with_fix_it(format!(
+                "Fix the errors above in [{}] to restore it. Until then its consumers \
+                 degrade: for [commands], command filtering is OFF (or fails closed if \
+                 `client_enforcement_only = true`).",
+                section.section,
+            ))
+        })
+        .collect()
+}
+
 /// Missing persisted-pin findings (misc 175).
 ///
 /// Each `[roots] pinned` entry whose path is absent on disk (deleted repo,

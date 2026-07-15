@@ -3558,6 +3558,7 @@ mod tests {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
         }
     }
 
@@ -3634,6 +3635,7 @@ mod tests {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
         })
     }
 
@@ -3677,6 +3679,7 @@ mod tests {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
         });
         (config, default_name, alt_name)
     }
@@ -3713,6 +3716,7 @@ mod tests {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
         })
     }
 
@@ -3758,6 +3762,7 @@ mod tests {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
         })
     }
 
@@ -3803,6 +3808,7 @@ mod tests {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
         })
     }
 
@@ -3851,6 +3857,7 @@ mod tests {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
         })
     }
 
@@ -4115,6 +4122,7 @@ mod tests {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -4607,6 +4615,7 @@ mod tests {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
         });
 
         let fs = test_fs_with_roots(&[
@@ -5111,6 +5120,7 @@ mod tests {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -5170,6 +5180,7 @@ mod tests {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -5228,6 +5239,7 @@ mod tests {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -5651,6 +5663,7 @@ mod tests {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
         });
 
         let manager = LspClientManager::new(config, test_logging(), test_fs_with_roots(&["/tmp"]));
@@ -7208,6 +7221,7 @@ mod tests {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
         })
     }
 
@@ -7248,6 +7262,7 @@ mod tests {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
         })
     }
 
@@ -8067,6 +8082,7 @@ mod tests {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
         })
     }
 
@@ -8565,6 +8581,7 @@ mod tests {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
         })
     }
 
@@ -8602,6 +8619,7 @@ mod tests {
             roots: None,
             registry: None,
             linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
         })
     }
 

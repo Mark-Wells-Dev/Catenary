@@ -130,6 +130,10 @@ pub enum FindingCode {
     ConfigLanguageInlinesServer,
     /// A `[commands]` entry using a removed denylist-era field.
     ConfigLegacyCommandsField,
+    /// A config section that failed validation and was quarantined — defaulted
+    /// out so the load succeeds on the valid remainder (bug 110). Its consumers
+    /// degrade; the fix restores them.
+    ConfigSectionQuarantined,
     /// A config key no Catenary schema defines (misc 131).
     ConfigUnknownKey,
     /// A `[roots] pinned` entry whose path is missing on disk — kept in the
@@ -215,6 +219,7 @@ impl FindingCode {
             Self::ConfigLanguageInherit => "config-language-inherit",
             Self::ConfigLanguageInlinesServer => "config-language-inlines-server",
             Self::ConfigLegacyCommandsField => "config-legacy-commands-field",
+            Self::ConfigSectionQuarantined => "config-section-quarantined",
             Self::ConfigUnknownKey => "config-unknown-key",
             Self::ConfigPinnedRootMissing => "config-pinned-root-missing",
             Self::ConfigValidationError => "config-validation-error",

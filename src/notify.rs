@@ -352,6 +352,136 @@ impl Default for UnreachableStamp {
     }
 }
 
+/// Cross-process onset dedup for the "config section quarantined" hook interrupt
+/// (bug 110), twinning [`UnreachableStamp`].
+///
+/// When the `PreToolUse` hook loads a config with a quarantined `[commands]`
+/// section it must degrade LOUDLY — but the hook is one short-lived process per
+/// tool call, so an in-process debounce cannot span invocations. Without a
+/// cross-process stamp, every tool call in a session would fire the same
+/// quarantine interrupt (the exact storm bug 111 taught us to avoid). This stamp
+/// keys the dedup to the **config file's mtime**: the first hook after an edit to
+/// the config fires one desktop notification; every later hook against the same
+/// unchanged config stays silent. Editing the config (fixing or re-breaking it)
+/// mints a new mtime, which is a fresh onset that earns its own single interrupt.
+///
+/// Lives under the ephemeral `runtime_dir` tier, like [`UnreachableStamp`] — a
+/// "notified already" flag that must not survive a reboot. Content is the config
+/// path folded with its mtime (see [`config_mtime_identity`]).
+pub struct QuarantineStamp {
+    path: PathBuf,
+}
+
+impl QuarantineStamp {
+    /// The marker's location:
+    /// `<runtime_dir>/catenary/commands-quarantine.stamp`.
+    #[must_use]
+    fn default_path() -> PathBuf {
+        crate::paths::runtime_dir()
+            .join("catenary")
+            .join("commands-quarantine.stamp")
+    }
+
+    /// A stamp at the default `runtime_dir` location.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            path: Self::default_path(),
+        }
+    }
+
+    /// A stamp at an explicit path (tests isolate it under a tempdir).
+    #[must_use]
+    pub const fn at(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Decide whether a quarantine sighting for the config at `config_path`
+    /// should fire a fresh interrupt, stamping the config's mtime identity when
+    /// it should.
+    ///
+    /// Returns `true` exactly once per config-mtime onset: the first hook that
+    /// observes a given `(path, mtime)` returns `true` and records it; every
+    /// later hook that observes the same identity returns `false`. A `config_path`
+    /// with no metadata (already gone) returns `true` — a quarantine we cannot
+    /// pin to an mtime errs toward notifying, since a lost warning about broken
+    /// enforcement is worse than a duplicate one.
+    #[must_use]
+    pub fn should_notify(&self, config_path: &Path) -> bool {
+        let Some(identity) = config_mtime_identity(config_path) else {
+            return true;
+        };
+        if self.matches(&identity) {
+            return false;
+        }
+        self.write(&identity);
+        true
+    }
+
+    /// Whether the stamp on disk records `identity`.
+    fn matches(&self, identity: &str) -> bool {
+        std::fs::read_to_string(&self.path).is_ok_and(|s| s.trim() == identity)
+    }
+
+    /// Atomically write `identity` into the stamp (rename-over), so a concurrent
+    /// reader never observes a torn marker. Best-effort.
+    fn write(&self, identity: &str) {
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut tmp = self.path.as_os_str().to_os_string();
+        tmp.push(format!(".tmp.{}", std::process::id()));
+        let tmp = PathBuf::from(tmp);
+        if std::fs::write(&tmp, identity).is_ok() && std::fs::rename(&tmp, &self.path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// Clear the stamp, so the next quarantine onset notifies fresh.
+    ///
+    /// Best-effort — a missing stamp is already the cleared state.
+    pub fn clear(&self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+impl Default for QuarantineStamp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A config file's mtime identity as a stable string, or `None` when the file
+/// has no metadata (already gone).
+///
+/// Keyed on `(path, mtime)` so an edit to the config — the moment a user fixes
+/// or re-breaks it — is a distinct identity that re-arms the one-shot quarantine
+/// notification. The full mtime (seconds and nanoseconds) discriminates edits
+/// within a second.
+fn config_mtime_identity(config_path: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(config_path).ok()?;
+        Some(format!(
+            "{}:{}.{}",
+            config_path.display(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let meta = std::fs::metadata(config_path).ok()?;
+        let modified = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(format!("{}:{}", config_path.display(), modified.as_nanos()))
+    }
+}
+
 /// The stranded socket's filesystem identity as a stable string, or `None` when
 /// the socket has no metadata (already gone).
 ///
@@ -623,5 +753,67 @@ mod tests {
         // Clearing a never-written stamp is a no-op, not an error.
         stamp.clear();
         stamp.clear();
+    }
+
+    // ── QuarantineStamp: the config-mtime one-shot (bug 110) ─────────
+
+    #[test]
+    fn quarantine_stamp_first_notify_then_suppresses_same_mtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "broken").expect("write config");
+        let stamp = QuarantineStamp::at(dir.path().join("q-stamp"));
+
+        // First hook sees the quarantine: fire.
+        assert!(
+            stamp.should_notify(&config),
+            "first quarantine sighting must notify"
+        );
+        // Every later hook against the same unchanged config: silent.
+        assert!(
+            !stamp.should_notify(&config),
+            "same config mtime must stay silent"
+        );
+        assert!(
+            !stamp.should_notify(&config),
+            "still silent on every later hook"
+        );
+    }
+
+    #[test]
+    fn quarantine_stamp_config_edit_re_notifies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "broken").expect("write config");
+        let stamp = QuarantineStamp::at(dir.path().join("q-stamp"));
+
+        assert!(stamp.should_notify(&config), "first onset notifies");
+        assert!(!stamp.should_notify(&config), "same onset silent");
+
+        // An edit to the config mints a new mtime — a fresh onset. Pin the mtime
+        // deterministically so the change does not depend on the write landing in
+        // a different clock tick.
+        std::fs::write(&config, "still broken, differently").expect("re-write config");
+        filetime::set_file_mtime(&config, filetime::FileTime::from_unix_time(2_000_000, 0))
+            .expect("pin config mtime");
+
+        assert!(
+            stamp.should_notify(&config),
+            "a new config mtime is a fresh onset that re-notifies"
+        );
+    }
+
+    #[test]
+    fn quarantine_stamp_missing_config_errs_toward_notifying() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stamp = QuarantineStamp::at(dir.path().join("q-stamp"));
+        let absent = dir.path().join("nonexistent.toml");
+
+        // A quarantine we cannot pin to an mtime still fires — a lost warning
+        // about broken enforcement is worse than a duplicate one.
+        assert!(
+            stamp.should_notify(&absent),
+            "a config with no mtime errs toward notifying"
+        );
     }
 }
