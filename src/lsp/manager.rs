@@ -271,6 +271,30 @@ fn dir_has_marker(dir: &Path, markers: &[String], compiled_markers: &[LspGlob]) 
 /// restarts or the root is retired and remounted (both reset the ledger).
 const MAX_SERVER_STRIKES: u8 = 3;
 
+/// Upper bound on how long a `grep`/`glob` query waits for server
+/// spawn/settle before it serves its results UNENRICHED (misc 197 stage 1).
+///
+/// The query enrichment path ([`LspClientManager::ensure_and_wait_for_paths`])
+/// can block unboundedly: a freshly-spawned or busy server sits in
+/// `Initializing`/`Pending`/`Busy`, and [`LspClient::wait_ready`] loops on its
+/// `state_notify` with no ceiling. Under a wedged/busy settle that turns a
+/// query silent — the caller sees nothing until the server happens to drain.
+///
+/// Decision 025's additive doctrine: enrichment rides along where available,
+/// but the ripgrep/readdir results are complete on their own and must never be
+/// held hostage to it. So the *wait* is bounded, not the search. Past the
+/// bound the query proceeds with whatever servers are ready; unenriched files
+/// fall through the existing degraded-enrichment arm (grep's `#?`
+/// could-not-enrich anchor, glob's missing outline) — no new output shape.
+///
+/// The value is generous by design (a few seconds, not milliseconds): a cold
+/// rust-analyzer settle is normal and worth waiting for, so the bound must not
+/// clip healthy enrichment. Five seconds sits above a warm server's ready
+/// latency yet well under the host harness's slow-command auto-background
+/// threshold — long enough that a normal settle enriches, short enough that a
+/// wedged one never goes silent.
+pub(crate) const QUERY_ENRICHMENT_BUDGET: Duration = Duration::from_secs(5);
+
 /// One instance's standing on the strike ledger (misc 167).
 ///
 /// `+1` per failure observation (a crash while up, a revive spawn failure, a
@@ -1645,6 +1669,36 @@ impl LspClientManager {
         self.ensure_clients_for_paths(paths).await;
         for path in paths {
             self.wait_ready_for_path(path).await;
+        }
+    }
+
+    /// [`ensure_and_wait_for_paths`](Self::ensure_and_wait_for_paths) bounded by
+    /// `budget` — the query-path variant (misc 197 stage 1).
+    ///
+    /// `grep`/`glob` enrichment must never go silent under a wedged/busy
+    /// settle or a slow spawn. The WHOLE ensure — the cold-spawn/`initialize`
+    /// handshake AND the per-path readiness wait — is raced against `budget`.
+    /// On timeout the call returns and the query proceeds with whatever servers
+    /// are ready: the results are already complete (ripgrep/readdir produced
+    /// them), only enrichment degrades — an un-ready file falls through the
+    /// existing could-not-enrich arm (grep's `#?` anchor, glob's missing
+    /// outline).
+    ///
+    /// Bounding the spawn leg too is safe: a dropped cold-spawn future clears
+    /// its marker via the [`SpawnMarkerGuard`] (misc 191), so a later query
+    /// retries the handshake fresh rather than finding a wedged key. The trip is
+    /// a `debug` breadcrumb, not a `warn!`/`error!`: a slow settle/spawn is
+    /// expected, not an actionable break, and the degradation already shows in
+    /// the receipt.
+    pub async fn ensure_and_wait_for_paths_bounded(&self, paths: &[PathBuf], budget: Duration) {
+        let ensure = self.ensure_and_wait_for_paths(paths);
+        if tokio::time::timeout(budget, ensure).await.is_err() {
+            debug!(
+                source = Source::LspLifecycle.as_str(),
+                budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+                paths = paths.len(),
+                "query enrichment ensure hit its bound — serving results unenriched (misc 197)",
+            );
         }
     }
 

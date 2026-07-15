@@ -930,6 +930,145 @@ impl SearchLimiter {
     }
 }
 
+/// Same-identity diagnose admission control (misc 197 stage 1).
+///
+/// The host harness auto-backgrounds a slow `catenary diagnostics` and retries
+/// it; each retry opens a fresh daemon connection, so N concurrent rounds can
+/// stack for ONE agent. Left unbounded they all fan out to the shared LSP pool
+/// at once, and — as the beta sighting showed — the whole daemon can go quiet
+/// for an extended stretch. This registry admits one round per editing identity
+/// at a time: a second same-identity round waits for the in-flight one to
+/// finish, then runs its own (with a one-line note), rather than stacking a
+/// concurrent execution.
+///
+/// It is the misc-191 in-flight-marker shape (`Mutex<HashMap<Key, Arc<Notify>>>`
+/// with an RAII guard) transplanted from the cold-spawn seat to the diagnose
+/// seat, keyed by the editing identity string (`session_id\0agent_id`, via
+/// [`crate::bridge::editing_manager::editing_key`]). Same-identity rounds
+/// serialize; DIFFERENT identities never collide (distinct keys), so today's
+/// cross-identity behavior is untouched — the redesign that adds cross-identity
+/// denial later reworks the *key*, not this admission mechanism.
+///
+/// Cloneable: the `Arc` inner map is shared across every hook-connection handler
+/// (each connection gets a `HookDispatchContext` clone).
+#[cfg(unix)]
+#[derive(Clone, Default)]
+struct DiagRoundRegistry {
+    /// One `Notify` per editing identity with a round in flight. Present ⇒ a
+    /// round is executing under that key; absent ⇒ the seat is free. Waiters
+    /// clone the `Notify` under the lock and await it; the owner's guard-drop
+    /// removes the key and wakes them (they then re-check and claim the seat).
+    in_flight: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+}
+
+#[cfg(unix)]
+impl DiagRoundRegistry {
+    /// Claims the round seat for `key`, or waits for the in-flight round to
+    /// finish and then claims it — returning a guard whose `Drop` frees the
+    /// seat and wakes the next waiter. The `bool` is `true` when this caller
+    /// waited on an in-flight round (it followed another), so the dispatch can
+    /// prepend the "another diagnose was in flight" note to its receipt.
+    ///
+    /// Serialization is the deliberate choice over mid-flight joining: each
+    /// caller may name a different file set (a scoped pull vs a bare drain) and
+    /// owns its own delivery-flag flip and socket write, so a shared single
+    /// result cannot serve both. Waiting-then-running keeps every round's
+    /// semantics intact while still admitting exactly one at a time.
+    async fn claim(&self, key: &str) -> (DiagRoundGuard<'_>, bool) {
+        let mut waited = false;
+        loop {
+            // Get-or-create the marker atomically under the std lock (the
+            // misc-191 spawn-marker claim idiom): `or_insert_with` returns the
+            // marker already present, or inserts and returns ours. Comparing
+            // `Arc` identity tells claim (we inserted) from wait (someone else's
+            // was already there) — and the same lock hold gives the wake-safety
+            // discipline: the owner cannot notify until it takes this lock to
+            // remove the key, so a waiter that clones under the lock is
+            // guaranteed to catch the coming wake.
+            let ours = Arc::new(tokio::sync::Notify::new());
+            let marker = self
+                .in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(key.to_string())
+                .or_insert_with(|| ours.clone())
+                .clone();
+            if Arc::ptr_eq(&marker, &ours) {
+                // We claimed the seat.
+                return (
+                    DiagRoundGuard {
+                        in_flight: &self.in_flight,
+                        key: key.to_string(),
+                        notify: ours,
+                    },
+                    waited,
+                );
+            }
+            // A round is already in flight under this key. Arm the notified
+            // future, then re-check under the lock so a wake between the clone
+            // and the wait cannot be missed; if the key is already gone, loop
+            // straight back to re-claim.
+            let notified = marker.notified();
+            tokio::pin!(notified);
+            let still_pending = {
+                let map = self
+                    .in_flight
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if map.contains_key(key) {
+                    notified.as_mut().enable();
+                    true
+                } else {
+                    false
+                }
+            };
+            if still_pending {
+                waited = true;
+                notified.await;
+            }
+        }
+    }
+}
+
+/// RAII lifetime for an in-flight diagnose round (misc 197 stage 1).
+///
+/// Mirrors the misc-191 [`SpawnMarkerGuard`](crate::lsp) shape: the round owner
+/// holds one across the whole `process_files_batched` pipeline. On `Drop` —
+/// completion, an early return, or a cancelled/dropped future — it removes the
+/// key from the registry and wakes every waiter. Binding the seat's release to
+/// the future's lifetime is the failure semantics: a panicking or abandoned
+/// round can never wedge the key, so an unstable pipeline never locks a caller
+/// out (the same doctrine as the diagnostics debt drop on daemon death, bug 79).
+#[cfg(unix)]
+struct DiagRoundGuard<'a> {
+    in_flight: &'a std::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+    key: String,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(unix)]
+impl Drop for DiagRoundGuard<'_> {
+    fn drop(&mut self) {
+        // Tiny sync section: remove the seat, then wake waiters. Never held
+        // across an await.
+        self.in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+        self.notify.notify_waiters();
+    }
+}
+
+/// The one-line note a diagnose receipt carries when its round followed another
+/// same-identity round rather than running concurrently (misc 197 stage 1).
+///
+/// Prepended as the receipt's first line so the caller can tell "the gate held
+/// because another of my own rounds was working" from "the gate is silent". It
+/// is a result annotation, not a `warn!`/`error!`: overlapping rounds are the
+/// host harness's auto-background retry, expected, not an actionable break.
+#[cfg(unix)]
+const DIAG_FOLLOWED_NOTE: &str = "another diagnose was in flight; this run followed it";
+
 /// Shared context for session-aware hook dispatch.
 ///
 /// When set on [`SessionManager`], hook connections are routed to
@@ -971,6 +1110,11 @@ struct HookDispatchContext {
     /// 1-permit semaphore: each [`HandoffKey`] serializes independently, so a
     /// staged `diagnostics` handoff never stalls another session daemon-wide.
     handoff: KeyedHandoff,
+    /// Same-identity diagnose admission control (misc 197 stage 1). Admits one
+    /// `catenary diagnostics` round per editing identity at a time so the host
+    /// harness's auto-background retries can never stack N concurrent rounds for
+    /// one agent. Different identities never collide.
+    diag_rounds: DiagRoundRegistry,
     /// Per-root idle clock for activity-mounted ephemeral roots (ephemeral-roots
     /// ticket 02). A CLI query touching a path outside every mounted root mounts
     /// its enclosing project root under an `ephemeral:*` contributor and records
@@ -2939,6 +3083,7 @@ impl SessionManager {
             root_tracker: Some(root_tracker),
             editing_guardrail: Arc::new(EditingGuardrail::new()),
             handoff: KeyedHandoff::new(),
+            diag_rounds: DiagRoundRegistry::default(),
             worktree_watcher,
             ephemeral_mounts,
             first_sightings: FirstSightings::new(),
@@ -5945,6 +6090,27 @@ async fn handle_hook_dispatch(
                 if let Some(s) = &board_session {
                     s.set_diagnostics_in_flight(true);
                 }
+                // Same-identity join (misc 197 stage 1): admit one round per
+                // editing identity at a time. The host harness auto-backgrounds a
+                // slow `catenary diagnostics` and retries it, stacking a fresh
+                // concurrent round per retry; left unbounded they all fan out to
+                // the shared LSP pool at once. A round whose identity already has
+                // one in flight WAITS for it here, then runs its own — never a
+                // second concurrent execution. Only identity-bearing rounds
+                // (`doc_owner` = the hooked `session_id\0agent_id`) take a seat;
+                // the hookless scoped form carries no identity and no debt, so it
+                // keeps today's behavior (no admission). The guard is held across
+                // the whole pipeline below and freed on drop (completion, an early
+                // return, or a cancelled future) so a wedged round never locks the
+                // identity out. `followed` ⇒ this run waited on a prior round, so
+                // its receipt earns the one-line note.
+                let (_round_guard, followed) = match doc_owner.as_deref() {
+                    Some(key) => {
+                        let (guard, waited) = ctx.diag_rounds.claim(key).await;
+                        (Some(guard), waited)
+                    }
+                    None => (None, false),
+                };
                 // Race the diagnostics pipeline against client disconnect. If the
                 // `catenary diagnostics` process is killed mid-settle (e.g. the host
                 // tool-call timeout fires while a server sits in a `$/progress`
@@ -6004,13 +6170,21 @@ async fn handle_hook_dispatch(
                     Some(session_id.clone()),
                 );
                 // Surface any skipped edits alongside the covered-file results,
-                // so a mixed batch never silently hides the unchecked files.
-                (
-                    outcome.dirty,
-                    with_skipped_edits_note(outcome.output, &skipped),
-                    covered,
-                    None,
-                )
+                // so a mixed batch never silently hides the unchecked files. When
+                // this round followed another same-identity round (misc 197), lead
+                // the receipt with the one-line note so the caller can tell "my own
+                // prior round was working" from a silent gate.
+                let receipt = with_skipped_edits_note(outcome.output, &skipped);
+                let receipt = if followed {
+                    if receipt.is_empty() {
+                        DIAG_FOLLOWED_NOTE.to_string()
+                    } else {
+                        format!("{DIAG_FOLLOWED_NOTE}\n{receipt}")
+                    }
+                } else {
+                    receipt
+                };
+                (outcome.dirty, receipt, covered, None)
             }
         } else {
             // Bare consume against an empty slot (bug 100): with no hook

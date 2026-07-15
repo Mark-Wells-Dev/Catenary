@@ -534,7 +534,10 @@ impl GlobServer {
                     // this fresh stat) must not silently skip a matched file that
                     // the pattern expansion already confirmed present on disk.
                     self.client_manager
-                        .ensure_and_wait_for_paths(std::slice::from_ref(path))
+                        .ensure_and_wait_for_paths_bounded(
+                            std::slice::from_ref(path),
+                            crate::lsp::manager::QUERY_ENRICHMENT_BUDGET,
+                        )
                         .await;
                     super::ensure_symbols(
                         self.symbol_index.as_ref(),
@@ -687,7 +690,10 @@ impl GlobServer {
             .map(|e| e.abs_path.clone())
             .collect();
         self.client_manager
-            .ensure_and_wait_for_paths(&file_paths)
+            .ensure_and_wait_for_paths_bounded(
+                &file_paths,
+                crate::lsp::manager::QUERY_ENRICHMENT_BUDGET,
+            )
             .await;
         super::ensure_symbols(
             self.symbol_index.as_ref(),

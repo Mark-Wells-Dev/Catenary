@@ -626,9 +626,16 @@ impl GrepServer {
         }
 
         // Step 2: Ensure servers exist for matched files and wait for readiness.
+        // The wait is bounded (misc 197): a wedged/busy settle must never make
+        // grep go silent. Past the bound the hits below serve unenriched (their
+        // `#?` could-not-enrich anchor) — the ripgrep matches are already
+        // complete, only the `#scope` annotation degrades.
         let rg_paths: Vec<PathBuf> = rg.file_lines.keys().map(PathBuf::from).collect();
         self.client_manager
-            .ensure_and_wait_for_paths(&rg_paths)
+            .ensure_and_wait_for_paths_bounded(
+                &rg_paths,
+                crate::lsp::manager::QUERY_ENRICHMENT_BUDGET,
+            )
             .await;
 
         // Step 2a: Route the changed-set nudge (WS31 Consumer A) under the
