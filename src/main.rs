@@ -2061,15 +2061,15 @@ async fn run_stop(out: &mut cli::Output, force: bool) -> Result<()> {
         let plural = if connections == 1 { "" } else { "s" };
         // Bug 80's reconnect-aware proxy made this a bounce, not a strand:
         // each live bridge respawns the daemon and replays its session on
-        // its own — no `/mcp` needed. The old exception — a binary swapped
-        // under a running bridge, where `current_exe` reads `… (deleted)`
-        // and the respawn exec'd a dead path — is healed since misc 182
-        // (the respawn trims the marker and execs the living path), so it
-        // survives only in bridges from builds older than that fix.
+        // its own — no `/mcp` needed. The old static "a bridge from an older
+        // build may need `/mcp`" guess retired here (ws41-02): a version
+        // mismatch is now *detected*, not guessed — the daemon fires one
+        // desktop interrupt and carries a persistent `catenary doctor` / TUI /
+        // `SessionStart` reminder naming the older side, so the cure is stated
+        // only when a mismatch is actually observed.
         let _ = out.writeln(format_args!(
             "note: {connections} connected session{plural} will respawn the daemon and \
-             reconnect on their own (a bridge from an older build may need `/mcp` after \
-             a binary swap)",
+             reconnect on their own",
         ));
     }
     Ok(())

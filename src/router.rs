@@ -2586,6 +2586,16 @@ pub struct SessionManager {
     /// unredirectable in-process: `std::env::set_var` is forbidden under Rust
     /// 2024, so `config_dir()` always resolves the real `~/.config`).
     config_path_override: Option<PathBuf>,
+    /// Once-per-pairing dedup for the bridge↔daemon version-mismatch interrupt
+    /// (ws41-02). Holds the [`catenary_mcp::VersionMismatch::pairing_key`] of
+    /// every `(bridge, daemon)` pairing that has already fired its one
+    /// `error!()` desktop interrupt this daemon lifetime. Shared into each MCP
+    /// connection's bridge-hello callback so repeated session-starts reporting
+    /// the same pairing never re-fire; a daemon restart re-verifies (an
+    /// acceptable one-time re-fire, not a per-session-start refire). The
+    /// persistent surfaces (doctor, board, `SessionStart`) carry the reminder
+    /// beneath the single interrupt.
+    mismatch_interrupts: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 #[cfg(unix)]
@@ -2637,6 +2647,7 @@ impl SessionManager {
             disconnect: Arc::new(tokio::sync::Notify::new()),
             worktree_watch_rx: std::sync::Mutex::new(None),
             config_path_override: None,
+            mismatch_interrupts: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -2685,6 +2696,7 @@ impl SessionManager {
             disconnect: Arc::new(tokio::sync::Notify::new()),
             worktree_watch_rx: std::sync::Mutex::new(None),
             config_path_override: None,
+            mismatch_interrupts: Arc::new(std::sync::Mutex::new(HashSet::new())),
         })
     }
 
@@ -2796,6 +2808,11 @@ impl SessionManager {
         let lsp = self.lsp.clone();
         let primary_session = self.hook_ctx.as_ref().map(|ctx| ctx.primary.clone());
         let root_tracker = self.root_tracker.clone();
+        // Bridge↔daemon version-mismatch surfacing (ws41-02): the daemon-owned
+        // snapshot writer (persistent surface) and the once-per-pairing interrupt
+        // dedup set, both cloned into the bridge-hello callback below.
+        let mismatch_snapshot = primary_session.as_ref().and_then(|s| s.snapshot.clone());
+        let mismatch_interrupts = Arc::clone(&self.mismatch_interrupts);
 
         // Per-connection session key. Monotonic counter avoids
         // collisions from fd reuse across the daemon's lifetime. The
@@ -2864,6 +2881,19 @@ impl SessionManager {
                     let _entered = span_for_blocking.enter();
 
                     let mut mcp = McpServer::new(logging);
+
+                    // Bridge↔daemon version handshake (ws41-02): the bridge's
+                    // hello reaches this callback with its reported `catenary-mcp`
+                    // version (`None` for a pre-handshake bridge). Comparison,
+                    // snapshot recording, and the once-per-pairing interrupt all
+                    // live daemon-side in `handle_bridge_hello`.
+                    mcp = mcp.on_bridge_hello(Box::new(move |bridge_version| {
+                        handle_bridge_hello(
+                            bridge_version,
+                            mismatch_snapshot.as_ref(),
+                            &mismatch_interrupts,
+                        );
+                    }));
 
                     // Wire lifecycle callbacks when the shared LSP
                     // infrastructure is available (daemon mode). When a
@@ -3398,6 +3428,71 @@ impl Drop for ConnectionGuard {
         self.count.fetch_sub(1, Ordering::AcqRel);
         self.disconnect.notify_one();
     }
+}
+
+/// Handles a bridge hello daemon-side: compare, record, interrupt (ws41-02).
+///
+/// `bridge` is the connecting bridge's reported `catenary-mcp` version (`None`
+/// for a pre-handshake bridge that carried no version); the daemon compares it
+/// against the version it links ([`catenary_mcp::version`]) via
+/// [`catenary_mcp::version_mismatch`], so the comparison is daemon-side and
+/// direction-blind — a pre-handshake bridge reads as mismatched precisely
+/// because the daemon, not the bridge, decides.
+///
+/// On agreement it clears any prior mismatch record (a `/mcp` restart or a
+/// daemon bounce that heals the pairing silences every surface). On
+/// disagreement it:
+///
+/// 1. records the mismatch onto the snapshot so the persistent surfaces
+///    (`catenary doctor`, the TUI board, the `SessionStart` hook line) carry the
+///    reminder until the versions agree, and
+/// 2. fires the ONE error-tier desktop interrupt the pairing earns — deduped on
+///    the `(bridge, daemon)` pairing key so repeated session-starts reporting the
+///    same pair never re-fire (a per-session-start refire would pollute both the
+///    desktop and the TUI health surface).
+///
+/// The interrupt is a `tracing::error!()` — in this codebase that IS the desktop
+/// interrupt (the `LoggingServer` routes error severity to the notification
+/// sink) and also lands as a TUI health finding; the dedup keeps it to one.
+#[cfg(unix)]
+fn handle_bridge_hello(
+    bridge: Option<&str>,
+    snapshot: Option<&Arc<crate::state_snapshot::SnapshotWriter>>,
+    dedup: &Arc<std::sync::Mutex<HashSet<String>>>,
+) {
+    let daemon = catenary_mcp::version();
+
+    // Record (or clear) the persistent surface first, so the doctor/board
+    // finding and the SessionStart line are already true when the interrupt
+    // fires — the interrupt is the alert; the record is the standing reminder.
+    if let Some(writer) = snapshot {
+        writer.record_bridge_mismatch(bridge, daemon);
+    }
+
+    let Some(mismatch) = catenary_mcp::version_mismatch(bridge, daemon) else {
+        // Versions agree — nothing to surface.
+        return;
+    };
+
+    // One interrupt per observed pairing this daemon lifetime.
+    let key = mismatch.pairing_key();
+    let first_time = {
+        let mut fired = dedup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fired.insert(key)
+    };
+    if !first_time {
+        return;
+    }
+
+    error!(
+        source = Source::DaemonLifecycle.as_str(),
+        bridge_version = mismatch.bridge_label(),
+        daemon_version = mismatch.daemon_version(),
+        "Catenary bridge↔daemon version mismatch: {}",
+        mismatch.message(),
+    );
 }
 
 /// Extracts canonical file paths from MCP root URIs.
@@ -7224,11 +7319,16 @@ fn reconnect_daemon(init_line: &str) -> Result<std::os::unix::net::UnixStream> {
         };
 
         // Replay the captured initialize so the fresh daemon rebuilds the MCP
-        // session. Swallow its response — the host already saw the first one.
+        // session, then re-announce our version (ws41-02) — a reconnect after a
+        // binary swap hands the session to a *fresh* daemon that never saw the
+        // first hello, so without this the mismatch a swap introduces would go
+        // undetected. Swallow the initialize response — the host already saw the
+        // first one.
         let replay = (&socket)
             .write_all(init_line.as_bytes())
             .and_then(|()| (&socket).flush())
             .map_err(anyhow::Error::from)
+            .inspect(|()| send_bridge_hello(&socket))
             .and_then(|()| read_json_line(&socket));
         match replay {
             Ok(_response) => {
@@ -7251,17 +7351,21 @@ fn reconnect_daemon(init_line: &str) -> Result<std::os::unix::net::UnixStream> {
     }))
 }
 
-/// Intercepts the MCP initialize handshake to verify daemon version.
+/// Announces the bridge's protocol version to the daemon during the handshake
+/// (ws41-02).
 ///
-/// Reads the initialize request from `client`, forwards it to `socket`,
-/// reads the response, and checks `serverInfo.version` against this
-/// bridge's version ([`CATENARY_VERSION`](env!("CATENARY_VERSION"))).
-/// On match, forwards the response to `output`. On mismatch, sends a
-/// `catenary/version-mismatch` notification to the daemon and returns
-/// an error.
+/// Reads the MCP `initialize` request from `client`, forwards it to `socket`,
+/// then sends a [`catenary_mcp::protocol::BRIDGE_HELLO_METHOD`] notification
+/// carrying the bridge's compiled [`catenary_mcp::version`]. The daemon compares
+/// that against the version IT links and owns the mismatch surfacing — so a
+/// running bridge is **never** torn down here for a version disagreement (a
+/// bridge survives binary swaps indefinitely; `/mcp` is needed only when the
+/// daemon-side surfacing says so). The hello rides alongside `initialize`, not
+/// inside it, so the MCP payload the host sees is untouched.
 ///
-/// Generic over reader/writer for testability — `proxy_stdio` passes
-/// stdin/stdout, tests pass in-memory buffers.
+/// The daemon's `initialize` response is read and forwarded to `output`
+/// unconditionally. Generic over reader/writer for testability — `proxy_stdio`
+/// passes stdin/stdout, tests pass in-memory buffers.
 ///
 /// Returns the captured initialize request line so the reconnect path (bug 80,
 /// leg 1) can replay it against a fresh daemon after a mid-session daemon loss —
@@ -7286,57 +7390,51 @@ fn version_handshake<R: std::io::BufRead, W: std::io::Write>(
         .context("forward initialize request to daemon")?;
     (&*socket).flush()?;
 
+    // Announce our compiled protocol version to the daemon — direction-blind
+    // comparison and all surfacing happen daemon-side, so this is fire-and-
+    // forget: a delivery failure never blocks the session, and a mismatch never
+    // tears the bridge down.
+    send_bridge_hello(socket);
+
     // Read the initialize response from daemon.
     // Byte-by-byte to avoid consuming data beyond the line boundary,
     // which would be lost to the subsequent concurrent byte proxy.
     let response_line = read_json_line(socket).context("read initialize response from daemon")?;
 
-    // Parse and check version.
-    let response: serde_json::Value =
-        serde_json::from_str(response_line.trim()).context("parse initialize response")?;
-
-    let daemon_version = response
-        .pointer("/result/serverInfo/version")
-        .and_then(|v| v.as_str());
-
-    let bridge_version = env!("CATENARY_VERSION");
-
-    match daemon_version {
-        Some(dv) if dv == bridge_version => {}
-        Some(dv) => {
-            // Notify daemon of the mismatch before disconnecting so it
-            // can surface the event via the notification sink.
-            let notification = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "catenary/version-mismatch",
-                "params": { "bridgeVersion": bridge_version }
-            });
-            if let Ok(line) = serde_json::to_string(&notification) {
-                let _ = (&*socket).write_all(line.as_bytes());
-                let _ = (&*socket).write_all(b"\n");
-                let _ = (&*socket).flush();
-            }
-
-            anyhow::bail!(
-                "Catenary version mismatch: daemon is v{dv}, \
-                 bridge is v{bridge_version}. Run 'catenary stop' and retry."
-            );
-        }
-        None => {
-            anyhow::bail!(
-                "daemon did not report a version in serverInfo — \
-                 not a Catenary daemon or a bug"
-            );
-        }
-    }
-
-    // Version matches — forward the response to the client.
+    // Forward the daemon's initialize response to the client verbatim — the
+    // handshake never rewrites or withholds it.
     output
         .write_all(response_line.as_bytes())
         .context("forward initialize response to client")?;
     output.flush()?;
 
     Ok(init_line)
+}
+
+/// Sends the bridge's version hello to the daemon, fire-and-forget (ws41-02).
+///
+/// Writes a [`catenary_mcp::protocol::BRIDGE_HELLO_METHOD`] notification
+/// carrying the bridge's compiled [`catenary_mcp::version`]. Delivery failures
+/// are ignored: comparison and all surfacing are daemon-side, so a lost hello
+/// only means the daemon does not learn this bridge's version now — it never
+/// blocks or tears down the session. Sent on the initial handshake **and** on
+/// every reconnect (bug 80), because a reconnect after a binary swap is exactly
+/// the case a fresh daemon must be told the bridge's version to detect a
+/// mismatch.
+#[cfg(unix)]
+fn send_bridge_hello(socket: &std::os::unix::net::UnixStream) {
+    use std::io::Write;
+
+    let hello = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": catenary_mcp::protocol::BRIDGE_HELLO_METHOD,
+        "params": { "bridgeVersion": catenary_mcp::version() }
+    });
+    if let Ok(line) = serde_json::to_string(&hello) {
+        let _ = (&*socket).write_all(line.as_bytes());
+        let _ = (&*socket).write_all(b"\n");
+        let _ = (&*socket).flush();
+    }
 }
 
 /// Reads a single newline-terminated line from a socket without buffering.
@@ -10980,19 +11078,45 @@ mod tests {
         format!("{}\n", serde_json::to_string(&request).expect("serialize"))
     }
 
-    /// Spawn a fake daemon thread that reads an initialize request and
-    /// responds with the given version in `serverInfo`.
+    /// Spawn a fake daemon thread that reads an initialize request, then the
+    /// bridge-hello notification, and responds with `serverInfo.version` set to
+    /// `daemon_version`. Captures the hello's `bridgeVersion` (as a JSON string
+    /// value) into `captured` so a test can assert the wire carried the bridge's
+    /// version — the string is `"<absent>"` if no hello with that field arrived.
+    ///
+    /// Post-ws41-02 the bridge no longer compares the daemon's
+    /// `serverInfo.version` — the daemon compares the bridge's hello — so
+    /// `daemon_version` here only exercises that the response is forwarded
+    /// verbatim regardless of what the daemon reports.
     fn fake_daemon(
         stream: std::os::unix::net::UnixStream,
-        version: &str,
+        daemon_version: &str,
+        captured: std::sync::Arc<std::sync::Mutex<String>>,
     ) -> std::thread::JoinHandle<()> {
-        let version = version.to_string();
+        let daemon_version = daemon_version.to_string();
         std::thread::spawn(move || {
             use std::io::{BufRead, Write};
             let mut reader = std::io::BufReader::new(&stream);
-            let mut line = String::new();
-            reader.read_line(&mut line).expect("read init request");
 
+            // 1) initialize request
+            let mut init = String::new();
+            reader.read_line(&mut init).expect("read init request");
+
+            // 2) bridge-hello notification (ws41-02) — capture its bridgeVersion.
+            let mut hello = String::new();
+            reader.read_line(&mut hello).expect("read bridge hello");
+            let parsed: serde_json::Value =
+                serde_json::from_str(hello.trim()).expect("parse hello");
+            let method = parsed["method"].as_str().unwrap_or_default();
+            if method == catenary_mcp::protocol::BRIDGE_HELLO_METHOD {
+                let bridge_version = parsed
+                    .pointer("/params/bridgeVersion")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<absent>");
+                *captured.lock().expect("lock") = bridge_version.to_string();
+            }
+
+            // 3) initialize response
             let response = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -11001,7 +11125,7 @@ mod tests {
                     "capabilities": {},
                     "serverInfo": {
                         "name": "catenary",
-                        "version": version,
+                        "version": daemon_version,
                     }
                 }
             });
@@ -11012,96 +11136,121 @@ mod tests {
     }
 
     #[test]
-    fn matching_version_connects() {
+    fn handshake_sends_bridge_version_and_forwards_response() {
         let (server_sock, client_sock) =
             std::os::unix::net::UnixStream::pair().expect("stream pair");
 
-        let handle = fake_daemon(server_sock, env!("CATENARY_VERSION"));
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let handle = fake_daemon(server_sock, catenary_mcp::version(), captured.clone());
 
         let mut stdin = std::io::Cursor::new(init_request_line());
         let mut stdout = Vec::new();
 
         version_handshake(&mut stdin, &client_sock, &mut stdout)
-            .expect("handshake should succeed with matching version");
+            .expect("handshake forwards the initialize response and returns the init line");
         handle.join().expect("daemon thread");
 
+        // The wire carried the bridge's compiled catenary-mcp version.
+        assert_eq!(
+            captured.lock().expect("lock").as_str(),
+            catenary_mcp::version(),
+            "the bridge hello must carry the bridge's catenary-mcp version",
+        );
+
+        // The daemon's initialize response is forwarded to the client verbatim.
         assert!(!stdout.is_empty(), "response should be forwarded to stdout");
         let response: serde_json::Value =
             serde_json::from_str(String::from_utf8(stdout).expect("utf8").trim())
                 .expect("parse response");
         assert_eq!(response["result"]["serverInfo"]["name"], "catenary");
+    }
+
+    #[test]
+    fn handshake_never_bails_on_daemon_version_disagreement() {
+        // A daemon reporting a different serverInfo.version no longer tears the
+        // bridge down (ws41-02): comparison and surfacing are daemon-side; the
+        // bridge forwards the response and connects regardless.
+        let (server_sock, client_sock) =
+            std::os::unix::net::UnixStream::pair().expect("stream pair");
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let handle = fake_daemon(server_sock, "0.0.0-fake", captured.clone());
+
+        let mut stdin = std::io::Cursor::new(init_request_line());
+        let mut stdout = Vec::new();
+
+        version_handshake(&mut stdin, &client_sock, &mut stdout)
+            .expect("a running bridge survives a version disagreement");
+        handle.join().expect("daemon thread");
+
+        assert!(
+            !stdout.is_empty(),
+            "the response is forwarded even when the daemon's version differs",
+        );
         assert_eq!(
-            response["result"]["serverInfo"]["version"],
-            env!("CATENARY_VERSION"),
+            captured.lock().expect("lock").as_str(),
+            catenary_mcp::version(),
+            "the hello still carried the bridge version",
+        );
+    }
+
+    // ── Bridge-hello surfacing tests (ws41-02) ───────────────────────────
+
+    #[test]
+    fn handle_bridge_hello_matching_version_records_nothing() {
+        use crate::state_snapshot::{DaemonInfo, SnapshotWriter, now_iso};
+
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = SnapshotWriter::new(
+            rt.handle(),
+            dir.path(),
+            DaemonInfo::current("daemon:test".to_string(), 1, now_iso()),
+        );
+        let dedup = Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+        handle_bridge_hello(Some(catenary_mcp::version()), Some(&writer), &dedup);
+
+        assert!(
+            dedup.lock().expect("lock").is_empty(),
+            "a matching version fires no interrupt",
         );
     }
 
     #[test]
-    fn mismatched_version_rejected() {
-        let (server_sock, client_sock) =
-            std::os::unix::net::UnixStream::pair().expect("stream pair");
+    fn handle_bridge_hello_mismatch_fires_once_per_pairing() {
+        use crate::state_snapshot::{DaemonInfo, SnapshotWriter, now_iso};
 
-        let handle = fake_daemon(server_sock, "0.0.0-fake");
-
-        let mut stdin = std::io::Cursor::new(init_request_line());
-        let mut stdout = Vec::new();
-
-        let result = version_handshake(&mut stdin, &client_sock, &mut stdout);
-        handle.join().expect("daemon thread");
-
-        assert!(result.is_err(), "handshake should fail on version mismatch");
-        let err = result.expect_err("expected error").to_string();
-        assert!(
-            err.contains("version mismatch"),
-            "error should mention mismatch: {err}",
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = SnapshotWriter::new(
+            rt.handle(),
+            dir.path(),
+            DaemonInfo::current("daemon:test".to_string(), 1, now_iso()),
         );
-        assert!(
-            err.contains("0.0.0-fake"),
-            "error should contain daemon version: {err}",
+        let dedup = Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+        // Same mismatched pairing observed three times across "session starts".
+        for _ in 0..3 {
+            handle_bridge_hello(Some("0.0.0-older"), Some(&writer), &dedup);
+        }
+        assert_eq!(
+            dedup.lock().expect("lock").len(),
+            1,
+            "the interrupt dedups to one entry per (bridge, daemon) pairing",
         );
-        assert!(stdout.is_empty(), "should not forward response on mismatch");
-    }
 
-    #[test]
-    fn missing_version_rejected() {
-        let (server_sock, client_sock) =
-            std::os::unix::net::UnixStream::pair().expect("stream pair");
-
-        // Daemon responds without a version field in serverInfo.
-        let handle = std::thread::spawn(move || {
-            use std::io::{BufRead, Write};
-            let mut reader = std::io::BufReader::new(&server_sock);
-            let mut line = String::new();
-            reader.read_line(&mut line).expect("read init request");
-
-            let response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "serverInfo": { "name": "not-catenary" }
-                }
-            });
-            let mut w: &std::os::unix::net::UnixStream = &server_sock;
-            writeln!(w, "{}", serde_json::to_string(&response).expect("ser"))
-                .expect("write response");
-        });
-
-        let mut stdin = std::io::Cursor::new(init_request_line());
-        let mut stdout = Vec::new();
-
-        let result = version_handshake(&mut stdin, &client_sock, &mut stdout);
-        handle.join().expect("daemon thread");
-
-        assert!(
-            result.is_err(),
-            "handshake should fail when version is missing"
-        );
-        let err = result.expect_err("expected error").to_string();
-        assert!(
-            err.contains("did not report a version"),
-            "error should explain missing version: {err}",
+        // A pre-handshake bridge (no version) is a distinct pairing → a second
+        // interrupt entry, but still only once for that pairing.
+        for _ in 0..2 {
+            handle_bridge_hello(None, Some(&writer), &dedup);
+        }
+        assert_eq!(
+            dedup.lock().expect("lock").len(),
+            2,
+            "a new (pre-handshake, daemon) pairing fires its own single interrupt",
         );
     }
 

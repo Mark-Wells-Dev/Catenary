@@ -7,8 +7,12 @@
 //! `CATENARY_VERSION` and exits inside clap, doing no I/O. This subcommand is
 //! the proactive, daemon-aware view: it prints the CLI version, queries the
 //! running daemon for *its* version over the IPC socket (`tool/version`), and
-//! on a mismatch points at the stale daemon — the same fact the bridge's
-//! `version_handshake` only surfaces as a hard error on the next connection.
+//! on a mismatch points at the stale daemon. This is the binary-vs-daemon skew
+//! (the `git describe` `CATENARY_VERSION`), distinct from the bridge↔daemon
+//! protocol handshake (ws41-02), which compares the `catenary-mcp` crate version
+//! and surfaces a mismatch non-fatally (a deduped desktop interrupt plus a
+//! persistent `catenary doctor` / board / `SessionStart` reminder), never as a
+//! hard error that tears the session down.
 
 use anyhow::Result;
 

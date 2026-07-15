@@ -44,6 +44,39 @@ pub fn skew_finding(binary_version: &str, daemon_version: Option<&str>) -> Optio
     )
 }
 
+/// A bridge↔daemon version-mismatch finding (ws41-02), or `None` when the two
+/// agree (or nothing was recorded).
+///
+/// The daemon records an observed mismatch into its `state.json` snapshot the
+/// moment a bridge's hello disagrees with the version the daemon links; this
+/// reads that record back into a persistent [`Finding`] for `catenary doctor`
+/// and the TUI board. `bridge` is the bridge version as recorded (`None` for a
+/// pre-handshake bridge that carried no version); `daemon` is the daemon's
+/// linked `catenary-mcp` version. The direction-aware wording — which side is
+/// older and its cure — comes from [`catenary_mcp::version_mismatch`], the one
+/// definition the interrupt, this finding, and the `SessionStart` line share.
+///
+/// A match (or an unrecorded/agreed pairing, `bridge == Some(daemon)`) produces
+/// no finding — silence is the healthy state, and the record self-clears once
+/// the versions agree.
+#[must_use]
+pub fn bridge_mismatch_finding(bridge: Option<&str>, daemon: &str) -> Option<Finding> {
+    let mismatch = catenary_mcp::version_mismatch(bridge, daemon)?;
+    let fix_it = if mismatch.bridge_is_older() {
+        "Run `/mcp` (the host command that restarts the bridge) to pick up the new build."
+    } else {
+        "Bounce or update the `catenary` binary so the daemon links the newer protocol."
+    };
+    Some(
+        Finding::new(
+            FindingCode::BridgeVersionMismatch,
+            Severity::Warning,
+            mismatch.message(),
+        )
+        .with_fix_it(fix_it.to_string()),
+    )
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -55,6 +88,39 @@ mod tests {
     #[test]
     fn matching_versions_produce_no_finding() {
         assert!(skew_finding("1.3.6", Some("1.3.6")).is_none());
+    }
+
+    #[test]
+    fn bridge_mismatch_matching_versions_is_silent() {
+        assert!(bridge_mismatch_finding(Some("2.0.2"), "2.0.2").is_none());
+    }
+
+    #[test]
+    fn bridge_mismatch_bridge_older_names_mcp() {
+        let f = bridge_mismatch_finding(Some("2.0.1"), "2.0.2").expect("mismatch finding");
+        assert_eq!(f.code, FindingCode::BridgeVersionMismatch);
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(f.message.contains("bridge is older"), "msg: {}", f.message);
+        assert!(f.fix_it.as_deref().unwrap_or_default().contains("/mcp"));
+    }
+
+    #[test]
+    fn bridge_mismatch_daemon_older_names_the_binary() {
+        let f = bridge_mismatch_finding(Some("2.1.0"), "2.0.2").expect("mismatch finding");
+        assert!(f.message.contains("daemon is older"), "msg: {}", f.message);
+        assert!(
+            f.fix_it
+                .as_deref()
+                .unwrap_or_default()
+                .contains("catenary` binary")
+        );
+    }
+
+    #[test]
+    fn bridge_mismatch_pre_handshake_bridge_is_a_finding() {
+        let f = bridge_mismatch_finding(None, "2.0.2").expect("pre-handshake reads as mismatch");
+        assert_eq!(f.code, FindingCode::BridgeVersionMismatch);
+        assert!(f.fix_it.as_deref().unwrap_or_default().contains("/mcp"));
     }
 
     #[test]

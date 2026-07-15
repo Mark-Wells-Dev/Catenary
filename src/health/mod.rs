@@ -178,6 +178,11 @@ pub enum FindingCode {
     ServerReady,
     /// The running daemon serves a different build than this binary.
     VersionSkew,
+    /// A connected bridge links a different `catenary-mcp` protocol version than
+    /// the daemon (ws41-02) — the bridge or the daemon is older. Persists until
+    /// the versions agree; the cure names the older side (`/mcp` or a binary
+    /// bounce).
+    BridgeVersionMismatch,
     /// Installed host hooks diverge from the shipped set.
     HooksStale,
     /// Installed host hooks are missing from the plugin cache.
@@ -239,6 +244,7 @@ impl FindingCode {
             Self::ServerEnrichmentOnly => "server-enrichment-only",
             Self::ServerReady => "server-ready",
             Self::VersionSkew => "version-skew",
+            Self::BridgeVersionMismatch => "bridge-version-mismatch",
             Self::HooksStale => "hooks-stale",
             Self::HooksMissing => "hooks-missing",
             Self::HooksUnreadable => "hooks-unreadable",

@@ -125,6 +125,31 @@ pub const REQUEST_CANCELLED: i64 = -32800;
 #[error("request cancelled")]
 pub struct RequestCancelled;
 
+/// JSON-RPC method for the bridge→daemon version hello (ws41-02).
+///
+/// The bridge sends this notification once, right after forwarding the MCP
+/// `initialize`, carrying the bridge's compiled [`crate::version`]
+/// ([`BridgeHelloParams::bridge_version`]). The daemon compares it against the
+/// [`crate::version`] it links; a mismatch (in either direction — or a
+/// pre-handshake bridge that never sends this) is surfaced daemon-side. The
+/// bridge is never torn down for a mismatch: a running bridge survives binary
+/// swaps, and the surfacing tells the human when a `/mcp` restart is owed.
+pub const BRIDGE_HELLO_METHOD: &str = "catenary/bridge-hello";
+
+/// Parameters for the [`BRIDGE_HELLO_METHOD`] notification.
+///
+/// Carries the bridge's compiled `catenary-mcp` crate version across the wire.
+/// The daemon reads [`Self::bridge_version`] and compares it against its own
+/// linked [`crate::version`]. A pre-handshake bridge sends no hello at all, so
+/// the daemon reads its bridge version as absent — which it treats as a
+/// mismatch, since silence cannot prove sameness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeHelloParams {
+    /// The bridge's compiled `catenary-mcp` crate version ([`crate::version`]).
+    pub bridge_version: String,
+}
+
 /// Parameters for `notifications/cancelled`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

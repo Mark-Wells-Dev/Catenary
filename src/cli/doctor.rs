@@ -97,6 +97,17 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
         let _ = out.writeln(format_args!(""));
     }
 
+    // Bridge↔daemon protocol-version mismatch (ws41-02) — the daemon records an
+    // observed mismatch onto its snapshot; read it back into a persistent
+    // finding that names the older side and its cure. Daemon down or versions
+    // agree → no record → no finding.
+    if let Some(finding) = read_bridge_mismatch()
+        .and_then(|m| crate::health::skew::bridge_mismatch_finding(m.bridge.as_deref(), &m.daemon))
+    {
+        render_finding(out, &finding, show_diff);
+        let _ = out.writeln(format_args!(""));
+    }
+
     // Config migration walk — runs before the load so its rename guidance can
     // print above a config-load error. A non-empty set also lets the load-error
     // path drop the self-referential "run catenary doctor" pointer.
@@ -337,6 +348,26 @@ fn read_snapshot() -> Option<crate::state_snapshot::Snapshot> {
 fn read_daemon_version() -> Option<String> {
     let version = read_snapshot()?.daemon.version;
     (!version.is_empty()).then_some(version)
+}
+
+/// The bridge/daemon versions of an observed mismatch, as recorded on the
+/// snapshot (ws41-02). `bridge` is `None` for a pre-handshake bridge.
+struct RecordedBridgeMismatch {
+    bridge: Option<String>,
+    daemon: String,
+}
+
+/// Read the daemon's recorded bridge↔daemon version mismatch, if any.
+///
+/// The daemon writes this onto its snapshot the moment a bridge's hello
+/// disagrees and clears it once they agree, so a missing snapshot, an absent
+/// record (agreement), or a daemon predating the field all yield `None`.
+fn read_bridge_mismatch() -> Option<RecordedBridgeMismatch> {
+    let m = read_snapshot()?.daemon.bridge_mismatch?;
+    Some(RecordedBridgeMismatch {
+        bridge: m.bridge_version,
+        daemon: m.daemon_version,
+    })
 }
 
 /// Run the doctor command for a single server with verbose output.

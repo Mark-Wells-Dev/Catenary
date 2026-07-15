@@ -96,6 +96,26 @@ const MAX_ACTIVITY_FILES: usize = 128;
 /// provenance line, far below the tracked-file cap.
 const ACTIVITY_FILES_SHOWN: usize = 8;
 
+/// A bridge↔daemon protocol-version mismatch the daemon observed at a hello
+/// (ws41-02).
+///
+/// Recorded into the snapshot's daemon block the moment a connecting bridge's
+/// hello disagrees with the `catenary-mcp` version the daemon links, and
+/// cleared once an agreeing hello arrives. It is the persistent surface behind
+/// the `catenary doctor` finding, the TUI/board finding, and the `SessionStart`
+/// hook line — the one interrupt fired at observation time, then this record
+/// carries the reminder until the versions agree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeMismatch {
+    /// The bridge's reported `catenary-mcp` version, or `None` for a
+    /// pre-handshake bridge that carried no version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_version: Option<String>,
+    /// The `catenary-mcp` version the daemon links.
+    pub daemon_version: String,
+}
+
 /// Immutable daemon identity, recorded once at startup.
 #[derive(Debug, Clone)]
 pub struct DaemonInfo {
@@ -131,14 +151,16 @@ impl DaemonInfo {
         }
     }
 
-    /// Builds the serialized `daemon` block, stamping `generated_at` now.
-    fn to_meta(&self) -> DaemonMeta<'_> {
+    /// Builds the serialized `daemon` block, stamping `generated_at` now and
+    /// folding in any observed bridge↔daemon version mismatch.
+    fn to_meta<'a>(&'a self, bridge_mismatch: Option<&'a BridgeMismatch>) -> DaemonMeta<'a> {
         DaemonMeta {
             instance_id: &self.instance_id,
             pid: self.pid,
             version: &self.version,
             started_at: &self.started_at,
             generated_at: now_iso(),
+            bridge_mismatch,
         }
     }
 }
@@ -152,6 +174,9 @@ struct DaemonMeta<'a> {
     started_at: &'a str,
     /// When this snapshot was generated (staleness / daemon-down detection).
     generated_at: String,
+    /// The observed bridge↔daemon protocol-version mismatch, if any (ws41-02).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bridge_mismatch: Option<&'a BridgeMismatch>,
 }
 
 /// Live progress for a server entry.
@@ -566,6 +591,27 @@ pub struct Snapshot {
     pub activity_languages: Vec<LanguageActivity>,
 }
 
+impl Snapshot {
+    /// The default `state.json` path: `runtime_dir()/catenary/state.json`.
+    #[must_use]
+    pub fn default_path() -> PathBuf {
+        crate::paths::runtime_dir()
+            .join("catenary")
+            .join("state.json")
+    }
+
+    /// Read and parse the running daemon's snapshot from [`Self::default_path`],
+    /// or `None` when it is missing/unparseable (daemon down).
+    ///
+    /// Deserialization is permissive (`#[serde(default)]`), so a snapshot from a
+    /// daemon predating any given field still parses — the missing field defaults.
+    #[must_use]
+    pub fn read_default() -> Option<Self> {
+        let contents = std::fs::read_to_string(Self::default_path()).ok()?;
+        serde_json::from_str(&contents).ok()
+    }
+}
+
 /// Reader-side `daemon` block — owned counterpart to [`DaemonMeta`].
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -581,6 +627,10 @@ pub struct DaemonSnapshot {
     /// When the snapshot was generated (ISO 8601) — staleness / daemon-down
     /// detection.
     pub generated_at: String,
+    /// The observed bridge↔daemon protocol-version mismatch, if any (ws41-02).
+    /// Absent on agreement and on snapshots from daemons predating the field.
+    #[serde(default)]
+    pub bridge_mismatch: Option<BridgeMismatch>,
 }
 
 /// Current UTC time as an ISO 8601 string with millisecond precision.
@@ -618,6 +668,11 @@ struct SnapshotState {
     /// files, bounded. Serialized into [`Snapshot::activity_languages`] as the
     /// health model's suggestion/Fatal gate and provenance source (tui-rework 09).
     activity_languages: BTreeMap<(String, String), BTreeSet<String>>,
+    /// The observed bridge↔daemon protocol-version mismatch (ws41-02), set the
+    /// moment a disagreeing hello arrives and cleared once the versions agree.
+    /// Serialized into the `daemon` block so `catenary doctor`, the TUI board,
+    /// and the `SessionStart` hook all read one record.
+    bridge_mismatch: Option<BridgeMismatch>,
     dirty: bool,
     urgent: bool,
 }
@@ -951,7 +1006,7 @@ impl SnapshotState {
         roots.sort_by(|a, b| a.path.cmp(&b.path));
         let view = SnapshotView {
             schema: SCHEMA,
-            daemon: self.daemon.to_meta(),
+            daemon: self.daemon.to_meta(self.bridge_mismatch.as_ref()),
             servers,
             sessions,
             roots,
@@ -1097,6 +1152,7 @@ impl SnapshotWriter {
                 alerts: VecDeque::new(),
                 activity: VecDeque::new(),
                 activity_languages: BTreeMap::new(),
+                bridge_mismatch: None,
                 dirty: false,
                 urgent: false,
             }),
@@ -1136,6 +1192,34 @@ impl SnapshotWriter {
                 state.dirty = true;
                 state.urgent = true;
             }
+        }
+        self.inner.notify.notify_one();
+    }
+
+    /// Records — or clears — the observed bridge↔daemon protocol-version
+    /// mismatch (ws41-02, coalesced flush).
+    ///
+    /// `bridge` is the connecting bridge's reported `catenary-mcp` version
+    /// (`None` for a pre-handshake bridge that carried no version); `daemon` is
+    /// the version this daemon links. On disagreement the record is set so the
+    /// persistent surfaces (doctor, board, `SessionStart`) carry the reminder;
+    /// on agreement it is cleared, so a `/mcp` restart or a daemon bounce that
+    /// heals the pairing silences every surface. No-op when the recorded state
+    /// already matches, so a healthy stream of agreeing hellos never churns the
+    /// snapshot.
+    pub fn record_bridge_mismatch(&self, bridge: Option<&str>, daemon: &str) {
+        let desired = catenary_mcp::version_mismatch(bridge, daemon).map(|_| BridgeMismatch {
+            bridge_version: bridge.map(str::to_string),
+            daemon_version: daemon.to_string(),
+        });
+        {
+            let mut state = self.inner.lock_state();
+            if state.bridge_mismatch == desired {
+                return;
+            }
+            state.bridge_mismatch = desired;
+            state.dirty = true;
+            state.urgent = true;
         }
         self.inner.notify.notify_one();
     }
@@ -1424,6 +1508,7 @@ mod tests {
             alerts: VecDeque::new(),
             activity: VecDeque::new(),
             activity_languages: BTreeMap::new(),
+            bridge_mismatch: None,
             dirty: false,
             urgent: false,
         }
@@ -2408,6 +2493,85 @@ mod tests {
         assert_eq!(act.root, "/p/Catenary");
         assert_eq!(act.files, vec!["src/db.rs"]);
         assert_eq!(act.file_count, 1);
+    }
+
+    #[test]
+    fn bridge_mismatch_round_trips_through_the_snapshot() {
+        // The daemon records a bridge↔daemon mismatch; the reader must parse it
+        // back so `catenary doctor` and the board render the persistent finding.
+        let mut state = fresh_state();
+        state.bridge_mismatch = Some(BridgeMismatch {
+            bridge_version: Some("2.0.1".to_string()),
+            daemon_version: "2.0.2".to_string(),
+        });
+        let json = state.to_json(&[], &[]);
+        let snapshot: Snapshot = serde_json::from_str(&json).expect("reader parses writer output");
+        let recorded = snapshot
+            .daemon
+            .bridge_mismatch
+            .expect("mismatch round-trips onto the daemon block");
+        assert_eq!(recorded.bridge_version.as_deref(), Some("2.0.1"));
+        assert_eq!(recorded.daemon_version, "2.0.2");
+
+        // A pre-handshake bridge (no version) round-trips as an absent
+        // bridge_version.
+        state.bridge_mismatch = Some(BridgeMismatch {
+            bridge_version: None,
+            daemon_version: "2.0.2".to_string(),
+        });
+        let json = state.to_json(&[], &[]);
+        let snapshot: Snapshot = serde_json::from_str(&json).expect("parse");
+        let recorded = snapshot.daemon.bridge_mismatch.expect("mismatch present");
+        assert!(
+            recorded.bridge_version.is_none(),
+            "pre-handshake bridge round-trips as None",
+        );
+
+        // Agreement clears the record — no daemon block field.
+        state.bridge_mismatch = None;
+        let json = state.to_json(&[], &[]);
+        let snapshot: Snapshot = serde_json::from_str(&json).expect("parse");
+        assert!(
+            snapshot.daemon.bridge_mismatch.is_none(),
+            "an agreeing pairing leaves no record — the finding self-clears",
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_record_bridge_mismatch_sets_then_clears() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = SnapshotWriter::with_coalesce(
+            &tokio::runtime::Handle::current(),
+            dir.path(),
+            daemon_info(),
+            Duration::from_millis(0),
+        );
+
+        // A disagreeing hello records the mismatch onto the persisted snapshot.
+        writer.record_bridge_mismatch(Some("2.0.1"), "2.0.2");
+        writer.flush_now();
+        assert!(
+            poll_until(|| {
+                read_snapshot(&writer)
+                    .and_then(|v| v.get("daemon")?.get("bridge_mismatch").cloned())
+                    .is_some()
+            })
+            .await,
+            "a mismatch is recorded onto the snapshot",
+        );
+
+        // An agreeing hello clears it — the persistent surfaces go silent.
+        writer.record_bridge_mismatch(Some("2.0.2"), "2.0.2");
+        writer.flush_now();
+        assert!(
+            poll_until(|| {
+                read_snapshot(&writer)
+                    .and_then(|v| v.get("daemon")?.get("bridge_mismatch").cloned())
+                    .is_none()
+            })
+            .await,
+            "agreement clears the record",
+        );
     }
 
     #[test]

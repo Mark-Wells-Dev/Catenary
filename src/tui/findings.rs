@@ -241,6 +241,19 @@ pub fn gather_snapshot(
         });
     }
 
+    // ── Bridge↔daemon protocol-version mismatch (ws41-02) ────────────
+    // The daemon records an observed mismatch onto the snapshot; it persists as
+    // a board finding until the versions agree (a `/mcp` restart or a daemon
+    // bounce clears the record). Absent record → no finding.
+    if let Some(f) = snapshot.daemon.bridge_mismatch.as_ref().and_then(|m| {
+        crate::health::skew::bridge_mismatch_finding(m.bridge_version.as_deref(), &m.daemon_version)
+    }) {
+        out.push(OwnedFinding {
+            finding: f,
+            owner: Owner::Global,
+        });
+    }
+
     // ── Config-struct validation (pure over the resolved config) ─────
     let mut config_findings = crate::health::config_checks::validation_findings(config);
     config_findings.extend(crate::health::config_checks::unreferenced_server_findings(
@@ -472,6 +485,44 @@ mod tests {
             state_since: crate::state_snapshot::now_iso(),
             ..ServerEntry::default()
         }
+    }
+
+    #[test]
+    fn bridge_mismatch_on_snapshot_surfaces_a_global_finding() {
+        use crate::state_snapshot::{BridgeMismatch, DaemonSnapshot};
+
+        let snap = Snapshot {
+            daemon: DaemonSnapshot {
+                version: crate::health::skew::BINARY_VERSION.to_string(),
+                bridge_mismatch: Some(BridgeMismatch {
+                    bridge_version: Some("2.0.1".to_string()),
+                    daemon_version: "2.0.2".to_string(),
+                }),
+                ..DaemonSnapshot::default()
+            },
+            ..Snapshot::default()
+        };
+        let findings = gather_snapshot(&snap, &Config::default(), HashSet::new());
+        let mismatch = findings
+            .iter()
+            .find(|f| f.finding.code == crate::health::FindingCode::BridgeVersionMismatch)
+            .expect("a recorded mismatch surfaces a board finding");
+        assert_eq!(mismatch.owner, Owner::Global);
+        assert!(mismatch.finding.message.contains("bridge is older"));
+    }
+
+    #[test]
+    fn no_bridge_mismatch_record_surfaces_no_finding() {
+        // A snapshot with no recorded mismatch (versions agree, or a daemon
+        // predating the field) produces no bridge-mismatch finding.
+        let snap = Snapshot::default();
+        let findings = gather_snapshot(&snap, &Config::default(), HashSet::new());
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.finding.code == crate::health::FindingCode::BridgeVersionMismatch),
+            "silence is the healthy state",
+        );
     }
 
     #[test]

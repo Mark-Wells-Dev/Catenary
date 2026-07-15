@@ -13,9 +13,9 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::logging::LoggingServer;
 use catenary_mcp::protocol::{
-    CancelledParams, INTERNAL_ERROR, InitializeParams, InitializeResult, METHOD_NOT_FOUND,
-    Notification, Request, RequestId, Response, Root, RootsListResult, ServerCapabilities,
-    ServerInfo,
+    BRIDGE_HELLO_METHOD, BridgeHelloParams, CancelledParams, INTERNAL_ERROR, InitializeParams,
+    InitializeResult, METHOD_NOT_FOUND, Notification, Request, RequestId, Response, Root,
+    RootsListResult, ServerCapabilities, ServerInfo,
 };
 
 /// Map an MCP method to its tracing severity level.
@@ -34,6 +34,17 @@ type CancelMap = Arc<std::sync::Mutex<HashMap<RequestId, CancellationToken>>>;
 
 /// MCP protocol versions this server supports (newest first).
 const SUPPORTED_MCP_VERSIONS: &[&str] = &["2025-11-25", "2024-11-05"];
+
+/// The ws41-01-generation bridge's mismatch notification (legacy compat).
+///
+/// That generation compares versions bridge-side (its git-describe
+/// `CATENARY_VERSION` against the daemon's `serverInfo.version`), sends this
+/// notification on disagreement, and then bails — tearing its own session down.
+/// It predates the [`BRIDGE_HELLO_METHOD`] hello, so on receipt the daemon
+/// treats it exactly like an absent hello: a pre-handshake bridge, cured by
+/// `/mcp`. Kept here (not in the wire-definition crate) because it is a
+/// receive-only compat shim for a retired message, never sent by current code.
+const LEGACY_VERSION_MISMATCH_METHOD: &str = "catenary/version-mismatch";
 
 /// Emit an MCP protocol event at the given tracing level.
 ///
@@ -106,6 +117,17 @@ fn emit_mcp_event(
 /// Callback invoked when MCP client info is received during initialize.
 pub type ClientInfoCallback = Box<dyn Fn(&str, &str) + Send + Sync>;
 
+/// Callback invoked when the bridge-hello question resolves (ws41-02).
+///
+/// The argument is the bridge's reported `catenary-mcp` version, or `None` for
+/// a pre-handshake bridge — one whose hello never arrived by the first
+/// post-`initialize` message ([`McpServer::check_bridge_hello_absent`]), or a
+/// ws41-01-generation bridge announcing itself via the legacy mismatch
+/// notification. The daemon-side wiring compares it against its linked version,
+/// records/clears the mismatch on the snapshot, and fires the once-per-pairing
+/// interrupt.
+pub type BridgeHelloCallback = Box<dyn Fn(Option<&str>) + Send + Sync>;
+
 /// Callback invoked when MCP roots are received or updated.
 pub type RootsChangedCallback = Box<dyn Fn(Vec<Root>) -> Result<()> + Send + Sync>;
 
@@ -124,6 +146,19 @@ pub struct McpServer {
     /// Name of the connected MCP client (learned during initialize).
     client_name: String,
     on_client_info: Option<ClientInfoCallback>,
+    /// Callback invoked when a bridge hello arrives (ws41-02), carrying the
+    /// bridge's reported version for the daemon-side comparison/surfacing.
+    on_bridge_hello: Option<BridgeHelloCallback>,
+    /// Whether `initialize` has been dispatched — the anchor for the
+    /// absent-hello check (ws41-02). A hello-capable bridge injects its hello
+    /// immediately after forwarding `initialize` on the same in-order pipe, so
+    /// only messages *after* `initialize` can prove a hello absent.
+    init_seen: bool,
+    /// Whether the bridge-hello question is resolved (ws41-02): a hello (or the
+    /// legacy ws41-01 mismatch notification) arrived, or the absent-hello
+    /// `None` already fired. Guards the absent case to exactly one callback
+    /// invocation per connection.
+    hello_checked: bool,
     /// Whether the client advertised any `roots` capability.
     client_has_roots: bool,
     /// Flag: should we send a `roots/list` request after this message?
@@ -155,6 +190,9 @@ impl McpServer {
             _logging: logging,
             client_name: "unknown".to_string(),
             on_client_info: None,
+            on_bridge_hello: None,
+            init_seen: false,
+            hello_checked: false,
             client_has_roots: false,
             should_fetch_roots: false,
             fetching_roots: false,
@@ -170,6 +208,13 @@ impl McpServer {
     #[must_use]
     pub fn on_client_info(mut self, callback: ClientInfoCallback) -> Self {
         self.on_client_info = Some(callback);
+        self
+    }
+
+    /// Set a callback to be invoked when a bridge hello arrives (ws41-02).
+    #[must_use]
+    pub fn on_bridge_hello(mut self, callback: BridgeHelloCallback) -> Self {
+        self.on_bridge_hello = Some(callback);
         self
     }
 
@@ -455,12 +500,20 @@ impl McpServer {
     fn handle_message(&mut self, line: &str) -> Result<Option<Response>> {
         // Try to parse as request first
         if let Ok(request) = serde_json::from_str::<Request>(line) {
+            if request.method != "initialize" {
+                self.check_bridge_hello_absent();
+            }
             let response = self.handle_request(request)?;
             return Ok(Some(response));
         }
 
         // Try to parse as notification
         if let Ok(notification) = serde_json::from_str::<Notification>(line) {
+            if notification.method != BRIDGE_HELLO_METHOD
+                && notification.method != LEGACY_VERSION_MISMATCH_METHOD
+            {
+                self.check_bridge_hello_absent();
+            }
             self.handle_notification(&notification);
             return Ok(None);
         }
@@ -470,11 +523,39 @@ impl McpServer {
         ))
     }
 
+    /// Detects a pre-handshake bridge — one whose hello never arrives (ws41-02).
+    ///
+    /// A hello-capable bridge injects its [`BRIDGE_HELLO_METHOD`] notification
+    /// immediately after forwarding `initialize`, on the same in-order pipe — so
+    /// by the time any *other* post-`initialize` message reaches this server,
+    /// the hello has either already been dispatched or is never coming. This is
+    /// called from [`Self::handle_message`] (the single choke point every
+    /// production message crosses, including the `fetch_roots` buffered replay)
+    /// for every non-hello message: on the first one after `initialize` with no
+    /// hello seen, it reports the bridge as pre-handshake — `None` — exactly
+    /// once. A later-arriving hello (should not happen, but cheap to honor)
+    /// still fires the callback with its version, and the record-then-clear
+    /// machinery corrects the surfaces.
+    fn check_bridge_hello_absent(&mut self) {
+        if !self.init_seen || self.hello_checked {
+            return;
+        }
+        self.hello_checked = true;
+        if let Some(callback) = &self.on_bridge_hello {
+            callback(None);
+        }
+    }
+
     fn handle_request(&mut self, request: Request) -> Result<Response> {
         debug!("Handling request: {} (id={:?})", request.method, request.id);
 
         match request.method.as_str() {
-            "initialize" => self.handle_initialize(request),
+            "initialize" => {
+                // Anchor for the absent-hello check (ws41-02): a hello-capable
+                // bridge's hello follows immediately on the same in-order pipe.
+                self.init_seen = true;
+                self.handle_initialize(request)
+            }
             "ping" => Ok(Response::success(request.id, serde_json::json!({}))?),
             _ => {
                 debug!("Unknown method: {}", request.method);
@@ -509,21 +590,40 @@ impl McpServer {
                 // thread. If we see it here, the request already finished.
                 debug!("notifications/cancelled received (request already complete)");
             }
-            "catenary/version-mismatch" => {
+            BRIDGE_HELLO_METHOD => {
+                // The bridge announced its compiled `catenary-mcp` version
+                // (ws41-02). Hand it to the daemon-side callback, which compares
+                // against the version the daemon links, records/clears the
+                // mismatch on the snapshot, and fires the once-per-pairing
+                // interrupt. Comparison and surfacing live daemon-side precisely
+                // so a pre-handshake bridge (no field) reads as a mismatch.
+                // Resolves the absent-hello question; a hello arriving late
+                // (after an absent-`None` already fired) still runs the
+                // callback, whose record-then-clear machinery corrects the
+                // surfaces.
+                self.hello_checked = true;
                 let bridge_version = notification
                     .params
-                    .as_ref()
-                    .and_then(|p| p.get("bridgeVersion"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                warn!(
-                    source = crate::source::Source::DaemonLifecycle.as_str(),
-                    daemon_version = env!("CATENARY_VERSION"),
-                    bridge_version = bridge_version,
-                    "Version mismatch: bridge v{bridge_version} rejected \
-                     (daemon is v{})",
-                    env!("CATENARY_VERSION"),
-                );
+                    .clone()
+                    .and_then(|p| serde_json::from_value::<BridgeHelloParams>(p).ok())
+                    .map(|params| params.bridge_version);
+                if let Some(callback) = &self.on_bridge_hello {
+                    callback(bridge_version.as_deref());
+                }
+            }
+            LEGACY_VERSION_MISMATCH_METHOD => {
+                // A ws41-01-generation bridge: it compared versions bridge-side,
+                // sent this, and is about to bail. It predates the hello, so it
+                // IS a pre-handshake bridge — map it to the same callback as an
+                // absent hello. Its `bridgeVersion` param is a git-describe
+                // binary string, not a `catenary-mcp` semver; feeding that into
+                // the direction comparison could mis-name which side is older,
+                // while the pre-handshake label's cure (`/mcp`) is exactly right
+                // for a bridge that just tore its own session down.
+                self.hello_checked = true;
+                if let Some(callback) = &self.on_bridge_hello {
+                    callback(None);
+                }
             }
             _ => {
                 debug!("Ignoring unknown notification: {}", notification.method);
@@ -1590,71 +1690,204 @@ mod tests {
         Ok(())
     }
 
-    // ── Version mismatch notification tests ────────────────────────
+    // ── Bridge hello notification tests ────────────────────────────
 
     #[test]
-    fn mismatch_emits_warning() {
+    fn bridge_hello_delivers_reported_version_to_callback() {
         use std::sync::{Arc, Mutex};
-        use tracing_subscriber::layer::SubscriberExt;
 
-        struct WarnCapture {
-            sources: Arc<Mutex<Vec<String>>>,
-        }
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                if *event.metadata().level() == tracing::Level::WARN {
-                    struct Visitor(Option<String>);
-                    impl tracing::field::Visit for Visitor {
-                        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                            if field.name() == "source" {
-                                self.0 = Some(value.to_string());
-                            }
-                        }
-                        fn record_debug(
-                            &mut self,
-                            _field: &tracing::field::Field,
-                            _value: &dyn std::fmt::Debug,
-                        ) {
-                        }
-                    }
-                    let mut v = Visitor(None);
-                    event.record(&mut v);
-                    if let Some(src) = v.0
-                        && let Ok(mut w) = self.sources.lock()
-                    {
-                        w.push(src);
-                    }
-                }
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        let mut server = McpServer::new(LoggingServer::new()).on_bridge_hello(Box::new(move |v| {
+            if let Ok(mut w) = seen_clone.lock() {
+                w.push(v.map(str::to_string));
             }
-        }
-
-        let sources = Arc::new(Mutex::new(Vec::new()));
-        let layer = WarnCapture {
-            sources: Arc::clone(&sources),
-        };
-
-        let subscriber = tracing_subscriber::registry().with(layer);
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let mut server = McpServer::new(LoggingServer::new());
+        }));
 
         let notification = Notification {
             jsonrpc: "2.0".to_string(),
-            method: "catenary/version-mismatch".to_string(),
+            method: BRIDGE_HELLO_METHOD.to_string(),
             params: Some(serde_json::json!({"bridgeVersion": "0.0.0-fake"})),
         };
         server.handle_notification(&notification);
 
-        let captured = sources.lock().expect("lock").clone();
-        assert!(
-            captured.contains(&"daemon.lifecycle".to_string()),
-            "should emit daemon.lifecycle warning, got: {captured:?}",
+        assert_eq!(
+            seen.lock().expect("lock").as_slice(),
+            &[Some("0.0.0-fake".to_string())],
+            "callback should receive the reported bridge version",
         );
+    }
+
+    #[test]
+    fn bridge_hello_without_version_delivers_none() {
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        let mut server = McpServer::new(LoggingServer::new()).on_bridge_hello(Box::new(move |v| {
+            if let Ok(mut w) = seen_clone.lock() {
+                w.push(v.map(str::to_string));
+            }
+        }));
+
+        // A malformed/absent-params hello (a bridge too old to carry the field)
+        // still reaches the callback as `None` — the daemon reads that as a
+        // mismatch.
+        let notification = Notification {
+            jsonrpc: "2.0".to_string(),
+            method: BRIDGE_HELLO_METHOD.to_string(),
+            params: None,
+        };
+        server.handle_notification(&notification);
+
+        assert_eq!(
+            seen.lock().expect("lock").as_slice(),
+            &[None],
+            "an absent version reaches the callback as None",
+        );
+    }
+
+    /// Harness for the absent-hello seam: a server whose `on_bridge_hello`
+    /// records every invocation, driven through `handle_message` (the
+    /// production choke point), plus the JSON lines a bridge/host produces.
+    fn hello_probe() -> (
+        McpServer,
+        std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    ) {
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        let server = McpServer::new(LoggingServer::new()).on_bridge_hello(Box::new(move |v| {
+            if let Ok(mut w) = seen_clone.lock() {
+                w.push(v.map(str::to_string));
+            }
+        }));
+        (server, seen)
+    }
+
+    fn initialize_line() -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "1.0"}
+            }
+        })
+        .to_string()
+    }
+
+    fn hello_line(version: &str) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0", "method": BRIDGE_HELLO_METHOD,
+            "params": {"bridgeVersion": version}
+        })
+        .to_string()
+    }
+
+    const INITIALIZED_LINE: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+    const PING_LINE: &str = r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#;
+
+    #[test]
+    fn absent_hello_fires_none_exactly_once() -> Result<()> {
+        let (mut server, seen) = hello_probe();
+
+        // A message BEFORE initialize proves nothing (the hello rides after
+        // initialize) — no None.
+        server.handle_message(INITIALIZED_LINE)?;
+        assert!(
+            seen.lock().expect("lock").is_empty(),
+            "pre-initialize traffic never fires the absent-hello None",
+        );
+
+        // initialize, then the host's initialized — with NO hello in between:
+        // a pre-handshake bridge, reported as exactly one None.
+        server.handle_message(&initialize_line())?;
+        server.handle_message(INITIALIZED_LINE)?;
+        assert_eq!(
+            seen.lock().expect("lock").as_slice(),
+            &[None],
+            "an absent hello reads as pre-handshake — one None",
+        );
+
+        // Further traffic never re-fires.
+        server.handle_message(PING_LINE)?;
+        server.handle_message(INITIALIZED_LINE)?;
+        assert_eq!(
+            seen.lock().expect("lock").as_slice(),
+            &[None],
+            "the absent-hello None fires exactly once per connection",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hello_before_initialized_reports_version_never_none() -> Result<()> {
+        let (mut server, seen) = hello_probe();
+
+        // The wire order a hello-capable bridge produces: initialize, hello,
+        // then the host's initialized.
+        server.handle_message(&initialize_line())?;
+        server.handle_message(&hello_line("9.9.9"))?;
+        server.handle_message(INITIALIZED_LINE)?;
+        server.handle_message(PING_LINE)?;
+
+        assert_eq!(
+            seen.lock().expect("lock").as_slice(),
+            &[Some("9.9.9".to_string())],
+            "a hello-capable bridge reports its version — no spurious None",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reconnect_replay_shape_hello_then_request_no_none() -> Result<()> {
+        // The reconnect replay (bug 80 + ws41-02): a fresh daemon connection
+        // sees the replayed initialize, then the re-sent hello, then ordinary
+        // host traffic — `notifications/initialized` never re-arrives. The
+        // hello still resolves the question; no None fires on the traffic.
+        let (mut server, seen) = hello_probe();
+
+        server.handle_message(&initialize_line())?;
+        server.handle_message(&hello_line("9.9.9"))?;
+        server.handle_message(PING_LINE)?;
+
+        assert_eq!(
+            seen.lock().expect("lock").as_slice(),
+            &[Some("9.9.9".to_string())],
+            "the replayed hello resolves the check — no None on later traffic",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_version_mismatch_reads_as_pre_handshake() -> Result<()> {
+        // A ws41-01-generation bridge sends `catenary/version-mismatch` (then
+        // bails). It maps to the same callback as an absent hello — one None —
+        // and resolves the check so nothing double-fires.
+        let (mut server, seen) = hello_probe();
+
+        server.handle_message(&initialize_line())?;
+        server.handle_message(
+            &serde_json::json!({
+                "jsonrpc": "2.0", "method": LEGACY_VERSION_MISMATCH_METHOD,
+                "params": {"bridgeVersion": "1.2.3-4-gabc"}
+            })
+            .to_string(),
+        )?;
+        assert_eq!(
+            seen.lock().expect("lock").as_slice(),
+            &[None],
+            "the legacy notification reads as a pre-handshake bridge",
+        );
+
+        server.handle_message(INITIALIZED_LINE)?;
+        assert_eq!(
+            seen.lock().expect("lock").as_slice(),
+            &[None],
+            "the legacy arm resolves the check — no second None",
+        );
+        Ok(())
     }
 
     #[test]

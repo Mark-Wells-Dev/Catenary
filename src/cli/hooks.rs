@@ -80,6 +80,42 @@ fn with_orphan_line(ctx: Option<String>) -> Option<String> {
     }
 }
 
+/// Append the bridge↔daemon protocol-version mismatch line (ws41-02) to a
+/// `SessionStart` context, when there is one and the daemon has recorded a
+/// mismatch.
+///
+/// Only augments a `Some` context (the announce+Claude path), so
+/// [`session_start_context`] stays hermetic and this snapshot read runs only in
+/// the live hook. The line names the older side and its cure — the persistent
+/// reminder that carries beneath the daemon's one-time desktop interrupt until
+/// the versions agree.
+fn with_bridge_mismatch_line(ctx: Option<String>) -> Option<String> {
+    let base = ctx?;
+    match bridge_mismatch_line() {
+        Some(line) => Some(format!("{base}\n\n{line}")),
+        None => Some(base),
+    }
+}
+
+/// The one-line bridge↔daemon version-mismatch note, or `None` when no daemon is
+/// up, the versions agree, or the daemon predates the recorded field.
+///
+/// Reads the mismatch the daemon recorded onto its snapshot and renders the
+/// shared direction-aware wording ([`catenary_mcp::version_mismatch`]), so the
+/// `SessionStart` line, the `catenary doctor` finding, and the TUI board finding
+/// all say the same thing ("bridge is `X`, daemon links `Y` — run `/mcp`").
+#[must_use]
+fn bridge_mismatch_line() -> Option<String> {
+    let recorded = crate::state_snapshot::Snapshot::read_default()?
+        .daemon
+        .bridge_mismatch?;
+    let mismatch = catenary_mcp::version_mismatch(
+        recorded.bridge_version.as_deref(),
+        &recorded.daemon_version,
+    )?;
+    Some(mismatch.message())
+}
+
 /// A one-line mention of agent worktrees lingering from previous sessions (misc
 /// 151 D-2 cross-session orphans), or `None` when there are none.
 ///
@@ -536,7 +572,8 @@ pub fn run_session_start(format: HostFormat) {
     let announce = session_start_should_announce(source);
 
     let Some(stream) = hook_connect(&hook_json) else {
-        let ctx = with_orphan_line(session_start_context(announce, format));
+        let ctx =
+            with_bridge_mismatch_line(with_orphan_line(session_start_context(announce, format)));
         emit_session_start(builder, ctx.as_deref());
         return;
     };
@@ -557,7 +594,7 @@ pub fn run_session_start(format: HostFormat) {
     // 04), so the response is ignored.
     let _ = ipc_exchange(stream, &request);
 
-    let ctx = with_orphan_line(session_start_context(announce, format));
+    let ctx = with_bridge_mismatch_line(with_orphan_line(session_start_context(announce, format)));
     emit_session_start(builder, ctx.as_deref());
 }
 
