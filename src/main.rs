@@ -579,8 +579,9 @@ enum HookCommand {
         #[arg(long, value_enum)]
         format: HostFormat,
     },
-    /// `PermissionRequest`: observe a permission prompt (pure observer — suspends
-    /// the subagent's worktree idle expiry while blocked; misc 150).
+    /// `PermissionRequest`: observe a permission prompt (pure observer — marks the
+    /// enclosing worktree root blocked for the `worktree ls` display; no pause
+    /// machinery, root-ownership 04).
     #[command(name = "permission-request")]
     PermissionRequest {
         /// Output format: "claude" or "antigravity".
@@ -1769,11 +1770,6 @@ fn serve_daemon(
         let reap_policy = config.reap_policy();
         let retention_days = config.log_retention_days;
 
-        // Parent-agent additionalContext side channel (misc 151): the
-        // dirty-worktree "kept" notice queues here for delivery on the parent's
-        // next hook response. Shared by every per-session `Session`.
-        let parent_context = catenary_cli::bridge::ParentContextQueue::new();
-
         // Daemon-owned live-state snapshot. Mirrors server lifecycle/progress
         // and the alert ring to runtime_dir()/catenary/state.json — the
         // out-of-process surface that replaces the language_servers table.
@@ -1796,7 +1792,6 @@ fn serve_daemon(
             logging.clone(),
             instance_id.clone(),
             rt.handle().clone(),
-            parent_context,
             Some(snapshot),
         ));
 

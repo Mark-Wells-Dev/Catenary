@@ -1498,19 +1498,6 @@ impl RootTracker {
         inner.reconcile_roots();
     }
 
-    /// Returns whether `contributor` currently contributes any roots.
-    ///
-    /// Lets a teardown caller (`SubagentStop`) run the reap only for a live
-    /// worktree mount, so a stop whose `cwd` never mounted a worktree is a true
-    /// no-op — no re-sync, no misleading teardown log.
-    fn has_contributor(&self, contributor: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contributors
-            .contains_key(contributor)
-    }
-
     /// Removes every contributor whose key `starts_with(prefix)`, in one shot.
     ///
     /// Sweeps a whole namespace at once — e.g. all `worktree:{session_id}:*`
@@ -1669,6 +1656,27 @@ impl RootTracker {
             .filter(|roots| roots.contains(root))
             .count()
     }
+}
+
+/// The host cwd carried by a hook payload, from either the top-level `cwd`
+/// (`PreToolUse`, `Stop`) or the nested `host_payload.cwd` (the forwarded raw
+/// event), or `None` when the hook forwards neither (root-ownership 04).
+///
+/// Every hook carries cwd, and the one hook seam uses it to feed the single
+/// activity model for every mount lifetime — the worktree kept countdown and the
+/// ephemeral idle clock both reset when a hook resolves into their root. Reading
+/// both locations keeps the seam host-agnostic: whichever field the surface
+/// populated wins, top-level first.
+#[cfg(unix)]
+fn hook_cwd(raw: &serde_json::Value) -> Option<&str> {
+    raw.get("cwd")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            raw.get("host_payload")
+                .and_then(|hp| hp.get("cwd"))
+                .and_then(|v| v.as_str())
+        })
+        .filter(|s| !s.is_empty())
 }
 
 /// Parses the contributing `session_id` out of a `worktree:{session_id}:{path}`
@@ -2147,37 +2155,59 @@ fn reap_idle_ephemeral_roots(
     expired
 }
 
-// ── Worktree-class roots: registry, blocked-on-permission display (misc 150) ──
+// ── Worktree-class roots: the kept countdown + blocked display (root-ownership 04) ──
 
-/// One worktree root's blocked-on-permission display flag.
+/// How long a KEPT worktree mount survives without a refreshing hook activity
+/// before the countdown reaper retires its MOUNT (root-ownership 04).
 ///
-/// A worktree root is pinned-class — it does not expire on an idle clock (bug
-/// 106); the worktrees dir vanish-watch is its release edge. This struct no
-/// longer carries a last-activity instant: it survives only as the per-root
-/// blocked-on-permission flag the `catenary worktree ls` root-state column reads.
+/// On the "kept" signal (subagent stopped, worktree dirty) the mount enters a
+/// countdown; any hook resolving into the worktree resets it — pure
+/// activity-reset, no pause machinery (the third-round ruling). Matched to
+/// [`EPHEMERAL_ROOT_IDLE_TIMEOUT`] and [`crate::lock::PAID_IDLE_TIMEOUT`] so the
+/// three idle clocks in the daemon agree — one activity model for every mount
+/// lifetime. Comfortably inside the ticket's 5–10 minute band; the reaper sweep
+/// ([`EPHEMERAL_ROOT_SWEEP_INTERVAL`]) adds at most one minute of slack, keeping
+/// the worst case under 10 minutes.
+#[cfg(unix)]
+const WORKTREE_KEPT_COUNTDOWN: Duration = Duration::from_mins(7);
+
+/// One worktree root's mount state: the kept countdown and the blocked-display
+/// flag (root-ownership 04).
+///
+/// A LIVE worktree (its subagent still running) is pinned-class — `kept_since` is
+/// `None`, so no countdown runs; the vanish-watch is its release edge. On the
+/// "kept" signal (subagent stopped, worktree dirty) `kept_since` is armed to the
+/// stop instant, and any hook resolving into the worktree refreshes it — the same
+/// idle-with-activity-reset [`EphemeralMounts`] uses. The countdown reaper retires
+/// the MOUNT (servers, root, lock) once it lapses, never the dirty directory.
 #[cfg(unix)]
 struct WorktreeClock {
     /// The tracked root path (for `touch_covering`'s prefix test, `mounted_roots`,
-    /// and logging).
+    /// the countdown reaper, and logging).
     root: PathBuf,
-    /// Blocked-on-permission: the subagent is parked at a permission prompt. Feeds
-    /// the `blocked` root-state in `catenary worktree ls` (misc 151); cleared on
-    /// the next identity event or qualifying activity under the root.
+    /// Blocked-on-permission: a subagent parked at a permission prompt. Feeds the
+    /// `blocked` root-state in `catenary worktree ls` (misc 151); marked/cleared
+    /// by path (the enclosing worktree of the `PermissionRequest` / activity
+    /// cwd) — no identity keying (root-ownership 04, AUDIT #11).
     blocked: bool,
+    /// The kept countdown's last-activity instant, or `None` while the worktree is
+    /// LIVE (pinned-class, no expiry). Armed on the "kept" signal
+    /// ([`arm_countdown`](WorktreeMounts::arm_countdown)); refreshed by any hook
+    /// resolving into the worktree; the reaper retires the mount once it lapses
+    /// past [`WORKTREE_KEPT_COUNTDOWN`].
+    kept_since: Option<Instant>,
 }
 
-/// Per-root blocked-on-permission state for mounted worktree-class roots, keyed
-/// by contributor (misc 150).
+/// Per-root mount state (kept countdown + blocked display) for mounted
+/// worktree-class roots, keyed by contributor (root-ownership 04).
 ///
-/// The worktree analogue of [`EphemeralMounts`], but keyed by the **contributor**
-/// rather than the path: a worktree contributor may be identity-shaped
-/// (`worktree:{session}:{agent_id}`), which is not path-derivable, so a teardown
-/// must carry the key it will `remove`. Each entry tracks a blocked-on-permission
-/// flag — a subagent parked at a permission prompt is *blocked*, surfaced as the
-/// `blocked` root-state in `catenary worktree ls`; the flag clears on an identity
-/// event or qualifying activity. Worktree roots no longer expire on idle (bug
-/// 106), so this structure carries no idle clock — only the display flag and the
-/// mounted-root set.
+/// The worktree analogue of [`EphemeralMounts`], keyed by the **contributor** so
+/// a teardown carries the key it will `remove`. Contributors are now uniformly
+/// path-shaped (`worktree:{session}:{canonical-path}`) — the identity-shaped
+/// `worktree:{session}:{agent_id}` form retired with the registry identity
+/// lookups (root-ownership 04, AUDIT #10/#11). Each entry carries the kept
+/// countdown (the mount's lifetime once its subagent stops dirty) and the
+/// blocked-on-permission display flag.
 #[cfg(unix)]
 #[derive(Clone)]
 struct WorktreeMounts {
@@ -2192,8 +2222,8 @@ impl WorktreeMounts {
         }
     }
 
-    /// Track a mounted worktree root. Mounting always clears any stale blocked
-    /// flag (a re-mount at the same key is a fresh, unblocked subagent).
+    /// Track a mounted worktree root. Mounting always resets a fresh, LIVE state
+    /// (no countdown, unblocked — a re-mount at the same key is a fresh subagent).
     fn track(&self, contributor: &str, root: &Path) {
         self.inner
             .lock()
@@ -2203,17 +2233,20 @@ impl WorktreeMounts {
                 WorktreeClock {
                     root: root.to_path_buf(),
                     blocked: false,
+                    kept_since: None,
                 },
             );
     }
 
-    /// Unblock every worktree root that encloses `path`.
+    /// Refresh every worktree root that encloses `path` on qualifying activity.
     ///
-    /// Qualifying activity under a root clears its blocked-on-permission flag (the
-    /// agent resumed work), so `catenary worktree ls` stops rendering it `blocked`.
+    /// Any hook resolving into a worktree is activity: it clears the
+    /// blocked-on-permission flag (the agent resumed) AND — the root-ownership-04
+    /// countdown reset — refreshes the kept countdown to `now` when one is armed,
+    /// so an attended, actively-touched worktree never idle-expires its mount.
     /// `path` should already be canonicalized so it lines up with the canonical
     /// root keys.
-    fn touch_covering(&self, path: &Path) {
+    fn touch_covering(&self, path: &Path, now: Instant) {
         let mut inner = self
             .inner
             .lock()
@@ -2221,36 +2254,46 @@ impl WorktreeMounts {
         for clock in inner.values_mut() {
             if path.starts_with(&clock.root) {
                 clock.blocked = false;
+                if clock.kept_since.is_some() {
+                    clock.kept_since = Some(now);
+                }
             }
         }
     }
 
-    /// Mark a single worktree root blocked-on-permission. Returns whether a
-    /// matching root was found.
-    fn mark_blocked(&self, contributor: &str) -> bool {
+    /// Arm the kept countdown on the worktree mount enclosing `path` (the "kept"
+    /// signal — subagent stopped, worktree dirty). Idempotent re-arm to `now`.
+    ///
+    /// Resolves by path so it needs no identity: the stopping subagent's cwd
+    /// resolves to its worktree root, and the enclosing mount enters the
+    /// countdown. Returns whether a mount was armed.
+    fn arm_countdown(&self, path: &Path, now: Instant) -> bool {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(clock) = inner.get_mut(contributor) {
-            clock.blocked = true;
-            true
-        } else {
-            false
+        let mut armed = false;
+        for clock in inner.values_mut() {
+            if path.starts_with(&clock.root) {
+                clock.kept_since = Some(now);
+                armed = true;
+            }
         }
+        drop(inner);
+        armed
     }
 
-    /// Mark every worktree root of a session blocked — the coarse fallback when
-    /// a permission payload carries no agent identity. Returns the count marked.
-    fn mark_blocked_session(&self, session_id: &str) -> usize {
-        let prefix = format!("worktree:{session_id}:");
+    /// Mark every worktree root enclosing `path` blocked-on-permission (a
+    /// `PermissionRequest` resolving into the worktree). Path-keyed — no identity
+    /// (root-ownership 04). Returns the count marked.
+    fn mark_blocked_covering(&self, path: &Path) -> usize {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut marked = 0;
-        for (contributor, clock) in inner.iter_mut() {
-            if contributor.starts_with(&prefix) {
+        for clock in inner.values_mut() {
+            if path.starts_with(&clock.root) {
                 clock.blocked = true;
                 marked += 1;
             }
@@ -2259,16 +2302,25 @@ impl WorktreeMounts {
         marked
     }
 
-    /// Clear a worktree root's blocked flag (an identity event resumed it).
-    fn clear_blocked(&self, contributor: &str) {
-        if let Some(clock) = self
-            .inner
+    /// The contributor keys whose kept countdown has lapsed past `idle` as of
+    /// `now` — the mounts the reaper retires (root-ownership 04).
+    ///
+    /// Only KEPT mounts (`kept_since = Some`) are candidates; a LIVE worktree
+    /// (`None`) is never expired. `saturating_duration_since` is panic-free
+    /// against a future `Instant`. Returns `(contributor, root)` pairs so the
+    /// reaper can retire the mount and log the root.
+    fn expired_countdowns(&self, now: Instant, idle: Duration) -> Vec<(String, PathBuf)> {
+        self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_mut(contributor)
-        {
-            clock.blocked = false;
-        }
+            .iter()
+            .filter_map(|(contributor, clock)| {
+                clock.kept_since.and_then(|since| {
+                    (now.saturating_duration_since(since) >= idle)
+                        .then(|| (contributor.clone(), clock.root.clone()))
+                })
+            })
+            .collect()
     }
 
     /// Drop a root's entry (on teardown).
@@ -2307,6 +2359,17 @@ impl WorktreeMounts {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(contributor)
             .is_some_and(|clock| clock.blocked)
+    }
+
+    /// The kept-countdown last-activity for a contributor, or `None` when the
+    /// mount is absent or LIVE (test-only).
+    #[cfg(test)]
+    fn kept_since(&self, contributor: &str) -> Option<Instant> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(contributor)
+            .and_then(|clock| clock.kept_since)
     }
 }
 
@@ -2457,18 +2520,6 @@ impl WorktreeRegistry {
             .remove(worktree);
     }
 
-    /// The registered worktree path for a `(session_id, agent_id)` identity.
-    fn path_for_identity(&self, session_id: &str, agent_id: &str) -> Option<PathBuf> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .find(|meta| {
-                meta.session_id == session_id && meta.agent_id.as_deref() == Some(agent_id)
-            })
-            .map(|meta| meta.worktree.clone())
-    }
-
     /// The number of registered worktrees (test-only).
     #[cfg(test)]
     fn len(&self) -> usize {
@@ -2532,11 +2583,10 @@ async fn ensure_ephemeral_mounts(
         // its resolved spelling (its enclosing `.git` still resolves lexically).
         let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
         // Every qualifying activity refreshes the covering ephemeral root's idle
-        // clock, and clears any blocked-on-permission flag on a covering
-        // worktree-class root (misc 150 — the worktree root itself no longer
-        // expires on idle, bug 106).
+        // clock and the covering worktree's kept countdown, clearing its
+        // blocked-on-permission flag too (root-ownership 04 — one activity model).
         mounts.touch_covering(&canonical, now);
-        ctx.worktree_mounts.touch_covering(&canonical);
+        ctx.worktree_mounts.touch_covering(&canonical, now);
         let existing: HashSet<PathBuf> = tracker.global_roots().into_iter().collect();
         if let Some(root) = ephemeral_root_to_mount(&canonical, &existing) {
             let contributor = ephemeral_contributor(&root);
@@ -3259,11 +3309,44 @@ impl SessionManager {
         let tracker = tracker.clone();
         let session = ctx.primary.clone();
         let mounts = ctx.ephemeral_mounts.clone();
+        // The worktree kept-countdown reaper (root-ownership 04) rides this same
+        // sweep — one activity model, one cadence. It needs the full dispatch
+        // context to run `retire_root` (the MOUNT-only teardown discipline).
+        let ctx = ctx.clone();
         rt.spawn(async move {
             let mut ticker = tokio::time::interval(EPHEMERAL_ROOT_SWEEP_INTERVAL);
             ticker.tick().await; // consume the immediate first tick
             loop {
                 ticker.tick().await;
+
+                // Worktree kept countdown (root-ownership 04, the mount lifetime
+                // for KEPT worktrees): retire every worktree MOUNT whose countdown
+                // lapsed past `WORKTREE_KEPT_COUNTDOWN` untouched by a hook. Expiry
+                // retires the mount ONLY (servers, root, lock — `retire_root`); it
+                // NEVER deletes the dirty directory, which persists for `land`/`rm`.
+                // The countdown is armed at subagent stop and reset by any hook
+                // resolving into the worktree (the one hook seam). A LIVE worktree
+                // (no countdown armed) is never a candidate.
+                let expired_worktrees = ctx
+                    .worktree_mounts
+                    .expired_countdowns(Instant::now(), WORKTREE_KEPT_COUNTDOWN);
+                for (contributor, root) in &expired_worktrees {
+                    // Full retire discipline: every contributor declaring the root
+                    // releases it, the watch + kept clock unregister, the lock and
+                    // held-open docs go, the reduced union syncs once. The DIRECTORY
+                    // is untouched (the maintainer-verbatim absolute).
+                    retire_root(&ctx, &tracker, root).await;
+                    info!(
+                        source = Source::DaemonDispatch.as_str(),
+                        session_id = worktree_contributor_session_id(contributor).unwrap_or(""),
+                        contributor = %contributor,
+                        worktree = %root.display(),
+                        "expired kept-worktree mount countdown (mount retired; dirty dir left in place)",
+                    );
+                }
+                if !expired_worktrees.is_empty() {
+                    session.touch_snapshot();
+                }
                 // Durable-lock paid-idle countdown (root-ownership stage 2,
                 // release leg 1): remove every lock dir that is paid (empty
                 // ledger) and idle past the window. Rides this existing sweep —
@@ -3809,66 +3892,27 @@ fn worktree_contributor(session_id: &str, path: &Path) -> (PathBuf, String) {
     (canonical, contributor)
 }
 
-/// Resolves the `(contributor, worktree)` a `SubagentStop` should reap — identity
-/// first, cwd second (misc 150 hardening).
+/// Resolves the `(contributor, worktree)` a `SubagentStop` should reap by cwd —
+/// pure path algebra, no identity (root-ownership 04, AUDIT #10/#11).
 ///
-/// 1. **Identity.** When `agent_id` is non-empty and its identity contributor
-///    `worktree:{session_id}:{agent_id}` is live, reap that. The registry supplies
-///    the registered path (for the log + drift telemetry); when it disagrees with
-///    the cwd-enclosing root the registry wins (we reap the identity contributor
-///    either way) and the divergence is logged at debug.
-/// 2. **cwd.** Otherwise resolve the *enclosing* worktree root of `cwd`
-///    ([`crate::companions::enclosing_worktree_root`]) and key on THAT — never an
-///    exact match on the raw cwd, so a final `cd` into a subdirectory of the
-///    worktree still reaps. This covers foreign/legacy worktrees with no agent
-///    identity (path-keyed mounts) and the registry-miss case.
+/// Resolves the *enclosing* worktree root of `cwd`
+/// ([`crate::companions::enclosing_worktree_root`]) and keys on THAT canonical
+/// path — never an exact match on the raw cwd, so a final `cd` into a
+/// subdirectory of the worktree still reaps. Contributors are uniformly
+/// path-shaped (`worktree:{session}:{canonical-path}`), so the same path that
+/// mounted the worktree resolves its teardown key; the identity-first registry
+/// lookup (`path_for_identity`) and the `worktree:{session}:{agent}` contributor
+/// namespace retired with the cwd-activity mechanism.
 ///
-/// Returns `None` when neither route yields a candidate (no agent identity mount
-/// and no enclosing worktree for `cwd`).
+/// Returns `None` when `cwd` resolves to no enclosing worktree.
 #[cfg(unix)]
-fn resolve_stop_reap_target(
-    ctx: &HookDispatchContext,
-    tracker: &RootTracker,
-    session_id: &str,
-    agent_id: &str,
-    cwd: Option<&str>,
-) -> Option<(String, PathBuf)> {
-    // The cwd route: the enclosing worktree root, canonicalized to line up with
-    // the tracker's canonical root values.
-    let cwd_route = cwd.and_then(|c| {
+fn resolve_stop_reap_target(session_id: &str, cwd: Option<&str>) -> Option<(String, PathBuf)> {
+    cwd.and_then(|c| {
         crate::companions::enclosing_worktree_root(Path::new(c)).map(|root| {
             let root = root.canonicalize().unwrap_or(root);
             (format!("worktree:{session_id}:{}", root.display()), root)
         })
-    });
-
-    if !agent_id.is_empty() {
-        let identity = format!("worktree:{session_id}:{agent_id}");
-        if tracker.has_contributor(&identity) {
-            let registered = ctx
-                .worktree_registry
-                .path_for_identity(session_id, agent_id);
-            // Drift telemetry: the registry (identity) path vs the cwd-enclosing
-            // root. Prefer the registry; log the disagreement at debug.
-            if let (Some(reg), Some((_, cwd_root))) = (&registered, &cwd_route)
-                && reg != cwd_root
-            {
-                debug!(
-                    source = Source::DaemonDispatch.as_str(),
-                    session_id = %session_id,
-                    agent_id = agent_id,
-                    registry = %reg.display(),
-                    cwd_root = %cwd_root.display(),
-                    "registry/cwd worktree divergence at subagent stop — preferring the registry",
-                );
-            }
-            let worktree = registered
-                .or_else(|| cwd_route.as_ref().map(|(_, r)| r.clone()))
-                .unwrap_or_else(|| PathBuf::from(cwd.unwrap_or_default()));
-            return Some((identity, worktree));
-        }
-    }
-    cwd_route
+    })
 }
 
 /// Tears down a mounted subagent worktree root: drops the `contributor` and its
@@ -4410,28 +4454,30 @@ fn load_meta_from_sidecar(worktree: &Path) -> Option<crate::worktree_create::Wor
 /// Dispose a worktree in a background task (misc 151 triggers 1/2/4).
 ///
 /// Blocking (git subprocesses) — call from `spawn_blocking`. On a clean dispose
-/// the registry entry is dropped; on a dirty keep the parent is surfaced
-/// ([`surface_dirty_kept`]) unless the removal was host-initiated (`WorktreeRemove`
-/// logs the divergence inside [`crate::worktree_dispose::dispose`] instead). A
-/// path with no registry entry and no sidecar is silently skipped (never ours).
+/// the registry entry is dropped (and the dir removal fires the vanish-watch,
+/// which retires the mount); on a dirty keep the worktree is left untouched and
+/// the once-per-path firehose record fires ([`surface_dirty_kept`]) unless the
+/// removal was host-initiated (`WorktreeRemove` logs the divergence inside
+/// [`crate::worktree_dispose::dispose`] instead). The kept dir persists for
+/// `land`/`rm`, discoverable via the session-start linger nag and `worktree ls`;
+/// its mount is governed by the kept countdown, never auto-cleaned (the
+/// maintainer-verbatim absolute). A path with no registry entry and no sidecar is
+/// silently skipped (never ours).
 ///
-/// `stopping_agent_id` is the identity gate for the `SubagentStop` fallback (bug
-/// 103). `SubagentStop` resolves its dispose target identity-first, cwd-second
-/// (`resolve_stop_reap_target`); the cwd fallback resolves the *enclosing*
-/// worktree root, so a nested/foreign subagent whose cwd merely sits inside a
-/// live sibling's worktree resolves onto that sibling — and the clean arm would
-/// then **delete** the live owner's tree. Passing `Some(stopping_agent_id)` gates
-/// the dispose to a matching owner: the tree is disposed only when the stopping
-/// agent IS the worktree's owner (its dirname, bug 91's [`worktree_owner_label`]).
-/// A foreign stop skips the dispose entirely — the fallback may have surfaced the
-/// worktree, but must never SELECT it as a dispose target; the hourly GC (which
-/// prunes gone dirs, `497c989`) carries any genuinely-orphaned tree. Pass `None`
-/// to bypass the gate for a host-initiated `WorktreeRemove`, where the human
-/// asked for removal of this exact path and there is no stopping-agent identity.
+/// `stopping_agent_id` is the ownership gate for the `SubagentStop` path (bug
+/// 103). The stop's cwd is resolved to its *enclosing* worktree root, so a
+/// nested/foreign subagent whose cwd merely sits inside a live sibling's worktree
+/// resolves onto that sibling — and the clean arm would then **delete** the live
+/// owner's tree. Passing `Some(stopping_agent_id)` gates the dispose to a matching
+/// owner: the tree is disposed only when the stopping agent IS the worktree's
+/// owner (its dirname, bug 91's [`worktree_owner_label`]). A foreign stop skips
+/// the dispose entirely; the hourly GC (which prunes gone dirs, `497c989`) carries
+/// any genuinely-orphaned tree. Pass `None` to bypass the gate for a
+/// host-initiated `WorktreeRemove`, where the human asked for removal of this
+/// exact path and there is no stopping-agent identity.
 #[cfg(unix)]
 fn dispose_worktree_in_background(
     registry: &WorktreeRegistry,
-    parent_context: &crate::bridge::ParentContextQueue,
     session_id: &str,
     stopping_agent_id: Option<&str>,
     worktree: &Path,
@@ -4443,10 +4489,10 @@ fn dispose_worktree_in_background(
     else {
         return;
     };
-    // Bug 103 identity gate: a `SubagentStop` may dispose only its own worktree.
+    // Bug 103 ownership gate: a `SubagentStop` may dispose only its own worktree.
     // A stop whose agent identity does not own this tree must not select it for
-    // disposal, even though the cwd fallback surfaced it. `None` (a host-initiated
-    // `WorktreeRemove`) bypasses the gate.
+    // disposal, even though the cwd resolution enclosed it. `None` (a
+    // host-initiated `WorktreeRemove`) bypasses the gate.
     if let Some(stopping_agent_id) = stopping_agent_id
         && !stop_owns_worktree(stopping_agent_id, worktree)
     {
@@ -4457,7 +4503,7 @@ fn dispose_worktree_in_background(
             owner = %worktree_owner_label(worktree),
             worktree = %worktree.display(),
             "subagent stop dispose skipped — stopping agent is not the worktree owner \
-             (cwd fallback surfaced a live sibling; not disposing)",
+             (cwd resolution enclosed a live sibling; not disposing)",
         );
         return;
     }
@@ -4466,7 +4512,7 @@ fn dispose_worktree_in_background(
         crate::worktree_dispose::Disposition::Disposed
         | crate::worktree_dispose::Disposition::Remnant => registry.forget(worktree),
         crate::worktree_dispose::Disposition::KeptDirty { .. } if !host_initiated => {
-            surface_dirty_kept(registry, parent_context, session_id, worktree);
+            surface_dirty_kept(registry, session_id, worktree);
         }
         _ => {}
     }
@@ -4491,15 +4537,16 @@ fn worktree_owner_label(worktree: &Path) -> String {
 /// Whether the agent stopping at `SubagentStop` **owns** `worktree` — the bug 103
 /// dispose gate.
 ///
-/// `resolve_stop_reap_target` resolves a stop's dispose target identity-first,
-/// cwd-second; the cwd leg falls back to the *enclosing* worktree root, so a
-/// nested/foreign subagent whose cwd merely sits inside a live sibling's tree
-/// resolves onto that sibling. Disposing there would delete a live owner's
-/// workspace (bug 103). Ownership is the tree's on-disk directory name — bug 91's
-/// dirname-IS-owner primitive ([`worktree_owner_label`]): a subagent worktree's
-/// leaf segment is exactly its agent id (misc 150). Only a stop whose agent
-/// identity equals that owner may dispose; a foreign stop must not select the
-/// tree, letting the hourly GC carry any genuinely-orphaned one.
+/// `resolve_stop_reap_target` resolves a stop's target by cwd — the *enclosing*
+/// worktree root — so a nested/foreign subagent whose cwd merely sits inside a
+/// live sibling's tree resolves onto that sibling. Disposing there would delete a
+/// live owner's workspace (bug 103). Ownership is the tree's on-disk directory
+/// name — bug 91's dirname-IS-owner primitive ([`worktree_owner_label`]): a
+/// subagent worktree's leaf segment is exactly its agent id (misc 150). Only a
+/// stop whose agent identity equals that owner may dispose; a foreign stop must
+/// not select the tree, letting the hourly GC carry any genuinely-orphaned one.
+/// (Identity appears here only as the ownership tag at the hook, never as a
+/// daemon lookup key — the same seam the lock uses.)
 #[cfg(unix)]
 fn stop_owns_worktree(stopping_agent_id: &str, worktree: &Path) -> bool {
     // An empty id (no agent identity in the stop payload) can never prove
@@ -4507,63 +4554,35 @@ fn stop_owns_worktree(stopping_agent_id: &str, worktree: &Path) -> bool {
     !stopping_agent_id.is_empty() && stopping_agent_id == worktree_owner_label(worktree)
 }
 
-/// Surface a dirty worktree kept at `SubagentStop` to the *parent agent* (misc
-/// 151, D-1) — once per worktree path (bug 91).
+/// Record a dirty worktree kept at `SubagentStop` — once per worktree path (bug
+/// 91), a firehose/TUI record only (root-ownership 04).
 ///
-/// The retired notification queue's user `systemMessage` leg is gone (tui-rework
-/// 04): the notice's actionable audience is the parent agent, delivered as
-/// `additionalContext` ([`queue_parent_additional_context`]). The `warn!` stays
-/// as the firehose/log record of the event (queryable via `catenary query`), no
-/// longer a user notification.
+/// The identity-addressed parent-agent `additionalContext` side channel (the
+/// `ParentContextQueue`) retired with the worktree countdown: nothing needs to
+/// find "the agent that spawned it." The dirty worktree is discoverable exactly
+/// where it lives — the session-start linger nag and `catenary worktree ls` — and
+/// its mount is governed by the kept countdown. The `warn!` stays as the
+/// firehose/log record of the event (queryable via `catenary query`, a TUI health
+/// finding).
 ///
 /// Bug 91: the owner is the worktree's own directory name
-/// ([`worktree_owner_label`]), not the triggering subagent's id, and the notice
+/// ([`worktree_owner_label`]), not the triggering subagent's id, and the record
 /// is deduped to **once per worktree path** ([`WorktreeRegistry::mark_surfaced`]).
-/// Several subagents whose cwd resolves to the one surviving dirty worktree used
-/// to each queue a line naming their own (phantom-to-that-path) id; now the one
-/// worktree yields one reminder naming its real owner. The dedup never suppresses
-/// a *first* report — a dirty worktree that exists is always surfaced.
+/// The dedup never suppresses a *first* report — a dirty worktree that exists is
+/// always recorded.
 #[cfg(unix)]
-fn surface_dirty_kept(
-    registry: &WorktreeRegistry,
-    parent_context: &crate::bridge::ParentContextQueue,
-    session_id: &str,
-    worktree: &Path,
-) {
+fn surface_dirty_kept(registry: &WorktreeRegistry, session_id: &str, worktree: &Path) {
     if !registry.mark_surfaced(worktree) {
-        return; // already surfaced this worktree — one reminder per path
+        return; // already surfaced this worktree — one record per path
     }
     let owner = worktree_owner_label(worktree);
-    let message = format!(
+    warn!(
+        source = Source::DaemonDispatch.as_str(),
+        session_id = %session_id,
         "subagent `{owner}` left a dirty worktree at `{}` (kept; land its work \
          or `catenary worktree rm` it)",
         worktree.display(),
     );
-    warn!(
-        source = Source::DaemonDispatch.as_str(),
-        session_id = %session_id,
-        "{message}",
-    );
-    queue_parent_additional_context(parent_context, session_id, message);
-}
-
-/// Deliver the dirty-kept notice to the *parent agent* as `additionalContext`
-/// on its next eligible hook response (misc 151, D-1 — the cashed-in stub).
-///
-/// The `SubagentStop` response goes to the *stopping subagent*, not the parent,
-/// so the notice is queued against the parent's `session_id` in the shared
-/// [`ParentContextQueue`](crate::bridge::ParentContextQueue). The parent's own
-/// hook dispatch drains it on its next allowed `PreToolUse` / `Stop` (see
-/// [`HookRouter::drain_parent_context`](crate::bridge::HookRouter)), where the
-/// CLI emits it as `hookSpecificOutput.additionalContext`. Session-scoped,
-/// dropped on session end.
-#[cfg(unix)]
-fn queue_parent_additional_context(
-    parent_context: &crate::bridge::ParentContextQueue,
-    session_id: &str,
-    message: String,
-) {
-    parent_context.queue(session_id, message);
 }
 
 /// The `id`s of background subagents reported **running** in a stop payload's
@@ -5132,6 +5151,27 @@ async fn handle_hook_dispatch(
         .unwrap_or("default")
         .to_string();
 
+    // ── The one hook seam: cwd-activity resets every mount lifetime (root-ownership 04) ──
+    //
+    // Every hook carries cwd, so ANY hook resolving into a mounted root is
+    // activity — one activity model for every mount lifetime, fed from this one
+    // seam. It refreshes the covering ephemeral root's idle clock AND the covering
+    // worktree's kept countdown (clearing any blocked-on-permission flag too), so
+    // an ephemeral or kept-worktree mount under active hook traffic — edits,
+    // reads, even a PermissionRequest — never idle-expires. Reads count: a bare
+    // `catenary grep`/`glob` is not a hook, but the host's own PreToolUse for the
+    // read tool is, and it lands here. Pure refresh — mounting is a query's job
+    // (`ensure_ephemeral_mounts`), never a hook's, so this stays fast. Runs before
+    // every method short-circuit so no hook is exempt.
+    if let Some(cwd) = hook_cwd(&raw) {
+        let canonical = Path::new(cwd)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(cwd));
+        let now = Instant::now();
+        ctx.ephemeral_mounts.touch_covering(&canonical, now);
+        ctx.worktree_mounts.touch_covering(&canonical, now);
+    }
+
     // ── Antigravity teaching first-sighting (teaching-surface ticket 03) ──
     //
     // Fires on every Antigravity `PreInvocation` (before each model call). The
@@ -5176,7 +5216,7 @@ async fn handle_hook_dispatch(
     //
     // Fires when the host CLI sends a SessionEnd hook (exit, /clear,
     // resume, logout). Cleans up session-scoped state: editing
-    // guardrail, parent-context queue, session registry, and roots.
+    // guardrail, session registry, and roots.
     //
     // Short-circuits before get_or_create_router to avoid creating
     // a new session just to immediately clean it up.
@@ -5186,10 +5226,6 @@ async fn handle_hook_dispatch(
         // Release editing guardrail locks (idempotent if MCP
         // disconnect already ran).
         ctx.editing_guardrail.release_all(&session_id);
-
-        // Drop any undelivered parent-agent context for this session
-        // (misc 151 — session-scoped, dropped on session end).
-        ctx.primary.parent_context.remove_session(&session_id);
 
         // Remove the session from the registry.
         ctx.sessions
@@ -5379,23 +5415,18 @@ async fn handle_hook_dispatch(
         {
             let roots: HashSet<PathBuf> = tracker.global_roots().into_iter().collect();
             if let Some(worktree) = worktree_to_auto_mount(Path::new(cwd), &roots) {
-                // Identity-keyed when the payload carries `agent_id`
-                // (`worktree:{session_id}:{agent_id}`) so the SubagentStop reap
-                // rebuilds the key from identity alone (misc 150); otherwise the
-                // path-keyed form (`--worktree`/foreign, no agent identity), which
-                // teardown rebuilds by canonicalizing `worktree_path`. The tracked
-                // root VALUE is the canonical worktree path either way.
-                let agent_id = raw.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-                let contributor = if agent_id.is_empty() {
-                    format!("worktree:{session_id}:{}", worktree.display())
-                } else {
-                    format!("worktree:{session_id}:{agent_id}")
-                };
+                // Uniformly path-shaped (`worktree:{session}:{canonical-path}`):
+                // the teardown routes (SubagentStop, WorktreeRemove) rebuild the
+                // exact key by canonicalizing the same worktree path, so no
+                // identity is needed to find the mount. The identity-shaped
+                // `worktree:{session}:{agent}` form retired with the registry
+                // identity lookups (root-ownership 04, AUDIT #10/#11).
+                let (_canonical, contributor) = worktree_contributor(&session_id, &worktree);
                 tracker.set_roots(&contributor, vec![worktree.clone()]);
-                // Track the mounted worktree root for the blocked-on-permission
-                // display flag (misc 150). The root is pinned-class — its lifetime
-                // is the directory (the vanish-watch retires it), not an idle clock
-                // (bug 106).
+                // Track the mounted worktree root (root-ownership 04): a LIVE
+                // worktree is pinned-class (no countdown) — its release edge is
+                // the vanish-watch — until its subagent stops dirty, when the
+                // SubagentStop path arms the kept countdown on this mount.
                 ctx.worktree_mounts.track(&contributor, &worktree);
 
                 // Register the bounded deletion watch (ticket 05): the prompt
@@ -5488,10 +5519,11 @@ async fn handle_hook_dispatch(
             && let Some(raw_path) = raw.get("worktree_path").and_then(|v| v.as_str())
         {
             let (canonical, path_key) = worktree_contributor(&session_id, Path::new(raw_path));
-            // The mount may be identity-keyed (`worktree:{sid}:{agent_id}`), which
-            // is not path-derivable, so reverse-lookup the `worktree:*` contributor
-            // whose tracked root VALUE is this path (misc 150). Fall back to the
-            // path-keyed form for a still-path-keyed mount that never registered.
+            // Mounts are uniformly path-keyed (`worktree:{sid}:{canonical-path}`;
+            // root-ownership 04), so `path_key` rebuilt from the canonicalized
+            // `worktree_path` IS the mount key. The reverse-lookup by tracked-root
+            // VALUE stays as a belt-and-suspenders match for any legacy/foreign
+            // key spelling, falling back to the path form.
             let contributor = tracker
                 .contributors_with_prefix("worktree:")
                 .into_iter()
@@ -5517,13 +5549,12 @@ async fn handle_hook_dispatch(
             // The guard is unchanged — never a path outside our scheme or without
             // a sidecar. (Dormant for git, whose worktrees the host removes itself.)
             let registry = ctx.worktree_registry.clone();
-            let parent_context = ctx.primary.parent_context.clone();
             let sid = session_id.clone();
             let wt = canonical.clone();
             tokio::task::spawn_blocking(move || {
                 // Host-initiated removal: no stopping-agent identity to gate on —
                 // the human asked for this exact path (bug 103 gate bypassed).
-                dispose_worktree_in_background(&registry, &parent_context, &sid, None, &wt, true);
+                dispose_worktree_in_background(&registry, &sid, None, &wt, true);
             });
         }
 
@@ -5552,37 +5583,33 @@ async fn handle_hook_dispatch(
     // ── Blocked-on-permission (misc 150) ──────────────────────────
     //
     // Fires when the host CLI sends a `PermissionRequest` hook (a pure observer;
-    // returns no decision). Marks the agent's worktree root **blocked** — a
-    // subagent parked at a permission prompt — so `catenary worktree ls` renders
-    // its root-state as `blocked` (misc 151). Identity-scoped when the payload
-    // carries `agent_id`; else the coarse fallback marks ALL of this session's
-    // worktree roots (prompts are rare). The flag clears on the next identity
-    // event (any hook dispatch with that agent_id) or qualifying activity under
-    // the root. The flag no longer gates a lifetime decision: worktree roots are
-    // pinned-class (no idle expiry — bug 106), released only by the vanish-watch.
+    // returns no decision). Marks the worktree root enclosing the prompt's cwd
+    // **blocked** — a subagent parked at a permission prompt — so `catenary
+    // worktree ls` renders its root-state as `blocked` (misc 151). Resolved by
+    // PATH (the prompt's cwd → its enclosing worktree), not identity: the
+    // identity-scoped mark and the no-agent-id coarse session fallback retired
+    // with the registry identity lookups (root-ownership 04, AUDIT #11). The flag
+    // clears on any subsequent activity resolving into the root (`touch_covering`
+    // at the one hook seam). It gates no lifetime decision — the kept countdown
+    // is pure hook-activity reset, with no pause machinery (the answer-desk
+    // ruling); a PermissionRequest is itself activity that resets the countdown
+    // via the one hook seam.
     //
     // Short-circuits before get_or_create_router: daemon-level root concern only.
     if method == "permission-request/blocked" {
         let scope_id = uuid::Uuid::new_v4().to_string();
 
-        let agent_id = raw.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-        if agent_id.is_empty() {
-            let marked = ctx.worktree_mounts.mark_blocked_session(&session_id);
+        if let Some(cwd) = hook_cwd(&raw) {
+            let canonical = Path::new(cwd)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(cwd));
+            let marked = ctx.worktree_mounts.mark_blocked_covering(&canonical);
             debug!(
                 source = Source::DaemonDispatch.as_str(),
                 session_id = %session_id,
+                cwd = cwd,
                 count = marked,
-                "permission prompt (no agent id): marked the session's worktree roots blocked",
-            );
-        } else {
-            let contributor = format!("worktree:{session_id}:{agent_id}");
-            let marked = ctx.worktree_mounts.mark_blocked(&contributor);
-            debug!(
-                source = Source::DaemonDispatch.as_str(),
-                session_id = %session_id,
-                agent_id = agent_id,
-                marked = marked,
-                "permission prompt: marked the agent's worktree root blocked",
+                "permission prompt: marked the enclosing worktree root(s) blocked",
             );
         }
 
@@ -6480,9 +6507,7 @@ async fn handle_hook_dispatch(
     // dir present, root NOT mounted, owning agent NOT running in the stop
     // payload's `background_tasks`, and not yet nagged (once per worktree). A
     // doorbell, not a wall — the `stop_hook_active` retry passes. Fires only on a
-    // clean turn: not already blocking on the editing gate, and no pending
-    // parent-agent context to deliver first (delivering that keeps `result` an
-    // allow this turn; the nag takes the next clean stop). Scoped to the
+    // clean turn: not already blocking on the editing gate. Scoped to the
     // **top-level Stop** (`hook_event_name == "Stop"`) so a leaf subagent's
     // SubagentStop is never held for a sibling's lingering worktree; the
     // mid-tier-parent SubagentStop case is a deferred refinement.
@@ -6497,7 +6522,6 @@ async fn handle_hook_dispatch(
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
         && result.result.is_none()
-        && result.additional_context.is_none()
         && let Some(nag) = lingering_worktree_nag(&ctx, &session_id, &raw)
     {
         result.result = Some(crate::hook::HookResult::Block(nag));
@@ -6514,25 +6538,28 @@ async fn handle_hook_dispatch(
     // documents belong to exactly one editor, so root-lifetime teardown closes
     // exactly the right set.
 
-    // ── Subagent worktree teardown at stop (misc 150) ──────────
+    // ── The "kept" signal: arm the worktree countdown at subagent stop (root-ownership 04) ──
     //
     // A Claude Code SubagentStop reaches the daemon as this same
-    // `post-agent/require-release`. Reap the subagent's worktree root now so its
-    // language servers shut down at agent completion, not at the parent's
-    // SessionEnd sweep (the reported RAM buildup — the fix).
+    // `post-agent/require-release`. Instead of tearing the mount down immediately
+    // (the old RAM-buildup fix), arm the KEPT COUNTDOWN on the subagent's worktree
+    // mount: the servers stay warm for a `land`/`rm`, and the countdown (reset by
+    // any hook resolving into the worktree — the one hook seam) bounds how long an
+    // idle kept mount lingers. Expiry retires the MOUNT only (servers, root, lock —
+    // `retire_root`), never the dirty directory. A CLEAN worktree is disposed in
+    // the background below; its dir removal fires the vanish-watch, which retires
+    // the mount at once — the countdown never matters for it.
     //
-    // Outcome-gated (maintainer ruling): reap ONLY when the require-release
-    // outcome ALLOWS the stop. A `Block` means the agent is NOT stopping — it is
-    // about to run `catenary diagnostics` in that very worktree — so the root
-    // stays warm (reaping first would tear down the servers the receipt needs).
-    // Once the debt is paid, the `stop_hook_active` retry allows the stop and the
-    // reap runs.
+    // Outcome-gated (maintainer ruling): arm ONLY when the require-release outcome
+    // ALLOWS the stop. A `Block` means the agent is NOT stopping — it is about to
+    // run `catenary diagnostics` in that very worktree — so the mount stays a LIVE
+    // (uncounted) mount until the debt is paid and the `stop_hook_active` retry
+    // allows the stop.
     //
-    // Resolution order (misc 150 hardening): identity/registry first, cwd second —
-    // never an exact match on the raw cwd (see `resolve_stop_reap_target`). A pure
-    // side effect (decision 029): invisible to the require-release response.
+    // Resolution is by cwd — pure path algebra, no identity
+    // (`resolve_stop_reap_target`; root-ownership 04, AUDIT #10/#11). A pure side
+    // effect (decision 029): invisible to the require-release response.
     if method == "post-agent/require-release"
-        && let Some(ref tracker) = ctx.root_tracker
         && let Some(hp) = raw.get("host_payload")
         && hp.get("hook_event_name").and_then(|v| v.as_str()) == Some("SubagentStop")
         && !matches!(&result.result, Some(crate::hook::HookResult::Block(_)))
@@ -6542,93 +6569,64 @@ async fn handle_hook_dispatch(
         // a blocked stop, gated out above, means it is still running).
         ctx.subagents.stop(&session_id, agent_id);
         let cwd = hp.get("cwd").and_then(|v| v.as_str());
-        if let Some((contributor, worktree)) =
-            resolve_stop_reap_target(&ctx, tracker, &session_id, agent_id, cwd)
-        {
-            if tracker.has_contributor(&contributor) {
-                reap_worktree_root(
-                    &ctx,
-                    tracker,
-                    &session_id,
-                    &contributor,
-                    &worktree,
-                    "subagent stop",
-                )
-                .await;
-            } else {
-                debug!(
-                    source = Source::DaemonDispatch.as_str(),
-                    session_id = %session_id,
-                    agent_id = agent_id,
-                    contributor = %contributor,
-                    "subagent stop worktree teardown skipped (no live worktree root for identity/cwd)",
-                );
-            }
+        if let Some((_contributor, worktree)) = resolve_stop_reap_target(&session_id, cwd) {
+            // Arm the kept countdown on the mount enclosing the stop's cwd (the
+            // "kept" signal). A LIVE mount enters the countdown; the reaper retires
+            // it after the idle window unless a hook refreshes it first. Resolved
+            // by path — the stopping cwd's enclosing worktree — so no identity is
+            // needed. A no-op when the worktree was never a mounted root of ours.
+            let armed = ctx.worktree_mounts.arm_countdown(&worktree, Instant::now());
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                session_id = %session_id,
+                worktree = %worktree.display(),
+                armed = armed,
+                "subagent stop: armed the worktree kept countdown",
+            );
 
             // misc 151 trigger 1: dispose the subagent's worktree in the
             // background (spawn_blocking for the git subprocesses) so the
             // stop-gate response latency is untouched (decision 029). Clean →
-            // auto-disposed; dirty → kept and surfaced to the parent (D-1). Runs
-            // whether or not the root was still mounted (an idle-reaped worktree
-            // still disposes).
+            // auto-disposed (dir removed → the vanish-watch retires the mount);
+            // dirty → KEPT untouched, discoverable via the session-start linger
+            // nag and `worktree ls`, its mount governed by the countdown just
+            // armed. Never auto-cleaned (the maintainer-verbatim absolute).
             //
-            // Bug 103 identity gate: pass the stopping agent's id so the dispose
-            // fires only when it IS the worktree's owner. `resolve_stop_reap_target`
-            // may fall back to the cwd-enclosing root, resolving a nested/foreign
-            // subagent's stop onto a live sibling's tree; the gate stops that
-            // fallback from disposing a tree the stopping agent does not own.
+            // Bug 103 ownership gate: pass the stopping agent's id so the dispose
+            // fires only when it IS the worktree's owner (its dirname). The cwd
+            // resolution may enclose a live sibling's tree; the gate stops that
+            // from disposing a tree the stopping agent does not own.
             let registry = ctx.worktree_registry.clone();
-            let parent_context = ctx.primary.parent_context.clone();
             let sid = session_id.clone();
             let aid = agent_id.to_string();
-            let wt = worktree.clone();
+            let wt = worktree;
             tokio::task::spawn_blocking(move || {
-                dispose_worktree_in_background(
-                    &registry,
-                    &parent_context,
-                    &sid,
-                    Some(&aid),
-                    &wt,
-                    false,
-                );
+                dispose_worktree_in_background(&registry, &sid, Some(&aid), &wt, false);
             });
         }
     }
 
-    // A hook dispatch carrying an agent identity clears any blocked-on-permission
-    // flag for that agent's worktree root (misc 150) — the human answered the
-    // prompt and the agent resumed, so `catenary worktree ls` stops rendering it
-    // `blocked`. (The SubagentStop reap above already dropped the entry, so this
-    // is a no-op there.)
-    if let Some(aid) = raw
-        .get("agent_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        ctx.worktree_mounts
-            .clear_blocked(&format!("worktree:{session_id}:{aid}"));
-    }
-
-    // Edit tracking is a qualifying activity (ticket 02 / misc 150): a `PreToolUse`
-    // edit of a file under an ephemeral root refreshes that root's idle clock, so
-    // an agent actively editing under it never has it expire mid-work; an edit
-    // under a worktree root clears any blocked-on-permission flag (the worktree
-    // root itself no longer expires on idle, bug 106). This only *refreshes* —
-    // edits never mount (a query does), keeping the edit hook fast.
+    // Edit tracking is a qualifying activity (ticket 02 / root-ownership 04): a
+    // `PreToolUse` edit of a file under an ephemeral or kept-worktree root
+    // refreshes its idle clock / kept countdown, so an agent actively editing
+    // under it never has it expire mid-work; the covering worktree's
+    // blocked-on-permission flag clears too. This is a belt-and-suspenders refresh
+    // on the specific edited `file_path` (the one hook seam above already
+    // refreshed on the hook's cwd); it only *refreshes* — edits never mount (a
+    // query does), keeping the edit hook fast.
     if let Some(file_path) = raw.get("file_path").and_then(|v| v.as_str()) {
         let path = Path::new(file_path);
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let now = Instant::now();
         ctx.ephemeral_mounts.touch_covering(&canonical, now);
-        ctx.worktree_mounts.touch_covering(&canonical);
+        ctx.worktree_mounts.touch_covering(&canonical, now);
     }
 
     let envelope = HookResponseEnvelope {
         result: result.result,
-        additional_context: result.additional_context,
     };
 
-    let response = if envelope.result.is_some() || envelope.additional_context.is_some() {
+    let response = if envelope.result.is_some() {
         serde_json::to_string(&envelope)?
     } else {
         String::new()
@@ -8467,14 +8465,12 @@ mod tests {
         let logging = LoggingServer::new();
         let runtime = tokio::runtime::Handle::current();
         let instance_id: Arc<str> = "daemon".into();
-        let parent_context = crate::bridge::ParentContextQueue::new();
         let session = Arc::new(crate::bridge::session::Session::new(
             config,
             roots,
             logging.clone(),
             instance_id,
             runtime,
-            parent_context,
             None,
         ));
 
@@ -8525,14 +8521,12 @@ mod tests {
         use crate::state_snapshot::{SessionBoard, SessionStatus};
 
         let instance_id: Arc<str> = "sess-1".into();
-        let parent_context = crate::bridge::ParentContextQueue::new();
         let session = Arc::new(crate::bridge::session::Session::new(
             crate::config::Config::default(),
             vec![],
             LoggingServer::new(),
             instance_id.clone(),
             tokio::runtime::Handle::current(),
-            parent_context,
             None,
         ));
         let router = Arc::new(HookRouter::new(
@@ -9732,38 +9726,26 @@ mod tests {
     }
 
     #[test]
-    fn surface_dirty_kept_is_once_per_path_naming_the_dirname() {
+    fn surface_dirty_kept_is_once_per_path() {
         // Bug 91 — the sighting pinned: several subagents whose cwd resolves to
         // the ONE surviving dirty worktree each drive `surface_dirty_kept` for
-        // that same path (the phantom-agent pileup). It must now yield exactly
-        // ONE reminder, attributed to the worktree's on-disk directory name (the
-        // real owner's agent id) — never one line per triggering agent.
+        // that same path (the phantom-agent pileup). It must record exactly ONCE
+        // per worktree path (root-ownership 04: a firehose/TUI record, no longer a
+        // parent-agent queue). The once-per-path dedup rides
+        // `WorktreeRegistry::mark_surfaced`.
         let registry = WorktreeRegistry::new();
-        let parent_context = crate::bridge::ParentContextQueue::new();
         // The surviving dirty worktree — its leaf dir name IS the owner agent id
-        // (misc 150: `worktree_segment` uses the bare `agent-<id>` id as the
-        // segment), matching the ticket's `.../a8458e9e8f03be469`.
+        // (misc 150), matching the ticket's `.../a8458e9e8f03be469`.
         let worktree = PathBuf::from("/state/catenary/worktrees/agents/sess-1/a8458e9e8f03be469");
 
-        // Three phantom stops + the real one all resolve (via cwd) to this path.
-        for _ in 0..4 {
-            surface_dirty_kept(&registry, &parent_context, "sess-1", &worktree);
-        }
-
-        let drained = parent_context.drain("sess-1");
-        assert_eq!(
-            drained.len(),
-            1,
-            "one dirty worktree yields exactly one reminder (deduped by path): {drained:?}",
-        );
-        let line = &drained[0];
+        // The first call records and marks the path surfaced.
+        surface_dirty_kept(&registry, "sess-1", &worktree);
+        // Three phantom stops + the real one all resolve (via cwd) to this path;
+        // every subsequent call is a no-op — the path is already marked surfaced,
+        // so `mark_surfaced` now returns `false` for it.
         assert!(
-            line.contains("subagent `a8458e9e8f03be469` left a dirty worktree"),
-            "the reminder names the dirname-derived owner, not a triggering agent: {line}",
-        );
-        assert!(
-            line.contains(&worktree.display().to_string()),
-            "the reminder still carries the surviving worktree path: {line}",
+            !registry.mark_surfaced(&worktree),
+            "the first surface_dirty_kept marked the path surfaced (deduped)",
         );
     }
 
@@ -9839,7 +9821,6 @@ mod tests {
         std::fs::create_dir_all(&worktree).expect("mkdir worktree");
 
         let registry = WorktreeRegistry::new();
-        let parent_context = crate::bridge::ParentContextQueue::new();
         registry.register(crate::worktree_create::WorktreeMeta {
             worktree: worktree.clone(),
             source_repo: PathBuf::from("/repo"),
@@ -9854,18 +9835,11 @@ mod tests {
             vcs: crate::worktree_create::WORKTREE_VCS_GIT.to_string(),
         });
 
-        // First surfacing — always reported.
-        surface_dirty_kept(&registry, &parent_context, "sess-1", &worktree);
-        assert_eq!(
-            parent_context.drain("sess-1").len(),
-            1,
-            "first report fires"
-        );
-        // Duplicate while the dir still exists — suppressed.
-        surface_dirty_kept(&registry, &parent_context, "sess-1", &worktree);
-        assert_eq!(
-            parent_context.drain("sess-1").len(),
-            0,
+        // First surfacing — always recorded (marks the path surfaced).
+        surface_dirty_kept(&registry, "sess-1", &worktree);
+        // Duplicate while the dir still exists — suppressed (already marked).
+        assert!(
+            !registry.mark_surfaced(&worktree),
             "a duplicate for the same present path is deduped",
         );
 
@@ -9879,11 +9853,11 @@ mod tests {
         );
         // A new worktree is created at the same path — it must surface afresh.
         std::fs::create_dir_all(&worktree).expect("recreate worktree");
-        surface_dirty_kept(&registry, &parent_context, "sess-1", &worktree);
-        assert_eq!(
-            parent_context.drain("sess-1").len(),
-            1,
-            "a worktree recreated at a pruned path surfaces afresh (safety net intact)",
+        surface_dirty_kept(&registry, "sess-1", &worktree);
+        assert!(
+            !registry.mark_surfaced(&worktree),
+            "a worktree recreated at a pruned path surfaces afresh then re-dedups \
+             (safety net intact)",
         );
     }
 
@@ -9933,7 +9907,6 @@ mod tests {
         std::fs::create_dir_all(&worktree).expect("mkdir worktree");
 
         let registry = WorktreeRegistry::new();
-        let parent_context = crate::bridge::ParentContextQueue::new();
         registry.register(crate::worktree_create::WorktreeMeta {
             worktree: worktree.clone(),
             source_repo: PathBuf::from("/repo"),
@@ -9952,7 +9925,6 @@ mod tests {
         // resolved onto the owner's tree.
         dispose_worktree_in_background(
             &registry,
-            &parent_context,
             "sess-1",
             Some("nested-guide-agent"),
             &worktree,
@@ -9968,10 +9940,10 @@ mod tests {
             Some(worktree.clone()),
             "the registration survives — the gate short-circuited before dispose",
         );
-        assert_eq!(
-            parent_context.drain("sess-1").len(),
-            0,
-            "a foreign stop surfaces nothing (it never reached the dispose)",
+        assert!(
+            registry.mark_surfaced(&worktree),
+            "a foreign stop surfaces nothing — the path was never marked surfaced \
+             (it never reached the dispose)",
         );
     }
 
@@ -9989,7 +9961,6 @@ mod tests {
         std::fs::create_dir_all(&worktree).expect("mkdir worktree");
 
         let registry = WorktreeRegistry::new();
-        let parent_context = crate::bridge::ParentContextQueue::new();
         registry.register(crate::worktree_create::WorktreeMeta {
             worktree: worktree.clone(),
             source_repo: PathBuf::from("/repo"),
@@ -10005,14 +9976,7 @@ mod tests {
         });
 
         // The owner's own stop (id == the worktree's owner dirname) passes the gate.
-        dispose_worktree_in_background(
-            &registry,
-            &parent_context,
-            "sess-1",
-            Some("owner-id"),
-            &worktree,
-            false,
-        );
+        dispose_worktree_in_background(&registry, "sess-1", Some("owner-id"), &worktree, false);
 
         // The gate itself is the assertion of record.
         assert!(
@@ -10023,10 +9987,9 @@ mod tests {
         // its registration are untouched (no forget, no surface) — the gate did
         // not swallow the call, `dispose`'s guard did.
         assert!(worktree.exists(), "a `NotOurs` path is never deleted");
-        assert_eq!(
-            parent_context.drain("sess-1").len(),
-            0,
-            "a `NotOurs` disposition surfaces nothing",
+        assert!(
+            registry.mark_surfaced(&worktree),
+            "a `NotOurs` disposition surfaces nothing — the path was never marked",
         );
     }
 
@@ -10046,7 +10009,6 @@ mod tests {
         std::fs::create_dir_all(&worktree).expect("mkdir worktree");
 
         let registry = WorktreeRegistry::new();
-        let parent_context = crate::bridge::ParentContextQueue::new();
         registry.register(crate::worktree_create::WorktreeMeta {
             worktree: worktree.clone(),
             source_repo: PathBuf::from("/repo"),
@@ -10062,7 +10024,7 @@ mod tests {
         });
 
         // Host-initiated dispose: `None` bypasses the gate entirely.
-        dispose_worktree_in_background(&registry, &parent_context, "sess-1", None, &worktree, true);
+        dispose_worktree_in_background(&registry, "sess-1", None, &worktree, true);
 
         // `None` is not subject to ownership: had the gate applied it would have
         // skipped (dirname "my-feature" is no agent id). It reaches `dispose`,
@@ -10705,12 +10667,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn subagent_stop_tears_down_mounted_worktree() {
-        // misc 150 hardening: a SubagentStop reaches the daemon as
-        // `post-agent/require-release`. With `agent_id` present at both mount and
-        // stop, the mount is IDENTITY-keyed (`worktree:{sid}:{agent_id}`) and the
-        // reap rebuilds that key from identity alone — no path needed. The reap is
-        // a pure side effect while the require-release contract still allows.
+    async fn subagent_stop_arms_countdown_and_keeps_mount() {
+        // root-ownership 04: a SubagentStop reaches the daemon as
+        // `post-agent/require-release`. The mount is PATH-keyed
+        // (`worktree:{sid}:{canonical-path}`) — no identity — and SubagentStop no
+        // longer tears it down: it ARMS the kept countdown so the servers stay
+        // warm for a `land`/`rm`, with the countdown (reset by hook activity)
+        // bounding an idle mount's lifetime. The mount persists across the stop.
         let dir = tempfile::tempdir().expect("create tempdir");
         let ipc_path = ipc_socket_in(dir.path());
         let base = dir.path().canonicalize().expect("canonicalize");
@@ -10731,7 +10694,7 @@ mod tests {
             }),
         )
         .await;
-        // Mount WITH an agent id → identity-keyed contributor.
+        // Mount WITH an agent id — the contributor is nonetheless path-keyed.
         let _ = hook_roundtrip(
             &ipc_path,
             &serde_json::json!({
@@ -10749,11 +10712,11 @@ mod tests {
             .expect("precondition: worktree mounted");
         assert_eq!(
             entry.1,
-            vec!["worktree:sess-1:sub-1".to_string()],
-            "the mount is identity-keyed, not path-keyed",
+            vec![format!("worktree:sess-1:{}", worktree.display())],
+            "the mount is uniformly path-keyed, never identity-keyed",
         );
 
-        // SubagentStop carrying the same identity — reaps by identity alone.
+        // SubagentStop — arms the countdown by cwd, keeps the mount.
         let resp = hook_roundtrip(
             &ipc_path,
             &serde_json::json!({
@@ -10769,22 +10732,99 @@ mod tests {
         )
         .await;
         // Require-release contract intact: a subagent with no editing debt is
-        // allowed to stop — empty response, never a block. The teardown is a
-        // pure side effect (decision 029).
+        // allowed to stop — empty response, never a block. Arming is a pure side
+        // effect (decision 029).
         assert!(
             resp.trim().is_empty(),
-            "require-release still allows the stop (teardown is invisible): {resp:?}",
+            "require-release still allows the stop (arming is invisible): {resp:?}",
         );
 
         let roots = roots_ls(&ipc_path).await;
         assert!(
-            !roots.iter().any(|(p, _)| Path::new(p) == worktree),
-            "worktree torn down at SubagentStop: {roots:?}",
+            roots.iter().any(|(p, _)| Path::new(p) == worktree),
+            "the worktree MOUNT persists across SubagentStop (kept warm for land/rm; \
+             the countdown, not the stop, retires it): {roots:?}",
         );
         // The seeded project root (other contributor) is untouched.
         assert!(
             roots.iter().any(|(p, _)| Path::new(p) == project),
-            "the project root (hook contributor) survives teardown",
+            "the project root (hook contributor) survives",
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kept_countdown_expiry_retires_mount_and_leaves_the_dirty_dir() {
+        // The absolute (maintainer-verbatim, root-ownership 04): countdown expiry
+        // retires the MOUNT ONLY (servers + root + lock) and PROVABLY leaves the
+        // dirty directory in place. This drives the exact teardown the reaper runs
+        // (`retire_root`) after arming the countdown, then asserts the worktree dir
+        // still exists on disk.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, worktree) = linked_worktree_layout(&base);
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "tool/roots-add",
+                "path": project.display().to_string(),
+            }),
+        )
+        .await;
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "subagent-start/mount-worktree",
+                "session_id": "sess-1",
+                "cwd": worktree.display().to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            roots_ls(&ipc_path)
+                .await
+                .iter()
+                .any(|(p, _)| Path::new(p) == worktree),
+            "precondition: worktree mounted",
+        );
+
+        // Arm the countdown, then invoke the reaper's exact retire path.
+        let ctx = manager.hook_ctx.as_ref().expect("hook_ctx").clone();
+        let tracker = manager.root_tracker.as_ref().expect("tracker").clone();
+        assert!(ctx.worktree_mounts.arm_countdown(&worktree, Instant::now()));
+        retire_root(&ctx, &tracker, &worktree).await;
+
+        // The MOUNT is gone (servers + root released)…
+        assert!(
+            !roots_ls(&ipc_path)
+                .await
+                .iter()
+                .any(|(p, _)| Path::new(p) == worktree),
+            "countdown expiry retired the worktree mount",
+        );
+        // …the project root (a separate contributor) survives…
+        assert!(
+            roots_ls(&ipc_path)
+                .await
+                .iter()
+                .any(|(p, _)| Path::new(p) == project),
+            "the project root survives the worktree-mount retirement",
+        );
+        // …and the DIRECTORY is untouched — never auto-cleaned (the absolute).
+        assert!(
+            worktree.exists(),
+            "expiry retires the mount ONLY; the dirty worktree directory persists \
+             for land/rm (never auto-cleaned)",
         );
 
         shutdown.cancel();
@@ -10923,12 +10963,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn subagent_stop_outcome_gate_blocks_then_reaps() {
-        // Outcome gate (misc 150 hardening): SubagentStop has two sequenced jobs.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "sequential mount/debt/stop/retry steps"
+    )]
+    async fn subagent_stop_outcome_gate_blocks_then_arms_countdown() {
+        // Outcome gate (root-ownership 04): SubagentStop has two sequenced jobs.
         // While there is undelivered editing debt, require-release BLOCKS (the
         // agent is not stopping — it is about to run diagnostics in the worktree),
-        // so the reap must NOT run and the root stays warm. The `stop_hook_active`
-        // retry then ALLOWS the stop and the reap runs.
+        // so the countdown must NOT arm and the mount is a LIVE (uncounted) mount.
+        // The `stop_hook_active` retry then ALLOWS the stop and ARMS the kept
+        // countdown — the mount persists, warm for a `land`/`rm`.
         let dir = tempfile::tempdir().expect("create tempdir");
         let ipc_path = ipc_socket_in(dir.path());
         let base = dir.path().canonicalize().expect("canonicalize");
@@ -11013,7 +11058,19 @@ mod tests {
             "a blocked stop leaves the worktree mounted (servers stay warm for diagnostics)",
         );
 
-        // Retry with `stop_hook_active` → the stop is ALLOWED → the reap runs.
+        // The block left the mount a LIVE (uncounted) mount — no countdown armed.
+        let key = format!("worktree:sess-1:{}", worktree.display());
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            assert!(
+                ctx.worktree_mounts.kept_since(&key).is_none(),
+                "a blocked stop does not arm the countdown (mount stays LIVE)",
+            );
+        }
+
+        // Retry with `stop_hook_active` → the stop is ALLOWED → the countdown arms
+        // and the mount PERSISTS (warm for land/rm; the countdown, not the stop,
+        // retires it).
         let _ = hook_roundtrip(
             &ipc_path,
             &serde_json::json!({
@@ -11029,21 +11086,29 @@ mod tests {
         )
         .await;
         assert!(
-            !roots_ls(&ipc_path)
+            roots_ls(&ipc_path)
                 .await
                 .iter()
                 .any(|(p, _)| Path::new(p) == worktree),
-            "the allowed retry reaps the worktree root",
+            "the allowed retry keeps the worktree mounted (countdown-governed)",
         );
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            assert!(
+                ctx.worktree_mounts.kept_since(&key).is_some(),
+                "the allowed retry armed the kept countdown on the mount",
+            );
+        }
 
         shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn subagent_stop_foreign_no_agent_id_path_keyed_round_trip() {
+    async fn subagent_stop_foreign_no_agent_id_arms_by_cwd() {
         // Foreign/legacy worktree: no `agent_id` at mount OR stop. The mount is
-        // path-keyed (`worktree:{sid}:{path}`) and the reap resolves via the cwd
-        // route (the enclosing worktree root of the stop cwd).
+        // path-keyed (`worktree:{sid}:{path}`) and SubagentStop arms its countdown
+        // via the cwd route (the enclosing worktree root of the stop cwd) — no
+        // identity anywhere. The mount persists (countdown-governed).
         let dir = tempfile::tempdir().expect("create tempdir");
         let ipc_path = ipc_socket_in(dir.path());
         let base = dir.path().canonicalize().expect("canonicalize");
@@ -11085,7 +11150,7 @@ mod tests {
             "no agent id → path-keyed contributor",
         );
 
-        // SubagentStop WITHOUT an agent id → cwd route reaps the path-keyed mount.
+        // SubagentStop WITHOUT an agent id → cwd route arms the path-keyed mount.
         let _ = hook_roundtrip(
             &ipc_path,
             &serde_json::json!({
@@ -11101,21 +11166,29 @@ mod tests {
         )
         .await;
         assert!(
-            !roots_ls(&ipc_path)
+            roots_ls(&ipc_path)
                 .await
                 .iter()
                 .any(|(p, _)| Path::new(p) == worktree),
-            "path-keyed foreign worktree still reaps at stop via the cwd route",
+            "path-keyed foreign worktree mount persists at stop (countdown armed via cwd)",
         );
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let key = format!("worktree:sess-1:{}", worktree.display());
+            assert!(
+                ctx.worktree_mounts.kept_since(&key).is_some(),
+                "the cwd route armed the kept countdown with no identity",
+            );
+        }
 
         shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn subagent_stop_cwd_fallback_reaps_from_subdirectory() {
-        // The cwd fallback resolves the ENCLOSING worktree root, never an exact
-        // match on the raw cwd: a final `cd` into a subdirectory of the worktree
-        // (the host's carry-over default) still reaps a path-keyed mount.
+    async fn subagent_stop_cwd_arms_from_subdirectory() {
+        // The cwd route resolves the ENCLOSING worktree root, never an exact match
+        // on the raw cwd: a final `cd` into a subdirectory of the worktree (the
+        // host's carry-over default) still arms the enclosing mount's countdown.
         let dir = tempfile::tempdir().expect("create tempdir");
         let ipc_path = ipc_socket_in(dir.path());
         let base = dir.path().canonicalize().expect("canonicalize");
@@ -11172,22 +11245,31 @@ mod tests {
         )
         .await;
         assert!(
-            !roots_ls(&ipc_path)
+            roots_ls(&ipc_path)
                 .await
                 .iter()
                 .any(|(p, _)| Path::new(p) == worktree),
-            "enclosing-root resolution reaps even from a worktree subdirectory",
+            "the mount persists; enclosing-root resolution armed its countdown \
+             even from a worktree subdirectory",
         );
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let key = format!("worktree:sess-1:{}", worktree.display());
+            assert!(
+                ctx.worktree_mounts.kept_since(&key).is_some(),
+                "a subdirectory cwd resolves to the enclosing worktree and arms it",
+            );
+        }
 
         shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn subagent_stop_prefers_registry_over_cwd_on_divergence() {
-        // When the identity route and the cwd route disagree, the identity/registry
-        // route wins: the stop reports worktree B's path as cwd, but the agent's
-        // identity mount is worktree A — so A is reaped and B survives (cwd was not
-        // used for the reap).
+    async fn subagent_stop_arms_the_cwd_worktree_not_a_foreign_one() {
+        // Resolution is cwd-ONLY (root-ownership 04, AUDIT #10/#11): the stop arms
+        // the countdown on the worktree its cwd resolves into (B), and never
+        // reaches for an agent's other worktree (A) by identity. Both mounts
+        // persist (arming keeps the mount); only B's countdown is armed.
         let dir = tempfile::tempdir().expect("create tempdir");
         let ipc_path = ipc_socket_in(dir.path());
         let base = dir.path().canonicalize().expect("canonicalize");
@@ -11212,53 +11294,21 @@ mod tests {
             .await;
         }
 
-        // Identity-key worktree A under sub-1; register it in the daemon registry.
-        let _ = hook_roundtrip(
-            &ipc_path,
-            &serde_json::json!({
-                "method": "subagent-start/mount-worktree",
-                "session_id": "sess-1",
-                "agent_id": "sub-1",
-                "cwd": worktree_a.display().to_string(),
-            }),
-        )
-        .await;
-        let meta = crate::worktree_create::WorktreeMeta {
-            worktree: worktree_a.clone(),
-            source_repo: project_a.clone(),
-            base_commit: "deadbeef".to_string(),
-            branch: "agent-sub-1".to_string(),
-            name: "agent-sub-1".to_string(),
-            agent_id: Some("sub-1".to_string()),
-            session_id: "sess-1".to_string(),
-            created_at: "2026-07-06T00:00:00.000Z".to_string(),
-            class: "agent".to_string(),
-            link: None,
-            vcs: crate::worktree_create::WORKTREE_VCS_GIT.to_string(),
-        };
-        let _ = hook_roundtrip(
-            &ipc_path,
-            &serde_json::json!({
-                "method": "worktree-create/log-payload",
-                "session_id": "sess-1",
-                "worktree_meta": meta,
-            }),
-        )
-        .await;
+        // Mount both worktrees (path-keyed uniformly).
+        for wt in [&worktree_a, &worktree_b] {
+            let _ = hook_roundtrip(
+                &ipc_path,
+                &serde_json::json!({
+                    "method": "subagent-start/mount-worktree",
+                    "session_id": "sess-1",
+                    "agent_id": "sub-1",
+                    "cwd": wt.display().to_string(),
+                }),
+            )
+            .await;
+        }
 
-        // Mount worktree B under a different (path-keyed) contributor so we can
-        // watch it survive.
-        let _ = hook_roundtrip(
-            &ipc_path,
-            &serde_json::json!({
-                "method": "subagent-start/mount-worktree",
-                "session_id": "sess-1",
-                "cwd": worktree_b.display().to_string(),
-            }),
-        )
-        .await;
-
-        // SubagentStop: identity is sub-1 (→ worktree A) but cwd is worktree B.
+        // SubagentStop: agent id present but cwd is worktree B — cwd wins, arming B.
         let _ = hook_roundtrip(
             &ipc_path,
             &serde_json::json!({
@@ -11276,13 +11326,26 @@ mod tests {
 
         let roots = roots_ls(&ipc_path).await;
         assert!(
-            !roots.iter().any(|(p, _)| Path::new(p) == worktree_a),
-            "the identity worktree (A) is reaped: {roots:?}",
+            roots.iter().any(|(p, _)| Path::new(p) == worktree_a),
+            "worktree A stays mounted — the stop never reached for it: {roots:?}",
         );
         assert!(
             roots.iter().any(|(p, _)| Path::new(p) == worktree_b),
-            "the cwd worktree (B) survives — cwd was not used for the reap: {roots:?}",
+            "worktree B stays mounted (its countdown is armed): {roots:?}",
         );
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let key_a = format!("worktree:sess-1:{}", worktree_a.display());
+            let key_b = format!("worktree:sess-1:{}", worktree_b.display());
+            assert!(
+                ctx.worktree_mounts.kept_since(&key_a).is_none(),
+                "worktree A's countdown is NOT armed (cwd resolved to B)",
+            );
+            assert!(
+                ctx.worktree_mounts.kept_since(&key_b).is_some(),
+                "worktree B's countdown IS armed (the cwd worktree)",
+            );
+        }
 
         shutdown.cancel();
     }
@@ -11290,8 +11353,9 @@ mod tests {
     #[test]
     fn worktree_registry_rehydrates_from_sidecars() {
         // A fresh registry (what `with_session` builds on daemon start) rebuilds
-        // the identity→path map by scanning the agents subtree for sidecars — a
-        // daemon restart loses nothing durable (misc 150).
+        // the path→meta map by scanning the agents subtree for sidecars — a
+        // daemon restart loses nothing durable (misc 150). The lookup is by
+        // canonical path, not identity (root-ownership 04, AUDIT #10).
         let tmp = tempfile::tempdir().expect("tempdir");
         let agents = tmp.path().join("agents");
         let wt = agents.join("sess-1").join("abc");
@@ -11315,14 +11379,13 @@ mod tests {
         registry.rehydrate(crate::worktree_create::scan_sidecars(&agents));
         assert_eq!(registry.len(), 1, "one registration rehydrated");
         assert_eq!(
-            registry.path_for_identity("sess-1", "abc"),
-            Some(wt),
-            "identity→path map rebuilt from the sidecar",
+            registry.get(&wt).map(|m| m.worktree),
+            Some(wt.clone()),
+            "path→meta map rebuilt from the sidecar",
         );
-        assert_eq!(
-            registry.path_for_identity("sess-1", "other"),
-            None,
-            "an unregistered identity is absent",
+        assert!(
+            registry.get(&wt.with_file_name("other")).is_none(),
+            "an unregistered path is absent",
         );
     }
 
@@ -11875,59 +11938,184 @@ mod tests {
     }
 
     #[test]
-    fn worktree_blocked_flag_marks_clears_and_survives_activity() {
-        // The blocked-on-permission flag is now a pure display state (misc 151's
-        // `catenary worktree ls` root-state), no longer gating any idle expiry
-        // (bug 106): mark it, clear it on an identity event, and clear it on
-        // qualifying activity. The root is never expired — only its flag moves.
+    fn worktree_blocked_flag_marks_by_path_and_clears_on_activity() {
+        // The blocked-on-permission flag is a pure display state (misc 151's
+        // `catenary worktree ls` root-state). It is marked and cleared BY PATH
+        // (the enclosing worktree of the PermissionRequest / activity cwd) — no
+        // identity keying (root-ownership 04, AUDIT #11). The mount is never
+        // expired by this — only its flag moves.
         let mounts = WorktreeMounts::new();
         let root = PathBuf::from("/wt/blocked");
         let key = format!("worktree:sess:{}", root.display());
         mounts.track(&key, &root);
 
-        assert!(mounts.mark_blocked(&key), "the root is present and marked");
+        // A PermissionRequest resolving into the worktree marks it blocked.
+        assert_eq!(
+            mounts.mark_blocked_covering(&root.join("sub")),
+            1,
+            "the enclosing worktree is present and marked",
+        );
         assert!(mounts.is_blocked(&key));
 
-        // An identity event clears the flag (the human answered the prompt).
-        mounts.clear_blocked(&key);
-        assert!(!mounts.is_blocked(&key));
-
-        // Qualifying activity under the root also clears the flag.
-        mounts.mark_blocked(&key);
-        assert!(mounts.is_blocked(&key));
-        mounts.touch_covering(&root.join("f.rs"));
+        // Qualifying activity resolving into the root clears the flag.
+        mounts.touch_covering(&root.join("f.rs"), Instant::now());
         assert!(
             !mounts.is_blocked(&key),
             "activity under the root clears the blocked flag",
         );
 
         // The root's mount entry is never dropped by any of this — only teardown
-        // (`remove`) drops it, which is the vanish-watch/GC/SessionEnd path.
+        // (`remove`) or the kept countdown drops it.
         assert_eq!(
             mounts.mounted_roots(),
             vec![(root, false)],
-            "the root stays mounted (unblocked) throughout — no idle expiry",
+            "the root stays mounted (unblocked) throughout",
         );
     }
 
     #[test]
-    fn worktree_blocked_session_marks_all_that_sessions_roots() {
-        // The coarse fallback (no agent identity in the permission payload) marks
-        // every worktree root of the session blocked for the `worktree ls` display.
+    fn worktree_blocked_covering_marks_every_enclosing_root() {
+        // A PermissionRequest whose cwd sits under two nested worktree roots marks
+        // both; a sibling root is untouched. Resolved by PATH, no identity.
         let mounts = WorktreeMounts::new();
-        let a = PathBuf::from("/wt/a");
-        let b = PathBuf::from("/wt/b");
+        let outer = PathBuf::from("/wt/outer");
+        let inner = PathBuf::from("/wt/outer/inner");
         let other = PathBuf::from("/wt/other");
-        mounts.track("worktree:sess-1:one", &a);
-        mounts.track("worktree:sess-1:two", &b);
+        mounts.track("worktree:sess-1:outer", &outer);
+        mounts.track("worktree:sess-1:inner", &inner);
         mounts.track("worktree:sess-2:x", &other);
 
-        assert_eq!(mounts.mark_blocked_session("sess-1"), 2);
-        assert!(mounts.is_blocked("worktree:sess-1:one"));
-        assert!(mounts.is_blocked("worktree:sess-1:two"));
+        // A prompt cwd under `inner` encloses both `inner` and `outer`.
+        assert_eq!(mounts.mark_blocked_covering(&inner.join("f.rs")), 2);
+        assert!(mounts.is_blocked("worktree:sess-1:outer"));
+        assert!(mounts.is_blocked("worktree:sess-1:inner"));
         assert!(
             !mounts.is_blocked("worktree:sess-2:x"),
-            "a different session's roots are untouched",
+            "a sibling root outside the prompt's cwd is untouched",
+        );
+    }
+
+    #[test]
+    fn worktree_kept_countdown_expires_only_idle_armed_mounts() {
+        // The kept countdown (root-ownership 04): only an ARMED mount idle past
+        // `WORKTREE_KEPT_COUNTDOWN` is a reaper candidate. A LIVE mount (never
+        // armed) is never expired; an armed mount refreshed by activity survives.
+        let mounts = WorktreeMounts::new();
+        let live = PathBuf::from("/wt/live");
+        let idle = PathBuf::from("/wt/idle");
+        let fresh = PathBuf::from("/wt/fresh");
+        mounts.track("worktree:s:live", &live);
+        mounts.track("worktree:s:idle", &idle);
+        mounts.track("worktree:s:fresh", &fresh);
+
+        let t0 = Instant::now();
+        // Arm the two kept mounts at t0; `live` stays LIVE (never armed).
+        assert!(mounts.arm_countdown(&idle, t0));
+        assert!(mounts.arm_countdown(&fresh, t0));
+        // A LIVE mount can never be armed by `arm_countdown` if absent; here
+        // `live` simply is never armed, so `kept_since` stays None.
+        assert!(mounts.kept_since("worktree:s:live").is_none());
+
+        // Refresh `fresh` a moment after arming — its clock now trails `idle`'s by
+        // a second, so a sweep exactly at `idle`'s deadline spares `fresh`.
+        let refresh = t0 + Duration::from_secs(1);
+        mounts.touch_covering(&fresh.join("f.rs"), refresh);
+
+        // Sweep at exactly `idle`'s deadline (`t0 + COUNTDOWN`): `idle` lapsed
+        // (elapsed == COUNTDOWN); `fresh` was refreshed 1s later so it trails by a
+        // second and survives; `live` has no countdown.
+        let now = t0 + WORKTREE_KEPT_COUNTDOWN;
+        let expired = mounts.expired_countdowns(now, WORKTREE_KEPT_COUNTDOWN);
+        assert_eq!(
+            expired,
+            vec![("worktree:s:idle".to_string(), idle)],
+            "only the idle armed mount expires; live + refreshed survive: {expired:?}",
+        );
+    }
+
+    #[test]
+    fn worktree_kept_countdown_resets_on_covering_activity() {
+        // Any hook resolving into the worktree resets the countdown (the one hook
+        // seam). After arming and then touching, the last-activity moves forward,
+        // so a sweep at the original deadline no longer expires it.
+        let mounts = WorktreeMounts::new();
+        let root = PathBuf::from("/wt/kept");
+        mounts.track("worktree:s:kept", &root);
+
+        let t0 = Instant::now();
+        assert!(mounts.arm_countdown(&root, t0));
+
+        // Activity at t0 + half the window refreshes the countdown to that instant.
+        let mid = t0 + WORKTREE_KEPT_COUNTDOWN / 2;
+        mounts.touch_covering(&root.join("src/main.rs"), mid);
+        assert_eq!(mounts.kept_since("worktree:s:kept"), Some(mid));
+
+        // At the ORIGINAL deadline the refreshed mount is not yet expired.
+        let orig_deadline = t0 + WORKTREE_KEPT_COUNTDOWN;
+        assert!(
+            mounts
+                .expired_countdowns(orig_deadline, WORKTREE_KEPT_COUNTDOWN)
+                .is_empty(),
+            "activity reset the countdown — not expired at the original deadline",
+        );
+        // A full window after the refresh, it expires.
+        let after = mid + WORKTREE_KEPT_COUNTDOWN;
+        assert_eq!(
+            mounts
+                .expired_countdowns(after, WORKTREE_KEPT_COUNTDOWN)
+                .len(),
+            1,
+            "a full window after the last activity, the countdown expires",
+        );
+    }
+
+    #[test]
+    fn worktree_countdown_activity_lines_up_after_canonicalizing_the_seam() {
+        // The spelling rule (d40a79b, extended to comparison seams): the countdown
+        // reset compares an incoming cwd against the stored CANONICAL root by
+        // `starts_with`. A symlinked-prefix alias of the root would NOT match the
+        // canonical stored root lexically — so the one hook seam canonicalizes the
+        // incoming cwd before `touch_covering`. This test pins that: the mount is
+        // stored under a canonical root, and only the CANONICALIZED alias spelling
+        // refreshes it (the raw alias, uncanonicalized, would silently miss).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize base");
+        // The real worktree root and an ALIAS symlink to it (an ancestor alias:
+        // `<base>/alias` → `<base>/real`).
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("src")).expect("mkdir real/src");
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).expect("symlink alias → real");
+
+        let mounts = WorktreeMounts::new();
+        // The mount is stored under the CANONICAL root (as the daemon stores it).
+        let canonical_root = real.canonicalize().expect("canonical real");
+        mounts.track("worktree:s:real", &canonical_root);
+
+        let t0 = Instant::now();
+        assert!(mounts.arm_countdown(&canonical_root, t0));
+
+        // A hook arrives with the ALIAS spelling of a file under the worktree.
+        let aliased_cwd = alias.join("src");
+        // The RAW alias spelling does not line up with the canonical stored root
+        // (that is the whole hazard) — it refreshes nothing.
+        let later = t0 + Duration::from_mins(1);
+        mounts.touch_covering(&aliased_cwd, later);
+        assert_eq!(
+            mounts.kept_since("worktree:s:real"),
+            Some(t0),
+            "the RAW alias spelling misses the canonical root — no refresh (the hazard)",
+        );
+
+        // The seam's fix: canonicalize the incoming cwd first (what the one hook
+        // seam does). The canonicalized alias now lines up and refreshes.
+        let canonical_cwd = aliased_cwd.canonicalize().expect("canonical aliased cwd");
+        mounts.touch_covering(&canonical_cwd, later);
+        assert_eq!(
+            mounts.kept_since("worktree:s:real"),
+            Some(later),
+            "canonicalizing the incoming cwd at the seam lines it up with the \
+             canonical stored root — the countdown resets",
         );
     }
 
@@ -12002,6 +12190,88 @@ mod tests {
             .find(|(p, _)| Path::new(p) == project)
             .expect("enclosing project mounted ephemerally on out-of-root grep");
         assert!(entry.1, "the activity-mounted root is classed ephemeral");
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ephemeral_root_under_hook_activity_does_not_idle_expire() {
+        // Acceptance (root-ownership 04): an ephemeral root under active hook
+        // traffic (edits/reads, no queries) does not idle-expire. Every hook
+        // carries cwd, and the one hook seam refreshes the covering ephemeral
+        // root's idle clock — so a stream of ordinary hooks (a Read PreToolUse
+        // whose cwd is inside the ephemeral root) keeps it alive with NO query.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, file) = marker_project(&base, "Lattice");
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // Mount the ephemeral root via an out-of-root grep (the one query allowed
+        // — mounting is a query's job; refreshing is the hook seam's).
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "tool/grep",
+                "pattern": "hello",
+                "paths": [file.display().to_string()],
+            }),
+        )
+        .await;
+
+        // Age the ephemeral clock deep into the idle window by hand (no wall-clock
+        // wait): set its last-activity to a stale instant, so absent a refresh the
+        // next sweep would reap it. `checked_sub` keeps the arithmetic panic-free.
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let stale = Instant::now()
+                .checked_sub(EPHEMERAL_ROOT_IDLE_TIMEOUT)
+                .expect("a monotonic instant far enough in the past");
+            ctx.ephemeral_mounts.touch(&project, stale);
+        }
+
+        // A NON-query hook — a Read PreToolUse whose cwd sits inside the ephemeral
+        // root — flows through the one hook seam and refreshes the clock.
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "pre-tool/editing-state",
+                "tool_name": "Read",
+                "session_id": "sess-1",
+                "cwd": project.display().to_string(),
+                "host_payload": { "cwd": project.display().to_string() },
+            }),
+        )
+        .await;
+
+        // The clock is refreshed: its remaining is back near the full timeout —
+        // well above the stale (fully-elapsed) value it held before the hook.
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            let remaining = ctx
+                .ephemeral_mounts
+                .idle_remaining(&project, Instant::now(), EPHEMERAL_ROOT_IDLE_TIMEOUT)
+                .expect("the ephemeral root still carries an idle clock");
+            assert!(
+                remaining > EPHEMERAL_ROOT_IDLE_TIMEOUT / 2,
+                "hook activity reset the ephemeral clock near full ({remaining:?}); \
+                 the root does not idle-expire under active hook traffic",
+            );
+        }
+        // And it is still mounted — no idle expiry happened.
+        assert!(
+            roots_ls_classes(&ipc_path)
+                .await
+                .iter()
+                .any(|(p, eph)| Path::new(p) == project && *eph),
+            "the ephemeral root survives under hook activity",
+        );
 
         shutdown.cancel();
     }

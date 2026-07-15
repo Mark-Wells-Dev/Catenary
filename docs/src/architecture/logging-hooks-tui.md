@@ -137,14 +137,17 @@ delivered expired truths (a warn arriving after the problem was already
 resolved), which the TUI's durable, state-based problems pane cannot. The
 `[notifications] threshold` key that set its floor retired with it.
 
-### The parent-agent context leg
+### The dirty-worktree notice (no identity-addressed audience)
 
-One hook-borne notice survives, and it is agent-facing, not user-facing: when a
-subagent stops leaving a dirty worktree, the notice rides Claude Code's
-`hookSpecificOutput.additionalContext` on the **parent** agent's next allowed
-`PreToolUse` / `Stop` response (a per-session queue in `parent_context.rs`,
-dropped on session end). The parent is the actionable audience — it can land
-the work or remove the worktree.
+When a subagent stops leaving a dirty worktree, that worktree is kept untouched
+and its language-server mount enters a countdown (root-ownership 04). The notice
+needs no "find the agent that spawned it" audience: the dirty worktree is
+discoverable exactly where it lives — the session-start linger nag and `catenary
+worktree ls` — and it is recorded once per path as a `warn`-level firehose/TUI
+finding. The old identity-addressed `hookSpecificOutput.additionalContext` side
+channel (the per-session `ParentContextQueue`) retired with the countdown; the
+never-auto-clean rule keeps the dirty tree in place until an act of intent
+(`land`/`rm`).
 
 The `SystemMessageBuilder` survives too, trimmed to a thin `[severity] message`
 formatter for the one remaining direct `systemMessage`: the `SessionStart`

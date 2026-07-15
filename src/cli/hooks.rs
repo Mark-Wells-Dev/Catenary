@@ -746,10 +746,11 @@ pub fn run_subagent_start(format: HostFormat) {
     if let Some(stream) = hook_connect(&hook_json) {
         let mut request = serde_json::json!({
             "method": "subagent-start/mount-worktree",
-            // Forward the agent identity so the daemon keys the mount
-            // `worktree:{session_id}:{agent_id}` (misc 150) — the reap at
-            // SubagentStop then rebuilds the key from identity alone. Absent
-            // (empty) for a `--worktree` session, which keys by path.
+            // Forward the agent identity for the subagent BOARD row and the
+            // dispose ownership tag (the worktree's dirname). It no longer keys
+            // the mount — mounts are uniformly path-keyed
+            // (`worktree:{session_id}:{canonical-path}`; root-ownership 04), and
+            // the SubagentStop reap resolves by cwd, not identity.
             "agent_id": extract_agent_id(&hook_json),
             "format": format.as_str(),
         });
@@ -836,11 +837,13 @@ pub fn run_worktree_remove(format: HostFormat) {
 /// idle expiry (`PermissionRequest` hook handler).
 ///
 /// A **pure observer** (misc 150): it forwards `session_id` + `agent_id` +
-/// the host payload to the daemon, which marks the agent's worktree root
-/// **blocked** — a blocked root is exempt from idle expiry, because a subagent
-/// parked at a permission prompt for hours is *blocked*, not orphaned. It returns
-/// no decision to the host: it **prints nothing on every path** and always exits
-/// `0`, so it can never interfere with the host's permission flow.
+/// the host payload (carrying cwd) to the daemon, which marks the worktree root
+/// **enclosing the prompt's cwd** blocked for the `catenary worktree ls` display.
+/// There is no pause machinery (root-ownership 04, the answer-desk ruling): the
+/// prompt is itself hook activity that resets the kept countdown via the one hook
+/// seam, so a governed prompt keeps the mount alive without a special suspend. It
+/// returns no decision to the host: it **prints nothing on every path** and always
+/// exits `0`, so it can never interfere with the host's permission flow.
 pub fn run_permission_request(format: HostFormat) {
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         return;
@@ -1090,14 +1093,9 @@ pub fn run_post_agent(format: HostFormat) {
 
     if let Some(line) = lines.first()
         && let Ok(envelope) = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
+        && let Some(crate::hook::HookResult::Block(reason)) = &envelope.result
     {
-        if let Some(crate::hook::HookResult::Block(reason)) = &envelope.result {
-            print!("{}", format_stop_block(reason, format));
-        } else if let Some(ctx) = &envelope.additional_context {
-            // Allowing with a drained parent-agent notice (misc 151): deliver it
-            // as this Stop response's `additionalContext`.
-            print!("{}", format_additional_context(ctx, "Stop", format));
-        }
+        print!("{}", format_stop_block(reason, format));
     }
 }
 
@@ -1310,16 +1308,9 @@ fn enforce_editing_state(
 
     if let Some(line) = lines.first()
         && let Ok(envelope) = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
+        && let Some(crate::hook::HookResult::Deny(reason)) = &envelope.result
     {
-        if let Some(crate::hook::HookResult::Deny(reason)) = &envelope.result {
-            print!("{}", format_deny(reason, format));
-        } else if let Some(ctx) = &envelope.additional_context {
-            // An allowed PreToolUse carrying a drained parent-agent notice
-            // (misc 151): deliver it as this call's `additionalContext`. The
-            // daemon only drains for the parent (empty agent_id), so a subagent's
-            // own PreToolUse never lands here.
-            print!("{}", format_additional_context(ctx, "PreToolUse", format));
-        }
+        print!("{}", format_deny(reason, format));
     }
 }
 

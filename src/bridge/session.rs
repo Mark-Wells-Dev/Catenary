@@ -23,7 +23,6 @@ use super::file_tools::GlobServer;
 use super::filesystem_manager::{FilesystemManager, Root};
 use super::grep_server::GrepServer;
 use super::handler::expand_tilde;
-use super::parent_context::ParentContextQueue;
 use super::path_security::PathValidator;
 use crate::config::Config;
 use crate::logging::LoggingServer;
@@ -689,12 +688,6 @@ pub struct Session {
     path_validator: Arc<RwLock<PathValidator>>,
     /// Multi-sink tracing dispatcher.
     pub logging: LoggingServer,
-    /// Per-session notification router.
-    ///
-    /// Parent-agent `additionalContext` side channel (misc 151): the
-    /// dirty-worktree "kept" notice queues here keyed by the parent's
-    /// `session_id` and drains into the parent's next eligible hook response.
-    pub parent_context: Arc<ParentContextQueue>,
     /// Symbol index populated from `documentSymbol` responses (shared with grep).
     pub symbol_index: Option<Arc<std::sync::Mutex<SymbolIndex>>>,
     /// Catenary instance ID (unique per process invocation).
@@ -823,10 +816,6 @@ impl Session {
     /// Constructs the logging sinks and activates the `LoggingServer`,
     /// draining any bootstrap-buffered events. After this call, all
     /// `tracing` events flow through the logging pipeline.
-    ///
-    /// The shared `parent_context` queue (misc 151) is stored, not registered
-    /// as a sink — it carries daemon-pushed `additionalContext` for the parent
-    /// agent, not tracing events.
     #[must_use]
     #[allow(
         clippy::too_many_arguments,
@@ -839,7 +828,6 @@ impl Session {
         logging: LoggingServer,
         instance_id: Arc<str>,
         runtime: Handle,
-        parent_context: Arc<ParentContextQueue>,
         snapshot: Option<Arc<crate::state_snapshot::SnapshotWriter>>,
     ) -> Self {
         let config = Arc::new(config);
@@ -932,7 +920,6 @@ impl Session {
             fs_manager,
             path_validator,
             logging,
-            parent_context,
             symbol_index,
             instance_id,
             runtime,
@@ -950,11 +937,6 @@ impl Session {
     /// `SymbolIndex`, config, logging) with the daemon's primary session.
     /// Creates fresh per-session state: editing manager and editing
     /// guardrail.
-    ///
-    /// The shared [`ParentContextQueue`] is cloned from the primary so a
-    /// dirty-worktree notice pushed against this session's `session_id`
-    /// (from the daemon's `SubagentStop` handler) is visible to its own
-    /// hook dispatch.
     #[must_use]
     pub fn new_for_daemon(
         primary: &Self,
@@ -989,7 +971,6 @@ impl Session {
             fs_manager: primary.fs_manager.clone(),
             path_validator: primary.path_validator.clone(),
             logging: primary.logging.clone(),
-            parent_context: primary.parent_context.clone(),
             symbol_index: primary.symbol_index.clone(),
             instance_id: session_id,
             runtime: primary.runtime.clone(),
@@ -2120,7 +2101,6 @@ mod tests {
             LoggingServer::new(),
             instance_id,
             handle.clone(),
-            super::super::parent_context::ParentContextQueue::new(),
             None,
         )
     }

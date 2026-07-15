@@ -95,19 +95,16 @@ fn is_allowed_during_editing(tool_name: &str) -> bool {
     tool_name == "ToolSearch"
 }
 
-/// Result of hook dispatch: the handler's result plus an optional
-/// `additionalContext` payload for the parent agent (misc 151).
+/// Result of hook dispatch: the handler's result.
 ///
-/// The user-facing `systemMessage` notification queue retired (tui-rework 04);
-/// what rides the hook response now is the parent-agent leg — the dirty-worktree
-/// notice drained from the [`ParentContextQueue`](super::parent_context::ParentContextQueue)
-/// on the parent's next eligible response.
+/// The user-facing `systemMessage` notification queue retired (tui-rework 04),
+/// and the identity-addressed parent-agent `additionalContext` side channel
+/// (the `ParentContextQueue`) retired with the worktree countdown
+/// (root-ownership 04): the dirty-worktree "kept" notice is now the countdown +
+/// the session-start linger nag + `worktree ls`, no identity-addressed audience.
 pub struct DispatchResult {
     /// Handler result (`None` = allow / no actionable data).
     pub result: Option<HookResult>,
-    /// Drained `additionalContext` for the parent agent, delivered when the
-    /// response allows. `None` = no `additionalContext` field in host output.
-    pub additional_context: Option<String>,
 }
 
 // ── HookRouter ──────────────────────────────────────────────────────────
@@ -142,12 +139,10 @@ impl HookRouter {
 
     /// Dispatches a parsed hook request to the appropriate handler.
     ///
-    /// Returns a [`DispatchResult`] with the handler's result and, when the
-    /// response allows, any `additionalContext` drained from the parent-agent
-    /// [`ParentContextQueue`](super::parent_context::ParentContextQueue). The
-    /// queue is drained only for the *parent* (empty `agent_id`) on its eligible
-    /// hook exchanges — `PreToolUse` and `Stop`/`AfterAgent` — so a subagent's
-    /// own hook traffic never absorbs a notice meant for its spawner (misc 151).
+    /// Returns a [`DispatchResult`] with the handler's result. The
+    /// identity-addressed parent-agent `additionalContext` side channel retired
+    /// with the worktree countdown (root-ownership 04) — the dirty-worktree
+    /// notice needs no "find the agent that spawned it" audience.
     #[allow(clippy::too_many_lines, reason = "match arms are sequential and flat")]
     pub(crate) fn dispatch(&self, request: HookRequest) -> DispatchResult {
         match request {
@@ -222,18 +217,7 @@ impl HookRouter {
                         }
                     }
                 }
-                // Deliver any pending parent-agent context on an allowed
-                // PreToolUse — the parent's most frequent eligible response
-                // (misc 151). A denied call carries nothing.
-                let additional_context = if result.is_none() {
-                    self.drain_parent_context(&agent_id)
-                } else {
-                    None
-                };
-                DispatchResult {
-                    result,
-                    additional_context,
-                }
+                DispatchResult { result }
             }
             HookRequest::PreToolStartEditing {
                 agent_id,
@@ -245,26 +229,17 @@ impl HookRouter {
                     .start_editing(session_id.as_deref(), &agent_id);
                 // Status may flip to `editing` — refresh the board (ticket 05).
                 self.session.touch_snapshot();
-                DispatchResult {
-                    result: None,
-                    additional_context: None,
-                }
+                DispatchResult { result: None }
             }
             HookRequest::PreToolDoneEditingPrepare { .. } => {
                 // Handled at the daemon level (router.rs), not here.
                 // This arm exists for exhaustive matching in the
                 // per-session HookServer path.
-                DispatchResult {
-                    result: None,
-                    additional_context: None,
-                }
+                DispatchResult { result: None }
             }
             HookRequest::DoneEditingRun => {
                 // Handled at the daemon level (router.rs), not here.
-                DispatchResult {
-                    result: None,
-                    additional_context: None,
-                }
+                DispatchResult { result: None }
             }
             HookRequest::PostAgent {
                 agent_id,
@@ -276,58 +251,20 @@ impl HookRouter {
                 // Editing state may have cleared (status → idle) — refresh the
                 // board (ticket 05).
                 self.session.touch_snapshot();
-                // Deliver any pending parent-agent context on an allowed Stop —
-                // the second eligible delivery point (misc 151). A blocked stop
-                // (editing gate / lingering-worktree nag) carries nothing.
-                let additional_context = if matches!(result, Some(HookResult::Block(_))) {
-                    None
-                } else {
-                    self.drain_parent_context(&agent_id)
-                };
-                DispatchResult {
-                    result,
-                    additional_context,
-                }
+                DispatchResult { result }
             }
             HookRequest::SessionStart { session_id: _ } => {
                 let result = self.handle_clear_editing();
                 // Stale editing state may have cleared (status → idle) —
                 // refresh the board (ticket 05).
                 self.session.touch_snapshot();
-                DispatchResult {
-                    result,
-                    additional_context: None,
-                }
+                DispatchResult { result }
             }
             HookRequest::SessionEnd { session_id: _ } => {
                 // No-op at the router level — cleanup happens in the
                 // daemon's handle_hook_dispatch (root tracker removal).
-                DispatchResult {
-                    result: None,
-                    additional_context: None,
-                }
+                DispatchResult { result: None }
             }
-        }
-    }
-
-    /// Drain the parent-agent [`ParentContextQueue`](super::parent_context::ParentContextQueue)
-    /// into an `additionalContext` string (misc 151, D-1).
-    ///
-    /// Only the **parent** (empty `agent_id` — the top-level agent) drains: a
-    /// sibling subagent's hook traffic shares the `session_id` but must not
-    /// absorb a notice meant for the spawner. Multiple queued lines join with
-    /// newlines.
-    /// Returns `None` when the queue is empty (the common case) or when a
-    /// subagent is calling.
-    fn drain_parent_context(&self, agent_id: &str) -> Option<String> {
-        if !agent_id.is_empty() {
-            return None;
-        }
-        let lines = self.session.parent_context.drain(&self.session.instance_id);
-        if lines.is_empty() {
-            None
-        } else {
-            Some(lines.join("\n"))
         }
     }
 
@@ -1484,14 +1421,12 @@ mod tests {
         let handle = runtime.handle().clone();
 
         let instance_id: Arc<str> = "test-session".into();
-        let parent_context = crate::bridge::parent_context::ParentContextQueue::new();
         let session = Arc::new(Session::new(
             config,
             vec![],
             logging,
             instance_id.clone(),
             handle,
-            parent_context,
             None,
         ));
 
@@ -1986,14 +1921,12 @@ mod tests {
         let handle = runtime.handle().clone();
 
         let instance_id: Arc<str> = "test-session".into();
-        let parent_context = crate::bridge::parent_context::ParentContextQueue::new();
         let session = Arc::new(Session::new(
             config,
             vec![],
             logging,
             instance_id.clone(),
             handle,
-            parent_context,
             None,
         ));
         let router = HookRouter::new(session, instance_id, "test".to_string());
@@ -2036,14 +1969,12 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create workspace dir");
 
         let instance_id: Arc<str> = "test-session".into();
-        let parent_context = crate::bridge::parent_context::ParentContextQueue::new();
         let session = Arc::new(Session::new(
             config,
             vec![root.clone()],
             logging,
             instance_id.clone(),
             handle,
-            parent_context,
             None,
         ));
 
@@ -2077,14 +2008,12 @@ mod tests {
         let handle = runtime.handle().clone();
 
         let instance_id: Arc<str> = "test-session".into();
-        let parent_context = crate::bridge::parent_context::ParentContextQueue::new();
         let session = Arc::new(Session::new(
             config,
             vec![root.clone()],
             logging,
             instance_id.clone(),
             handle,
-            parent_context,
             None,
         ));
 
@@ -2125,7 +2054,6 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create workspace dir");
 
         let instance_id: Arc<str> = "test-session".into();
-        let parent_context = crate::bridge::parent_context::ParentContextQueue::new();
         // The primary session owns the shared resources (fs_manager carries
         // the workspace root); the per-session daemon session carries the
         // guardrail under test.
@@ -2135,7 +2063,6 @@ mod tests {
             logging,
             instance_id.clone(),
             handle,
-            parent_context,
             None,
         );
         let guardrail = Arc::new(crate::bridge::editing_guardrail::EditingGuardrail::new());
@@ -2170,132 +2097,6 @@ mod tests {
         fn deref(&self) -> &Self::Target {
             &self.router
         }
-    }
-
-    // ── Parent-context delivery tests (misc 151) ──────────────────────
-
-    #[test]
-    fn pre_tool_allow_delivers_parent_context() {
-        let router = test_router();
-        router.session.parent_context.queue(
-            "test-session",
-            "subagent `a` left a dirty worktree".to_string(),
-        );
-
-        // An allowed PreToolUse by the parent (empty agent_id) drains it.
-        let result = router.dispatch(crate::hook::HookRequest::PreTool {
-            tool_name: "Read".to_string(),
-            file_path: None,
-            command: None,
-            cwd: None,
-            agent_id: String::new(),
-            session_id: None,
-            writes: Vec::new(),
-        });
-        assert!(result.result.is_none(), "read allowed");
-        assert_eq!(
-            result.additional_context.as_deref(),
-            Some("subagent `a` left a dirty worktree"),
-        );
-        // Drained — not redelivered on the next call.
-        assert_eq!(router.session.parent_context.queue_len("test-session"), 0);
-    }
-
-    #[test]
-    fn subagent_pre_tool_does_not_absorb_parent_context() {
-        let router = test_router();
-        router
-            .session
-            .parent_context
-            .queue("test-session", "parent notice".to_string());
-
-        // A subagent (non-empty agent_id) must not drain the parent's notice.
-        let result = router.dispatch(crate::hook::HookRequest::PreTool {
-            tool_name: "Read".to_string(),
-            file_path: None,
-            command: None,
-            cwd: None,
-            agent_id: "sub-agent".to_string(),
-            session_id: None,
-            writes: Vec::new(),
-        });
-        assert!(result.additional_context.is_none());
-        assert_eq!(
-            router.session.parent_context.queue_len("test-session"),
-            1,
-            "notice preserved for the parent"
-        );
-    }
-
-    #[test]
-    fn stop_allow_delivers_parent_context() {
-        let router = test_router();
-        router
-            .session
-            .parent_context
-            .queue("test-session", "dirty worktree kept".to_string());
-
-        // Not editing → allow → drain on Stop.
-        let result = router.dispatch(crate::hook::HookRequest::PostAgent {
-            agent_id: String::new(),
-            session_id: None,
-            stop_hook_active: false,
-        });
-        assert!(result.result.is_none(), "should allow");
-        assert_eq!(
-            result.additional_context.as_deref(),
-            Some("dirty worktree kept"),
-        );
-    }
-
-    #[test]
-    fn stop_block_preserves_parent_context() {
-        let router = test_router();
-        let _ = router.session.editing.start_editing(None, "");
-        router
-            .session
-            .editing
-            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
-        router
-            .session
-            .parent_context
-            .queue("test-session", "dirty worktree kept".to_string());
-
-        // The editing gate blocks the stop → no delivery, context preserved for
-        // the next allowed response (the once-clean-turn rule, misc 151).
-        let result = router.dispatch(crate::hook::HookRequest::PostAgent {
-            agent_id: String::new(),
-            session_id: None,
-            stop_hook_active: false,
-        });
-        assert!(
-            matches!(result.result, Some(HookResult::Block(_))),
-            "should block"
-        );
-        assert!(
-            result.additional_context.is_none(),
-            "block delivers nothing"
-        );
-        assert_eq!(
-            router.session.parent_context.queue_len("test-session"),
-            1,
-            "context preserved for the next allowed response"
-        );
-    }
-
-    #[test]
-    fn empty_parent_context_yields_no_additional_context() {
-        let router = test_router();
-        let result = router.dispatch(crate::hook::HookRequest::PreTool {
-            tool_name: "Read".to_string(),
-            file_path: None,
-            command: None,
-            cwd: None,
-            agent_id: String::new(),
-            session_id: None,
-            writes: Vec::new(),
-        });
-        assert!(result.additional_context.is_none());
     }
 
     // ── PreToolUse file tracking tests ──────────────────────────────
