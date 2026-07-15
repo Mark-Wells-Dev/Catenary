@@ -1151,6 +1151,10 @@ pub fn run_pre_tool(format: HostFormat) {
                 handle_done_editing_hook(&hook_json, format);
                 return;
             }
+            CatenaryAction::Claim => {
+                handle_claim_hook(&hook_json, shell_cmd, format);
+                return;
+            }
             // Canonical search/tool command. A `cd`/foreign-chained search
             // (or an arg-substitution carrying a foreign command) still has
             // its foreign segments allowlist-checked (regime 2); `catenary`
@@ -1256,6 +1260,18 @@ fn enforce_editing_state(
     format: HostFormat,
     writes: &[PathBuf],
 ) {
+    // ── Durable root lock (root-ownership stage 2) ──────────────────────
+    // Acquire (or re-affirm) the per-root lock at the edit seam BEFORE any
+    // daemon contact, so the one-cook-per-kitchen rule holds with the daemon
+    // down. A collision denies with the briefing and accumulates nothing (the
+    // guardrail-deny invariant); an allow (ours / foreign / uncovered) flows on
+    // to the daemon editing-state transport below. Read-only tools carry no
+    // edited path and take no lock — they look through the window unbounded.
+    if let Some(reason) = root_lock_gate(hook_json, tool_name, file_path, format, writes) {
+        print!("{}", format_deny(&reason, format));
+        return;
+    }
+
     let Some(stream) = hook_connect(hook_json) else {
         return;
     };
@@ -1298,6 +1314,68 @@ fn enforce_editing_state(
             print!("{}", format_additional_context(ctx, "PreToolUse", format));
         }
     }
+}
+
+/// The durable-root-lock gate at the edit seam (root-ownership stage 2).
+///
+/// Hook-process-local: acquires (or re-affirms) the per-root lock for every
+/// covered edit target this tool call touches — the Edit/Write `file_path` and
+/// any resolved shell `writes` — using the identity the host supplied at THIS
+/// seam (`<client>+<session>+<agent>`, the one place identity appears). The lock
+/// is a filesystem fact under `state_dir/locks/`, so it works with the daemon
+/// down (unlike the daemon-side `EditingGuardrail`, which dies with the daemon).
+///
+/// Returns `Some(briefing)` on the first collision (another agent holds the
+/// root) — the caller denies with it and accumulates nothing. Returns `None`
+/// when every target is ours / foreign / uncovered (the edit flows on). Booking
+/// is static-data-driven ([`crate::lock::Booking`] from a hook-side
+/// `Config::load()`), so no daemon connection is ever made here.
+///
+/// Reads carry no edited path and pass no `writes`, so they take no lock — the
+/// window stays open for read-only agents. A config that fails to load skips the
+/// gate entirely (fail-open): a lone agent must never be false-denied because the
+/// booking data was unreadable.
+fn root_lock_gate(
+    hook_json: &serde_json::Value,
+    tool_name: &str,
+    file_path: Option<&str>,
+    format: HostFormat,
+    writes: &[PathBuf],
+) -> Option<String> {
+    // Collect the covered edit targets this call touches: the Edit/Write path
+    // (only for an actual edit tool) plus every resolved shell write.
+    let mut targets: Vec<PathBuf> = Vec::new();
+    if crate::bridge::is_edit_tool(tool_name)
+        && let Some(path) = file_path
+    {
+        targets.push(PathBuf::from(path));
+    }
+    targets.extend(writes.iter().cloned());
+    if targets.is_empty() {
+        return None;
+    }
+
+    // Static booking data — no daemon. A config that won't load fails open.
+    let Ok(config) = crate::config::Config::load() else {
+        return None;
+    };
+    let booking = crate::lock::Booking::from_config(&config);
+
+    let owner = crate::lock::Owner::new(
+        format.as_str(),
+        extract_session_id(hook_json, format).unwrap_or_default(),
+        extract_agent_id(hook_json),
+    );
+    let now = std::time::SystemTime::now();
+
+    for target in &targets {
+        if let crate::lock::Acquired::Denied(briefing) =
+            crate::lock::acquire(target, &owner, &booking, now)
+        {
+            return Some(briefing);
+        }
+    }
+    None
 }
 
 /// Run the foreign-command allowlist filter (regime 2) **and** the write
@@ -1733,6 +1811,98 @@ fn handle_done_editing_hook(hook_json: &serde_json::Value, format: HostFormat) {
     }
 }
 
+/// Extract the root-path argument from a `catenary claim <root>` command line.
+///
+/// The command reached here as a bare, canonical `catenary claim …` (the
+/// isolation gate guarantees the sole command), so the token after `claim` is
+/// the root. Splits on ASCII whitespace and returns the first non-flag token
+/// following `claim`. Returns `None` when no argument was supplied (the CLI then
+/// prints the clap usage error).
+fn extract_claim_root(command: &str) -> Option<String> {
+    let mut toks = command.split_whitespace();
+    // Advance to the `claim` word.
+    for tok in toks.by_ref() {
+        if tok == "claim" {
+            break;
+        }
+    }
+    // The first following non-flag token is the root.
+    toks.find(|t| !t.starts_with('-')).map(str::to_string)
+}
+
+/// Handle `PreToolUse` for `catenary claim <root>` (root-ownership stage 2).
+///
+/// The identity tuple lives at THIS seam. The hook forwards the claimant's
+/// identity (`format`+`session`+`agent`) and the resolved root to the daemon via
+/// `pre-tool/claim`, which runs the mechanical guard (refuse while a diagnose
+/// round is in flight), performs the one atomic owner-file rename, records the
+/// takeover (firehose + warn finding), and stages the rendered answer for the
+/// CLI to print. The hook then ALLOWS the command (prints nothing) so the CLI
+/// runs and drains the answer.
+///
+/// Degrade-open when the daemon is unreachable: the lock is a hook-plane fact, so
+/// the hook performs the rename itself and allows — the CLI's own degrade path
+/// reads the post-rename lock state to print a confirmation. A guard refusal from
+/// the daemon (a diagnose round in flight) is surfaced to the agent as a deny.
+fn handle_claim_hook(hook_json: &serde_json::Value, command: &str, format: HostFormat) {
+    let Some(root_arg) = extract_claim_root(command) else {
+        // No root supplied — let the CLI's clap layer print the usage error.
+        return;
+    };
+    // Resolve to an absolute, canonical path so the encoding matches the
+    // acquisition-time root.
+    let root = std::path::Path::new(&root_arg);
+    let root = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        extract_cwd_str(hook_json, format)
+            .map_or_else(
+                || std::env::current_dir().unwrap_or_default(),
+                PathBuf::from,
+            )
+            .join(root)
+    };
+    let root = root.canonicalize().unwrap_or(root);
+
+    let owner = crate::lock::Owner::new(
+        format.as_str(),
+        extract_session_id(hook_json, format).unwrap_or_default(),
+        extract_agent_id(hook_json),
+    );
+
+    let Some(stream) = hook_connect(hook_json) else {
+        // Daemon down — degrade open: perform the rename hook-local (the lock is
+        // a filesystem fact). No firehose/warn (those need the daemon); the CLI
+        // reads the resulting lock state to print its own confirmation.
+        let _ = crate::lock::claim(&root, &owner, std::time::SystemTime::now());
+        return;
+    };
+
+    let request = serde_json::json!({
+        "method": "pre-tool/claim",
+        "format": format.as_str(),
+        "session_id": owner.session,
+        "agent_id": owner.agent,
+        "root": root.display().to_string(),
+    });
+    let lines = ipc_exchange(stream, &request);
+
+    // A guard refusal (a diagnose round in flight) is surfaced to the agent as a
+    // deny; every other outcome allows (the CLI prints the staged answer, or its
+    // own degrade confirmation).
+    if let Some(line) = lines.first()
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+        && v.get("status").and_then(serde_json::Value::as_str) == Some("refused")
+    {
+        let reason = v
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("claim refused: a diagnose round is in flight")
+            .to_string();
+        print!("{}", format_deny(&reason, format));
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -1741,6 +1911,26 @@ fn handle_done_editing_hook(hook_json: &serde_json::Value, format: HostFormat) {
 mod tests {
     use super::*;
     use anyhow::{Context, Result};
+
+    #[test]
+    fn extract_claim_root_reads_the_root_argument() {
+        assert_eq!(
+            extract_claim_root("catenary claim /home/mark/Projects/Catenary"),
+            Some("/home/mark/Projects/Catenary".to_string()),
+        );
+        // A flag before the root is skipped; the first non-flag token wins.
+        assert_eq!(
+            extract_claim_root("catenary claim --force /repo"),
+            Some("/repo".to_string()),
+        );
+        // A leading path to the binary does not confuse the `claim` anchor.
+        assert_eq!(
+            extract_claim_root("/usr/local/bin/catenary claim /repo"),
+            Some("/repo".to_string()),
+        );
+        // No argument → None (the CLI's clap layer reports the usage error).
+        assert!(extract_claim_root("catenary claim").is_none());
+    }
 
     #[test]
     fn additional_context_claude_shape() -> Result<()> {

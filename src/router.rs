@@ -974,6 +974,22 @@ impl DiagRoundRegistry {
     /// owns its own delivery-flag flip and socket write, so a shared single
     /// result cannot serve both. Waiting-then-running keeps every round's
     /// semantics intact while still admitting exactly one at a time.
+    /// Whether any diagnose round is currently executing (any identity).
+    ///
+    /// The claim guard's activity signal (root-ownership stage 2): a `catenary
+    /// claim` refuses while a diagnose round is in flight — a diagnosing agent is
+    /// demonstrably present, not gone. The registry keys by editing identity, not
+    /// root, and a round may diagnose a batch spanning roots, so the honest
+    /// (conservative) signal is "any round in flight" rather than a per-root
+    /// query. A quick non-blocking peek under the std lock.
+    fn any_in_flight(&self) -> bool {
+        !self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
     async fn claim(&self, key: &str) -> (DiagRoundGuard<'_>, bool) {
         let mut waited = false;
         loop {
@@ -1206,6 +1222,15 @@ enum HandoffPayload {
         /// (bug 37 scoping — touch only the requesting agent's batch).
         agent_id: String,
     },
+    /// `claim` — *data-back*: the `PreToolUse` hook performs the atomic owner-file
+    /// rename (identity lives at the hook, root-ownership stage 2) and stages the
+    /// rendered answer; the identity-less `catenary claim` CLI drains it. The
+    /// answer is fully rendered hook-side so the CLI is a pure printer.
+    Claim {
+        /// The rendered claim answer (`claimed <root> …`), printed verbatim by
+        /// the CLI.
+        answer: String,
+    },
 }
 
 /// Correlation key for the hook→CLI handoff — the catenary subcommand alone
@@ -1220,13 +1245,16 @@ enum HandoffKey {
     /// `catenary diagnostics` — data-back: the hook stages the accumulated
     /// file set, the CLI drains it.
     Diagnostics,
+    /// `catenary claim` — data-back: the hook performs the owner-file rename and
+    /// stages the rendered answer, the CLI drains it (root-ownership stage 2).
+    Claim,
 }
 
 impl HandoffKey {
     /// Every handoff key — used to eagerly create the per-key semaphores.
-    /// Cardinality 1 today (ADR 014); the registry stays keyed so a future
-    /// correlated command plugs into the mechanism rather than rebuilding it.
-    const ALL: [Self; 1] = [Self::Diagnostics];
+    /// The registry stays keyed so each correlated command plugs into the
+    /// mechanism rather than rebuilding it.
+    const ALL: [Self; 2] = [Self::Diagnostics, Self::Claim];
 }
 
 /// Per-key handoff self-heal timeout.
@@ -2094,6 +2122,29 @@ fn ephemeral_root_to_mount(
         return None;
     }
     Some(root)
+}
+
+/// Delivery-side unlink of durable-lock ledger entries for a served file set
+/// (root-ownership stage 2).
+///
+/// Groups `files` by their resolved lock root ([`crate::lock::resolve_lock_root`])
+/// and unlinks each file's `dir/<relpath>.lock` touch entry from that root's
+/// on-disk lock ledger. Emptying `dir/` marks the lock **paid**, arming the
+/// daemon's paid-idle countdown. Payment is parole, not release — the lock dir
+/// survives; only the paid-idle reaper and root retirement remove it. Files
+/// outside any repository (no lock root) unlink nothing. Best-effort throughout.
+#[cfg(unix)]
+fn unlink_delivered_locks(files: &[PathBuf]) {
+    use std::collections::HashMap;
+    let mut by_root: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    for file in files {
+        if let Some(root) = crate::lock::resolve_lock_root(file) {
+            by_root.entry(root).or_default().push(file.clone());
+        }
+    }
+    for (root, served) in &by_root {
+        crate::lock::unlink_delivered(root, served);
+    }
 }
 
 /// Reaps every ephemeral root idle beyond `idle` as of `now`, returning the
@@ -3238,6 +3289,24 @@ impl SessionManager {
             ticker.tick().await; // consume the immediate first tick
             loop {
                 ticker.tick().await;
+                // Durable-lock paid-idle countdown (root-ownership stage 2,
+                // release leg 1): remove every lock dir that is paid (empty
+                // ledger) and idle past the window. Rides this existing sweep —
+                // same cadence as the ephemeral reaper. Indifferent to daemon
+                // lifecycle: locks survive daemon churn and reboots, so this is
+                // the only timer-driven release. A re-edit inside the window
+                // re-arms the same lock with no new ceremony.
+                let reaped_locks = crate::lock::reap_paid_idle_locks(
+                    std::time::SystemTime::now(),
+                    crate::lock::PAID_IDLE_TIMEOUT,
+                );
+                for encoded in &reaped_locks {
+                    info!(
+                        source = Source::DaemonDispatch.as_str(),
+                        lock = %encoded,
+                        "expired paid idle root lock",
+                    );
+                }
                 let expired = reap_idle_ephemeral_roots(
                     &tracker,
                     &mounts,
@@ -3994,6 +4063,111 @@ async fn reap_worktree_root(
     );
 }
 
+/// Handle the `pre-tool/claim` hook stage (root-ownership stage 2).
+///
+/// The `PreToolUse` hook for `catenary claim <root>` calls this with the
+/// claimant's identity (`format`+`session_id`+`agent_id` — the one seam identity
+/// appears) and the target `root`. The daemon:
+/// 1. Runs the mechanical guard: refuse while a diagnose round is in flight on
+///    any identity (an activity fact — a diagnosing agent is demonstrably
+///    present, not gone). The registry keys by editing identity, not root, and a
+///    round may diagnose a batch spanning roots, so the conservative "any in
+///    flight" signal is the honest one.
+/// 2. Performs the one atomic owner-file rename to the claimant's tuple
+///    ([`crate::lock::claim`]); the old→new title pair is the audit record.
+/// 3. Records the takeover loudly: a firehose event and a `warn!`-level TUI
+///    finding (the human sees every takeover — `warn!` is the finding tier; an
+///    `error!` would fire an unwanted desktop interrupt).
+/// 4. Stages the rendered answer for the identity-less CLI to drain.
+///
+/// Returns `{"status":"staged"}` on a completed takeover, `{"status":"refused",
+/// "message":…}` when the guard blocks it (a diagnose round in flight), or
+/// `{"status":"unlocked"}` / `{"status":"already_ours"}` when there is nothing to
+/// take. The hook maps a non-`staged` outcome to its own degrade path.
+#[cfg(unix)]
+async fn handle_claim_stage(
+    ctx: &HookDispatchContext,
+    raw: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(root_str) = raw.get("root").and_then(|v| v.as_str()) else {
+        return serde_json::json!({"status": "error", "message": "missing root"});
+    };
+    let root = PathBuf::from(root_str);
+    let root = root.canonicalize().unwrap_or(root);
+
+    // Mechanical guard: refuse while a diagnose round is executing (an activity
+    // fact, not a timeout). The lock is a hook-plane fact, so if the guard says
+    // "busy" the takeover waits for a genuinely-absent editor.
+    if ctx.diag_rounds.any_in_flight() {
+        return serde_json::json!({
+            "status": "refused",
+            "message": format!(
+                "a diagnose round is in flight — {} is actively being diagnosed; \
+                 try `catenary claim` again once it settles",
+                root.display()
+            ),
+        });
+    }
+
+    let claimant = crate::lock::Owner::new(
+        raw.get("format")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+        raw.get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+        raw.get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+    );
+    let now = std::time::SystemTime::now();
+
+    let answer = match crate::lock::claim(&root, &claimant, now) {
+        crate::lock::Claimed::Ok {
+            previous_age,
+            due,
+            paid_and_idle,
+        } => crate::lock::claim_answer(&root, previous_age, due, paid_and_idle),
+        crate::lock::Claimed::Unlocked => {
+            return serde_json::json!({"status": "unlocked"});
+        }
+        crate::lock::Claimed::AlreadyOurs => {
+            return serde_json::json!({"status": "already_ours"});
+        }
+    };
+
+    // Record the takeover loudly: a firehose event AND a warn-level TUI finding
+    // (the human sees every takeover). `warn!` is the finding tier in this
+    // codebase — NOT `error!`, which fires a desktop interrupt a routine
+    // hand-over does not earn.
+    warn!(
+        source = Source::DaemonDispatch.as_str(),
+        root = %root.display(),
+        claimant = %claimant.file_name(),
+        "root claimed from a prior editor",
+    );
+
+    // Stage the rendered answer for the CLI to drain. Acquiring the per-key
+    // permit blocks only behind another in-flight *claim* stage (never
+    // daemon-wide) and holds for milliseconds. A permit-acquire failure is
+    // non-fatal: report `staged` anyway so the rename (already done) is not
+    // reversed, and the CLI's degrade path reads the lock state.
+    if let Ok(permit) = ctx.handoff.acquire(HandoffKey::Claim).await {
+        ctx.handoff.stage(
+            HandoffKey::Claim,
+            HandoffContext {
+                parent_id: uuid::Uuid::new_v4().to_string(),
+                payload: HandoffPayload::Claim {
+                    answer: answer.clone(),
+                },
+                permit,
+            },
+        );
+    }
+
+    serde_json::json!({"status": "staged", "answer": answer})
+}
+
 /// Retires a landed/removed worktree root from ALL daemon-side state in the
 /// same round-trip the disposal ran (bug 93).
 ///
@@ -4034,6 +4208,16 @@ async fn retire_root(ctx: &HookDispatchContext, tracker: &RootTracker, worktree:
     // the removal — even when no contributor held the path (a stale ledger entry
     // from a prior touch), so this runs unconditionally.
     ctx.primary.forget_root_activity(worktree);
+    // Root retirement takes the durable lock and its ledger with the kitchen
+    // (root-ownership stage 2, release leg 2). The worktree encoding must match
+    // the acquisition-time encoding, which canonicalizes; retire both the raw
+    // and canonical spellings so a symlinked-prefix worktree still clears.
+    crate::lock::retire(worktree);
+    if let Ok(canonical) = worktree.canonicalize()
+        && canonical != worktree
+    {
+        crate::lock::retire(&canonical);
+    }
     let global = tracker.global_roots_rich();
     if let Err(e) = ctx.primary.sync_roots(global).await {
         debug!(
@@ -6041,23 +6225,28 @@ async fn handle_hook_dispatch(
         // releasing the permit immediately. The permit must not be held during
         // the diagnostics pipeline (which may take seconds). Consuming the
         // HandoffContext drops it, releasing the owned semaphore permit.
-        let handoff = ctx.handoff.consume(HandoffKey::Diagnostics).map(|h| {
-            let HandoffPayload::Diagnostics {
-                files,
-                skipped,
-                session_id,
-                editing_session,
-                agent_id,
-            } = h.payload;
-            (
-                files,
-                skipped,
-                session_id,
-                editing_session,
-                agent_id,
-                h.parent_id,
-            )
-        });
+        let handoff = ctx
+            .handoff
+            .consume(HandoffKey::Diagnostics)
+            .and_then(|h| match h.payload {
+                HandoffPayload::Diagnostics {
+                    files,
+                    skipped,
+                    session_id,
+                    editing_session,
+                    agent_id,
+                } => Some((
+                    files,
+                    skipped,
+                    session_id,
+                    editing_session,
+                    agent_id,
+                    h.parent_id,
+                )),
+                // The Diagnostics slot only ever holds a Diagnostics payload;
+                // any mismatch drops to no handoff (a fault, not a panic).
+                HandoffPayload::Claim { .. } => None,
+            });
 
         // The batch is NOT mutated here (misc 141): a `catenary diagnostics` run
         // pays its debt by *delivery*, not on consume, so the `delivered` flags
@@ -6359,6 +6548,15 @@ async fn handle_hook_dispatch(
                 .get(session_id)
                 .map(|e| e.router.session.clone());
             if let Some(session) = editing {
+                // The files this run served — the scoped set, or the whole batch
+                // snapshot for a bare pull. Captured before the flag-flip so the
+                // durable-lock ledger unlink (below) covers exactly what was
+                // delivered.
+                let delivered: Vec<PathBuf> = if scoped {
+                    scoped_files.clone()
+                } else {
+                    session.editing.files(editing_session.as_deref(), agent_id)
+                };
                 if scoped {
                     session.editing.mark_delivered(
                         editing_session.as_deref(),
@@ -6370,6 +6568,15 @@ async fn handle_hook_dispatch(
                         .editing
                         .mark_delivered_all(editing_session.as_deref(), agent_id);
                 }
+                // Delivery deletes: unlink each served file's touch entry from
+                // the durable root lock's on-disk ledger (root-ownership stage 2).
+                // Empty `dir/` = paid = the daemon's idle countdown starts. This
+                // is daemon-side unlink of ledger entries — only the EDIT seam
+                // must stay daemon-free; delivery already runs here. Payment is
+                // parole, not release: the lock dir survives (the paid-idle
+                // reaper removes it after the window). Grouped by the file's
+                // resolved lock root so a multi-root batch pays each kitchen.
+                unlink_delivered_locks(&delivered);
                 debug!(
                     source = Source::DaemonDispatch.as_str(),
                     session_id = %session_id,
@@ -6392,6 +6599,56 @@ async fn handle_hook_dispatch(
             }
         }
 
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
+    // ── Root claim (root-ownership stage 2) ──────────────────────
+    //
+    // `pre-tool/claim` is sent by the PreToolUse hook for `catenary claim
+    // <root>`: the hook supplies the claimant's identity (the one seam identity
+    // appears), the daemon runs the mechanical guard + records the takeover, and
+    // stages the rendered answer for the identity-less CLI to drain via
+    // `tool/claim`. The rename itself is a filesystem fact — the hook does it
+    // locally if the daemon is down (degrade-open), so the guard here is a
+    // best-effort safety, not the sole authority.
+    if method == "pre-tool/claim" {
+        let scope_id = uuid::Uuid::new_v4().to_string();
+        let response = handle_claim_stage(&ctx, &raw).await;
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            Some(&scope_id),
+            &response.to_string(),
+            "outgoing hook response",
+        );
+        let mut payload = serde_json::to_vec(&response)?;
+        payload.push(b'\n');
+        writer.write_all(&payload).await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
+    if method == "tool/claim" {
+        // The identity-less CLI drains the staged claim answer. An absent slot
+        // (the hook could not stage — daemon was down at hook time, or the guard
+        // refused) yields a `not_staged` status the CLI maps to its own
+        // degrade-open path (read the lock state directly).
+        let response = match ctx.handoff.consume(HandoffKey::Claim).map(|h| h.payload) {
+            Some(HandoffPayload::Claim { answer }) => {
+                serde_json::json!({"status": "ok", "answer": answer})
+            }
+            // The Claim slot only ever holds a Claim payload; a mismatch is a
+            // programming error, surfaced as a fault rather than a panic.
+            Some(_) => {
+                serde_json::json!({"status": "error", "message": "handoff payload mismatch"})
+            }
+            None => serde_json::json!({"status": "not_staged"}),
+        };
+        let mut payload = serde_json::to_vec(&response)?;
+        payload.push(b'\n');
+        writer.write_all(&payload).await?;
         writer.shutdown().await?;
         return Ok(());
     }
@@ -7464,7 +7721,8 @@ fn read_json_line(socket: &std::os::unix::net::UnixStream) -> Result<String> {
 #[cfg(unix)]
 #[allow(
     clippy::expect_used,
-    reason = "tests use expect for readable assertions"
+    clippy::panic,
+    reason = "tests use expect/panic for readable assertions"
 )]
 #[allow(
     clippy::significant_drop_tightening,
@@ -10983,7 +11241,10 @@ mod tests {
             session_id,
             editing_session,
             agent_id,
-        } = &consumed.payload;
+        } = &consumed.payload
+        else {
+            panic!("expected a Diagnostics payload");
+        };
         assert_eq!(files, &vec![PathBuf::from("/tmp/a.rs")]);
         assert_eq!(skipped.outside, 2);
         assert_eq!(

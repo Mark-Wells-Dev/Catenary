@@ -703,6 +703,10 @@ enum Sub {
     Pin,
     /// `catenary unpin <path>` — unpin a workspace root. Bare-only lifecycle.
     Unpin,
+    /// `catenary claim <root>` — take over a root's durable lock and its
+    /// diagnostic debt (root-ownership stage 2). Agent-invocable, bare-only
+    /// lifecycle: it mutates the on-disk lock and must run as the sole command.
+    Claim,
     Primer,
     /// `catenary commands` — prints the allowed-command surface.
     Commands,
@@ -747,6 +751,7 @@ impl Sub {
             | Self::RootsAddRm
             | Self::Pin
             | Self::Unpin
+            | Self::Claim
             | Self::Primer
             | Self::Commands
             | Self::WorktreeAdd
@@ -769,6 +774,7 @@ impl Sub {
             Self::RootsAddRm => "roots add/rm",
             Self::Pin => "pin",
             Self::Unpin => "unpin",
+            Self::Claim => "claim",
             Self::Primer => "primer",
             Self::Commands => "commands",
             Self::WorktreeLs => "worktree ls",
@@ -815,6 +821,7 @@ fn recognize_catenary_sub(rest: &[&str]) -> Recog {
         (Some("roots"), _) => Recog::Agent(Sub::Roots),
         (Some("pin"), _) => Recog::Agent(Sub::Pin),
         (Some("unpin"), _) => Recog::Agent(Sub::Unpin),
+        (Some("claim"), _) => Recog::Agent(Sub::Claim),
         // `worktree ls` is Search-class (pipe-friendly registry view); `worktree
         // add`/`rm` are bare-only lifecycle verbs (misc 151), recognized apart so
         // `add` alone can take the client-keyed dispatch deny (misc 177). Split
@@ -903,6 +910,10 @@ pub enum CatenaryAction {
     /// A bare, canonical `catenary diagnostics` — stage the done-editing handoff
     /// (internal `pre-tool/editing-stop`), then allow the command to run.
     Diagnostics,
+    /// A bare, canonical `catenary claim <root>` — perform the root-lock takeover
+    /// hook-side (identity lives at the hook, root-ownership stage 2), stage the
+    /// rendered answer, then allow the command to run (it prints the answer).
+    Claim,
     /// A canonical catenary command (`grep`/`glob`/`roots`/`primer`).
     /// `has_foreign` is true when the call also contains foreign segments (a
     /// search chain) whose allowlist must still be checked.
@@ -1086,6 +1097,7 @@ pub fn analyze_catenary_command(cmd: &str, client: Option<HostFormat>) -> Catena
         return match subs.first() {
             Some(Sub::EditingStart) => CatenaryAction::EditingStart,
             Some(Sub::Diagnostics) => CatenaryAction::Diagnostics,
+            Some(Sub::Claim) => CatenaryAction::Claim,
             // A bare lifecycle command (`roots`/`primer`/`commands`).
             _ => CatenaryAction::Allow { has_foreign },
         };
@@ -1116,6 +1128,7 @@ const fn occ_needs_isolation(occ: &CatenaryOcc) -> bool {
             | Sub::RootsAddRm
             | Sub::Pin
             | Sub::Unpin
+            | Sub::Claim
             | Sub::Primer
             | Sub::Commands
             | Sub::WorktreeAdd
@@ -1353,6 +1366,7 @@ fn stdin_denial(sub: Sub) -> Option<String> {
         | Sub::RootsAddRm
         | Sub::Pin
         | Sub::Unpin
+        | Sub::Claim
         | Sub::Primer
         | Sub::Commands
         | Sub::WorktreeAdd
@@ -4346,6 +4360,38 @@ mod tests {
     }
 
     #[test]
+    fn claim_recognized_as_bare_only_lifecycle() {
+        // Root-ownership stage 2: `catenary claim <root>` is agent-invocable,
+        // maps to the dedicated Claim action (the hook stages, the CLI drains),
+        // and is bare-only (it mutates the on-disk lock, so it takes the handoff
+        // and must be the sole command).
+        assert_eq!(
+            recognize_catenary_sub(&["claim", "/repo"]),
+            Recog::Agent(Sub::Claim),
+        );
+        assert_eq!(Sub::Claim.class(), CatenaryClass::Lifecycle);
+        assert_eq!(
+            analyze_catenary_command("catenary claim /repo", None),
+            CatenaryAction::Claim,
+            "a bare claim maps to the Claim action",
+        );
+        assert!(
+            matches!(
+                analyze_catenary_command("cd /repo && catenary claim .", None),
+                CatenaryAction::Deny(_),
+            ),
+            "claim must be the sole command",
+        );
+        assert!(
+            matches!(
+                analyze_catenary_command("catenary claim /repo | tee log", None),
+                CatenaryAction::Deny(_),
+            ),
+            "claim must not pipe out",
+        );
+    }
+
+    #[test]
     fn worktree_ls_is_search_class_pipes_and_chains() {
         // `catenary worktree ls` is Search-class (misc 151): pipe-friendly,
         // chainable, no isolation.
@@ -5199,7 +5245,9 @@ mod tests {
             // segments are skipped by the allowlist walk, so a search chain's
             // foreign part is still validated.
             CatenaryAction::NotCatenary | CatenaryAction::Allow { .. } => foreign(cmd),
-            CatenaryAction::EditingStart | CatenaryAction::Diagnostics => Outcome::Allow,
+            CatenaryAction::EditingStart | CatenaryAction::Diagnostics | CatenaryAction::Claim => {
+                Outcome::Allow
+            }
         }
     }
 

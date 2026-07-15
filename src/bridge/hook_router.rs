@@ -453,6 +453,7 @@ impl HookRouter {
                 Some(
                     CatenaryAction::EditingStart
                     | CatenaryAction::Diagnostics
+                    | CatenaryAction::Claim
                     | CatenaryAction::Allow { .. },
                 ) => return None,
                 Some(CatenaryAction::NotCatenary) | None => {}

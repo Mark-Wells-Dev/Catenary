@@ -24,6 +24,8 @@ pub mod health;
 pub mod hook;
 /// Guided-install engine: consented, verified per-ecosystem installs (tui-rework 06).
 pub mod install;
+/// The durable root lock — one cook per kitchen (root-ownership stage 2).
+pub mod lock;
 /// Multi-sink tracing dispatcher for Catenary telemetry.
 pub mod logging;
 /// LSP client implementation and server management.

@@ -249,6 +249,23 @@ enum Command {
         path: PathBuf,
     },
 
+    /// Claim a root: take over its durable lock and its diagnostic debt.
+    ///
+    /// One cook per kitchen (root-ownership stage 2): when an edit is denied
+    /// because another agent holds the root's lock, `catenary claim <root>`
+    /// transfers the lock — and the previous editor's unpaid diagnostics debt —
+    /// to you. The takeover is a single atomic rename of the owner record; the
+    /// old→new title pair is the audit trail. Recency (the previous editor's last
+    /// activity) is evidence for your judgement, never an automatic trigger:
+    /// nothing auto-releases on staleness. Refused while a diagnose round is
+    /// executing on the root (a diagnosing agent is present, not gone). After
+    /// claiming, run `catenary diagnostics` to serve the inherited debt and
+    /// review the inherited edits with `git diff` / `git status`.
+    Claim {
+        /// Root path to claim.
+        root: PathBuf,
+    },
+
     /// List the current workspace roots with their contributor classes.
     ///
     /// Bare `catenary roots` lists the roots. The old `roots add`/`roots rm`
@@ -952,6 +969,13 @@ fn main() -> Result<()> {
         }
         #[cfg(not(unix))]
         Some(Command::Unpin { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        #[cfg(unix)]
+        Some(Command::Claim { root }) => {
+            let mut out = cli::Output::stdout(false);
+            build_runtime()?.block_on(run_claim(&mut out, root))
+        }
+        #[cfg(not(unix))]
+        Some(Command::Claim { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
         Some(Command::Roots { command }) => {
             let mut out = cli::Output::stdout(false);
@@ -2997,6 +3021,78 @@ async fn run_root_command(out: &mut cli::Output, path: PathBuf, method: &str) ->
         }
         Err(msg) => anyhow::bail!("{msg}"),
     }
+}
+
+/// Run `catenary claim <root>` — print the takeover answer the hook staged
+/// (root-ownership stage 2).
+///
+/// The identity-bearing work — the mechanical guard, the atomic owner-file
+/// rename, and the firehose/warn recording — already happened at the `PreToolUse`
+/// hook (the one seam identity appears). This CLI process is identity-less: it
+/// drains the staged answer via `tool/claim` and prints it.
+///
+/// Degrade-open when the daemon is unreachable: the hook performed the rename
+/// itself (the lock is a filesystem fact), so this reads the resulting lock
+/// state and prints a plain confirmation. A `not_staged` reply (the guard
+/// refused, or the daemon was down at hook time) also routes to the lock-state
+/// read — the hook already surfaced any refusal as a deny, so reaching here means
+/// the takeover stands.
+///
+/// # Errors
+///
+/// Never fails on a missing daemon (degrade-open); returns an error only for an
+/// unexpected fault envelope.
+#[cfg(unix)]
+async fn run_claim(out: &mut cli::Output, root: PathBuf) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let resolved = cli::commands::resolve_root_path(&root);
+    let ipc_path = catenary_cli::router::socket_path();
+
+    // Drain the staged answer from the daemon. A connection failure or a
+    // `not_staged` reply falls through to the lock-state read below.
+    let staged: Option<String> = match tokio::net::UnixStream::connect(&ipc_path).await {
+        Ok(stream) => {
+            let (reader, mut writer) = stream.into_split();
+            let request = serde_json::json!({ "method": "tool/claim" });
+            let mut payload = serde_json::to_string(&request)?;
+            payload.push('\n');
+            writer.write_all(payload.as_bytes()).await?;
+            let mut buf_reader = BufReader::new(reader);
+            let mut line = String::new();
+            buf_reader.read_line(&mut line).await?;
+            let response: serde_json::Value = serde_json::from_str(line.trim()).unwrap_or_default();
+            match response.get("status").and_then(|v| v.as_str()) {
+                Some("ok") => response
+                    .get("answer")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                _ => None,
+            }
+        }
+        Err(_) => None,
+    };
+
+    if let Some(answer) = staged {
+        let _ = out.writeln(format_args!("{answer}"));
+        return Ok(());
+    }
+
+    // Degrade path: the hook did the rename (daemon down) or nothing was staged.
+    // Read the resulting lock state and print a plain confirmation. If no lock
+    // exists at all, report the benign nothing-to-claim outcome.
+    let lock_dir = catenary_cli::lock::root_lock_dir(&resolved);
+    if lock_dir.is_dir() {
+        let due = catenary_cli::lock::due_count(&lock_dir);
+        let answer = catenary_cli::lock::claim_answer(&resolved, None, due, due == 0);
+        let _ = out.writeln(format_args!("{answer}"));
+    } else {
+        let _ = out.writeln(format_args!(
+            "no lock held on {} — nothing to claim.",
+            resolved.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Check installed hooks against embedded expected hooks at daemon startup.
