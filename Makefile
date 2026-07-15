@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: bench bench-test build-release check conformance conformance-matrix deny flake-hunt fuzz install machete mdbook mockgrep mockglob mdgrep mdglob refresh-recipes registry-selftest rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish publish-check tag-current
+.PHONY: bench bench-test build-release bump-guard check conformance conformance-matrix deny flake-hunt fuzz install machete mdbook mockgrep mockglob mdgrep mdglob publish-backstop refresh-recipes registry-selftest rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish publish-check tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -476,6 +476,37 @@ pre-release-check:
 	fi
 	@$(MAKE) publish-check
 	@echo "Prerequisites OK."
+
+# ── ws41-03: bridge-crate bump guard + workspace publish backstop ─────
+# The per-PR guard: any PR whose diff touches the catenary-mcp bridge crate
+# (docs INCLUDED) must bump that crate's `version` — the daemon<->bridge
+# handshake comparand — in the same PR. NO escape hatch (maintainer-ruled): a
+# false positive costs one harmless /mcp, a false negative is a silent wire
+# divergence, and an override is a judgment surface through which that failure
+# re-enters. Runs in CI on pull_request (see .github/workflows/ci.yml,
+# bridge-bump-guard job); BASE is the diff base (locally origin/main, in CI the
+# PR base sha). HEAD overrides the head ref for local testing against synthetic
+# commits.
+#   make bump-guard BASE=origin/main
+#   make bump-guard BASE=<base-sha> HEAD=<head-sha>
+BASE ?= origin/main
+bump-guard:
+	@sh scripts/bridge-bump-guard.sh "$(BASE)" $(if $(HEAD),"$(HEAD)",)
+
+# The workspace-wide, fail-not-skip publish backstop: for EVERY published crate
+# (catenary-proc included, not just the bridge crate), FAIL — never skip — when a
+# crate's content differs from its already-published version. crates.io protects
+# the registry entry, never the version claim compiled into a binary via a path
+# dep, so a changed-but-unbumped crate would ship as a stale registry artifact
+# under a version a from-source build then compiles against new code. Read-only:
+# for an already-published crate it GETs the sparse-index line (as publish-check
+# does) and the static-CDN .crate, then compares payloads; no credential, no
+# write. Runs in CD before the publish (see cd.yml). Pass crate names to scope it
+# (tests drive one crate).
+#   make publish-backstop
+#   make publish-backstop CRATES=catenary-proc
+publish-backstop:
+	@sh scripts/publish-backstop.sh $(CRATES)
 
 # Verify the crates will publish cleanly BEFORE any tag exists (the v2.0.0
 # crates.io failure: catenary-proc's API grew under a frozen, already-published

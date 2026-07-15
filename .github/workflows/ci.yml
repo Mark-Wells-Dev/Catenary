@@ -79,3 +79,21 @@ jobs:
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
+
+  # ws41-03: the per-PR bridge-crate version-bump guard. Any PR whose diff
+  # touches the catenary-mcp bridge crate (docs INCLUDED) must bump that crate's
+  # `version` — the daemon<->bridge handshake comparand — in the same PR. There
+  # is NO escape hatch (maintainer-ruled): a false positive costs one harmless
+  # /mcp, a false negative is a silent wire divergence. PR-only: the guard's job
+  # is PR-time (a direct push to main is the maintainer's solo path and has no
+  # base to diff). fetch-depth: 0 so the PR base sha resolves for the diff.
+  bridge-bump-guard:
+    name: Bridge bump guard
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # base ref needed to diff the bridge crate
+      - name: Guard the bridge crate version
+        run: make bump-guard BASE="${{ github.event.pull_request.base.sha }}"

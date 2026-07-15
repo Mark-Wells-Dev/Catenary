@@ -13,7 +13,11 @@
 #                      returns post-v2 behind the port.
 #   2. create-release  cut a GitHub Release with the binaries attached
 #   3. publish-crate   publish to crates.io via Trusted Publishing (OIDC — no
-#                      stored token): catenary-proc, then catenary-mcp
+#                      stored token), in dependency order: catenary-proc, then
+#                      catenary-mcp (the bridge crate), then the catenary-cli
+#                      root. A workspace-wide fail-not-skip backstop (ws41-03)
+#                      runs first, so an unbumped content drift reds the release
+#                      instead of hiding behind a skip.
 #   4. notify-distribution  dispatch the distribution repos (pkgbuilds,
 #                      homebrew-tap, scoop-bucket) so packaging starts
 #                      immediately instead of on their next poll
@@ -21,11 +25,14 @@
 # Triggered ONLY by tag pushes (which require write access), so a fork PR can
 # never trigger it — the publish credential is never exposed to untrusted code.
 #
-# Crates published: `catenary-proc` (workspace member) and `catenary-mcp` (the
-# root package — provides the `catenary` binary). There is no `catenary-ts`.
+# Crates published: `catenary-proc` and `catenary-mcp` (the bridge crate) —
+# both workspace members — and `catenary-cli`, the root package that provides
+# the `catenary` binary and depends on the other two by path (so they must
+# publish first). There is no `catenary-ts`.
 #
 # One-time setup before the first Trusted-Publishing run:
-#   - crates.io → for EACH crate (`catenary-mcp` AND `catenary-proc`):
+#   - crates.io → for EACH published crate (`catenary-proc`, `catenary-mcp`,
+#     AND `catenary-cli`):
 #       crate Settings → Trusted Publishing → add a publisher with
 #         repository   TwoWells/Catenary
 #         workflow     cd.yml
@@ -137,24 +144,42 @@ jobs:
 
       # OIDC: exchange the GitHub id-token for a short-lived crates.io token.
       # Nothing long-lived is stored in secrets or on the runner. Requires the
-      # Trusted Publishing config above on BOTH catenary-mcp and catenary-proc;
-      # one minted token then authorizes publishing both.
+      # Trusted Publishing config above on ALL THREE published crates
+      # (catenary-proc, catenary-mcp, catenary-cli); one minted token then
+      # authorizes publishing all of them.
       - name: Authenticate to crates.io (Trusted Publishing)
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
+
+      # ws41-03: the fail-not-skip, WORKSPACE-WIDE publish backstop. Runs BEFORE
+      # any publish. crates.io protects the registry entry, never the version
+      # claim compiled into a binary via a path dep, so the publish step below
+      # legitimately SKIPS an already-published version (`|| echo skipping`) —
+      # but that skip is safe ONLY when the content is byte-identical to what is
+      # published. This backstop reds the release when any published crate's
+      # content differs from its already-published version WITHOUT a bump
+      # (catenary-proc included, not just the bridge crate), so drift can never
+      # hide behind the skip. Read-only: it hits the sparse index and the static
+      # CDN, never publishes.
+      - name: Publish backstop (fail on unbumped content drift)
+        run: make publish-backstop
 
       - name: Publish crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
-          # Workspace subcrate first; skip if its version is already
-          # published.
+          # Workspace subcrates first, in dependency order; skip only if the
+          # version is already published — the backstop above has already failed
+          # the run if any of these drifted without a bump, so a reached skip is
+          # a genuine identical-content no-op.
           cargo publish -p catenary-proc \
             || echo "catenary-proc: already published, skipping"
-          # Wait for the crates.io index to propagate before the dependent
-          # crate.
+          cargo publish -p catenary-mcp \
+            || echo "catenary-mcp: already published, skipping"
+          # Wait for the crates.io index to propagate before the dependent root
+          # crate resolves its just-published path deps.
           sleep 30
-          # Root package (catenary-mcp).
+          # Root package (catenary-cli — the `catenary` binary).
           cargo publish --allow-dirty
 
   # Push, don't poll: nudge the distribution repos so packaging starts now
