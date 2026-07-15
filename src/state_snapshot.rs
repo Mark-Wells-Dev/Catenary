@@ -202,7 +202,9 @@ pub struct ServerEntry {
     /// When the server entered `state` (ISO 8601). Time-in-state = `now −
     /// state_since`, so a stuck `probing` is visible.
     pub state_since: String,
-    /// In-flight progress count, present only while `busy`.
+    /// Outstanding work-done-token count: the in-flight `begin` bracket count
+    /// while `busy`, or the announced-but-not-started token count while
+    /// `pending` (misc 200). Absent in every other state.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub busy_count: Option<u32>,
     /// When the server was spawned (ISO 8601).
@@ -751,7 +753,9 @@ impl SnapshotState {
     fn update_state(&mut self, key: &InstanceKey, lifecycle: &ServerLifecycle) -> bool {
         let new_state = lifecycle.lifecycle_str().to_string();
         let busy_count = match lifecycle {
-            ServerLifecycle::Busy(n) => Some(*n),
+            // Both the busy `begin`-bracket count and the pending
+            // announced-token count ride the same field (misc 200).
+            ServerLifecycle::Busy(n) | ServerLifecycle::Pending(n) => Some(*n),
             _ => None,
         };
         let terminal = lifecycle.is_terminal();

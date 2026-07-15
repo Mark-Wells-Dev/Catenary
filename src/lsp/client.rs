@@ -1356,7 +1356,7 @@ impl LspClient {
             match lifecycle {
                 ServerLifecycle::Healthy | ServerLifecycle::Probing => return true,
                 ServerLifecycle::Failed | ServerLifecycle::Dead => return false,
-                _ => {} // Initializing, Busy — keep waiting
+                _ => {} // Initializing, Pending, Busy — keep waiting
             }
             self.server.state_notify.notified().await;
         }

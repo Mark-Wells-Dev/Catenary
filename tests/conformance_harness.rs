@@ -1065,6 +1065,48 @@ fn conformance_mockls_violator() -> Result<()> {
     Ok(())
 }
 
+/// `mockls-pending` — the created-token-pending shape (misc 200, the elm
+/// cold-download trace). The manifest declares `discipline = "event"` plus the
+/// verified `declares_progress` leg; the binary's bundle
+/// (`--create-delayed-begin`) announces a work-done token via
+/// `window/workDoneProgress/create` at init, goes quiet for the gap, then opens
+/// and closes the `$/progress` bracket — DROPPING any didOpen/didSave that lands
+/// inside the gap (elm's `NoWorkspaceContainsError`, never re-pushed).
+///
+/// **The red/green pin.** Pre-fix, Catenary acks the create and discards it, so
+/// the lifecycle arms only on `begin`: both batch settle seams sample the quiet
+/// tree, release inside the gap, and the didOpen/didSave land mid-init where the
+/// persona drops them — the file resolves absent (no publish ever arrives),
+/// never a real diagnostic. Post-fix, the created token holds settle in the
+/// Pending state across the create→begin gap (the same Stuck ceiling a hung
+/// Busy bracket rides), so the stimulus lands AFTER the bracket, the persona
+/// publishes, and the diagnostic reaches the receipt. This leg asserts the
+/// green: the mock diagnostic is collected, proving the batch held through the
+/// gap.
+///
+/// Contention doctrine: `call_diagnostics` runs the pipeline (settle + collect)
+/// to completion, so the receipt is authoritative; the gap is the only wait and
+/// it is finite.
+#[test]
+fn conformance_mockls_pending() -> Result<()> {
+    let receipt = persona_receipt("mockls-pending", "", "echo hello\n")?;
+    assert!(
+        receipt.contains("mock diagnostic"),
+        "`mockls-pending` announces a work-done token before its download gap — \
+         the created token must hold both settle seams across the create\u{2192}begin \
+         gap so the stimulus lands post-init and the publish reaches the receipt \
+         (post-fix green; pre-fix the settle released in the gap and the file read \
+         absent):\n{receipt}"
+    );
+    assert!(
+        !receipt.contains("[clean]"),
+        "the held batch must collect the real diagnostic, never a settle-released \
+         [clean] over a dropped mid-init stimulus:\n{receipt}"
+    );
+    eprintln!("conformance: `mockls-pending` PASSED");
+    Ok(())
+}
+
 /// `mockls-scan` withholding twin — the SCAN floor arm (misc 196). The scan
 /// persona owes its WHOLE-WORKSPACE answer: the `workspace/diagnostic` pull is its
 /// contractual trigger. Here the persona bundle's workspace-diagnostic serving is

@@ -156,6 +156,12 @@ fn state_style(state: &str, busy_count: Option<u32>, theme: &Theme) -> (String, 
             busy_count.map_or_else(|| "busy".to_string(), |n| format!("busy({n})")),
             theme.accent,
         ),
+        // Announced-but-not-started work-done tokens (misc 200): the server has
+        // requested progress tokens it has not opened a `begin` for yet.
+        "pending" => (
+            busy_count.map_or_else(|| "pending".to_string(), |n| format!("pending({n})")),
+            theme.accent,
+        ),
         "initializing" => ("initializing".to_string(), theme.warning),
         "probing" => ("probing".to_string(), theme.warning),
         "failed" => ("failed".to_string(), theme.error),

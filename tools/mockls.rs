@@ -180,6 +180,24 @@ struct Args {
     #[arg(long)]
     progress_on_change: bool,
 
+    /// The created-token-pending shape (misc 200, the elm cold-download trace).
+    /// On `initialized`, request a work-done token via
+    /// `window/workDoneProgress/create` BEFORE any bracket, then go quiet for
+    /// `<ms>` (no CPU, no wire — the download gap), then open and close the
+    /// `$/progress` begin/end bracket. Until that bracket, the "workspace" is
+    /// NOT ready: any `didOpen`/`didChange`/`didSave` publish that arrives
+    /// inside the gap is DROPPED (elm's `NoWorkspaceContainsError` — the server
+    /// refuses a file whose workspace has not finished loading and never
+    /// re-pushes). A stimulus that lands AFTER the bracket publishes normally.
+    ///
+    /// So: pre-fix, both batch settle seams release inside the gap, the
+    /// didOpen/didSave land mid-init and are dropped → the file resolves absent
+    /// (never `[clean]` from a real answer). Post-fix, the created token holds
+    /// settle across the create→begin gap, the stimulus lands post-bracket, and
+    /// the publish carries the diagnostic. `0` disables (the default).
+    #[arg(long, default_value_t = 0)]
+    create_delayed_begin: u64,
+
     /// Burn CPU for N milliseconds after `didChange` without sending any
     /// notifications (simulates a server doing work without progress).
     #[arg(long)]
@@ -476,6 +494,12 @@ struct MockServer {
     /// pushed by the flycheck thread and drained by the main loop on the
     /// next `didOpen`. Shared with the flycheck thread via `Arc`.
     pending_flycheck_publishes: Arc<Mutex<Vec<PendingPublish>>>,
+    /// Whether the "workspace" has finished its create-delayed-begin init
+    /// (`--create-delayed-begin`, misc 200). `true` immediately when the flag
+    /// is off; flipped `true` by the init thread only after the quiet gap, at
+    /// the `$/progress begin`. While `false`, an incoming document publish is
+    /// dropped (elm's `NoWorkspaceContainsError`). Shared with the init thread.
+    progress_ready: Arc<AtomicBool>,
 }
 
 impl MockServer {
@@ -514,6 +538,9 @@ impl MockServer {
         });
 
         let pull_cancels_remaining = args.cancel_pull;
+        // The workspace is ready from the start UNLESS the create-delayed-begin
+        // persona gates it behind the quiet gap (misc 200).
+        let progress_ready = Arc::new(AtomicBool::new(args.create_delayed_begin == 0));
         Self {
             args,
             documents: BTreeMap::new(),
@@ -532,6 +559,7 @@ impl MockServer {
             die_armed,
             published_once: AtomicBool::new(false),
             pending_flycheck_publishes: Arc::new(Mutex::new(Vec::new())),
+            progress_ready,
         }
     }
 
@@ -912,6 +940,9 @@ impl MockServer {
                 }
                 if self.args.indexing_delay > 0 {
                     self.start_indexing_simulation();
+                }
+                if self.args.create_delayed_begin > 0 {
+                    self.start_create_delayed_begin();
                 }
             }
             "textDocument/didOpen" => {
@@ -2075,6 +2106,15 @@ impl MockServer {
     }
 
     fn publish_diagnostics(&self, uri: &str) {
+        // `--create-delayed-begin` (misc 200): while the workspace is still
+        // loading (inside the quiet create→begin gap), a document publish is
+        // DROPPED — elm's `NoWorkspaceContainsError`, the server refusing a file
+        // whose workspace has not finished loading, and never re-pushing. A
+        // stimulus that lands after the bracket sees `progress_ready` and
+        // publishes normally.
+        if self.args.create_delayed_begin > 0 && !self.progress_ready.load(Ordering::SeqCst) {
+            return;
+        }
         // `--publish-once`: only the first publish (or its delayed
         // scheduling) fires per process — a push server that never
         // re-publishes an unchanged document.
@@ -2164,6 +2204,78 @@ impl MockServer {
                     "params": {
                         "token": token,
                         "value": { "kind": "end", "message": "Indexing complete" }
+                    }
+                }),
+            );
+        });
+    }
+
+    /// The created-token-pending init sequence (`--create-delayed-begin`, misc
+    /// 200; the elm cold-download trace).
+    ///
+    /// Spawned on `initialized`. Requests a work-done token via
+    /// `window/workDoneProgress/create` immediately (before any `$/progress`
+    /// bracket — exactly the elm 06:57:50.729 create, ahead of its download),
+    /// then goes quiet for `create_delayed_begin` ms (a plain `sleep` — no CPU,
+    /// no wire, the download window that samples as idle), then flips
+    /// `progress_ready` and opens/closes the `$/progress` begin/end bracket
+    /// (elm's post-download 06:57:53.077 begin / 53.174 end). The ready flip
+    /// gates the document publish path: a stimulus that landed during the gap
+    /// was dropped; one that lands after publishes normally.
+    fn start_create_delayed_begin(&self) {
+        let gap_ms = self.args.create_delayed_begin;
+        let writer = self.writer.clone();
+        let next_id = self.next_request_id.clone();
+        let ready = self.progress_ready.clone();
+
+        std::thread::spawn(move || {
+            let token = "mockls-pending";
+
+            // Announce the token BEFORE the bracket (the create-then-pending
+            // shape). Catenary registers it and holds settle in the Pending
+            // state across the gap below.
+            let req_id = next_id.fetch_add(1, Ordering::SeqCst);
+            send_message(
+                &writer,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "method": "window/workDoneProgress/create",
+                    "params": { "token": token }
+                }),
+            );
+
+            // The quiet gap — the cold-home download. No CPU, no wire; the
+            // process tree samples idle, so pre-fix the settle seams release
+            // here.
+            std::thread::sleep(Duration::from_millis(gap_ms));
+
+            // The workspace is now loaded: a stimulus that lands from here on
+            // publishes normally.
+            ready.store(true, Ordering::SeqCst);
+
+            send_message(
+                &writer,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "$/progress",
+                    "params": {
+                        "token": token,
+                        "value": { "kind": "begin", "title": "Initializing workspace", "percentage": 0 }
+                    }
+                }),
+            );
+
+            std::thread::sleep(Duration::from_millis(50));
+
+            send_message(
+                &writer,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "$/progress",
+                    "params": {
+                        "token": token,
+                        "value": { "kind": "end", "message": "Workspace ready" }
                     }
                 }),
             );
@@ -2927,6 +3039,12 @@ fn parse_symbol_line(trimmed: &str) -> Option<(u32, usize)> {
 /// the declared-vs-implemented pairing the persona exists to prove.
 const MOCKLS_DEBOUNCE_MS: u64 = 300;
 
+/// The default create→begin quiet gap for the `mockls-pending` persona (misc
+/// 200), in milliseconds. Sized well above a few 50 ms settle polls so the gap
+/// deterministically straddles both batch settle seams: pre-fix a seam samples
+/// idle and releases inside it; post-fix the created token holds through it.
+const MOCKLS_CREATE_GAP_MS: u64 = 600;
+
 /// Applies the persona's default behavior bundle, selected from the server key
 /// (`args.name`) mockls was spawned under (diagnostics-debt 04c deliverable 2).
 ///
@@ -2987,6 +3105,18 @@ fn persona_bundle(args: &mut Args) {
             args.no_push_diagnostics = true;
             args.reject_pull = true;
         }
+        // the created-token-pending shape (misc 200, the elm cold-download
+        // trace): an event-push server that announces its work-done token at
+        // init via `window/workDoneProgress/create`, goes quiet for the gap,
+        // then opens/closes the `$/progress` bracket — dropping any
+        // didOpen/didSave that lands inside the gap (elm's
+        // `NoWorkspaceContainsError`). The created token must hold both settle
+        // seams across the gap so the stimulus lands post-init and its publish
+        // carries the diagnostic. `MOCKLS_CREATE_GAP_MS` sizes the gap
+        // comfortably above a few settle polls; a test may pin its own.
+        "mockls-pending" if args.create_delayed_begin == 0 => {
+            args.create_delayed_begin = MOCKLS_CREATE_GAP_MS;
+        }
         // `mockls-event` (default mockls push IS the event discipline) and every
         // non-persona name (the ordinary `mockls_lsp_arg` extension) select no
         // bundle: the mock behaves exactly as its flags say.
@@ -3040,6 +3170,7 @@ mod tests {
             send_configuration_request: false,
             publish_version: false,
             progress_on_change: false,
+            create_delayed_begin: 0,
             cpu_busy: None,
             flycheck_command: None,
             advertise_save: false,
@@ -3417,6 +3548,105 @@ mod tests {
                 && m["params"]["value"]["kind"] == "end"
         });
         assert!(has_end, "Expected $/progress end. Got: {messages:?}");
+    }
+
+    #[test]
+    fn test_create_delayed_begin_announces_then_brackets() {
+        // The created-token-pending persona (misc 200): on `initialized` it
+        // announces the token via `window/workDoneProgress/create`, then after
+        // the quiet gap opens/closes the `$/progress` bracket. The create must
+        // precede the begin on the wire — the pending shape.
+        let mut args = default_args();
+        args.name = "mockls-pending".to_string();
+        args.create_delayed_begin = 60;
+
+        let initialized = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        })
+        .to_string();
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&initialized));
+        input.extend(frame(&shutdown_request(2)));
+
+        let is_kind = |m: &Value, kind: &str| {
+            m.get("method").and_then(Value::as_str) == Some("$/progress")
+                && m["params"]["value"]["kind"] == kind
+        };
+        let messages = run_server_until(
+            args,
+            &input,
+            |messages| messages.iter().any(|m| is_kind(m, "end")),
+            Duration::from_secs(10),
+        );
+
+        let create_idx = messages.iter().position(|m| {
+            m.get("method").and_then(Value::as_str) == Some("window/workDoneProgress/create")
+        });
+        let begin_idx = messages.iter().position(|m| is_kind(m, "begin"));
+        let end_idx = messages.iter().position(|m| is_kind(m, "end"));
+        let create_idx = create_idx.expect("create announced");
+        let begin_idx = begin_idx.expect("begin bracket opened");
+        let end_idx = end_idx.expect("end bracket closed");
+        assert!(
+            create_idx < begin_idx && begin_idx < end_idx,
+            "the token is announced (create) before its bracket opens (begin) \
+             and closes (end): {messages:?}"
+        );
+    }
+
+    #[test]
+    fn test_create_delayed_begin_drops_publish_during_gap() {
+        // A didOpen that lands while the workspace is still loading (inside the
+        // create->begin gap) is DROPPED — elm's `NoWorkspaceContainsError`. The
+        // input drains synchronously (didOpen handled well before the 5 s gap
+        // thread flips ready), so no publishDiagnostics is emitted for it.
+        let mut args = default_args();
+        args.name = "mockls-pending".to_string();
+        args.create_delayed_begin = 5000;
+
+        let initialized = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        })
+        .to_string();
+        let uri = "file:///tmp/case.mockls-pending";
+
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&initialized));
+        input.extend(frame(&did_open_notification(uri, "echo hello\n")));
+        input.extend(frame(&shutdown_request(2)));
+
+        let messages = run_server_with(args, &input);
+        let published = messages.iter().any(|m| {
+            m.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
+        });
+        assert!(
+            !published,
+            "a didOpen inside the loading gap must be dropped (no publish): {messages:?}"
+        );
+    }
+
+    #[test]
+    fn test_create_delayed_begin_publishes_after_ready() {
+        // The default mock (no `--create-delayed-begin`) publishes on didOpen
+        // immediately — the gate only suppresses while the persona's gap is
+        // open, so the ordinary event path is unaffected.
+        let uri = "file:///tmp/case.plain";
+        let mut input = frame(&initialize_request(1));
+        input.extend(frame(&did_open_notification(uri, "echo hello\n")));
+        input.extend(frame(&shutdown_request(2)));
+
+        let messages = run_server_with(default_args(), &input);
+        assert!(
+            messages.iter().any(|m| {
+                m.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
+            }),
+            "with the gate off, didOpen publishes as usual: {messages:?}"
+        );
     }
 
     #[test]

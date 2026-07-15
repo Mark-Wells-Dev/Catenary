@@ -245,8 +245,10 @@ const fn is_pending_work(state: ProcessState) -> bool {
 /// Waits for the server to go idle using the provided detector.
 ///
 /// Runs a 50ms polling loop, skipping the tree walk while the server is
-/// `Busy(n)` (an open `$/progress` bracket — explained work), and delegating
-/// idle detection to [`IdleDetector::check`].
+/// `Busy(n)` (an open `$/progress` bracket — explained work) or `Pending(n)`
+/// (a work-done token announced via `window/workDoneProgress/create` but not
+/// yet begun — the elm cold-download gap the token straddles, misc 200), and
+/// delegating idle detection to [`IdleDetector::check`].
 ///
 /// There is deliberately **no CPU-time cap**: the detector watches the whole
 /// subtree, so a flycheck burning CPU in `cargo`/`rustc` children keeps the
@@ -289,10 +291,17 @@ pub async fn await_idle(
             return SettleResult::RootDied;
         }
 
-        // During Busy: activity is implicit (an open `$/progress` bracket),
-        // skip tree walking. The server is provably working, so the heartbeat
-        // reports it as such.
-        if matches!(lifecycle, ServerLifecycle::Busy(_)) {
+        // During Busy or Pending: outstanding work is announced (a `$/progress`
+        // bracket is open, or a work-done token was created but not yet begun —
+        // the elm gap, misc 200). Skip tree walking; the server is holding
+        // unfinished work, so the heartbeat reports it as working. A
+        // created-never-begun token holds here indefinitely, bounded only by
+        // the caller's cancel-on-disconnect — the same `Stuck` ceiling a hung
+        // `Busy` bracket rides today (no new clock).
+        if matches!(
+            lifecycle,
+            ServerLifecycle::Busy(_) | ServerLifecycle::Pending(_)
+        ) {
             heartbeat(server_name, samples, true);
             continue;
         }
@@ -1032,6 +1041,44 @@ mod tests {
         let detector = IdleDetector::unconditional();
         let result = await_idle(&server, detector, cancel, "test-server").await;
         assert_eq!(result, SettleResult::RootDied);
+    }
+
+    #[tokio::test]
+    async fn await_idle_holds_on_a_created_never_begun_token(// A Pending lifecycle (an announced work-done token, no `begin` yet —
+        // misc 200) holds the settle open exactly as an open `Busy` bracket
+        // does: the tree walk is skipped, so the server never settles on quiet
+        // sleep. The only bound is the caller's cancel — the same Stuck ceiling
+        // that covers a hung Busy bracket today, no new clock. Without the fix
+        // a Pending server has no lifecycle at all and settles on the first
+        // quiet poll.
+    ) {
+        let server = Arc::new(test_server());
+        // Pending, as if `window/workDoneProgress/create` arrived but the
+        // `$/progress begin` has not.
+        server.set_lifecycle(ServerLifecycle::Pending(1));
+        let cancel = CancellationToken::new();
+        let detector = IdleDetector::unconditional();
+
+        // The hold must outlast several poll intervals — it does not settle.
+        let held = tokio::time::timeout(
+            POLL_INTERVAL * 5,
+            await_idle(&server, detector, cancel.clone(), "test-server"),
+        )
+        .await;
+        assert!(
+            held.is_err(),
+            "a created-never-begun token holds settle open (no timeout, no settle)"
+        );
+
+        // The caller's cancel is the only bound — the Stuck ceiling.
+        cancel.cancel();
+        let detector = IdleDetector::unconditional();
+        let result = await_idle(&server, detector, cancel, "test-server").await;
+        assert_eq!(
+            result,
+            SettleResult::Settled,
+            "cancel is the ceiling that releases a stuck Pending token"
+        );
     }
 
     #[test]

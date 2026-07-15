@@ -799,6 +799,18 @@ pub struct DisciplineRecord {
     /// retrieval evidence bar by declaration. Defaults to `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub declares_push: bool,
+    /// Evidence class: the server is verified to announce work-done progress
+    /// tokens via `window/workDoneProgress/create` **before** it opens the
+    /// `$/progress` bracket — the created-token-pending shape (misc 200,
+    /// grounded in the conformance-29312867815-elm trace: `create` observed at
+    /// 06:57:50.729, pre-download, the `begin` bracket only at 06:57:53.077).
+    /// The token-pending settle hold that covers that gap is **identity-blind**
+    /// (it fires for any server that creates a token, keyed on nothing), so
+    /// this leg records the verified evidence rather than gating behaviour — an
+    /// honesty marker in the discipline row, like the verified `declares_push`
+    /// leg. Defaults to `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub declares_progress: bool,
     /// Forced `initializationOptions` overlaid onto — and winning over — the
     /// user's options at initialize time. A raw TOML value serialized as an inline
     /// table / sub-table. Absent ⇒ no forced options. (gopls's `pullDiagnostics:
@@ -1366,6 +1378,26 @@ mod tests {
         // lattice: declares push.
         let lattice = manifest.discipline_for("lattice");
         assert!(lattice.declares_push, "lattice declares push");
+        assert!(
+            !lattice.declares_progress,
+            "declares_progress defaults off — only elm's verified leg sets it"
+        );
+
+        // elm-language-server: the misc-200 verified `declares_progress` leg —
+        // the conformance-29312867815-elm trace observed
+        // `window/workDoneProgress/create` pre-download. It is an evidence class
+        // (identity-blind hold), not a behaviour gate, so the discipline stays
+        // bare `event`.
+        let elm = manifest.discipline_for("elm-language-server");
+        assert_eq!(elm.discipline, Some(Discipline::Event));
+        assert!(
+            elm.declares_progress,
+            "elm declares the created-token-pending progress shape (misc 200)"
+        );
+        assert!(
+            !elm.declares_push,
+            "elm's stronger push contract stays unverified/unarmed (misc 196)"
+        );
 
         // An unruled/unverified server projects the empty record.
         let unknown = manifest.discipline_for("some-custom-server");
@@ -1390,6 +1422,7 @@ mod tests {
             "mockls-scan",
             "mockls-diff",
             "mockls-violator",
+            "mockls-pending",
         ] {
             assert!(manifest.is_blessed(name), "`{name}` must be blessed");
         }
@@ -1430,6 +1463,17 @@ mod tests {
         assert!(
             violator.declares_push,
             "`mockls-violator` DECLARES push — the binary breaks the contract"
+        );
+
+        // The created-token-pending persona (the elm shape, misc 200): event
+        // discipline PLUS the verified `declares_progress` leg, mirroring elm's
+        // real row. The binary announces its token at init and holds settle
+        // across the gap.
+        let pending = manifest.discipline_for("mockls-pending");
+        assert_eq!(pending.discipline, Some(Discipline::Event));
+        assert!(
+            pending.declares_progress,
+            "`mockls-pending` declares the created-token-pending progress shape"
         );
     }
 

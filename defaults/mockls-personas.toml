@@ -103,6 +103,25 @@ tier = "synthetic-persona"
 [discipline.mockls-diff]
 discipline = "diff"
 
+# ── created-token-pending (the elm cold-download shape, misc 200) ────────────
+# An event-push server that announces its work-done token at init via
+# `window/workDoneProgress/create` BEFORE any bracket, goes quiet for a gap (the
+# cold-home download), then opens/closes the `$/progress` bracket — dropping any
+# didOpen/didSave that lands inside the gap (elm's `NoWorkspaceContainsError`).
+# The created token must hold both batch settle seams across the gap so the
+# stimulus lands post-init and its publish carries the diagnostic. Carries the
+# `declares_progress` evidence leg exactly as elm's real row does. Bundle:
+# `--create-delayed-begin <MOCKLS_CREATE_GAP_MS>` (a test may pin its own gap).
+[blessed.mockls-pending.synthetic]
+version = "mockls-persona"
+platform = "synthetic"
+date = "2026-07-14"
+tier = "synthetic-persona"
+
+[discipline.mockls-pending]
+discipline = "event"
+declares_progress = true
+
 # ── the violating twin (ledger 05's fault-attribution dummy) ─────────────────
 # Declares the push contract (`declares_push = true`, like `mockls-declared`)
 # but the binary WITHHOLDS on the persona's default bundle: it never publishes

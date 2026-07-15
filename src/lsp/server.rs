@@ -842,6 +842,44 @@ impl LspServer {
         self.state_notify.notify_waiters();
     }
 
+    /// Derives the lifecycle from the single work-done-token registry counts
+    /// and applies it (misc 200).
+    ///
+    /// `begun` is the count of tokens with an open `$/progress` `begin`
+    /// bracket; `created` is the count of tokens announced via
+    /// `window/workDoneProgress/create` but not yet begun. The derivation:
+    /// `begun > 0` → [`ServerLifecycle::Busy`] (unchanged busy semantics),
+    /// else `created > 0` → [`ServerLifecycle::Pending`] (announced, not yet
+    /// started — the pending half both settle seams hold on), else
+    /// [`ServerLifecycle::Healthy`] (all tokens retired).
+    ///
+    /// A no-op when the server is already terminal (a dead server produces no
+    /// more progress) and when the derived state equals the current one — so a
+    /// `report` on an already-`Busy` server churns no snapshot write. Persists
+    /// and wakes state waiters on a real transition.
+    pub(crate) fn apply_progress_lifecycle(&self, begun: u32, created: u32) {
+        let derived = if begun > 0 {
+            ServerLifecycle::Busy(begun)
+        } else if created > 0 {
+            ServerLifecycle::Pending(created)
+        } else {
+            ServerLifecycle::Healthy
+        };
+
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lifecycle.is_terminal() || *lifecycle == derived {
+            return;
+        }
+        *lifecycle = derived.clone();
+        drop(lifecycle);
+
+        self.persist_state(&derived);
+        self.state_notify.notify_waiters();
+    }
+
     // ── State snapshot ───────────────────────────────────────────
 
     /// Sets the `state.json` snapshot writer for live-state mirroring.
@@ -1154,6 +1192,11 @@ impl LspServer {
                     debug!("$/progress missing token");
                     return;
                 };
+                // A terminal server produces no more progress; ignore the event
+                // rather than repopulate the registry `on_shutdown` cleared.
+                if self.lifecycle().is_terminal() {
+                    return;
+                }
                 let token_str = token_value
                     .as_str()
                     .map_or_else(|| token_value.to_string(), str::to_string);
@@ -1175,54 +1218,28 @@ impl LspServer {
                 let db_title = primary.map(|p| p.title.clone());
                 let db_message = primary.and_then(|p| p.message.clone());
                 let db_pct = primary.and_then(|p| p.percentage);
+                // Snapshot the registry counts under the same lock so the
+                // lifecycle derives from the single token registry (misc 200):
+                // `begun` → Busy, else `created` → Pending, else Healthy.
+                let begun = tracker.begun_count();
+                let created = tracker.created_count();
                 drop(tracker);
                 self.persist_progress(db_title.as_deref(), db_message.as_deref(), db_pct);
 
-                // Update lifecycle based on progress kind
+                // `begin` arms the runtime "sends progress" capability
+                // independently of create — a sloppy server that begins a
+                // token it never announced still counts (misc 200). Only the
+                // begin event flips `ever_busy`; a bare create does not.
                 let kind = params["value"]["kind"].as_str();
-                let mut lifecycle = self
-                    .lifecycle
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-                if lifecycle.is_terminal() {
-                    return;
+                if kind == Some("begin") && !self.ever_busy.swap(true, Ordering::SeqCst) {
+                    self.capability_notify.notify_waiters();
+                }
+                if kind == Some("end") && begun == 0 && created == 0 {
+                    debug!("Server ready (progress completed)");
                 }
 
-                match kind {
-                    Some("begin") => {
-                        let first = !self.ever_busy.swap(true, Ordering::SeqCst);
-                        let new_state = match *lifecycle {
-                            ServerLifecycle::Busy(n) => ServerLifecycle::Busy(n + 1),
-                            _ => ServerLifecycle::Busy(1),
-                        };
-                        *lifecycle = new_state.clone();
-                        drop(lifecycle);
-                        self.persist_state(&new_state);
-                        if first {
-                            self.capability_notify.notify_waiters();
-                        }
-                    }
-                    Some("end") => {
-                        let new_state = match *lifecycle {
-                            ServerLifecycle::Busy(n) if n > 1 => ServerLifecycle::Busy(n - 1),
-                            ServerLifecycle::Busy(1) => {
-                                debug!("Server ready (progress completed)");
-                                ServerLifecycle::Healthy
-                            }
-                            ref other => other.clone(),
-                        };
-                        *lifecycle = new_state.clone();
-                        drop(lifecycle);
-                        self.persist_state(&new_state);
-                    }
-                    _ => {
-                        drop(lifecycle);
-                    }
-                }
-
+                self.apply_progress_lifecycle(begun, created);
                 self.progress_notify.notify_waiters();
-                self.state_notify.notify_waiters();
             }
             "window/logMessage" | "window/showMessage" => {
                 if let Some(message) = params.get("message").and_then(|m| m.as_str()) {
@@ -1271,14 +1288,44 @@ impl LspServer {
                 self.handle_unregister_capability(params);
                 Ok(Value::Null)
             }
+            // window/workDoneProgress/create: the server announces a work-done
+            // token BEFORE it opens the `$/progress` bracket. Register the
+            // token in the single progress registry so settle holds on the
+            // announced-but-not-started (Pending) state — the elm cold-download
+            // gap the create straddles (misc 200) — then ack `Null` (the ack
+            // itself is spec-correct and unchanged; the token retires via the
+            // `$/progress` `end`, not a wire response). A malformed/missing
+            // token still acks `Null` and registers nothing.
+            "window/workDoneProgress/create" => {
+                // A terminal server produces no more progress; ack `Null` but
+                // do not repopulate the registry `on_shutdown` cleared.
+                if let Some(token_value) =
+                    extract::progress_token(params).filter(|_| !self.lifecycle().is_terminal())
+                {
+                    let token_str = token_value
+                        .as_str()
+                        .map_or_else(|| token_value.to_string(), str::to_string);
+                    let (begun, created) = {
+                        let mut tracker = self
+                            .progress
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        tracker.create(&token_str);
+                        (tracker.begun_count(), tracker.created_count())
+                    };
+                    self.apply_progress_lifecycle(begun, created);
+                    self.progress_notify.notify_waiters();
+                } else {
+                    debug!("window/workDoneProgress/create missing token");
+                }
+                Ok(Value::Null)
+            }
             // workspace/diagnostic/refresh: server asks client to re-pull
             // diagnostics for open documents. No-op — document lifecycle
             // is transient (open/settle/save/settle/retrieve/close within
             // done_editing), so there is no stale cache to invalidate.
             // Mid-batch, the settle pipeline already waits for quiescence.
-            "window/workDoneProgress/create"
-            | "window/showMessageRequest"
-            | "workspace/diagnostic/refresh" => Ok(Value::Null),
+            "window/showMessageRequest" | "workspace/diagnostic/refresh" => Ok(Value::Null),
             _ => Err(RpcError {
                 code: -32601,
                 message: format!("Method '{method}' not supported by client"),
@@ -2539,6 +2586,150 @@ mod tests {
             }),
         );
         assert_eq!(server.lifecycle(), ServerLifecycle::Dead);
+    }
+
+    // ── window/workDoneProgress/create → Pending lifecycle (misc 200) ──
+
+    #[test]
+    fn create_arms_pending_and_still_acks_null() {
+        // The create request registers the announced token (holding settle via
+        // the Pending lifecycle) while the wire response stays spec-correct
+        // `Null` — the ack is unchanged.
+        let server = test_server();
+        server.set_lifecycle(ServerLifecycle::Healthy);
+        assert!(!server.sends_progress());
+
+        let ack = server
+            .on_request(
+                "window/workDoneProgress/create",
+                &json!({ "token": "tok-1" }),
+            )
+            .expect("create acks");
+        assert_eq!(ack, Value::Null, "the create ack is spec-correct Null");
+        assert_eq!(server.lifecycle(), ServerLifecycle::Pending(1));
+        // A bare create does NOT flip the runtime "sends progress" capability —
+        // that is reserved for a $/progress begin.
+        assert!(
+            !server.sends_progress(),
+            "create alone is not a begin — capability discovery waits for begin"
+        );
+    }
+
+    #[test]
+    fn create_then_begin_then_end_walks_pending_busy_healthy() {
+        // The full elm-shaped lifecycle: announce (Pending) → open bracket
+        // (Busy) → close (Healthy). The created token holds settle across the
+        // create→begin gap.
+        let server = test_server();
+        server.set_lifecycle(ServerLifecycle::Healthy);
+
+        server
+            .on_request(
+                "window/workDoneProgress/create",
+                &json!({ "token": "tok-1" }),
+            )
+            .expect("create acks");
+        assert_eq!(server.lifecycle(), ServerLifecycle::Pending(1));
+
+        server.on_notification(
+            "$/progress",
+            &json!({ "token": "tok-1", "value": { "kind": "begin", "title": "Initializing workspace" } }),
+        );
+        assert_eq!(
+            server.lifecycle(),
+            ServerLifecycle::Busy(1),
+            "the begin upgrades the announced token to a live bracket"
+        );
+        assert!(server.sends_progress(), "begin flips the capability");
+
+        server.on_notification(
+            "$/progress",
+            &json!({ "token": "tok-1", "value": { "kind": "end" } }),
+        );
+        assert_eq!(server.lifecycle(), ServerLifecycle::Healthy);
+    }
+
+    #[test]
+    fn two_created_tokens_hold_pending_until_all_retire() {
+        // Pending derives from the outstanding created-token count; the server
+        // stays Pending until the last announced token is begun or ended.
+        let server = test_server();
+        server.set_lifecycle(ServerLifecycle::Healthy);
+        for tok in ["a", "b"] {
+            server
+                .on_request("window/workDoneProgress/create", &json!({ "token": tok }))
+                .expect("create acks");
+        }
+        assert_eq!(server.lifecycle(), ServerLifecycle::Pending(2));
+
+        // End one never-begun token → still one announced, still Pending.
+        server.on_notification(
+            "$/progress",
+            &json!({ "token": "a", "value": { "kind": "end" } }),
+        );
+        assert_eq!(server.lifecycle(), ServerLifecycle::Pending(1));
+
+        // Begin the other → Busy, then end → Healthy.
+        server.on_notification(
+            "$/progress",
+            &json!({ "token": "b", "value": { "kind": "begin", "title": "x" } }),
+        );
+        assert_eq!(server.lifecycle(), ServerLifecycle::Busy(1));
+        server.on_notification(
+            "$/progress",
+            &json!({ "token": "b", "value": { "kind": "end" } }),
+        );
+        assert_eq!(server.lifecycle(), ServerLifecycle::Healthy);
+    }
+
+    #[test]
+    fn shutdown_clears_a_pending_created_token() {
+        // Server death releases the token registry the same way it clears the
+        // progress tracker — a created-never-begun token does not survive it.
+        let server = test_server();
+        server.set_lifecycle(ServerLifecycle::Healthy);
+        server
+            .on_request(
+                "window/workDoneProgress/create",
+                &json!({ "token": "tok-1" }),
+            )
+            .expect("create acks");
+        assert_eq!(server.lifecycle(), ServerLifecycle::Pending(1));
+
+        server.on_shutdown();
+        assert_eq!(server.lifecycle(), ServerLifecycle::Dead);
+        assert!(
+            !server
+                .progress
+                .lock()
+                .expect("progress lock")
+                .has_outstanding(),
+            "on_shutdown clears the created token registry"
+        );
+    }
+
+    #[test]
+    fn create_on_terminal_server_acks_null_and_registers_nothing() {
+        // A dead server's create still acks Null (spec-correct) but does not
+        // repopulate the registry on_shutdown cleared.
+        let server = test_server();
+        server.set_lifecycle(ServerLifecycle::Dead);
+        let ack = server
+            .on_request(
+                "window/workDoneProgress/create",
+                &json!({ "token": "tok-1" }),
+            )
+            .expect("create acks");
+        assert_eq!(ack, Value::Null);
+        assert_eq!(server.lifecycle(), ServerLifecycle::Dead);
+        assert!(
+            !server
+                .progress
+                .lock()
+                .expect("progress lock")
+                .has_outstanding(),
+            "a terminal server registers no token"
+        );
     }
 
     // ── try_transition_probing_to_healthy tests ─────────────────────

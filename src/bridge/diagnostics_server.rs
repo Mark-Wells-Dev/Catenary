@@ -2279,10 +2279,16 @@ async fn await_publish_evidence(
             () = tokio::time::sleep(POLL_INTERVAL) => {}
         }
 
-        // Work accounting: an open progress bracket or a working tree is the
-        // server still reacting — the budget is untouched (work-based; never
-        // cap observed work). Only a quiet sample drains it.
-        if matches!(server.lifecycle(), ServerLifecycle::Busy(_)) {
+        // Work accounting: an open progress bracket (`Busy`), an announced
+        // work-done token not yet begun (`Pending` — the elm cold-download
+        // gap, misc 200), or a working tree is the server still reacting — the
+        // budget is untouched (work-based; never cap observed work). Only a
+        // quiet sample drains it. A created-never-begun token rides the same
+        // Stuck ceiling as a hung `Busy` bracket — no new clock.
+        if matches!(
+            server.lifecycle(),
+            ServerLifecycle::Busy(_) | ServerLifecycle::Pending(_)
+        ) {
             continue;
         }
         let sampler = Arc::clone(&server);

@@ -505,8 +505,18 @@ discipline = "pull"
 # push contract is unverified and deliberately unarmed — with the row present its
 # silence now reads through the event residual, not the rowless most-trusting
 # `[clean]` that rendered the dirty fixture clean in the incident.
+#
+# `declares_progress` (misc 200) — VERIFIED from the conformance-29312867815-elm
+# trace: elm-ls requests its work-done token via `window/workDoneProgress/create`
+# at 06:57:50.729, BEFORE its ~2 s `elm make` cold-home download, and opens the
+# `$/progress begin` bracket only at 06:57:53.077 (closed 53.174) — the
+# created-token-pending shape. Catenary now holds settle across that
+# created→begin gap (the token rides Created ∪ Begun), so both batch settle seams
+# no longer release mid-download. The hold is identity-blind — this leg records
+# the verified evidence class, it does not gate behaviour.
 [discipline.elm-language-server]
 discipline = "event"
+declares_progress = true
 
 # intelephense — event (misc 196; conformance-grounded, NOT on this host's PATH).
 # intelephense is a PHP push-diagnostics server (`--stdio`) that publishes on
