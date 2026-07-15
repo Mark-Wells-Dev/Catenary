@@ -1265,7 +1265,8 @@ fn enforce_editing_state(
     // guardrail-deny invariant); an allow (ours / foreign / uncovered) flows on
     // to the daemon editing-state transport below. Read-only tools carry no
     // edited path and take no lock — they look through the window unbounded.
-    if let Some(reason) = root_lock_gate(hook_json, tool_name, file_path, format, writes) {
+    if let Some(reason) = root_lock_gate(hook_json, tool_name, file_path, shell_cmd, format, writes)
+    {
         print!("{}", format_deny(&reason, format));
         return;
     }
@@ -1314,46 +1315,48 @@ fn enforce_editing_state(
     }
 }
 
-/// The durable-root-lock gate at the edit seam (root-ownership stage 2).
+/// The durable-root-lock gate at the tool seam (root-ownership stages 2 + 5).
 ///
-/// Hook-process-local: acquires (or re-affirms) the per-root lock for every
-/// covered edit target this tool call touches — the Edit/Write `file_path` and
-/// any resolved shell `writes` — using the identity the host supplied at THIS
-/// seam (`<client>+<session>+<agent>`, the one place identity appears). The lock
-/// is a filesystem fact under `state_dir/locks/`, so it works with the daemon
-/// down (unlike the daemon-side `EditingGuardrail`, which dies with the daemon).
+/// Hook-process-local: enforces the one-cook-per-kitchen rule across all three
+/// command tiers (root-ownership stage 5), using the identity the host supplied
+/// at THIS seam (`<client>+<session>+<agent>`, the one place identity appears).
+/// The lock is a filesystem fact under `state_dir/locks/`, so it works with the
+/// daemon down (unlike the daemon-side `EditingGuardrail`, which dies with the
+/// daemon).
 ///
-/// Returns `Some(briefing)` on the first collision (another agent holds the
-/// root) — the caller denies with it and accumulates nothing. Returns `None`
-/// when every target is ours / foreign / uncovered (the edit flows on). Booking
-/// is static-data-driven ([`crate::lock::Booking`] from a hook-side
-/// `Config::load()`), so no daemon connection is ever made here.
+/// - **Edit tier** — the Edit/Write `file_path` and any resolved shell `writes`
+///   [`acquire`](crate::lock::acquire) (or re-affirm) the per-root lock, booking
+///   each covered target. A collision (another agent holds the root) denies with
+///   the briefing.
+/// - **Stateful tier** — a `build` / mutating-git-subcommand / `chmod` command
+///   ([`tier::classify_command`](crate::cli::command_filter::tier::classify_command))
+///   takes no file lock (it edits no named path), but a stateful operation in a
+///   kitchen ANOTHER agent holds is the same trespass through a different door.
+///   The command's root is resolved from cwd; if it is locked by another
+///   identity, the command is denied with the same briefing shape as the edit
+///   seam's.
+/// - **Read tier** — everything else (reads, read-only git) passes unconditionally
+///   — a waiter looks through the window unbounded.
 ///
-/// Reads carry no edited path and pass no `writes`, so they take no lock — the
-/// window stays open for read-only agents. A config that fails to load skips the
-/// gate entirely (fail-open): a lone agent must never be false-denied because the
-/// booking data was unreadable.
+/// The asymmetry that must hold: an UNLOCKED root imposes nothing (a lone cook
+/// works free); only a root LOCKED BY ANOTHER identity denies. Booking is
+/// static-data-driven ([`crate::lock::Booking`] from a hook-side `Config::load()`),
+/// so no daemon connection is ever made here. A config that fails to load skips
+/// the gate entirely (fail-open): a lone agent must never be false-denied because
+/// the booking data was unreadable.
+///
+/// Returns `Some(briefing)` on the first collision, else `None` (the tool flows
+/// on).
 fn root_lock_gate(
     hook_json: &serde_json::Value,
     tool_name: &str,
     file_path: Option<&str>,
+    shell_cmd: Option<&str>,
     format: HostFormat,
     writes: &[PathBuf],
 ) -> Option<String> {
-    // Collect the covered edit targets this call touches: the Edit/Write path
-    // (only for an actual edit tool) plus every resolved shell write.
-    let mut targets: Vec<PathBuf> = Vec::new();
-    if crate::bridge::is_edit_tool(tool_name)
-        && let Some(path) = file_path
-    {
-        targets.push(PathBuf::from(path));
-    }
-    targets.extend(writes.iter().cloned());
-    if targets.is_empty() {
-        return None;
-    }
-
-    // Static booking data — no daemon. A config that won't load fails open.
+    // Static booking data — no daemon. A config that won't load fails open (for
+    // BOTH tiers: a lone agent is never false-denied on an unreadable config).
     let Ok(config) = crate::config::Config::load() else {
         return None;
     };
@@ -1366,6 +1369,17 @@ fn root_lock_gate(
     );
     let now = std::time::SystemTime::now();
 
+    // ── Edit tier: acquire (and book) each covered edit target ──────────────
+    // The Edit/Write path (only for an actual edit tool) plus every resolved
+    // shell write. A collision denies; an allow (ours / foreign / uncovered)
+    // flows on.
+    let mut targets: Vec<PathBuf> = Vec::new();
+    if crate::bridge::is_edit_tool(tool_name)
+        && let Some(path) = file_path
+    {
+        targets.push(PathBuf::from(path));
+    }
+    targets.extend(writes.iter().cloned());
     for target in &targets {
         if let crate::lock::Acquired::Denied(briefing) =
             crate::lock::acquire(target, &owner, &booking, now)
@@ -1373,7 +1387,53 @@ fn root_lock_gate(
             return Some(briefing);
         }
     }
+
+    // ── Stateful tier: a mutating kitchen operation needs the lock ──────────
+    // A `build` / mutating-git / `chmod` command edits no named path, so the
+    // edit-tier acquire above did not gate it. Resolve its root from cwd and deny
+    // only when it is held by ANOTHER identity (an unlocked root imposes nothing).
+    if let Some(cmd) = shell_cmd {
+        let cwd = extract_cwd_str(hook_json, format).map(PathBuf::from);
+        let resolved = config.resolved_commands.as_ref();
+        if let Some(rules) = resolved
+            && crate::cli::command_filter::tier::classify_command(
+                cmd,
+                writes,
+                rules,
+                cwd.as_deref(),
+            )
+            .requires_lock()
+            && let Some(reason) = stateful_root_gate(cwd.as_deref(), &owner, now)
+        {
+            return Some(reason);
+        }
+    }
+
     None
+}
+
+/// Deny a stateful-tier command whose kitchen (the cwd's enclosing root) is held
+/// by another identity (root-ownership stage 5).
+///
+/// Resolves the cwd's lock root and reads its owner file by pure path algebra. An
+/// unlocked root (no lock dir) or one this caller owns imposes nothing — the
+/// command flows on. Only a root LOCKED BY ANOTHER identity denies, with the same
+/// briefing shape as the edit seam's (root path copy-pasteable, `catenary claim`
+/// rescue, the softened paid-idle copy). An unresolvable cwd (scratch dir, no VCS
+/// checkout) resolves to no root — nothing to gate.
+fn stateful_root_gate(
+    cwd: Option<&std::path::Path>,
+    owner: &crate::lock::Owner,
+    now: std::time::SystemTime,
+) -> Option<String> {
+    let cwd = cwd?;
+    let root = crate::lock::resolve_lock_root(cwd)?;
+    let holder = crate::lock::owner_of(&root)?;
+    if &holder == owner {
+        return None; // ours — a stateful op in our own kitchen is free
+    }
+    // Locked by another identity — deny with the edit-seam briefing shape.
+    Some(crate::lock::holder_briefing(&root, now))
 }
 
 /// Run the foreign-command allowlist filter (regime 2) **and** the write
@@ -1960,6 +2020,169 @@ fn handle_claim_hook(hook_json: &serde_json::Value, command: &str, format: HostF
     }
 }
 
+// ── The reconcile bracket (root-ownership stage 5) ──────────────────────────
+
+/// The `PostToolUse` hook handler — the reconcile bracket's post-command leg
+/// (root-ownership stage 5).
+///
+/// A stateful-tier git command that moves the working tree
+/// (`stash`/`checkout`/`stash pop`/`merge`/`rebase`) gets reconciled against git
+/// itself as the changed-ness oracle (`git status --porcelain`), both directions:
+/// `stash`/`checkout` unbook files git now reports clean, `stash pop`/`merge`/
+/// `rebase` book every covered file git reports modified ("the pop should present
+/// as writes that restore it"). **Attribution is clean** because the bracket
+/// wraps the cook's OWN command at THIS seam — no watcher guesswork.
+///
+/// Runs entirely hook-process-local (the ledger is a filesystem fact) and
+/// **returns no decision**: `PostToolUse` carries none, so this never interferes
+/// with the host's flow. Every reconcile leg (unparsable stdin, a non-git or
+/// non-reconciling command, an unresolvable root, a failed git query) is a silent
+/// no-op. Only Claude and OpenCode carry a `Bash` shell tool through
+/// `PostToolUse`; other hosts reconcile nothing (their shell-tool extractor yields
+/// `None`).
+///
+/// The reserved-shim dialect contract is preserved (this event stays wired across
+/// the full surface): Claude tolerates silence, but Antigravity's contract is
+/// JSON-in/JSON-out, so an Antigravity host always gets the documented empty
+/// object `{}` — the reconcile is the added behavior, the empty answer the
+/// unchanged floor.
+pub fn run_post_tool(format: HostFormat) {
+    // Drain-and-parse; on any failure still answer the dialect's empty form so a
+    // garbage payload never breaks the host's flow (the shim contract).
+    if let Ok(stdin_data) = std::io::read_to_string(std::io::stdin())
+        && let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data)
+    {
+        let tool_name = extract_tool_name(&hook_json, format);
+        if let Some(command) = extract_shell_command(&hook_json, tool_name, format) {
+            reconcile_stateful_git(&hook_json, &command, format);
+        }
+    }
+    // Antigravity's JSON-in/JSON-out contract: answer the empty object. Claude /
+    // OpenCode tolerate silence, so nothing is emitted for them.
+    if matches!(format, HostFormat::Antigravity) {
+        print!("{{}}");
+    }
+}
+
+/// Run the reconcile bracket for a stateful-tier git command, if the command
+/// drives a reconcile (root-ownership stage 5).
+///
+/// Classifies the command's reconcile direction
+/// ([`tier::git_reconcile_direction`](crate::cli::command_filter::tier::git_reconcile_direction)):
+/// a non-reconciling command (`git commit`, a read-only git, a non-git command)
+/// is a no-op. Otherwise resolves the command's root from cwd, runs the
+/// `git status --porcelain` oracle in that root, and drives
+/// [`crate::lock::reconcile_bracket`] in the classified direction under the cook's
+/// own identity. All paths (the oracle's, the ledger's) canonicalize at their
+/// ingestion seam so the reconcile keys the SAME canonical ledger the edit seam
+/// booked under (the spelling rule).
+fn reconcile_stateful_git(hook_json: &serde_json::Value, command: &str, format: HostFormat) {
+    use crate::cli::command_filter::tier;
+
+    let Some(direction) = tier::git_reconcile_direction(command) else {
+        return; // not a reconciling git command (commit, read-only, non-git)
+    };
+
+    // The command's kitchen: resolve the cwd to its lock root. An unresolvable
+    // cwd (scratch dir, no VCS checkout) has no ledger to reconcile.
+    let cwd = extract_cwd_str(hook_json, format).map_or_else(
+        || std::env::current_dir().unwrap_or_default(),
+        PathBuf::from,
+    );
+    let Some(root) = crate::lock::resolve_lock_root(&cwd) else {
+        return;
+    };
+
+    // Book direction needs the static booking data (a pop never books an
+    // uncoverable file — the same gate the edit seam uses). A config that won't
+    // load fails open: skip the reconcile rather than mis-book.
+    let Ok(config) = crate::config::Config::load() else {
+        return;
+    };
+    let booking = crate::lock::Booking::from_config(&config);
+
+    let owner = crate::lock::Owner::new(
+        format.as_str(),
+        extract_session_id(hook_json, format).unwrap_or_default(),
+        extract_agent_id(hook_json),
+    );
+
+    // The oracle: git's own changed-ness report, canonicalized against the repo
+    // root. A failed query yields an empty set — in the Unbook direction that
+    // would clear all debt (wrong), so a failed query is a no-op instead.
+    let Some(modified) = git_status_modified(&cwd) else {
+        return;
+    };
+
+    crate::lock::reconcile_bracket(&root, &owner, &booking, direction, &modified);
+}
+
+/// Run `git status --porcelain` in `cwd` and return the canonical absolute paths
+/// git reports as changed — the reconcile bracket's changed-ness oracle
+/// (root-ownership stage 5).
+///
+/// Non-interactive and read-only (`GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0`,
+/// stdin closed), mirroring the write resolver's git-query discipline. The porcelain
+/// paths are **repo-relative**, so they join onto the repository root
+/// (`git rev-parse --show-toplevel`) — never the cwd — then canonicalize at the
+/// ingestion seam (the spelling rule) so they key the same canonical ledger the
+/// edit seam booked under. Returns `None` on any failure (git missing, not a repo,
+/// non-zero exit, non-UTF-8) so the caller no-ops rather than reconcile against a
+/// phantom empty set.
+fn git_status_modified(cwd: &std::path::Path) -> Option<Vec<PathBuf>> {
+    let repo_root = git_query(cwd, &["rev-parse", "--show-toplevel"])?
+        .into_iter()
+        .next()
+        .map(PathBuf::from)?;
+    let lines = git_query(cwd, &["status", "--porcelain", "--no-renames"])?;
+    let paths = lines
+        .iter()
+        .filter_map(|line| porcelain_path(line))
+        .map(|rel| {
+            let joined = repo_root.join(rel);
+            joined.canonicalize().unwrap_or(joined)
+        })
+        .collect();
+    Some(paths)
+}
+
+/// Parse the repo-relative path out of one `git status --porcelain` line.
+///
+/// Porcelain v1 lines are `XY <path>` — two status columns, a space, then the
+/// path (rename arrows are suppressed by `--no-renames`, so no ` -> ` split is
+/// needed). The path starts at byte offset 3. A short/malformed line yields
+/// `None`. A quoted path (git quotes paths with unusual bytes when `core.quotePath`
+/// is on) is left as-is: it won't match a booked touch leaf and simply reconciles
+/// nothing for that entry — the safe direction, never a mis-book.
+fn porcelain_path(line: &str) -> Option<&str> {
+    let path = line.get(3..)?.trim();
+    (!path.is_empty()).then_some(path)
+}
+
+/// Run a non-interactive, read-only git query in `cwd`, returning its stdout
+/// lines on a clean (exit 0) run, or `None` on any failure.
+///
+/// The reconcile bracket's private twin of the write resolver's git query
+/// (`resolver::git::git_query`, not re-exported): same discipline
+/// (`GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0`, stdin closed), so a
+/// bracket query is as inert and hermetic as a resolver query.
+fn git_query(cwd: &std::path::Path, args: &[&str]) -> Option<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    Some(text.lines().map(str::to_string).collect())
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -2012,6 +2235,24 @@ mod tests {
         );
         // No argument → None (the CLI's clap layer reports the usage error).
         assert!(extract_claim_root("catenary claim").is_none());
+    }
+
+    // ── Reconcile bracket: porcelain parsing (root-ownership stage 5) ────
+
+    #[test]
+    fn porcelain_path_extracts_the_relative_path() {
+        // `XY <path>` — two status columns, a space, then the repo-relative path.
+        assert_eq!(porcelain_path(" M src/main.rs"), Some("src/main.rs"));
+        assert_eq!(porcelain_path("M  src/main.rs"), Some("src/main.rs"));
+        assert_eq!(porcelain_path("?? new.rs"), Some("new.rs"));
+        assert_eq!(porcelain_path("A  src/added.rs"), Some("src/added.rs"));
+    }
+
+    #[test]
+    fn porcelain_path_rejects_short_or_empty_lines() {
+        assert!(porcelain_path("").is_none());
+        assert!(porcelain_path(" M ").is_none());
+        assert!(porcelain_path("XY").is_none());
     }
 
     #[test]

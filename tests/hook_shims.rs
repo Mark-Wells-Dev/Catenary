@@ -79,9 +79,13 @@ fn reserved_shims_exit_zero_silently() -> Result<()> {
     Ok(())
 }
 
-/// The Antigravity dialect: its hook contract is JSON-in/JSON-out, so the
-/// same shims answer the documented empty object `{}` on stdout (and nothing
-/// else) — for its two reserved events, on every stdin shape.
+/// The Antigravity dialect: its hook contract is JSON-in/JSON-out, so these
+/// events answer the documented empty object `{}` on stdout (and nothing else)
+/// on every stdin shape. `post-invocation` is a reserved shim; `post-tool-use`
+/// is the real reconcile-bracket handler (root-ownership stage 5), whose
+/// Antigravity floor is the same empty answer — the reconcile is Claude/OpenCode
+/// Bash-only, so an Antigravity `post-tool-use` reconciles nothing and answers
+/// `{}` exactly like the shim it grew out of.
 #[test]
 fn antigravity_shims_answer_the_empty_object() -> Result<()> {
     let tmp = tempfile::tempdir().expect("create tempdir");

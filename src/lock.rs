@@ -481,6 +481,25 @@ fn is_paid_and_idle(lock_dir: &Path, now: SystemTime, idle_timeout: Duration) ->
         && last_activity_age(lock_dir, now).is_some_and(|age| age < idle_timeout)
 }
 
+/// The deny briefing for a `root` held by another identity, computed from its
+/// on-disk lock state — the same briefing the edit-seam collision produces
+/// (root-ownership stage 5).
+///
+/// Reads the lock dir's age / due count / paid-idle state and renders
+/// [`deny_briefing`]. The caller resolves the root and confirms it is held by
+/// another owner first; this only formats. Used by the stateful-tier gate at the
+/// hook (a `build` / mutating-git / `chmod` command in another cook's kitchen) so
+/// its denial matches the edit seam's exactly, without re-deriving the internals
+/// hook-side.
+#[must_use]
+pub fn holder_briefing(root: &Path, now: SystemTime) -> String {
+    let lock_dir = root_lock_dir(root);
+    let age = last_activity_age(&lock_dir, now);
+    let due = due_count(&lock_dir);
+    let paid_and_idle = is_paid_and_idle(&lock_dir, now, PAID_IDLE_TIMEOUT);
+    deny_briefing(root, age, due, paid_and_idle)
+}
+
 /// Formats the deny briefing shown to an entering second cook (copy is ruled).
 ///
 /// The root path is on its own line, copy-pasteable, and the `catenary claim`
@@ -856,6 +875,109 @@ pub fn book_transferred_in(locks_base: &Path, root: &Path, owner: &Owner, files:
 /// [`locks_dir`].
 pub fn book_transferred(root: &Path, owner: &Owner, files: &[PathBuf]) {
     book_transferred_in(&locks_dir(), root, owner, files);
+}
+
+/// The direction a reconcile bracket drives the ledger (root-ownership stage 5).
+///
+/// A stateful-tier git command is bracketed by a post-command reconcile with git
+/// itself as the changed-ness oracle (`git status --porcelain`). Which way the
+/// ledger moves is the command's effect on the working tree:
+///
+/// - [`Unbook`](ReconcileDirection::Unbook) — `git stash` / `git checkout` remove
+///   modifications, so files git now reports CLEAN are unbooked (their debt left
+///   the working tree with the modifications).
+/// - [`Book`](ReconcileDirection::Book) — `git stash pop` / `merge` / `rebase`
+///   restore or introduce modifications, so every COVERED file git reports
+///   MODIFIED is booked ("the pop should present as writes that restore it").
+///
+/// One bracket, one oracle, per command, both directions — nothing
+/// stash-specific.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileDirection {
+    /// Files git now reports clean are unbooked.
+    Unbook,
+    /// Covered files git reports modified are booked.
+    Book,
+}
+
+/// Reconciles a root's ledger against git's changed-ness oracle after a
+/// stateful-tier git command, in the given `direction` (root-ownership stage 5).
+///
+/// `modified` is the canonical absolute path set git reports as changed after the
+/// command — the `git status --porcelain` result, joined onto the repo root and
+/// canonicalized at its ingestion seam (the spelling rule: these paths key ledger
+/// reads/writes, so they must carry the SAME canonical spelling the edit seam
+/// booked under). The bracket derives both directions from that one oracle plus
+/// the current due set:
+///
+/// - [`Unbook`](ReconcileDirection::Unbook): every currently-due file NOT in
+///   `modified` went clean — the modification left the working tree, so its touch
+///   file is unlinked ([`unlink_delivered_in`] is the existing unlink primitive).
+///   Debt goes with the modifications.
+/// - [`Book`](ReconcileDirection::Book): every file in `modified` that [`Booking`]
+///   says is covered is booked (creating the lock dir + owner file if the root is
+///   not yet locked, so a pop into a paid/expired kitchen re-arms it). The static
+///   `Booking` gate is the SAME one the edit seam uses, so the pop never books an
+///   uncoverable file. Over-booking an already-diagnosed file whose bytes the pop
+///   restored is the safe direction — it re-diagnoses clean and retires;
+///   under-booking would lose the debt the ruling restores.
+///
+/// **Attribution is clean** because the bracket wraps the cook's OWN command at
+/// the hook — no watcher guesswork. Best-effort throughout: a booking/unlink
+/// failure never blocks the command (it already ran).
+pub fn reconcile_bracket_in(
+    locks_base: &Path,
+    root: &Path,
+    owner: &Owner,
+    booking: &Booking,
+    direction: ReconcileDirection,
+    modified: &[PathBuf],
+) {
+    // The oracle's spelling must match the ledger's canonical spelling — the
+    // caller canonicalizes at the git-query seam, but re-canonicalize here so a
+    // direct call (a test, a future caller) is never split by a symlinked prefix.
+    let modified: std::collections::BTreeSet<PathBuf> = modified
+        .iter()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+        .collect();
+
+    match direction {
+        ReconcileDirection::Unbook => {
+            // Files that were due but git now reports clean left the working tree
+            // — unbook them. A file still modified stays due (its debt is real).
+            let cleared: Vec<PathBuf> = due_files_in(locks_base, root)
+                .into_iter()
+                .filter(|due| !modified.contains(due))
+                .collect();
+            if !cleared.is_empty() {
+                unlink_delivered_in(locks_base, root, &cleared);
+            }
+        }
+        ReconcileDirection::Book => {
+            // Every covered modified file is booked — the pop presents as writes
+            // that restore it. `Booking` is the same static gate the edit seam
+            // uses, so an uncoverable file never books.
+            let to_book: Vec<PathBuf> = modified
+                .into_iter()
+                .filter(|file| booking.books(file))
+                .collect();
+            if !to_book.is_empty() {
+                book_transferred_in(locks_base, root, owner, &to_book);
+            }
+        }
+    }
+}
+
+/// Production wrapper for [`reconcile_bracket_in`] resolving the base through
+/// [`locks_dir`].
+pub fn reconcile_bracket(
+    root: &Path,
+    owner: &Owner,
+    booking: &Booking,
+    direction: ReconcileDirection,
+    modified: &[PathBuf],
+) {
+    reconcile_bracket_in(&locks_dir(), root, owner, booking, direction, modified);
 }
 
 /// Unlinks a set of delivered files from their ledgers, grouping each file by its
@@ -1786,6 +1908,222 @@ mod tests {
             read_owner_name(&lock_dir).expect("read owner"),
             Some(b.file_name()),
             "the marker does not confuse owner-file resolution"
+        );
+    }
+
+    // ── The reconcile bracket (root-ownership stage 5) ──────────────────────
+
+    #[test]
+    fn unbook_direction_clears_files_git_reports_clean() {
+        // The edit → book → `git stash` (unbook) leg: an edited-and-booked file
+        // that git now reports CLEAN (its modification left the working tree) is
+        // unbooked. A file still modified stays due.
+        let fx = Fixture::new();
+        let stashed = fx.file("src/stashed.rs");
+        let kept = fx.file("src/kept.rs");
+        let owner = Owner::new("claude", "sess-a", "");
+        let booking = rust_booking();
+        let now = SystemTime::now();
+        let locks = fx.locks();
+
+        // Both files are edited and booked.
+        assert!(matches!(
+            acquire_in(&locks, &stashed, &owner, &booking, now),
+            Acquired::Ours
+        ));
+        assert!(matches!(
+            acquire_in(&locks, &kept, &owner, &booking, now),
+            Acquired::Ours
+        ));
+        assert_eq!(due_files_in(&locks, &fx.root).len(), 2, "both booked");
+
+        // git now reports only `kept` modified (a `git stash` of `stashed`).
+        reconcile_bracket_in(
+            &locks,
+            &fx.root,
+            &owner,
+            &booking,
+            ReconcileDirection::Unbook,
+            std::slice::from_ref(&kept),
+        );
+
+        assert_eq!(
+            due_files_in(&locks, &fx.root),
+            vec![kept],
+            "the stashed file is unbooked; the still-modified file stays due"
+        );
+    }
+
+    #[test]
+    fn unbook_all_clean_clears_the_whole_ledger() {
+        // A `git stash` of everything: git reports nothing modified, so the whole
+        // ledger unbooks and a bare diagnose would answer no-debt.
+        let fx = Fixture::new();
+        let f1 = fx.file("src/a.rs");
+        let f2 = fx.file("src/b.rs");
+        let owner = Owner::new("claude", "sess-a", "");
+        let booking = rust_booking();
+        let now = SystemTime::now();
+        let locks = fx.locks();
+        assert!(matches!(
+            acquire_in(&locks, &f1, &owner, &booking, now),
+            Acquired::Ours
+        ));
+        assert!(matches!(
+            acquire_in(&locks, &f2, &owner, &booking, now),
+            Acquired::Ours
+        ));
+
+        reconcile_bracket_in(
+            &locks,
+            &fx.root,
+            &owner,
+            &booking,
+            ReconcileDirection::Unbook,
+            &[],
+        );
+
+        assert!(
+            !has_debt_in(&locks, &fx.root),
+            "stashing everything clears the debt"
+        );
+    }
+
+    #[test]
+    fn book_direction_books_covered_modified_files() {
+        // The `git stash pop` (book) leg: every COVERED file git reports modified
+        // is booked ("the pop should present as writes that restore it"). An
+        // uncoverable file (no server) is never booked — the same static gate the
+        // edit seam uses.
+        let fx = Fixture::new();
+        let covered = fx.file("src/restored.rs");
+        let uncovered = fx.file("notes.txt");
+        let owner = Owner::new("claude", "sess-a", "");
+        let booking = rust_booking();
+        let locks = fx.locks();
+
+        // The root is not yet locked (a pop into a fresh/paid kitchen).
+        assert!(!root_lock_dir_in(&locks, &fx.root).exists());
+
+        reconcile_bracket_in(
+            &locks,
+            &fx.root,
+            &owner,
+            &booking,
+            ReconcileDirection::Book,
+            &[covered.clone(), uncovered],
+        );
+
+        // Only the covered file booked; the ledger + owner were created.
+        assert_eq!(
+            due_files_in(&locks, &fx.root),
+            vec![covered],
+            "the pop books the covered restored file, never the uncoverable one"
+        );
+        let lock_dir = root_lock_dir_in(&locks, &fx.root);
+        assert_eq!(
+            read_owner_name(&lock_dir).expect("read owner"),
+            Some(owner.file_name()),
+            "the pop creates the owner file when the root was unlocked"
+        );
+    }
+
+    #[test]
+    fn round_trip_edit_stash_pop_re_books() {
+        // The end-to-end round trip: edit → booked; stash → unbooked (no debt);
+        // pop → re-booked (debt restored, ready to serve).
+        let fx = Fixture::new();
+        let file = fx.file("src/main.rs");
+        let owner = Owner::new("claude", "sess-a", "");
+        let booking = rust_booking();
+        let now = SystemTime::now();
+        let locks = fx.locks();
+
+        // edit → booked
+        assert!(matches!(
+            acquire_in(&locks, &file, &owner, &booking, now),
+            Acquired::Ours
+        ));
+        assert!(has_debt_in(&locks, &fx.root), "edit books the file");
+
+        // stash → git reports clean → unbooked
+        reconcile_bracket_in(
+            &locks,
+            &fx.root,
+            &owner,
+            &booking,
+            ReconcileDirection::Unbook,
+            &[],
+        );
+        assert!(
+            !has_debt_in(&locks, &fx.root),
+            "the stash unbooks: bare diagnostics answers no-debt"
+        );
+
+        // pop → git reports it modified again → re-booked
+        reconcile_bracket_in(
+            &locks,
+            &fx.root,
+            &owner,
+            &booking,
+            ReconcileDirection::Book,
+            std::slice::from_ref(&file),
+        );
+        assert_eq!(
+            due_files_in(&locks, &fx.root),
+            vec![file],
+            "the pop re-books the restored file — diagnose serves it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_bracket_books_through_aliased_spelling_into_canonical_ledger() {
+        // The spelling rule at the reconcile seam (misc 193): a `git status`
+        // path reached through a symlinked-prefix alias of the root must book
+        // into the SAME canonical ledger the edit seam pays against. A green
+        // real-dir run masks this — the symlink alias is the regression pin.
+        let fx = Fixture::new();
+        let alias = fx.dir.path().join("alias");
+        std::os::unix::fs::symlink(&fx.root, &alias).expect("mk symlink");
+        // The real file, and its aliased spelling (what a status-in-the-alias
+        // query would join).
+        let real = fx.file("src/main.rs");
+        let via_alias = alias.join("src/main.rs");
+        let owner = Owner::new("claude", "sess-a", "");
+        let booking = rust_booking();
+        let locks = fx.locks();
+
+        // Book via the alias spelling (the pop direction).
+        reconcile_bracket_in(
+            &locks,
+            &fx.root,
+            &owner,
+            &booking,
+            ReconcileDirection::Book,
+            std::slice::from_ref(&via_alias),
+        );
+        assert_eq!(
+            due_files_in(&locks, &fx.root),
+            vec![real.clone()],
+            "the aliased pop books into the canonical ledger"
+        );
+
+        // Unbook via the alias spelling too (the stash direction): a status that
+        // reports the aliased file still modified must NOT unbook the canonical
+        // entry. Passing the alias spelling as the modified set keeps it due.
+        reconcile_bracket_in(
+            &locks,
+            &fx.root,
+            &owner,
+            &booking,
+            ReconcileDirection::Unbook,
+            std::slice::from_ref(&via_alias),
+        );
+        assert_eq!(
+            due_files_in(&locks, &fx.root),
+            vec![real],
+            "the aliased still-modified file is NOT wrongly unbooked (same canonical spelling)"
         );
     }
 }

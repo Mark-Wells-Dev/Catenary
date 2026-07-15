@@ -58,6 +58,15 @@ pub mod oracle;
 /// denies with a teaching message.
 pub mod resolver;
 
+/// Command tiers — Read / Edit / Stateful (root-ownership stage 5).
+///
+/// Classifies a shell command line onto the three lock tiers as DATA over the
+/// grant lists: a read passes any window, an edit/stateful command requires the
+/// lock. The stateful set (mutating git subcommands, `build`, `chmod`) is the
+/// annotation the reconcile bracket also keys off — `git stash`/`checkout`
+/// unbook, `git stash pop`/`merge`/`rebase` book.
+pub mod tier;
+
 use crate::cli::HostFormat;
 use crate::config::ResolvedCommands;
 

@@ -1163,6 +1163,11 @@ fn main() -> Result<()> {
                 HookCommand::PermissionRequest { format } => {
                     cli::hooks::run_permission_request(format);
                 }
+                // The reconcile bracket's post-command leg (root-ownership stage
+                // 5): a stateful-tier git command is reconciled against `git
+                // status --porcelain`, both directions. Emits nothing (PostToolUse
+                // carries no decision), so it never interferes with the host flow.
+                HookCommand::PostToolUse { format } => cli::hooks::run_post_tool(format),
                 // Reserved no-op shims (full-surface registration, pre-v2
                 // ruling): drain stdin, exit 0 — no daemon connection; the
                 // only output is the host dialect's empty answer (Antigravity
@@ -1172,7 +1177,6 @@ fn main() -> Result<()> {
                 | HookCommand::UserPromptSubmit { format }
                 | HookCommand::UserPromptExpansion { format }
                 | HookCommand::PermissionDenied { format }
-                | HookCommand::PostToolUse { format }
                 | HookCommand::PostToolUseFailure { format }
                 | HookCommand::PostInvocation { format }
                 | HookCommand::Notification { format }
