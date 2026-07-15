@@ -547,7 +547,7 @@
       "properties": {
         "desktop": {
           "default": null,
-          "description": "Whether OS-level desktop notifications are enabled for error events. Defaults to `true`. Set to `false` to suppress desktop notifications. The `CATENARY_NOTIFY=0` environment variable overrides this to `false`.",
+          "description": "Whether OS-level desktop notifications are enabled for error events. Defaults to `true`. Set to `false` to suppress desktop notifications. An off-spelled `CATENARY_NOTIFY` env var (`0`/`off`/`false`/`no`) overrides this to `false`.",
           "type": [
             "boolean",
             "null"

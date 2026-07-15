@@ -108,14 +108,19 @@ pub fn isolate_env(cmd: &mut Command, root: &str) {
     // which reads the real config before/after an isolated pin and fails loudly on
     // any change — a stronger, platform-agnostic net than a HOME redirect (it
     // catches XDG- and HOME-resolved leaks alike, not just HOME-based ones).
-    // Suppress the desktop-notification sink (misc 179): test daemons resolve
-    // `$HOME` (which isolate_env does not redirect) and so read the user's
+    // Suppress the desktop-notification sink (misc 179, bug 111): test daemons
+    // resolve `$HOME` (which isolate_env does not redirect) and so read the user's
     // REAL `~/.claude` plugin cache — whenever the dev tree's hooks.json
     // diverges from the installed copy, every daemon start fires the
     // stale-hooks `error!()` and a real desktop notification, storming the
-    // maintainer's desktop once per daemon-spawning test. `CATENARY_NOTIFY=0`
-    // is the sink's own suppression knob; must come after the clearing loop.
-    cmd.env("CATENARY_NOTIFY", "0");
+    // maintainer's desktop once per daemon-spawning test. This is the isolation
+    // TRIPWIRE (bug 111 fix direction 4): `isolate_env` redirects the XDG file
+    // bases but NOT the D-Bus session, so nothing else stops an isolated
+    // subprocess's notify sink from reaching the real desktop no matter what
+    // error path it walks. `CATENARY_NOTIFY=off` is the sink's own suppression
+    // knob, honored by EVERY Catenary surface (daemon sink, hook sink, and the
+    // direct `notify_desktop` refusal path); must come after the clearing loop.
+    cmd.env("CATENARY_NOTIFY", "off");
     // NOTE (diagnostics-debt 04c): the operator bless-list wildcard that used to
     // bless every mock server retired here. Blessing is now pure manifest
     // membership: under `feature = "mockls"` (which every `make test`/`make

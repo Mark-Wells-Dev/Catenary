@@ -501,21 +501,73 @@ fn resolve_relative(pattern: &str, base: &Path) -> String {
     base.join(&expanded).to_string_lossy().into_owned()
 }
 
+/// Unlinks two bound socket files unless disarmed first.
+///
+/// The boot-abort cleanup for [`DaemonSockets`] (bug 111). Held as a field so
+/// [`DaemonSockets`] itself needs no `Drop` — its plain listener fields can be
+/// moved out by [`SessionManager::from_sockets`] with no `Option`/panic dance —
+/// and the socket-file lifetime rides this guard instead. A live drop (an
+/// aborted boot) unlinks both files; [`disarm`](Self::disarm) suppresses that
+/// once a [`SessionManager`] has taken over the lifetime.
+#[cfg(unix)]
+struct SocketCleanupGuard {
+    mcp_path: PathBuf,
+    ipc_path: PathBuf,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl SocketCleanupGuard {
+    /// Disarm the guard so [`Drop`] leaves the socket files in place.
+    const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SocketCleanupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // A boot aborted after the bind but before a SessionManager took
+            // ownership. Unlink both socket files so a subsequent client gets
+            // the quiet "no daemon running" arm (os error 2), not the
+            // "unreachable" storm (os error 111) — bug 111.
+            let _ = std::fs::remove_file(&self.mcp_path);
+            let _ = std::fs::remove_file(&self.ipc_path);
+        }
+    }
+}
+
 /// Pre-bound MCP and IPC socket listeners.
 ///
 /// Returned by [`bind_daemon_sockets`] for early socket binding in daemon
-/// mode. Pass to [`SessionManager::from_listeners`] once the tool handler
+/// mode. Pass to [`SessionManager::from_sockets`] once the tool handler
 /// is ready.
+///
+/// # Boot-abort cleanup (bug 111)
+///
+/// Sockets are bound *first* in daemon startup — before config load and LSP
+/// spawning — so bridge proxies can connect while heavy init proceeds. That
+/// window means any abort between the bind and [`SessionManager::from_sockets`]
+/// (an invalid config today, anything else tomorrow) would unwind through this
+/// value while the socket files stay on disk with nobody listening — the
+/// `socket exists, connection refused` (os error 111) strand every later client
+/// then reports. So this value carries a [`SocketCleanupGuard`] that unlinks both
+/// socket files on any drop path. [`SessionManager::from_sockets`] disarms the
+/// guard as it takes ownership, because the resulting [`SessionManager`] owns the
+/// socket lifetime from that point (its own `Drop` unlinks them).
 #[cfg(unix)]
 pub struct DaemonSockets {
     /// MCP socket listener.
-    pub mcp_listener: tokio::net::UnixListener,
+    mcp_listener: tokio::net::UnixListener,
     /// General-purpose IPC socket listener.
-    pub ipc_listener: tokio::net::UnixListener,
+    ipc_listener: tokio::net::UnixListener,
     /// Filesystem path of the MCP socket.
-    pub mcp_path: PathBuf,
+    mcp_path: PathBuf,
     /// Filesystem path of the IPC socket.
-    pub ipc_path: PathBuf,
+    ipc_path: PathBuf,
+    /// Boot-abort cleanup: unlinks the two files on drop unless disarmed.
+    guard: SocketCleanupGuard,
 }
 
 /// Binds the daemon's MCP and IPC sockets immediately.
@@ -531,9 +583,36 @@ pub struct DaemonSockets {
 /// be bound.
 #[cfg(unix)]
 pub fn bind_daemon_sockets() -> Result<DaemonSockets> {
-    let mcp_path = mcp_socket_path();
-    let ipc_path = socket_path();
+    let sockets = bind_daemon_sockets_at(&mcp_socket_path(), &socket_path())?;
 
+    // A live daemon means the IPC socket is reachable again: clear the
+    // "unreachable" onset stamp so a future strand notifies fresh (bug 111).
+    // Only the real daemon bind clears it — the path-explicit helper stays
+    // side-effect-free so a unit test binding at a tempdir path never touches
+    // the real user's runtime-dir stamp.
+    crate::notify::UnreachableStamp::new().clear();
+
+    info!(
+        source = Source::DaemonLifecycle.as_str(),
+        mcp_path = %sockets.mcp_path.display(),
+        ipc_path = %sockets.ipc_path.display(),
+        "daemon sockets bound",
+    );
+
+    Ok(sockets)
+}
+
+/// Binds the MCP and IPC sockets at explicit paths, arming the boot-abort
+/// cleanup guard (bug 111) but with no notification/stamp side effects.
+///
+/// The path-explicit core of [`bind_daemon_sockets`]. Kept separate so unit
+/// tests can bind into a tempdir without clearing the real user's onset stamp.
+///
+/// # Errors
+///
+/// Returns an error if a parent directory cannot be created or either socket
+/// cannot be bound.
+fn bind_daemon_sockets_at(mcp_path: &Path, ipc_path: &Path) -> Result<DaemonSockets> {
     if let Some(parent) = mcp_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create socket directory: {}", parent.display()))?;
@@ -543,23 +622,21 @@ pub fn bind_daemon_sockets() -> Result<DaemonSockets> {
             .with_context(|| format!("create socket directory: {}", parent.display()))?;
     }
 
-    let mcp_listener = tokio::net::UnixListener::bind(&mcp_path)
+    let mcp_listener = tokio::net::UnixListener::bind(mcp_path)
         .with_context(|| format!("bind MCP socket: {}", mcp_path.display()))?;
-    let ipc_listener = tokio::net::UnixListener::bind(&ipc_path)
+    let ipc_listener = tokio::net::UnixListener::bind(ipc_path)
         .with_context(|| format!("bind IPC socket: {}", ipc_path.display()))?;
-
-    info!(
-        source = Source::DaemonLifecycle.as_str(),
-        mcp_path = %mcp_path.display(),
-        ipc_path = %ipc_path.display(),
-        "daemon sockets bound",
-    );
 
     Ok(DaemonSockets {
         mcp_listener,
         ipc_listener,
-        mcp_path,
-        ipc_path,
+        guard: SocketCleanupGuard {
+            mcp_path: mcp_path.to_path_buf(),
+            ipc_path: ipc_path.to_path_buf(),
+            armed: true,
+        },
+        mcp_path: mcp_path.to_path_buf(),
+        ipc_path: ipc_path.to_path_buf(),
     })
 }
 
@@ -2385,14 +2462,27 @@ impl SessionManager {
     /// Consumes the [`DaemonSockets`] returned by [`bind_daemon_sockets`],
     /// transferring socket ownership. Used in daemon mode where sockets
     /// are bound before heavy initialization so bridges can connect
-    /// immediately. [`SessionManager::drop`] cleans up the socket files.
+    /// immediately. Disarms the [`DaemonSockets`] boot-abort guard as it takes
+    /// the listeners: from here on [`SessionManager::drop`] owns unlinking the
+    /// socket files (bug 111).
     #[must_use]
     pub fn from_sockets(sockets: DaemonSockets, logging: LoggingServer) -> Self {
+        // Take over the socket-file lifetime: disarm the boot-abort guard so its
+        // drop leaves the files in place — this SessionManager's own `Drop`
+        // unlinks them from here on (bug 111).
+        let DaemonSockets {
+            mcp_listener,
+            ipc_listener,
+            mcp_path,
+            ipc_path,
+            mut guard,
+        } = sockets;
+        guard.disarm();
         Self {
-            mcp_listener: sockets.mcp_listener,
-            ipc_listener: sockets.ipc_listener,
-            mcp_socket_path: sockets.mcp_path,
-            ipc_socket_path: sockets.ipc_path,
+            mcp_listener,
+            ipc_listener,
+            mcp_socket_path: mcp_path,
+            ipc_socket_path: ipc_path,
             logging,
             connection_count: Arc::new(AtomicUsize::new(0)),
             next_connection_id: Arc::new(AtomicUsize::new(0)),
@@ -7101,6 +7191,114 @@ mod tests {
             LoggingServer::new(),
         )
         .expect("bind")
+    }
+
+    // ── SocketCleanupGuard (bug 111) ───────────────────────────────
+
+    /// An armed guard unlinks both socket files on drop — the failed-boot
+    /// cleanup that stops a stranded socket from provoking the "unreachable"
+    /// storm.
+    #[test]
+    fn socket_cleanup_guard_armed_unlinks_on_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mcp = dir.path().join("mcp.sock");
+        let ipc = dir.path().join("ipc.sock");
+        std::fs::write(&mcp, b"").expect("write mcp");
+        std::fs::write(&ipc, b"").expect("write ipc");
+
+        {
+            let _guard = SocketCleanupGuard {
+                mcp_path: mcp.clone(),
+                ipc_path: ipc.clone(),
+                armed: true,
+            };
+        } // drop here
+
+        assert!(
+            !mcp.exists(),
+            "armed guard must unlink the MCP socket on drop"
+        );
+        assert!(
+            !ipc.exists(),
+            "armed guard must unlink the IPC socket on drop"
+        );
+    }
+
+    /// A disarmed guard leaves the socket files intact — the success path, where
+    /// the `SessionManager` has taken over the socket lifetime.
+    #[test]
+    fn socket_cleanup_guard_disarmed_leaves_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mcp = dir.path().join("mcp.sock");
+        let ipc = dir.path().join("ipc.sock");
+        std::fs::write(&mcp, b"").expect("write mcp");
+        std::fs::write(&ipc, b"").expect("write ipc");
+
+        {
+            let mut guard = SocketCleanupGuard {
+                mcp_path: mcp.clone(),
+                ipc_path: ipc.clone(),
+                armed: true,
+            };
+            guard.disarm();
+        } // drop here
+
+        assert!(mcp.exists(), "disarmed guard must leave the MCP socket");
+        assert!(ipc.exists(), "disarmed guard must leave the IPC socket");
+    }
+
+    /// `from_sockets` disarms the boot-abort guard as it takes ownership: after
+    /// the manager drops, the sockets are gone (its OWN drop cleans up), but the
+    /// `DaemonSockets` guard must NOT have fired early and left the manager
+    /// serving on an unlinked socket. This proves the disarm handoff.
+    #[tokio::test]
+    async fn from_sockets_disarms_guard_and_manager_owns_cleanup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mcp = mcp_socket_in(dir.path());
+        let ipc = ipc_socket_in(dir.path());
+        if let Some(parent) = mcp.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+
+        let sockets = bind_daemon_sockets_at(&mcp, &ipc).expect("bind");
+        assert!(mcp.exists() && ipc.exists(), "bind creates both sockets");
+
+        let manager = SessionManager::from_sockets(sockets, LoggingServer::new());
+        // The manager is live: the guard was disarmed, so the sockets still exist.
+        assert!(
+            mcp.exists() && ipc.exists(),
+            "from_sockets must disarm the guard — sockets stay bound while the manager lives",
+        );
+
+        drop(manager);
+        // The SessionManager's own Drop removes them.
+        assert!(
+            !mcp.exists() && !ipc.exists(),
+            "SessionManager drop unlinks the sockets it took over",
+        );
+    }
+
+    /// A `DaemonSockets` dropped WITHOUT being consumed (an aborted boot) unlinks
+    /// both bound sockets — the stranded-socket fix in isolation.
+    #[tokio::test]
+    async fn dropped_daemon_sockets_unlink_on_abort() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mcp = mcp_socket_in(dir.path());
+        let ipc = ipc_socket_in(dir.path());
+        if let Some(parent) = mcp.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+
+        {
+            let _sockets = bind_daemon_sockets_at(&mcp, &ipc).expect("bind");
+            assert!(mcp.exists() && ipc.exists(), "bind creates both sockets");
+            // Simulate a post-bind boot abort: drop without from_sockets.
+        }
+
+        assert!(
+            !mcp.exists() && !ipc.exists(),
+            "an unconsumed DaemonSockets must unlink both sockets on drop (bug 111)",
+        );
     }
 
     // ── Tracing capture layer ──────────────────────────────────────

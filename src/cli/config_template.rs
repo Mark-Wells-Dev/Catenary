@@ -172,7 +172,8 @@ const TEMPLATE: &str = r#"#:schema https://twowells.github.io/catenary/schemas/c
 # the urgent interrupt. Warns persist on the TUI health dashboard and
 # everything is queryable via `catenary query`, so there is no severity
 # threshold to set.
-# Set desktop to false to suppress. CATENARY_NOTIFY=0 env var also suppresses.
+# Set desktop to false to suppress. The CATENARY_NOTIFY env var also suppresses
+# when set to an off value (0/off/false/no).
 
 # [notifications]
 # desktop = true

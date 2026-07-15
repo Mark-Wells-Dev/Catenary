@@ -62,7 +62,8 @@ pub use weights::{BASELINE_WEIGHT, DiagnosticWeights};
 pub struct NotificationConfig {
     /// Whether OS-level desktop notifications are enabled for error events.
     /// Defaults to `true`. Set to `false` to suppress desktop notifications.
-    /// The `CATENARY_NOTIFY=0` environment variable overrides this to `false`.
+    /// An off-spelled `CATENARY_NOTIFY` env var (`0`/`off`/`false`/`no`)
+    /// overrides this to `false`.
     pub desktop: Option<bool>,
 }
 

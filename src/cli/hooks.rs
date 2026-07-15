@@ -176,15 +176,26 @@ fn announcement_hook_specific_output(
 /// Connect to the daemon's IPC endpoint.
 ///
 /// When the socket file exists but the connection fails (daemon likely
-/// crashed), emits an `error!()` event. The hook CLI's tracing subscriber
-/// routes this to a desktop notification so the user gets an immediate
-/// signal outside the agent's context.
+/// crashed), emits an `error!()` event — but only on the *first* hook to
+/// witness a given stranded socket. The hook CLI is one short-lived process
+/// per tool call, so an in-process debounce cannot span invocations; the
+/// cross-process [`UnreachableStamp`](crate::notify::UnreachableStamp) keyed to
+/// the socket's filesystem identity is what keeps one strand to one interrupt
+/// (bug 111 — the 26-notification storm). A NEW strand (a different socket
+/// inode) or a successful daemon bind re-arms the stamp. The hook CLI's tracing
+/// subscriber routes the `error!()` to a desktop notification so the user gets
+/// an immediate signal outside the agent's context.
 #[cfg(unix)]
 fn hook_connect(_hook_json: &serde_json::Value) -> Option<std::os::unix::net::UnixStream> {
     let daemon_path = crate::router::socket_path();
     let result = notify_connect(&daemon_path);
-    if result.is_none() && daemon_path.exists() {
-        // Socket exists but connection failed — daemon likely crashed.
+    if result.is_none()
+        && daemon_path.exists()
+        && crate::notify::UnreachableStamp::new().should_notify(&daemon_path)
+    {
+        // Socket exists but connection failed — daemon likely crashed. First
+        // hook to see this strand fires the one interrupt it earns; later hooks
+        // find a matching stamp and stay silent.
         tracing::error!(
             source = crate::source::Source::HookDispatch.as_str(),
             "Catenary daemon unreachable (socket exists but connection failed). Run: catenary doctor",

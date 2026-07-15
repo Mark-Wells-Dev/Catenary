@@ -1585,20 +1585,18 @@ fn run_daemon() -> Result<()> {
 }
 
 /// Daemon entry point, runs on a thread with a large stack.
+///
+/// Binds the sockets and initializes logging, then delegates the post-bind boot
+/// to [`serve_daemon`]. A single error arm hangs off that call: on ANY abort
+/// after the bind (bug 111) the `DaemonSockets` guard has already unlinked the
+/// bound sockets, and [`notify_boot_refusal`] fires the one desktop interrupt the
+/// refusal earns.
 #[cfg(unix)]
-#[allow(
-    clippy::too_many_lines,
-    reason = "Daemon setup requires sequential initialization steps"
-)]
-#[allow(
-    clippy::significant_drop_tightening,
-    reason = "SessionManager lifetime is correct — explicit drop(manager) at function end"
-)]
 fn run_daemon_main() -> Result<()> {
-    use catenary_cli::router::SessionManager;
-
     // Build runtime first — bind_daemon_sockets needs the tokio
-    // reactor for UnixListener::bind.
+    // reactor for UnixListener::bind. The enter guard stays alive across the
+    // whole boot (bind, `serve_daemon`), and `rt` is dropped last — after
+    // `serve_daemon` returns — so background tasks shut down on the way out.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1627,6 +1625,68 @@ fn run_daemon_main() -> Result<()> {
         .with(filter)
         .with(logging.clone())
         .init();
+
+    // Everything past the socket bind is a boot-abort risk (bug 111): an invalid
+    // config refuses `Config::load` today; the section-quarantine work and any
+    // future post-bind step are the same shape. On ANY abort here, `serve_daemon`
+    // returns `Err` — the `DaemonSockets` boot-abort guard has already unlinked
+    // the bound sockets (so retries get the quiet os-error-2 "no daemon" arm, not
+    // the os-error-111 storm), and we fire the ONE desktop interrupt the refusal
+    // earns, carrying the real cause. The refusal is emitted directly (not via
+    // `error!()`) because the desktop sink is not registered until `Session::new`
+    // succeeds — the abort happens before that, so the interrupt has no sink to
+    // ride and must be sent point-blank.
+    let outcome = serve_daemon(&rt, sockets, logging);
+    if let Err(e) = &outcome {
+        notify_boot_refusal(e);
+    }
+    outcome
+}
+
+/// Fire the single desktop interrupt a boot refusal earns (bug 111).
+///
+/// Emitted point-blank via [`catenary_cli::notify::notify_desktop`] (not
+/// `error!()`): the abort happens before the daemon's desktop sink is registered
+/// (`Session::new`), so there is no sink to route an `error!()` through. Called
+/// exactly once, from the single `run_daemon_main` error arm, so the loudness
+/// lands on the informative event — the moment the interrupt was genuinely owed —
+/// instead of the downstream `unreachable` storm. Honors `CATENARY_NOTIFY=off`
+/// like every other notification, so an isolated test never reaches the desktop.
+#[cfg(unix)]
+fn notify_boot_refusal(error: &anyhow::Error) {
+    catenary_cli::notify::notify_desktop(
+        "Catenary daemon failed to start",
+        &format!("{error:#} — run: catenary doctor"),
+    );
+}
+
+/// Post-bind daemon boot and serve loop.
+///
+/// Split out of [`run_daemon_main`] so every `?` early-return here is a single
+/// boot-abort seam the caller can hang the one-shot refusal notification on (bug
+/// 111). Consumes `sockets`: on the error paths below (config, roots, signal
+/// registration) `sockets` drops with its cleanup guard still armed, unlinking
+/// the bound socket files; on the success path [`SessionManager::from_sockets`]
+/// disarms the guard and takes over the socket lifetime.
+#[cfg(unix)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Daemon setup requires sequential initialization steps"
+)]
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "SessionManager lifetime is correct — explicit drop(manager) at function end"
+)]
+fn serve_daemon(
+    rt: &tokio::runtime::Runtime,
+    sockets: catenary_cli::router::DaemonSockets,
+    logging: LoggingServer,
+) -> Result<()> {
+    use catenary_cli::router::SessionManager;
+
+    // The runtime enter guard lives in `run_daemon_main` across this whole call,
+    // so the ambient reactor is available to the setup below (snapshot writer,
+    // reaper tickers).
 
     // One-time reclaim of the legacy SQLite database (observability ticket 07).
     // Safe here: the socket bind above proved we are the sole daemon.
