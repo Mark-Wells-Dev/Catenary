@@ -185,14 +185,21 @@ fn ledger_dir(lock_dir: &Path) -> PathBuf {
 /// The touch-file path for a due file, mirrored under `dir/` with a `.lock`
 /// suffix: `dir/<root-relative-path>.lock`.
 ///
-/// Falls back to the flattened absolute path when the file is not under `root`
-/// (defensive — the caller resolves the root first, so this should not happen
-/// in practice).
+/// Callers pass one canonical spelling for both `root` and `file` (the
+/// acquire/unlink seams canonicalize), so the strip succeeds in practice. The
+/// defensive fallback for a file NOT under `root` flattens the absolute path
+/// into a single ledger-safe component — it must never be joined raw, because
+/// joining an absolute path REPLACES the base and would drop the touch file
+/// into the workspace itself (the macOS `/var`→`/private/var` sighting).
 fn touch_file(lock_dir: &Path, root: &Path, file: &Path) -> PathBuf {
-    let rel = file.strip_prefix(root).unwrap_or(file);
-    let mut name = rel.as_os_str().to_os_string();
+    let base = ledger_dir(lock_dir);
+    let mut name = file.strip_prefix(root).map_or_else(
+        // Flatten: one component, separators encoded, always inside `dir/`.
+        |_| std::ffi::OsString::from(file.to_string_lossy().replace('/', "%2F")),
+        |rel| rel.as_os_str().to_os_string(),
+    );
     name.push(".lock");
-    ledger_dir(lock_dir).join(name)
+    base.join(name)
 }
 
 /// Reads the owner file's name from a lock directory, if one exists.
@@ -471,11 +478,17 @@ pub fn acquire_in(
     booking: &Booking,
     now: SystemTime,
 ) -> Acquired {
-    let Some(root) = resolve_lock_root(file) else {
+    // One spelling everywhere: canonicalize the edited path up front so the
+    // root key AND the ledger relpath agree on symlinked spellings (macOS
+    // `/var` → `/private/var`, a symlinked ~/Projects). Without this the root
+    // canonicalizes but the file doesn't, `strip_prefix` misses, and the
+    // booking falls back — the misc-193 ingestion-seam rule applied here.
+    let file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    let Some(root) = resolve_lock_root(&file) else {
         // Foreign territory (/tmp, scratch) — never tracked, no lock.
         return Acquired::Ours;
     };
-    let books = booking.books(file);
+    let books = booking.books(&file);
     let lock_dir = root_lock_dir_in(locks_base, &root);
 
     match std::fs::create_dir_all(locks_base).and_then(|()| std::fs::create_dir(&lock_dir)) {
@@ -488,7 +501,7 @@ pub fn acquire_in(
                 return Acquired::Ours;
             }
             let _ = write_owner_atomic(&lock_dir, owner);
-            book_file(&lock_dir, &root, file);
+            book_file(&lock_dir, &root, &file);
             Acquired::Ours
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -496,7 +509,7 @@ pub fn acquire_in(
                 Ok(Some(name)) if name == owner.file_name() => {
                     // Ours — book (idempotent), bump last-activity, allow.
                     if books {
-                        book_file(&lock_dir, &root, file);
+                        book_file(&lock_dir, &root, &file);
                     }
                     touch_owner(&lock_dir, &name);
                     Acquired::Ours
@@ -649,7 +662,10 @@ pub fn unlink_delivered_in(locks_base: &Path, root: &Path, files: &[PathBuf]) {
     }
     let base = ledger_dir(&lock_dir);
     for file in files {
-        let touch = touch_file(&lock_dir, root, file);
+        // Same-spelling rule as the acquire seam: canonicalize so the relpath
+        // agrees with the booked touch file on symlinked spellings.
+        let file = file.canonicalize().unwrap_or_else(|_| file.clone());
+        let touch = touch_file(&lock_dir, root, &file);
         let _ = std::fs::remove_file(&touch);
         // Prune now-empty mirrored parents up to (but not including) `dir/`.
         let mut cur = touch.parent().map(Path::to_path_buf);
@@ -933,6 +949,45 @@ mod tests {
             "owner file titled with the tuple"
         );
         assert_eq!(due_count(&lock_dir), 1, "the edited file is booked");
+    }
+
+    /// The macOS `/var` → `/private/var` class, reproduced with a symlink on
+    /// any platform: an edit arriving under a symlinked SPELLING of the root
+    /// must key the same lock and book into its ledger — never fall back to a
+    /// stray `.lock` beside the source file (the CI sighting on `c58b81c`).
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_spelling_books_into_the_same_ledger() {
+        let fx = Fixture::new();
+        let file = fx.file("src/main.rs");
+
+        // An alias spelling of the same root, via a symlink beside it.
+        let alias = fx.dir.path().join("alias");
+        std::os::unix::fs::symlink(&fx.root, &alias).expect("symlink alias");
+        let aliased_file = alias.join("src/main.rs");
+
+        let owner = Owner::new("claude", "sess-a", "");
+        let got = acquire_in(
+            &fx.locks(),
+            &aliased_file,
+            &owner,
+            &rust_booking(),
+            SystemTime::now(),
+        );
+        assert!(matches!(got, Acquired::Ours), "aliased first cook admitted");
+
+        // Books under the CANONICAL root's lock dir, count visible.
+        let lock_dir = root_lock_dir_in(&fx.locks(), &fx.root);
+        assert_eq!(due_count(&lock_dir), 1, "aliased edit booked canonically");
+        // And never as a stray .lock beside the source file.
+        assert!(
+            !file.with_extension("rs.lock").exists(),
+            "no stray lock file lands in the workspace"
+        );
+
+        // Delivery through the alias spelling unlinks the same touch file.
+        unlink_delivered_in(&fx.locks(), &fx.root, &[aliased_file]);
+        assert_eq!(due_count(&lock_dir), 0, "aliased delivery pays the ledger");
     }
 
     #[test]
