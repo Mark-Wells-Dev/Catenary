@@ -282,6 +282,45 @@ jobs:
         if: matrix.source == 'recipe'
         run: |
           set -euo pipefail
+          # lsm 04: a pinned official upstream release binary for this platform
+          # is PREFERRED over the ecosystem install, mirroring the engine
+          # (src/install.rs InstallPlan::resolve): fetch, verify OUR pinned SRI
+          # hash BEFORE any unpack, unpack/place, expose the launcher on PATH
+          # under the shipped server command (= basename artifact_bin).
+          art_url="${{ matrix.artifact_url }}"
+          if [ -n "$art_url" ]; then
+            want="${{ matrix.artifact_hash }}"
+            curl -sSL "$art_url" -o artifact.dl
+            case "$want" in
+              sha256-*) algo=sha256 ;;
+              sha512-*) algo=sha512 ;;
+              *)
+                echo "artifact hash is not SRI: $want"
+                exit 1 ;;
+            esac
+            digest="$(openssl dgst -$algo -binary artifact.dl | base64 -w0)"
+            actual="$algo-$digest"
+            if [ "$actual" != "$want" ]; then
+              echo "SRI mismatch for $art_url"
+              echo "  expected $want"
+              echo "  actual   $actual"
+              exit 1
+            fi
+            binrel="${{ matrix.artifact_bin }}"
+            dest="$HOME/.managed/${{ matrix.server }}"
+            mkdir -p "$dest" "$(dirname "$dest/$binrel")"
+            case "$art_url" in
+              *.tar.gz|*.tgz) tar -xzf artifact.dl -C "$dest" ;;
+              *.gz)           gunzip -c artifact.dl > "$dest/$binrel" ;;
+              # Anything else is a bare binary.
+              *)              cp artifact.dl "$dest/$binrel" ;;
+            esac
+            chmod +x "$dest/$binrel"
+            bindir="$HOME/.local/bin"; mkdir -p "$bindir"
+            ln -sf "$dest/$binrel" "$bindir/$(basename "$binrel")"
+            echo "$bindir" >> "$GITHUB_PATH"
+            exit 0
+          fi
           pkg="${{ matrix.package }}@${{ matrix.version }}"
           want="${{ matrix.hash }}"
           case "${{ matrix.ecosystem }}" in
@@ -318,6 +357,12 @@ jobs:
               go install "$pkg"
               echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
               ;;
+            binary)
+              # Reachable only when a binary recipe pins NO artifact for this
+              # leg's platform — an unresolvable job, failed loudly (never a
+              # silent skip).
+              echo "binary recipe pins no artifact for this platform"
+              exit 1 ;;
             *)
               echo "unknown ecosystem: ${{ matrix.ecosystem }}"; exit 1 ;;
           esac

@@ -38,6 +38,18 @@
 //! - **go** — `GOBIN=<version-dir>/bin go install <pkg>@v<v>` (the Go checksum
 //!   DB verifies transparently; `GOBIN` drops the binary in `bin/` — conforms
 //!   natively).
+//! - **binary** (lsm 04) — the *preferred* shape wherever the upstream project
+//!   publishes official release binaries: fetch the running platform's pinned
+//!   artifact (the same bounded fetcher and tarball ceiling as npm), verify its
+//!   SRI hash **before** any unpack, unpack/place it inside the version dir,
+//!   and expose the launcher at `bin/` via
+//!   [`crate::managed_home::expose_executable`]. One hash, one artifact, no
+//!   host toolchain — and **never a Catenary-built or Catenary-mirrored
+//!   binary**: upstream official artifacts only, hash-pinned. A recipe may
+//!   overlay per-platform artifacts on a package ecosystem: the artifact wins
+//!   where the platform has one, the ecosystem is the fallback where it does
+//!   not, and a pure-binary recipe with no artifact for the platform refuses
+//!   with a clear message — never a silent skip.
 //!
 //! Every command is spawned as **argv** ([`InstallCommand`]) — never a shell
 //! string — and there is no `curl | bash` anywhere. Execution runs through two
@@ -66,16 +78,28 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::managed_home::ManagedHome;
-use crate::recipes::{BlessedEntry, BlessedManifest, Ecosystem, InstallRecipe, VerificationTier};
+use crate::managed_home::{ManagedHome, expose_executable};
+use crate::recipes::{
+    BinaryArtifact, BlessedEntry, BlessedManifest, Ecosystem, InstallRecipe, VerificationTier,
+    current_platform_token,
+};
 
 /// The npm registry the tarball URL is derived against.
 const NPM_REGISTRY: &str = "https://registry.npmjs.org";
 
 /// A ceiling on a fetched tarball so a hostile or misdirected response cannot
 /// exhaust memory (128 MiB — orders of magnitude above any language-server
-/// package).
+/// package). Every fetch rides it — the npm tarballs *and* the lsm-04 binary
+/// artifacts share the one [`TarballFetcher`] seam, so a direct binary fetch is
+/// bounded by the same ceiling.
 const MAX_TARBALL_BYTES: u64 = 128 * 1024 * 1024;
+
+/// A ceiling on the bytes *decoded out of* a fetched binary archive (lsm 04),
+/// so a decompression bomb cannot exhaust the disk even though its compressed
+/// form cleared [`MAX_TARBALL_BYTES`]. 512 MiB — generous for any language
+/// server; hitting it aborts the unpack with an error, never a truncated
+/// install.
+const MAX_UNPACKED_BYTES: u64 = 512 * 1024 * 1024;
 
 // ── The blessing gate (structural) ───────────────────────────────────
 
@@ -159,6 +183,11 @@ impl BlessedRecipe {
             }
             Ecosystem::Pip => format!("pip install {}=={}", r.package, r.version),
             Ecosystem::Go => format!("go install {}@{}", r.package, go_version(&r.version)),
+            // A binary recipe has no CLI one-liner — the pinned form names the
+            // official upstream release the guided engine fetches and verifies.
+            Ecosystem::Binary => {
+                format!("official upstream release {}@{}", r.package, r.version)
+            }
         };
         let note = match r.ecosystem {
             Ecosystem::Npm => {
@@ -166,6 +195,9 @@ impl BlessedRecipe {
             }
             Ecosystem::Pip => " — press `a` for the guided --require-hashes install.",
             Ecosystem::Cargo | Ecosystem::Go => " — press `a` to run the guided, verified install.",
+            Ecosystem::Binary => {
+                " — press `a` for the guided install (fetches the official artifact, verifies its SRI hash before unpack)."
+            }
         };
         format!("Pinned: {command}{note}")
     }
@@ -343,6 +375,40 @@ fn go_version(version: &str) -> String {
     }
 }
 
+/// Build the [`PlanKind::BinaryFetch`] step for one platform artifact (lsm 04),
+/// re-validating the recipe data at the resolve seam (defense in depth over
+/// `crate::recipes::validate_recipes`): a fetch without a supported SRI hash
+/// refuses here, before any bytes move, and a traversing launcher path never
+/// reaches the filesystem.
+fn binary_plan_kind(server: &str, artifact: &BinaryArtifact) -> Result<PlanKind> {
+    if !(artifact.hash.starts_with("sha256-") || artifact.hash.starts_with("sha512-")) {
+        bail!(
+            "binary artifact for `{server}` carries no SRI hash (`sha256-…`/`sha512-…`), got \
+             `{}` — Catenary will not fetch an unverifiable artifact",
+            artifact.hash
+        );
+    }
+    let bin = Path::new(&artifact.bin);
+    if artifact.bin.trim().is_empty()
+        || bin.is_absolute()
+        || bin
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        bail!(
+            "binary artifact for `{server}` names a non-plain launcher path `{}` — a version \
+             dir is self-contained",
+            artifact.bin
+        );
+    }
+    Ok(PlanKind::BinaryFetch {
+        url: artifact.url.clone(),
+        sri: artifact.hash.clone(),
+        archive: archive_kind(&artifact.url)?,
+        bin: artifact.bin.clone(),
+    })
+}
+
 // ── the resolved install plan ────────────────────────────────────────
 
 /// One pinned npm artifact of a plan: the server package itself or a
@@ -356,6 +422,59 @@ struct NpmArtifact {
     url: String,
     /// The expected SRI sha512 (`sha512-<base64>`) from the recipe.
     sri: String,
+}
+
+/// The unpack treatment of a fetched binary artifact (lsm 04), derived from the
+/// artifact URL's file name by [`archive_kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveKind {
+    /// `.tar.gz` / `.tgz` — gunzip + untar into the version dir; the artifact's
+    /// `bin` path names the launcher within the unpacked tree.
+    TarGz,
+    /// `.gz` (a single gzipped file, not a tarball) — gunzip to the artifact's
+    /// `bin` path.
+    Gzip,
+    /// No recognized archive extension — a bare executable, written to the
+    /// artifact's `bin` path verbatim.
+    Bare,
+}
+
+/// Archive extensions Catenary recognizes but does not unpack yet — refused
+/// loudly at plan time (never a silent skip, never a misread as a bare
+/// binary). Longest-match ordering: the `.tar.*` compounds precede their bare
+/// compressor suffixes.
+const UNSUPPORTED_ARCHIVE_SUFFIXES: &[&str] = &[
+    ".tar.xz", ".tar.bz2", ".tar.zst", ".zip", ".txz", ".tbz2", ".7z", ".xz", ".bz2", ".zst",
+    ".rar",
+];
+
+/// Classify an artifact URL's unpack treatment, refusing archive kinds the
+/// engine does not support with a clear error naming the kind. Extensions
+/// compare case-insensitively (the file name is lowercased once).
+#[allow(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "the file name is lowercased once above the checks, so the compound-extension \
+              (.tar.gz) suffix comparisons are already case-insensitive; Path::extension() \
+              cannot express compound extensions"
+)]
+fn archive_kind(url: &str) -> Result<ArchiveKind> {
+    let name = url.rsplit('/').next().unwrap_or(url).to_ascii_lowercase();
+    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        return Ok(ArchiveKind::TarGz);
+    }
+    if let Some(suffix) = UNSUPPORTED_ARCHIVE_SUFFIXES
+        .iter()
+        .find(|s| name.ends_with(*s))
+    {
+        bail!(
+            "artifact `{name}` is a `{suffix}` archive, which the install engine does not \
+             unpack yet — supported kinds are .tar.gz/.tgz, single-file .gz, and bare binaries"
+        );
+    }
+    if name.ends_with(".gz") {
+        return Ok(ArchiveKind::Gzip);
+    }
+    Ok(ArchiveKind::Bare)
 }
 
 /// The per-ecosystem step a plan runs.
@@ -381,6 +500,21 @@ enum PlanKind {
     PipRequireHashes {
         /// The `<package>==<version> --hash=sha256:<hex>` requirement line.
         requirement: String,
+    },
+    /// binary (lsm 04) — fetch the platform's official upstream artifact,
+    /// verify its SRI hash **before** any unpack, unpack/place inside the
+    /// version dir, expose the launcher at `bin/`. No command runs — the
+    /// engine itself is the installer.
+    BinaryFetch {
+        /// The pinned artifact URL, verbatim from the recipe.
+        url: String,
+        /// The expected SRI hash (`sha256-…` / `sha512-…`) from the recipe.
+        sri: String,
+        /// How the verified bytes are unpacked/placed.
+        archive: ArchiveKind,
+        /// The launcher's relative path within the version dir (the artifact's
+        /// `bin` field, validated as a plain relative path at resolve time).
+        bin: String,
     },
 }
 
@@ -414,6 +548,14 @@ impl InstallPlan {
     /// The destination is derived here — `home.version_dir(server, version)` —
     /// and nowhere else: the recipe is declarative and carries no destination.
     ///
+    /// Platform preference (lsm 04): when the recipe pins a
+    /// [`BinaryArtifact`] for [`current_platform_token`], the plan is the
+    /// direct SRI-verified fetch of that official upstream binary — the
+    /// fastest, most verifiable shape — regardless of the recipe's fallback
+    /// ecosystem. Without one, the recipe's ecosystem installs as before; a
+    /// pure-`binary` recipe with no artifact for this platform refuses with a
+    /// message naming the situation — never a silent skip.
+    ///
     /// # Errors
     ///
     /// Returns an error when the ecosystem requires a content hash the recipe
@@ -421,11 +563,39 @@ impl InstallPlan {
     /// or for any `co_install` companion (the pinned set installs as one unit,
     /// so one unverifiable member refuses the whole plan) — or a **pip** recipe
     /// with no `--require-hashes` digest (refused politely, echoing the
-    /// recipe's note). Also errs when the server name or version is not a plain
-    /// path segment (defensive; blessed data never is).
+    /// recipe's note). A **binary** artifact refuses when its hash is not SRI
+    /// (`sha256-…`/`sha512-…` — an unverifiable fetch never runs), when its
+    /// archive kind is unsupported, or when its `bin` path is not plain
+    /// relative; a `binary` recipe with no artifact for this platform and no
+    /// ecosystem fallback refuses naming the platform. Also errs when the
+    /// server name or version is not a plain path segment (defensive; blessed
+    /// data never is).
     pub fn resolve(blessed: &BlessedRecipe, home: &ManagedHome) -> Result<Self> {
         let r = blessed.recipe();
         let destination = home.version_dir(blessed.server(), &r.version)?;
+        // The lsm-04 preference: an official binary artifact for this platform
+        // wins over the ecosystem fallback.
+        if let Some(artifact) = current_platform_token().and_then(|token| r.artifact.get(token)) {
+            return Ok(Self {
+                ecosystem: Ecosystem::Binary,
+                tier: VerificationTier::BinarySri,
+                package: r.package.clone(),
+                version: r.version.clone(),
+                destination,
+                kind: binary_plan_kind(blessed.server(), artifact)?,
+            });
+        }
+        if r.ecosystem == Ecosystem::Binary {
+            let platform =
+                current_platform_token().unwrap_or("an unrecognized platform (no pinned token)");
+            let available: Vec<&str> = r.artifact.keys().map(String::as_str).collect();
+            bail!(
+                "no official `{server}` release binary is pinned for this platform \
+                 ({platform}; artifacts exist for {available:?}), and the recipe has no \
+                 package-ecosystem fallback — refusing rather than guessing",
+                server = blessed.server(),
+            );
+        }
         let kind = match r.ecosystem {
             Ecosystem::Npm => {
                 let sri = r.hash.clone().ok_or_else(|| {
@@ -479,6 +649,14 @@ impl InstallPlan {
                     requirement: pip_requirement_line(&r.package, &r.version, &hash),
                 }
             }
+            // Handled before this match: a `binary` recipe either resolved its
+            // platform artifact or refused with the no-artifact message, so
+            // reaching this arm is a logic error surfaced loudly.
+            Ecosystem::Binary => bail!(
+                "binary recipe for `{}` reached the ecosystem fallback — a logic error \
+                 (binary recipes resolve per-platform artifacts only)",
+                blessed.server()
+            ),
         };
         Ok(Self {
             ecosystem: r.ecosystem,
@@ -522,12 +700,14 @@ impl InstallPlan {
         &self.destination
     }
 
-    /// The tarball URL fetched-and-verified before install (npm only; the
-    /// server's own artifact — co-install companions follow the same path).
+    /// The URL fetched-and-verified before install (the npm server tarball —
+    /// co-install companions follow the same path — or the lsm-04 binary
+    /// artifact).
     #[must_use]
     pub fn fetch_url(&self) -> Option<&str> {
         match &self.kind {
             PlanKind::NpmTarball { artifacts } => artifacts.first().map(|a| a.url.as_str()),
+            PlanKind::BinaryFetch { url, .. } => Some(url),
             PlanKind::Direct { .. } | PlanKind::PipRequireHashes { .. } => None,
         }
     }
@@ -544,6 +724,9 @@ impl InstallPlan {
             }
             VerificationTier::PipHashes => "--require-hashes (pip verifies the pinned sha256)",
             VerificationTier::GoChecksumdb => "version pin (Go checksum DB verifies transparently)",
+            VerificationTier::BinarySri => {
+                "fetch official upstream artifact, verify SRI hash BEFORE unpack, expose at bin/"
+            }
         }
     }
 
@@ -571,25 +754,43 @@ impl InstallPlan {
                     pip_install_command(&self.destination, "<requirements>").display()
                 )
             }
+            PlanKind::BinaryFetch { url, bin, .. } => {
+                // No command runs — the engine fetches, verifies, unpacks, and
+                // exposes itself; the line states the pipeline honestly.
+                format!(
+                    "fetch {url} → verify SRI → unpack into {dest} → expose bin/{name}",
+                    dest = self.destination.display(),
+                    name = Path::new(bin)
+                        .file_name()
+                        .map_or_else(|| bin.clone(), |n| n.to_string_lossy().into_owned()),
+                )
+            }
         }
     }
 }
 
 // ── verification ─────────────────────────────────────────────────────
 
-/// Verify that `bytes` hash to the expected SRI sha512 (`sha512-<base64>`).
+/// Verify that `bytes` hash to the expected SRI string — `sha512-<base64>`
+/// (the npm registry integrity form) or `sha256-<base64>` (the lsm-04 binary
+/// artifacts, re-encoded from upstream release digests). The one verification
+/// gate every fetched artifact passes **before** anything unpacks or installs.
 ///
 /// # Errors
 ///
-/// Returns an error when `sri` is not an `sha512-` SRI string, or when the
-/// computed digest does not match — in which case the caller must NOT install.
-fn verify_sha512(bytes: &[u8], sri: &str) -> Result<()> {
-    let expected = sri
-        .strip_prefix("sha512-")
-        .ok_or_else(|| anyhow!("recipe hash is not an SRI sha512 (`sha512-…`): {sri}"))?;
-    let actual = base64_standard(&sha512(bytes));
+/// Returns an error when `sri` carries no supported SRI prefix — a fetch
+/// without an SRI hash refuses — or when the computed digest does not match,
+/// in which case the caller must NOT install.
+fn verify_sri(bytes: &[u8], sri: &str) -> Result<()> {
+    let (expected, actual) = if let Some(expected) = sri.strip_prefix("sha512-") {
+        (expected, base64_standard(&sha512(bytes)))
+    } else if let Some(expected) = sri.strip_prefix("sha256-") {
+        (expected, base64_standard(&sha256(bytes)))
+    } else {
+        bail!("recipe hash is not a supported SRI string (`sha256-…`/`sha512-…`): {sri}");
+    };
     if actual != expected {
-        bail!("sha512 mismatch: recipe pins {expected}, artifact hashed to {actual}");
+        bail!("SRI hash mismatch: recipe pins {expected}, artifact hashed to {actual}");
     }
     Ok(())
 }
@@ -740,7 +941,132 @@ pub fn execute(
         PlanKind::PipRequireHashes { requirement } => {
             execute_pip(requirement, &plan.destination, runner, log)
         }
+        PlanKind::BinaryFetch {
+            url,
+            sri,
+            archive,
+            bin,
+        } => execute_binary(url, sri, *archive, bin, &plan.destination, fetcher, log),
     }
+}
+
+/// binary (lsm 04): fetch the official upstream artifact → verify its SRI hash
+/// **before any unpack** → unpack/place inside the version dir → expose the
+/// launcher at `bin/`. No external command runs — the engine is the installer,
+/// so nothing here can be shell-interpreted and no install script executes.
+fn execute_binary(
+    url: &str,
+    sri: &str,
+    archive: ArchiveKind,
+    bin: &str,
+    version_dir: &Path,
+    fetcher: &dyn TarballFetcher,
+    mut log: Vec<String>,
+) -> InstallOutcome {
+    log.push(format!("fetching {url}"));
+    let bytes = match fetcher.fetch(url) {
+        Ok(b) => b,
+        Err(e) => return InstallOutcome::failed(log, &format!("fetch failed: {e:#}")),
+    };
+    log.push(format!("verifying SRI hash over {} bytes", bytes.len()));
+    if let Err(e) = verify_sri(&bytes, sri) {
+        // Never unpack unverified bytes: the version dir is not even created.
+        return InstallOutcome::failed(log, &e.to_string());
+    }
+    log.push("SRI hash verified".to_owned());
+    if let Err(e) = std::fs::create_dir_all(version_dir) {
+        return InstallOutcome::failed(
+            log,
+            &format!("could not create {}: {e}", version_dir.display()),
+        );
+    }
+    let launcher = version_dir.join(bin);
+    let unpacked = match archive {
+        ArchiveKind::TarGz => {
+            log.push(format!("unpacking tar.gz into {}", version_dir.display()));
+            unpack_tar_gz(&bytes, version_dir, MAX_UNPACKED_BYTES)
+        }
+        ArchiveKind::Gzip => {
+            log.push(format!("gunzipping to {}", launcher.display()));
+            unpack_gzip(&bytes, &launcher, MAX_UNPACKED_BYTES)
+        }
+        ArchiveKind::Bare => {
+            log.push(format!("placing bare binary at {}", launcher.display()));
+            place_file(&bytes, &launcher)
+        }
+    };
+    if let Err(e) = unpacked {
+        return InstallOutcome::failed(log, &format!("unpack failed: {e:#}"));
+    }
+    if !launcher.is_file() {
+        return InstallOutcome::failed(
+            log,
+            &format!(
+                "the verified artifact did not contain the launcher `{bin}` — the recipe's \
+                 artifact `bin` path does not match the archive layout"
+            ),
+        );
+    }
+    let bin_name = Path::new(bin)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
+    let Some(bin_name) = bin_name else {
+        return InstallOutcome::failed(log, &format!("launcher path `{bin}` has no file name"));
+    };
+    match expose_executable(version_dir, &launcher, &bin_name) {
+        Ok(link) => {
+            log.push(format!("exposed {}", link.display()));
+            log.push("done".to_owned());
+            InstallOutcome { success: true, log }
+        }
+        Err(e) => InstallOutcome::failed(log, &format!("could not expose launcher: {e:#}")),
+    }
+}
+
+/// Unpack a verified `.tar.gz` into `dest`, decoding at most `ceiling` bytes.
+///
+/// The tar layer skips any entry whose path would escape `dest` (the `tar`
+/// crate's `unpack` containment), and the gzip stream is capped so a
+/// decompression bomb aborts with an error instead of filling the disk.
+fn unpack_tar_gz(bytes: &[u8], dest: &Path, ceiling: u64) -> Result<()> {
+    let decoder = flate2::read::GzDecoder::new(bytes).take(ceiling);
+    let mut archive = tar::Archive::new(decoder);
+    archive.unpack(dest).with_context(|| {
+        format!(
+            "unpacking tar.gz into {} (decoded stream capped at {ceiling} bytes)",
+            dest.display()
+        )
+    })
+}
+
+/// Gunzip a verified single-file `.gz` artifact to `dest_file`, decoding at
+/// most `ceiling` bytes.
+fn unpack_gzip(bytes: &[u8], dest_file: &Path, ceiling: u64) -> Result<()> {
+    if let Some(parent) = dest_file.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut decoder = flate2::read::GzDecoder::new(bytes).take(ceiling);
+    let mut out = std::fs::File::create(dest_file)
+        .with_context(|| format!("creating {}", dest_file.display()))?;
+    let written = std::io::copy(&mut decoder, &mut out)
+        .with_context(|| format!("gunzipping to {}", dest_file.display()))?;
+    if written >= ceiling {
+        bail!(
+            "gunzipped artifact hit the {ceiling}-byte unpack ceiling — refusing a \
+             decompression bomb"
+        );
+    }
+    Ok(())
+}
+
+/// Place a verified bare-binary artifact at `dest_file` verbatim.
+fn place_file(bytes: &[u8], dest_file: &Path) -> Result<()> {
+    if let Some(parent) = dest_file.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(dest_file, bytes).with_context(|| format!("writing {}", dest_file.display()))
 }
 
 /// npm: fetch → verify (every artifact, before anything installs) → stage →
@@ -767,7 +1093,7 @@ fn execute_npm(
             bytes.len(),
             artifact.label
         ));
-        if let Err(e) = verify_sha512(&bytes, &artifact.sri) {
+        if let Err(e) = verify_sri(&bytes, &artifact.sri) {
             // Never install unverified bytes: stop here, no command runs.
             return InstallOutcome::failed(log, &e.to_string());
         }
@@ -867,6 +1193,153 @@ fn stage_temp(bytes: &[u8], suffix: &str) -> Result<tempfile::NamedTempFile> {
     file.write_all(bytes).context("writing temp file")?;
     file.flush().context("flushing temp file")?;
     Ok(file)
+}
+
+// ── SHA-256 (FIPS 180-4) ─────────────────────────────────────────────
+// Same in-house discipline as the SHA-512 below (hash functions with FIPS
+// vectors, never signatures): the lsm-04 binary artifacts pin SRI sha256 —
+// the digest upstream release metadata publishes — so the gate needs both.
+
+/// SHA-256 initial hash values (FIPS 180-4 §5.3.3).
+const SHA256_H0: [u32; 8] = [
+    0x6a09_e667,
+    0xbb67_ae85,
+    0x3c6e_f372,
+    0xa54f_f53a,
+    0x510e_527f,
+    0x9b05_688c,
+    0x1f83_d9ab,
+    0x5be0_cd19,
+];
+
+/// SHA-256 round constants (FIPS 180-4 §4.2.2).
+const SHA256_K: [u32; 64] = [
+    0x428a_2f98,
+    0x7137_4491,
+    0xb5c0_fbcf,
+    0xe9b5_dba5,
+    0x3956_c25b,
+    0x59f1_11f1,
+    0x923f_82a4,
+    0xab1c_5ed5,
+    0xd807_aa98,
+    0x1283_5b01,
+    0x2431_85be,
+    0x550c_7dc3,
+    0x72be_5d74,
+    0x80de_b1fe,
+    0x9bdc_06a7,
+    0xc19b_f174,
+    0xe49b_69c1,
+    0xefbe_4786,
+    0x0fc1_9dc6,
+    0x240c_a1cc,
+    0x2de9_2c6f,
+    0x4a74_84aa,
+    0x5cb0_a9dc,
+    0x76f9_88da,
+    0x983e_5152,
+    0xa831_c66d,
+    0xb003_27c8,
+    0xbf59_7fc7,
+    0xc6e0_0bf3,
+    0xd5a7_9147,
+    0x06ca_6351,
+    0x1429_2967,
+    0x27b7_0a85,
+    0x2e1b_2138,
+    0x4d2c_6dfc,
+    0x5338_0d13,
+    0x650a_7354,
+    0x766a_0abb,
+    0x81c2_c92e,
+    0x9272_2c85,
+    0xa2bf_e8a1,
+    0xa81a_664b,
+    0xc24b_8b70,
+    0xc76c_51a3,
+    0xd192_e819,
+    0xd699_0624,
+    0xf40e_3585,
+    0x106a_a070,
+    0x19a4_c116,
+    0x1e37_6c08,
+    0x2748_774c,
+    0x34b0_bcb5,
+    0x391c_0cb3,
+    0x4ed8_aa4a,
+    0x5b9c_ca4f,
+    0x682e_6ff3,
+    0x748f_82ee,
+    0x78a5_636f,
+    0x84c8_7814,
+    0x8cc7_0208,
+    0x90be_fffa,
+    0xa450_6ceb,
+    0xbef9_a3f7,
+    0xc671_78f2,
+];
+
+/// Compute the SHA-256 digest of `data` (FIPS 180-4).
+fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut h = SHA256_H0;
+
+    // Pad: append 0x80, then zeros to 56 mod 64, then the 64-bit big-endian
+    // bit length.
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for block in msg.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (i, chunk) in block.chunks_exact(4).enumerate().take(16) {
+            w[i] = u32::from_be_bytes(chunk.try_into().unwrap_or([0; 4]));
+        }
+        for t in 16..64 {
+            let s0 = w[t - 15].rotate_right(7) ^ w[t - 15].rotate_right(18) ^ (w[t - 15] >> 3);
+            let s1 = w[t - 2].rotate_right(17) ^ w[t - 2].rotate_right(19) ^ (w[t - 2] >> 10);
+            w[t] = w[t - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[t - 7])
+                .wrapping_add(s1);
+        }
+
+        // Working variables a..h held as v[0..8], mirroring the sha512 below.
+        let mut v = h;
+        for t in 0..64 {
+            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+            let ch = (v[4] & v[5]) ^ ((!v[4]) & v[6]);
+            let temp1 = v[7]
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(SHA256_K[t])
+                .wrapping_add(w[t]);
+            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+            let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+            let temp2 = s0.wrapping_add(maj);
+            v[7] = v[6];
+            v[6] = v[5];
+            v[5] = v[4];
+            v[4] = v[3].wrapping_add(temp1);
+            v[3] = v[2];
+            v[2] = v[1];
+            v[1] = v[0];
+            v[0] = temp1.wrapping_add(temp2);
+        }
+        for (hi, vi) in h.iter_mut().zip(v.iter()) {
+            *hi = hi.wrapping_add(*vi);
+        }
+    }
+
+    let mut out = [0u8; 32];
+    for (word, slot) in h.iter().zip(out.chunks_exact_mut(4)) {
+        slot.copy_from_slice(&word.to_be_bytes());
+    }
+    out
 }
 
 // ── SHA-512 (FIPS 180-4) ─────────────────────────────────────────────
@@ -1193,6 +1666,7 @@ mod tests {
             note: None,
             conformance: true,
             co_install: Vec::new(),
+            artifact: std::collections::BTreeMap::new(),
             runtime: None,
         }
     }
@@ -1267,11 +1741,43 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
     fn verify_accepts_matching_and_rejects_tampered() {
         let bytes = b"a pretend tarball";
         let sri = format!("sha512-{}", base64_standard(&sha512(bytes)));
-        assert!(verify_sha512(bytes, &sri).is_ok());
+        assert!(verify_sri(bytes, &sri).is_ok());
         // A single flipped byte must fail — an unverified artifact is never installed.
-        assert!(verify_sha512(b"a pretend tarbalX", &sri).is_err());
-        // A non-SRI string is rejected too.
-        assert!(verify_sha512(bytes, "deadbeef").is_err());
+        assert!(verify_sri(b"a pretend tarbalX", &sri).is_err());
+        // A non-SRI string is rejected too — a fetch without an SRI hash refuses.
+        assert!(verify_sri(bytes, "deadbeef").is_err());
+        // The sha256 leg (the lsm-04 binary artifacts) dispatches on prefix.
+        let sri256 = format!("sha256-{}", base64_standard(&sha256(bytes)));
+        assert!(verify_sri(bytes, &sri256).is_ok());
+        assert!(verify_sri(b"a pretend tarbalX", &sri256).is_err());
+        // An unsupported SRI algorithm is refused, not misread.
+        assert!(verify_sri(bytes, "sha384-AAAA").is_err());
+    }
+
+    #[test]
+    fn sha256_matches_known_vectors() {
+        assert_eq!(
+            hex(&sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(&sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // FIPS 180-4 two-block vector — the multi-block compression path and
+        // the padding boundary, the same coverage doctrine as the sha512
+        // vectors below (a real artifact is always multi-block).
+        assert_eq!(
+            hex(&sha256(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        // FIPS 180-4 long-message vector: one million 'a' bytes.
+        assert_eq!(
+            hex(&sha256(&vec![b'a'; 1_000_000])),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
     }
 
     #[test]
@@ -2068,5 +2574,344 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
                 );
             }
         }
+    }
+
+    // ── binary-first installs (lsm 04) ────────────────────────────────
+
+    use crate::recipes::{BinaryArtifact, PLATFORM_TOKENS, current_platform_token};
+
+    /// A binary recipe pinning the same artifact under every pinned platform
+    /// token, so the test resolves identically on the Linux and macOS hosts.
+    fn binary_recipe(url: &str, sri: &str, bin: &str) -> InstallRecipe {
+        let mut r = recipe(
+            Ecosystem::Binary,
+            "owner/srv",
+            "1.0.0",
+            VerificationTier::BinarySri,
+        );
+        for token in PLATFORM_TOKENS {
+            r.artifact.insert(
+                (*token).to_owned(),
+                BinaryArtifact {
+                    url: url.to_owned(),
+                    hash: sri.to_owned(),
+                    bin: bin.to_owned(),
+                },
+            );
+        }
+        r
+    }
+
+    /// The platform token that is NOT this host's — for fallback tests.
+    fn other_platform_token() -> &'static str {
+        let current = current_platform_token();
+        PLATFORM_TOKENS
+            .iter()
+            .find(|t| Some(**t) != current)
+            .expect("at least two pinned platforms")
+    }
+
+    /// Build a gzipped tarball holding one file at `path` with `contents`
+    /// (hashed in the test — the fixture-artifact pattern, no network).
+    fn tar_gz_fixture(path: &str, contents: &[u8]) -> Vec<u8> {
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut builder = tar::Builder::new(gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, contents)
+            .expect("append tar entry");
+        builder
+            .into_inner()
+            .expect("finish tar")
+            .finish()
+            .expect("finish gzip")
+    }
+
+    fn sri256(bytes: &[u8]) -> String {
+        format!("sha256-{}", base64_standard(&sha256(bytes)))
+    }
+
+    #[test]
+    fn binary_plan_fetches_verifies_unpacks_and_exposes() {
+        if current_platform_token().is_none() {
+            return; // off the pinned platform set (never the case on CI)
+        }
+        let payload = b"#!/bin/sh\necho srv\n";
+        let bytes = tar_gz_fixture("pkg/inner/srv", payload);
+        let url = "https://github.com/owner/srv/releases/download/1.0.0/srv-1.0.0.tar.gz";
+        let r = binary_recipe(url, &sri256(&bytes), "pkg/inner/srv");
+        let blessed = BlessedRecipe::resolve("srv", &r, &manifest("srv", "1.0.0")).unwrap();
+        let (tmp, home) = temp_home();
+        let plan = InstallPlan::resolve(&blessed, &home).expect("binary plan resolves");
+        assert_eq!(plan.tier(), VerificationTier::BinarySri);
+        assert_eq!(plan.ecosystem(), Ecosystem::Binary);
+        assert_eq!(plan.fetch_url(), Some(url));
+
+        let runner = FakeRunner::ok();
+        let fetcher = FakeFetcher::new(bytes);
+        let outcome = execute(&plan, &runner, &fetcher);
+        assert!(outcome.success, "{:?}", outcome.log);
+        assert!(
+            runner.calls.borrow().is_empty(),
+            "a binary install runs NO external command — the engine is the installer",
+        );
+        assert_eq!(fetcher.fetched.borrow().as_slice(), [url]);
+
+        // Verify happens BEFORE unpack: the log states them in that order.
+        let verify_idx = outcome
+            .log
+            .iter()
+            .position(|l| l.contains("SRI hash verified"))
+            .expect("a verified line");
+        let unpack_idx = outcome
+            .log
+            .iter()
+            .position(|l| l.contains("unpacking"))
+            .expect("an unpack line");
+        assert!(verify_idx < unpack_idx, "verified before any unpack");
+
+        // The ruled invariant: the launcher is exposed at `bin/` and resolves
+        // to the in-place artifact.
+        let dest = home.version_dir("srv", "1.0.0").expect("version dir");
+        let link = dest.join("bin").join("srv");
+        assert_eq!(
+            std::fs::read(std::fs::canonicalize(&link).expect("link resolves"))
+                .expect("read launcher"),
+            payload,
+        );
+        // Containment: nothing landed outside the version dir.
+        for file in files_under(tmp.path()) {
+            assert!(
+                file.starts_with(&dest),
+                "`{}` landed outside the version dir",
+                file.display(),
+            );
+        }
+    }
+
+    #[test]
+    fn binary_hash_mismatch_never_unpacks() {
+        if current_platform_token().is_none() {
+            return;
+        }
+        let bytes = tar_gz_fixture("srv", b"real");
+        let url = "https://example.com/srv-1.0.0.tar.gz";
+        // Pin the hash of DIFFERENT bytes than the fetcher will return.
+        let r = binary_recipe(url, &sri256(b"other bytes"), "srv");
+        let blessed = BlessedRecipe::resolve("srv", &r, &manifest("srv", "1.0.0")).unwrap();
+        let (_tmp, home) = temp_home();
+        let plan = InstallPlan::resolve(&blessed, &home).unwrap();
+        let outcome = execute(&plan, &FakeRunner::ok(), &FakeFetcher::new(bytes));
+        assert!(!outcome.success, "a hash mismatch fails");
+        assert!(
+            outcome.log.iter().any(|l| l.contains("mismatch")),
+            "the failure names the mismatch: {:?}",
+            outcome.log,
+        );
+        assert!(
+            !plan.destination().exists(),
+            "unverified bytes are never unpacked — no version dir is created",
+        );
+    }
+
+    #[test]
+    fn binary_gzip_and_bare_artifacts_place_and_expose() {
+        if current_platform_token().is_none() {
+            return;
+        }
+        let payload = b"ELF pretend binary";
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(payload).expect("gz write");
+        let gz_bytes = gz.finish().expect("gz finish");
+        let cases = [
+            ("https://example.com/dl/srv-full-linux.gz", gz_bytes),
+            ("https://example.com/dl/srv-linux-x64", payload.to_vec()),
+        ];
+        for (url, bytes) in cases {
+            let r = binary_recipe(url, &sri256(&bytes), "srv");
+            let blessed = BlessedRecipe::resolve("srv", &r, &manifest("srv", "1.0.0")).unwrap();
+            let (_tmp, home) = temp_home();
+            let plan = InstallPlan::resolve(&blessed, &home).expect("plan resolves");
+            let outcome = execute(&plan, &FakeRunner::ok(), &FakeFetcher::new(bytes));
+            assert!(outcome.success, "{url}: {:?}", outcome.log);
+            let dest = home.version_dir("srv", "1.0.0").expect("version dir");
+            let link = dest.join("bin").join("srv");
+            assert_eq!(
+                std::fs::read(std::fs::canonicalize(&link).expect("link resolves"))
+                    .expect("read launcher"),
+                payload,
+                "{url}: the exposed launcher is the decoded payload",
+            );
+        }
+    }
+
+    #[test]
+    fn binary_refuses_non_sri_hash_at_resolve() {
+        if current_platform_token().is_none() {
+            return;
+        }
+        // A bare hex digest is NOT SRI — the fetch must refuse before any
+        // bytes move (the lsm-04 "fetches without an SRI hash refuse" pin).
+        let r = binary_recipe(
+            "https://example.com/srv.tar.gz",
+            "ca71415dd19f19e30aaa35a4915aefca9fdb5fec31b98331cc3d77f778d539c5",
+            "srv",
+        );
+        let blessed = BlessedRecipe::resolve("srv", &r, &manifest("srv", "1.0.0")).unwrap();
+        let err = InstallPlan::resolve(&blessed, &fixed_home())
+            .expect_err("a non-SRI hash refuses at plan time");
+        assert!(err.to_string().contains("SRI"), "names the format: {err}");
+    }
+
+    #[test]
+    fn binary_refuses_unknown_archive_kinds_and_traversal_bins() {
+        if current_platform_token().is_none() {
+            return;
+        }
+        let sri = sri256(b"whatever");
+        for url in [
+            "https://example.com/srv.zip",
+            "https://example.com/srv.tar.xz",
+        ] {
+            let r = binary_recipe(url, &sri, "srv");
+            let blessed = BlessedRecipe::resolve("srv", &r, &manifest("srv", "1.0.0")).unwrap();
+            let err = InstallPlan::resolve(&blessed, &fixed_home())
+                .expect_err("an unsupported archive kind refuses");
+            assert!(
+                err.to_string().contains("does not unpack yet"),
+                "{url}: the refusal names the situation: {err}",
+            );
+        }
+        let r = binary_recipe("https://example.com/srv.tar.gz", &sri, "../escape");
+        let blessed = BlessedRecipe::resolve("srv", &r, &manifest("srv", "1.0.0")).unwrap();
+        let err = InstallPlan::resolve(&blessed, &fixed_home())
+            .expect_err("a traversing bin path refuses");
+        assert!(err.to_string().contains("self-contained"), "{err}");
+    }
+
+    #[test]
+    fn binary_platform_fallback_and_honest_refusal() {
+        let Some(current) = current_platform_token() else {
+            return;
+        };
+        let other = other_platform_token();
+        let artifact = BinaryArtifact {
+            url: "https://example.com/srv.tar.gz".to_owned(),
+            hash: sri256(b"bytes"),
+            bin: "srv".to_owned(),
+        };
+
+        // An artifact for ANOTHER platform + a cargo fallback → the plan is
+        // the cargo install (the compile-class fallback), not a refusal.
+        let mut with_fallback = recipe(
+            Ecosystem::Cargo,
+            "srv-cli",
+            "1.0.0",
+            VerificationTier::CargoLocked,
+        );
+        with_fallback
+            .artifact
+            .insert(other.to_owned(), artifact.clone());
+        let blessed =
+            BlessedRecipe::resolve("srv", &with_fallback, &manifest("srv", "1.0.0")).unwrap();
+        let plan = InstallPlan::resolve(&blessed, &fixed_home()).expect("falls back to cargo");
+        assert_eq!(plan.tier(), VerificationTier::CargoLocked);
+        assert_eq!(plan.ecosystem(), Ecosystem::Cargo);
+
+        // The same artifact under THIS platform is preferred over the fallback.
+        let mut preferred = with_fallback.clone();
+        preferred.artifact.insert(current.to_owned(), artifact);
+        let blessed = BlessedRecipe::resolve("srv", &preferred, &manifest("srv", "1.0.0")).unwrap();
+        let plan = InstallPlan::resolve(&blessed, &fixed_home()).expect("prefers the binary");
+        assert_eq!(plan.tier(), VerificationTier::BinarySri);
+        assert_eq!(plan.ecosystem(), Ecosystem::Binary);
+
+        // A pure-binary recipe with no artifact for this platform and no
+        // fallback refuses with a message naming the situation — never a
+        // silent skip.
+        let mut no_fallback = binary_recipe("https://example.com/srv.tar.gz", &sri256(b"x"), "srv");
+        no_fallback.artifact.remove(current);
+        let blessed =
+            BlessedRecipe::resolve("srv", &no_fallback, &manifest("srv", "1.0.0")).unwrap();
+        let err = InstallPlan::resolve(&blessed, &fixed_home()).expect_err("refuses loudly");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(current) && msg.contains("no package-ecosystem fallback"),
+            "the refusal names the platform and the missing fallback: {msg}",
+        );
+    }
+
+    #[test]
+    fn binary_archive_missing_the_launcher_fails_loudly() {
+        if current_platform_token().is_none() {
+            return;
+        }
+        let bytes = tar_gz_fixture("some/other/file", b"not the launcher");
+        let r = binary_recipe("https://example.com/srv.tar.gz", &sri256(&bytes), "bin/srv");
+        let blessed = BlessedRecipe::resolve("srv", &r, &manifest("srv", "1.0.0")).unwrap();
+        let (_tmp, home) = temp_home();
+        let plan = InstallPlan::resolve(&blessed, &home).unwrap();
+        let outcome = execute(&plan, &FakeRunner::ok(), &FakeFetcher::new(bytes));
+        assert!(!outcome.success);
+        assert!(
+            outcome
+                .log
+                .iter()
+                .any(|l| l.contains("did not contain the launcher")),
+            "the failure names the missing launcher: {:?}",
+            outcome.log,
+        );
+    }
+
+    #[test]
+    fn unpack_ceilings_refuse_decompression_bombs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // 1 KiB of zeros compresses tiny; a 16-byte decode ceiling must abort.
+        let bytes = tar_gz_fixture("srv", &[0u8; 1024]);
+        assert!(
+            unpack_tar_gz(&bytes, tmp.path(), 16).is_err(),
+            "a capped tar.gz decode aborts instead of filling the disk",
+        );
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&[0u8; 1024]).expect("gz write");
+        let gz_bytes = gz.finish().expect("gz finish");
+        let err = unpack_gzip(&gz_bytes, &tmp.path().join("out"), 16)
+            .expect_err("a capped gunzip aborts");
+        assert!(err.to_string().contains("ceiling"), "{err}");
+    }
+
+    #[test]
+    fn tar_traversal_entries_never_escape_the_version_dir() {
+        // A tarball whose entry path traverses out (`../evil`) must not land
+        // anything outside the destination — the tar layer refuses or skips
+        // it, and either way the outside file does not exist. The Builder
+        // rightly refuses to AUTHOR such an entry, so the hostile header is
+        // crafted at the byte level (the name field is offset 0..100 of the
+        // 512-byte header), the way an attacker's archive would carry it.
+        let contents = b"escape attempt";
+        let mut header = tar::Header::new_gnu();
+        header.as_mut_bytes()[..7].copy_from_slice(b"../evil");
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(header.as_bytes()).expect("write header");
+        gz.write_all(contents).expect("write contents");
+        gz.write_all(&vec![0u8; 512 - contents.len()])
+            .expect("pad data block");
+        gz.write_all(&[0u8; 1024]).expect("end-of-archive blocks");
+        let bytes = gz.finish().expect("finish gzip");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dest = tmp.path().join("srv").join("1.0.0");
+        std::fs::create_dir_all(&dest).expect("mkdir");
+        let _ = unpack_tar_gz(&bytes, &dest, MAX_UNPACKED_BYTES);
+        assert!(
+            !tmp.path().join("srv").join("evil").exists() && !tmp.path().join("evil").exists(),
+            "no traversal entry ever lands outside the destination",
+        );
     }
 }

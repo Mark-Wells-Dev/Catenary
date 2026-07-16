@@ -3,8 +3,10 @@
 # Each `[recipe.<server>]` keys a canonical server name from
 # `defaults/servers.toml`. A recipe records how a conformance CI matrix job
 # installs that server, pinned, before running the harness against it:
-#   ecosystem  npm | cargo | pip | go
-#   package    the package/module id within the ecosystem
+#   ecosystem  npm | cargo | pip | go | binary
+#   package    the package/module id within the ecosystem (for `binary`, the
+#              upstream project — a GitHub `owner/name` — that refresh-recipes
+#              re-resolves releases against)
 #   version    an EXACT pin (never a range)
 #   tier       how the artifact is verified (see below)
 #   draft      always true — a draft is CI-internal and never reaches a user
@@ -16,14 +18,23 @@
 #              runtime but does not bundle, co-installed alongside it (misc 195):
 #              [[recipe.<server>.co_install]] with package + version + hash, each
 #              pinned + verified by the SAME npm-tarball-sha512 mechanics. An
-#              array-of-tables, so it trails the scalars (and precedes runtime).
-#              ts-ls carries one (typescript → tsserver); no other draft needs
-#              one yet.
+#              array-of-tables, so it trails the scalars (and precedes artifact
+#              tables / runtime). ts-ls carries one (typescript → tsserver); no
+#              other draft needs one yet.
+#   artifact   (binary shape, lsm 04) per-platform official upstream release
+#              binaries: [recipe.<server>.artifact.<platform>] tables keyed by
+#              the pinned platform set (linux-x86_64 / macos-arm64), each with
+#              url (https, verbatim) + hash (SRI, REQUIRED — a hashless binary
+#              entry fails the schema) + bin (the launcher's relative path in
+#              the unpacked artifact; its basename must equal the shipped
+#              server command). An artifact is PREFERRED over the ecosystem on
+#              any platform that has one; a platform without one falls back to
+#              the ecosystem, and a pure-binary recipe refuses there loudly.
 #   runtime    (optional) an extra runtime dep, e.g.
 #              runtime = { name = "jdk", version = ">=17" } — declared LAST in a
 #              stanza (it is a sub-table). No tranche-1/2 draft needs one yet.
 #
-# Verification tiers (tui-rework 06 §"Recipes as data"):
+# Verification tiers (tui-rework 06 §"Recipes as data"; lsm 04):
 #   go-checksumdb        version pin; the Go checksum DB verifies transparently
 #                        (no explicit hash carried).
 #   cargo-locked         exact version installed with `--locked`; cargo verifies
@@ -33,16 +44,33 @@
 #   npm-tarball-sha512   exact version + the expected tarball sha512 (`hash`, in
 #                        SRI form); the engine fetches, verifies, then installs
 #                        with `--ignore-scripts`.
+#   binary-sri           direct fetch of the upstream OFFICIAL release binary;
+#                        each per-platform artifact pins its own SRI hash
+#                        (sha256-/sha512-<base64>), verified BEFORE any unpack.
+#                        Fastest and most verifiable: one hash, one artifact, no
+#                        host toolchain. Catenary NEVER distributes its own
+#                        binaries — upstream official artifacts only, hash-pinned;
+#                        no Catenary-hosted mirror, ever.
+#
+# INSTALL CLASS (lsm 04, machine-readable): the class is a total function of
+# the schema — npm/pip/binary FETCH prebuilt artifacts (seconds); cargo/go
+# COMPILE on the host toolchain (minutes). A per-platform artifact upgrades the
+# platforms it covers to fetch-class (src/recipes.rs `InstallClass`). gopls
+# stays honestly compile-class: upstream publishes no gopls binaries.
 #
 # HASHES: npm `hash` values are the registry `dist.integrity` (SRI sha512) for
 # the pinned version, obtained mechanically from the npm registry metadata
 # (`registry.npmjs.org/<pkg>/<version>`) — never hand-computed or invented.
-# `make refresh-recipes` re-resolves versions and re-fetches these on every bump,
-# and the conformance install VERIFIES the pin against `hash`, so a mis-pasted
-# value fails the matrix loudly rather than shipping. Versions resolved
-# 2026-07-07. Where a hash-carrying tier has no `hash` it is marked pending: the
-# pip closure needs `pip-compile --generate-hashes` over the whole dep tree,
-# which refresh-recipes runs — a single-artifact hash would not satisfy
+# Binary artifact `hash` values are the upstream release asset digest (GitHub's
+# reported sha256), re-encoded hex → SRI base64 — a format conversion, never a
+# new hash. `make refresh-recipes` re-resolves versions and re-fetches these on
+# every bump (for binary recipes: re-resolves each pinned platform's artifact
+# URL + digest from the release metadata), and the conformance install VERIFIES
+# the pin against the hash, so a mis-pasted value fails the matrix loudly
+# rather than shipping. Versions resolved 2026-07-07. Where a hash-carrying
+# tier has no `hash` it is marked pending: the pip closure needs
+# `pip-compile --generate-hashes` over the whole dep tree, which
+# refresh-recipes runs — a single-artifact hash would not satisfy
 # `--require-hashes` and so is honestly omitted rather than half-filled.
 
 # ── npm tranche ──────────────────────────────────────────────────────
@@ -207,6 +235,8 @@ note = "hash pending: --require-hashes needs the sha256 of every artifact in the
 
 # ── go tranche ───────────────────────────────────────────────────────
 # the go toolchain is the implied host; the checksum DB verifies transparently.
+# COMPILE-CLASS (lsm 04): upstream publishes no gopls binaries, so this recipe
+# honestly builds on the host go toolchain — surfaces may say "takes minutes".
 
 [recipe.gopls]
 ecosystem = "go"
@@ -214,3 +244,34 @@ package = "golang.org/x/tools/gopls"
 version = "v0.22.0"
 tier = "go-checksumdb"
 draft = true
+
+# ── binary tranche (lsm 04) ──────────────────────────────────────────
+# Direct SRI-hashed fetch of upstream OFFICIAL release binaries — the preferred
+# shape wherever a project publishes them: one hash, one artifact, no host
+# toolchain. Catenary NEVER distributes its own binaries: upstream official
+# artifacts only, hash-pinned; no Catenary-hosted mirror, ever.
+#
+# lua-language-server moved here from defaults/ci-provision.toml (the lsm-04
+# maintainer amendment supersedes the old "GitHub-release binaries are out of
+# recipe scope" ruling — the managed home solved placement). The linux-x86_64
+# pin below carries over that stanza's data verbatim: same release URL shape
+# (repo LuaLS/lua-language-server, tag 3.18.2, asset
+# lua-language-server-3.18.2-linux-x64.tar.gz), same sha256 (GitHub's release
+# asset digest), re-encoded hex → SRI base64. The macos-arm64 artifact is
+# PENDING attended resolution (refresh-recipes resolves it from the release
+# metadata; no hash for it exists in-repo, and a hash is never invented) — the
+# macOS conformance leg keeps its homebrew provisioning meanwhile, and a macOS
+# guided install refuses with a clear no-artifact message rather than guessing.
+
+[recipe.lua-language-server]
+ecosystem = "binary"
+package = "LuaLS/lua-language-server"
+version = "3.18.2"
+tier = "binary-sri"
+draft = true
+note = "official LuaLS release binaries, fetched direct and SRI-verified before unpack. macos-arm64 artifact pending refresh-recipes resolution — never invented; macOS falls back to nothing (refuses loudly) in the engine and rides homebrew in CI."
+
+[recipe.lua-language-server.artifact.linux-x86_64]
+url = "https://github.com/LuaLS/lua-language-server/releases/download/3.18.2/lua-language-server-3.18.2-linux-x64.tar.gz"
+hash = "sha256-ynFBXdGfGeMKqjWkkVrvyp/bX+wxuYMxzD1393jVOcU="
+bin = "bin/lua-language-server"

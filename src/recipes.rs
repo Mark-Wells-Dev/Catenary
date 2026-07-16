@@ -72,9 +72,18 @@ pub const MOCKLS_PERSONAS: &str = include_str!("../defaults/mockls-personas.toml
 
 /// The package ecosystem a recipe installs from.
 ///
-/// The four ecosystems whose native verification the recipe schema records
-/// (tui-rework 06 §"Recipes as data"). GitHub-release binary distributions are
-/// deliberately out of scope — placing binaries is the full-mason boundary.
+/// The four package ecosystems whose native verification the recipe schema
+/// records (tui-rework 06 §"Recipes as data"), plus `binary` — direct SRI-hashed
+/// fetch of an upstream **official** release binary (lsm 04). The old ruling
+/// that GitHub-release binary distributions are out of recipe scope ("the
+/// full-mason boundary") is SUPERSEDED by the lsm-04 maintainer amendment: the
+/// managed server home (ls-manager 01) solved the placement problem, so a
+/// pinned official binary is now the *preferred* recipe shape wherever a
+/// project publishes one — one hash, one artifact, no host toolchain.
+///
+/// **Catenary never distributes its own binaries.** A `binary` recipe fetches
+/// the upstream project's own published release artifact, hash-pinned; there is
+/// no Catenary-hosted mirror, ever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Ecosystem {
@@ -86,6 +95,13 @@ pub enum Ecosystem {
     Pip,
     /// Go module proxy (`go install`).
     Go,
+    /// Upstream official release binaries, fetched directly and SRI-verified
+    /// (lsm 04). Per-platform artifacts ride the recipe's
+    /// `[recipe.<name>.artifact.<platform>]` tables ([`BinaryArtifact`]);
+    /// `package` names the upstream project (for a GitHub-hosted project, its
+    /// `owner/name` — what `refresh-recipes` re-resolves against). Never a
+    /// Catenary-built or Catenary-mirrored artifact.
+    Binary,
 }
 
 impl Ecosystem {
@@ -97,6 +113,48 @@ impl Ecosystem {
             Self::Cargo => "cargo",
             Self::Pip => "pip",
             Self::Go => "go",
+            Self::Binary => "binary",
+        }
+    }
+
+    /// The [`InstallClass`] an install from this ecosystem falls in.
+    ///
+    /// The machine-readable compile-class marking (lsm 04): it is a total
+    /// function of the schema's `ecosystem` field, so it can never drift from
+    /// the recipe data. `cargo` and `go` builds compile from source on the
+    /// host toolchain ("this one takes minutes"); `npm`, `pip`, and `binary`
+    /// fetch prebuilt artifacts.
+    #[must_use]
+    pub const fn install_class(self) -> InstallClass {
+        match self {
+            Self::Npm | Self::Pip | Self::Binary => InstallClass::Fetch,
+            Self::Cargo | Self::Go => InstallClass::Compile,
+        }
+    }
+}
+
+/// How long-running an install is, machine-readably (lsm 04).
+///
+/// Derived from the recipe schema ([`Ecosystem::install_class`], and
+/// per-platform via [`InstallRecipe::install_class_on`]) so a surface can state
+/// honestly that a compile-class install takes minutes while a fetch-class one
+/// takes seconds. Data, not policy: nothing gates on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InstallClass {
+    /// A prebuilt artifact is fetched and verified — seconds.
+    Fetch,
+    /// The host toolchain compiles from source — minutes.
+    Compile,
+}
+
+impl InstallClass {
+    /// The lowercase token (`fetch` / `compile`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetch",
+            Self::Compile => "compile",
         }
     }
 }
@@ -123,6 +181,12 @@ pub enum VerificationTier {
     /// verifies the tarball, then installs from the verified artifact with
     /// `--ignore-scripts` (install scripts never run).
     NpmTarballSha512,
+    /// binary — each per-platform [`BinaryArtifact`] pins its own SRI hash
+    /// (`sha256-…` / `sha512-…`); the engine fetches the platform's official
+    /// upstream artifact and verifies the hash **before** any unpack (lsm 04).
+    /// The hash is schema-required per artifact, so a hashless binary entry
+    /// cannot even parse.
+    BinarySri,
 }
 
 impl VerificationTier {
@@ -134,14 +198,19 @@ impl VerificationTier {
             Self::CargoLocked => "cargo-locked",
             Self::PipHashes => "pip-hashes",
             Self::NpmTarballSha512 => "npm-tarball-sha512",
+            Self::BinarySri => "binary-sri",
         }
     }
 
-    /// Whether this tier carries an explicit content hash in the recipe.
+    /// Whether this tier carries an explicit content hash in the recipe's
+    /// top-level `hash` field.
     ///
-    /// `pip`/`npm` pin an artifact hash; `go`/`cargo` delegate verification to
-    /// the ecosystem (checksum DB / `--locked` index checksums), so a missing
-    /// hash is expected and correct for them.
+    /// `pip`/`npm` pin an artifact hash there; `go`/`cargo` delegate
+    /// verification to the ecosystem (checksum DB / `--locked` index
+    /// checksums), so a missing hash is expected and correct for them.
+    /// `binary-sri` pins its hashes **per platform artifact** instead
+    /// ([`BinaryArtifact::hash`], schema-required), so its top-level `hash` is
+    /// unused and correctly absent.
     #[must_use]
     pub const fn carries_hash(self) -> bool {
         matches!(self, Self::PipHashes | Self::NpmTarballSha512)
@@ -199,6 +268,53 @@ pub struct CoInstall {
     /// [`recipes_missing_hash`] reports a co-install still lacking one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+}
+
+/// The pinned platform set the conformance matrix blesses (misc 164).
+///
+/// Also the only keys a recipe's `[recipe.<name>.artifact.<platform>]` tables
+/// may use — [`validate_recipes`] rejects any other key so a typo'd platform
+/// can never silently match nothing. [`current_platform_token`] returns one of
+/// these (or `None` off the pinned set), and `refresh-recipes` re-resolves
+/// exactly this set on a version bump.
+pub const PLATFORM_TOKENS: &[&str] = &["linux-x86_64", "macos-arm64"];
+
+/// One per-platform official upstream release artifact of a `binary`-shaped
+/// recipe (lsm 04).
+///
+/// Keyed by platform token ([`PLATFORM_TOKENS`]) under
+/// `[recipe.<name>.artifact.<platform>]`. Every field is **required**: in
+/// particular a binary artifact with no SRI `hash` fails to parse — the schema
+/// itself rejects an unverifiable entry, there is no hashless draft stage for
+/// binaries (`refresh-recipes` resolves URL and hash together from the upstream
+/// release metadata, or writes nothing).
+///
+/// The artifact is always the upstream project's **official** release binary.
+/// Catenary never distributes its own binaries and hosts no mirror, ever — the
+/// URL points at the project's own release infrastructure.
+///
+/// The schema is **closed** (`deny_unknown_fields`), like [`InstallRecipe`]'s:
+/// an artifact naming a destination is a schema error — the managed server home
+/// owns destinations (ls-manager 01).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BinaryArtifact {
+    /// The pinned artifact URL, verbatim (https only). For a GitHub release:
+    /// `https://github.com/<owner>/<name>/releases/download/<tag>/<asset>`.
+    pub url: String,
+    /// The pinned SRI hash of the artifact bytes (`sha256-<base64>` or
+    /// `sha512-<base64>`), verified **before** any unpack. Required by the
+    /// schema — a hashless binary entry does not parse. Obtained mechanically
+    /// (the GitHub release asset `digest`, re-encoded hex → SRI base64), never
+    /// hand-computed or invented.
+    pub hash: String,
+    /// The executable's relative path within the unpacked artifact (e.g.
+    /// `bin/lua-language-server` inside a tarball), or — for a bare-binary or
+    /// single-file `.gz` artifact — the relative path to place the fetched
+    /// file at. Its basename becomes the exposed `bin/` entry name, so it must
+    /// equal the shipped `[lsp.server.*]` command. Always a plain relative
+    /// path: [`validate_recipes`] rejects traversal or absolute forms.
+    pub bin: String,
 }
 
 /// One CI-internal install recipe for a shipped server.
@@ -261,6 +377,18 @@ pub struct InstallRecipe {
     /// before `runtime`, and any recipe round-trips through `toml::to_string`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub co_install: Vec<CoInstall>,
+    /// Per-platform official upstream release binaries, keyed by platform token
+    /// (`[recipe.<name>.artifact.<platform>]`; lsm 04). The **preferred** install
+    /// shape: when the running platform has an entry here, the engine fetches
+    /// it directly (SRI-verified before unpack) instead of running the
+    /// ecosystem install; when it has none, the recipe's `ecosystem` is the
+    /// fallback — and a pure-`binary` recipe with no artifact for the platform
+    /// refuses with a clear message, never a silent skip. Required non-empty
+    /// when `ecosystem = "binary"`. A composite (map-of-tables) field, so it
+    /// sits with the trailing composites: after the `co_install`
+    /// array-of-tables, before the `runtime` sub-table.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub artifact: BTreeMap<String, BinaryArtifact>,
     /// An additional runtime dependency (e.g. a JDK), if any.
     ///
     /// A struct-valued field, so it is declared **last**: TOML serializes a
@@ -269,6 +397,26 @@ pub struct InstallRecipe {
     /// round-trip through `toml::to_string` regardless of which scalars are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<Runtime>,
+}
+
+impl InstallRecipe {
+    /// The [`InstallClass`] this recipe resolves to on `platform` (a
+    /// [`PLATFORM_TOKENS`] token, or `None` off the pinned set) — the
+    /// machine-readable "this one takes minutes" marking, per platform (lsm 04).
+    ///
+    /// A platform with a [`BinaryArtifact`] is fetch-class regardless of the
+    /// fallback ecosystem (the binary is preferred); otherwise the class is the
+    /// ecosystem's ([`Ecosystem::install_class`]) — compile-class for the
+    /// cargo/go recipes that build on the host toolchain (gopls has no upstream
+    /// binaries; some cargo-built servers publish none).
+    #[must_use]
+    pub fn install_class_on(&self, platform: Option<&str>) -> InstallClass {
+        if platform.is_some_and(|token| self.artifact.contains_key(token)) {
+            InstallClass::Fetch
+        } else {
+            self.ecosystem.install_class()
+        }
+    }
 }
 
 /// serde default for [`InstallRecipe::draft`] — drafts are the safe default.
@@ -367,8 +515,105 @@ pub fn validate_recipes(recipes: &BTreeMap<String, InstallRecipe>) -> Vec<String
                 ));
             }
         }
+        validate_binary_shape(name, recipe, &mut errors);
     }
     errors
+}
+
+/// The lsm-04 binary-shape invariants for one recipe, appended to `errors`.
+///
+/// A `binary` recipe must carry the `binary-sri` tier and at least one
+/// per-platform artifact (an artifact-less binary recipe could install nothing
+/// anywhere); the tier and ecosystem may not disagree in either direction.
+/// Every artifact — on any ecosystem, since artifacts may overlay a
+/// compile-class fallback — must key a pinned platform token
+/// ([`PLATFORM_TOKENS`]), pin an https URL, carry a well-formed SRI hash
+/// (`sha256-`/`sha512-` plus the digest's exact base64 length), and name a
+/// plain relative `bin` path (no traversal, no absolute path).
+fn validate_binary_shape(name: &str, recipe: &InstallRecipe, errors: &mut Vec<String>) {
+    if recipe.ecosystem == Ecosystem::Binary {
+        if recipe.tier != VerificationTier::BinarySri {
+            errors.push(format!(
+                "recipe `{name}` is ecosystem `binary` but tier `{}` — a binary \
+                 recipe is verified per-artifact (`binary-sri`)",
+                recipe.tier.as_str()
+            ));
+        }
+        if recipe.artifact.is_empty() {
+            errors.push(format!(
+                "recipe `{name}` is ecosystem `binary` but carries no \
+                 [recipe.{name}.artifact.<platform>] entry — it could install \
+                 nothing on any platform"
+            ));
+        }
+    } else if recipe.tier == VerificationTier::BinarySri {
+        errors.push(format!(
+            "recipe `{name}` has tier `binary-sri` but ecosystem `{}` — the \
+             binary tier belongs to ecosystem `binary` recipes",
+            recipe.ecosystem.as_str()
+        ));
+    }
+    for (platform, artifact) in &recipe.artifact {
+        if !PLATFORM_TOKENS.contains(&platform.as_str()) {
+            errors.push(format!(
+                "recipe `{name}` artifact keys unknown platform `{platform}` — \
+                 the pinned set is {PLATFORM_TOKENS:?}, and an unknown key would \
+                 silently never match a host"
+            ));
+        }
+        if !artifact.url.starts_with("https://") {
+            errors.push(format!(
+                "recipe `{name}` artifact [{platform}] URL `{}` is not https",
+                artifact.url
+            ));
+        }
+        if !sri_hash_is_well_formed(&artifact.hash) {
+            errors.push(format!(
+                "recipe `{name}` artifact [{platform}] hash `{}` is not a \
+                 well-formed SRI hash (`sha256-<44 base64 chars>` / \
+                 `sha512-<88 base64 chars>`) — an unverifiable artifact is \
+                 rejected, never fetched",
+                artifact.hash
+            ));
+        }
+        if !bin_path_is_plain_relative(&artifact.bin) {
+            errors.push(format!(
+                "recipe `{name}` artifact [{platform}] bin `{}` is not a plain \
+                 relative path — a version dir is self-contained, so the \
+                 launcher may not traverse out of it",
+                artifact.bin
+            ));
+        }
+    }
+}
+
+/// Whether `hash` is a well-formed SRI string for the two supported digests:
+/// `sha256-` + 44 base64 chars (32 bytes) or `sha512-` + 88 base64 chars
+/// (64 bytes).
+fn sri_hash_is_well_formed(hash: &str) -> bool {
+    let (digest, expected_len) = if let Some(rest) = hash.strip_prefix("sha256-") {
+        (rest, 44)
+    } else if let Some(rest) = hash.strip_prefix("sha512-") {
+        (rest, 88)
+    } else {
+        return false;
+    };
+    digest.len() == expected_len
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+}
+
+/// Whether `bin` is a plain relative path: non-empty, not absolute, no `..`/`.`
+/// components, no backslash or NUL. The managed home's per-segment validation
+/// runs again at install time; this rejects the data at the schema seam.
+fn bin_path_is_plain_relative(bin: &str) -> bool {
+    !bin.trim().is_empty()
+        && !bin.contains(['\\', '\0'])
+        && !std::path::Path::new(bin).is_absolute()
+        && std::path::Path::new(bin)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
 /// Names of hash-carrying-tier recipes that have no `hash` yet — including a
@@ -1195,9 +1440,13 @@ impl VersionDrift {
 }
 
 /// This host's blessed-manifest platform token (`linux-x86_64` /
-/// `macos-arm64`), or `None` on a platform the conformance matrix does not
-/// pin. Matches the row keys the CI bless jobs write.
-fn current_platform_token() -> Option<&'static str> {
+/// `macos-arm64`, one of [`PLATFORM_TOKENS`]), or `None` on a platform the
+/// conformance matrix does not pin.
+///
+/// Matches the row keys the CI bless jobs write, and keys the per-platform
+/// [`BinaryArtifact`] lookup in [`crate::install`] (lsm 04).
+#[must_use]
+pub fn current_platform_token() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Some("linux-x86_64"),
         ("macos", "aarch64") => Some("macos-arm64"),
@@ -1487,10 +1736,241 @@ tier = "cargo-locked"
                         | VerificationTier::CargoLocked
                         | VerificationTier::PipHashes
                         | VerificationTier::GoChecksumdb
+                        | VerificationTier::BinarySri
                 ),
                 "`{name}` tier"
             );
         }
+    }
+
+    // ── binary-first recipes (lsm 04) ────────────────────────────────
+
+    /// A well-formed binary recipe document with one artifact per pinned
+    /// platform.
+    const BINARY_RECIPE: &str = r#"
+[recipe.srv]
+ecosystem = "binary"
+package = "owner/srv"
+version = "1.2.3"
+tier = "binary-sri"
+draft = true
+
+[recipe.srv.artifact.linux-x86_64]
+url = "https://github.com/owner/srv/releases/download/1.2.3/srv-1.2.3-linux-x64.tar.gz"
+hash = "sha256-ynFBXdGfGeMKqjWkkVrvyp/bX+wxuYMxzD1393jVOcU="
+bin = "bin/srv"
+
+[recipe.srv.artifact.macos-arm64]
+url = "https://github.com/owner/srv/releases/download/1.2.3/srv-1.2.3-darwin-arm64.tar.gz"
+hash = "sha256-ynFBXdGfGeMKqjWkkVrvyp/bX+wxuYMxzD1393jVOcU="
+bin = "bin/srv"
+"#;
+
+    #[test]
+    fn binary_recipe_parses_and_validates() {
+        let recipes = parse_recipes(BINARY_RECIPE).expect("binary recipe parses");
+        let errors = validate_recipes(&recipes);
+        assert!(errors.is_empty(), "a well-formed binary recipe: {errors:?}");
+        let srv = &recipes["srv"];
+        assert_eq!(srv.ecosystem, Ecosystem::Binary);
+        assert_eq!(srv.tier, VerificationTier::BinarySri);
+        assert_eq!(srv.artifact.len(), 2, "one artifact per pinned platform");
+    }
+
+    #[test]
+    fn binary_artifact_without_sri_hash_fails_to_parse() {
+        // THE acceptance pin: the schema itself rejects a binary entry with no
+        // SRI hash — `hash` is a required field, so a hashless artifact never
+        // even reaches validation, let alone a fetch.
+        let hashless = r#"
+[recipe.srv]
+ecosystem = "binary"
+package = "owner/srv"
+version = "1.2.3"
+tier = "binary-sri"
+
+[recipe.srv.artifact.linux-x86_64]
+url = "https://github.com/owner/srv/releases/download/1.2.3/srv.tar.gz"
+bin = "bin/srv"
+"#;
+        assert!(
+            parse_recipes(hashless).is_err(),
+            "a binary artifact with no hash must fail the schema"
+        );
+        // `url` and `bin` are equally required.
+        for missing in ["url", "bin"] {
+            let doc = BINARY_RECIPE
+                .lines()
+                .filter(|l| !l.starts_with(missing))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                parse_recipes(&doc).is_err(),
+                "a binary artifact with no `{missing}` must fail the schema"
+            );
+        }
+    }
+
+    #[test]
+    fn binary_recipe_validation_rejects_malformed_shapes() {
+        // Non-SRI hash (a bare hex sha256 is NOT SRI — pin the format).
+        let hex_hash = BINARY_RECIPE.replace(
+            "sha256-ynFBXdGfGeMKqjWkkVrvyp/bX+wxuYMxzD1393jVOcU=",
+            "ca71415dd19f19e30aaa35a4915aefca9fdb5fec31b98331cc3d77f778d539c5",
+        );
+        let recipes = parse_recipes(&hex_hash).expect("parses (hash is a string)");
+        assert!(
+            validate_recipes(&recipes)
+                .iter()
+                .any(|e| e.contains("not a well-formed SRI hash")),
+            "a non-SRI hash must fail validation"
+        );
+
+        // Unknown platform key — would silently never match a host.
+        let bad_platform = BINARY_RECIPE.replace("artifact.macos-arm64", "artifact.macos-x86_64");
+        let recipes = parse_recipes(&bad_platform).expect("parses");
+        assert!(
+            validate_recipes(&recipes)
+                .iter()
+                .any(|e| e.contains("unknown platform `macos-x86_64`")),
+            "an unknown platform key must fail validation"
+        );
+
+        // Traversal / absolute bin paths.
+        for bad_bin in ["../escape", "/usr/bin/srv", "a/../b"] {
+            let doc = BINARY_RECIPE.replace("bin = \"bin/srv\"", &format!("bin = \"{bad_bin}\""));
+            let recipes = parse_recipes(&doc).expect("parses");
+            assert!(
+                validate_recipes(&recipes)
+                    .iter()
+                    .any(|e| e.contains("not a plain relative path")),
+                "bin `{bad_bin}` must fail validation"
+            );
+        }
+
+        // http (not https) URL.
+        let plain_http = BINARY_RECIPE.replace("https://github.com", "http://github.com");
+        let recipes = parse_recipes(&plain_http).expect("parses");
+        assert!(
+            validate_recipes(&recipes)
+                .iter()
+                .any(|e| e.contains("is not https")),
+            "an http artifact URL must fail validation"
+        );
+
+        // A binary recipe with no artifacts installs nothing anywhere.
+        let no_artifacts = "[recipe.srv]\necosystem = \"binary\"\npackage = \"owner/srv\"\n\
+                            version = \"1.2.3\"\ntier = \"binary-sri\"\n";
+        let recipes = parse_recipes(no_artifacts).expect("parses");
+        assert!(
+            validate_recipes(&recipes)
+                .iter()
+                .any(|e| e.contains("carries no")),
+            "an artifact-less binary recipe must fail validation"
+        );
+
+        // Tier/ecosystem disagreement, both directions.
+        let wrong_tier = BINARY_RECIPE.replace("tier = \"binary-sri\"", "tier = \"cargo-locked\"");
+        let recipes = parse_recipes(&wrong_tier).expect("parses");
+        assert!(
+            validate_recipes(&recipes)
+                .iter()
+                .any(|e| e.contains("is ecosystem `binary` but tier")),
+            "a binary recipe must carry the binary-sri tier"
+        );
+        let wrong_ecosystem = "[recipe.srv]\necosystem = \"cargo\"\npackage = \"srv-cli\"\n\
+                               version = \"1.2.3\"\ntier = \"binary-sri\"\n";
+        let recipes = parse_recipes(wrong_ecosystem).expect("parses");
+        assert!(
+            validate_recipes(&recipes)
+                .iter()
+                .any(|e| e.contains("has tier `binary-sri` but ecosystem")),
+            "the binary tier belongs to binary recipes"
+        );
+    }
+
+    #[test]
+    fn install_class_marks_compile_recipes_machine_readably() {
+        // The compile-class marking is a total function of the schema's
+        // ecosystem field — it cannot drift from the recipe data.
+        assert_eq!(Ecosystem::Cargo.install_class(), InstallClass::Compile);
+        assert_eq!(Ecosystem::Go.install_class(), InstallClass::Compile);
+        assert_eq!(Ecosystem::Npm.install_class(), InstallClass::Fetch);
+        assert_eq!(Ecosystem::Pip.install_class(), InstallClass::Fetch);
+        assert_eq!(Ecosystem::Binary.install_class(), InstallClass::Fetch);
+        assert_eq!(InstallClass::Compile.as_str(), "compile");
+        assert_eq!(InstallClass::Fetch.as_str(), "fetch");
+
+        // The shipped compile-class rows: gopls (no upstream binaries) and the
+        // cargo-built taplo fallback are honestly marked.
+        let recipes = default_recipes().expect("default recipes parse");
+        assert_eq!(
+            recipes["gopls"].install_class_on(Some("linux-x86_64")),
+            InstallClass::Compile,
+            "gopls is compile-class — no upstream binaries"
+        );
+
+        // A binary artifact upgrades the platform it covers to fetch-class; the
+        // uncovered platform stays on the fallback ecosystem's class.
+        let overlay = "[recipe.srv]\necosystem = \"cargo\"\npackage = \"srv-cli\"\n\
+                       version = \"1.2.3\"\ntier = \"cargo-locked\"\n\
+                       [recipe.srv.artifact.linux-x86_64]\n\
+                       url = \"https://example.com/srv.tar.gz\"\n\
+                       hash = \"sha256-ynFBXdGfGeMKqjWkkVrvyp/bX+wxuYMxzD1393jVOcU=\"\n\
+                       bin = \"bin/srv\"\n";
+        let recipes = parse_recipes(overlay).expect("parses");
+        let srv = &recipes["srv"];
+        assert_eq!(
+            srv.install_class_on(Some("linux-x86_64")),
+            InstallClass::Fetch
+        );
+        assert_eq!(
+            srv.install_class_on(Some("macos-arm64")),
+            InstallClass::Compile
+        );
+        assert_eq!(srv.install_class_on(None), InstallClass::Compile);
+    }
+
+    #[test]
+    fn current_platform_token_is_in_the_pinned_set() {
+        // On a pinned platform the token is one of PLATFORM_TOKENS; off the
+        // set it is None. Either way, artifact keys validate against the same
+        // constant, so the lookup and the validation cannot disagree.
+        if let Some(token) = current_platform_token() {
+            assert!(PLATFORM_TOKENS.contains(&token));
+        }
+    }
+
+    #[test]
+    fn shipped_lua_language_server_recipe_is_the_binary_shape() {
+        // The one real lsm-04 entry: official LuaLS release binaries, the
+        // linux-x86_64 URL + hash carried over from the retired ci-provision
+        // stanza (the hash is the same sha256, re-encoded hex → SRI base64).
+        let recipes = default_recipes().expect("default recipes parse");
+        let lua = recipes
+            .get("lua-language-server")
+            .expect("lua-language-server carries a recipe now (lsm 04)");
+        assert_eq!(lua.ecosystem, Ecosystem::Binary);
+        assert_eq!(lua.tier, VerificationTier::BinarySri);
+        let artifact = lua
+            .artifact
+            .get("linux-x86_64")
+            .expect("the linux-x86_64 artifact is pinned");
+        assert!(
+            artifact
+                .url
+                .starts_with("https://github.com/LuaLS/lua-language-server/releases/download/"),
+            "the URL is the upstream official release, never a mirror: {}",
+            artifact.url
+        );
+        assert!(artifact.hash.starts_with("sha256-"));
+        assert_eq!(artifact.bin, "bin/lua-language-server");
+        // The provision stanza is gone — the disjointness boundary holds.
+        let provisions = default_provisioning().expect("provisioning parses");
+        assert!(
+            !provisions.contains_key("lua-language-server"),
+            "lua-language-server moved from ci-provision to a binary recipe"
+        );
     }
 
     #[test]
@@ -2255,6 +2735,12 @@ tier = "cargo-locked"
                     recipe.hash.is_none(),
                     "recipe `{name}` tier delegates verification and must carry no hash"
                 ),
+                // binary-sri hashes ride the per-platform artifacts (validated
+                // as SRI by validate_recipes), never the top-level field.
+                VerificationTier::BinarySri => assert!(
+                    recipe.hash.is_none(),
+                    "recipe `{name}` pins per-artifact SRI hashes and must carry no top-level hash"
+                ),
             }
         }
         // A co-install always pins by npm SRI sha512 (regardless of the parent
@@ -2314,11 +2800,14 @@ tier = "cargo-locked"
     fn provisioning_covers_the_ticket_servers_and_kinds() {
         // tui-rework 10's headline coverage: the servers everyone actually wants
         // plus the lattice dogfood, spanning every provisioning kind.
+        // lua-language-server left this list in lsm 04 — it moved to a `binary`
+        // recipe in defaults/recipes.toml (official upstream binaries are the
+        // preferred recipe shape now); marksman keeps the
+        // github-release-sha256 kind covered.
         let provisions = default_provisioning().expect("provisioning parses");
         for server in [
             "rust-analyzer",
             "clangd",
-            "lua-language-server",
             "marksman",
             "lattice",
             "jdtls",

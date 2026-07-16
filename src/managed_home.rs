@@ -230,6 +230,20 @@ pub fn expose_executable(version_dir: &Path, executable: &Path, bin_name: &str) 
             version_dir.display()
         )
     })?;
+    // The strip above is lexical, so `<version_dir>/../x` would pass it while
+    // resolving outside the dir. Refuse any non-plain component (lsm 04 — the
+    // direct-fetch leg feeds recipe-derived paths through here).
+    if relative
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        bail!(
+            "executable path {} traverses out of the version dir {} — a version dir is \
+             self-contained",
+            executable.display(),
+            version_dir.display()
+        );
+    }
     let bin_dir = version_dir.join("bin");
     std::fs::create_dir_all(&bin_dir).with_context(|| format!("creating {}", bin_dir.display()))?;
     #[cfg(unix)]
@@ -360,6 +374,13 @@ mod tests {
         assert!(
             expose_executable(&version_dir, &outside, "srv").is_err(),
             "a version dir never links out of itself",
+        );
+        // A lexically-inside path that traverses out via `..` is refused too
+        // (`strip_prefix` alone would pass it).
+        let traversal = version_dir.join("..").join("elsewhere");
+        assert!(
+            expose_executable(&version_dir, &traversal, "srv").is_err(),
+            "a `..`-traversing path never escapes the version dir",
         );
     }
 

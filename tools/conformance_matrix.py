@@ -13,9 +13,17 @@ Each entry carries a `source` (`recipe` | `provision`) that the workflow branche
 on, plus the fields that source's install step needs:
 
     recipe:    { server, source, ecosystem, package, version, tier, hash,
-                 co_install, runtime_name, runtime_version }
+                 co_install, artifact_url, artifact_hash, artifact_bin,
+                 runtime_name, runtime_version }
     provision: { server, source, kind, version, component, apt, repo, asset,
                  sha256, bin, git, rev, url, gem, runtime_name, runtime_version }
+
+The `artifact_*` fields (lsm 04) are the recipe's pinned linux-x86_64 official
+upstream release binary — url + SRI hash + launcher path — resolved from its
+`[recipe.<server>.artifact.linux-x86_64]` table, empty when the recipe pins no
+binary for the leg's platform. The install step PREFERS a non-empty
+artifact_url over the ecosystem install, mirroring the engine
+(src/install.rs `InstallPlan::resolve`).
 
 `co_install` (misc 195) is a list of `{package, version, hash}` pinned npm
 packages the server needs at runtime but does not bundle
@@ -115,6 +123,10 @@ def co_installs(recipe: dict) -> list[dict]:
 def recipe_entry(name: str, recipe: dict) -> dict:
     """One `source = recipe` matrix entry."""
     runtime = recipe.get("runtime") or {}
+    # The lsm-04 binary shape: the Linux leg's pinned official release binary,
+    # when the recipe carries one. Preferred by the install step over the
+    # ecosystem, mirroring the engine's platform preference.
+    artifact = recipe.get("artifact", {}).get("linux-x86_64", {})
     return {
         "server": name,
         "source": "recipe",
@@ -124,6 +136,9 @@ def recipe_entry(name: str, recipe: dict) -> dict:
         "tier": recipe.get("tier", ""),
         "hash": recipe.get("hash", ""),
         "co_install": co_installs(recipe),
+        "artifact_url": artifact.get("url", ""),
+        "artifact_hash": artifact.get("hash", ""),
+        "artifact_bin": artifact.get("bin", ""),
         "runtime_name": runtime.get("name", ""),
         "runtime_version": runtime.get("version", ""),
     }
@@ -274,6 +289,17 @@ def validate_macos(
                 errors.append(
                     f"macOS provision `{name}` is `linux-recipe` but names no "
                     f"recipe in defaults/recipes.toml"
+                )
+            elif recipes[name].get("ecosystem") == "binary":
+                # A binary recipe pins per-platform artifacts; the macOS leg has
+                # no binary install branch, and a Linux artifact could never
+                # conform macOS anyway — a guaranteed-red job stays out of the
+                # matrix (lsm 04).
+                errors.append(
+                    f"macOS provision `{name}` is `linux-recipe` but the Linux "
+                    f"recipe is ecosystem `binary` (per-platform artifacts are "
+                    f"not platform-neutral) — use a homebrew stanza or an "
+                    f"explicit skip"
                 )
         elif kind == MACOS_LINUX_PROVISION and name not in provisions:
             errors.append(

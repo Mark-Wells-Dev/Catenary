@@ -161,6 +161,9 @@ formula = "llvm"
 bin = "bin/clangd"
 note = "llvm is keg-only (macOS ships its own toolchain), so nothing lands on PATH by default; `bin` names the launcher and the workflow symlinks it in as `clangd`. The llvm bottle is heavy but is the leanest core formula that carries clangd."
 
+# The Linux leg is a `binary` recipe now (lsm 04, defaults/recipes.toml); its
+# macos-arm64 artifact is pending attended resolution, so this leg stays on the
+# homebrew-core formula meanwhile.
 [provision.lua-language-server]
 kind = "homebrew"
 formula = "lua-language-server"

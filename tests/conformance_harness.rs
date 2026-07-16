@@ -1494,11 +1494,23 @@ fn macos_provisioning_partitions_the_conformed_set() {
             }
             // A neutral-kind stanza REFERENCES this server's Linux source so a
             // Linux pin bump cannot diverge; the reference is the stanza key.
-            Some("linux-recipe") => assert!(
-                recipes.contains_key(name),
-                "macOS provision `{name}` is `linux-recipe` but names no recipe in \
-                 defaults/recipes.toml"
-            ),
+            Some("linux-recipe") => {
+                assert!(
+                    recipes.contains_key(name),
+                    "macOS provision `{name}` is `linux-recipe` but names no recipe in \
+                     defaults/recipes.toml"
+                );
+                // lsm 04: a `binary` recipe pins per-platform artifacts, which
+                // are not platform-neutral — a Linux artifact can never conform
+                // macOS, so the reference kind is refused (mirrors
+                // tools/conformance_matrix.py `validate_macos`).
+                assert_ne!(
+                    recipes[name].ecosystem,
+                    catenary_cli::recipes::Ecosystem::Binary,
+                    "macOS provision `{name}` is `linux-recipe` but the Linux recipe is \
+                     ecosystem `binary` — use a homebrew stanza or an explicit skip"
+                );
+            }
             // The only remaining valid kind (the assert above ruled out any
             // other), so no catch-all `panic!` arm is needed (`clippy::panic` is
             // denied in this test file).

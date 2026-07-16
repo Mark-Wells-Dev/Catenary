@@ -2,11 +2,13 @@
 # offerable (tui-rework 10).
 #
 # This file answers a different question than `defaults/recipes.toml`. A recipe
-# records *can Catenary install this for a user* (a user-grade ecosystem pin an
-# install engine can execute — npm/cargo/pip/go, all offerable once blessed). A
+# records *can Catenary install this for a user* (a user-grade pin the install
+# engine can execute — npm/cargo/pip/go, and since lsm 04 direct SRI-hashed
+# fetches of official upstream release binaries, all offerable once blessed). A
 # provision stanza records *how a conformance CI matrix job OBTAINS a server that
-# no user-grade ecosystem recipe can carry* — a toolchain component, a system
-# package, a checksummed GitHub release binary, a git-pinned source build, a gem.
+# no user-grade recipe can carry* — a toolchain component, a system package, a
+# git-pinned source build, a gem, or a release binary for a server that cannot
+# conform (marksman).
 #
 # The separation is the whole point: a provisioned server lives ONLY here, is
 # NEVER parsed into the install engine's recipe set, and so is STRUCTURALLY unable
@@ -44,10 +46,12 @@
 #                         apt's signed repositories verify — no explicit hash.
 #   github-release-sha256 a pinned release `tag` + `asset` from `repo`, verified
 #                         against `sha256`, unpacked to a runner temp dir; `bin`
-#                         is the launcher path within the unpacked asset. The
-#                         placement problem that deferred this tier for USERS
-#                         (managed-dir territory, tui-rework 06) does not exist in
-#                         CI — download-verify was always the easy half.
+#                         is the launcher path within the unpacked asset. Since
+#                         lsm 04 this shape is ALSO available to users as a
+#                         `binary` recipe (the managed home solved the placement
+#                         problem that once deferred it) — a server stays here
+#                         only when it should not be a recipe at all (marksman:
+#                         conformance = false, never blessed, never offerable).
 #   cargo-git-locked      `cargo install --git <git> --rev <rev> --locked` — a
 #                         reproducible source build pinned to an exact commit;
 #                         `--locked` + the git rev verify.
@@ -81,16 +85,12 @@ kind = "system-apt"
 apt = "clangd"
 
 # ── checksummed GitHub releases ──────────────────────────────────────
-# lua-language-server, marksman — pinned tag + pinned asset sha256, unpacked to
-# a temp dir.
-
-[provision.lua-language-server]
-kind = "github-release-sha256"
-repo = "LuaLS/lua-language-server"
-version = "3.18.2"
-asset = "lua-language-server-3.18.2-linux-x64.tar.gz"
-sha256 = "ca71415dd19f19e30aaa35a4915aefca9fdb5fec31b98331cc3d77f778d539c5"
-bin = "bin/lua-language-server"
+# marksman — pinned tag + pinned asset sha256, unpacked to a temp dir.
+# lua-language-server used to live here too: it moved to a `binary` recipe in
+# defaults/recipes.toml (lsm 04 — official upstream binaries are now the
+# preferred RECIPE shape; the maintainer amendment supersedes the tui-rework 06
+# ruling that deferred this tier for users). Its linux pin carried over
+# verbatim (same URL data, sha256 re-encoded as SRI).
 
 [provision.marksman]
 kind = "github-release-sha256"

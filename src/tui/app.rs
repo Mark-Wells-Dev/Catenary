@@ -1251,6 +1251,7 @@ mod tests {
             note: None,
             conformance: true,
             co_install: Vec::new(),
+            artifact: BTreeMap::new(),
             runtime: None,
         }
     }

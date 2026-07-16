@@ -1967,6 +1967,7 @@ mod tests {
             note: None,
             conformance: true,
             co_install: Vec::new(),
+            artifact: std::collections::BTreeMap::new(),
             runtime: None,
         };
         let mut manifest = BlessedManifest::default();

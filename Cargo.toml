@@ -99,6 +99,15 @@ dirs = "6.0.0"
 # derive an ephemeral keypair from a fixed seed (`SigningKey::from_bytes`) — no
 # real key, no RNG, no network.
 ed25519-dalek = "2"
+# `flate2` + `tar` unpack the lsm-04 binary-recipe artifacts (official upstream
+# release .tar.gz/.gz files) in-process, after SRI verification: in-process
+# unpacking gives deterministic path-traversal containment (the tar layer never
+# writes outside the destination) and a decode ceiling against decompression
+# bombs, where shelling out to a host `tar` would give neither guarantee
+# portably. `flate2` (MIT OR Apache-2.0) is already in the dependency graph via
+# `ureq`, so it adds no new crate; `tar` (MIT OR Apache-2.0) adds itself plus
+# `xattr` (also MIT OR Apache-2.0) — deny.toml-clean.
+flate2 = "1"
 futures = "0.3"
 globset = "0.4"
 grep-matcher = "0.1.8"
@@ -119,6 +128,9 @@ schemars = "0.8"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 similar = "2.6"
+# See the `flate2` note above (lsm 04): the tar half of the in-process,
+# containment-guaranteed artifact unpack.
+tar = "0.4"
 tempfile = "3"
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["full"] }
