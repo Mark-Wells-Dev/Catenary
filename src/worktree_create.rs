@@ -286,7 +286,7 @@ pub fn create_from_payload(payload: &Value) -> Result<WorktreeMeta> {
         .to_string();
     let segment = worktree_segment(agent_id.as_deref(), raw_name, &unique_id);
     let worktree = paths::agent_worktree_dir(&session_id, &segment);
-    let branch = branch_name(payload, &unique_id);
+    let branch = branch_name(payload, agent_id.as_deref(), &unique_id);
 
     // Ensure the worktrees root exists; the VCS copy command creates the leaf.
     if let Some(parent) = worktree.parent() {
@@ -1159,16 +1159,101 @@ fn copy_worktree_includes(repo: &Path, worktree: &Path) {
     }
 }
 
+/// Maximum length of the description-derived slug segment of a purpose-named
+/// branch (wf-02) — bounded so a verbose dispatch description still yields a
+/// readable branch; uniqueness is carried entirely by the id suffix.
+const BRANCH_SLUG_MAX: usize = 40;
+
+/// Length of the short-id suffix on a purpose-named branch (wf-02). Long enough
+/// that two live agent branches cannot collide in practice; short enough that
+/// the purpose slug stays the visible part.
+const BRANCH_ID_SUFFIX_LEN: usize = 8;
+
+/// Slugify free text into a branch-safe segment: lowercase `[a-z0-9-]` only,
+/// runs of any other characters collapsed to a single `-`, no leading/trailing
+/// dashes, bounded at [`BRANCH_SLUG_MAX`] (wf-02).
+///
+/// Dependency-free by design (a plain char filter/map). Text with no ASCII
+/// alphanumerics at all (all-CJK, all-punctuation) slugs to the empty string —
+/// the caller treats that as "no usable description" and falls back.
+fn slugify(text: &str) -> String {
+    let mut slug = String::with_capacity(BRANCH_SLUG_MAX);
+    for c in text.chars() {
+        if slug.len() >= BRANCH_SLUG_MAX {
+            break;
+        }
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_end_matches('-').to_string()
+}
+
+/// The dispatch description riding in a `WorktreeCreate` payload, when present.
+///
+/// The Agent tool call's `description` field is expected to ride in the hook's
+/// `tool_input` JSON; a top-level `description` is kept as a drift net (the
+/// payload is schema-verified live via the debug log at the hook boundary).
+/// **As of Claude Code today the payload carries neither** — the confirmed
+/// schema is `{cwd, hook_event_name, name, session_id, transcript_path}` — so
+/// this returns `None` in production and the purpose-branch path lights up
+/// automatically if the host ever forwards the field.
+fn payload_description(payload: &Value) -> Option<&str> {
+    payload
+        .get("tool_input")
+        .and_then(|input| input.get("description"))
+        .or_else(|| payload.get("description"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// The short-id suffix for a purpose-named branch: the first
+/// [`BRANCH_ID_SUFFIX_LEN`] alphanumerics of `id` (lowercased — branch-safe by
+/// construction), falling back to `fallback` (the generated hex `unique_id`,
+/// always safe) when `id` carries none.
+fn short_suffix(id: &str, fallback: &str) -> String {
+    let short: String = id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .take(BRANCH_ID_SUFFIX_LEN)
+        .collect();
+    if short.is_empty() {
+        fallback.chars().take(BRANCH_ID_SUFFIX_LEN).collect()
+    } else {
+        short
+    }
+}
+
 /// Choose the branch name for the new worktree.
 ///
-/// Follows a payload-supplied name when present, else generates a unique
+/// **Purpose first (wf-02):** when the payload carries the dispatch description
+/// (`tool_input.description`, top-level `description` as a drift net) and it
+/// slugs to something non-empty, the branch is named for the work's purpose —
+/// `agent/<slug>-<short-id>` (e.g. `agent/fix-bug-118-write-gate-ab7cf3d9`),
+/// the short id (from the agent id, else the generated unique id) making
+/// collisions impossible. Only the **branch** takes this name — the worktree
+/// dirname stays the agent id (dirname-is-owner is load-bearing: the
+/// `SubagentStop` identity gate, bugs 91/103).
+///
+/// **Fallback:** a payload-supplied name when present, else a generated unique
 /// `catenary-wt-<id>`. The confirmed `WorktreeCreate` schema names the field
-/// `name` (the worktree name — user-chosen for `--worktree`, generated for
-/// subagents), so it is checked **first**; the earlier lenient candidates
-/// (`branch`/`branch_name`/`worktree_name`) remain as a drift net, and the full
-/// payload is debug-logged at the hook boundary so any schema change still
-/// surfaces on the first live run.
-fn branch_name(payload: &Value, unique_id: &str) -> String {
+/// `name` (the worktree name — user-chosen for `--worktree`, generated as
+/// `agent-<id>` for subagents), so it is checked **first**; the earlier lenient
+/// candidates (`branch`/`branch_name`/`worktree_name`) remain as a drift net,
+/// and the full payload is debug-logged at the hook boundary so any schema
+/// change still surfaces on the first live run.
+fn branch_name(payload: &Value, agent_id: Option<&str>, unique_id: &str) -> String {
+    if let Some(description) = payload_description(payload) {
+        let slug = slugify(description);
+        if !slug.is_empty() {
+            let short = short_suffix(agent_id.unwrap_or(unique_id), unique_id);
+            return format!("agent/{slug}-{short}");
+        }
+    }
     for key in ["name", "branch", "branch_name", "worktree_name"] {
         if let Some(name) = payload.get(key).and_then(Value::as_str) {
             let trimmed = name.trim();
@@ -1300,8 +1385,8 @@ mod tests {
     use super::{
         ForeignVcs, VcsPosture, WorktreeMeta, branch_name, copy_worktree_includes,
         create_feat_worktree, create_hg_copy, create_svn_copy, detect_vcs, linkage_dead,
-        parse_agent_id, prune_agent_orphans, prune_orphans, scan_sidecars, sidecar_path,
-        worktree_segment, write_sidecar,
+        parse_agent_id, prune_agent_orphans, prune_orphans, scan_sidecars, short_suffix,
+        sidecar_path, slugify, worktree_segment, write_sidecar,
     };
 
     /// Whether `bin` is on PATH (runs `<bin> --version`). Binary-gated svn/hg
@@ -1416,26 +1501,114 @@ mod tests {
     #[test]
     fn branch_name_prefers_payload_name() {
         let payload = serde_json::json!({ "branch": "worktree-agent-abc" });
-        assert_eq!(branch_name(&payload, "xyz"), "worktree-agent-abc");
+        assert_eq!(branch_name(&payload, None, "xyz"), "worktree-agent-abc");
     }
 
     #[test]
     fn branch_name_prefers_name_over_other_candidates() {
         // The confirmed schema's `name` wins over the lenient drift-net keys.
         let payload = serde_json::json!({ "name": "feature-auth", "branch": "other" });
-        assert_eq!(branch_name(&payload, "xyz"), "feature-auth");
+        assert_eq!(branch_name(&payload, None, "xyz"), "feature-auth");
     }
 
     #[test]
     fn branch_name_generates_when_absent() {
         let payload = serde_json::json!({ "session_id": "s1" });
-        assert_eq!(branch_name(&payload, "xyz"), "catenary-wt-xyz");
+        assert_eq!(branch_name(&payload, None, "xyz"), "catenary-wt-xyz");
     }
 
     #[test]
     fn branch_name_ignores_blank_supplied_name() {
         let payload = serde_json::json!({ "name": "   " });
-        assert_eq!(branch_name(&payload, "xyz"), "catenary-wt-xyz");
+        assert_eq!(branch_name(&payload, None, "xyz"), "catenary-wt-xyz");
+    }
+
+    #[test]
+    fn branch_name_derives_purpose_from_tool_input_description() {
+        // wf-02: the dispatch description names the branch by purpose,
+        // suffixed with the short agent id; it outranks the payload `name`.
+        let payload = serde_json::json!({
+            "name": "agent-ab7cf3d91613f48c6",
+            "tool_input": { "description": "Fix bug 118 write gate" },
+        });
+        assert_eq!(
+            branch_name(&payload, Some("ab7cf3d91613f48c6"), "xyz"),
+            "agent/fix-bug-118-write-gate-ab7cf3d9",
+        );
+    }
+
+    #[test]
+    fn branch_name_reads_top_level_description_as_drift_net() {
+        let payload = serde_json::json!({ "description": "Ship the thing" });
+        assert_eq!(
+            branch_name(&payload, Some("deadbeef01234567"), "xyz"),
+            "agent/ship-the-thing-deadbeef",
+        );
+    }
+
+    #[test]
+    fn branch_name_purpose_suffix_falls_back_to_unique_id_without_agent_id() {
+        let payload = serde_json::json!({
+            "tool_input": { "description": "Refactor the parser" },
+        });
+        assert_eq!(
+            branch_name(&payload, None, "0123456789abcdef"),
+            "agent/refactor-the-parser-01234567",
+        );
+    }
+
+    #[test]
+    fn branch_name_empty_slug_falls_back_to_the_name_chain() {
+        // A description with no ASCII alphanumerics (all-CJK, all-punctuation)
+        // slugs to empty — fall back to the payload name (the bare agent id
+        // convention), never an `agent/-<id>` stub.
+        let payload = serde_json::json!({
+            "name": "agent-deadbeef",
+            "tool_input": { "description": "工事中 —— !!!" },
+        });
+        assert_eq!(
+            branch_name(&payload, Some("deadbeef"), "xyz"),
+            "agent-deadbeef",
+        );
+    }
+
+    #[test]
+    fn slugify_lowercases_filters_and_collapses() {
+        assert_eq!(
+            slugify("  Fix Bug #118 -- WRITE gate!! "),
+            "fix-bug-118-write-gate",
+        );
+    }
+
+    #[test]
+    fn slugify_bounds_length_and_trims_trailing_dashes() {
+        let long = "a very long dispatch description that keeps going and going and going";
+        let slug = slugify(long);
+        assert!(
+            slug.len() <= super::BRANCH_SLUG_MAX,
+            "slug must be bounded: {slug}",
+        );
+        assert!(!slug.ends_with('-'), "no trailing dash: {slug}");
+        assert!(!slug.starts_with('-'), "no leading dash: {slug}");
+        assert!(
+            slug.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "slug alphabet is [a-z0-9-]: {slug}",
+        );
+    }
+
+    #[test]
+    fn slugify_no_ascii_alphanumerics_is_empty() {
+        assert_eq!(slugify("工事中"), "");
+        assert_eq!(slugify("—— !!! ——"), "");
+        assert_eq!(slugify(""), "");
+    }
+
+    #[test]
+    fn short_suffix_filters_and_bounds_falling_back_when_empty() {
+        assert_eq!(short_suffix("ab7cf3d91613f48c6", "fallback"), "ab7cf3d9");
+        assert_eq!(short_suffix("AB-7c", "fallback"), "ab7c");
+        assert_eq!(short_suffix("~~~", "0123456789"), "01234567");
     }
 
     #[test]

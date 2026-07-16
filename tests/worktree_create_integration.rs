@@ -295,6 +295,75 @@ fn worktree_create_tolerates_extra_payload_fields_and_names_branch() {
 }
 
 #[test]
+fn worktree_create_description_names_branch_but_not_dirname() {
+    // wf-02: a dispatch description riding in the payload's `tool_input` names
+    // the BRANCH by purpose (`agent/<slug>-<short-id>`), while the worktree
+    // DIRNAME stays the agent id — dirname-is-owner is load-bearing (the
+    // SubagentStop identity gate; bugs 91/103).
+    let home = tempfile::tempdir().expect("home tempdir");
+    let repo = home.path().join("repo");
+    init_repo(&repo);
+
+    let output = run_hook(
+        home.path(),
+        &json!({
+            "cwd": repo.to_str().expect("repo path"),
+            "session_id": "sess-wf02",
+            "name": "agent-ab7cf3d91613f48c6",
+            "hook_event_name": "WorktreeCreate",
+            "tool_input": { "description": "Fix bug 118 write gate" },
+        }),
+    );
+    assert!(
+        output.status.success(),
+        "hook must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // Dirname unchanged: still `agents/<session_id>/<agent_id>`.
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let worktree = PathBuf::from(&stdout);
+    let tail = Path::new("agents")
+        .join("sess-wf02")
+        .join("ab7cf3d91613f48c6");
+    assert!(
+        worktree.ends_with(&tail),
+        "dirname must stay the agent id: {}",
+        worktree.display(),
+    );
+
+    // The branch is purpose-named: slugified description + short agent id.
+    let expected_branch = "agent/fix-bug-118-write-gate-ab7cf3d9";
+    let branches = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["branch", "--list", expected_branch])
+        .output()
+        .expect("git branch list");
+    let branches = String::from_utf8_lossy(&branches.stdout);
+    assert!(
+        branches.contains(expected_branch),
+        "the description should name the branch, got:\n{branches}",
+    );
+
+    // The sidecar records the purpose branch, so `worktree rm` deletes it by
+    // its recorded name (never assuming branch == dirname).
+    let leaf = worktree
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("worktree leaf");
+    let sidecar = worktree.with_file_name(format!("{leaf}.meta.json"));
+    let meta: Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar).expect("read sidecar"))
+            .expect("parse sidecar json");
+    assert_eq!(
+        meta.get("branch").and_then(Value::as_str),
+        Some(expected_branch),
+        "sidecar records the purpose-named branch",
+    );
+}
+
+#[test]
 fn worktree_create_missing_repo_fails_loud_and_nonzero() {
     let home = tempfile::tempdir().expect("home tempdir");
     // A cwd that is NOT inside any git repo (a bare tempdir under /tmp).
