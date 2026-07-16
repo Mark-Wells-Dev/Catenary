@@ -38,7 +38,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # macOS lints the target_os = "macos" branches (e.g. notify.rs
       # osascript) that never compile on the Linux runner.
-      - run: cargo clippy --all-targets --features mockls -- -D warnings
+      # `make clippy` is the lint gate's single source of truth (misc 202): the
+      # pedantic/nursery/cargo groups live in Cargo.toml's
+      # `[workspace.lints.clippy]`, so this carries no group flags — only
+      # `-D warnings`, the deny lever.
+      - run: make clippy
 
   test:
     name: Test (${{ matrix.os }})

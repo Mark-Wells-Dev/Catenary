@@ -589,13 +589,52 @@ pub fn run_session_start(format: HostFormat) {
     request["host_payload"] = prepare_host_payload(&hook_json);
 
     // Fire the clear-editing request for its daemon-side effect (resetting stale
-    // editing state). The response carries nothing the user needs: the Cleared
-    // count was routine info and the notification-drain leg retired (tui-rework
-    // 04), so the response is ignored.
-    let _ = ipc_exchange(stream, &request);
+    // editing state). The response carries the project-config setup nudge (misc
+    // 202) when the daemon owes one for a served root this SessionStart — the
+    // daemon owns the once-per-root-per-instance ledger, so the CLI only renders
+    // what it is handed. The Cleared count retired (tui-rework 04); nothing else in
+    // the response is user-facing.
+    let lines = ipc_exchange(stream, &request);
+    let nudge = session_start_nudge_from_response(&lines);
 
-    let ctx = with_bridge_mismatch_line(with_orphan_line(session_start_context(announce, format)));
+    let ctx = with_project_config_line(
+        with_bridge_mismatch_line(with_orphan_line(session_start_context(announce, format))),
+        nudge.as_deref(),
+    );
     emit_session_start(builder, ctx.as_deref());
+}
+
+/// The `session_start_nudge` line the daemon returned in its
+/// `session-start/clear-editing` response, or `None` (misc 202).
+///
+/// The daemon emits at most one nudge per served root per instance; the CLI reads
+/// it off the first response line and renders it verbatim. An absent field (the
+/// common case — no nudge owed, or the root already nudged) leaves this `None`.
+#[must_use]
+fn session_start_nudge_from_response(lines: &[String]) -> Option<String> {
+    let line = lines.first()?;
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    value
+        .get("session_start_nudge")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// Append the project-config setup-nudge line (misc 202) to a `SessionStart`
+/// context, when the daemon returned one and there is a context to carry it.
+///
+/// Mirrors [`with_orphan_line`] / [`with_bridge_mismatch_line`] exactly: it only
+/// augments a `Some` context (the announce+Claude path — the sole `SessionStart`
+/// surface that carries `additionalContext`), so a non-Claude host never receives
+/// a Claude-shaped standalone line. A `None` context or an absent nudge is the
+/// identity.
+#[must_use]
+fn with_project_config_line(ctx: Option<String>, nudge: Option<&str>) -> Option<String> {
+    let base = ctx?;
+    match nudge {
+        Some(line) => Some(format!("{base}\n\n{line}")),
+        None => Some(base),
+    }
 }
 
 /// Inject the per-session teaching sliver on a conversation's first sighting
@@ -3239,6 +3278,51 @@ mod tests {
         // Claude Code reads `additionalContext` at SessionStart.
         assert!(session_start_context(true, HostFormat::Antigravity).is_none());
         assert!(session_start_context(true, HostFormat::OpenCode).is_none());
+    }
+
+    // ── Project-config setup nudge (misc 202) ───────────────────────────
+
+    #[test]
+    fn session_start_nudge_read_from_response() {
+        // The daemon returns the nudge under `session_start_nudge` on the first
+        // response line; the CLI reads it verbatim.
+        let lines = vec![
+            serde_json::json!({ "session_start_nudge": "rust-analyzer reads rust-analyzer.toml; add one." })
+                .to_string(),
+        ];
+        assert_eq!(
+            session_start_nudge_from_response(&lines).as_deref(),
+            Some("rust-analyzer reads rust-analyzer.toml; add one."),
+        );
+    }
+
+    #[test]
+    fn session_start_nudge_absent_when_field_missing_or_no_response() {
+        // A bare envelope (no nudge field) and an empty response both yield None.
+        let envelope_only = vec![serde_json::json!({ "result": null }).to_string()];
+        assert_eq!(session_start_nudge_from_response(&envelope_only), None);
+        assert_eq!(session_start_nudge_from_response(&[]), None);
+        // A non-JSON line is tolerated (None, not a panic).
+        assert_eq!(
+            session_start_nudge_from_response(&["not json".to_string()]),
+            None,
+        );
+    }
+
+    #[test]
+    fn with_project_config_line_augments_only_a_present_context() {
+        // Mirrors with_orphan_line: only a Some base is augmented, so a non-Claude
+        // host (None context) never receives a standalone Claude-shaped line.
+        assert_eq!(
+            with_project_config_line(Some("base".to_string()), Some("nudge")),
+            Some("base\n\nnudge".to_string()),
+        );
+        assert_eq!(
+            with_project_config_line(Some("base".to_string()), None),
+            Some("base".to_string()),
+        );
+        assert_eq!(with_project_config_line(None, Some("nudge")), None);
+        assert_eq!(with_project_config_line(None, None), None);
     }
 
     #[test]

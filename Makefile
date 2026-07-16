@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: bench bench-test build-release bump-guard check conformance conformance-matrix deny flake-hunt fuzz install machete mdbook mockgrep mockglob mdgrep mdglob publish-backstop refresh-recipes registry-selftest rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish publish-check tag-current
+.PHONY: bench bench-test build-release bump-guard check clippy conformance conformance-matrix deny flake-hunt fuzz install machete mdbook mockgrep mockglob mdgrep mdglob publish-backstop refresh-recipes registry-selftest rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish publish-check tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -40,7 +40,7 @@ check:
 	 fi
 	@cargo update --quiet
 	@cargo fmt -- -l | sed 's/^/fmt: formatted /'
-	@cargo clippy --tests --all-features --quiet -- -D warnings
+	@$(MAKE) clippy
 	@tries=0; while true; do \
 	   cargo deny --log-level error check; rc=$$?; \
 	   if [ $$rc -eq 0 ]; then break; \
@@ -54,6 +54,20 @@ check:
 	@cargo machete --skip-target-dir
 	@if [ "$(MEMLIMIT_KB)" != unlimited ]; then ulimit -v $(MEMLIMIT_KB); fi; \
 	 cargo nextest run --workspace --features mockls --no-fail-fast --status-level fail --final-status-level fail --cargo-quiet --show-progress only
+
+# Clippy — CI's single source of truth for the lint gate (misc 202).
+#
+# The lint SET (the pedantic/nursery/cargo groups + the hard denials) lives in
+# Cargo.toml's `[workspace.lints.clippy]`, so it is a PROJECT property the editor
+# and the `catenary diagnostics` receipt read too (rust-analyzer.toml runs clippy
+# for flycheck). This invocation therefore carries NO group flags — only `-D
+# warnings`, CI's deny lever: the same warnings live in the editor/receipt, and go
+# red here. `--all-targets --all-features` is the broadest surface (lib, bins,
+# tests, benches; both `mockls` and `fuzzing`), a superset of the test/build
+# feature sets, so no gated module escapes the gate. Both `make check` and
+# `.github/workflows/ci.yml` call this target — the flags live in one place.
+clippy:
+	@cargo clippy --all-targets --all-features --quiet -- -D warnings
 
 # Detect unused dependencies
 machete:

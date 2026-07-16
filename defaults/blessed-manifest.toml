@@ -314,6 +314,16 @@ discipline = "event"
 suppress_pull = true
 compress_versions = ["1."]
 
+# Project-config-file convention (misc 202): rust-analyzer reads per-project
+# settings (flycheck command, cargo features, …) from `rust-analyzer.toml` at the
+# project root. The `SessionStart` setup nudge fires once per root when a served
+# Rust project has none — the lint/feature surface the editor and the receipt see
+# may then not match the build. Advisory metadata only; no diagnostics seam reads
+# it.
+[discipline.rust-analyzer.project_config]
+file = "rust-analyzer.toml"
+docs = "https://rust-analyzer.github.io/manual.html#configuration"
+
 # Clippy "for further information visit https://..." URL lines.
 [[discipline.rust-analyzer.compress]]
 prefix = "for further information visit"

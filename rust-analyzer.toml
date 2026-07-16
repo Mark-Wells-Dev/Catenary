@@ -1,0 +1,21 @@
+# rust-analyzer project config (misc 202).
+#
+# The language server reads its settings FROM THE PROJECT: Cargo.toml carries the
+# lint SET (`[workspace.lints.clippy]` — the pedantic/nursery/cargo groups), and
+# this file carries the two things Cargo.toml structurally cannot express, so the
+# `catenary diagnostics` receipt matches `make check`:
+#
+#   - flycheck runs clippy, not the default `cargo check`, so the pedantic-tier
+#     lints in `[workspace.lints.clippy]` reach the receipt (the "false clean" the
+#     default check surface caused);
+#   - the `mockls` feature is enabled for both cargo metadata and the check, so the
+#     `#[cfg(feature = "mockls")]` modules that import `crate::logging::test_support`
+#     resolve instead of diagnosing `rustc(E0432): unresolved import` (the "false
+#     red" against a build that is clean under `make check --features mockls`).
+#
+# Keep this minimal: only what Cargo.toml cannot say. The lint set lives in
+# Cargo.toml and is the single source of truth.
+
+check.command = "clippy"
+cargo.features = ["mockls"]
+check.features = ["mockls"]

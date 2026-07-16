@@ -756,6 +756,31 @@ impl StripRule {
     }
 }
 
+/// A language server's **project-config-file convention** — the file it reads
+/// its per-project settings from, and where that convention is documented (misc
+/// 202).
+///
+/// Data riding the manifest, projected onto
+/// [`crate::lsp::server_behavior::ServerProfile`] like every other discipline
+/// leg. It drives the `SessionStart` setup nudge only: when a served root's
+/// language routes to a server carrying this convention and the named file is
+/// **absent** at the root, the hook surfaces a one-line pointer so the agent
+/// knows the editor/receipt lint+feature surface may not match its build. It is
+/// advisory metadata — nothing in the diagnostics path reads it, and a server
+/// with no convention (the common case) simply never nudges.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectConfigConvention {
+    /// The config file the server reads from a project root (e.g.
+    /// `rust-analyzer.toml` for rust-analyzer). Checked for existence at the
+    /// served root; its absence is what arms the nudge.
+    pub file: String,
+    /// A human-readable pointer to the convention's documentation, rendered
+    /// verbatim in the nudge line (e.g. a URL or a `docs/` path). Absent ⇒ the
+    /// nudge names the file without a "see …" tail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs: Option<String>,
+}
+
 /// The per-server discipline record — the misc-157 profile table, made manifest
 /// data (diagnostics-debt 04 §"Discipline metadata as data").
 ///
@@ -838,6 +863,13 @@ pub struct DisciplineRecord {
     /// only when a rule is version-agnostic).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compress_versions: Vec<String>,
+    /// The server's project-config-file convention, for the `SessionStart` setup
+    /// nudge (misc 202). `Some` for a server that reads per-project settings from
+    /// a known file (rust-analyzer → `rust-analyzer.toml`); `None` for a server
+    /// with no such convention (the common case — it never nudges). Advisory
+    /// metadata: nothing in the diagnostics path reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_config: Option<ProjectConfigConvention>,
 }
 
 impl DisciplineRecord {
@@ -1359,6 +1391,22 @@ mod tests {
         assert_eq!(ra.discipline, Some(Discipline::Event));
         assert!(!ra.compress.is_empty(), "rust-analyzer carries strip rules");
         assert_eq!(ra.compress_versions, vec!["1.".to_owned()]);
+        // misc 202: rust-analyzer carries its project-config-file convention for
+        // the SessionStart setup nudge.
+        let convention = ra
+            .project_config
+            .as_ref()
+            .expect("rust-analyzer carries a project-config convention");
+        assert_eq!(convention.file, "rust-analyzer.toml");
+        assert!(
+            convention.docs.is_some(),
+            "the rust-analyzer convention carries a docs pointer",
+        );
+        // A server with no convention row projects None — the common case.
+        assert!(
+            manifest.discipline_for("gopls").project_config.is_none(),
+            "gopls carries no project-config convention",
+        );
 
         // gopls: PULL discipline (diagnostics-debt 05 re-enabled pull — bug 87's
         // `pullDiagnostics = false` override is retired). Still forbids

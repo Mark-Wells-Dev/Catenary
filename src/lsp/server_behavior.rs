@@ -144,6 +144,13 @@ pub struct ServerProfile {
     /// [`Self::is_scan`] / [`Self::is_diff`] together with the round context the
     /// static predicate cannot see (DESIGN §"Publisher-discipline metadata").
     discipline: Option<crate::recipes::Discipline>,
+    /// The server's project-config-file convention (misc 202), projected verbatim
+    /// from the manifest's [`crate::recipes::DisciplineRecord::project_config`].
+    /// `Some` for a server that reads per-project settings from a known file
+    /// (rust-analyzer → `rust-analyzer.toml`); `None` for a server with no
+    /// convention. Read only by the `SessionStart` setup nudge — advisory
+    /// metadata that no diagnostics seam consults.
+    project_config: Option<crate::recipes::ProjectConfigConvention>,
 }
 
 impl ServerProfile {
@@ -193,6 +200,7 @@ impl ServerProfile {
             .then_some(record.debounce_ms)
             .flatten(),
             discipline: record.discipline,
+            project_config: record.project_config.clone(),
         }
     }
 
@@ -253,6 +261,18 @@ impl ServerProfile {
     #[must_use]
     pub const fn debounce_ms(&self) -> Option<u64> {
         self.debounce_ms
+    }
+
+    /// The server's project-config-file convention, or `None` (misc 202).
+    ///
+    /// `Some` for a server that reads per-project settings from a known file
+    /// (rust-analyzer → `rust-analyzer.toml`). Read only by the `SessionStart`
+    /// setup nudge, which surfaces a one-line pointer when a served root routes
+    /// to this server and the named file is absent at the root — advisory
+    /// metadata no diagnostics seam consults.
+    #[must_use]
+    pub const fn project_config(&self) -> Option<&crate::recipes::ProjectConfigConvention> {
+        self.project_config.as_ref()
     }
 
     /// Whether the server's **verified discipline STATICALLY owes an answer** for
@@ -632,6 +652,25 @@ mod tests {
             None,
             "a debounce_ms on a non-debounce row must not project a bound",
         );
+    }
+
+    #[test]
+    fn rust_analyzer_projects_its_project_config_convention() {
+        // misc 202: the profile carries rust-analyzer's config-file convention for
+        // the SessionStart nudge; a server without one (gopls) projects None.
+        let ra = ServerProfile::for_server("rust-analyzer");
+        let convention = ra
+            .project_config()
+            .expect("rust-analyzer projects a project-config convention");
+        assert_eq!(convention.file, "rust-analyzer.toml");
+        assert!(convention.docs.is_some());
+
+        for name in ["gopls", "lattice", "clangd", "some-custom-server", "yX4Za"] {
+            assert!(
+                ServerProfile::for_server(name).project_config().is_none(),
+                "{name} carries no project-config convention",
+            );
+        }
     }
 
     #[test]

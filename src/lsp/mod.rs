@@ -17,6 +17,8 @@ pub mod lang;
 pub mod manager;
 /// Builder functions for LSP request and notification parameters.
 pub(crate) mod params;
+/// The `SessionStart` project-config setup nudge (misc 202).
+pub mod project_config;
 /// LSP message protocol definitions.
 pub mod protocol;
 /// Spawn-time rust-toolchain pin resolution (misc 176 / bug 92).

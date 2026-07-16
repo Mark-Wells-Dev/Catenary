@@ -865,6 +865,50 @@ fn record_loud_read(decision: &crate::answer_desk::Decision, session_id: &str) {
     }
 }
 
+/// The `SessionStart` project-config setup nudge owed for this hook, or `None`
+/// (misc 202).
+///
+/// Walks the session's own roots (from the `SessionStart` host payload —
+/// [`extract_session_roots`], since the `RootTracker` is not yet populated at this
+/// seam), and for the first root that both (a) is owed a nudge
+/// ([`crate::lsp::project_config::nudge_line`] — a marked project whose server has
+/// a config convention whose file is absent) and (b) has not already been nudged
+/// this daemon lifetime ([`ProjectConfigNudges`]), records the root and returns
+/// its pointer. Every later `SessionStart` on the same root returns `None` — a
+/// doorbell, not a nag. Roots are canonicalized so the ledger key matches across
+/// symlinked spellings.
+#[cfg(unix)]
+fn session_start_project_config_nudge(
+    ctx: &HookDispatchContext,
+    raw: &serde_json::Value,
+) -> Option<String> {
+    // Gate on the same announce decision the CLI uses (a `resume` restores the
+    // prior transcript, so its `SessionStart` surfaces no context). Marking a root
+    // the CLI would then drop would silently burn its one shot, so the daemon only
+    // computes+marks on an announcing source. `source` rides `host_payload`.
+    let source = raw
+        .get("host_payload")
+        .and_then(|hp| hp.get("source"))
+        .and_then(serde_json::Value::as_str);
+    if source == Some("resume") {
+        return None;
+    }
+    let config = &ctx.primary.config;
+    for root in extract_session_roots(raw) {
+        let path = Path::new(&root);
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if let Some(line) = crate::lsp::project_config::nudge_line(&canonical, config) {
+            // Mark ON FIRE: a root owed no nudge never consumes its "once", so a
+            // later run after the project gains a server still surfaces it; a root
+            // that fired is silent forever this daemon lifetime.
+            if ctx.project_config_nudges.mark(&canonical) {
+                return Some(line);
+            }
+        }
+    }
+    None
+}
+
 /// Live session board over the daemon's per-session registry.
 ///
 /// Implements [`crate::state_snapshot::SessionBoard`]: at each snapshot flush
@@ -1328,6 +1372,10 @@ struct HookDispatchContext {
     /// allow under each declared `always_read` prefix per session, so only that
     /// prompt emits the session-destination `addDirectories` promotion.
     promoted_prefixes: PromotedPrefixes,
+    /// Per-root ledger for the `SessionStart` project-config setup nudge (misc
+    /// 202). Fires the missing-config pointer once per served root per daemon
+    /// instance; a repeat `SessionStart` on the same root is silent.
+    project_config_nudges: ProjectConfigNudges,
     /// Identity→(path, metadata) registry for Catenary-created worktrees
     /// (misc 150). Registered at `worktree-create/log-payload`, rehydrated from
     /// sidecars at startup; anchors the identity-keyed `SubagentStop` reap and the
@@ -2283,6 +2331,38 @@ impl PromotedPrefixes {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(key)
+    }
+}
+
+/// Per-root ledger for the `SessionStart` project-config setup nudge (misc 202).
+///
+/// The nudge points an agent at a served root's missing language-server config
+/// file (rust-analyzer → `rust-analyzer.toml`), so its editor/receipt lint+feature
+/// surface can match its build. It fires **once per root per daemon instance** — a
+/// doorbell, not an alarm: a second `SessionStart` resolving to the same root is
+/// silent. The ledger lives for the daemon's lifetime; a restart forgets it (a
+/// bounded, acceptable one-time re-fire on the next `SessionStart`, analogous to
+/// [`FirstSightings`]). Memory is one path per nudged root.
+#[cfg(unix)]
+#[derive(Clone, Default)]
+struct ProjectConfigNudges {
+    inner: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
+}
+
+#[cfg(unix)]
+impl ProjectConfigNudges {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records `root` and returns `true` iff it was **not** already present — i.e.
+    /// this root has not been nudged this daemon lifetime, so the pointer should be
+    /// surfaced now. Every later call for the same root returns `false`.
+    fn mark(&self, root: &Path) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.to_path_buf())
     }
 }
 
@@ -3402,6 +3482,7 @@ impl SessionManager {
             ephemeral_mounts,
             first_sightings: FirstSightings::new(),
             promoted_prefixes: PromotedPrefixes::new(),
+            project_config_nudges: ProjectConfigNudges::new(),
             worktree_registry,
             worktree_mounts: WorktreeMounts::new(),
             subagents,
@@ -6884,11 +6965,39 @@ async fn handle_hook_dispatch(
         ensure_ephemeral_mounts(&ctx, &touched, Instant::now(), &session_id).await;
     }
 
+    // ── SessionStart project-config setup nudge (misc 202) ──────────────
+    //
+    // When a served root routes to a language server with a project-config-file
+    // convention (rust-analyzer → `rust-analyzer.toml`) and that file is absent,
+    // surface a one-line pointer so the agent knows its editor/receipt lint+feature
+    // surface may not match its build. Once per root per daemon instance (the
+    // `ProjectConfigNudges` ledger): a repeat `SessionStart` on the same root is
+    // silent. Computed here because the roots ride the SessionStart host payload
+    // (`workspacePaths`/`cwd`) — they are not yet in the RootTracker at this seam.
+    let session_start_nudge = if method == "session-start/clear-editing" {
+        session_start_project_config_nudge(&ctx, &raw)
+    } else {
+        None
+    };
+
     let envelope = HookResponseEnvelope {
         result: result.result,
     };
 
-    let response = if envelope.result.is_some() {
+    let response = if let Some(nudge) = session_start_nudge {
+        // The SessionStart response carries the nudge alongside any result. Its own
+        // wire shape (a `session_start_nudge` field) — the CLI folds it into the
+        // SessionStart context; a hook that never nudges keeps the plain envelope.
+        let mut obj = serde_json::to_value(&envelope)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        obj.insert(
+            "session_start_nudge".to_string(),
+            serde_json::Value::String(nudge),
+        );
+        serde_json::to_string(&serde_json::Value::Object(obj))?
+    } else if envelope.result.is_some() {
         serde_json::to_string(&envelope)?
     } else {
         String::new()
@@ -8627,6 +8736,27 @@ mod tests {
         assert!(
             ledger.see("conv-b"),
             "a different conversation is its own first sighting"
+        );
+    }
+
+    #[test]
+    fn project_config_nudges_fire_once_per_root() {
+        // misc 202: the SessionStart project-config nudge is a doorbell — a root is
+        // nudged on its first SessionStart (`mark` → `true`) and silent on every
+        // later one (`false`), while a distinct root rings its own bell once. This
+        // is the "second SessionStart same root → silent" acceptance leg.
+        let ledger = ProjectConfigNudges::new();
+        let root_a = PathBuf::from("/ws/project-a");
+        let root_b = PathBuf::from("/ws/project-b");
+        assert!(ledger.mark(&root_a), "first SessionStart on root-a nudges");
+        assert!(
+            !ledger.mark(&root_a),
+            "second SessionStart on root-a is silent"
+        );
+        assert!(!ledger.mark(&root_a), "and every later one, too");
+        assert!(
+            ledger.mark(&root_b),
+            "a different root rings its own bell once"
         );
     }
 
