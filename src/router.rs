@@ -5002,6 +5002,86 @@ fn lingering_worktree_nag(
     ))
 }
 
+/// Whether a `post-agent/require-release` dispatch is the MAIN agent's
+/// top-level `Stop` (wf-04): `hook_event_name == "Stop"` **and** no agent id on
+/// the request.
+///
+/// In Claude Code the main agent is the identity WITHOUT an `agentId` (a
+/// display label, never a key); any identity WITH one is a subagent and never
+/// draws the merged-linger nag. `SubagentStop` is excluded outright by the
+/// event-name leg.
+#[cfg(unix)]
+fn is_main_agent_stop(raw: &serde_json::Value) -> bool {
+    raw.get("host_payload")
+        .and_then(|hp| hp.get("hook_event_name"))
+        .and_then(serde_json::Value::as_str)
+        == Some("Stop")
+        && raw
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .is_empty()
+}
+
+/// The merged-linger advisory for the main agent's Stop (wf-04), or `None`
+/// when nothing qualifies.
+///
+/// Second linger oracle beside [`lingering_worktree_nag`]'s owner-dead/
+/// root-unmounted one: `git cherry` patch-equivalence
+/// ([`crate::worktree_dispose::is_squash_merged`]) — a squash landing creates
+/// no ancestry, so a landed worktree lingers until someone runs
+/// `catenary worktree rm`. Collects the session's registered worktrees
+/// satisfying ALL of: dir present, branch already squash-merged, and not yet
+/// nagged this daemon lifetime. The once-mark is the SAME `nagged` ledger the
+/// existing linger nag uses, and this runs AFTER it in the dispatch, so a
+/// worktree qualifying under both oracles draws exactly one line (the dedupe)
+/// and every worktree is nagged once per daemon lifetime regardless of oracle.
+///
+/// Advisory, never a gate: the caller rides this on the `merged_nudge`
+/// response side-channel (surfaced as a Claude `systemMessage`), and the
+/// require-release outcome — allow or block — is untouched. The oracle's
+/// amended-landing residual (patch-equivalence defeated → no line here; the
+/// worktree stays visible through the general linger surfacing) is documented
+/// on `is_squash_merged`.
+#[cfg(unix)]
+fn merged_worktree_nudge(ctx: &HookDispatchContext, session_id: &str) -> Option<String> {
+    let mut merged = Vec::new();
+    for meta in ctx.worktree_registry.metas_for_session(session_id) {
+        if !meta.worktree.exists() {
+            continue; // dir gone — nothing left to rm
+        }
+        if !crate::worktree_dispose::is_squash_merged(&meta) {
+            continue; // unmerged, amended landing, or oracle silence — no line
+        }
+        if !ctx.worktree_registry.mark_nagged(&meta.worktree) {
+            continue; // already nagged this daemon lifetime (by either oracle)
+        }
+        merged.push(meta.worktree.clone());
+    }
+    if merged.is_empty() {
+        return None;
+    }
+    Some(merged_nudge_message(&merged))
+}
+
+/// Render the merged-linger advisory line (wf-04) for the given worktrees.
+#[cfg(unix)]
+fn merged_nudge_message(merged: &[PathBuf]) -> String {
+    let list = merged
+        .iter()
+        .map(|p| format!("  {}", p.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let count = merged.len();
+    if count == 1 {
+        format!("1 worktree is already merged into main; `catenary worktree rm` it:\n{list}")
+    } else {
+        format!(
+            "{count} worktrees are already merged into main; `catenary worktree rm` them:\n{list}"
+        )
+    }
+}
+
 /// Streams a grep outcome as a chunk-frame sequence (misc 140 phase 2).
 ///
 /// One [`GrepFrame::Chunk`] per rendered hunk in global sort order, then one
@@ -6924,6 +7004,24 @@ async fn handle_hook_dispatch(
         result.result = Some(crate::hook::HookResult::Block(nag));
     }
 
+    // ── Merged-linger advisory at the main agent's Stop (wf-04) ────────
+    //
+    // The second linger oracle: `git cherry` patch-equivalence. A squash
+    // landing creates no ancestry, so a landed worktree lingers until someone
+    // runs `catenary worktree rm`; this teaches the forgotten rm. Advisory,
+    // never a gate — it rides the `merged_nudge` side-channel (a Claude
+    // `systemMessage`) and the require-release outcome is untouched, blocked
+    // or allowed. Gated to the MAIN agent (top-level Stop, no agent id): a
+    // subagent's stop never draws it. Placed AFTER the lingering nag above so
+    // a worktree qualifying under both oracles is marked by that one first and
+    // draws exactly one line (the shared once-per-worktree `nagged` ledger is
+    // the dedupe).
+    let merged_nudge = if method == "post-agent/require-release" && is_main_agent_stop(&raw) {
+        merged_worktree_nudge(&ctx, &session_id)
+    } else {
+        None
+    };
+
     // ── Held-open batch teardown: root retirement, not identity (stage 3) ──
     //
     // The identity-keyed Stop/SubagentStop document close retired with the
@@ -7044,18 +7142,25 @@ async fn handle_hook_dispatch(
         result: result.result,
     };
 
-    let response = if let Some(nudge) = session_start_nudge {
-        // The SessionStart response carries the nudge alongside any result. Its own
-        // wire shape (a `session_start_nudge` field) — the CLI folds it into the
-        // SessionStart context; a hook that never nudges keeps the plain envelope.
+    let response = if session_start_nudge.is_some() || merged_nudge.is_some() {
+        // A nudge rides alongside any result on its own wire field —
+        // `session_start_nudge` (misc 202; the CLI folds it into the
+        // SessionStart context) or `merged_nudge` (wf-04; the CLI surfaces it
+        // as a Stop-time `systemMessage`, never a gate). A hook that never
+        // nudges keeps the plain envelope.
         let mut obj = serde_json::to_value(&envelope)
             .ok()
             .and_then(|v| v.as_object().cloned())
             .unwrap_or_default();
-        obj.insert(
-            "session_start_nudge".to_string(),
-            serde_json::Value::String(nudge),
-        );
+        if let Some(nudge) = session_start_nudge {
+            obj.insert(
+                "session_start_nudge".to_string(),
+                serde_json::Value::String(nudge),
+            );
+        }
+        if let Some(nudge) = merged_nudge {
+            obj.insert("merged_nudge".to_string(), serde_json::Value::String(nudge));
+        }
         serde_json::to_string(&serde_json::Value::Object(obj))?
     } else if envelope.result.is_some() {
         serde_json::to_string(&envelope)?
@@ -10605,6 +10710,81 @@ mod tests {
         let wt = PathBuf::from("/state/catenary/worktrees/agents/s/a");
         assert!(registry.mark_nagged(&wt), "first nag marks");
         assert!(!registry.mark_nagged(&wt), "second nag is suppressed");
+    }
+
+    #[test]
+    fn merged_and_linger_oracles_share_the_once_ledger() {
+        // wf-04 dedupe: the merged-linger advisory marks the SAME `nagged`
+        // ledger as the owner-dead/root-unmounted nag, so a worktree
+        // qualifying under both oracles draws exactly one line — whichever
+        // oracle marks first wins the shot.
+        let registry = WorktreeRegistry::new();
+        let wt = PathBuf::from("/state/catenary/worktrees/agents/s/b");
+        assert!(registry.mark_nagged(&wt), "the first oracle draws the line");
+        assert!(
+            !registry.mark_nagged(&wt),
+            "the second oracle is deduped for the same worktree",
+        );
+    }
+
+    #[test]
+    fn is_main_agent_stop_requires_top_level_stop_and_no_agent_id() {
+        // wf-04: the merged-linger nag aims at the MAIN agent — in Claude Code
+        // the identity with NO agentId. A subagent (any identity WITH one)
+        // never draws it, and SubagentStop is excluded outright.
+        let main_stop = serde_json::json!({
+            "agent_id": "",
+            "host_payload": { "hook_event_name": "Stop" },
+        });
+        assert!(
+            is_main_agent_stop(&main_stop),
+            "top-level Stop, no agent id"
+        );
+
+        let subagent_identity = serde_json::json!({
+            "agent_id": "abc123",
+            "host_payload": { "hook_event_name": "Stop" },
+        });
+        assert!(
+            !is_main_agent_stop(&subagent_identity),
+            "an identity WITH an agentId gets no nag",
+        );
+
+        let subagent_stop = serde_json::json!({
+            "agent_id": "",
+            "host_payload": { "hook_event_name": "SubagentStop" },
+        });
+        assert!(!is_main_agent_stop(&subagent_stop), "SubagentStop excluded");
+
+        let absent_agent_id = serde_json::json!({
+            "host_payload": { "hook_event_name": "Stop" },
+        });
+        assert!(
+            is_main_agent_stop(&absent_agent_id),
+            "an absent agent_id field is the main identity too",
+        );
+    }
+
+    #[test]
+    fn merged_nudge_message_names_count_and_paths() {
+        let one = merged_nudge_message(&[PathBuf::from("/wt/a")]);
+        assert!(
+            one.starts_with("1 worktree is already merged into main; `catenary worktree rm` it:"),
+            "singular header: {one}"
+        );
+        assert!(one.contains("/wt/a"), "path listed: {one}");
+
+        let two = merged_nudge_message(&[PathBuf::from("/wt/a"), PathBuf::from("/wt/b")]);
+        assert!(
+            two.starts_with(
+                "2 worktrees are already merged into main; `catenary worktree rm` them:"
+            ),
+            "plural header: {two}"
+        );
+        assert!(
+            two.contains("/wt/a") && two.contains("/wt/b"),
+            "paths listed: {two}"
+        );
     }
 
     #[test]

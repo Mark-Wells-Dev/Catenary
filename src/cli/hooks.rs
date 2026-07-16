@@ -116,30 +116,59 @@ fn bridge_mismatch_line() -> Option<String> {
     Some(mismatch.message())
 }
 
-/// A one-line mention of agent worktrees lingering from previous sessions (misc
-/// 151 D-2 cross-session orphans), or `None` when there are none.
+/// The mention of agent worktrees lingering from previous sessions (misc 151
+/// D-2 cross-session orphans, split by the wf-04 merged oracle), or `None`
+/// when there are none.
 ///
 /// Scans `agents_root` for sidecars whose worktree dir still exists — a present
-/// agent worktree at session start belongs to a prior (now-dead) session. These
-/// get this passive mention plus the `catenary worktree ls` pointer, not a block
-/// (the nag is a same-session doorbell).
+/// agent worktree at session start belongs to a prior (now-dead) session. Each
+/// one is classified by the `git cherry` patch-equivalence oracle
+/// ([`crate::worktree_dispose::is_squash_merged`]) and counted in exactly ONE
+/// line (the dedupe): already squash-merged into main → the `catenary worktree
+/// rm` pointer; everything else → the generic linger mention. Passive mentions,
+/// not a block (the Stop nag is a same-session doorbell).
 #[must_use]
 fn cross_session_orphan_line(agents_root: &std::path::Path) -> Option<String> {
-    let count = crate::worktree_create::scan_sidecars(agents_root)
+    let present: Vec<_> = crate::worktree_create::scan_sidecars(agents_root)
         .into_iter()
         .filter(|meta| meta.worktree.exists())
+        .collect();
+    let merged = present
+        .iter()
+        .filter(|meta| crate::worktree_dispose::is_squash_merged(meta))
         .count();
-    if count == 0 {
-        return None;
+    orphan_lines(present.len() - merged, merged)
+}
+
+/// Render the `SessionStart` linger mention for `lingering` unmerged and
+/// `merged` already-squash-merged worktrees (wf-04) — up to two lines, `None`
+/// when both counts are zero.
+#[must_use]
+fn orphan_lines(lingering: usize, merged: usize) -> Option<String> {
+    let mut lines = Vec::new();
+    if lingering > 0 {
+        let verb = if lingering == 1 {
+            "worktree lingers"
+        } else {
+            "worktrees linger"
+        };
+        lines.push(format!(
+            "{lingering} agent {verb} from previous sessions — run `catenary worktree ls`."
+        ));
     }
-    let verb = if count == 1 {
-        "worktree lingers"
+    match merged {
+        0 => {}
+        1 => lines
+            .push("1 worktree is already merged into main; `catenary worktree rm` it.".to_string()),
+        n => lines.push(format!(
+            "{n} worktrees are already merged into main; `catenary worktree rm` them."
+        )),
+    }
+    if lines.is_empty() {
+        None
     } else {
-        "worktrees linger"
-    };
-    Some(format!(
-        "{count} agent {verb} from previous sessions — run `catenary worktree ls`."
-    ))
+        Some(lines.join("\n"))
+    }
 }
 
 /// The raw stdout body emitted by `catenary hook session-start
@@ -324,22 +353,52 @@ fn format_deny(reason: &str, format: HostFormat) -> String {
     }
 }
 
-/// Format a Stop/AfterAgent block response for the host CLI.
-fn format_stop_block(reason: &str, format: HostFormat) -> String {
+/// Format a Stop/AfterAgent response for the host CLI: a block (`reason`), the
+/// merged-linger advisory (`advisory`, wf-04), or both — `None` when there is
+/// nothing to emit.
+fn format_stop_output(
+    reason: Option<&str>,
+    advisory: Option<&str>,
+    format: HostFormat,
+) -> Option<String> {
     match format {
         // OpenCode registers only `tool.execute.before` (no Stop/AfterAgent
         // surface), so this is never emitted for OpenCode; it shares Claude's
-        // `{decision: "block", reason}` shape as a safe never-reached default.
-        HostFormat::Claude | HostFormat::OpenCode => serde_json::json!({
-            "decision": "block",
-            "reason": reason
-        })
-        .to_string(),
-        HostFormat::Antigravity => serde_json::json!({
-            "decision": "continue",
-            "reason": reason
-        })
-        .to_string(),
+        // shape as a safe never-reached default.
+        //
+        // The advisory rides `systemMessage` — a user-visible notice that
+        // never changes the Stop outcome: alone it decides nothing, and beside
+        // a block it leaves the block's `{decision, reason}` exactly as they
+        // were.
+        HostFormat::Claude | HostFormat::OpenCode => {
+            let mut obj = serde_json::Map::new();
+            if let Some(reason) = reason {
+                obj.insert(
+                    "decision".to_string(),
+                    serde_json::Value::String("block".to_string()),
+                );
+                obj.insert(
+                    "reason".to_string(),
+                    serde_json::Value::String(reason.to_string()),
+                );
+            }
+            if let Some(advisory) = advisory {
+                obj.insert(
+                    "systemMessage".to_string(),
+                    serde_json::Value::String(advisory.to_string()),
+                );
+            }
+            (!obj.is_empty()).then(|| serde_json::Value::Object(obj).to_string())
+        }
+        // Antigravity carries no `systemMessage` contract: a block renders as
+        // before; an advisory alone renders nothing.
+        HostFormat::Antigravity => reason.map(|reason| {
+            serde_json::json!({
+                "decision": "continue",
+                "reason": reason
+            })
+            .to_string()
+        }),
     }
 }
 
@@ -1154,12 +1213,41 @@ pub fn run_post_agent(format: HostFormat) {
 
     let lines = ipc_exchange(stream, &request);
 
-    if let Some(line) = lines.first()
-        && let Ok(envelope) = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
-        && let Some(crate::hook::HookResult::Block(reason)) = &envelope.result
-    {
-        print!("{}", format_stop_block(reason, format));
+    let envelope = lines
+        .first()
+        .and_then(|line| serde_json::from_str::<crate::hook::HookResponseEnvelope>(line).ok());
+    let reason = match envelope.as_ref().and_then(|e| e.result.as_ref()) {
+        Some(crate::hook::HookResult::Block(reason)) => Some(reason.as_str()),
+        _ => None,
+    };
+    // The merged-linger advisory (wf-04) rides its own response field beside
+    // the result; Claude is the only host with a `systemMessage` Stop surface.
+    let advisory = if matches!(format, HostFormat::Claude) {
+        merged_nudge_from_response(&lines)
+    } else {
+        None
+    };
+    if let Some(output) = format_stop_output(reason, advisory.as_deref(), format) {
+        print!("{output}");
     }
+}
+
+/// The `merged_nudge` advisory the daemon returned in its
+/// `post-agent/require-release` response, or `None` (wf-04).
+///
+/// The daemon emits it only for the main agent's top-level Stop, once per
+/// worktree per daemon lifetime; the CLI reads it off the first response line
+/// and renders it as a `systemMessage` — advisory, never a gate. An absent
+/// field (the common case) leaves this `None`. Mirrors
+/// [`session_start_nudge_from_response`].
+#[must_use]
+fn merged_nudge_from_response(lines: &[String]) -> Option<String> {
+    let line = lines.first()?;
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    value
+        .get("merged_nudge")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 /// The redirect-to-`catenary` teaching for a denied host `Grep`/`Glob` tool, or
@@ -3092,16 +3180,104 @@ mod tests {
         );
     }
 
-    // ── format_stop_block tests ──────────────────────────────────────
+    // ── format_stop_output tests ─────────────────────────────────────
 
     #[test]
-    fn format_stop_block_claude_structure() -> Result<()> {
-        let output = format_stop_block("files still in editing state", HostFormat::Claude);
+    fn format_stop_output_claude_block_structure() -> Result<()> {
+        let output = format_stop_output(
+            Some("files still in editing state"),
+            None,
+            HostFormat::Claude,
+        )
+        .context("a block always emits")?;
         let parsed: serde_json::Value =
             serde_json::from_str(&output).context("should produce valid JSON")?;
         assert_eq!(parsed["decision"], "block");
         assert_eq!(parsed["reason"], "files still in editing state");
+        assert!(
+            parsed.get("systemMessage").is_none(),
+            "no advisory field without an advisory",
+        );
         Ok(())
+    }
+
+    #[test]
+    fn format_stop_output_advisory_alone_is_system_message_only() -> Result<()> {
+        // wf-04: the merged-linger nudge is advisory, never a gate — no
+        // decision field, so the Stop outcome is untouched.
+        let output = format_stop_output(
+            None,
+            Some("1 worktree is already merged into main; `catenary worktree rm` it."),
+            HostFormat::Claude,
+        )
+        .context("an advisory alone emits for Claude")?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+        assert!(parsed.get("decision").is_none(), "never a gate");
+        assert!(parsed.get("reason").is_none(), "never a gate");
+        assert_eq!(
+            parsed["systemMessage"],
+            "1 worktree is already merged into main; `catenary worktree rm` it.",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn format_stop_output_block_and_advisory_combine() -> Result<()> {
+        // A block plus the advisory: the block's decision/reason are exactly
+        // as they were, the advisory rides beside them.
+        let output = format_stop_output(
+            Some("files still in editing state"),
+            Some("2 worktrees are already merged into main; `catenary worktree rm` them."),
+            HostFormat::Claude,
+        )
+        .context("both emit")?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).context("should produce valid JSON")?;
+        assert_eq!(parsed["decision"], "block");
+        assert_eq!(parsed["reason"], "files still in editing state");
+        assert_eq!(
+            parsed["systemMessage"],
+            "2 worktrees are already merged into main; `catenary worktree rm` them.",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn format_stop_output_nothing_emits_nothing() {
+        assert!(
+            format_stop_output(None, None, HostFormat::Claude).is_none(),
+            "no block, no advisory — no output",
+        );
+    }
+
+    #[test]
+    fn format_stop_output_antigravity_drops_advisory_alone() {
+        // Antigravity has no `systemMessage` Stop contract: an advisory alone
+        // renders nothing; a block renders as before.
+        assert!(format_stop_output(None, Some("advisory"), HostFormat::Antigravity).is_none());
+        let block = format_stop_output(Some("reason"), Some("advisory"), HostFormat::Antigravity)
+            .expect("a block still emits");
+        assert!(
+            block.contains("\"decision\":\"continue\""),
+            "block: {block}"
+        );
+        assert!(
+            !block.contains("advisory"),
+            "the advisory never leaks into the Antigravity shape: {block}",
+        );
+    }
+
+    #[test]
+    fn merged_nudge_from_response_reads_the_side_channel() {
+        let lines = vec![r#"{"result":{"Block":"nag"},"merged_nudge":"rm them"}"#.to_string()];
+        assert_eq!(
+            merged_nudge_from_response(&lines).as_deref(),
+            Some("rm them")
+        );
+        let plain = vec![r#"{"result":{"Block":"nag"}}"#.to_string()];
+        assert!(merged_nudge_from_response(&plain).is_none());
+        assert!(merged_nudge_from_response(&[]).is_none());
     }
 
     // ── extract_file_path tests ──────────────────────────────────────
@@ -3404,7 +3580,12 @@ mod tests {
 
     #[test]
     fn antigravity_stop_block_format() -> Result<()> {
-        let output = format_stop_block("files still in editing state", HostFormat::Antigravity);
+        let output = format_stop_output(
+            Some("files still in editing state"),
+            None,
+            HostFormat::Antigravity,
+        )
+        .context("a block always emits")?;
         let parsed: serde_json::Value =
             serde_json::from_str(&output).context("should produce valid JSON")?;
         assert_eq!(parsed["decision"], "continue");
@@ -3613,6 +3794,44 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         // No sidecars → no line.
         assert!(cross_session_orphan_line(&tmp.path().join("agents")).is_none());
+    }
+
+    #[test]
+    fn orphan_lines_split_lingering_and_merged() {
+        // wf-04: each worktree counts in exactly ONE line — merged draws the
+        // `catenary worktree rm` pointer, the rest the generic linger mention.
+        assert!(orphan_lines(0, 0).is_none(), "nothing → no lines");
+
+        let linger_only = orphan_lines(2, 0).expect("linger line");
+        assert!(
+            linger_only.contains("2 agent worktrees linger"),
+            "linger count: {linger_only}"
+        );
+        assert!(
+            !linger_only.contains("already merged"),
+            "no merged line without merged worktrees: {linger_only}"
+        );
+
+        let merged_only = orphan_lines(0, 1).expect("merged line");
+        assert!(
+            merged_only
+                .contains("1 worktree is already merged into main; `catenary worktree rm` it."),
+            "merged singular: {merged_only}"
+        );
+        assert!(
+            !merged_only.contains("linger"),
+            "no linger line without unmerged worktrees: {merged_only}"
+        );
+
+        let both = orphan_lines(1, 2).expect("both lines");
+        assert!(
+            both.contains("1 agent worktree lingers"),
+            "linger leg: {both}"
+        );
+        assert!(
+            both.contains("2 worktrees are already merged into main; `catenary worktree rm` them."),
+            "merged leg: {both}"
+        );
     }
 
     // ── session_start_context: inject/host gating carries the live payload ─

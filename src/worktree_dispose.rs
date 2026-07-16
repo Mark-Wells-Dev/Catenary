@@ -724,6 +724,62 @@ pub fn feat_ahead_behind(worktree: &Path) -> Option<(u64, u64)> {
     Some((behind, ahead))
 }
 
+/// Whether an agent worktree's branch has already been **squash-merged** into
+/// the source repo's checked-out branch — the `git cherry` patch-equivalence
+/// oracle behind the merged-linger nag (wf-04).
+///
+/// `git merge --squash` creates no ancestry, so `merge-base --is-ancestor`
+/// cannot recognize a landed branch; `git cherry <upstream> <head> <base>` can:
+/// a `-` line is a commit patch-equivalent to one in upstream, a `+` line is
+/// not. "Already merged" = at least one commit beyond the recorded base and
+/// **every** one of them patch-equivalent (all `-`).
+///
+/// Deliberate postures (this feeds an advisory nag, never a gate — silence
+/// beats noise):
+/// - **Upstream is the source repo's `HEAD`** (main in practice — the branch
+///   the lead lands onto). The sidecar records no source-branch name, and the
+///   checkout's own truth beats a naming guess.
+/// - **The branch comes from the sidecar** ([`WorktreeMeta::branch`]) — branch
+///   naming is a convention, never parsed from the path.
+/// - **No commits beyond base → `false`**: an empty `git cherry` is trivially
+///   not a landing; the owner-dead/root-unmounted linger oracle owns that
+///   worktree.
+/// - **An amended landing defeats patch-equivalence** (any `+` line →
+///   `false`): the worktree is NOT reported merged — it simply stays visible
+///   through the general linger surfacing for human judgment. An accepted
+///   residual of the oracle.
+/// - **Any git failure → `false`**: a missing branch, a detached/unreadable
+///   ref, a moved source repo, or a spawn failure all fall back to silence for
+///   that worktree.
+/// - **Non-git worktrees → `false`**: squash landing is a git-native flow.
+///
+/// There is no durable "keep this worktree" marker to honor today (the kept
+/// countdown governs a *mount's* lifetime, not the directory's intent); if one
+/// grows, this oracle should skip kept worktrees so a deliberately long-lived
+/// staging worktree stops re-drawing its once-per-daemon-lifetime nag on every
+/// daemon bounce.
+#[must_use]
+pub fn is_squash_merged(meta: &WorktreeMeta) -> bool {
+    if is_nongit(vcs_of(meta)) {
+        return false;
+    }
+    let branch = meta.branch.trim();
+    if branch.is_empty() {
+        return false;
+    }
+    let mut args = vec!["cherry", "HEAD", branch];
+    let base = meta.base_commit.trim();
+    if !base.is_empty() {
+        args.push(base); // bound the walk to the commits beyond the recorded base
+    }
+    match git(&meta.source_repo, &args) {
+        Some((true, out, _)) if !out.is_empty() => {
+            out.lines().all(|line| line.trim_start().starts_with('-'))
+        }
+        _ => false,
+    }
+}
+
 /// Whether a worktree's `created_at` is older than `max_age` as of `now`.
 ///
 /// An unparseable timestamp is treated as **not** old (never force-dispose on a
@@ -1426,5 +1482,81 @@ mod tests {
             "a local hg commit (draft beyond base) is kept: {d:?}",
         );
         assert!(worktree.exists());
+    }
+
+    // ── The squash-merge patch-equivalence oracle (wf-04) ─────────────
+
+    /// One commit of work in the worktree beyond the recorded base.
+    fn commit_work(worktree: &Path, content: &str) {
+        std::fs::write(worktree.join("w.txt"), content).expect("write work");
+        tgit(worktree, &["add", "w.txt"]);
+        tgit(worktree, &["commit", "-qm", "work"]);
+    }
+
+    #[test]
+    fn squash_landed_branch_is_merged() {
+        let (_tmp, _root, repo, worktree, meta) = fixture("agent-squash", WORKTREE_CLASS_AGENT);
+        commit_work(&worktree, "work");
+        // The lead lands it git-native: squash-merge creates NO ancestry, so
+        // only patch-equivalence can recognize the landing.
+        tgit(&repo, &["merge", "--squash", "agent-squash"]);
+        tgit(&repo, &["commit", "-qm", "land: agent-squash"]);
+        assert!(
+            is_squash_merged(&meta),
+            "a squash-landed branch is patch-equivalent to main",
+        );
+    }
+
+    #[test]
+    fn unmerged_branch_is_not_merged() {
+        let (_tmp, _root, _repo, worktree, meta) = fixture("agent-unmerged", WORKTREE_CLASS_AGENT);
+        commit_work(&worktree, "work");
+        assert!(
+            !is_squash_merged(&meta),
+            "an unlanded branch draws no merged verdict",
+        );
+    }
+
+    #[test]
+    fn amended_landing_is_not_merged() {
+        let (_tmp, _root, repo, worktree, meta) = fixture("agent-amend", WORKTREE_CLASS_AGENT);
+        commit_work(&worktree, "work");
+        // The lead amends the landing: the landed patch differs from the
+        // branch's, defeating patch-equivalence — the worktree stays visible
+        // for human judgment, never nagged as merged (the accepted residual).
+        tgit(&repo, &["merge", "--squash", "agent-amend"]);
+        std::fs::write(repo.join("w.txt"), "work, amended at landing").expect("amend");
+        tgit(&repo, &["add", "w.txt"]);
+        tgit(&repo, &["commit", "-qm", "land amended"]);
+        assert!(
+            !is_squash_merged(&meta),
+            "an amended landing defeats patch-equivalence — no merged verdict",
+        );
+    }
+
+    #[test]
+    fn branch_with_no_commits_beyond_base_is_not_merged() {
+        // An empty `git cherry` is trivially not a landing — the owner-dead
+        // linger oracle owns this worktree.
+        let (_tmp, _root, _repo, _worktree, meta) = fixture("agent-empty", WORKTREE_CLASS_AGENT);
+        assert!(!is_squash_merged(&meta), "no commits beyond base → silent");
+    }
+
+    #[test]
+    fn missing_branch_is_silently_not_merged() {
+        let (_tmp, _root, _repo, _worktree, mut meta) = fixture("agent-gone", WORKTREE_CLASS_AGENT);
+        meta.branch = "no-such-branch".to_string();
+        assert!(
+            !is_squash_merged(&meta),
+            "a git failure falls back to false"
+        );
+    }
+
+    #[test]
+    fn nongit_worktree_is_never_merged() {
+        let (_tmp, _root, _repo, _worktree, mut meta) =
+            fixture("agent-nongit", WORKTREE_CLASS_AGENT);
+        meta.vcs = crate::worktree_create::WORKTREE_VCS_SVN.to_string();
+        assert!(!is_squash_merged(&meta), "squash landing is git-native");
     }
 }
