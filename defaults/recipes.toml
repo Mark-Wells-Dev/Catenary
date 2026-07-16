@@ -255,13 +255,14 @@ draft = true
 # maintainer amendment supersedes the old "GitHub-release binaries are out of
 # recipe scope" ruling — the managed home solved placement). The linux-x86_64
 # pin below carries over that stanza's data verbatim: same release URL shape
-# (repo LuaLS/lua-language-server, tag 3.18.2, asset
-# lua-language-server-3.18.2-linux-x64.tar.gz), same sha256 (GitHub's release
-# asset digest), re-encoded hex → SRI base64. The macos-arm64 artifact is
-# PENDING attended resolution (refresh-recipes resolves it from the release
-# metadata; no hash for it exists in-repo, and a hash is never invented) — the
-# macOS conformance leg keeps its homebrew provisioning meanwhile, and a macOS
-# guided install refuses with a clear no-artifact message rather than guessing.
+# (repo LuaLS/lua-language-server, tag 3.18.2), same sha256 source for both
+# platforms (GitHub's release asset digest), re-encoded hex → SRI base64 —
+# never computed from downloaded bytes. The linux hash carried over verbatim
+# from the retired ci-provision stanza; the macos-arm64 hash resolved
+# attended 2026-07-16 from the release metadata (the linux digest re-encoding
+# to the already-shipped hash cross-validated the method). The macOS
+# conformance leg keeps its homebrew provisioning for now (matrix change is a
+# separate attended step).
 
 [recipe.lua-language-server]
 ecosystem = "binary"
@@ -269,9 +270,14 @@ package = "LuaLS/lua-language-server"
 version = "3.18.2"
 tier = "binary-sri"
 draft = true
-note = "official LuaLS release binaries, fetched direct and SRI-verified before unpack. macos-arm64 artifact pending refresh-recipes resolution — never invented; macOS falls back to nothing (refuses loudly) in the engine and rides homebrew in CI."
+note = "official LuaLS release binaries, fetched direct and SRI-verified before unpack; both platform artifacts pinned from upstream release digests."
 
 [recipe.lua-language-server.artifact.linux-x86_64]
 url = "https://github.com/LuaLS/lua-language-server/releases/download/3.18.2/lua-language-server-3.18.2-linux-x64.tar.gz"
 hash = "sha256-ynFBXdGfGeMKqjWkkVrvyp/bX+wxuYMxzD1393jVOcU="
+bin = "bin/lua-language-server"
+
+[recipe.lua-language-server.artifact.macos-arm64]
+url = "https://github.com/LuaLS/lua-language-server/releases/download/3.18.2/lua-language-server-3.18.2-darwin-arm64.tar.gz"
+hash = "sha256-zsmdcLH2EqzsShCnmgNmTjqgwinU2KWGyz+SjsN9UJ4="
 bin = "bin/lua-language-server"
