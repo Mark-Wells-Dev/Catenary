@@ -141,6 +141,16 @@ pub(crate) enum HookRequest {
         /// non-shell tools and for commands that write nothing.
         #[serde(default)]
         writes: Vec<std::path::PathBuf>,
+        /// The subset of this command's targets the hook-side lock gate NEWLY
+        /// booked into the ledger — files that were NOT already due before this
+        /// call (bug 118). The debt gate excludes exactly these when deciding,
+        /// so a write-resolving command is never denied on the very debt its
+        /// own booking created (the check-then-book invariant). A file already
+        /// due before this call is *not* here, so an executed write's next
+        /// write to the same file stays honestly gated. Empty for non-shell
+        /// tools and for commands that book nothing new.
+        #[serde(default)]
+        self_booked: Vec<std::path::PathBuf>,
     },
 
     /// Enter editing mode via CLI command (`catenary editing start`).

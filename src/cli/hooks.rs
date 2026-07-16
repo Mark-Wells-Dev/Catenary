@@ -1381,11 +1381,17 @@ fn enforce_editing_state(
     // guardrail-deny invariant); an allow (ours / foreign / uncovered) flows on
     // to the daemon editing-state transport below. Read-only tools carry no
     // edited path and take no lock — they look through the window unbounded.
-    if let Some(reason) = root_lock_gate(hook_json, tool_name, file_path, shell_cmd, format, writes)
-    {
+    //
+    // `self_booked` is the check-then-book cut (bug 118): the targets this call
+    // freshly booked, which the daemon debt gate must exclude so the command is
+    // never denied on its own booking, and which are unwound if the tool is
+    // denied downstream (deny-books-nothing).
+    let gate = root_lock_gate(hook_json, tool_name, file_path, shell_cmd, format, writes);
+    if let Some(reason) = gate.deny {
         print!("{}", format_deny(&reason, format));
         return;
     }
+    let self_booked = gate.self_booked;
 
     let Some(stream) = hook_connect(hook_json) else {
         return;
@@ -1419,6 +1425,9 @@ fn enforce_editing_state(
     if !writes.is_empty() {
         request["writes"] = serde_json::json!(writes);
     }
+    if !self_booked.is_empty() {
+        request["self_booked"] = serde_json::json!(self_booked);
+    }
     request["host_payload"] = prepare_host_payload(hook_json);
 
     let lines = ipc_exchange(stream, &request);
@@ -1427,6 +1436,11 @@ fn enforce_editing_state(
         && let Ok(envelope) = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
         && let Some(crate::hook::HookResult::Deny(reason)) = &envelope.result
     {
+        // Deny-books-nothing (bug 118): the daemon denied this tool on
+        // PRE-EXISTING debt, so the command never runs — unwind whatever this
+        // call freshly booked into the ledger. The excluded self-booked set is
+        // exactly the debt to remove; pre-existing debt is untouched.
+        crate::lock::unlink_delivered_by_root(&self_booked);
         print!("{}", format_deny(reason, format));
     }
 }
@@ -1463,6 +1477,23 @@ fn enforce_editing_state(
 ///
 /// Returns `Some(briefing)` on the first collision, else `None` (the tool flows
 /// on).
+/// The outcome of [`root_lock_gate`]: whether the tool is denied, and which
+/// targets this call NEWLY booked into the ledger.
+///
+/// `self_booked` is the check-then-book cut (bug 118): the targets this call
+/// booked that were NOT already due before it ran. `enforce_editing_state`
+/// forwards it to the daemon debt gate — which excludes it, so the command is
+/// never denied on its own fresh booking — and unwinds it if the tool is denied
+/// anyway (deny-books-nothing).
+struct LockGateOutcome {
+    /// `Some(briefing)` when the lock gate itself denies (a cross-agent
+    /// collision), else `None`.
+    deny: Option<String>,
+    /// The targets this call newly booked into the ledger (empty if it booked
+    /// nothing new).
+    self_booked: Vec<PathBuf>,
+}
+
 fn root_lock_gate(
     hook_json: &serde_json::Value,
     tool_name: &str,
@@ -1470,11 +1501,14 @@ fn root_lock_gate(
     shell_cmd: Option<&str>,
     format: HostFormat,
     writes: &[PathBuf],
-) -> Option<String> {
+) -> LockGateOutcome {
     // Static booking data — no daemon. A config that won't load fails open (for
     // BOTH tiers: a lone agent is never false-denied on an unreadable config).
     let Ok(config) = crate::config::Config::load() else {
-        return None;
+        return LockGateOutcome {
+            deny: None,
+            self_booked: Vec::new(),
+        };
     };
     let booking = crate::lock::Booking::from_config(&config);
 
@@ -1496,11 +1530,41 @@ fn root_lock_gate(
         targets.push(PathBuf::from(path));
     }
     targets.extend(writes.iter().cloned());
+
+    // Snapshot which targets were ALREADY due before this call books anything
+    // (bug 118): the complement — targets that become due only because this call
+    // books them — is the self-arm cut. Computed before the `acquire` loop so
+    // the "before" reading is honest. A booking that only re-affirms an
+    // already-due file is NOT in the cut, so an executed write's next write to
+    // the same file stays honestly gated (the honest-gate invariant).
+    let already_due: std::collections::BTreeSet<PathBuf> =
+        crate::lock::due_candidates(&targets).into_iter().collect();
+
+    let mut self_booked: Vec<PathBuf> = Vec::new();
     for target in &targets {
-        if let crate::lock::Acquired::Denied(briefing) =
-            crate::lock::acquire(target, &owner, &booking, now)
-        {
-            return Some(briefing);
+        match crate::lock::acquire(target, &owner, &booking, now) {
+            crate::lock::Acquired::Ours => {
+                // Booked (or re-affirmed / uncovered). Record it in the self-arm
+                // cut only if it was NOT already due — a fresh booking, not a
+                // re-affirm of standing debt. Canonicalize to match the ledger's
+                // spelling (`acquire` books canonically) and the daemon's
+                // subtraction (misc 193).
+                let canonical = target.canonicalize().unwrap_or_else(|_| target.clone());
+                if !already_due.contains(&canonical) {
+                    self_booked.push(canonical);
+                }
+            }
+            crate::lock::Acquired::Denied(briefing) => {
+                // Deny-books-nothing (bug 118): a collision here means the tool
+                // never runs, so unwind whatever THIS call freshly booked before
+                // the collision — the earlier targets in the loop. Pre-existing
+                // debt (not in the cut) is left untouched.
+                crate::lock::unlink_delivered_by_root(&self_booked);
+                return LockGateOutcome {
+                    deny: Some(briefing),
+                    self_booked: Vec::new(),
+                };
+            }
         }
     }
 
@@ -1521,11 +1585,20 @@ fn root_lock_gate(
             .requires_lock()
             && let Some(reason) = stateful_root_gate(cwd.as_deref(), &owner, now)
         {
-            return Some(reason);
+            // Deny-books-nothing: unwind this call's fresh bookings before the
+            // stateful-tier collision denies.
+            crate::lock::unlink_delivered_by_root(&self_booked);
+            return LockGateOutcome {
+                deny: Some(reason),
+                self_booked: Vec::new(),
+            };
         }
     }
 
-    None
+    LockGateOutcome {
+        deny: None,
+        self_booked,
+    }
 }
 
 /// Deny a stateful-tier command whose kitchen (the cwd's enclosing root) is held
