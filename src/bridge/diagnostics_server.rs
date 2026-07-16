@@ -102,6 +102,14 @@ pub struct DiagnosticsOutcome {
     pub errors: usize,
     /// Number of warning-severity (LSP severity 2) diagnostics across the batch.
     pub warnings: usize,
+    /// The canonical paths of every file this round actually diagnosed — the
+    /// fan-out's covered set plus the workspace pull's reported documents.
+    /// A directory argument expands to files *inside* the pipeline
+    /// ([`DiagnosticsServer::plan_scope`]), so the caller's named-path set does
+    /// not know them; the delivery seam unlinks this set from the debt ledger
+    /// alongside the named paths so a file served through a directory argument
+    /// is paid like one named directly (bug 120).
+    pub served: Vec<PathBuf>,
 }
 
 /// Rendering context shared by every [`FeederEntry`] from one feeder.
@@ -446,6 +454,7 @@ impl DiagnosticsServer {
                 dirty: false,
                 errors: 0,
                 warnings: 0,
+                served: Vec::new(),
             };
         }
 
@@ -1323,6 +1332,7 @@ impl DiagnosticsServer {
             dirty,
             errors,
             warnings,
+            served: canonical_paths.to_vec(),
         }
     }
 

@@ -984,6 +984,28 @@ pub fn claim_answer(
     }
 }
 
+/// The per-entry result of a delivery unlink — the forensic receipt the
+/// delivery seam traces so a leaked ledger entry names WHERE the payment went
+/// missing (bug 120).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlinkOutcome {
+    /// The touch leaf existed and was removed — the entry is paid.
+    Unlinked,
+    /// No lock root resolves for the file (foreign territory) — there is no
+    /// ledger to pay. Only produced by [`unlink_delivered_by_root`].
+    NoRoot,
+    /// The root has no lock directory at all — nothing was ever booked (or the
+    /// lock was already retired/reaped).
+    NoLedger,
+    /// The lock directory exists but holds no touch leaf for this path — the
+    /// file was served without standing debt (an on-demand scoped serve), or
+    /// the delivery spelling diverged from the booking's.
+    NoEntry,
+    /// The leaf could not be removed (an I/O error other than not-found) — the
+    /// entry survives as phantom debt.
+    Failed(std::io::ErrorKind),
+}
+
 /// Unlinks the touch files for a set of delivered files from a root's ledger
 /// under `locks_base` (delivery deletes — the daemon knows which files served).
 ///
@@ -991,13 +1013,24 @@ pub fn claim_answer(
 /// entry marks it paid; when `dir/` empties, the lock is paid and the idle
 /// countdown starts. **Does not remove the lock** — payment is parole, not
 /// release. Prunes now-empty mirrored subdirectories so `dir/` genuinely empties.
-/// Best-effort: a failed unlink is ignored (the reaper's empty check still holds).
-pub fn unlink_delivered_in(locks_base: &Path, root: &Path, files: &[PathBuf]) {
+/// Best-effort: a failed unlink never blocks the caller (the reaper's empty
+/// check still holds) — but each entry's [`UnlinkOutcome`] is returned so the
+/// delivery seam can trace exactly which entries paid, which were skipped, and
+/// which failed (bug 120). Callers with no forensic seam ignore the receipt.
+pub fn unlink_delivered_in(
+    locks_base: &Path,
+    root: &Path,
+    files: &[PathBuf],
+) -> Vec<(PathBuf, UnlinkOutcome)> {
     let lock_dir = root_lock_dir_in(locks_base, root);
     if !lock_dir.exists() {
-        return;
+        return files
+            .iter()
+            .map(|f| (f.clone(), UnlinkOutcome::NoLedger))
+            .collect();
     }
     let base = ledger_dir(&lock_dir);
+    let mut outcomes = Vec::with_capacity(files.len());
     for file in files {
         // Canonicalize the delivered file at the seam (misc 193): the touch path
         // must be computed from the same spelling `acquire_in` booked it under,
@@ -1005,7 +1038,12 @@ pub fn unlink_delivered_in(locks_base: &Path, root: &Path, files: &[PathBuf]) {
         // fail to unlink — leaving phantom debt on a canonical ledger.
         let file = file.canonicalize().unwrap_or_else(|_| file.clone());
         let touch = touch_file(&lock_dir, root, &file);
-        let _ = std::fs::remove_file(&touch);
+        let outcome = match std::fs::remove_file(&touch) {
+            Ok(()) => UnlinkOutcome::Unlinked,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => UnlinkOutcome::NoEntry,
+            Err(e) => UnlinkOutcome::Failed(e.kind()),
+        };
+        outcomes.push((file, outcome));
         // Prune now-empty mirrored parents up to (but not including) `dir/`.
         let mut cur = touch.parent().map(Path::to_path_buf);
         while let Some(dir) = cur {
@@ -1018,12 +1056,17 @@ pub fn unlink_delivered_in(locks_base: &Path, root: &Path, files: &[PathBuf]) {
             cur = dir.parent().map(Path::to_path_buf);
         }
     }
+    outcomes
 }
 
 /// Production wrapper for [`unlink_delivered_in`] resolving the base through
 /// [`locks_dir`].
-pub fn unlink_delivered(root: &Path, files: &[PathBuf]) {
-    unlink_delivered_in(&locks_dir(), root, files);
+#[allow(
+    clippy::must_use_candidate,
+    reason = "called for the unlink side effect; the outcome receipt is optional forensics (bug 120)"
+)]
+pub fn unlink_delivered(root: &Path, files: &[PathBuf]) -> Vec<(PathBuf, UnlinkOutcome)> {
+    unlink_delivered_in(&locks_dir(), root, files)
 }
 
 /// Books a set of files into `root`'s ledger under `owner`, creating the lock
@@ -1244,18 +1287,28 @@ pub fn merge_transfer(
 /// delivery seam and the worktree-land ledger prune). Each file is canonicalized
 /// inside [`unlink_delivered_in`] so a symlinked-prefix alias pays the canonical
 /// ledger it booked against (misc 193). Best-effort: a file that resolves to no
-/// root is skipped.
-pub fn unlink_delivered_by_root(files: &[PathBuf]) {
+/// root unlinks nothing and reports [`UnlinkOutcome::NoRoot`]. Returns every
+/// entry's [`UnlinkOutcome`] so the delivery seam can trace the payment
+/// per file (bug 120); callers with no forensic seam ignore the receipt.
+#[allow(
+    clippy::must_use_candidate,
+    reason = "called for the unlink side effect; the outcome receipt is optional forensics (bug 120)"
+)]
+pub fn unlink_delivered_by_root(files: &[PathBuf]) -> Vec<(PathBuf, UnlinkOutcome)> {
     use std::collections::HashMap;
     let mut by_root: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    let mut outcomes = Vec::with_capacity(files.len());
     for file in files {
         if let Some(root) = resolve_lock_root(file) {
             by_root.entry(root).or_default().push(file.clone());
+        } else {
+            outcomes.push((file.clone(), UnlinkOutcome::NoRoot));
         }
     }
     for (root, served) in &by_root {
-        unlink_delivered(root, served);
+        outcomes.extend(unlink_delivered(root, served));
     }
+    outcomes
 }
 
 /// Retires a root's lock entirely under `locks_base`: removes
@@ -1760,6 +1813,34 @@ mod tests {
         assert_eq!(due_count(&lock_dir), 0, "delivery unlinks the touch file");
         // Payment is parole — the lock survives.
         assert!(lock_dir.is_dir(), "lock is NOT removed at payment");
+    }
+
+    /// The delivery unlink's forensic receipt (bug 120): each entry names where
+    /// the payment went — `NoLedger` for an unlocked root, `Unlinked` for a
+    /// paid leaf, `NoEntry` for a serve with no standing debt.
+    #[test]
+    fn unlink_outcomes_name_where_payment_went() {
+        let fx = Fixture::new();
+        let file = fx.file("src/main.rs");
+        let owner = Owner::new("claude", "sess-a", "");
+        let locks = fx.locks();
+
+        // No lock dir yet — nothing to pay.
+        let got = unlink_delivered_in(&locks, &fx.root, std::slice::from_ref(&file));
+        assert_eq!(got, vec![(file.clone(), UnlinkOutcome::NoLedger)]);
+
+        // Booked, then delivered — the leaf pays.
+        assert!(matches!(
+            acquire_in(&locks, &file, &owner, &rust_booking(), SystemTime::now()),
+            Acquired::Ours
+        ));
+        let got = unlink_delivered_in(&locks, &fx.root, std::slice::from_ref(&file));
+        assert_eq!(got, vec![(file.clone(), UnlinkOutcome::Unlinked)]);
+
+        // Delivered again with the lock dir surviving (payment is parole): no
+        // leaf remains — the skip is reported, not silent.
+        let got = unlink_delivered_in(&locks, &fx.root, std::slice::from_ref(&file));
+        assert_eq!(got, vec![(file, UnlinkOutcome::NoEntry)]);
     }
 
     #[test]

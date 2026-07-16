@@ -2456,9 +2456,45 @@ fn ephemeral_root_to_mount(
 /// daemon's paid-idle countdown. Payment is parole, not release — the lock dir
 /// survives; only the paid-idle reaper and root retirement remove it. Files
 /// outside any repository (no lock root) unlink nothing. Best-effort throughout.
+///
+/// Every entry's [`crate::lock::UnlinkOutcome`] is traced (bug 120): the
+/// delivery unlink used to emit nothing, so a served file whose ledger entry
+/// survived delivery — phantom debt the next Stop blocks on — left no evidence
+/// of WHERE the payment went missing. Routine outcomes (paid, or served without
+/// standing debt) land at `debug!`; an actual unlink failure lands at `info!`
+/// (firehose-only — internal diagnostics never interrupt).
 #[cfg(unix)]
 fn unlink_delivered_locks(files: &[PathBuf]) {
-    crate::lock::unlink_delivered_by_root(files);
+    for (file, outcome) in crate::lock::unlink_delivered_by_root(files) {
+        match outcome {
+            crate::lock::UnlinkOutcome::Unlinked => debug!(
+                source = Source::DaemonDispatch.as_str(),
+                path = %file.display(),
+                "diagnostics delivery: ledger entry unlinked (paid)",
+            ),
+            crate::lock::UnlinkOutcome::NoRoot => debug!(
+                source = Source::DaemonDispatch.as_str(),
+                path = %file.display(),
+                "diagnostics delivery: no lock root resolves — unlink skipped",
+            ),
+            crate::lock::UnlinkOutcome::NoLedger => debug!(
+                source = Source::DaemonDispatch.as_str(),
+                path = %file.display(),
+                "diagnostics delivery: root has no lock dir — unlink skipped",
+            ),
+            crate::lock::UnlinkOutcome::NoEntry => debug!(
+                source = Source::DaemonDispatch.as_str(),
+                path = %file.display(),
+                "diagnostics delivery: no ledger entry for served file — unlink skipped",
+            ),
+            crate::lock::UnlinkOutcome::Failed(kind) => info!(
+                source = Source::DaemonDispatch.as_str(),
+                path = %file.display(),
+                cause = ?kind,
+                "diagnostics delivery: ledger unlink failed — entry survives as phantom debt (bug 120)",
+            ),
+        }
+    }
 }
 
 /// Reaps every ephemeral root idle beyond `idle` as of `now`, returning the
@@ -6547,7 +6583,7 @@ async fn handle_hook_dispatch(
         // (covered == 0). The bare-rerun contract retired (root-ownership stage
         // 3, deliverable 6): a bare run after full payment finds an empty ledger
         // and honestly answers `[no edited files]` — no debt, no fault.
-        let (dirty, output, covered, fault) = {
+        let (dirty, output, covered, fault, delivered) = {
             let covered = diag_files.len();
             if diag_files.is_empty() {
                 // Nothing due to diagnose — the honest no-debt answer (the new
@@ -6558,7 +6594,7 @@ async fn handle_hook_dispatch(
                 } else {
                     String::new()
                 };
-                (false, output, covered, None::<String>)
+                (false, output, covered, None::<String>, Vec::new())
             } else {
                 // Ephemeral mount (ticket 02): any diagnosed file outside
                 // every mounted root mounts its enclosing project root so the
@@ -6660,6 +6696,23 @@ async fn handle_hook_dispatch(
                     ),
                     Some(session_id.clone()),
                 );
+                // The delivery set (bug 120): the named paths PLUS the files the
+                // pipeline actually served. A directory argument expands to its
+                // covered files *inside* the pipeline (`plan_scope`), so those
+                // files never appear in `diag_files` — without the served set
+                // their ledger entries would survive delivery as phantom debt
+                // (the sighting: a directory-form sweep answered "10 files
+                // clean", then the Stop blocked naming one of them). Directories
+                // themselves are dropped: a directory has no ledger leaf; its
+                // expansion carries the payment.
+                let delivered: Vec<PathBuf> = diag_files
+                    .iter()
+                    .chain(outcome.served.iter())
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .filter(|p| !p.is_dir())
+                    .collect();
                 // Lead the receipt with the one-line takeover breadcrumb when
                 // this is the first serve after a `catenary claim` (root-ownership
                 // stage 3, deliverable 7), then the misc-197 followed note when
@@ -6679,7 +6732,7 @@ async fn handle_hook_dispatch(
                         format!("{CLAIMED_RECEIPT_LEAD}\n{receipt}")
                     };
                 }
-                (outcome.dirty, receipt, covered, None::<String>)
+                (outcome.dirty, receipt, covered, None::<String>, delivered)
             }
         };
 
@@ -6734,14 +6787,15 @@ async fn handle_hook_dispatch(
         // place and the gate armed — the killed-client shape recovers by
         // re-running (the next bare re-serves the still-due set, fresh).
         //
-        // The delivered set: the scoped named files, or the whole due set the
-        // bare run diagnosed. Both were already resolved into `diag_files`.
-        unlink_delivered_locks(&diag_files);
+        // The delivered set: the named files (or the whole due set the bare run
+        // diagnosed) UNION the files the pipeline actually served — a directory
+        // argument's expansion pays like a directly-named file (bug 120).
+        unlink_delivered_locks(&delivered);
         debug!(
             source = Source::DaemonDispatch.as_str(),
             session_id = %session_id,
             scoped,
-            delivered = diag_files.len(),
+            delivered = delivered.len(),
             "diagnostics: served files unlinked from the ledger (root-ownership stage 3)",
         );
 
