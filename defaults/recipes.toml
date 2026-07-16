@@ -88,10 +88,10 @@ note = "diagnostics come from shellcheck; a conformance job provisions it too."
 [recipe.yaml-language-server]
 ecosystem = "npm"
 package = "yaml-language-server"
-version = "1.23.0"
+version = "1.24.0"
 tier = "npm-tarball-sha512"
 draft = true
-hash = "sha512-3qVyCOexLCWw06PQa5kRPwvMWMZ/eZeCRWUvgD6a0OkqL/4iCnxy2WumbWifa937Uo5xhyWJ0uxlU39ljhNh7A=="
+hash = "sha512-+HGcwu4M7IC+UDhDZScTZR8qsl2MMj/X1E5e83QcWzWn2pctj0fv8HHdrHHcbc1KB3CuRPJ4gc1Nm36D0iCu0g=="
 
 # vscode-langservers-extracted ships four bundled servers (json/css/html/eslint)
 # from one package; each server gets its own recipe so the matrix runs one job
@@ -241,7 +241,7 @@ note = "hash pending: --require-hashes needs the sha256 of every artifact in the
 [recipe.gopls]
 ecosystem = "go"
 package = "golang.org/x/tools/gopls"
-version = "v0.22.0"
+version = "v0.23.0"
 tier = "go-checksumdb"
 draft = true
 
