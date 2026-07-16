@@ -250,6 +250,26 @@ const TEMPLATE: &str = r#"#:schema https://twowells.github.io/catenary/schemas/c
 # "*"                  = "{root}Internal"          # any root → its <path>Internal sibling
 # "~/Projects/homelab" = "~/.local/share/chezmoi"  # explicit, unrelated path
 
+# ── Permissions (the answer desk) ────────────────────────────────
+#
+# [permissions] governs how Catenary answers the host's read-class permission
+# prompts so an agent never parks on one ("reads nod through, writes wait"):
+# sensitive files are denied with a teaching, in-scope reads are allowed quietly,
+# and out-of-scope reads are allowed AND recorded (your morning report shows the
+# "declare it" signal). Write-class prompts are never answered — you decide.
+#
+# USER-CONFIG ONLY: a project `.catenary.toml` carrying `[permissions]` is
+# warned-and-ignored, so a public repo cannot broaden read scope or the denylist
+# for your machine. Everything below is OFF/empty by default.
+#
+# [permissions]
+# always_read = ["~/notes"]      # extra always-readable prefixes (the first read
+#                                #   promotes the tree into the session's dirs)
+# deny_paths  = ["**/vault/**"]  # extend the built-in sensitive-path denylist
+#                                #   (SSH keys, *.pem/*.key, .env*, cloud creds)
+# deny_host_grep = true          # deny the host Grep tool → use `catenary grep`
+# deny_host_glob = true          # deny the host Glob tool → use `catenary glob`
+
 # ── Tools (`catenary grep`/`glob`/`diagnostics`) ─────────────────
 #
 # Every command emits its COMPLETE output (decision 025): no line budget, no

@@ -833,17 +833,27 @@ pub fn run_worktree_remove(format: HostFormat) {
     let _ = ipc_exchange(stream, &request);
 }
 
-/// Observe a permission prompt so the daemon suspends the subagent's worktree
-/// idle expiry (`PermissionRequest` hook handler).
+/// Answer a read-class permission prompt so the agent never parks on it
+/// (`PermissionRequest` hook handler — the answer desk, misc 201 / decision 031).
 ///
-/// A **pure observer** (misc 150): it forwards `session_id` + `agent_id` +
-/// the host payload (carrying cwd) to the daemon, which marks the worktree root
-/// **enclosing the prompt's cwd** blocked for the `catenary worktree ls` display.
-/// There is no pause machinery (root-ownership 04, the answer-desk ruling): the
-/// prompt is itself hook activity that resets the kept countdown via the one hook
-/// seam, so a governed prompt keeps the mount alive without a special suspend. It
-/// returns no decision to the host: it **prints nothing on every path** and always
-/// exits `0`, so it can never interfere with the host's permission flow.
+/// Forwards `session_id` + `agent_id` + the **full** host payload (`tool_name`,
+/// `tool_input`, cwd) to the daemon, which computes the read policy (decision 031,
+/// "Reads nod through, writes wait") and — same round-trip — marks the worktree
+/// root enclosing the prompt's cwd blocked for `catenary worktree ls`. The daemon
+/// returns the decision JSON, which this prints verbatim:
+///
+/// - **Deny** (a sensitive file) with the maintainer's teaching — a deny does not
+///   park the agent; the model gets the reason and continues.
+/// - **Allow** with the resolved realpath pinned via `updatedInput` (quiet inside
+///   declared scope; loud + recorded outside; `always_read` also promotes the
+///   enclosing prefix into the session's working directories on the first allow).
+/// - **Nothing** for a write-class tool — the human decides.
+///
+/// **Fail-PASS** (the load-bearing safety rule): only Claude Code's
+/// `PermissionRequest` is answered, and only when the daemon actually returns a
+/// non-empty decision. An unreachable daemon, a non-Claude host, or an
+/// unresolvable target prints nothing — the human's prompt must stand; the desk
+/// never eats a prompt it cannot answer.
 pub fn run_permission_request(format: HostFormat) {
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         return;
@@ -851,6 +861,12 @@ pub fn run_permission_request(format: HostFormat) {
     let Ok(hook_json) = serde_json::from_str::<serde_json::Value>(&stdin_data) else {
         return;
     };
+
+    // Only Claude Code carries the answer-desk PermissionRequest surface; any
+    // other host is a no-op (nothing printed — fail PASS).
+    if !matches!(format, HostFormat::Claude) {
+        return;
+    }
 
     let Some(stream) = hook_connect(&hook_json) else {
         return;
@@ -864,10 +880,18 @@ pub fn run_permission_request(format: HostFormat) {
     if let Some(sid) = extract_session_id(&hook_json, format) {
         request["session_id"] = serde_json::json!(sid);
     }
-    request["host_payload"] = prepare_host_payload(&hook_json);
+    // The desk needs the tool_name + tool_input to classify the read, so forward
+    // the FULL raw payload (not the truncated one — a path could exceed the
+    // capture cap and mis-resolve). The blocked-marking cwd rides along with it.
+    request["host_payload"] = hook_json;
 
-    // Fire and forget — the observer never emits a decision or any stdout.
-    let _ = ipc_exchange(stream, &request);
+    // The daemon returns the decision JSON (or an empty line for "no decision").
+    // Print it verbatim; an empty line prints nothing — the human's prompt stands.
+    for line in ipc_exchange(stream, &request) {
+        if !line.trim().is_empty() {
+            print!("{line}");
+        }
+    }
 }
 
 /// Reserved no-op shim shared by every hook event registered ahead of its
@@ -1099,6 +1123,47 @@ pub fn run_post_agent(format: HostFormat) {
     }
 }
 
+/// The redirect-to-`catenary` teaching for a denied host `Grep`/`Glob` tool, or
+/// `None` when the tool is not a host search tool or its lever is off (misc 201,
+/// component 2).
+///
+/// Voice-matches the shell-side `rg`/`find` denial
+/// ([`crate::cli::command_filter`], the `Redirect` guidance opening line): "`X`
+/// isn't allowed. Use `catenary Y` instead. Works on any path (LSP enrichment
+/// only within tracked roots)." A config that won't load fails OPEN (the lever is
+/// treated as off) so a broken config never denies a search tool the user did not
+/// ask to deny.
+#[must_use]
+fn host_search_tool_denial(tool_name: &str) -> Option<String> {
+    // A host search tool at all? (Cheap check before the config load.)
+    if !matches!(tool_name, "Grep" | "Glob") {
+        return None;
+    }
+    let config = crate::config::Config::load().ok()?;
+    host_search_tool_denial_for(tool_name, &config.permissions())
+}
+
+/// Pure core of [`host_search_tool_denial`]: the redirect-to-`catenary` teaching
+/// for a denied host `Grep`/`Glob` tool given the resolved permission policy, or
+/// `None` when the tool is not a host search tool or its lever is off.
+///
+/// Split from the config-loading wrapper so the deny message and the lever
+/// polarity are unit-testable without touching the real user config.
+#[must_use]
+fn host_search_tool_denial_for(
+    tool_name: &str,
+    permissions: &crate::config::PermissionsConfig,
+) -> Option<String> {
+    let redirect = match tool_name {
+        "Grep" if permissions.deny_host_grep => "grep",
+        "Glob" if permissions.deny_host_glob => "glob",
+        _ => return None,
+    };
+    Some(format!(
+        "`{tool_name}` isn't allowed. Use `catenary {redirect}` instead. Works on any path (LSP enrichment only within tracked roots)."
+    ))
+}
+
 /// Editing state enforcement and command filtering (`PreToolUse` / `BeforeTool`
 /// hook handler).
 ///
@@ -1119,6 +1184,18 @@ pub fn run_pre_tool(format: HostFormat) {
     };
 
     let tool_name = extract_tool_name(&hook_json, format);
+
+    // ── Host Grep/Glob deny levers (misc 201, component 2) ──
+    // When `[permissions] deny_host_grep`/`deny_host_glob` is set, the host's
+    // built-in Grep/Glob tools are denied with the same redirect-to-`catenary`
+    // teaching the shell-side `rg`/`find` denial uses, so users stop carrying the
+    // denial in client settings. Today the PreToolUse hook only acts on shell and
+    // edit tools — these levers close the host-tool gap. Checked before anything
+    // else so a denied host tool never falls through to editing-state.
+    if let Some(reason) = host_search_tool_denial(tool_name) {
+        print!("{}", format_deny(&reason, format));
+        return;
+    }
 
     // ── Catenary CLI commands (regime 1: canonical-form matcher) ──
     // Recognize and classify Catenary's own subcommands in any position
@@ -2056,12 +2133,57 @@ pub fn run_post_tool(format: HostFormat) {
         if let Some(command) = extract_shell_command(&hook_json, tool_name, format) {
             reconcile_stateful_git(&hook_json, &command, format);
         }
+
+        // The secret-redaction backstop (misc 201, component 3). Scans EVERY
+        // tool's output (Read and Bash both matter; PostToolUse fires for
+        // subagents too and receives the COMPLETE output) for high-confidence
+        // secret shapes and, on a hit, emits `updatedToolOutput` with the spans
+        // replaced by a marker naming what was redacted. A clean output emits
+        // nothing — the original bytes pass through byte-identical. Claude Code
+        // only; the shape is Claude's, and no other host carries it.
+        if matches!(format, HostFormat::Claude) && redact_tool_output(&hook_json) {
+            return;
+        }
     }
     // Antigravity's JSON-in/JSON-out contract: answer the empty object. Claude /
     // OpenCode tolerate silence, so nothing is emitted for them.
     if matches!(format, HostFormat::Antigravity) {
         print!("{{}}");
     }
+}
+
+/// Scan the `PostToolUse` tool output for high-confidence secret shapes and, on a
+/// hit, print the `hookSpecificOutput.updatedToolOutput` redaction response
+/// (misc 201, component 3). Returns `true` iff something was emitted.
+///
+/// This is the ONE emission site for the redaction wire shape, so a field rename
+/// is a one-place fix. The scanned output is Claude Code's `PostToolUse`
+/// `tool_response` — a bare string, or an object/array whose string leaves are
+/// scanned and reassembled. A clean output emits nothing and returns `false`, so
+/// the untouched output passes through byte-identical (no `updatedToolOutput`).
+fn redact_tool_output(hook_json: &serde_json::Value) -> bool {
+    let Some(response) = hook_json.get("tool_response") else {
+        return false;
+    };
+    // Only the string-valued output can carry a scannable secret. A structured
+    // `tool_response` (Read returns `{file: {…}}`) is rendered to its JSON text
+    // for the scan; on a hit we replace the whole field with the redacted STRING
+    // form (the marker survives, the rest is preserved) — never dropping output.
+    let text = match response {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let Some(redacted) = crate::answer_desk::redact_secrets(&text) else {
+        return false;
+    };
+    let out = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "updatedToolOutput": redacted,
+        }
+    });
+    print!("{out}");
+    true
 }
 
 /// Run the reconcile bracket for a stateful-tier git command, if the command
@@ -3336,5 +3458,90 @@ mod tests {
             v.as_object().expect("object").is_empty(),
             "no injectSteps on the no-op path: {out}",
         );
+    }
+
+    // ── Host Grep/Glob deny levers (misc 201, component 2) ───────────────
+
+    #[test]
+    fn host_grep_glob_untouched_by_default() {
+        // Default policy — both levers off. The host tools pass through untouched
+        // (no denial), so a user who has not opted in keeps the host Grep/Glob.
+        let perms = crate::config::PermissionsConfig::default();
+        assert!(host_search_tool_denial_for("Grep", &perms).is_none());
+        assert!(host_search_tool_denial_for("Glob", &perms).is_none());
+    }
+
+    #[test]
+    fn host_grep_denied_with_redirect_teaching_when_on() {
+        let perms = crate::config::PermissionsConfig {
+            deny_host_grep: true,
+            ..Default::default()
+        };
+        let msg = host_search_tool_denial_for("Grep", &perms).expect("Grep denied");
+        assert_eq!(
+            msg,
+            "`Grep` isn't allowed. Use `catenary grep` instead. Works on any path (LSP enrichment only within tracked roots)."
+        );
+        // The glob lever is independent — Glob stays untouched.
+        assert!(host_search_tool_denial_for("Glob", &perms).is_none());
+    }
+
+    #[test]
+    fn host_glob_denied_with_redirect_teaching_when_on() {
+        let perms = crate::config::PermissionsConfig {
+            deny_host_glob: true,
+            ..Default::default()
+        };
+        let msg = host_search_tool_denial_for("Glob", &perms).expect("Glob denied");
+        assert_eq!(
+            msg,
+            "`Glob` isn't allowed. Use `catenary glob` instead. Works on any path (LSP enrichment only within tracked roots)."
+        );
+        assert!(host_search_tool_denial_for("Grep", &perms).is_none());
+    }
+
+    #[test]
+    fn host_deny_lever_ignores_non_search_tools() {
+        let perms = crate::config::PermissionsConfig {
+            deny_host_grep: true,
+            deny_host_glob: true,
+            ..Default::default()
+        };
+        // Read/Write/Bash are never host search tools — the lever never touches them.
+        assert!(host_search_tool_denial_for("Read", &perms).is_none());
+        assert!(host_search_tool_denial_for("Write", &perms).is_none());
+        assert!(host_search_tool_denial_for("Bash", &perms).is_none());
+    }
+
+    // ── PostToolUse redaction backstop (misc 201, component 3) ───────────
+
+    #[test]
+    fn redact_tool_output_clean_output_emits_nothing() {
+        // A clean tool_response: no hit, no emission — the output passes through
+        // byte-identical (no updatedToolOutput at all).
+        let payload = serde_json::json!({
+            "tool_name": "Read",
+            "tool_response": "fn main() { println!(\"hello\"); }",
+        });
+        assert!(!redact_tool_output(&payload));
+    }
+
+    #[test]
+    fn redact_tool_output_string_response_redacts_secret() {
+        let payload = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_response": "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+        });
+        // A live pin against a real Claude Code session is the follow-up (the
+        // exact updatedToolOutput field name is docs-level evidence); here we
+        // assert the emission fires on a hit.
+        assert!(redact_tool_output(&payload));
+    }
+
+    #[test]
+    fn redact_tool_output_absent_response_emits_nothing() {
+        // No tool_response field — nothing to scan, nothing emitted.
+        let payload = serde_json::json!({ "tool_name": "Read" });
+        assert!(!redact_tool_output(&payload));
     }
 }

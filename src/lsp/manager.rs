@@ -3612,6 +3612,7 @@ mod tests {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         }
@@ -3689,6 +3690,7 @@ mod tests {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })
@@ -3733,6 +3735,7 @@ mod tests {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         });
@@ -3770,6 +3773,7 @@ mod tests {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })
@@ -3816,6 +3820,7 @@ mod tests {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })
@@ -3862,6 +3867,7 @@ mod tests {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })
@@ -3911,6 +3917,7 @@ mod tests {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })
@@ -4176,6 +4183,7 @@ mod tests {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         });
@@ -4669,6 +4677,7 @@ mod tests {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         });
@@ -5174,6 +5183,7 @@ mod tests {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         });
@@ -5234,6 +5244,7 @@ mod tests {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         });
@@ -5293,6 +5304,7 @@ mod tests {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         });
@@ -5717,6 +5729,7 @@ mod tests {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         });
@@ -7275,6 +7288,7 @@ mod tests {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })
@@ -7316,6 +7330,7 @@ mod tests {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })
@@ -8136,6 +8151,7 @@ mod tests {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })
@@ -8635,6 +8651,7 @@ mod tests {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })
@@ -8673,6 +8690,7 @@ mod tests {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })

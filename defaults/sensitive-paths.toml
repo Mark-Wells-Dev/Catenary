@@ -1,0 +1,63 @@
+# Built-in tier-0 sensitive-path denylist (misc 201, the answer desk).
+#
+# The lean set of paths whose CONTENTS must stay out of an agent's context: SSH
+# private keys, PEM/key material, `.env`-class secrets files, and cloud
+# credential files. The answer desk (`catenary hook permission-request`) denies a
+# read-class prompt whose resolved realpath matches any entry here with a
+# teaching message (keep the bytes out of context; move them with file-level ops;
+# secrets are redacted by the PostToolUse backstop). A deny is a teaching, not a
+# park — the model gets the reason and continues.
+#
+# This corpus is deliberately LEAN. A false positive costs a needless deny on a
+# harmless file, so entries name only unambiguous secret shapes. The user extends
+# it via `[permissions] deny_paths` in the user config (never a project
+# `.catenary.toml` — a public repo cannot broaden the denylist for a private
+# machine).
+#
+# Each `patterns` entry is a glob matched against BOTH the file's basename and
+# the file path with `~`/`$HOME` collapsed to `~`, so `~/.ssh/id_ed25519`, an
+# absolute `/home/me/.ssh/id_ed25519`, and a bare `id_ed25519` all match. Globs
+# are gitignore-style: `*` does not cross `/`, `**` does. Matching is on the
+# CANONICAL realpath, so a symlinked-prefix alias gets the same verdict as the
+# canonical spelling (the path-spelling rule).
+
+[deny]
+patterns = [
+    # ── SSH private keys ──────────────────────────────────────────────
+    "**/.ssh/id_*",         # id_rsa, id_ed25519, id_ecdsa, id_dsa (public .pub excluded below)
+    "**/.ssh/*_rsa",
+    "**/.ssh/*_ed25519",
+    "**/.ssh/*_ecdsa",
+    "**/.ssh/*_dsa",
+    "**/.ssh/identity",
+
+    # ── PEM / key material ────────────────────────────────────────────
+    "**/*.pem",
+    "**/*.key",
+    "**/*.p12",
+    "**/*.pfx",
+    "**/*.keystore",
+
+    # ── .env-class secrets files ──────────────────────────────────────
+    ".env",
+    ".env.*",
+    "**/.env",
+    "**/.env.*",
+
+    # ── Cloud credential files ────────────────────────────────────────
+    "**/.aws/credentials",
+    "**/.config/gcloud/**/*.json",
+    "**/.kube/config",
+    "**/.docker/config.json",
+    "**/.netrc",
+    "**/.npmrc",
+    "**/.pypirc",
+]
+
+# Basenames that are secret shapes but whose EXTENSION would otherwise read as
+# ordinary (a `.pub` is public — never denied). Anti-patterns win over a
+# `patterns` match, so `~/.ssh/id_ed25519.pub` is allowed while
+# `~/.ssh/id_ed25519` is denied.
+allow_overrides = [
+    "**/*.pub",
+]

@@ -16,8 +16,8 @@ use crate::logging::reaper::ReapPolicy;
 
 use super::commands::{self, CommandsConfig};
 use super::{
-    Config, IconConfig, LanguageConfig, LinterConfig, NotificationConfig, RegistryConfig,
-    RootsConfig, ServerBinding, ServerDef, ToolsConfig, default_log_retention_days,
+    Config, IconConfig, LanguageConfig, LinterConfig, NotificationConfig, PermissionsConfig,
+    RegistryConfig, RootsConfig, ServerBinding, ServerDef, ToolsConfig, default_log_retention_days,
 };
 
 /// Embedded default classification config (lowest-priority layer).
@@ -79,6 +79,9 @@ pub(super) struct RawConfig {
 
     #[serde(default)]
     registry: Option<RegistryConfig>,
+
+    #[serde(default)]
+    permissions: Option<PermissionsConfig>,
 
     #[serde(default)]
     linter: RawLinterSection,
@@ -616,6 +619,9 @@ fn merge(config: &mut Config, other: RawConfig) {
     }
     if other.registry.is_some() {
         config.registry = other.registry;
+    }
+    if other.permissions.is_some() {
+        config.permissions = other.permissions;
     }
     for (key, value) in other.linter.rule {
         config.linter.insert(key, value);
@@ -1330,6 +1336,30 @@ servers = []
 
         // Should succeed (warnings only, not errors) but the unsupported
         // sections are warned about. We verify it loads without error.
+        let result = load_project_config(dir.path())?;
+        assert!(result.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn project_permissions_section_is_warned_and_ignored() -> Result<()> {
+        // `[permissions]` is user-config-only (misc 201, mirroring `[roots]`): a
+        // project `.catenary.toml` carrying it must warn-and-ignore, never adopt
+        // it — a public repo cannot broaden read scope or the denylist for a
+        // private machine. `[permissions]` is absent from
+        // `PROJECT_CONFIG_ALLOWED_KEYS`, so the unsupported-key warning fires and
+        // `ProjectConfig` (which has no permissions field) drops it structurally.
+        assert!(!PROJECT_CONFIG_ALLOWED_KEYS.contains(&"permissions"));
+
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "[permissions]\ndeny_host_grep = true\nalways_read = [\"/etc\"]\n",
+        )?;
+
+        // Loads without error (warn-only); the project config carries no
+        // permission policy — the section never reaches enforcement.
         let result = load_project_config(dir.path())?;
         assert!(result.is_some());
 

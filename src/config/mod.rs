@@ -102,6 +102,67 @@ pub struct RootsConfig {
     pub pinned: Vec<String>,
 }
 
+/// Answer-desk permission policy (`[permissions]`, misc 201).
+///
+/// User-level only — homes the answer desk's config levers (decision 031,
+/// "Reads nod through, writes wait"). A project `.catenary.toml` carrying
+/// `[permissions]` is warned-and-ignored (it is not in
+/// [`crate::config::parse::PROJECT_CONFIG_ALLOWED_KEYS`]), mirroring the
+/// `[roots]` user-config-only precedent so a public repo cannot broaden read
+/// scope or the sensitive-path denylist for a private machine.
+///
+/// # Examples
+///
+/// ```toml
+/// [permissions]
+/// always_read = ["~/notes", "/srv/shared-docs"]
+/// deny_paths = ["**/vault/**"]
+/// deny_host_grep = true
+/// deny_host_glob = true
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct PermissionsConfig {
+    /// Additional declared-readable prefixes (`[permissions] always_read`).
+    ///
+    /// Each entry joins the answer desk's declared read scope (alongside the
+    /// session's workspace roots, the agents-worktree base, and companion
+    /// repos). A read under one of these is a quiet allow, and the FIRST such
+    /// allow promotes the enclosing prefix into the session's working
+    /// directories (session destination only — never persistent client state).
+    /// `~`/`$VAR` expand at the ingestion seam.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub always_read: Vec<String>,
+
+    /// User extensions to the tier-0 sensitive-path denylist
+    /// (`[permissions] deny_paths`).
+    ///
+    /// Unioned with the built-in defaults
+    /// ([`crate::answer_desk::DEFAULT_SENSITIVE_PATHS`]). Each entry is a
+    /// gitignore-style glob matched against the resolved realpath and its
+    /// basename; a match makes the read a sensitive deny (the teaching, not a
+    /// park).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_paths: Vec<String>,
+
+    /// Deny the host `Grep` tool, redirecting to `catenary grep`
+    /// (`[permissions] deny_host_grep`, default `false`).
+    ///
+    /// When set, the `PreToolUse` hook denies the host's built-in `Grep` tool
+    /// with the same deny-with-teaching voice the shell-side `rg` denial uses,
+    /// so users stop carrying the denial in client settings.
+    #[serde(default)]
+    pub deny_host_grep: bool,
+
+    /// Deny the host `Glob` tool, redirecting to `catenary glob`
+    /// (`[permissions] deny_host_glob`, default `false`).
+    ///
+    /// When set, the `PreToolUse` hook denies the host's built-in `Glob` tool
+    /// with the same deny-with-teaching voice the shell-side `find` denial uses.
+    #[serde(default)]
+    pub deny_host_glob: bool,
+}
+
 /// External signed-registry configuration (`[registry]`, tui-rework 08).
 ///
 /// Controls the signed-registry loader ([`crate::registry`]): whether the daemon
@@ -210,6 +271,12 @@ pub struct Config {
     /// `None` when no source specified `[registry]` (⇒ seed-only, the shipped
     /// default). Drives the [`crate::registry`] loader; user-config only.
     pub registry: Option<RegistryConfig>,
+
+    /// Answer-desk permission policy (`[permissions]`, misc 201).
+    ///
+    /// `None` when no source specified `[permissions]`. User-config only; read
+    /// via [`Config::permissions`].
+    pub permissions: Option<PermissionsConfig>,
 
     /// Standalone-linter definitions keyed by linter name (`[linter.rule.*]`).
     ///
@@ -480,6 +547,16 @@ impl Config {
             .as_ref()
             .map_or(&[], |roots| roots.pinned.as_slice())
     }
+
+    /// Returns the answer-desk permission policy (`[permissions]`, misc 201).
+    ///
+    /// The owned default (empty scope, empty denylist extension, both host-tool
+    /// levers off) when no source specified `[permissions]`, so the answer desk
+    /// always has a policy to read.
+    #[must_use]
+    pub fn permissions(&self) -> PermissionsConfig {
+        self.permissions.clone().unwrap_or_default()
+    }
 }
 
 impl Default for Config {
@@ -495,6 +572,7 @@ impl Default for Config {
             observability: None,
             roots: None,
             registry: None,
+            permissions: None,
             linter: HashMap::new(),
             quarantined: quarantine::Quarantine::new(),
         }
@@ -1601,6 +1679,55 @@ command = "rust-analyzer"
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         fs::write(&path, "[roots]\nbogus = true\n").expect("write");
+
+        assert!(Config::load_from_sources(&[path]).is_err());
+    }
+
+    #[test]
+    fn permissions_absent_is_default_off() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "")?;
+
+        let config = Config::load_from_sources(&[path])?;
+        assert!(config.permissions.is_none());
+        let perms = config.permissions();
+        assert!(perms.always_read.is_empty());
+        assert!(perms.deny_paths.is_empty());
+        assert!(!perms.deny_host_grep);
+        assert!(!perms.deny_host_glob);
+
+        Ok(())
+    }
+
+    #[test]
+    fn permissions_parses_all_keys_from_user_config() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[permissions]\n\
+             always_read = [\"~/notes\", \"/srv/shared\"]\n\
+             deny_paths = [\"**/vault/**\"]\n\
+             deny_host_grep = true\n\
+             deny_host_glob = true\n",
+        )?;
+
+        let config = Config::load_from_sources(&[path])?;
+        let perms = config.permissions();
+        assert_eq!(perms.always_read, vec!["~/notes", "/srv/shared"]);
+        assert_eq!(perms.deny_paths, vec!["**/vault/**"]);
+        assert!(perms.deny_host_grep);
+        assert!(perms.deny_host_glob);
+
+        Ok(())
+    }
+
+    #[test]
+    fn permissions_rejects_unknown_field() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[permissions]\nbogus = true\n").expect("write");
 
         assert!(Config::load_from_sources(&[path]).is_err());
     }
