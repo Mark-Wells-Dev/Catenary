@@ -630,6 +630,215 @@ fn reconcile_bracket_checkout_unbooks_reverted_file() -> Result<()> {
     Ok(())
 }
 
+// ── The merge bracket: unpaid worktree debt transfers, nothing else (wf-01) ──
+
+/// Init a real git repo at `dir` with a committed `src/lib.rs`.
+fn init_owning_repo(dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    git(dir, &["init", "-q"])?;
+    git(dir, &["config", "user.email", "t@t"])?;
+    git(dir, &["config", "user.name", "t"])?;
+    std::fs::create_dir_all(dir.join("src"))?;
+    std::fs::write(dir.join("src/lib.rs"), "fn base() {}\n")?;
+    git(dir, &["add", "."])?;
+    git(dir, &["commit", "-qm", "init"])?;
+    Ok(())
+}
+
+/// The due set of `ledger_root` under the isolated locks base keyed by `root`.
+fn due_in(root: &str, ledger_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let locks_base = xdg_state_home(root).join("locks");
+    let canonical = ledger_root
+        .canonicalize()
+        .unwrap_or_else(|_| ledger_root.to_path_buf());
+    catenary_cli::lock::due_files_in(&locks_base, &canonical)
+}
+
+/// The primary wf-01 acceptance matrix, driven by REAL git and the real hook
+/// binary: a lead squash-merges an agent worktree's branch. The worker left
+/// `a.rs` PAID, `b.rs` unpaid-and-committed, `c.rs` unpaid-and-uncommitted.
+/// Exactly `b.rs` — unpaid AND merged — transfers into the owning ledger; the
+/// paid file and the never-merged file book nothing; the worktree's own ledger
+/// is untouched.
+#[test]
+fn merge_bracket_squash_transfers_unpaid_worktree_debt_only() -> Result<()> {
+    if which_git().is_none() {
+        eprintln!("merge_bracket_squash: skipping — git not on PATH");
+        return Ok(());
+    }
+    let tmp = tempfile::tempdir()?;
+    let repo = tmp.path().join("repo");
+    init_owning_repo(&repo)?;
+    let root = repo.to_str().context("repo path utf-8")?;
+
+    // The agent worktree, on branch `topic`.
+    let wt = tmp.path().join("repo-wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "topic",
+            wt.to_str().context("wt path utf-8")?,
+        ],
+    )?;
+
+    // The worker edits three covered files; the edit hook books each into the
+    // WORKTREE root's ledger.
+    for rel in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+        let f = wt.join(rel);
+        std::fs::write(&f, "fn w() {}\n")?;
+        let out = run_edit_hook(root, "worker", f.to_str().context("file path utf-8")?)?;
+        assert!(
+            deny_reason(&out).is_none(),
+            "the worker's edit must be admitted, got: {out}"
+        );
+    }
+    let wt_canon = wt.canonicalize()?;
+    assert_eq!(due_in(root, &wt).len(), 3, "three worker edits booked");
+
+    // The worker PAYS a.rs (diagnosed and delivered) before the landing.
+    let locks_base = xdg_state_home(root).join("locks");
+    catenary_cli::lock::unlink_delivered_in(&locks_base, &wt_canon, &[wt_canon.join("src/a.rs")]);
+
+    // a.rs and b.rs are committed — they merge; c.rs stays uncommitted — a
+    // squash merge never carries it.
+    git(&wt, &["add", "src/a.rs", "src/b.rs"])?;
+    git(&wt, &["commit", "-qm", "work"])?;
+
+    // The lead squash-merges the worktree branch; the bracket reconciles.
+    git(&repo, &["merge", "--squash", "topic"])?;
+    run_post_tool_hook(root, "lead", "git merge --squash topic")?;
+
+    let repo_canon = repo.canonicalize()?;
+    assert_eq!(
+        due_in(root, &repo),
+        vec![repo_canon.join("src/b.rs")],
+        "exactly the unpaid-and-merged file transfers: the paid file books \
+         nothing, the never-merged file books nothing"
+    );
+    assert_eq!(
+        due_in(root, &wt),
+        vec![wt_canon.join("src/b.rs"), wt_canon.join("src/c.rs")],
+        "the worktree's own ledger is untouched by the transfer"
+    );
+    Ok(())
+}
+
+/// A COMPLETED (fast-forward) merge of a worktree branch — `HEAD` moves, the
+/// status oracle goes clean — still transfers the unpaid debt: the committed
+/// leg of the merged-set oracle (`ORIG_HEAD..HEAD`) carries it.
+#[test]
+fn merge_bracket_full_merge_transfers_committed_unpaid_debt() -> Result<()> {
+    if which_git().is_none() {
+        eprintln!("merge_bracket_full_merge: skipping — git not on PATH");
+        return Ok(());
+    }
+    let tmp = tempfile::tempdir()?;
+    let repo = tmp.path().join("repo");
+    init_owning_repo(&repo)?;
+    let root = repo.to_str().context("repo path utf-8")?;
+
+    let wt = tmp.path().join("repo-wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "topic",
+            wt.to_str().context("wt path utf-8")?,
+        ],
+    )?;
+
+    // One unpaid covered edit, committed in the worktree.
+    let f = wt.join("src/b.rs");
+    std::fs::write(&f, "fn w() {}\n")?;
+    run_edit_hook(root, "worker", f.to_str().context("file path utf-8")?)?;
+    git(&wt, &["add", "src/b.rs"])?;
+    git(&wt, &["commit", "-qm", "work"])?;
+
+    // A full merge in the owning repo fast-forwards and commits: the working
+    // tree ends clean, so only the ORIG_HEAD..HEAD leg can see what merged.
+    git(&repo, &["merge", "-q", "topic"])?;
+    run_post_tool_hook(root, "lead", "git merge topic")?;
+
+    let repo_canon = repo.canonicalize()?;
+    assert_eq!(
+        due_in(root, &repo),
+        vec![repo_canon.join("src/b.rs")],
+        "a completed full merge still transfers the unpaid worktree debt"
+    );
+    Ok(())
+}
+
+/// Pull-parity: a merge whose source is NOT an agent worktree books NOTHING —
+/// even with covered files staged by the merge, and even while an unrelated
+/// agent worktree holds unpaid debt. The stage-5 Book-on-merge over-booking is
+/// retired: debt means "an agent edited this and nobody has looked," not
+/// "content moved."
+#[test]
+fn merge_bracket_plain_merge_books_nothing() -> Result<()> {
+    if which_git().is_none() {
+        eprintln!("merge_bracket_plain_merge: skipping — git not on PATH");
+        return Ok(());
+    }
+    let tmp = tempfile::tempdir()?;
+    let repo = tmp.path().join("repo");
+    init_owning_repo(&repo)?;
+    let root = repo.to_str().context("repo path utf-8")?;
+
+    // An agent worktree with UNPAID debt exists — but its branch is not what
+    // merges, so the per-ref match (not a no-worktrees shortcut) must decline.
+    let wt = tmp.path().join("repo-wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "topic",
+            wt.to_str().context("wt path utf-8")?,
+        ],
+    )?;
+    let unrelated = wt.join("src/unrelated.rs");
+    std::fs::write(&unrelated, "fn w() {}\n")?;
+    run_edit_hook(
+        root,
+        "worker",
+        unrelated.to_str().context("file path utf-8")?,
+    )?;
+
+    // An upstream-ish branch made in the owning repo itself (no worktree).
+    git(&repo, &["checkout", "-qb", "upstream"])?;
+    std::fs::write(repo.join("src/u.rs"), "fn u() {}\n")?;
+    git(&repo, &["add", "src/u.rs"])?;
+    git(&repo, &["commit", "-qm", "upstream work"])?;
+    git(&repo, &["checkout", "-q", "-"])?;
+
+    // The squash merge stages a covered `.rs` file — exactly the shape the old
+    // bracket over-booked at a real landing.
+    git(&repo, &["merge", "--squash", "upstream"])?;
+    run_post_tool_hook(root, "lead", "git merge --squash upstream")?;
+
+    assert_eq!(
+        due_in(root, &repo),
+        Vec::<std::path::PathBuf>::new(),
+        "a plain upstream merge books nothing (pull-parity)"
+    );
+    let wt_canon = wt.canonicalize()?;
+    assert_eq!(
+        due_in(root, &wt),
+        vec![wt_canon.join("src/unrelated.rs")],
+        "the unrelated worktree's own unpaid debt is untouched"
+    );
+    Ok(())
+}
+
 /// Whether `git` resolves on the current PATH (the reconcile bracket needs it).
 fn which_git() -> Option<()> {
     Command::new("git")

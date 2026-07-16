@@ -225,7 +225,34 @@ fn command_is_stateful_recursive(
         .any(|sub| script_has_stateful(sub, rules, cwd))
 }
 
-/// The reconcile direction of a stateful-tier git command line, or `None` when
+/// What the reconcile bracket does after a stateful-tier git command
+/// (root-ownership stage 5; the merge arm narrowed by wf-01).
+///
+/// Most reconciling git commands drive the status-oracle ledger reconcile in a
+/// [`ReconcileDirection`]. `git merge` is different in kind: debt means "an
+/// agent edited this and nobody has looked," not "content moved" (the
+/// pull-parity ruling), so a merge books nothing by itself — it only TRANSFERS
+/// still-unpaid debt from a merged-from agent worktree's ledger into the owning
+/// root's ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconcileAction {
+    /// Reconcile the cwd root's ledger against the `git status --porcelain`
+    /// oracle in the given direction (`stash`/`checkout`/`rebase`, and
+    /// `merge --abort` — the abort restores the pre-merge tree, so entries a
+    /// transfer booked for the aborted merge go clean and unbook with it).
+    Ledger(ReconcileDirection),
+    /// A `git merge`: the worktree-debt transfer bracket (wf-01). `sources`
+    /// are the merge's non-flag operands — the candidate merged-from refs.
+    /// Every merge whose source is NOT an agent worktree root books nothing
+    /// (pull-parity); an operand-less form (`--continue`/`--quit`) carries an
+    /// empty `sources` and transfers nothing.
+    MergeTransfer {
+        /// The merged-from refs named on the command line.
+        sources: Vec<String>,
+    },
+}
+
+/// The reconcile action of a stateful-tier git command line, or `None` when
 /// the line drives no reconcile (not a git command, a non-reconciling git
 /// subcommand like `commit`, or an unrecognized shape).
 ///
@@ -235,48 +262,107 @@ fn command_is_stateful_recursive(
 /// isolation/allowlist gates for other reasons in practice) never needs two
 /// reconciles. `stash` bifurcates: `stash pop` / `stash apply` book (they
 /// restore modifications), bare `stash` / `stash push` unbook (they remove
-/// them).
+/// them). `merge` classifies as [`ReconcileAction::MergeTransfer`] — the
+/// unconditional Book-on-merge retired with wf-01 (a `git pull` never booked
+/// debt; a merge must not either).
 #[must_use]
-pub fn git_reconcile_direction(command: &str) -> Option<ReconcileDirection> {
+pub fn git_reconcile_action(command: &str) -> Option<ReconcileAction> {
     let script = parse::parse(command);
     for pipeline in &script.pipelines {
         for cmd in &pipeline.commands {
             if cmd.name.as_deref() != Some("git") {
                 continue;
             }
-            if let Some(dir) = git_subcommand_direction(&cmd.argv) {
-                return Some(dir);
+            if let Some(action) = git_subcommand_action(&cmd.argv) {
+                return Some(action);
             }
         }
     }
     None
 }
 
-/// Classify a `git` argv's reconcile direction by its subcommand and, for
-/// `stash`, its operand.
-fn git_subcommand_direction(argv: &[String]) -> Option<ReconcileDirection> {
+/// Classify a `git` argv's reconcile action by its subcommand and, for
+/// `stash`/`merge`, its operands.
+fn git_subcommand_action(argv: &[String]) -> Option<ReconcileAction> {
     let (sub, rest_start) = git_subcommand(argv)?;
     match sub.as_str() {
         // Working-tree movers that REMOVE modifications: files that go clean are
         // unbooked. `checkout` here is the pathspec/undo restore (a covered file
         // reverted to its committed bytes leaves the gate); a branch switch moves
         // nothing dirty, so the reconcile simply finds nothing newly clean.
-        "checkout" => Some(ReconcileDirection::Unbook),
+        "checkout" => Some(ReconcileAction::Ledger(ReconcileDirection::Unbook)),
         // `stash` bifurcates on its operand: pop/apply RESTORE modifications
         // (book), bare stash / push / save REMOVE them (unbook). The operand is
         // the first non-flag token after `stash`.
         "stash" => {
             let operand = argv[rest_start..].iter().find(|a| !a.starts_with('-'));
-            Some(match operand.map(String::as_str) {
+            Some(ReconcileAction::Ledger(match operand.map(String::as_str) {
                 Some("pop" | "apply") => ReconcileDirection::Book,
                 _ => ReconcileDirection::Unbook,
+            }))
+        }
+        // `rebase` replays the agent's OWN commits, so the status-oracle Book
+        // leg stands: a completed rebase leaves the tree clean (books nothing);
+        // an interrupted one leaves the agent's restored modifications due.
+        "rebase" => Some(ReconcileAction::Ledger(ReconcileDirection::Book)),
+        // `merge` transfers unpaid worktree debt only (wf-01). `--abort`
+        // restores the pre-merge tree, so it reconciles like a stash: due files
+        // git now reports clean — including entries the merge's transfer just
+        // booked — unbook.
+        "merge" => {
+            let rest = &argv[rest_start..];
+            if rest.iter().any(|a| a == "--abort") {
+                return Some(ReconcileAction::Ledger(ReconcileDirection::Unbook));
+            }
+            Some(ReconcileAction::MergeTransfer {
+                sources: merge_source_operands(rest),
             })
         }
-        // Content-introducing movers: every covered file left modified is booked.
-        "merge" | "rebase" => Some(ReconcileDirection::Book),
         // `commit` and every other git subcommand drive no reconcile.
         _ => None,
     }
+}
+
+/// The merged-from refs named on a `git merge` argv tail — its non-flag
+/// operands, with the values of value-carrying merge options stepped over.
+///
+/// `git merge -m "msg" topic` must yield `topic`, not the message: the listed
+/// separated-value options (`-m`, `-F`, `-s`, `-X` and their long forms)
+/// consume the following token. A `--opt=value` form carries its own value and
+/// is skipped as a flag. Everything after a literal `--` is operands (merge
+/// takes no pathspec, so the tail is refs). An unlisted value-carrying option
+/// mis-reads its value as a ref — the safe direction: a bogus ref resolves to
+/// no worktree and transfers nothing.
+fn merge_source_operands(rest: &[String]) -> Vec<String> {
+    /// Merge options whose value rides in the FOLLOWING token.
+    const VALUE_FLAGS: &[&str] = &[
+        "-m",
+        "--message",
+        "-F",
+        "--file",
+        "-s",
+        "--strategy",
+        "-X",
+        "--strategy-option",
+        "--cleanup",
+        "--into-name",
+    ];
+    let mut sources = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        if a == "--" {
+            sources.extend(rest[i + 1..].iter().cloned());
+            break;
+        }
+        if a.starts_with('-') {
+            i += if VALUE_FLAGS.contains(&a) { 2 } else { 1 };
+            continue;
+        }
+        sources.push(a.to_string());
+        i += 1;
+    }
+    sources
 }
 
 #[cfg(test)]
@@ -366,12 +452,12 @@ mod tests {
         // `git -c key=val stash pop` still reads as a pop (book), not confused by
         // the config value operand.
         assert_eq!(
-            git_reconcile_direction("git -c gc.auto=0 stash pop"),
-            Some(ReconcileDirection::Book)
+            git_reconcile_action("git -c gc.auto=0 stash pop"),
+            Some(ReconcileAction::Ledger(ReconcileDirection::Book))
         );
         assert_eq!(
-            git_reconcile_direction("git -c gc.auto=0 stash"),
-            Some(ReconcileDirection::Unbook)
+            git_reconcile_action("git -c gc.auto=0 stash"),
+            Some(ReconcileAction::Ledger(ReconcileDirection::Unbook))
         );
     }
 
@@ -424,48 +510,99 @@ mod tests {
     #[test]
     fn reconcile_direction_unbook_for_stash_and_checkout() {
         assert_eq!(
-            git_reconcile_direction("git stash"),
-            Some(ReconcileDirection::Unbook)
+            git_reconcile_action("git stash"),
+            Some(ReconcileAction::Ledger(ReconcileDirection::Unbook))
         );
         assert_eq!(
-            git_reconcile_direction("git stash push"),
-            Some(ReconcileDirection::Unbook)
+            git_reconcile_action("git stash push"),
+            Some(ReconcileAction::Ledger(ReconcileDirection::Unbook))
         );
         assert_eq!(
-            git_reconcile_direction("git checkout -- src/main.rs"),
-            Some(ReconcileDirection::Unbook)
+            git_reconcile_action("git checkout -- src/main.rs"),
+            Some(ReconcileAction::Ledger(ReconcileDirection::Unbook))
         );
         assert_eq!(
-            git_reconcile_direction("git checkout main"),
-            Some(ReconcileDirection::Unbook)
+            git_reconcile_action("git checkout main"),
+            Some(ReconcileAction::Ledger(ReconcileDirection::Unbook))
         );
     }
 
     #[test]
-    fn reconcile_direction_book_for_pop_merge_rebase() {
+    fn reconcile_direction_book_for_pop_and_rebase() {
         assert_eq!(
-            git_reconcile_direction("git stash pop"),
-            Some(ReconcileDirection::Book)
+            git_reconcile_action("git stash pop"),
+            Some(ReconcileAction::Ledger(ReconcileDirection::Book))
         );
         assert_eq!(
-            git_reconcile_direction("git stash apply"),
-            Some(ReconcileDirection::Book)
+            git_reconcile_action("git stash apply"),
+            Some(ReconcileAction::Ledger(ReconcileDirection::Book))
         );
         assert_eq!(
-            git_reconcile_direction("git merge feature"),
-            Some(ReconcileDirection::Book)
-        );
-        assert_eq!(
-            git_reconcile_direction("git rebase main"),
-            Some(ReconcileDirection::Book)
+            git_reconcile_action("git rebase main"),
+            Some(ReconcileAction::Ledger(ReconcileDirection::Book))
         );
     }
 
     #[test]
     fn reconcile_direction_none_for_commit_and_non_git() {
-        assert_eq!(git_reconcile_direction("git commit -m x"), None);
-        assert_eq!(git_reconcile_direction("git status"), None);
-        assert_eq!(git_reconcile_direction("make check"), None);
-        assert_eq!(git_reconcile_direction("cat file"), None);
+        assert_eq!(git_reconcile_action("git commit -m x"), None);
+        assert_eq!(git_reconcile_action("git status"), None);
+        // `git pull` drives no reconcile at all — the pull-parity floor the
+        // wf-01 merge narrowing was ruled against.
+        assert_eq!(git_reconcile_action("git pull"), None);
+        assert_eq!(git_reconcile_action("make check"), None);
+        assert_eq!(git_reconcile_action("cat file"), None);
+    }
+
+    // ── The merge arm: transfer-only, never Book (wf-01) ─────────────────────
+
+    #[test]
+    fn merge_classifies_as_transfer_with_its_source_refs() {
+        // The primary real-world shape: a lead squash-merging an agent
+        // worktree's branch.
+        assert_eq!(
+            git_reconcile_action("git merge --squash agents/s1/w1"),
+            Some(ReconcileAction::MergeTransfer {
+                sources: vec!["agents/s1/w1".to_string()],
+            })
+        );
+        // A full merge carries the same transfer semantics.
+        assert_eq!(
+            git_reconcile_action("git merge feature"),
+            Some(ReconcileAction::MergeTransfer {
+                sources: vec!["feature".to_string()],
+            })
+        );
+        // Value-carrying options never masquerade as the source ref.
+        assert_eq!(
+            git_reconcile_action("git merge --no-ff -m \"landing\" topic"),
+            Some(ReconcileAction::MergeTransfer {
+                sources: vec!["topic".to_string()],
+            })
+        );
+        // Operands after a literal `--` are refs.
+        assert_eq!(
+            git_reconcile_action("git merge --squash -- topic"),
+            Some(ReconcileAction::MergeTransfer {
+                sources: vec!["topic".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn merge_abort_reconciles_as_unbook_and_continue_transfers_nothing() {
+        // `--abort` restores the pre-merge tree: entries the transfer booked go
+        // clean and unbook — the cheap least-surprising abort behavior.
+        assert_eq!(
+            git_reconcile_action("git merge --abort"),
+            Some(ReconcileAction::Ledger(ReconcileDirection::Unbook))
+        );
+        // `--continue` completes a conflicted merge (commits it). It names no
+        // source, so it transfers nothing — and it must NOT unbook: the
+        // just-committed transferred debt stays due.
+        assert_eq!(
+            git_reconcile_action("git merge --continue"),
+            Some(ReconcileAction::MergeTransfer { sources: vec![] })
+        );
     }
 }

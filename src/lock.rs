@@ -1068,15 +1068,18 @@ pub fn book_transferred(root: &Path, owner: &Owner, files: &[PathBuf]) {
 /// itself as the changed-ness oracle (`git status --porcelain`). Which way the
 /// ledger moves is the command's effect on the working tree:
 ///
-/// - [`Unbook`](ReconcileDirection::Unbook) — `git stash` / `git checkout` remove
-///   modifications, so files git now reports CLEAN are unbooked (their debt left
-///   the working tree with the modifications).
-/// - [`Book`](ReconcileDirection::Book) — `git stash pop` / `merge` / `rebase`
-///   restore or introduce modifications, so every COVERED file git reports
-///   MODIFIED is booked ("the pop should present as writes that restore it").
+/// - [`Unbook`](ReconcileDirection::Unbook) — `git stash` / `git checkout` /
+///   `git merge --abort` remove modifications, so files git now reports CLEAN
+///   are unbooked (their debt left the working tree with the modifications).
+/// - [`Book`](ReconcileDirection::Book) — `git stash pop` / `rebase` restore
+///   the agent's OWN modifications, so every COVERED file git reports MODIFIED
+///   is booked ("the pop should present as writes that restore it").
 ///
 /// One bracket, one oracle, per command, both directions — nothing
-/// stash-specific.
+/// stash-specific. `git merge` no longer drives a Book reconcile: debt means
+/// "an agent edited this and nobody has looked," not "content moved" (the
+/// pull-parity ruling, wf-01), so a merge only transfers unpaid worktree debt
+/// via [`merge_transfer_in`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconcileDirection {
     /// Files git now reports clean are unbooked.
@@ -1163,6 +1166,73 @@ pub fn reconcile_bracket(
     modified: &[PathBuf],
 ) {
     reconcile_bracket_in(&locks_dir(), root, owner, booking, direction, modified);
+}
+
+/// Transfers a merged agent worktree's UNPAID debt into the owning root's
+/// ledger — the merge bracket's only booking leg (wf-01; the misc-189
+/// intersection, relocated from the retired land engine).
+///
+/// Debt means "an agent edited this and nobody has looked," not "content
+/// moved" (the pull-parity ruling): the transfer set is the intersection of
+/// the WORKTREE root's still-due ledger entries — each mapped worktree→owning
+/// by its root-relative path — with `merged`, the canonical owning-root paths
+/// the merge actually changed. A paid worktree (empty ledger) transfers
+/// nothing; an unpaid file that did NOT merge (e.g. uncommitted worktree work
+/// a squash merge never carries) transfers nothing. The transfer books under
+/// `owner` — the identity that ran the merge — via [`book_transferred_in`], so
+/// the lead's next bare `catenary diagnostics` serves exactly the inherited
+/// set.
+///
+/// Spelling rule (misc 193): both roots canonicalize at this seam and each
+/// mapped path re-canonicalizes, so the mapping keys the SAME canonical
+/// ledgers the edit seams booked under regardless of any symlink alias the
+/// caller resolved through. `merged` must already carry canonical spellings
+/// (the caller canonicalizes at the git-oracle seam). Pin:
+/// [`merge_transfer_books_through_aliased_spelling_into_canonical_ledger`].
+///
+/// The worktree's own ledger is deliberately left untouched: it retires with
+/// the worktree (the disposal machinery removes the lock dir), and a KEPT
+/// worktree's worker still owes its own gate — least surprising both ways.
+/// Best-effort throughout: a booking failure never blocks the merge (it
+/// already ran).
+pub fn merge_transfer_in(
+    locks_base: &Path,
+    worktree_root: &Path,
+    owning_root: &Path,
+    owner: &Owner,
+    merged: &std::collections::BTreeSet<PathBuf>,
+) {
+    let worktree_root = worktree_root
+        .canonicalize()
+        .unwrap_or_else(|_| worktree_root.to_path_buf());
+    let owning_root = owning_root
+        .canonicalize()
+        .unwrap_or_else(|_| owning_root.to_path_buf());
+    let mut transfer: Vec<PathBuf> = Vec::new();
+    for unpaid in due_files_in(locks_base, &worktree_root) {
+        let Ok(rel) = unpaid.strip_prefix(&worktree_root) else {
+            continue; // not under the worktree — never part of this merge's debt
+        };
+        let mapped = owning_root.join(rel);
+        let mapped = mapped.canonicalize().unwrap_or(mapped);
+        if merged.contains(&mapped) {
+            transfer.push(mapped);
+        }
+    }
+    if !transfer.is_empty() {
+        book_transferred_in(locks_base, &owning_root, owner, &transfer);
+    }
+}
+
+/// Production wrapper for [`merge_transfer_in`] resolving the base through
+/// [`locks_dir`].
+pub fn merge_transfer(
+    worktree_root: &Path,
+    owning_root: &Path,
+    owner: &Owner,
+    merged: &std::collections::BTreeSet<PathBuf>,
+) {
+    merge_transfer_in(&locks_dir(), worktree_root, owning_root, owner, merged);
 }
 
 /// Unlinks a set of delivered files from their ledgers, grouping each file by its
@@ -2394,6 +2464,164 @@ mod tests {
             due_files_in(&locks, &fx.root),
             vec![real],
             "the aliased still-modified file is NOT wrongly unbooked (same canonical spelling)"
+        );
+    }
+
+    // ── The merge bracket: unpaid-debt transfer only (wf-01) ────────────────
+
+    /// A two-kitchen fixture for the merge transfer: an `owning/` repo root and
+    /// a sibling `wt/` agent-worktree root (a `.git` FILE marker, as a real
+    /// linked worktree carries), both canonical, sharing one locks base.
+    struct MergeFixture {
+        dir: tempfile::TempDir,
+        owning: PathBuf,
+        worktree: PathBuf,
+    }
+
+    impl MergeFixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let owning = dir.path().join("owning");
+            std::fs::create_dir_all(owning.join(".git")).expect("mk owning .git");
+            std::fs::create_dir_all(owning.join("src")).expect("mk owning src");
+            let worktree = dir.path().join("wt");
+            std::fs::create_dir_all(worktree.join("src")).expect("mk wt src");
+            std::fs::write(worktree.join(".git"), "gitdir: /elsewhere\n").expect("mk wt .git");
+            Self {
+                owning: owning.canonicalize().expect("canon owning"),
+                worktree: worktree.canonicalize().expect("canon wt"),
+                dir,
+            }
+        }
+
+        fn locks(&self) -> PathBuf {
+            self.dir.path().join("locks")
+        }
+
+        /// Create `rel` under both roots (merged content exists on both sides)
+        /// and return (worktree path, owning path).
+        fn pair(&self, rel: &str) -> (PathBuf, PathBuf) {
+            let wt = self.worktree.join(rel);
+            let own = self.owning.join(rel);
+            std::fs::write(&wt, b"fn f() {}\n").expect("write wt file");
+            std::fs::write(&own, b"fn f() {}\n").expect("write owning file");
+            (wt, own)
+        }
+    }
+
+    #[test]
+    fn merge_transfer_books_unpaid_intersect_merged_only() {
+        // The wf-01 acceptance matrix in one ledger round-trip: the worker
+        // leaves a.rs PAID, b.rs and c.rs unpaid; the merge carries a.rs and
+        // b.rs but not c.rs (uncommitted work never merges). Exactly b.rs —
+        // unpaid AND merged — books into the owning ledger.
+        let fx = MergeFixture::new();
+        let locks = fx.locks();
+        let worker = Owner::new("claude", "sess-w", "w1");
+        let lead = Owner::new("claude", "sess-l", "");
+        let booking = rust_booking();
+        let now = SystemTime::now();
+
+        let (wt_a, own_a) = fx.pair("src/a.rs");
+        let (wt_b, own_b) = fx.pair("src/b.rs");
+        let (wt_c, _own_c) = fx.pair("src/c.rs");
+        for f in [&wt_a, &wt_b, &wt_c] {
+            assert!(matches!(
+                acquire_in(&locks, f, &worker, &booking, now),
+                Acquired::Ours
+            ));
+        }
+        // The worker pays a.rs (diagnosed and delivered) before the merge.
+        unlink_delivered_in(&locks, &fx.worktree, std::slice::from_ref(&wt_a));
+
+        // What merged: a.rs and b.rs arrived in the owning tree; c.rs did not.
+        let merged: std::collections::BTreeSet<PathBuf> = [
+            own_a.canonicalize().expect("canon a"),
+            own_b.canonicalize().expect("canon b"),
+        ]
+        .into_iter()
+        .collect();
+        merge_transfer_in(&locks, &fx.worktree, &fx.owning, &lead, &merged);
+
+        assert_eq!(
+            due_files_in(&locks, &fx.owning),
+            vec![own_b.canonicalize().expect("canon b")],
+            "exactly the unpaid-AND-merged file books into the owning ledger: \
+             the paid file transfers nothing, the unmerged file transfers nothing"
+        );
+        // The transfer books under the merging identity.
+        let owning_lock = root_lock_dir_in(&locks, &fx.owning);
+        assert_eq!(
+            read_owner_name(&owning_lock).expect("read owner"),
+            Some(lead.file_name()),
+            "the inherited debt belongs to the lead who merged"
+        );
+        // The worktree's own ledger is untouched — it retires with the
+        // worktree, and a kept worktree's worker still owes its own gate.
+        assert_eq!(
+            due_files_in(&locks, &fx.worktree),
+            vec![
+                wt_b.canonicalize().expect("canon wt b"),
+                wt_c.canonicalize().expect("canon wt c")
+            ],
+            "the transfer never mutates the worktree ledger"
+        );
+    }
+
+    #[test]
+    fn merge_transfer_of_a_paid_worktree_books_nothing() {
+        // The paid-worker acceptance leg: an empty worktree ledger transfers
+        // nothing no matter what merged — a paid landing arrives debt-free.
+        let fx = MergeFixture::new();
+        let locks = fx.locks();
+        let lead = Owner::new("claude", "sess-l", "");
+        let (_wt_a, own_a) = fx.pair("src/a.rs");
+        let merged = std::collections::BTreeSet::from([own_a.canonicalize().expect("canon a")]);
+
+        merge_transfer_in(&locks, &fx.worktree, &fx.owning, &lead, &merged);
+
+        assert!(
+            !root_lock_dir_in(&locks, &fx.owning).exists(),
+            "a paid worktree's merge must not even create the owning lock dir"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_transfer_books_through_aliased_spelling_into_canonical_ledger() {
+        // The spelling pin on the worktree→owning mapping (wf-01 acceptance):
+        // both roots handed to the transfer through symlink aliases must still
+        // read the canonical worktree ledger and book canonical paths into the
+        // canonical owning ledger — the same spellings the edit seam and the
+        // diagnose serve key by (misc 193).
+        let fx = MergeFixture::new();
+        let locks = fx.locks();
+        let worker = Owner::new("claude", "sess-w", "w1");
+        let lead = Owner::new("claude", "sess-l", "");
+        let booking = rust_booking();
+        let now = SystemTime::now();
+
+        let wt_alias = fx.dir.path().join("wt-alias");
+        std::os::unix::fs::symlink(&fx.worktree, &wt_alias).expect("mk wt alias");
+        let owning_alias = fx.dir.path().join("owning-alias");
+        std::os::unix::fs::symlink(&fx.owning, &owning_alias).expect("mk owning alias");
+
+        // The worker books canonically (the edit seam canonicalizes).
+        let (wt_b, own_b) = fx.pair("src/b.rs");
+        assert!(matches!(
+            acquire_in(&locks, &wt_b, &worker, &booking, now),
+            Acquired::Ours
+        ));
+
+        // The transfer is driven entirely through the ALIAS spellings.
+        let merged = std::collections::BTreeSet::from([own_b.canonicalize().expect("canon b")]);
+        merge_transfer_in(&locks, &wt_alias, &owning_alias, &lead, &merged);
+
+        assert_eq!(
+            due_files_in(&locks, &fx.owning),
+            vec![own_b.canonicalize().expect("canon b")],
+            "aliased root spellings still book the canonical owning ledger \
+             with canonical file paths"
         );
     }
 

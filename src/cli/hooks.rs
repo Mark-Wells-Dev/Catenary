@@ -2217,10 +2217,15 @@ fn handle_claim_hook(hook_json: &serde_json::Value, command: &str, format: HostF
 /// A stateful-tier git command that moves the working tree
 /// (`stash`/`checkout`/`stash pop`/`merge`/`rebase`) gets reconciled against git
 /// itself as the changed-ness oracle (`git status --porcelain`), both directions:
-/// `stash`/`checkout` unbook files git now reports clean, `stash pop`/`merge`/
-/// `rebase` book every covered file git reports modified ("the pop should present
-/// as writes that restore it"). **Attribution is clean** because the bracket
-/// wraps the cook's OWN command at THIS seam — no watcher guesswork.
+/// `stash`/`checkout` unbook files git now reports clean, `stash pop`/`rebase`
+/// book every covered file git reports modified ("the pop should present as
+/// writes that restore it"). `git merge` is the exception (wf-01): debt means
+/// "an agent edited this and nobody has looked," not "content moved," so a merge
+/// never books wholesale — it only transfers still-UNPAID debt from a
+/// merged-from agent worktree's ledger into the owning root's, and every other
+/// merge (an upstream branch, a pull's merge leg) books nothing. **Attribution
+/// is clean** because the bracket wraps the cook's OWN command at THIS seam — no
+/// watcher guesswork.
 ///
 /// Runs entirely hook-process-local (the ledger is a filesystem fact) and
 /// **returns no decision**: `PostToolUse` carries none, so this never interferes
@@ -2347,19 +2352,20 @@ fn redact_json_leaves(value: &mut serde_json::Value) -> bool {
 /// Run the reconcile bracket for a stateful-tier git command, if the command
 /// drives a reconcile (root-ownership stage 5).
 ///
-/// Classifies the command's reconcile direction
-/// ([`tier::git_reconcile_direction`](crate::cli::command_filter::tier::git_reconcile_direction)):
+/// Classifies the command's reconcile action
+/// ([`tier::git_reconcile_action`](crate::cli::command_filter::tier::git_reconcile_action)):
 /// a non-reconciling command (`git commit`, a read-only git, a non-git command)
-/// is a no-op. Otherwise resolves the command's root from cwd, runs the
-/// `git status --porcelain` oracle in that root, and drives
+/// is a no-op. A ledger-direction action resolves the command's root from cwd,
+/// runs the `git status --porcelain` oracle in that root, and drives
 /// [`crate::lock::reconcile_bracket`] in the classified direction under the cook's
-/// own identity. All paths (the oracle's, the ledger's) canonicalize at their
-/// ingestion seam so the reconcile keys the SAME canonical ledger the edit seam
-/// booked under (the spelling rule).
+/// own identity. A `git merge` runs the worktree-debt transfer instead
+/// ([`merge_debt_transfer`], wf-01). All paths (the oracle's, the ledger's)
+/// canonicalize at their ingestion seam so the reconcile keys the SAME canonical
+/// ledger the edit seam booked under (the spelling rule).
 fn reconcile_stateful_git(hook_json: &serde_json::Value, command: &str, format: HostFormat) {
     use crate::cli::command_filter::tier;
 
-    let Some(direction) = tier::git_reconcile_direction(command) else {
+    let Some(action) = tier::git_reconcile_action(command) else {
         return; // not a reconciling git command (commit, read-only, non-git)
     };
 
@@ -2373,28 +2379,181 @@ fn reconcile_stateful_git(hook_json: &serde_json::Value, command: &str, format: 
         return;
     };
 
-    // Book direction needs the static booking data (a pop never books an
-    // uncoverable file — the same gate the edit seam uses). A config that won't
-    // load fails open: skip the reconcile rather than mis-book.
-    let Ok(config) = crate::config::Config::load() else {
-        return;
-    };
-    let booking = crate::lock::Booking::from_config(&config);
-
     let owner = crate::lock::Owner::new(
         format.as_str(),
         extract_session_id(hook_json, format).unwrap_or_default(),
         extract_agent_id(hook_json),
     );
 
-    // The oracle: git's own changed-ness report, canonicalized against the repo
-    // root. A failed query yields an empty set — in the Unbook direction that
-    // would clear all debt (wrong), so a failed query is a no-op instead.
-    let Some(modified) = git_status_modified(&cwd) else {
-        return;
-    };
+    match action {
+        tier::ReconcileAction::Ledger(direction) => {
+            // Book direction needs the static booking data (a pop never books an
+            // uncoverable file — the same gate the edit seam uses). A config that
+            // won't load fails open: skip the reconcile rather than mis-book.
+            let Ok(config) = crate::config::Config::load() else {
+                return;
+            };
+            let booking = crate::lock::Booking::from_config(&config);
 
-    crate::lock::reconcile_bracket(&root, &owner, &booking, direction, &modified);
+            // The oracle: git's own changed-ness report, canonicalized against
+            // the repo root. A failed query yields an empty set — in the Unbook
+            // direction that would clear all debt (wrong), so a failed query is
+            // a no-op instead.
+            let Some(modified) = git_status_modified(&cwd) else {
+                return;
+            };
+
+            crate::lock::reconcile_bracket(&root, &owner, &booking, direction, &modified);
+        }
+        tier::ReconcileAction::MergeTransfer { sources } => {
+            merge_debt_transfer(&cwd, &root, &owner, &sources);
+        }
+    }
+}
+
+/// The merge bracket (wf-01): transfer a merged agent worktree's UNPAID debt
+/// into the owning root's ledger — and book nothing for every other merge.
+///
+/// The pull-parity ruling: debt means "an agent edited this and nobody has
+/// looked," not "content moved." A `git pull` never booked debt, so a merge
+/// must not either. The one merge that carries debt is one whose merged-from
+/// ref corresponds to an agent worktree root — a linked worktree whose ledger
+/// still holds unpaid entries. For each named source ref that resolves to a
+/// linked worktree's checked-out tip (`git worktree list --porcelain`; a
+/// branch checked out in a worktree shares its tip commit, so the sha match
+/// covers branch names, shas, and any other ref spelling), the transfer books
+/// `unpaid(worktree) ∩ merged` into the owning ledger under the merging
+/// identity ([`crate::lock::merge_transfer`]). A ref that matches no worktree
+/// — an upstream branch, `FETCH_HEAD`, a tag — transfers nothing. A worktree
+/// with no ledger (not an agent's kitchen, or already retired) transfers
+/// nothing.
+///
+/// Conflict resolutions need no special case: the lead resolves via Edit
+/// tools, which book through the ordinary edit path. `git merge --abort` never
+/// reaches here (it classifies as an Unbook reconcile, retiring what a prior
+/// transfer booked). Accepted residuals, deliberately unhandled:
+///
+/// - cross-file drift between the worker's base and main can break merged
+///   content no per-file receipt saw — that is `make check`/CI's job, exactly
+///   as it is for `git pull`;
+/// - a merge that FAILS outright (or answers "already up to date") after
+///   naming a worktree ref can still intersect pre-existing owning-root dirt
+///   (or a stale `ORIG_HEAD` delta) with the worktree's unpaid set — a rare
+///   over-booking, the safe direction (it re-diagnoses and retires).
+fn merge_debt_transfer(
+    cwd: &std::path::Path,
+    owning_root: &std::path::Path,
+    owner: &crate::lock::Owner,
+    sources: &[String],
+) {
+    if sources.is_empty() {
+        return; // `merge --continue` / `--quit` / operand-less: nothing named
+    }
+    let worktrees = linked_worktrees(cwd, owning_root);
+    if worktrees.is_empty() {
+        return; // no linked worktrees — nothing a worktree ledger could owe
+    }
+    for source in sources {
+        let Some(sha) = git_rev_parse_commit(cwd, source) else {
+            continue; // unresolvable ref — the merge itself had nothing to take
+        };
+        for (worktree_root, head) in &worktrees {
+            if *head != sha {
+                continue;
+            }
+            let Some(merged) = merge_changed_paths(cwd, &sha) else {
+                continue;
+            };
+            crate::lock::merge_transfer(worktree_root, owning_root, owner, &merged);
+        }
+    }
+}
+
+/// The linked worktrees of the repo at `cwd`, each as (canonical path, HEAD
+/// sha), excluding `owning_root` itself (the main checkout appears in the
+/// listing too). Empty on any git failure — the merge bracket then books
+/// nothing, the safe floor.
+fn linked_worktrees(
+    cwd: &std::path::Path,
+    owning_root: &std::path::Path,
+) -> Vec<(PathBuf, String)> {
+    let Some(lines) = git_query(cwd, &["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut path: Option<PathBuf> = None;
+    for line in lines {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(p));
+        } else if let Some(sha) = line.strip_prefix("HEAD ")
+            && let Some(p) = path.take()
+        {
+            let canonical = p.canonicalize().unwrap_or(p);
+            if canonical != *owning_root {
+                out.push((canonical, sha.trim().to_string()));
+            }
+        } else if line.is_empty() {
+            path = None; // entry separator — a bare/detached entry never armed
+        }
+    }
+    out
+}
+
+/// Resolve a ref spelling to its commit sha in `cwd`'s repo, or `None` when it
+/// does not resolve (the merge had nothing to take from it).
+fn git_rev_parse_commit(cwd: &std::path::Path, source: &str) -> Option<String> {
+    git_query(
+        cwd,
+        &["rev-parse", "--verify", &format!("{source}^{{commit}}")],
+    )?
+    .into_iter()
+    .next()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+}
+
+/// The canonical owning-root paths the merge actually changed — the merge
+/// bracket's "what merged" oracle (wf-01), unioned from two legs:
+///
+/// - the `git status --porcelain` set: a SQUASH merge (the primary real-world
+///   shape) leaves the merged result staged with `HEAD` unmoved, so it shows
+///   here — as do a conflicted merge's part-staged and conflicted files;
+/// - when the merged-from commit is now an ancestor of `HEAD` (a completed
+///   full or fast-forward merge that committed), the `ORIG_HEAD..HEAD` diff —
+///   the committed merge delta a clean status no longer shows. Gating this leg
+///   on ancestry keeps a FAILED merge, whose stale `ORIG_HEAD` points at some
+///   earlier operation, from contributing garbage.
+///
+/// Paths join onto the repo root and canonicalize at this seam (the spelling
+/// rule) so the intersection keys the same canonical ledger spellings the edit
+/// seams booked under. `None` when the status oracle itself fails — the caller
+/// then transfers nothing rather than trust a phantom empty set.
+fn merge_changed_paths(
+    cwd: &std::path::Path,
+    source_sha: &str,
+) -> Option<std::collections::BTreeSet<PathBuf>> {
+    let mut merged: std::collections::BTreeSet<PathBuf> =
+        git_status_modified(cwd)?.into_iter().collect();
+    // The committed leg: only meaningful once the source is an ancestor of HEAD
+    // (`merge-base --is-ancestor` exits nonzero otherwise, and `git_query`
+    // yields `None` — the leg is skipped, not failed).
+    if git_query(cwd, &["merge-base", "--is-ancestor", source_sha, "HEAD"]).is_some() {
+        let repo_root = git_query(cwd, &["rev-parse", "--show-toplevel"])?
+            .into_iter()
+            .next()
+            .map(PathBuf::from)?;
+        if let Some(lines) = git_query(cwd, &["diff", "--name-only", "ORIG_HEAD", "HEAD"]) {
+            for line in lines {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let joined = repo_root.join(line);
+                merged.insert(joined.canonicalize().unwrap_or(joined));
+            }
+        }
+    }
+    Some(merged)
 }
 
 /// Run `git status --porcelain` in `cwd` and return the canonical absolute paths
