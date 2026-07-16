@@ -847,4 +847,68 @@ mod tests {
             None,
         );
     }
+
+    // ── project-config forwarding through the seam (misc 202 follow-up) ──
+
+    #[test]
+    fn forced_overlay_wins_over_file_borne_keys() {
+        // The misc-202 follow-up forwards a project config file as the *user*
+        // options input to this seam. This pins that the conformance FORCED
+        // overlay still wins over a file-borne value for a forced key, while a
+        // file-borne UNRELATED key survives — the same layering as any user
+        // input, exercised with a forced-options profile.
+        use crate::recipes::{Discipline, DisciplineRecord, ProjectConfigConvention};
+        let record = DisciplineRecord {
+            discipline: Some(Discipline::Event),
+            forced_init_options: Some(
+                toml::Value::try_from(serde_json::json!({
+                    "check": { "command": "clippy-forced" }
+                }))
+                .expect("forced options as toml"),
+            ),
+            project_config: Some(ProjectConfigConvention {
+                file: "example.toml".to_string(),
+                docs: None,
+            }),
+            ..DisciplineRecord::default()
+        };
+        let profile = ServerProfile::from_record(&record);
+
+        // The value a project config FILE would carry, arriving as the user input.
+        let file_borne = json!({
+            "check": { "command": "clippy-from-file" },
+            "cargo": { "features": ["mockls"] },
+        });
+        let effective = profile
+            .effective_initialization_options(Some(&file_borne))
+            .expect("merged options");
+
+        // Forced wins over the file-borne value for the forced key…
+        assert_eq!(
+            effective["check"]["command"],
+            json!("clippy-forced"),
+            "the conformance forced overlay must win over a file-borne key",
+        );
+        // …and the file-borne unrelated key survives.
+        assert_eq!(effective["cargo"]["features"], json!(["mockls"]));
+    }
+
+    #[test]
+    fn forbidden_key_is_stripped_from_file_borne_options() {
+        // A forbidden key delivered by a project config file (as the user input)
+        // is stripped just as a user-supplied one is — the server's own default
+        // is the only value that can apply. gopls forbids `diagnosticsDelay`.
+        let file_borne = json!({
+            "diagnosticsDelay": "0s",
+            "buildFlags": ["-tags=mockls"],
+        });
+        let opts = ServerProfile::for_server("gopls")
+            .effective_initialization_options(Some(&file_borne))
+            .expect("merged options");
+        assert!(
+            opts.get("diagnosticsDelay").is_none(),
+            "a file-borne forbidden key is stripped",
+        );
+        assert_eq!(opts["buildFlags"], json!(["-tags=mockls"]));
+    }
 }

@@ -19,6 +19,9 @@ pub mod manager;
 pub(crate) mod params;
 /// The `SessionStart` project-config setup nudge (misc 202).
 pub mod project_config;
+/// The project-config forwarding transport (misc 202 follow-up): read the
+/// project's server config file and forward it as client config.
+pub mod project_config_forward;
 /// LSP message protocol definitions.
 pub mod protocol;
 /// Spawn-time rust-toolchain pin resolution (misc 176 / bug 92).

@@ -39,6 +39,49 @@ fn find_instance(
     clients.get(&key).cloned()
 }
 
+/// The `initializationOptions` for a root-scoped spawn: the user's
+/// Catenary-config server options layered **over** the project's forwarded
+/// config file (misc 202 follow-up).
+///
+/// Two data layers feed the initialize seam, and their order is a layering
+/// decision, not an accident:
+///
+/// - **The project's config file** (rust-analyzer.toml at `root`, forwarded via
+///   [`crate::lsp::project_config_forward::forwarded_options`]) is the base. It
+///   is *project* data — settings that belong to the repository and travel with
+///   it (its lint command, its build features).
+/// - **The user's Catenary-config server options** (`[lsp.server.*]
+///   .initialization_options`, `user`) overlay on top and **win on conflict**.
+///   They are *machine-level* data the operator wrote into their own Catenary
+///   config to shape how this machine drives the server — the more specific,
+///   more deliberate layer, so it overrides a repository default it disagrees
+///   with (a user who sets `check.command` in their Catenary config means it for
+///   every project on the machine).
+///
+/// The merge is the existing object-level [`deep_merge`]: `user` overlaid onto
+/// `file`, unrelated keys from both preserved. The result is the **user-options
+/// input** to
+/// [`ServerProfile::effective_initialization_options`](crate::lsp::server_behavior::ServerProfile::effective_initialization_options),
+/// so the conformance **forced** overlay still wins over *both* layers (and
+/// forbidden keys are still stripped) — that seam is unchanged and non-negotiable.
+///
+/// With no file forwarded this is the identity on `user` (today's behavior); with
+/// a file but no user options it is the forwarded file alone.
+fn initialization_options_with_project_config(
+    root: &Path,
+    server_name: &str,
+    user: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let profile = crate::lsp::server_behavior::ServerProfile::for_server(server_name);
+    let file = crate::lsp::project_config_forward::forwarded_options(root, &profile);
+    match (file, user) {
+        // Project file is the base; the user's machine-level options win on top.
+        (Some(file), Some(user)) => Some(crate::config::merge::deep_merge(&file, &user)),
+        (Some(file), None) => Some(file),
+        (None, user) => user,
+    }
+}
+
 /// Tests whether a path matches a server's `file_patterns`.
 ///
 /// If `patterns` is empty, returns `true` (no filter = match all).
@@ -2010,13 +2053,17 @@ impl LspClientManager {
             writer.register_server(&key, &crate::state_snapshot::now_iso());
         }
 
-        if let Err(e) = client
-            .initialize(
-                &[root.to_path_buf()],
-                server_def.initialization_options.clone(),
-            )
-            .await
-        {
+        // Forward the project's server config file (rust-analyzer.toml) as
+        // client config, layered UNDER the user's Catenary-config options (misc
+        // 202 follow-up). The conformance forced overlay in
+        // `effective_initialization_options` still wins over both. Spawn-time
+        // only — a mid-session file edit takes effect on the next spawn.
+        let init_options = initialization_options_with_project_config(
+            root,
+            server_name,
+            server_def.initialization_options.clone(),
+        );
+        if let Err(e) = client.initialize(&[root.to_path_buf()], init_options).await {
             // Surface the init failure on the board (snapshot-only — the caller
             // already handles the Err; no extra user notification).
             if let Some(writer) = &self.snapshot {
@@ -9349,5 +9396,112 @@ mod tests {
         assert_eq!(manager.spawning_len(), 0, "marker cleared after the retry");
 
         Ok(())
+    }
+
+    // ── project-config forwarding: the init-options layering (misc 202) ──
+
+    /// A convention-carrying server (rust-analyzer) with a present config file
+    /// and NO user options forwards the translated file as the init options —
+    /// the spawn path picks the file up from the workspace root.
+    #[test]
+    fn project_config_file_forwards_when_user_supplies_nothing() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            root.path().join("rust-analyzer.toml"),
+            "check.command = \"clippy\"\ncargo.features = [\"mockls\"]\n",
+        )
+        .expect("write rust-analyzer.toml");
+
+        let options =
+            initialization_options_with_project_config(root.path(), "rust-analyzer", None)
+                .expect("a present file with no user options forwards the file");
+        assert_eq!(
+            options,
+            serde_json::json!({
+                "check": { "command": "clippy" },
+                "cargo": { "features": ["mockls"] },
+            }),
+        );
+    }
+
+    /// The merge order: the project file is the base, the user's Catenary-config
+    /// options overlay ON TOP and win on conflict, unrelated keys from both
+    /// survive.
+    #[test]
+    fn user_options_win_over_the_project_file() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            root.path().join("rust-analyzer.toml"),
+            "check.command = \"clippy\"\ncargo.features = [\"from-file\"]\n",
+        )
+        .expect("write rust-analyzer.toml");
+
+        // The user's machine-level Catenary config disagrees on check.command and
+        // adds an unrelated key.
+        let user = serde_json::json!({
+            "check": { "command": "check" },
+            "trace": { "server": "verbose" },
+        });
+        let options =
+            initialization_options_with_project_config(root.path(), "rust-analyzer", Some(user))
+                .expect("merged options");
+
+        // User wins on the conflicting key…
+        assert_eq!(options["check"]["command"], serde_json::json!("check"));
+        // …the file's unrelated key survives…
+        assert_eq!(
+            options["cargo"]["features"],
+            serde_json::json!(["from-file"]),
+        );
+        // …and the user's unrelated key survives.
+        assert_eq!(options["trace"]["server"], serde_json::json!("verbose"));
+    }
+
+    /// A server with no project-config convention (gopls) is pure pass-through:
+    /// the user's options are returned unchanged, no file is ever read.
+    #[test]
+    fn no_convention_server_is_identity_on_user_options() {
+        let root = tempfile::tempdir().expect("tempdir");
+        // Even a file named like a convention at the root is irrelevant here.
+        std::fs::write(
+            root.path().join("rust-analyzer.toml"),
+            "check.command = \"clippy\"\n",
+        )
+        .expect("write a file");
+
+        let user = serde_json::json!({ "buildFlags": ["-tags=x"] });
+        assert_eq!(
+            initialization_options_with_project_config(root.path(), "gopls", Some(user.clone()),),
+            Some(user),
+            "a no-convention server passes user options through unchanged",
+        );
+        // And with no user options either, nothing is forwarded.
+        assert_eq!(
+            initialization_options_with_project_config(root.path(), "gopls", None),
+            None,
+        );
+    }
+
+    /// An absent file leaves today's behavior unchanged — the user's options
+    /// (present or absent) pass straight through.
+    #[test]
+    fn absent_file_leaves_user_options_unchanged() {
+        let root = tempfile::tempdir().expect("tempdir");
+        // No rust-analyzer.toml at the root.
+        assert_eq!(
+            initialization_options_with_project_config(root.path(), "rust-analyzer", None),
+            None,
+            "absent file + no user options → None (today's behavior)",
+        );
+        let user = serde_json::json!({ "cargo": { "features": ["x"] } });
+        assert_eq!(
+            initialization_options_with_project_config(
+                root.path(),
+                "rust-analyzer",
+                Some(user.clone()),
+            ),
+            Some(user),
+            "absent file → the user's options are untouched",
+        );
     }
 }
