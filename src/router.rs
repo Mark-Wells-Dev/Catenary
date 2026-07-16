@@ -865,6 +865,49 @@ fn record_loud_read(decision: &crate::answer_desk::Decision, session_id: &str) {
     }
 }
 
+/// Record ONE read-action event for an unprompted host read (misc 201, "record
+/// ALL reads — the action, not the content").
+///
+/// Fires from the `pre-tool/editing-state` dispatch for every read-class host
+/// tool (`Read`/`Grep`/`Glob` per [`crate::answer_desk::classify_tool`]) — the
+/// gap the answer desk never sees: the Read tool auto-allowed in a working
+/// directory, and host `Grep`/`Glob` when they aren't denied, both pass the
+/// `PreToolUse` leg untouched and unrecorded today. This closes it: one compact
+/// `info!` naming the ACTION — tool, target path, session, agent, cwd — never any
+/// file content, so the firehose carries the complete read record and the morning
+/// report derives its signals from it.
+///
+/// **Severity is `info!` by ruling — firehose only.** It must never be `warn!`
+/// (a TUI finding) or `error!` (a desktop interrupt): a read is the highest-
+/// frequency tool action, so recording is silent archival, not a surfaced
+/// condition. The answer desk's out-of-scope `warn!` on PROMPTED reads
+/// ([`record_loud_read`]) is a separate, existing surfacing and is unaffected.
+///
+/// Recording only — this never changes a decision, and it reads the path from the
+/// forwarded `host_payload` (`tool_input.file_path` / `tool_input.path`, cwd-
+/// resolved) exactly as [`permission_read_target`] does, so a read with no
+/// resolvable target (nothing to name) records nothing.
+#[cfg(unix)]
+fn record_read_action(raw: &serde_json::Value, session_id: &str) {
+    let Some(hp) = raw.get("host_payload") else {
+        return;
+    };
+    let Some((tool_name, target)) = permission_read_target(hp) else {
+        return;
+    };
+    let agent_id = raw.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+    let cwd = hook_cwd(raw).unwrap_or("");
+    tracing::info!(
+        source = Source::HookDispatch.as_str(),
+        session_id = %session_id,
+        agent_id = %agent_id,
+        tool = %tool_name,
+        path = %target.display(),
+        cwd = %cwd,
+        "read action",
+    );
+}
+
 /// The `SessionStart` project-config setup nudge owed for this hook, or `None`
 /// (misc 202).
 ///
@@ -6820,6 +6863,23 @@ async fn handle_hook_dispatch(
         return Ok(());
     }
 
+    // ── Read-action recorder (misc 201, "record ALL reads") ────────────
+    //
+    // Every read-class host tool that reaches the PreToolUse leg — the Read tool
+    // auto-allowed in a working directory, host `Grep`/`Glob` when they aren't
+    // denied — records ONE action event to the firehose here, riding the existing
+    // `pre-tool/editing-state` IPC. Placed daemon-side because the hook CLI's
+    // tracing subscriber carries only the desktop-notification sink (the JSONL
+    // firehose subscribes to the DAEMON's tracing), so a hook-side `info!` reaches
+    // no archive. Recording only — it never gates the dispatch — and it fires for
+    // ALL read-class pre-tool dispatches, subagents included (they route through
+    // this same method). `info!` by ruling: firehose only, never a TUI finding or
+    // an interrupt (a read is the highest-frequency action). Content is never
+    // recorded — only the action's fields (tool, path, session, agent, cwd).
+    if method == "pre-tool/editing-state" {
+        record_read_action(&raw, &session_id);
+    }
+
     let router = get_or_create_router(&ctx, &session_id, &raw);
 
     // Span with session_id so warn!/error! events emitted during
@@ -10032,6 +10092,121 @@ mod tests {
         assert!(
             matches!(decision, crate::answer_desk::Decision::QuietAllow { .. }),
             "an aliased read lands in-scope after canonicalization",
+        );
+    }
+
+    // ── Read-action recorder (misc 201, "record ALL reads") ─────────────
+
+    /// A `pre-tool/editing-state` request fixture whose `host_payload` names a
+    /// read-class tool — the daemon-side shape `record_read_action` reads.
+    fn pre_tool_read_request(
+        tool: &str,
+        path_key: &str,
+        path: &str,
+        cwd: &str,
+        agent_id: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "method": "pre-tool/editing-state",
+            "tool_name": tool,
+            "agent_id": agent_id,
+            "session_id": "sess-1",
+            "cwd": cwd,
+            "host_payload": {
+                "tool_name": tool,
+                "cwd": cwd,
+                "tool_input": {
+                    path_key: path,
+                    // A content-bearing field the recorder must NEVER echo.
+                    "CONTENT_MARKER": "secret-file-content-should-never-be-recorded",
+                },
+            },
+        })
+    }
+
+    /// The `read action` rows the recorder captured (internal-kind, info-level).
+    fn read_action_rows(
+        recorder: &Arc<crate::logging::test_support::MessageRecorder>,
+    ) -> Vec<crate::logging::test_support::MsgRow> {
+        crate::logging::test_support::query_all_messages(recorder)
+            .into_iter()
+            .filter(|m| m.payload.contains("\"message\":\"read action\""))
+            .collect()
+    }
+
+    #[test]
+    fn read_action_records_one_event_with_expected_fields() {
+        let (_logging, recorder, _guard) = crate::logging::test_support::setup_logging();
+
+        let req = pre_tool_read_request("Read", "file_path", "/abs/main.rs", "/work", "agent-7");
+        record_read_action(&req, "sess-1");
+
+        let rows = read_action_rows(&recorder);
+        assert_eq!(rows.len(), 1, "exactly one read-action record");
+        let row = &rows[0];
+        assert_eq!(
+            row.r#type, "internal",
+            "an internal trace event, not a hook row"
+        );
+        assert_eq!(row.level, "info", "info-level by ruling — firehose only");
+        // The action fields — tool, path, agent, cwd — land in the trace payload;
+        // never content. (`session_id` is a reserved firehose column pulled out of
+        // the payload projection, so it is carried but not asserted on here.)
+        assert!(row.payload.contains("\"source\":\"hook.dispatch\""));
+        assert!(row.payload.contains("\"tool\":\"Read\""));
+        assert!(row.payload.contains("/abs/main.rs"), "target path recorded");
+        assert!(row.payload.contains("agent-7"), "agent id recorded");
+        assert!(row.payload.contains("/work"), "cwd recorded");
+    }
+
+    #[test]
+    fn read_action_records_grep_and_glob() {
+        let (_logging, recorder, _guard) = crate::logging::test_support::setup_logging();
+
+        // Grep/Glob name their target under `path`, not `file_path`.
+        let grep = pre_tool_read_request("Grep", "path", "/repo/src", "/repo", "");
+        record_read_action(&grep, "sess-1");
+        let glob = pre_tool_read_request("Glob", "path", "/repo", "/repo", "");
+        record_read_action(&glob, "sess-1");
+
+        let rows = read_action_rows(&recorder);
+        assert_eq!(rows.len(), 2, "one record per read-class dispatch");
+        assert!(rows.iter().any(|r| r.payload.contains("\"tool\":\"Grep\"")));
+        assert!(rows.iter().any(|r| r.payload.contains("\"tool\":\"Glob\"")));
+    }
+
+    #[test]
+    fn read_action_ignores_write_class_tools() {
+        let (_logging, recorder, _guard) = crate::logging::test_support::setup_logging();
+
+        // A write-class tool is not read-class → the recorder records nothing.
+        let write = pre_tool_read_request("Write", "file_path", "/abs/x.rs", "/work", "");
+        record_read_action(&write, "sess-1");
+        let edit = pre_tool_read_request("Edit", "file_path", "/abs/x.rs", "/work", "");
+        record_read_action(&edit, "sess-1");
+
+        assert!(
+            read_action_rows(&recorder).is_empty(),
+            "write-class tools produce no read-action record",
+        );
+    }
+
+    #[test]
+    fn read_action_never_records_file_content() {
+        let (_logging, recorder, _guard) = crate::logging::test_support::setup_logging();
+
+        // The fixture's tool_input carries a content marker; the record must
+        // carry the ACTION only, never any content that rode the payload.
+        let req = pre_tool_read_request("Read", "file_path", "/abs/main.rs", "/work", "a");
+        record_read_action(&req, "sess-1");
+
+        let rows = read_action_rows(&recorder);
+        assert_eq!(rows.len(), 1, "one record");
+        assert!(
+            !rows[0]
+                .payload
+                .contains("secret-file-content-should-never-be-recorded"),
+            "no file content ever appears in the read-action record",
         );
     }
 
