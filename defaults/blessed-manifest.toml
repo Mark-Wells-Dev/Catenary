@@ -149,9 +149,9 @@ date = "2026-07-09"
 tier = "verified-on-linux"
 
 [blessed.typescript-language-server.linux-x86_64]
-version = "5.1.3"
+version = "5.3.0"
 platform = "linux-x86_64"
-date = "2026-07-13"
+date = "2026-07-15"
 tier = "verified-on-linux"
 
 [blessed.yaml-language-server.linux-x86_64]
@@ -227,9 +227,9 @@ date = "2026-07-10"
 tier = "verified-on-macos"
 
 [blessed.rust-analyzer.macos-arm64]
-version = "2026-07-06"
+version = "2026-07-13"
 platform = "macos-arm64"
-date = "2026-07-10"
+date = "2026-07-15"
 tier = "verified-on-macos"
 
 [blessed.svelteserver.macos-arm64]
@@ -242,6 +242,12 @@ tier = "verified-on-macos"
 version = "0.10.0"
 platform = "macos-arm64"
 date = "2026-07-10"
+tier = "verified-on-macos"
+
+[blessed.typescript-language-server.macos-arm64]
+version = "5.3.0"
+platform = "macos-arm64"
+date = "2026-07-15"
 tier = "verified-on-macos"
 
 [blessed.vscode-css-language-server.macos-arm64]
