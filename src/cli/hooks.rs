@@ -2197,32 +2197,78 @@ pub fn run_post_tool(format: HostFormat) {
 ///
 /// This is the ONE emission site for the redaction wire shape, so a field rename
 /// is a one-place fix. The scanned output is Claude Code's `PostToolUse`
-/// `tool_response` — a bare string, or an object/array whose string leaves are
-/// scanned and reassembled. A clean output emits nothing and returns `false`, so
-/// the untouched output passes through byte-identical (no `updatedToolOutput`).
+/// `tool_response`, whose **shape depends on the tool** (docs:
+/// <https://code.claude.com/docs/en/hooks>): the Bash tool returns an object with
+/// `stdout`/`stderr`/`exit_code`, the Read tool `{file_path, contents}`, and some
+/// tools a bare string. The rewrite contract is shape-preserving —
+/// `updatedToolOutput` "must match the shape of `tool_response` for the tool that
+/// ran" — so a structured response must be answered with the SAME structure, not a
+/// flattened string (the misc-201 live-pin failure: a bare-string rewrite of a
+/// Bash object was ignored, so the raw PEM armor reached the model).
+///
+/// The scan therefore walks the response's **string leaves** and redacts each in
+/// place ([`redact_json_leaves`]): every non-string field (`exit_code`,
+/// `file_path`, …) is preserved untouched, only a secret-bearing string value is
+/// swapped for its marker, and the emitted value has byte-identical shape to the
+/// original `tool_response`. A clean output redacts nothing and returns `false`,
+/// so the untouched output passes through with no `updatedToolOutput` at all.
 fn redact_tool_output(hook_json: &serde_json::Value) -> bool {
     let Some(response) = hook_json.get("tool_response") else {
         return false;
     };
-    // Only the string-valued output can carry a scannable secret. A structured
-    // `tool_response` (Read returns `{file: {…}}`) is rendered to its JSON text
-    // for the scan; on a hit we replace the whole field with the redacted STRING
-    // form (the marker survives, the rest is preserved) — never dropping output.
-    let text = match response {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    };
-    let Some(redacted) = crate::answer_desk::redact_secrets(&text) else {
+    let mut updated = response.clone();
+    if !redact_json_leaves(&mut updated) {
         return false;
-    };
+    }
     let out = serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "updatedToolOutput": redacted,
+            "updatedToolOutput": updated,
         }
     });
     print!("{out}");
     true
+}
+
+/// Redact secret shapes in every string leaf of a `tool_response` value, in place,
+/// returning `true` iff any leaf was rewritten.
+///
+/// Shape-preserving by construction: only [`serde_json::Value::String`] leaves are
+/// visited and swapped for their redacted form; objects and arrays are recursed
+/// into (so a Bash `{stdout, stderr, exit_code}` or a nested structure keeps every
+/// key and every non-string value), and numbers/bools/null are left untouched.
+/// Each string is scanned WHOLE (its real newlines intact — a PEM armor block is
+/// matched as the multi-line span it is, unlike a JSON-serialized form where the
+/// newlines are escaped). This is what lets the redacted result be handed back as
+/// `updatedToolOutput` and satisfy the "must match the shape of `tool_response`"
+/// contract for any tool.
+fn redact_json_leaves(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => {
+            crate::answer_desk::redact_secrets(s).is_some_and(|redacted| {
+                *s = redacted;
+                true
+            })
+        }
+        serde_json::Value::Object(map) => {
+            let mut hit = false;
+            for v in map.values_mut() {
+                // Bitwise-or into `hit` WITHOUT short-circuit so every leaf is
+                // scanned — a secret in `stderr` is redacted even when `stdout`
+                // already had one.
+                hit |= redact_json_leaves(v);
+            }
+            hit
+        }
+        serde_json::Value::Array(arr) => {
+            let mut hit = false;
+            for v in arr {
+                hit |= redact_json_leaves(v);
+            }
+            hit
+        }
+        _ => false,
+    }
 }
 
 /// Run the reconcile bracket for a stateful-tier git command, if the command
@@ -2414,6 +2460,108 @@ mod tests {
         assert!(porcelain_path("").is_none());
         assert!(porcelain_path(" M ").is_none());
         assert!(porcelain_path("XY").is_none());
+    }
+
+    // ── PostToolUse secret-redaction leaf walk (misc 201, live pin) ──────
+    //
+    // The redaction rewrite must be SHAPE-PRESERVING: `updatedToolOutput` must
+    // match the shape of `tool_response` for the tool that ran (docs:
+    // https://code.claude.com/docs/en/hooks). These pin `redact_json_leaves` —
+    // the pure core — over the exact Bash (`{stdout, stderr, exit_code}`) and Read
+    // (`{file_path, contents}`) response shapes.
+
+    const PEM_ARMOR: &str =
+        "-----BEGIN PRIVATE KEY-----\nMIIabcDUMMYbase64\n-----END PRIVATE KEY-----";
+
+    #[test]
+    fn redact_json_leaves_bash_shape_redacts_stdout_keeps_structure() {
+        // Bash `tool_response`: the PEM in `stdout` is redacted, `stderr` and the
+        // NON-string `exit_code` survive untouched — the object shape is preserved.
+        let mut resp = serde_json::json!({
+            "stdout": format!("dumping key\n{PEM_ARMOR}\ndone"),
+            "stderr": "",
+            "exit_code": 0,
+        });
+        assert!(redact_json_leaves(&mut resp), "the PEM must be a hit");
+        let stdout = resp["stdout"].as_str().expect("stdout stays a string");
+        assert!(stdout.contains("[REDACTED: private key]"));
+        assert!(!stdout.contains("MIIabc"), "key material must not survive");
+        assert!(stdout.starts_with("dumping key\n"));
+        assert!(stdout.ends_with("\ndone"));
+        // Shape preserved: exit_code is still the number 0, stderr still "".
+        assert_eq!(resp["exit_code"], serde_json::json!(0));
+        assert_eq!(resp["stderr"], serde_json::json!(""));
+    }
+
+    #[test]
+    fn redact_json_leaves_read_shape_redacts_contents_keeps_file_path() {
+        // Read `tool_response`: the PEM in `contents` is redacted; `file_path`
+        // is a string too but carries no secret, so it is left byte-identical.
+        let mut resp = serde_json::json!({
+            "file_path": "/home/me/secret.pem",
+            "contents": PEM_ARMOR,
+        });
+        assert!(redact_json_leaves(&mut resp), "the PEM must be a hit");
+        assert_eq!(
+            resp["contents"],
+            serde_json::json!("[REDACTED: private key]")
+        );
+        assert_eq!(resp["file_path"], serde_json::json!("/home/me/secret.pem"));
+    }
+
+    #[test]
+    fn redact_json_leaves_bare_string_response_redacts_in_place() {
+        // Some tools return a bare-string `tool_response`; the string leaf itself
+        // is scanned and swapped.
+        let mut resp = serde_json::json!(format!("cat output\n{PEM_ARMOR}"));
+        assert!(redact_json_leaves(&mut resp));
+        let s = resp.as_str().expect("stays a string");
+        assert!(s.starts_with("cat output\n"));
+        assert!(s.contains("[REDACTED: private key]"));
+    }
+
+    #[test]
+    fn redact_json_leaves_clean_response_is_a_no_op() {
+        // No secret anywhere → returns false, nothing mutated (byte-identical).
+        let mut resp = serde_json::json!({
+            "stdout": "all tests passed",
+            "stderr": "",
+            "exit_code": 0,
+        });
+        let before = resp.clone();
+        assert!(
+            !redact_json_leaves(&mut resp),
+            "a clean response is not a hit"
+        );
+        assert_eq!(resp, before, "a clean response is left untouched");
+    }
+
+    #[test]
+    fn redact_json_leaves_scans_every_leaf_not_just_the_first() {
+        // A secret in BOTH stdout and stderr: both are redacted (no short-circuit).
+        let mut resp = serde_json::json!({
+            "stdout": "AKIAIOSFODNN7EXAMPLE",
+            "stderr": "leaked ghp_1234567890abcdefghijABCDEFGHIJ0987",
+            "exit_code": 1,
+        });
+        assert!(redact_json_leaves(&mut resp));
+        assert!(
+            resp["stdout"]
+                .as_str()
+                .is_some_and(|s| s.contains("[REDACTED: AWS access key ID]"))
+        );
+        assert!(
+            resp["stderr"]
+                .as_str()
+                .is_some_and(|s| s.contains("[REDACTED: GitHub token]"))
+        );
+    }
+
+    #[test]
+    fn redact_tool_output_missing_tool_response_is_a_no_op() {
+        // No `tool_response` at all → nothing emitted, returns false.
+        let hook = serde_json::json!({"tool_name": "Bash", "tool_input": {}});
+        assert!(!redact_tool_output(&hook));
     }
 
     #[test]
