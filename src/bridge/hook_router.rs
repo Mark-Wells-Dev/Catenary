@@ -843,20 +843,57 @@ impl HookRouter {
         }
     }
 
-    /// Force `done_editing` before the agent stops.
+    /// Force `done_editing` before the agent stops (bug 116).
     ///
-    /// If `stop_hook_active` is true (retry after the agent failed to call
-    /// `done_editing`), force-clears the stale editing state and allows.
-    /// Otherwise blocks if the agent is in editing mode.
+    /// Production entry — resolves the ledger base through
+    /// [`crate::lock::locks_dir`] and delegates to [`Self::require_release_in`].
     fn handle_require_release(
         &self,
         session_id: Option<&str>,
         agent_id: &str,
         stop_hook_active: bool,
     ) -> Option<HookResult> {
+        self.require_release_in(
+            session_id,
+            agent_id,
+            stop_hook_active,
+            &crate::lock::locks_dir(),
+        )
+    }
+
+    /// The Stop-block gate, keyed to the durable LEDGER (bug 116).
+    ///
+    /// The in-memory batch (keyed `(session_id, agent_id)`) serves ONLY as the
+    /// CANDIDATE file set here — it names the paths the agent edited, but no
+    /// longer gates on the retired in-memory `delivered` flags. Root-ownership
+    /// stage 3 made the identity-free diagnose serve unable to pay those flags, so
+    /// nothing in production ever flipped them and the old
+    /// `has_undelivered`-keyed block armed unconditionally on the first Stop. The
+    /// gate now asks the single source of truth: for each candidate, is it still
+    /// DUE on its root's ledger ([`crate::lock::due_candidates_in`])? Block iff any
+    /// candidate is unpaid, and the block message NAMES those files (mirroring the
+    /// Bash gate's named message — the old bare "run diagnostics" text hid which
+    /// files were owed).
+    ///
+    /// The `stop_hook_active` retry arm clears editing state **unconditionally** —
+    /// the safety valve. Doctrine (bug 79): an unstable daemon must never lock a
+    /// session out, so a Stop that already retried once always passes regardless of
+    /// ledger state. Do not gate this arm on the ledger.
+    ///
+    /// `locks_base` is injected so unit tests point the ledger read at a tempdir
+    /// without mutating the process environment (`std::env::set_var` is forbidden
+    /// under Rust 2024).
+    fn require_release_in(
+        &self,
+        session_id: Option<&str>,
+        agent_id: &str,
+        stop_hook_active: bool,
+        locks_base: &Path,
+    ) -> Option<HookResult> {
         if stop_hook_active {
-            // Agent was told to call done_editing but didn't. Clear stale
-            // state rather than leaving it for SessionStart/GC cleanup.
+            // Retry safety valve (bug 79): the agent was told to diagnose but
+            // stopped again. Clear editing state UNCONDITIONALLY — ledger-blind —
+            // so an unstable daemon can never lock a session out of finishing.
             self.session.editing.done_editing(session_id, agent_id);
             if let Some(guardrail) = &self.session.editing_guardrail {
                 guardrail.release_all(&self.session.instance_id);
@@ -864,23 +901,76 @@ impl HookRouter {
             return None;
         }
 
-        if self.session.editing.is_editing(session_id, agent_id) {
-            if self.session.editing.has_undelivered(session_id, agent_id) {
-                Some(HookResult::Block(
-                    "run `catenary diagnostics` before finishing".into(),
-                ))
-            } else {
-                // No undelivered debt (nothing edited, or the batch is fully
-                // diagnosed) — silently clear editing state.
-                self.session.editing.done_editing(session_id, agent_id);
-                if let Some(guardrail) = &self.session.editing_guardrail {
-                    guardrail.release_all(&self.session.instance_id);
-                }
-                None
-            }
-        } else {
-            None
+        if !self.session.editing.is_editing(session_id, agent_id) {
+            return None;
         }
+
+        // The batch names the candidate set; the ledger decides which are unpaid.
+        let candidates = self.session.editing.files(session_id, agent_id);
+        let due = crate::lock::due_candidates_in(locks_base, &candidates);
+        if due.is_empty() {
+            // No unpaid candidate on any ledger (nothing edited, or the whole
+            // batch is diagnosed) — demote out of editing and allow. The board's
+            // editing→working/idle demotion rides this same clear (bug 116).
+            self.session.editing.done_editing(session_id, agent_id);
+            if let Some(guardrail) = &self.session.editing_guardrail {
+                guardrail.release_all(&self.session.instance_id);
+            }
+            return None;
+        }
+
+        Some(HookResult::Block(self.stop_block_message(&due)))
+    }
+
+    /// The Stop-block message — names the due files and points at the payment
+    /// command (bug 116).
+    ///
+    /// Mirrors [`Self::boundary_block_message`]'s named style (grouping each
+    /// outstanding file under the diagnostic feeder tracking it), so a blocked
+    /// Stop tells the agent exactly which edits are still owed instead of the old
+    /// bare "run `catenary diagnostics` before finishing" — the opacity that made
+    /// this bug need a firehose dig to see. There is no command to re-run at a
+    /// Stop, so the trailer just teaches the two payment forms.
+    fn stop_block_message(&self, files: &[PathBuf]) -> String {
+        use std::collections::BTreeMap;
+        use std::fmt::Write as _;
+
+        let mut by_feeder: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut unattributed: Vec<String> = Vec::new();
+        for file in files {
+            let shown = file.display().to_string();
+            let feeders = self.session.diagnostic_feeders(file);
+            if feeders.is_empty() {
+                unattributed.push(shown);
+            } else {
+                for feeder in feeders {
+                    by_feeder.entry(feeder).or_default().push(shown.clone());
+                }
+            }
+        }
+
+        let mut msg = String::from("These files were edited but haven't been diagnosed yet:\n");
+        for (feeder, group) in &by_feeder {
+            let _ = writeln!(msg, "  {feeder}");
+            for file in group {
+                let _ = writeln!(msg, "    {file}");
+            }
+        }
+        for file in &unattributed {
+            let _ = writeln!(msg, "  {file}");
+        }
+
+        let scoped = files
+            .iter()
+            .map(|f| f.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = writeln!(
+            msg,
+            "Run `catenary diagnostics` to check them all, or name paths to check only some:"
+        );
+        let _ = write!(msg, "  catenary diagnostics {scoped}");
+        msg
     }
 
     /// Clear stale editing state on session start/resume.
@@ -1051,20 +1141,199 @@ mod tests {
         assert_eq!(files, vec![PathBuf::from(&main_rs)]);
     }
 
-    #[test]
-    fn test_hook_require_release_block() {
-        let router = test_router();
+    /// A fresh router whose session owns a real repo root, paired with a tempdir
+    /// LEDGER base and a rust `Booking`, for the ledger-keyed Stop-block tests
+    /// (bug 116). Returns the router, the canonical repo root, and the locks base.
+    fn stop_router_with_ledger() -> (TestHookRouter, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir
+            .path()
+            .canonicalize()
+            .expect("canon tempdir")
+            .join("repo");
+        std::fs::create_dir_all(root.join(".git")).expect("mk .git");
+        std::fs::create_dir_all(root.join("src")).expect("mk src");
+        let locks = dir.path().join("locks");
+
+        let config = Config::default_with_classification();
+        let logging = crate::logging::LoggingServer::new();
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let handle = runtime.handle().clone();
+        let instance_id: Arc<str> = "test-session".into();
+        let session = Arc::new(Session::new(
+            config,
+            vec![root.clone()],
+            logging,
+            instance_id.clone(),
+            handle,
+            None,
+        ));
+        let router = HookRouter::new(session, instance_id, "test".to_string());
+        (
+            TestHookRouter {
+                _dir: dir,
+                _runtime: runtime,
+                router,
+            },
+            root,
+            locks,
+        )
+    }
+
+    /// Books a file into the real ledger under `locks` and records it in the
+    /// in-memory candidate batch — the state a covered edit leaves behind.
+    fn book_and_record(router: &HookRouter, locks: &Path, file: &Path) {
+        let owner = crate::lock::Owner::new("test", "", "");
+        let booking =
+            crate::lock::Booking::from_config(&crate::config::Config::load().expect("cfg"));
+        let acquired =
+            crate::lock::acquire_in(locks, file, &owner, &booking, std::time::SystemTime::now());
+        assert!(
+            matches!(acquired, crate::lock::Acquired::Ours),
+            "the edit books the ledger"
+        );
         let _ = router.session.editing.start_editing(None, "");
         router
             .session
             .editing
-            .record_covered_edit(None, "", PathBuf::from("/src/main.rs"), true);
+            .record_covered_edit(None, "", file.to_path_buf(), true);
+    }
 
-        let result = router.handle_require_release(None, "", false);
-        let Some(HookResult::Block(reason)) = result else {
-            unreachable!("expected Block, got {result:?}");
+    #[test]
+    fn stop_blocks_and_names_files_when_ledger_unpaid() {
+        // Bug 116 acceptance: a covered edit whose ledger debt is UNPAID blocks the
+        // first Stop, and the block message NAMES the due file (the old bare "run
+        // diagnostics" text hid which files were owed).
+        let (router, root, locks) = stop_router_with_ledger();
+        let file = root.join("src/main.rs");
+        std::fs::write(&file, b"").expect("write file");
+        book_and_record(&router, &locks, &file);
+
+        let result = router.require_release_in(None, "", false, &locks);
+        let Some(HookResult::Block(msg)) = result else {
+            unreachable!("expected Block on unpaid ledger, got {result:?}");
         };
-        assert!(reason.contains("diagnostics"));
+        assert!(
+            msg.contains(&file.display().to_string()),
+            "the block message must NAME the due file; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("catenary diagnostics"),
+            "the block message teaches the payment command; got:\n{msg}"
+        );
+        // The batch survives a block (the agent still owes it).
+        assert!(
+            router.session.editing.is_editing(None, ""),
+            "a blocked Stop leaves editing state intact"
+        );
+    }
+
+    #[test]
+    fn stop_passes_when_ledger_paid() {
+        // Bug 116 acceptance: a covered edit whose ledger debt is PAID (the touch
+        // file unlinked by the delivery seam) passes the FIRST Stop — no phantom
+        // block from a stale in-memory flag.
+        let (router, root, locks) = stop_router_with_ledger();
+        let file = root.join("src/main.rs");
+        std::fs::write(&file, b"").expect("write file");
+        book_and_record(&router, &locks, &file);
+
+        // Pay the ledger (the diagnostics delivery seam unlinks the touch file).
+        crate::lock::unlink_delivered_in(&locks, &root, std::slice::from_ref(&file));
+
+        let result = router.require_release_in(None, "", false, &locks);
+        assert!(
+            result.is_none(),
+            "a paid ledger passes the first Stop, got {result:?}"
+        );
+        // The paid-Stop path demotes out of editing (board demotion rides here).
+        assert!(
+            !router.session.editing.is_editing(None, ""),
+            "the paid Stop clears editing state (board editing→working/idle)"
+        );
+    }
+
+    #[test]
+    fn stop_retry_arm_clears_unconditionally_even_with_unpaid_ledger() {
+        // Bug 79 doctrine (retained through bug 116): the `stop_hook_active` retry
+        // arm clears editing state UNCONDITIONALLY — ledger-blind — so an unstable
+        // daemon can never lock a session out of finishing. Even with unpaid ledger
+        // debt, the retry passes and clears.
+        let (router, root, locks) = stop_router_with_ledger();
+        let file = root.join("src/main.rs");
+        std::fs::write(&file, b"").expect("write file");
+        book_and_record(&router, &locks, &file);
+        assert!(
+            crate::lock::has_debt_in(&locks, &root),
+            "the ledger is unpaid going into the retry"
+        );
+
+        let result = router.require_release_in(None, "", true, &locks);
+        assert!(
+            result.is_none(),
+            "the retry arm always passes (bug 79 safety valve), got {result:?}"
+        );
+        assert!(
+            !router.session.editing.is_editing(None, ""),
+            "the retry arm clears editing state even with unpaid ledger debt"
+        );
+    }
+
+    #[test]
+    fn stop_block_reads_through_aliased_spelling() {
+        // Path-spelling pin (bug 116 / misc 193): the Stop check compares batch
+        // candidate paths against the canonical ledger. A candidate reached through
+        // a symlinked-prefix alias of the root must resolve to the SAME ledger
+        // answer as the canonical spelling — Linux-green does not prove this
+        // (boot-spawn timing masks it), so the symlink alias is the regression pin.
+        let (router, root, locks) = stop_router_with_ledger();
+        let real = root.join("src/main.rs");
+        std::fs::write(&real, b"").expect("write file");
+
+        // A symlink whose target is the canonical repo root, and the file reached
+        // through the alias spelling.
+        let dir_parent = root.parent().expect("root parent");
+        let alias = dir_parent.join("alias");
+        std::os::unix::fs::symlink(&root, &alias).expect("mk symlink");
+        let via_alias = alias.join("src/main.rs");
+
+        // Book against the CANONICAL ledger (a normal edit), but seed the batch
+        // with the ALIASED spelling (what a host with a symlinked cwd would send).
+        let owner = crate::lock::Owner::new("test", "", "");
+        let booking =
+            crate::lock::Booking::from_config(&crate::config::Config::load().expect("cfg"));
+        assert!(matches!(
+            crate::lock::acquire_in(
+                &locks,
+                &real,
+                &owner,
+                &booking,
+                std::time::SystemTime::now()
+            ),
+            crate::lock::Acquired::Ours
+        ));
+        let _ = router.session.editing.start_editing(None, "");
+        router
+            .session
+            .editing
+            .record_covered_edit(None, "", via_alias, true);
+
+        // The aliased candidate must canonicalize to the same due path → still blocks.
+        let result = router.require_release_in(None, "", false, &locks);
+        let Some(HookResult::Block(msg)) = result else {
+            unreachable!("aliased candidate must resolve to the canonical debt, got {result:?}");
+        };
+        assert!(
+            msg.contains(&real.display().to_string()),
+            "the block names the CANONICAL file, resolved from the alias; got:\n{msg}"
+        );
+
+        // Paying the canonical ledger clears it → the aliased candidate now passes.
+        crate::lock::unlink_delivered_in(&locks, &root, std::slice::from_ref(&real));
+        assert!(
+            router.require_release_in(None, "", false, &locks).is_none(),
+            "the aliased candidate reads the same paid ledger and passes"
+        );
     }
 
     #[test]

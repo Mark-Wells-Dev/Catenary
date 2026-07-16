@@ -1064,26 +1064,45 @@ impl Session {
         self.touch_snapshot();
     }
 
-    /// Derives the session's board status from live editing state.
+    /// Derives the session's board status from live editing state, keyed to the
+    /// durable LEDGER for the armed/paid axis (bug 116).
     ///
     /// The editing debt gate is the truth source (tui-rework 14, item 1),
     /// evaluated at snapshot-build time with no transition tracking:
     ///
     /// - `diagnostics` while a `catenary diagnostics` run is in flight;
-    /// - `editing` when the gate is **armed** — any agent's batch holds an
-    ///   undelivered covered file;
+    /// - `editing` when the gate is **armed** — any of the session's roots holds
+    ///   unpaid debt on its ledger ([`crate::lock::has_debt`]);
     /// - `working` when the gate is **paid** but an editing accumulator is still
-    ///   held — the batch is fully diagnosed, yet the session is mid-edit;
+    ///   held — the ledger is clear, yet the session is mid-edit;
     /// - `idle` when no accumulator is active (the session did `done_editing`).
+    ///
+    /// The armed/paid axis reads the ledger, not the retired in-memory `delivered`
+    /// flags (root-ownership stage 3 left nothing in production to pay them, so the
+    /// board hung at `editing` from the first edit until a Stop — bug 116). The
+    /// accumulator presence ([`is_active`](crate::bridge::editing_manager::EditingManager::is_active))
+    /// still separates `working`/`idle`: it is set from `start_editing` to
+    /// `done_editing`, indifferent to daemon churn only for its own lifetime.
     #[must_use]
     pub fn status(&self) -> crate::state_snapshot::SessionStatus {
+        self.status_in(&crate::lock::locks_dir())
+    }
+
+    /// The ledger-base-injectable core of [`status`](Self::status) (bug 116).
+    ///
+    /// `locks_base` lets a unit test point the debt read at a tempdir ledger
+    /// without mutating the process environment (`std::env::set_var` is forbidden
+    /// under Rust 2024). Production calls [`status`](Self::status), which resolves
+    /// the base through [`crate::lock::locks_dir`].
+    #[must_use]
+    pub fn status_in(&self, locks_base: &Path) -> crate::state_snapshot::SessionStatus {
         use crate::state_snapshot::SessionStatus;
         if self
             .diagnostics_in_flight
             .load(std::sync::atomic::Ordering::Acquire)
         {
             SessionStatus::Diagnostics
-        } else if self.editing.has_undelivered_any() {
+        } else if self.any_root_has_debt(locks_base) {
             SessionStatus::Editing
         } else if self.editing.is_active() {
             SessionStatus::Working
@@ -1092,25 +1111,55 @@ impl Session {
         }
     }
 
-    /// Derives a subagent's board status from its own per-`(session, agent)`
-    /// editing batch (tui-rework 14, item 3).
+    /// Whether any of the session's roots carries unpaid debt on its ledger under
+    /// `locks_base` (bug 116) — the board's "is the gate armed?" question,
+    /// answered by the durable per-root touch-tree.
     ///
-    /// Same gate axis as [`status`](Self::status), but scoped to one agent:
-    /// `editing` when that agent's batch holds an undelivered covered file,
-    /// `working` when it holds a batch that is fully delivered, `idle` when it
-    /// has no accumulator. A subagent never runs its own `catenary diagnostics`
-    /// pass through the parent's in-flight flag, so `diagnostics` is not a
-    /// subagent status.
+    /// Each root is canonicalized inside [`crate::lock::has_debt_in`]'s resolution
+    /// (the encoding is keyed on the canonical path); the session's roots arrive
+    /// canonicalized (the tracker canonicalizes every root), so a symlinked-prefix
+    /// alias reads the same lock dir the edit seam booked under.
+    fn any_root_has_debt(&self, locks_base: &Path) -> bool {
+        self.roots()
+            .iter()
+            .any(|root| crate::lock::has_debt_in(locks_base, root))
+    }
+
+    /// Derives a subagent's board status from its own per-`(session, agent)`
+    /// editing batch, keyed to the durable LEDGER for the armed/paid axis
+    /// (tui-rework 14, item 3; re-keyed bug 116).
     #[must_use]
     pub fn subagent_status(&self, agent_id: &str) -> crate::state_snapshot::SessionStatus {
+        self.subagent_status_in(agent_id, &crate::lock::locks_dir())
+    }
+
+    /// The ledger-base-injectable core of [`subagent_status`](Self::subagent_status)
+    /// (bug 116).
+    ///
+    /// Same gate axis as [`status`](Self::status), but the candidate set is scoped
+    /// to one agent's batch: `editing` when any of the subagent's edited files is
+    /// still DUE on its root's ledger
+    /// ([`due_candidates_in`](crate::lock::due_candidates_in)), `working` when it
+    /// holds a batch but none is due, `idle` when it has no accumulator. A subagent
+    /// never runs its own `catenary diagnostics` pass through the parent's in-flight
+    /// flag, so `diagnostics` is not a subagent status. `locks_base` is injected for
+    /// the same tempdir-testability reason as [`status_in`](Self::status_in).
+    #[must_use]
+    pub fn subagent_status_in(
+        &self,
+        agent_id: &str,
+        locks_base: &Path,
+    ) -> crate::state_snapshot::SessionStatus {
         use crate::state_snapshot::SessionStatus;
         let session_id = Some(&*self.instance_id);
-        if self.editing.has_undelivered(session_id, agent_id) {
-            SessionStatus::Editing
-        } else if self.editing.has_files(session_id, agent_id) {
+        if !self.editing.has_files(session_id, agent_id) {
+            return SessionStatus::Idle;
+        }
+        let candidates = self.editing.files(session_id, agent_id);
+        if crate::lock::due_candidates_in(locks_base, &candidates).is_empty() {
             SessionStatus::Working
         } else {
-            SessionStatus::Idle
+            SessionStatus::Editing
         }
     }
 

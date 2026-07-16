@@ -8577,27 +8577,15 @@ mod tests {
             "last_seen is a non-empty ISO string"
         );
 
-        // The gate is the truth source (tui-rework 14, item 1): an accumulator
-        // with no undelivered covered file is `working`, not `editing` — only
-        // an armed gate reads as `editing`.
+        // The armed/paid axis reads the durable LEDGER now (bug 116); this
+        // session has no real roots, so its ledger is always clear — an active
+        // accumulator reads as `working`, never `editing`. The ledger-driven
+        // editing↔working demotion is exercised against a real ledger in
+        // `board_status_editing_working_rides_the_ledger` below.
         session
             .editing
             .start_editing(Some("sess-1"), "")
             .expect("start editing");
-        assert_eq!(board.sessions()[0].status, SessionStatus::Working);
-
-        // A covered edit arms the gate → `editing`.
-        session.editing.record_covered_edit(
-            Some("sess-1"),
-            "",
-            std::path::PathBuf::from("/p/A/src/lib.rs"),
-            true,
-        );
-        assert_eq!(board.sessions()[0].status, SessionStatus::Editing);
-
-        // Full delivery (a bare `catenary diagnostics` receipt) pays the gate:
-        // the batch is retained but fully diagnosed → back to `working`.
-        session.editing.mark_delivered_all(Some("sess-1"), "");
         assert_eq!(board.sessions()[0].status, SessionStatus::Working);
 
         // `done_editing` drops the accumulator → `idle`.
@@ -8622,8 +8610,8 @@ mod tests {
         assert!(!la.at.is_empty(), "last_action carries a timestamp");
 
         // A subagent's board entry is enriched with its own per-(session, agent)
-        // batch status (tui-rework 14, item 3): fresh → idle, covered edit →
-        // editing, delivered → working.
+        // batch status (tui-rework 14, item 3): fresh → idle, and (with a clear
+        // ledger) an active accumulator → working.
         board
             .subagents
             .start("sess-1", "agent-a", "2026-06-08T13:11:00.000Z".to_string());
@@ -8638,16 +8626,110 @@ mod tests {
             std::path::PathBuf::from("/p/A/src/sub.rs"),
             true,
         );
-        assert_eq!(
-            board.sessions()[0].subagents[0].status,
-            SessionStatus::Editing
-        );
-        session
-            .editing
-            .mark_delivered_all(Some("sess-1"), "agent-a");
+        // No real ledger debt for this synthetic path → working, not editing.
         assert_eq!(
             board.sessions()[0].subagents[0].status,
             SessionStatus::Working
+        );
+    }
+
+    /// The board's editing→working demotion rides the durable LEDGER, not the
+    /// retired in-memory `delivered` flags (bug 116).
+    ///
+    /// Root-ownership stage 3 left nothing in production to pay the in-memory
+    /// flags, so the board hung at `editing` from the first edit until a Stop.
+    /// Both [`Session::status_in`] (session-wide, keyed on any root's ledger debt)
+    /// and [`Session::subagent_status_in`] (per-agent candidate set intersected
+    /// with the ledger) now read the touch-tree: booking a file arms `editing`,
+    /// unlinking it (the delivery seam) demotes to `working`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn board_status_editing_working_rides_the_ledger() {
+        use crate::state_snapshot::SessionStatus;
+
+        // A real repo root and an isolated tempdir ledger base.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canon").join("repo");
+        std::fs::create_dir_all(root.join(".git")).expect("mk .git");
+        std::fs::create_dir_all(root.join("src")).expect("mk src");
+        let locks = dir.path().join("locks");
+        let file = root.join("src/lib.rs");
+        std::fs::write(&file, b"").expect("write file");
+
+        let instance_id: Arc<str> = "sess-led".into();
+        let session = Arc::new(crate::bridge::session::Session::new(
+            crate::config::Config::default_with_classification(),
+            vec![root.clone()],
+            LoggingServer::new(),
+            instance_id,
+            tokio::runtime::Handle::current(),
+            None,
+        ));
+        let owner = crate::lock::Owner::new("claude", "sess-led", "");
+        let booking =
+            crate::lock::Booking::from_config(&crate::config::Config::load().expect("cfg"));
+
+        // ── Session-wide status ──────────────────────────────────────────
+        // Active accumulator, empty ledger → working.
+        session
+            .editing
+            .start_editing(Some("sess-led"), "")
+            .expect("start");
+        assert_eq!(session.status_in(&locks), SessionStatus::Working);
+
+        // Book the edit into the real ledger → the gate is armed → editing.
+        assert!(matches!(
+            crate::lock::acquire_in(
+                &locks,
+                &file,
+                &owner,
+                &booking,
+                std::time::SystemTime::now()
+            ),
+            crate::lock::Acquired::Ours
+        ));
+        session
+            .editing
+            .record_covered_edit(Some("sess-led"), "", file.clone(), true);
+        assert_eq!(
+            session.status_in(&locks),
+            SessionStatus::Editing,
+            "booked ledger debt arms the board's editing status"
+        );
+
+        // Delivery unlinks the touch file (the paid-diagnostics seam) → working.
+        crate::lock::unlink_delivered_in(&locks, &root, std::slice::from_ref(&file));
+        assert_eq!(
+            session.status_in(&locks),
+            SessionStatus::Working,
+            "paying the ledger demotes editing→working — the dead demotion, revived"
+        );
+
+        // ── Per-agent subagent status ────────────────────────────────────
+        session
+            .editing
+            .start_editing(Some("sess-led"), "agent-a")
+            .expect("sub start");
+        session
+            .editing
+            .record_covered_edit(Some("sess-led"), "agent-a", file.clone(), true);
+        // Re-book (the delivery above cleared it) → the subagent's candidate is due.
+        let _ = crate::lock::acquire_in(
+            &locks,
+            &file,
+            &owner,
+            &booking,
+            std::time::SystemTime::now(),
+        );
+        assert_eq!(
+            session.subagent_status_in("agent-a", &locks),
+            SessionStatus::Editing,
+            "a subagent candidate still due reads editing"
+        );
+        crate::lock::unlink_delivered_in(&locks, &root, std::slice::from_ref(&file));
+        assert_eq!(
+            session.subagent_status_in("agent-a", &locks),
+            SessionStatus::Working,
+            "paying the candidate demotes the subagent editing→working"
         );
     }
 
@@ -11011,8 +11093,27 @@ mod tests {
         )
         .await;
 
-        // Give the subagent undelivered editing debt: start editing then record a
-        // covered edit on its per-session router (mirrors the editing-state tests).
+        // Give the subagent undelivered editing debt. The Stop-block is keyed to
+        // the durable LEDGER now (bug 116), so the debt must be BOOKED there — a
+        // real covered file under the worktree, acquired through the production
+        // lock (`state_dir()/locks`). The in-memory batch records the same path as
+        // the candidate set. Retired at the end so the production ledger is left
+        // clean (this in-process test cannot isolate `state_dir()` via env —
+        // Rust 2024 forbids `std::env::set_var`).
+        let edited = worktree.join("src").join("main.rs");
+        std::fs::create_dir_all(edited.parent().expect("parent")).expect("mk src");
+        std::fs::write(&edited, b"fn main() {}\n").expect("write covered file");
+        let edited = edited.canonicalize().expect("canon edited");
+        let owner = crate::lock::Owner::new("test", "sess-1", "sub-1");
+        let booking =
+            crate::lock::Booking::from_config(&crate::config::Config::load().expect("cfg"));
+        assert!(
+            matches!(
+                crate::lock::acquire(&edited, &owner, &booking, std::time::SystemTime::now()),
+                crate::lock::Acquired::Ours
+            ),
+            "the covered edit books the worktree ledger"
+        );
         let _ = hook_roundtrip(
             &ipc_path,
             &serde_json::json!({
@@ -11030,7 +11131,7 @@ mod tests {
             router.session.editing.record_covered_edit(
                 Some("sess-1"),
                 "sub-1",
-                std::path::PathBuf::from("/src/main.rs"),
+                edited.clone(),
                 true,
             );
         }
@@ -11106,6 +11207,9 @@ mod tests {
             );
         }
 
+        // Leave the production ledger clean — this in-process test booked into the
+        // real `state_dir()/locks` (no in-process env isolation under Rust 2024).
+        crate::lock::retire(&worktree);
         shutdown.cancel();
     }
 

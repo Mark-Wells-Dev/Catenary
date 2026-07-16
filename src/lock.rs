@@ -385,6 +385,65 @@ pub fn has_debt(root: &Path) -> bool {
     has_debt_in(&locks_dir(), root)
 }
 
+/// The subset of `candidates` still DUE (undiagnosed) on their roots' ledgers
+/// under `locks_base` (bug 116).
+///
+/// This is the Stop-block's "which of these edited files are unpaid?" question,
+/// answered by the durable ledger.
+/// The Stop hook holds the in-memory batch's file list as its CANDIDATE set — it
+/// names the paths the agent edited, but no longer gates on the in-memory
+/// `delivered` flags (nothing in production pays them since the identity-free
+/// diagnose serve landed, root-ownership stage 3). This re-keys the gate to the
+/// single source of truth: for each candidate, resolve its root
+/// ([`resolve_lock_root`]) and test membership in that root's due set
+/// ([`due_files_in`]). A candidate still on the touch-tree is unpaid → returned;
+/// a paid (unlinked), never-booked, or foreign-territory candidate is not.
+///
+/// **Path-spelling discipline (load-bearing):** every candidate is canonicalized
+/// at this ingestion seam so its spelling matches the canonical `.lock` leaves the
+/// edit seam booked and the canonical `due_files_in` reconstructs — a
+/// symlinked-prefix alias must resolve to the SAME ledger answer, or the block
+/// would split from the debt. Pin: [`due_candidates_read_through_aliased_spelling`].
+///
+/// Roots are read once and cached, so a batch spanning one kitchen reads its
+/// ledger a single time. Preserves input order (minus the paid entries) for a
+/// stable block message. Best-effort throughout: an unreadable ledger yields no
+/// debt for that root (never a false block on a transient FS error).
+#[must_use]
+pub fn due_candidates_in(locks_base: &Path, candidates: &[PathBuf]) -> Vec<PathBuf> {
+    use std::collections::HashMap;
+    // One due-set read per distinct root, cached across the candidate scan.
+    let mut due_by_root: HashMap<PathBuf, std::collections::BTreeSet<PathBuf>> = HashMap::new();
+    let mut out = Vec::new();
+    for candidate in candidates {
+        // Canonicalize at the seam so the spelling matches the canonical ledger
+        // (misc 193 / bug 116). A path that cannot canonicalize (a vanished
+        // edit) keeps its spelling — it will simply miss the canonical due set,
+        // which is the honest reading (a deleted file books no live debt).
+        let file = candidate
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.clone());
+        let Some(root) = resolve_lock_root(&file) else {
+            // Foreign territory (/tmp, scratch) — never booked, never due.
+            continue;
+        };
+        let due = due_by_root
+            .entry(root.clone())
+            .or_insert_with(|| due_files_in(locks_base, &root).into_iter().collect());
+        if due.contains(&file) {
+            out.push(file);
+        }
+    }
+    out
+}
+
+/// Production wrapper for [`due_candidates_in`] resolving the base through
+/// [`locks_dir`].
+#[must_use]
+pub fn due_candidates(candidates: &[PathBuf]) -> Vec<PathBuf> {
+    due_candidates_in(&locks_dir(), candidates)
+}
+
 /// The current owner of a root's lock, or `None` when the root is unlocked or
 /// the lock dir is ownerless (root-ownership stage 3).
 ///
@@ -1957,6 +2016,91 @@ mod tests {
         assert!(
             due_files_in(&locks, &fx.root).is_empty(),
             "paying through the alias spelling clears the canonical debt"
+        );
+    }
+
+    // ── The Stop-block candidate check (bug 116) ───────────────────────
+
+    #[test]
+    fn due_candidates_returns_only_the_unpaid() {
+        // The Stop-block core: given the edited candidate set, return exactly the
+        // files still due on their root's ledger. A booked file is due; an unbooked
+        // one is not.
+        let fx = Fixture::new();
+        let a = fx.file("src/a.rs");
+        let b = fx.file("src/b.rs");
+        let owner = Owner::new("claude", "sess-a", "");
+        let booking = rust_booking();
+        let now = SystemTime::now();
+        let locks = fx.locks();
+
+        // Only `a` is booked (edited); `b` was never covered.
+        assert!(matches!(
+            acquire_in(&locks, &a, &owner, &booking, now),
+            Acquired::Ours
+        ));
+        let due = due_candidates_in(&locks, &[a.clone(), b.clone()]);
+        assert_eq!(due, vec![a.clone()], "only the booked candidate is due");
+
+        // Paying `a` (delivery unlinks its touch file) empties the due set.
+        unlink_delivered_in(&locks, &fx.root, std::slice::from_ref(&a));
+        assert!(
+            due_candidates_in(&locks, &[a, b]).is_empty(),
+            "a paid candidate is no longer due"
+        );
+    }
+
+    #[test]
+    fn due_candidates_skips_foreign_territory() {
+        // A candidate outside any VCS checkout resolves to no root — never booked,
+        // never due, so it is silently dropped from the due set (no false block).
+        let fx = Fixture::new();
+        let scratch = fx.dir.path().join("scratch.rs");
+        std::fs::write(&scratch, b"").expect("write scratch");
+        assert!(
+            due_candidates_in(&fx.locks(), &[scratch]).is_empty(),
+            "a foreign-territory candidate books no debt"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn due_candidates_read_through_aliased_spelling() {
+        // Path-spelling pin (bug 116 / misc 193): a candidate reached through a
+        // symlinked-prefix alias of the root must resolve to the SAME canonical
+        // ledger answer as the direct spelling — else the Stop-block would split
+        // from the debt. Linux-green does not prove this; the symlink alias is the
+        // regression pin.
+        let fx = Fixture::new();
+        let alias = fx.dir.path().join("alias");
+        std::os::unix::fs::symlink(&fx.root, &alias).expect("mk symlink");
+        let real = fx.file("src/main.rs");
+        let via_alias = alias.join("src/main.rs");
+
+        let owner = Owner::new("claude", "sess-a", "");
+        let booking = rust_booking();
+        let now = SystemTime::now();
+        let locks = fx.locks();
+
+        // Book against the canonical ledger.
+        assert!(matches!(
+            acquire_in(&locks, &real, &owner, &booking, now),
+            Acquired::Ours
+        ));
+
+        // The candidate carried in the ALIASED spelling resolves to the canonical
+        // due path — the aliased answer matches the direct answer.
+        assert_eq!(
+            due_candidates_in(&locks, std::slice::from_ref(&via_alias)),
+            vec![real.clone()],
+            "the aliased candidate resolves to the canonical due path"
+        );
+
+        // Paying the canonical ledger clears the aliased candidate too.
+        unlink_delivered_in(&locks, &fx.root, std::slice::from_ref(&real));
+        assert!(
+            due_candidates_in(&locks, &[via_alias]).is_empty(),
+            "the aliased candidate reads the same paid canonical ledger"
         );
     }
 

@@ -71,24 +71,32 @@ struct BatchFile {
 /// Per-agent editing accumulator: one **batch** plus the out-of-coverage note
 /// metadata (misc 141).
 ///
-/// **Root-ownership stage 3 retired this as the diagnostics debt source.** The
-/// on-disk lock ledger ([`crate::lock`]) is now the single source of truth for
-/// diagnostic debt: the Bash nag and the diagnose serve read the ledger by pure
-/// path algebra (cwd → root), and delivery unlinks its touch files. This in-memory
-/// batch survives only for its *non-gate* roles — the session board's
-/// editing/working status ([`Self::has_undelivered_any`]/[`is_active`](EditingManager::is_active)),
-/// the Stop-block that nags an agent to diagnose before finishing, and the
-/// worktree-land debt transfer (which reads the owner's still-unpaid set). It is
-/// no longer consulted to gate shell commands or to source the diagnose set, so it
-/// can drift from the ledger without affecting enforcement.
+/// **Root-ownership stage 3 retired this as the diagnostics debt source, and
+/// bug 116 retired the `delivered` flag's GATE role entirely.** The on-disk lock
+/// ledger ([`crate::lock`]) is now the single source of truth for diagnostic
+/// debt: the Bash nag and the diagnose serve read the ledger by pure path algebra
+/// (cwd → root), and delivery unlinks its touch files. The identity-free diagnose
+/// serve cannot flip the in-memory `delivered` flags (it does not know whose batch
+/// to pay), so nothing in production ever set them true — the old Stop-block and
+/// board status that keyed on `has_undelivered*` armed unconditionally (bug 116).
+/// Both re-key to the ledger now:
+/// [`require_release_in`](super::hook_router::HookRouter) reads
+/// [`due_candidates`](crate::lock::due_candidates) against this batch's file list,
+/// and [`Session::status`](super::session::Session::status) reads
+/// [`has_debt`](crate::lock::has_debt) across the session's roots. This batch
+/// survives only to NAME the candidate set (the paths an agent edited) for the
+/// Stop-block and subagent status, and to feed the worktree-land debt transfer.
 ///
 /// The batch is the set of covered files this agent has edited, each carrying a
-/// `delivered` flag. A covered edit into an *incomplete* batch (some flag false)
-/// joins the file / flips its flag false; a covered edit into a *complete* batch
-/// (non-empty, all flags true) discards the batch and starts a new one with that
-/// file (the flat rule). `mark_delivered_all`/`mark_delivered` flip the flags. The
-/// batch is **in-memory** daemon state keyed by `(session_id, agent_id)`, released
-/// with the instance.
+/// `delivered` flag. The flag no longer gates anything; the retained
+/// `mark_delivered*`/`has_undelivered*` API drives only the batch flip/discard
+/// lifecycle (kept in place as a reviewable minimal cut — full removal balloons
+/// across the misc-141 batch semantics and their tests). A covered edit into an
+/// *incomplete* batch (some flag false) joins the file / flips its flag false; a
+/// covered edit into a *complete* batch (non-empty, all flags true) discards the
+/// batch and starts a new one with that file (the flat rule). The batch is
+/// **in-memory** daemon state keyed by `(session_id, agent_id)`, released with the
+/// instance.
 ///
 /// Holds the covered batch alongside the [`SkippedEdits`] buckets — edits
 /// skipped during accumulation because no diagnostic feeder covers them — so a
