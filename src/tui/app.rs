@@ -842,14 +842,40 @@ impl<'a> App<'a> {
     /// dismisses). On failure the overlay carries the error.
     pub fn confirm_install(&mut self) {
         // Take the plan out without holding a borrow across execution.
-        let plan = match self.pending_install.as_ref() {
+        let (server, plan) = match self.pending_install.as_ref() {
             Some(state) if state.can_execute() => match state.plan() {
-                Ok(plan) => plan.clone(),
+                Ok(plan) => (state.server().to_owned(), plan.clone()),
                 Err(_) => return,
             },
             _ => return,
         };
-        let outcome = crate::install::execute(&plan, self.runner.as_ref(), self.fetcher.as_ref());
+        let mut outcome =
+            crate::install::execute(&plan, self.runner.as_ref(), self.fetcher.as_ref());
+        // Warranty-renewal GC (lsm 06): a successful, non-hollow install at the
+        // pin — the same post-install invariant auto-install checks (the key IS
+        // the executable, misc 162) — collects version dirs beyond the kept
+        // pair, naming each deletion in the outcome the overlay renders. A
+        // failed or hollow install never GCs; a GC hiccup never flips the
+        // outcome.
+        if outcome.success
+            && self
+                .home
+                .pinned_executable(&server, plan.version(), &server)
+                .is_some()
+        {
+            match self.home.collect_stale_versions(&server, plan.version()) {
+                Ok(collected) => {
+                    for stale in collected {
+                        outcome
+                            .log
+                            .push(format!("collected stale managed version: {server} {stale}"));
+                    }
+                }
+                Err(e) => outcome.log.push(format!(
+                    "note: stale-version collection did not complete: {e:#}"
+                )),
+            }
+        }
         let success = outcome.success;
         if let Some(state) = self.pending_install.as_mut() {
             state.set_outcome(outcome);
@@ -1486,6 +1512,104 @@ mod tests {
         assert!(
             calls.borrow().iter().any(|c| c.as_str() == "cargo"),
             "confirm ran `cargo install` via argv",
+        );
+    }
+
+    /// A runner that succeeds AND stages the managed executable at the taplo
+    /// pin — standing in for the real contained `cargo install --root` leg, so
+    /// the post-install invariant check passes and the lsm-06 GC leg runs.
+    #[cfg(unix)]
+    struct StagingRunner(PathBuf);
+
+    #[cfg(unix)]
+    impl CommandRunner for StagingRunner {
+        fn run(&self, _command: &InstallCommand) -> Result<CommandOutcome> {
+            use std::os::unix::fs::PermissionsExt;
+            let home = ManagedHome::at(self.0.clone());
+            let bin_dir = home.bin_dir("taplo", "0.10.0").expect("derives");
+            std::fs::create_dir_all(&bin_dir).expect("mkdir bin");
+            let exe = bin_dir.join("taplo");
+            std::fs::write(&exe, b"#!/bin/sh\n").expect("write stub");
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
+                .expect("mark executable");
+            Ok(CommandOutcome {
+                success: true,
+                code: Some(0),
+                output: String::new(),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirm_install_collects_stale_versions_and_names_them_in_the_outcome() {
+        // The lsm-06 renewal enactment on the guided path: with three versions
+        // present after the install, the oldest is deleted and NAMED in the
+        // outcome the overlay renders; exactly two remain.
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home_root = tmp.path().join("servers");
+        let home = ManagedHome::at(home_root.clone());
+        for (version, secs) in [("0.8.0", 100_u64), ("0.9.0", 200)] {
+            let dir = home.version_dir("taplo", version).expect("derives");
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::File::open(&dir)
+                .expect("open dir")
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .expect("set mtime");
+        }
+        let mut app = app_with(&theme, &icons, snap_with_servers(1), Config::default());
+        app.inject_install_env(
+            recipes_map("taplo", cargo_recipe()),
+            blessed_manifest("taplo", "0.10.0"),
+            Box::new(StagingRunner(home_root.clone())),
+            Box::new(NoFetch),
+            home,
+        );
+        app.problem_rows = vec![suggestion_row("taplo")];
+        app.focus = Pane::Problems;
+        app.problem_cursor.index = 0;
+
+        app.begin_action();
+        app.confirm_install();
+
+        let state = app.pending_install.as_ref().expect("overlay stays open");
+        let outcome = state.outcome().expect("the install ran");
+        assert!(outcome.success, "the install succeeds: {:?}", outcome.log);
+        assert!(
+            outcome
+                .log
+                .iter()
+                .any(|l| l == "collected stale managed version: taplo 0.8.0"),
+            "the deletion is named in the renewal output: {:?}",
+            outcome.log,
+        );
+        assert!(
+            !outcome.log.iter().any(|l| l.contains("0.9.0")),
+            "the kept previous version is not announced as collected: {:?}",
+            outcome.log,
+        );
+        let survivors = ManagedHome::at(home_root);
+        assert!(
+            !survivors
+                .version_dir("taplo", "0.8.0")
+                .expect("derives")
+                .exists(),
+            "the oldest version dir is gone",
+        );
+        assert!(
+            survivors
+                .version_dir("taplo", "0.9.0")
+                .expect("derives")
+                .is_dir(),
+            "the most recent other version is kept",
+        );
+        assert!(
+            survivors
+                .pinned_executable("taplo", "0.10.0", "taplo")
+                .is_some(),
+            "the pin just installed is kept and resolvable",
         );
     }
 

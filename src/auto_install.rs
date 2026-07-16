@@ -18,7 +18,10 @@
 //! path. **Completion kicks a pre-warm**: the caller-supplied callback fires,
 //! and the router runs the same `spawn_all` machinery a `catenary pin` uses, so
 //! coverage arrives promptly for every live mounted root whose markers match
-//! rather than lazily on the next query.
+//! rather than lazily on the next query. A landed install also enacts the
+//! warranty-renewal GC (lsm 06, [`ManagedHome::collect_stale_versions`] — see
+//! the [`crate::managed_home`] docs): version dirs beyond the kept pair are
+//! collected, each named on the landing's firehose event and snapshot record.
 //!
 //! Failure is skip-with-finding, never a retry loop: the failure is recorded on
 //! the daemon snapshot ([`crate::state_snapshot::SnapshotWriter::record_auto_install`],
@@ -359,64 +362,7 @@ impl AutoInstaller {
                 Ok(result) => result,
                 Err(e) => Err(format!("install task panicked: {e}")),
             };
-            match result {
-                Ok(()) => {
-                    info!(
-                        source = Source::LspLifecycle.as_str(),
-                        server = %missing.server,
-                        version = %missing.version,
-                        "auto-install landed: {} {} in the managed home",
-                        missing.server,
-                        missing.version,
-                    );
-                    if let Some(snapshot) = &inner.snapshot {
-                        snapshot.record_auto_install(
-                            &missing.server,
-                            &missing.version,
-                            "installed",
-                            None,
-                        );
-                    }
-                    on_installed();
-                }
-                Err(reason) => {
-                    if let Some(snapshot) = &inner.snapshot {
-                        snapshot.record_auto_install(
-                            &missing.server,
-                            &missing.version,
-                            "failed",
-                            Some(&reason),
-                        );
-                    }
-                    // One warn! per server per daemon lifetime (TUI awareness,
-                    // no desktop interrupt); repeats stay firehose-only.
-                    let first = inner
-                        .warned
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(missing.server.clone());
-                    if first {
-                        warn!(
-                            source = Source::LspLifecycle.as_str(),
-                            server = %missing.server,
-                            version = %missing.version,
-                            "auto-install of {} {} failed: {reason} — see `catenary doctor`; \
-                             the next session start retries",
-                            missing.server,
-                            missing.version,
-                        );
-                    } else {
-                        info!(
-                            source = Source::LspLifecycle.as_str(),
-                            server = %missing.server,
-                            version = %missing.version,
-                            "auto-install of {} {} failed again (already warned): {reason}",
-                            missing.server,
-                            missing.version,
-                        );
-                    }
-                }
-            }
+            report_outcome(&inner, &missing, result, on_installed);
         });
         true
     }
@@ -431,10 +377,97 @@ impl AutoInstaller {
     }
 }
 
+/// Report a finished install task: announce the landing — naming any lsm-06
+/// collected stale versions on the firehose event and the snapshot record —
+/// or the failure, then fire the pre-warm callback on success.
+fn report_outcome(
+    inner: &Inner,
+    missing: &MissingServer,
+    result: Result<Vec<String>, String>,
+    on_installed: impl FnOnce(),
+) {
+    match result {
+        Ok(collected) => {
+            info!(
+                source = Source::LspLifecycle.as_str(),
+                server = %missing.server,
+                version = %missing.version,
+                "auto-install landed: {} {} in the managed home",
+                missing.server,
+                missing.version,
+            );
+            // The lsm-06 renewal announcement: each collected stale version is
+            // named — on the firehose event and on the snapshot record's
+            // detail — never a silent sweep.
+            let detail = if collected.is_empty() {
+                None
+            } else {
+                let stale = collected.join(", ");
+                info!(
+                    source = Source::LspLifecycle.as_str(),
+                    server = %missing.server,
+                    version = %missing.version,
+                    "warranty renewal collected stale managed versions of {}: {stale}",
+                    missing.server,
+                );
+                Some(format!("collected stale versions: {stale}"))
+            };
+            if let Some(snapshot) = &inner.snapshot {
+                snapshot.record_auto_install(
+                    &missing.server,
+                    &missing.version,
+                    "installed",
+                    detail.as_deref(),
+                );
+            }
+            on_installed();
+        }
+        Err(reason) => {
+            if let Some(snapshot) = &inner.snapshot {
+                snapshot.record_auto_install(
+                    &missing.server,
+                    &missing.version,
+                    "failed",
+                    Some(&reason),
+                );
+            }
+            // One warn! per server per daemon lifetime (TUI awareness, no
+            // desktop interrupt); repeats stay firehose-only.
+            let first = inner
+                .warned
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(missing.server.clone());
+            if first {
+                warn!(
+                    source = Source::LspLifecycle.as_str(),
+                    server = %missing.server,
+                    version = %missing.version,
+                    "auto-install of {} {} failed: {reason} — see `catenary doctor`; \
+                     the next session start retries",
+                    missing.server,
+                    missing.version,
+                );
+            } else {
+                info!(
+                    source = Source::LspLifecycle.as_str(),
+                    server = %missing.server,
+                    version = %missing.version,
+                    "auto-install of {} {} failed again (already warned): {reason}",
+                    missing.server,
+                    missing.version,
+                );
+            }
+        }
+    }
+}
+
 /// Run one install to completion through the real engine (blocking; called
-/// under `spawn_blocking`). `Err` carries the honest one-line reason for the
-/// snapshot record and the warn.
-fn run_install(inner: &Inner, missing: &MissingServer) -> Result<(), String> {
+/// under `spawn_blocking`). `Ok` carries the stale versions the
+/// warranty-renewal GC collected (lsm 06 — often empty) for the landing
+/// announcement; `Err` carries the honest one-line reason for the snapshot
+/// record and the warn.
+fn run_install(inner: &Inner, missing: &MissingServer) -> Result<Vec<String>, String> {
     let manifest = inner
         .manifest_override
         .clone()
@@ -473,7 +506,25 @@ fn run_install(inner: &Inner, missing: &MissingServer) -> Result<(), String> {
             missing.server, missing.version, missing.server,
         ));
     }
-    Ok(())
+    // Warranty-renewal GC (lsm 06): this successful, invariant-checked install
+    // at the current pin IS the renewal's enactment on this machine — collect
+    // version dirs beyond the kept pair. A GC hiccup never fails the install;
+    // the next renewal retries the sweep naturally.
+    let collected = inner
+        .home
+        .collect_stale_versions(&missing.server, &missing.version)
+        .unwrap_or_else(|e| {
+            info!(
+                source = Source::LspLifecycle.as_str(),
+                server = %missing.server,
+                version = %missing.version,
+                "managed-home GC after {} {} did not complete: {e:#}",
+                missing.server,
+                missing.version,
+            );
+            Vec::new()
+        });
+    Ok(collected)
 }
 
 #[cfg(test)]
@@ -974,6 +1025,151 @@ mod tests {
         }
         assert_eq!(runs.load(Ordering::SeqCst), 2, "the retry ran once");
         assert!(!prewarmed.load(Ordering::SeqCst));
+    }
+
+    // ── warranty-renewal GC on landing (lsm 06) ───────────────────────
+
+    /// Create a bare version dir under the home (a stale previous install),
+    /// optionally pinning its mtime for deterministic install-time ordering.
+    fn stage_stale_version(home_root: &std::path::Path, version: &str, at_secs: Option<u64>) {
+        let home = ManagedHome::at(home_root.to_path_buf());
+        let dir = home.version_dir(SERVER, version).expect("derives");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        if let Some(secs) = at_secs {
+            std::fs::File::open(&dir)
+                .expect("open dir")
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .expect("set mtime");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_install_never_collects_stale_versions() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home_root = home_dir.path().join("servers");
+        stage_stale_version(&home_root, "0.8.0", None);
+        stage_stale_version(&home_root, "0.9.0", None);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let installer =
+            installer_with_runner(&home_root, Box::new(FailingRunner { runs: runs.clone() }));
+
+        let missing = MissingServer {
+            server: SERVER.to_string(),
+            version: VERSION.to_string(),
+            class: InstallClass::Compile,
+        };
+        assert!(installer.kick(&missing, || {}));
+
+        // The failure arm marks the warn ledger — the reliable completion
+        // signal for the failed task.
+        for _ in 0..200 {
+            if installer
+                .inner
+                .warned
+                .lock()
+                .expect("ledger lock")
+                .contains(SERVER)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the install ran and failed");
+        let home = ManagedHome::at(home_root);
+        for version in ["0.8.0", "0.9.0"] {
+            assert!(
+                home.version_dir(SERVER, version).expect("derives").is_dir(),
+                "a failed install must not GC: {version} survives",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn landed_install_collects_stale_versions_and_records_them() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home_root = home_dir.path().join("servers");
+        // Two stale versions with explicit install times; the runner stages
+        // VERSION at "now", so the ordering is oldest → 0.8.0.
+        stage_stale_version(&home_root, "0.8.0", Some(100));
+        stage_stale_version(&home_root, "0.9.0", Some(200));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let snapshot = SnapshotWriter::with_coalesce(
+            &tokio::runtime::Handle::current(),
+            home_dir.path(),
+            crate::state_snapshot::DaemonInfo::current(
+                "daemon:test".to_string(),
+                1,
+                crate::state_snapshot::now_iso(),
+            ),
+            std::time::Duration::from_millis(10),
+        );
+        let installer = AutoInstaller::with_parts(
+            ManagedHome::at(home_root.clone()),
+            recipes(),
+            Some(Arc::new(manifest())),
+            Box::new(StagingRunner {
+                home_root: home_root.clone(),
+                gate: None,
+                runs: runs.clone(),
+            }),
+            Box::new(NoFetch),
+            Some(snapshot.clone()),
+        );
+
+        let missing = MissingServer {
+            server: SERVER.to_string(),
+            version: VERSION.to_string(),
+            class: InstallClass::Compile,
+        };
+        assert!(installer.kick(&missing, || {}));
+
+        // Wait for the landing to reach the snapshot record.
+        let mut recorded = None;
+        for _ in 0..200 {
+            snapshot.flush_now();
+            let parsed = std::fs::read_to_string(snapshot.path())
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+            if let Some(entry) = parsed
+                .as_ref()
+                .and_then(|v| v.get("auto_installs"))
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .filter(|e| e.get("status").and_then(|s| s.as_str()) == Some("installed"))
+            {
+                recorded = Some(entry.clone());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let entry = recorded.expect("the landed install is recorded on the snapshot");
+        let detail = entry
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .expect("the record names the collected versions");
+        assert!(
+            detail.contains("0.8.0"),
+            "the oldest stale version is named on the record: {detail}",
+        );
+        assert!(
+            !detail.contains("0.9.0"),
+            "the kept previous version is not named as collected: {detail}",
+        );
+
+        let home = ManagedHome::at(home_root);
+        assert!(
+            !home.version_dir(SERVER, "0.8.0").expect("derives").exists(),
+            "the oldest stale version dir is gone",
+        );
+        assert!(
+            home.version_dir(SERVER, "0.9.0").expect("derives").is_dir(),
+            "the most recent other version is kept (the rollback target)",
+        );
+        assert!(
+            home.pinned_executable(SERVER, VERSION, SERVER).is_some(),
+            "the pin just installed is kept and resolvable",
+        );
     }
 
     #[test]

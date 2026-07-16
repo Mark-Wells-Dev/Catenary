@@ -28,6 +28,28 @@
 //! (`[servers] prefer_managed = false`, or an explicit `[lsp.server.*]`
 //! `path` override), and rust-analyzer is exempt by design
 //! ([`crate::recipes::BlessedManifest::pinned_version`]).
+//!
+//! **Warranty-renewal GC (lsm 06).** A version bump is a warranty renewal: the
+//! renewal *event* is repo-side (a new blessed pin ships in the manifest), but
+//! its *enactment* on a user's machine is the successful managed install of
+//! the server at its current blessed pin — via the guided install or
+//! auto-install, both of which run [`crate::install::execute`]. GC hooks
+//! exactly that completion, after the post-install invariant check (a failed
+//! or hollow install never GCs): [`ManagedHome::collect_stale_versions`] keeps
+//! [`MANAGED_KEPT_VERSIONS`] version dirs — the pin just installed plus the
+//! most recently installed *other* version, the trivial-rollback target — and
+//! deletes everything older, each deletion named in the install's own outcome
+//! surface (the guided overlay's outcome log; the auto-install firehose event
+//! and snapshot record), never a silent sweep. "Most recent" is the version
+//! dir's mtime (install time), not semantic version order: the previous
+//! *vetted* pin is whatever landed last — right even across a pin rollback —
+//! and the codebase has no general version-compare helper for the fleet's
+//! mixed version shapes (`5.6.0`, `v0.22.0`, …). Deleting is safe because the
+//! tier is regenerable: the SRI-pinned recipe reinstalls any historical
+//! version exactly, and resolution ([`ManagedHome::pinned_executable`]) only
+//! ever points at the current pin — exactly the version being kept. Doctor
+//! never deletes, there is no GC verb, and nothing else in the codebase
+//! removes version dirs.
 
 use std::path::{Path, PathBuf};
 
@@ -37,6 +59,16 @@ use tracing::debug;
 use crate::config::ServerDef;
 use crate::recipes::BlessedManifest;
 use crate::source::Source;
+
+/// How many version dirs of one server the managed home retains after a
+/// successful install (lsm 06).
+///
+/// The kept set is the version just installed (the current pin) plus the
+/// single most recently installed other version — the trivial rollback target
+/// while a renewed pin proves itself. The ruled value is 2 (current +
+/// previous vetted). A named constant, not policy plumbing — the N stays open
+/// to later bikeshedding.
+pub const MANAGED_KEPT_VERSIONS: usize = 2;
 
 /// The Catenary-managed server home: the single owner of every
 /// install-destination path.
@@ -118,6 +150,87 @@ impl ManagedHome {
         }
         let candidate = self.bin_dir(server, version).ok()?.join(bin_name);
         is_executable(&candidate).then_some(candidate)
+    }
+
+    /// Warranty-renewal GC (lsm 06): delete `server`'s version dirs beyond the
+    /// kept set — `kept_version` (the pin just installed) plus the most
+    /// recently installed other version dirs, [`MANAGED_KEPT_VERSIONS`] total —
+    /// returning the deleted versions (oldest first) so the caller can name
+    /// each one in the install's outcome. Never a silent sweep: an empty
+    /// return means nothing was deleted (a same-version reinstall with nothing
+    /// older than the previous vetted version deletes nothing — idempotent).
+    ///
+    /// "Most recently installed" orders by the version dir's mtime — install
+    /// time — not semantic version order (the module docs state why); an
+    /// unreadable mtime orders oldest. Ties break lexically for determinism.
+    ///
+    /// Containment: only entries that are real directories (never files or
+    /// symlinks) whose names pass the same segment validation as
+    /// [`Self::version_dir`] are candidates, and every deletion path is
+    /// re-derived through [`Self::version_dir`] — nothing a validated
+    /// derivation didn't produce is ever removed. Callers gate the call on
+    /// install success plus the post-install invariant check; this method
+    /// never decides that.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a segment fails validation, when the server's
+    /// directory exists but cannot be listed (a missing directory is
+    /// `Ok(vec![])` — nothing installed yet), or when a stale dir cannot be
+    /// removed. Callers treat a GC error as announce-only: the install already
+    /// succeeded, and the next warranty renewal retries the sweep naturally.
+    pub fn collect_stale_versions(&self, server: &str, kept_version: &str) -> Result<Vec<String>> {
+        // Validate both segments up front — the same derivation every deletion
+        // below reuses.
+        self.version_dir(server, kept_version)?;
+        let server_dir = self.root.join(server);
+        let entries = match std::fs::read_dir(&server_dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            result => result.with_context(|| format!("listing {}", server_dir.display()))?,
+        };
+        let mut others: Vec<(std::time::SystemTime, String)> = Vec::new();
+        for entry in entries {
+            // An unreadable entry is skipped, never deleted.
+            let Ok(entry) = entry else { continue };
+            // Only a real directory is a version dir — a file or a symlink is
+            // not something a managed install produced, so never a candidate
+            // (`DirEntry::file_type` does not follow symlinks).
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue; // non-UTF-8 — not a name a validated version_dir produced
+            };
+            if name == kept_version || validate_segment("version", &name).is_err() {
+                continue;
+            }
+            // Install time from the dir mtime; unreadable orders oldest.
+            let installed_at = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            others.push((installed_at, name));
+        }
+        // Oldest first; the lexical tiebreak only pins determinism for
+        // identical timestamps.
+        others.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let keep_others = MANAGED_KEPT_VERSIONS.saturating_sub(1);
+        let stale = others.len().saturating_sub(keep_others);
+        let mut collected = Vec::with_capacity(stale);
+        for (_, version) in others.into_iter().take(stale) {
+            // Re-derive through the validated join — the ONLY path deleted.
+            let dir = self.version_dir(server, &version)?;
+            std::fs::remove_dir_all(&dir)
+                .with_context(|| format!("removing stale version dir {}", dir.display()))?;
+            debug!(
+                source = Source::LspLifecycle.as_str(),
+                server = server,
+                version = %version,
+                "warranty-renewal GC removed stale managed version dir: {server} {version}",
+            );
+            collected.push(version);
+        }
+        Ok(collected)
     }
 }
 
@@ -509,6 +622,171 @@ mod tests {
         assert_eq!(
             program, "srv",
             "a non-executable entry is not a spawn candidate"
+        );
+    }
+
+    // ── warranty-renewal GC (lsm 06) ──────────────────────────────────
+
+    /// Create `<home>/<server>/<version>/` with an explicit mtime, so the GC's
+    /// install-time ordering is asserted deterministically, never wall-clock
+    /// racy. `at_secs` counts from the Unix epoch.
+    #[cfg(unix)]
+    fn stage_version_dir(home: &ManagedHome, server: &str, version: &str, at_secs: u64) {
+        let dir = home.version_dir(server, version).expect("plain segments");
+        std::fs::create_dir_all(&dir).expect("mkdir version dir");
+        std::fs::File::open(&dir)
+            .expect("open dir")
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(at_secs))
+            .expect("set dir mtime");
+    }
+
+    /// The sorted version-dir names currently under `<home>/<server>/`.
+    fn version_dirs(home: &ManagedHome, server: &str) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(home.root().join(server))
+            .expect("list server dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_keeps_the_pin_plus_the_most_recent_other_and_names_the_rest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = ManagedHome::at(tmp.path().join("servers"));
+        stage_version_dir(&home, "srv", "0.7.0", 100);
+        stage_version_dir(&home, "srv", "0.8.0", 200);
+        stage_version_dir(&home, "srv", "0.9.0", 300);
+        stage_version_dir(&home, "srv", "1.0.0", 400); // the pin just installed
+
+        let collected = home
+            .collect_stale_versions("srv", "1.0.0")
+            .expect("gc runs");
+        assert_eq!(
+            collected,
+            vec!["0.7.0".to_string(), "0.8.0".to_string()],
+            "every deletion is named, oldest first — never a silent sweep",
+        );
+        let remaining = version_dirs(&home, "srv");
+        assert_eq!(
+            remaining,
+            vec!["0.9.0".to_string(), "1.0.0".to_string()],
+            "exactly the kept set remains: the pin + the most recent other",
+        );
+        assert_eq!(
+            remaining.len(),
+            MANAGED_KEPT_VERSIONS,
+            "the ruled N=2 retention",
+        );
+    }
+
+    #[test]
+    fn gc_same_version_reinstall_deletes_nothing() {
+        // Two dirs — previous + current. A reinstall at the current pin finds
+        // nothing beyond the kept set, so the sweep is an idempotent no-op.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = ManagedHome::at(tmp.path().join("servers"));
+        for version in ["0.9.0", "1.0.0"] {
+            let dir = home.version_dir("srv", version).expect("derives");
+            std::fs::create_dir_all(dir).expect("mkdir");
+        }
+
+        let collected = home
+            .collect_stale_versions("srv", "1.0.0")
+            .expect("gc runs");
+        assert!(collected.is_empty(), "nothing to collect: {collected:?}");
+        assert_eq!(
+            version_dirs(&home, "srv"),
+            vec!["0.9.0".to_string(), "1.0.0".to_string()],
+            "both kept versions survive a same-version reinstall",
+        );
+    }
+
+    #[test]
+    fn gc_on_a_never_installed_server_is_a_clean_no_op() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = ManagedHome::at(tmp.path().join("servers"));
+        let collected = home
+            .collect_stale_versions("srv", "1.0.0")
+            .expect("a missing server dir is not an error");
+        assert!(collected.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_orders_by_install_time_not_semantic_version() {
+        // A pin-rollback story: 1.2.0 landed long ago, the pin rolled back to
+        // 1.1.9 (installed later), and now renews to 1.2.1. The previous
+        // *vetted* pin is 1.1.9 — the most recently installed other — so it is
+        // kept and 1.2.0 collected, though semver ordering would say otherwise.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = ManagedHome::at(tmp.path().join("servers"));
+        stage_version_dir(&home, "srv", "1.2.0", 100);
+        stage_version_dir(&home, "srv", "1.1.9", 200);
+        stage_version_dir(&home, "srv", "1.2.1", 300);
+
+        let collected = home
+            .collect_stale_versions("srv", "1.2.1")
+            .expect("gc runs");
+        assert_eq!(collected, vec!["1.2.0".to_string()]);
+        assert_eq!(
+            version_dirs(&home, "srv"),
+            vec!["1.1.9".to_string(), "1.2.1".to_string()],
+            "install-time ordering keeps the actual rollback target",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_deletes_only_validated_version_dirs() {
+        // Containment: a stray file (even one older than everything) and a
+        // symlinked directory are never candidates — only real directories the
+        // validated derivation produces are removed, and a symlink's target
+        // outside the home stays intact.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = ManagedHome::at(tmp.path().join("servers"));
+        stage_version_dir(&home, "srv", "0.8.0", 100);
+        stage_version_dir(&home, "srv", "0.9.0", 200);
+        stage_version_dir(&home, "srv", "1.0.0", 300);
+        let server_dir = home.root().join("srv");
+        let stray = server_dir.join("notes.txt");
+        std::fs::write(&stray, b"not a version dir").expect("write stray");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        std::fs::write(outside.join("keep.me"), b"payload").expect("write payload");
+        let link = server_dir.join("0.0.1-link");
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink");
+
+        let collected = home
+            .collect_stale_versions("srv", "1.0.0")
+            .expect("gc runs");
+        assert_eq!(
+            collected,
+            vec!["0.8.0".to_string()],
+            "only the oldest real version dir is collected",
+        );
+        assert!(stray.is_file(), "a stray file is never a candidate");
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "a symlinked entry is never a candidate",
+        );
+        assert!(
+            outside.join("keep.me").is_file(),
+            "nothing outside the home is ever touched",
+        );
+    }
+
+    #[test]
+    fn gc_refuses_non_plain_segments() {
+        let home = ManagedHome::at(PathBuf::from("/mh"));
+        assert!(
+            home.collect_stale_versions("a/b", "1.0.0").is_err(),
+            "a separator-carrying server segment is refused",
+        );
+        assert!(
+            home.collect_stale_versions("srv", "..").is_err(),
+            "a traversing kept-version segment is refused",
         );
     }
 
