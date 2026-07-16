@@ -20,6 +20,8 @@ pub mod config;
 pub mod filter;
 /// Health model: typed findings shared by `catenary doctor` and the TUI.
 pub mod health;
+/// The hit-batch frame protocol and the CLI-owns-the-walk skeleton (ws43).
+pub mod hitstream;
 /// IPC server for host CLI hook integration (diagnostics and root sync).
 pub mod hook;
 /// Guided-install engine: consented, verified per-ecosystem installs (tui-rework 06).

@@ -68,6 +68,18 @@ pub const METHOD_GREP: &str = "tool/grep";
 /// IPC method string for glob requests.
 pub const METHOD_GLOB: &str = "tool/glob";
 
+/// IPC method string for the ws43 hit-batch annotation stream.
+///
+/// The CLI opens this on the existing socket, sends its method line, then streams
+/// [`crate::hitstream::HitFrame`] batches; the daemon annotates each under budget
+/// and streams [`crate::hitstream::AnnotationFrame`] batches back. An old daemon
+/// that predates this method never matches the arm and falls through to the
+/// unknown-method tail — the CLI reads no recognizable annotation frame and
+/// degrades to the unannotated stream, the same fallback as daemon-absent. The
+/// string is owned by the protocol module ([`crate::hitstream::HITSTREAM_METHOD`])
+/// and re-exported here.
+pub const METHOD_HITSTREAM: &str = crate::hitstream::HITSTREAM_METHOD;
+
 /// Compact, lexically-sortable UTC timestamp prefix for per-invocation search
 /// files (`grep/<ts>_<uuid>.jsonl`).
 ///
@@ -5643,6 +5655,22 @@ async fn handle_hook_dispatch(
     if method == "tool/editing-start" {
         writer.write_all(b"{\"status\":\"ok\"}\n").await?;
         writer.shutdown().await?;
+        return Ok(());
+    }
+
+    // ── Hit-batch annotation stream (ws43) ──────────────────────
+    //
+    // `tool/hitstream` is opened by the CLI-owns-the-walk engine. The method
+    // line has already been read; the CLI now streams `HitFrame` batches on this
+    // same connection. The daemon annotates each batch under budget (pass-through
+    // in this ticket) and streams `AnnotationFrame` batches back, preserving batch
+    // order. A malformed frame or a socket fault tears the connection down; the
+    // CLI, seeing an incomplete annotation stream, degrades to the unannotated
+    // stdout stream — the same fallback as daemon-absent (degrade-only). This arm
+    // is a native async citizen: read batch → await (budgeted) → write batch, no
+    // lock guard held across an await.
+    if method == METHOD_HITSTREAM {
+        crate::hitstream::serve_passthrough(&mut buf_reader, &mut writer).await?;
         return Ok(());
     }
 
@@ -13009,6 +13037,10 @@ mod tests {
     fn method_constants() {
         assert_eq!(METHOD_GREP, "tool/grep");
         assert_eq!(METHOD_GLOB, "tool/glob");
+        assert_eq!(METHOD_HITSTREAM, "tool/hitstream");
+        // The router constant re-exports the protocol module's owner (ws43), so
+        // the two spellings can never drift.
+        assert_eq!(METHOD_HITSTREAM, crate::hitstream::HITSTREAM_METHOD);
     }
 
     // ── repeatable --exclude-pattern to_params (bug 89) ──────────
