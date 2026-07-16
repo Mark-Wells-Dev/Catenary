@@ -1451,10 +1451,16 @@ fn render_search_outcome(
     } else {
         // The scope-disclosure anchor for cwd-anchored grep results (misc 172),
         // kept on stdout so `2>/dev/null` cannot lose it (see the doc comment).
-        if matches!(kind, SearchKind::Grep { .. }) && cwd_anchored(paths) {
-            let _ = out.writeln(format_args!("cwd: {}", compress_home(cwd)));
+        // Assembled into the SAME atomic block as the body so the anchor and its
+        // results are one `write_all`, flushed before any stderr advisory — the
+        // whole result body is one write, never split across syscalls a merged-fd
+        // hint could interleave (bug 112).
+        let anchored = matches!(kind, SearchKind::Grep { .. }) && cwd_anchored(paths);
+        if anchored {
+            let _ = out.write_block(&format!("cwd: {}\n{body}", compress_home(cwd)));
+        } else {
+            let _ = out.write_block(body);
         }
-        let _ = out.writeln(format_args!("{body}"));
     }
     // Per-argument glob no-match report (stderr) — fired whether or not the body
     // was empty, so a pattern that matched nothing is loud even when a sibling

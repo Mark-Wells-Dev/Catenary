@@ -261,6 +261,29 @@ impl Output {
         write!(self.w, "{args}")
     }
 
+    /// Write a pre-rendered result block as ONE atomic `write_all`, its trailing
+    /// newline included, then flush.
+    ///
+    /// The block-level analogue of [`crate::hitstream::sink::ResultSink::write_line`]
+    /// for the query result path: the whole body is assembled into one owned
+    /// buffer and flushed with a single `write_all`, so `io::Stdout`'s line
+    /// buffering never splits it into per-line syscalls that a physically-merged
+    /// stderr advisory could interleave (bug 112 — a `for its listing:` hint
+    /// fusing mid-line into a stdout result under `2>&1` piping). Flushing here,
+    /// before the caller writes any advisory to stderr, drains stdout fully so the
+    /// two streams never interleave under a merged fd.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the write or flush fails.
+    pub fn write_block(&mut self, body: &str) -> io::Result<()> {
+        let mut buf = String::with_capacity(body.len() + 1);
+        buf.push_str(body);
+        buf.push('\n');
+        self.w.write_all(buf.as_bytes())?;
+        self.w.flush()
+    }
+
     /// Create an in-memory buffer that captures written bytes.
     ///
     /// Pairs with [`Output::into_string`] to capture and assert on emitted
@@ -417,6 +440,30 @@ mod tests {
         assert_eq!(config.yellow("test"), "test");
         assert_eq!(config.bold("test"), "test");
         assert_eq!(config.dim("test"), "test");
+    }
+
+    // ── write_block (bug 112: atomic result-body write) ──────────────
+
+    /// `write_block` appends exactly one trailing newline and emits the body
+    /// verbatim — the atomic-line-write leg that keeps a multi-line result body
+    /// one `write_all` (never split across per-line syscalls a merged-fd stderr
+    /// advisory could interleave).
+    #[test]
+    fn write_block_appends_single_newline() {
+        let mut out = Output::buffer(80);
+        out.write_block("line one\nline two\nline three")
+            .expect("write_block");
+        assert_eq!(out.into_string(), "line one\nline two\nline three\n");
+    }
+
+    /// A body that already ends in a newline still gets exactly one newline
+    /// appended (the caller trims trailing newlines before handing the body over,
+    /// so this documents the raw contract: one `\n` is always added).
+    #[test]
+    fn write_block_adds_exactly_one_newline_even_when_body_lacks_one() {
+        let mut out = Output::buffer(80);
+        out.write_block("solo").expect("write_block");
+        assert_eq!(out.into_string(), "solo\n");
     }
 
     // ── HostFormat tests ────────────────────────────────────────────

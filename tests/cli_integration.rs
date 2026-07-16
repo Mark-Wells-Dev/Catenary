@@ -1248,3 +1248,214 @@ fn test_version_piped_stdout_delivers_full_output() -> Result<()> {
 
     Ok(())
 }
+
+// ── bug 112: the glob `for its listing:` hint fuses into stdout under piping ──
+
+/// Builds a workspace whose `**` glob resolves to a directory (firing the
+/// teaching-moment-4 `for its listing:` hint) plus a large, multi-line body
+/// (many files, each long) so the stdout stream is well over the kernel pipe
+/// buffer — the geometry under which `io::Stdout`'s line buffering used to split
+/// the body across syscalls a merged-fd stderr hint could interleave. Returns
+/// `(root, state_home_str)`; the daemon is left running on `bridge`, which the
+/// caller must keep alive for the duration of the glob run.
+fn bug112_workspace(root: &std::path::Path) -> Result<()> {
+    // A subdirectory the `**` pattern matches — this is what fires the dir hint.
+    let sub = root.join("resolver");
+    std::fs::create_dir_all(&sub)?;
+    // Enough long files that the rendered listing dwarfs the 64 KiB pipe buffer,
+    // forcing the multi-syscall write path the bug rode.
+    let long_line = "// a reasonably long source line to inflate the body\n".repeat(40);
+    for f in 0..60 {
+        std::fs::write(root.join(format!("file_{f:02}.rs")), &long_line)?;
+        std::fs::write(sub.join(format!("inner_{f:02}.rs")), &long_line)?;
+    }
+    Ok(())
+}
+
+/// The hint line the glob emits when its pattern resolves a directory
+/// (teaching moment 4). This substring must appear ONLY on stderr, never fused
+/// into a stdout result line.
+const GLOB_HINT_MARKER: &str = "for its listing:";
+
+/// Deterministic contract regression for bug 112: an enriched `catenary glob`
+/// whose `**` pattern matches a directory emits the `for its listing:` hint —
+/// and that hint rides **stderr only**. The stdout capture holds zero hint bytes
+/// and every stdout line is a well-formed result line (an absolute path listing
+/// row or an indented outline/summary row), never prose.
+///
+/// Separate stdout/stderr pipes make the assertion deterministic: it pins the
+/// stream contract (advisory on stderr, results on stdout) independent of the
+/// interleaving race, so a regression that routed the hint back onto stdout — or
+/// split it across the streams — fails here every run.
+#[test]
+fn test_glob_listing_hint_rides_stderr_only() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+    let root = tempfile::tempdir()?;
+    let root_str = root.path().to_str().context("root path")?;
+    bug112_workspace(root.path())?;
+
+    let mut bridge = common::BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_ROOTS", root_str);
+    })?;
+    bridge.initialize()?;
+
+    let ipc_sock = common::xdg_state_home(state_dir.path())
+        .join("catenary")
+        .join("catenary.sock");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !ipc_sock.exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, state_home);
+    cmd.current_dir(root.path())
+        .args(["glob", "**"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = cmd.output().context("failed to run catenary glob")?;
+    assert!(
+        output.status.success(),
+        "glob must exit 0, got {:?}; stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The hint fired — otherwise the test is not exercising the bug's path.
+    assert!(
+        stderr.contains(GLOB_HINT_MARKER),
+        "the directory match must emit the listing hint on stderr; stderr:\n{stderr}"
+    );
+    // ...and it is present ONLY on stderr: not one hint byte reaches stdout.
+    // Both the human hint marker AND its embedded command fragment
+    // (`catenary glob '<dir>/*'`) must be absent from stdout — the fusion welded
+    // that fragment onto a result line.
+    assert!(
+        !stdout.contains(GLOB_HINT_MARKER) && !stdout.contains("catenary glob '"),
+        "the listing hint must never appear on stdout (bug 112); stdout head:\n{}",
+        stdout.lines().take(20).collect::<Vec<_>>().join("\n"),
+    );
+
+    // The stdout body is non-empty (the workspace resolved a listing) — the test
+    // is exercising a real, large result body, not an empty stream.
+    assert!(
+        stdout.contains("file_00.rs") && stdout.contains("inner_00.rs"),
+        "stdout must carry the workspace listing; head:\n{}",
+        stdout.lines().take(10).collect::<Vec<_>>().join("\n"),
+    );
+
+    drop(bridge);
+    Ok(())
+}
+
+/// Stream-discipline guard for bug 112 under the real merged-fd geometry: run
+/// `catenary glob '**'` with stdout and stderr sharing ONE physical pipe (exactly
+/// how a backgrounding agent harness captures a command with `2>&1`), and assert
+/// the `for its listing:` hint always lands on its OWN line — never fused mid-line
+/// into a stdout result row — and that no other line carries the hint's command
+/// fragment.
+///
+/// The fusion was a buffering interleave (line-buffered stdout vs. immediate
+/// stderr on a shared fd), an intermittent race. This loops a bounded 24
+/// iterations so a probabilistic regression has repeated chances to surface. With
+/// the fix — the body written as one atomic `write_all` and flushed before any
+/// advisory — the two streams cannot interleave: stdout is fully drained before
+/// the hint is written.
+///
+/// Reliability note (beta-tester honesty): under this harness's `std::io::pipe`
+/// geometry the pre-fix code did NOT reproduce the fusion in 24-iteration and
+/// N=4 stress runs — Rust's `LineWriter` flushes the body up to its last newline
+/// in one blocking `write_all` before the sequential stderr write, so the
+/// interleave window the maintainer observed against the live rust-analyzer daemon
+/// (a ~48 KB enriched body) did not open here. This test therefore pins the
+/// CONTRACT (hint on its own line under merged fds) rather than deterministically
+/// reproducing the timing; the atomic-write mechanism itself is pinned
+/// deterministically by `write_block_appends_single_newline` in `cli::mod`.
+#[test]
+fn test_glob_listing_hint_never_fuses_in_merged_stream() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+    let root = tempfile::tempdir()?;
+    let root_str = root.path().to_str().context("root path")?;
+    bug112_workspace(root.path())?;
+
+    let mut bridge = common::BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_ROOTS", root_str);
+    })?;
+    bridge.initialize()?;
+
+    let ipc_sock = common::xdg_state_home(state_dir.path())
+        .join("catenary")
+        .join("catenary.sock");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !ipc_sock.exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    for iter in 0..24 {
+        // Merge the child's stdout and stderr into ONE physical pipe — the exact
+        // `2>&1` geometry a backgrounding harness captures, and the only stream
+        // where a stderr hint can fuse into a stdout result. Both fds are handed
+        // the same pipe writer (no `unsafe`, no PATH-dependent `sh`); the parent
+        // reads the merged bytes off the reader.
+        let (mut reader, writer) = std::io::pipe().context("create merge pipe")?;
+        let writer_dup = writer.try_clone().context("clone merge pipe writer")?;
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+        isolate_env(&mut cmd, state_home);
+        cmd.current_dir(root.path())
+            .args(["glob", "**"])
+            .stdout(Stdio::from(writer))
+            .stderr(Stdio::from(writer_dup));
+        let mut child = cmd.spawn().context("failed to spawn merged glob")?;
+
+        // Drop the parent's writer ends so the reader sees EOF once the child
+        // exits — otherwise `read_to_string` would block on the parent's own
+        // dangling write fds.
+        drop(cmd);
+        let mut merged = String::new();
+        std::io::Read::read_to_string(&mut reader, &mut merged).context("read merged stream")?;
+        let status = child.wait().context("wait for merged glob")?;
+        assert!(
+            status.success(),
+            "iter {iter}: merged glob must exit 0, got {:?}; merged:\n{}",
+            status.code(),
+            merged.lines().take(10).collect::<Vec<_>>().join("\n"),
+        );
+
+        // The hint fired this run (the merged stream carries stderr too).
+        assert!(
+            merged.contains(GLOB_HINT_MARKER),
+            "iter {iter}: the merged stream must carry the listing hint; head:\n{}",
+            merged.lines().take(10).collect::<Vec<_>>().join("\n"),
+        );
+        for line in merged.lines() {
+            if line.contains(GLOB_HINT_MARKER) {
+                // A line touching the hint must BE the hint line, whole — starting
+                // at the marker, never a result row with the hint welded onto its
+                // front or tail (the fusion signature). The hint is the only line
+                // that may carry the `for its listing:` / `catenary glob '`
+                // fragments.
+                assert!(
+                    line.starts_with(GLOB_HINT_MARKER),
+                    "iter {iter}: the hint fused into a result line (bug 112); line:\n{line}"
+                );
+            } else {
+                // No non-hint line may carry the hint's command fragment either —
+                // a split hint could deposit `catenary glob '` without the leading
+                // marker.
+                assert!(
+                    !line.contains("catenary glob '"),
+                    "iter {iter}: a result line carries the hint's command fragment (fusion); line:\n{line}"
+                );
+            }
+        }
+    }
+
+    drop(bridge);
+    Ok(())
+}
