@@ -366,6 +366,12 @@ struct Args {
     #[arg(long)]
     report_env: Option<String>,
 
+    /// Report this string verbatim as `serverInfo.version` in the initialize
+    /// response (lsm 03 — version-drift detection). Wins over `--report-env`
+    /// when both are set.
+    #[arg(long)]
+    server_version: Option<String>,
+
     /// Publish an EXTRA diagnostic alongside the default one, with a custom
     /// `source` and `code` (repeatable). Lets a single mockls instance emit
     /// overlapping multi-source diagnostics — the shape rust-analyzer produces
@@ -1208,6 +1214,12 @@ impl MockServer {
             result["serverInfo"] = serde_json::json!({
                 "name": "mockls",
                 "version": value
+            });
+        }
+        if let Some(ref version) = self.args.server_version {
+            result["serverInfo"] = serde_json::json!({
+                "name": "mockls",
+                "version": version
             });
         }
         result
@@ -3199,6 +3211,7 @@ mod tests {
             stderr_message: None,
             stderr_length: None,
             report_env: None,
+            server_version: None,
             extra_diagnostic: vec![],
         }
     }

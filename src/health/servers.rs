@@ -116,6 +116,12 @@ pub enum ServerStatus {
     Ready {
         /// Catenary tool names derived from the server's LSP capabilities.
         capabilities: Vec<&'static str>,
+        /// The version the server reported in the `initialize` result's
+        /// `serverInfo.version` (lsm 03) — the version-drift input. `None`
+        /// when the server reported no `serverInfo`/version (silence: absence
+        /// of evidence is not drift) or the feed carries no version data (the
+        /// TUI snapshot feed).
+        version: Option<String>,
     },
     /// The configured binary was not found on `$PATH`.
     BinaryNotFound(String),
@@ -296,7 +302,9 @@ pub fn classify_server(
     }
 }
 
-/// One finding per configured server, sorted by name.
+/// One finding per configured server, sorted by name — plus, for a ready
+/// server whose reported version drifted from its blessed pin, the advisory
+/// drift finding (lsm 03).
 ///
 /// The severity is the routed-vs-dormant derivation crossed with the **intent**
 /// axis (severity ladder, ratified 2026-07-07):
@@ -317,29 +325,67 @@ pub fn server_findings(config: &Config, feed: &dyn HealthFeed) -> Vec<Finding> {
 
     names
         .into_iter()
-        .map(|name| {
+        .flat_map(|name| {
             let class = classify_server(config, name, feed.active_languages());
             match feed.server_status(name) {
-                Some(ServerStatus::Ready { .. }) => {
+                Some(ServerStatus::Ready { version, .. }) => {
                     let suffix = ready_suffix(config, name);
-                    Finding::new(
+                    let mut findings = vec![Finding::new(
                         FindingCode::ServerReady,
                         Severity::Ok,
                         format!("{name}: ready{suffix}"),
-                    )
+                    )];
+                    findings.extend(version_drift_finding(name, version.as_deref()));
+                    findings
                 }
                 Some(status) => {
                     let finding = broken_finding(name, class, status);
-                    attach_provenance(finding, config, name, feed)
+                    vec![attach_provenance(finding, config, name, feed)]
                 }
-                None => Finding::new(
+                None => vec![Finding::new(
                     FindingCode::ServerDormant,
                     Severity::Info,
                     format!("{name}: not probed"),
-                ),
+                )],
             }
         })
         .collect()
+}
+
+/// The advisory version-drift finding for a ready server, or `None` (lsm 03).
+///
+/// Consults the active blessed manifest
+/// ([`crate::recipes::BlessedManifest::version_drift`]): silence for an
+/// unreported version, a matching version, an unblessed server, or the
+/// exempt toolchain-tracking rust-analyzer. Detection only — never a spawn
+/// gate, never a problem severity.
+fn version_drift_finding(name: &str, running: Option<&str>) -> Option<Finding> {
+    let running = running?;
+    let drift = crate::recipes::active_manifest().version_drift(name, running)?;
+    Some(drift_finding(name, &drift))
+}
+
+/// Render a [`crate::recipes::VersionDrift`] into its doctor finding: the
+/// message names both versions (pinned and running); the fix-it carries the
+/// warranty-tier annotation on the row's evidence class.
+///
+/// [`Severity::Info`], deliberately: running your own server version is a
+/// choice, not a fault — the finding discloses the warranty scope honestly and
+/// changes nothing.
+fn drift_finding(name: &str, drift: &crate::recipes::VersionDrift) -> Finding {
+    Finding::new(
+        FindingCode::ServerVersionDrift,
+        Severity::Info,
+        format!(
+            "{name}: running version {} differs from the blessed {} ({})",
+            drift.running, drift.pinned, drift.platform
+        ),
+    )
+    .with_fix_it(format!(
+        "{}. Running your own version is a choice, not a fault — nothing is \
+         refused; the conformance warranty simply does not cover it.",
+        drift.warranty_annotation(name)
+    ))
 }
 
 /// Attach the routing provenance (item 4) to a routed-broken or suggestion
@@ -611,8 +657,14 @@ pub async fn probe_server(
         Ok(Ok(result)) => {
             let capabilities =
                 extract_capabilities(&result["capabilities"], client.supports_type_hierarchy());
+            // The drift input (lsm 03): the `serverInfo.version` the client
+            // captured from the initialize result, nearly free at probe time.
+            let version = client.server_version().map(str::to_string);
             let _ = client.shutdown().await;
-            ServerStatus::Ready { capabilities }
+            ServerStatus::Ready {
+                capabilities,
+                version,
+            }
         }
         Ok(Err(e)) => {
             let _ = client.shutdown().await;
@@ -975,6 +1027,7 @@ mod tests {
             "rust-analyzer".to_string(),
             ServerStatus::Ready {
                 capabilities: vec!["hover"],
+                version: None,
             },
         );
         let feed = ProbeFeed::new(statuses, HashSet::new(), None);
@@ -983,6 +1036,103 @@ mod tests {
         assert_eq!(finding.code, FindingCode::ServerReady);
         assert_eq!(finding.severity, Severity::Ok);
         assert!(finding.message.contains("ready"));
+    }
+
+    // ── version drift (lsm 03) ──────────────────────────────────────
+
+    /// A probe feed whose single server probed ready reporting `version`.
+    fn ready_feed(server: &str, version: Option<&str>) -> ProbeFeed {
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            server.to_string(),
+            ServerStatus::Ready {
+                capabilities: Vec::new(),
+                version: version.map(str::to_string),
+            },
+        );
+        ProbeFeed::new(statuses, HashSet::new(), None)
+    }
+
+    #[test]
+    fn ready_drifted_version_earns_the_advisory_drift_finding() {
+        // taplo is blessed at 0.10.0 in the shipped seed manifest; a ready
+        // probe reporting a different version earns the advisory finding —
+        // naming both versions — alongside (never replacing) the Ok.
+        let config = routed_config("toml", "taplo");
+        let findings = server_findings(&config, &ready_feed("taplo", Some("0.11.0")));
+
+        assert_eq!(findings.len(), 2, "ready + drift: {findings:?}");
+        assert_eq!(findings[0].code, FindingCode::ServerReady);
+        assert_eq!(findings[0].severity, Severity::Ok, "ready stays Ok");
+
+        let drift = &findings[1];
+        assert_eq!(drift.code, FindingCode::ServerVersionDrift);
+        assert_eq!(drift.severity, Severity::Info, "advisory, never a problem");
+        assert!(
+            !drift.is_problem(),
+            "a version choice never dents a verdict"
+        );
+        assert!(
+            drift.message.contains("0.11.0") && drift.message.contains("0.10.0"),
+            "the finding names both versions: {}",
+            drift.message
+        );
+        let fix_it = drift.fix_it.as_deref().expect("carries the annotation");
+        assert!(
+            fix_it.contains("verified-on-"),
+            "the annotation names the row's evidence class: {fix_it}"
+        );
+        assert!(
+            fix_it.contains("choice, not a fault"),
+            "the annotation stays advisory: {fix_it}"
+        );
+    }
+
+    #[test]
+    fn ready_matching_version_is_silent() {
+        // The blessed version (modulo normalization looseness) → nothing.
+        let config = routed_config("toml", "taplo");
+        for reported in ["0.10.0", "v0.10.0", " 0.10.0+abc123 "] {
+            let findings = server_findings(&config, &ready_feed("taplo", Some(reported)));
+            assert_eq!(
+                findings.len(),
+                1,
+                "a vetted version draws no drift for {reported:?}: {findings:?}"
+            );
+            assert_eq!(findings[0].code, FindingCode::ServerReady);
+        }
+    }
+
+    #[test]
+    fn ready_unreported_version_is_silent() {
+        // No `serverInfo`/version → absence of evidence is not drift.
+        let config = routed_config("toml", "taplo");
+        let findings = server_findings(&config, &ready_feed("taplo", None));
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].code, FindingCode::ServerReady);
+    }
+
+    #[test]
+    fn ready_rust_analyzer_never_draws_drift() {
+        // The toolchain-tracking exemption: whatever version RA reports, no
+        // drift finding — its version rides `rustup update` by design.
+        let config = routed_config("rust", "rust-analyzer");
+        let findings = server_findings(
+            &config,
+            &ready_feed("rust-analyzer", Some("1.96.0 (abcdef0 2026-07-01)")),
+        );
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].code, FindingCode::ServerReady);
+    }
+
+    #[test]
+    fn ready_unblessed_server_never_draws_drift() {
+        // A custom def absent from the manifest has no pin to drift from
+        // (its disclosure is the enrichment-only finding, not drift).
+        let config = routed_config("foo", "my-custom-ls");
+        let findings = server_findings(&config, &ready_feed("my-custom-ls", Some("9.9.9")));
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].code, FindingCode::ServerReady);
     }
 
     #[test]

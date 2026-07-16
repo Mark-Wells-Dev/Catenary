@@ -315,7 +315,7 @@ fn render_languages(out: &mut Output, config: &crate::config::Config, feed: &dyn
     for (lang, target) in &lang_entries {
         let lang_display = format!("  {lang:<max_lang_width$}");
         let _ = out.writeln(format_args!("{lang_display}  → {target}"));
-        if let Some(ServerStatus::Ready { capabilities }) = feed.server_status(target)
+        if let Some(ServerStatus::Ready { capabilities, .. }) = feed.server_status(target)
             && !capabilities.is_empty()
         {
             let _ = out.writeln(format_args!(

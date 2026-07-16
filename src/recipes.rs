@@ -1056,6 +1056,170 @@ impl BlessedManifest {
     pub const fn engine_supports(&self) -> bool {
         self.meta.min_schema <= MANIFEST_SCHEMA_VERSION
     }
+
+    /// Detects `serverInfo.version` drift for `server` against its blessed
+    /// rows (lsm 03 — PATH-residue detection, advisory only).
+    ///
+    /// `running` is the version the live server reported in the `initialize`
+    /// result's `serverInfo.version`. Returns `Some` only when the normalized
+    /// running version ([`normalize_version`]) matches **none** of the
+    /// server's blessed rows — any-platform, mirroring [`Self::is_blessed`]
+    /// and [`Self::entry_at_version`]: a version vetted on *any* platform is a
+    /// vetted version, never drift. The returned [`VersionDrift`] names the
+    /// preferred row's pin: the row keyed by this host's platform token when
+    /// present, else the first row by platform-key order (deterministic).
+    ///
+    /// Silence wins every doubt (never a false finding):
+    ///
+    /// - `server` absent from the blessed set — no pin to drift from;
+    /// - `server` is exempt from version pinning ([`VERSION_PIN_EXEMPT`] —
+    ///   rust-analyzer, rustup-proxied by design, tracks the user's toolchain);
+    /// - the running version normalizes to empty — absence of evidence is not
+    ///   drift;
+    /// - any blessed row's pin normalizes to empty — the pin set is not
+    ///   comparable, so no drift claim can be made honestly.
+    ///
+    /// Detection only: nothing consults this at spawn-gating time, and no
+    /// behavior changes on a drift — the surfaces are the doctor finding, the
+    /// warranty annotation, and an `info!` firehose event.
+    #[must_use]
+    pub fn version_drift(&self, server: &str, running: &str) -> Option<VersionDrift> {
+        if VERSION_PIN_EXEMPT.contains(&server) {
+            return None;
+        }
+        let rows = self.blessed.get(server)?;
+        let running_normalized = normalize_version(running);
+        if running_normalized.is_empty() {
+            return None;
+        }
+        let pins: Vec<&str> = rows
+            .values()
+            .map(|entry| normalize_version(&entry.version))
+            .collect();
+        if pins.iter().any(|pin| pin.is_empty()) {
+            return None;
+        }
+        if pins.contains(&running_normalized) {
+            return None;
+        }
+        let (platform, entry) = current_platform_token()
+            .and_then(|token| rows.get_key_value(token))
+            .or_else(|| rows.iter().next())?;
+        Some(VersionDrift {
+            pinned: entry.version.clone(),
+            running: running.trim().to_string(),
+            platform: platform.clone(),
+            tier: entry.tier.clone(),
+        })
+    }
+}
+
+/// Servers exempt from version-drift detection by design (lsm 03).
+///
+/// rust-analyzer is rustup-proxied and tracks the user's toolchain — its
+/// version legitimately moves with every `rustup update`, and its blessed rows
+/// carry verbatim host-riding `--version` lines rather than a comparable pin
+/// (the health check already understands the rustup proxy shim, misc 162). A
+/// toolchain-tracking RA must never draw a drift finding.
+const VERSION_PIN_EXEMPT: &[&str] = &["rust-analyzer"];
+
+/// A detected mismatch between a running server's reported
+/// `serverInfo.version` and its blessed manifest pin (lsm 03).
+///
+/// Advisory data only — running your own server version is a choice, not a
+/// fault. Carried to the two disclosure surfaces (the doctor finding and the
+/// firehose `info!` event); nothing gates on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionDrift {
+    /// The preferred blessed row's pinned version, verbatim (this platform's
+    /// row when present, else the first row by platform-key order).
+    pub pinned: String,
+    /// The version the running server reported (trimmed, otherwise verbatim).
+    pub running: String,
+    /// The platform key of the preferred row (e.g. `linux-x86_64`).
+    pub platform: String,
+    /// The preferred row's honesty tier (e.g. `verified-on-linux`) — the
+    /// evidence class the warranty annotation names.
+    pub tier: Option<String>,
+}
+
+impl VersionDrift {
+    /// The warranty-tier annotation on the row's evidence class (lsm 03).
+    ///
+    /// States honestly that the evidence class (the blessed row's honesty
+    /// tier) covers the vetted version, not the one that is running. Rendered
+    /// under the doctor drift finding.
+    #[must_use]
+    pub fn warranty_annotation(&self, server: &str) -> String {
+        let tier = self.tier.as_deref().unwrap_or("blessed");
+        format!(
+            "Evidence class `{tier}` ({platform}) covers {server} {pinned}, the vetted \
+             version — the running {running} is outside that warranty",
+            platform = self.platform,
+            pinned = self.pinned,
+            running = self.running,
+        )
+    }
+}
+
+/// This host's blessed-manifest platform token (`linux-x86_64` /
+/// `macos-arm64`), or `None` on a platform the conformance matrix does not
+/// pin. Matches the row keys the CI bless jobs write.
+fn current_platform_token() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Some("linux-x86_64"),
+        ("macos", "aarch64") => Some("macos-arm64"),
+        _ => None,
+    }
+}
+
+/// Normalizes a server version string for drift comparison (lsm 03).
+///
+/// Version strings arrive in looser shapes than the pins were written in —
+/// leading `v` tags, build-metadata suffixes, stray whitespace. Normalization
+/// applies exactly three transformations, in order, so that looseness never
+/// manufactures false drift:
+///
+/// 1. **Whitespace** is trimmed from both ends.
+/// 2. **Build metadata** is cut: everything from the first `+` onward
+///    (semver build metadata, `1.2.3+abc123` → `1.2.3`) and everything from
+///    the first whitespace-preceded `(` onward (parenthesized hash/date
+///    suffixes, `1.2.3 (abcdef 2026-01-01)` → `1.2.3`), then trailing
+///    whitespace is re-trimmed. A string that *starts* with `(` is
+///    metadata-only and normalizes to empty — no version evidence.
+/// 3. A **leading `v`** is stripped when a digit follows (`v0.22.0` →
+///    `0.22.0`; a bare `v` or a word like `version` is untouched).
+///
+/// Examples:
+///
+/// - `"v1.2.3"` → `"1.2.3"`
+/// - `"1.2.3+abc123"` → `"1.2.3"`
+/// - `"1.2.3 (abcdef 2026-01-01)"` → `"1.2.3"`
+/// - `"  5.6.0\n"` → `"5.6.0"`
+/// - `"Ubuntu clangd version 18.1.3 (1ubuntu1)"` →
+///   `"Ubuntu clangd version 18.1.3"`
+///
+/// Nothing else is rewritten — comparison after normalization is exact and
+/// case-sensitive. When two versions still differ after this, the difference
+/// is real.
+#[must_use]
+pub fn normalize_version(raw: &str) -> &str {
+    let mut s = raw.trim();
+    if let Some(idx) = s.find('+') {
+        s = &s[..idx];
+    }
+    if s.starts_with('(') {
+        s = "";
+    } else if let Some(idx) = s.find(" (") {
+        s = &s[..idx];
+    }
+    s = s.trim_end();
+    if let Some(rest) = s.strip_prefix('v')
+        && rest.starts_with(|c: char| c.is_ascii_digit())
+    {
+        s = rest;
+    }
+    s
 }
 
 /// Parse a blessed-manifest TOML document.
@@ -1736,6 +1900,156 @@ tier = "cargo-locked"
         assert!(!ra.compress_applies(Some("2.0.0")));
         assert!(!ra.compress_applies(None));
         assert!(ra.compress_applies(Some("1.95.0")));
+    }
+
+    // ── version drift (lsm 03) ──────────────────────────────────────
+
+    /// A manifest with the given blessed rows for one server, each row
+    /// `(platform, version, tier)`.
+    fn drift_manifest(server: &str, rows: &[(&str, &str, Option<&str>)]) -> BlessedManifest {
+        let mut platform_rows = BTreeMap::new();
+        for (platform, version, tier) in rows {
+            platform_rows.insert(
+                (*platform).to_string(),
+                BlessedEntry {
+                    version: (*version).to_string(),
+                    platform: (*platform).to_string(),
+                    date: "2026-07-14".to_string(),
+                    tier: tier.map(str::to_string),
+                },
+            );
+        }
+        let mut blessed = BTreeMap::new();
+        blessed.insert(server.to_string(), platform_rows);
+        BlessedManifest {
+            blessed,
+            ..BlessedManifest::default()
+        }
+    }
+
+    #[test]
+    fn normalize_version_pins_the_looseness_rules() {
+        // The exact loosenesses the doc comment promises: leading `v`, `+`
+        // build metadata, ` (…)` suffixes, and whitespace.
+        assert_eq!(normalize_version("v1.2.3"), "1.2.3");
+        assert_eq!(normalize_version("1.2.3+abc123"), "1.2.3");
+        assert_eq!(normalize_version("1.2.3 (abcdef 2026-01-01)"), "1.2.3");
+        assert_eq!(normalize_version("  5.6.0\n"), "5.6.0");
+        assert_eq!(normalize_version("v1.2.3+abc (def)"), "1.2.3");
+        assert_eq!(
+            normalize_version("Ubuntu clangd version 18.1.3 (1ubuntu1)"),
+            "Ubuntu clangd version 18.1.3"
+        );
+        // A leading `v` not followed by a digit is NOT a version tag.
+        assert_eq!(normalize_version("vNext"), "vNext");
+        assert_eq!(normalize_version("v"), "v");
+        // A metadata-only string carries no version evidence.
+        assert_eq!(normalize_version(" (build only)"), "");
+        assert_eq!(normalize_version("+abc123"), "");
+        // Nothing else is rewritten.
+        assert_eq!(normalize_version("0.10.0"), "0.10.0");
+    }
+
+    #[test]
+    fn version_drift_matching_version_is_silent() {
+        let manifest = drift_manifest("srv", &[("alpha", "5.6.0", Some("verified-on-alpha"))]);
+        assert_eq!(manifest.version_drift("srv", "5.6.0"), None);
+        // Looseness never manufactures drift: leading `v`, metadata, spaces.
+        assert_eq!(manifest.version_drift("srv", "v5.6.0"), None);
+        assert_eq!(manifest.version_drift("srv", "5.6.0+abc123"), None);
+        assert_eq!(manifest.version_drift("srv", " 5.6.0 (deadbeef) "), None);
+    }
+
+    #[test]
+    fn version_drift_matches_any_platform_row() {
+        // Any-platform matching, mirroring `is_blessed`: a version vetted on
+        // some other platform is a vetted version, never drift.
+        let manifest = drift_manifest("srv", &[("alpha", "1.0.0", None), ("beta", "2.0.0", None)]);
+        assert_eq!(manifest.version_drift("srv", "1.0.0"), None);
+        assert_eq!(manifest.version_drift("srv", "2.0.0"), None);
+    }
+
+    #[test]
+    fn version_drift_mismatch_names_pin_platform_and_tier() {
+        let manifest = drift_manifest("srv", &[("alpha", "v5.6.0", Some("verified-on-alpha"))]);
+        let drift = manifest
+            .version_drift("srv", "5.7.0")
+            .expect("a mismatched version drifts");
+        assert_eq!(drift.pinned, "v5.6.0", "the pin is carried verbatim");
+        assert_eq!(drift.running, "5.7.0");
+        assert_eq!(drift.platform, "alpha");
+        assert_eq!(drift.tier.as_deref(), Some("verified-on-alpha"));
+
+        let annotation = drift.warranty_annotation("srv");
+        assert!(
+            annotation.contains("verified-on-alpha"),
+            "the annotation names the evidence class: {annotation}"
+        );
+        assert!(
+            annotation.contains("v5.6.0") && annotation.contains("5.7.0"),
+            "the annotation names both versions: {annotation}"
+        );
+    }
+
+    #[test]
+    fn version_drift_prefers_this_hosts_platform_row() {
+        // With rows for both real platform tokens, the drift names this
+        // host's pin. On an unpinned host the preference falls back to the
+        // first row, which this test cannot distinguish — skip there.
+        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => "1.1.1",
+            ("macos", "aarch64") => "2.2.2",
+            _ => return,
+        };
+        let manifest = drift_manifest(
+            "srv",
+            &[
+                ("linux-x86_64", "1.1.1", Some("verified-on-linux")),
+                ("macos-arm64", "2.2.2", Some("verified-on-macos")),
+            ],
+        );
+        let drift = manifest
+            .version_drift("srv", "9.9.9")
+            .expect("a mismatched version drifts");
+        assert_eq!(drift.pinned, expected);
+    }
+
+    #[test]
+    fn version_drift_silent_without_evidence_or_pin() {
+        let manifest = drift_manifest("srv", &[("alpha", "5.6.0", None)]);
+        // Unknown server: no pin to drift from.
+        assert_eq!(manifest.version_drift("other", "9.9.9"), None);
+        // A running version that normalizes to empty is absence of evidence.
+        assert_eq!(manifest.version_drift("srv", ""), None);
+        assert_eq!(manifest.version_drift("srv", "  "), None);
+        assert_eq!(manifest.version_drift("srv", " (build only)"), None);
+        // An empty-normalizing PIN makes the row set non-comparable: silence.
+        let empty_pin = drift_manifest("srv", &[("alpha", " ", None)]);
+        assert_eq!(empty_pin.version_drift("srv", "9.9.9"), None);
+    }
+
+    #[test]
+    fn version_drift_exempts_toolchain_tracking_rust_analyzer() {
+        // rust-analyzer is exempt by design (rustup-proxied, tracks the
+        // user's toolchain): even a manifest row that can never match its
+        // reported version draws no drift.
+        let manifest = drift_manifest(
+            "rust-analyzer",
+            &[(
+                "linux-x86_64",
+                "rust-analyzer 1.95.0 (5980761 2026-04-14)",
+                Some("verified-on-linux"),
+            )],
+        );
+        assert_eq!(
+            manifest.version_drift("rust-analyzer", "1.96.0 (abcdef0 2026-07-01)"),
+            None
+        );
+        // The seed manifest agrees — the shipped rows never drift RA either.
+        assert_eq!(
+            seed_manifest().version_drift("rust-analyzer", "1.96.0"),
+            None
+        );
     }
 
     #[test]

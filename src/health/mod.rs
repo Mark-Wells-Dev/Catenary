@@ -176,6 +176,12 @@ pub enum FindingCode {
     ServerEnrichmentOnly,
     /// A server that probed ready.
     ServerReady,
+    /// A ready blessed server whose reported `serverInfo.version` matches none
+    /// of its blessed manifest pins (lsm 03) — the running binary is not the
+    /// vetted one (PATH residue, e.g. a `pacman -Syu` swap). Advisory
+    /// [`Severity::Info`]: running your own version is a choice, not a fault,
+    /// and nothing gates on it.
+    ServerVersionDrift,
     /// The running daemon serves a different build than this binary.
     VersionSkew,
     /// A connected bridge links a different `catenary-mcp` protocol version than
@@ -243,6 +249,7 @@ impl FindingCode {
             Self::ServerDormant => "server-dormant",
             Self::ServerEnrichmentOnly => "server-enrichment-only",
             Self::ServerReady => "server-ready",
+            Self::ServerVersionDrift => "server-version-drift",
             Self::VersionSkew => "version-skew",
             Self::BridgeVersionMismatch => "bridge-version-mismatch",
             Self::HooksStale => "hooks-stale",

@@ -166,9 +166,12 @@ fn status_for_entry(entry: &ServerEntry) -> ServerStatus {
             .unwrap_or_else(|| format!("server {}", entry.state));
         ServerStatus::InitializeFailed(reason)
     } else {
-        // Healthy / busy / initializing / probing — up, not broken.
+        // Healthy / busy / initializing / probing — up, not broken. The
+        // snapshot carries no `serverInfo.version`, so the drift input stays
+        // `None` here — silence, never a fabricated drift (lsm 03).
         ServerStatus::Ready {
             capabilities: Vec::new(),
+            version: None,
         }
     }
 }
@@ -332,7 +335,8 @@ fn server_name_from_finding(f: &Finding) -> Option<String> {
         | FindingCode::ServerInstallSuggestion
         | FindingCode::ServerDormant
         | FindingCode::ServerEnrichmentOnly
-        | FindingCode::ServerReady => f
+        | FindingCode::ServerReady
+        | FindingCode::ServerVersionDrift => f
             .message
             .split(':')
             .next()

@@ -502,6 +502,29 @@ impl LspClient {
         self.server_version = super::extract::server_version(&raw).map(str::to_string);
         self.server.set_capabilities(caps);
 
+        // Version-drift capture (lsm 03): the initialize result is in hand, so
+        // compare the reported `serverInfo.version` against the blessed
+        // manifest pin. Detection only — an `info!` firehose event, never a
+        // `warn!` (running your own server version is a choice, not a fault)
+        // and never a spawn gate; the doctor finding and warranty annotation
+        // are the user-facing surfaces.
+        if let Some(running) = self.server_version.as_deref()
+            && let Some(drift) =
+                crate::recipes::active_manifest().version_drift(self.server.server_name(), running)
+        {
+            tracing::info!(
+                source = crate::source::Source::LspLifecycle.as_str(),
+                server = self.server.server_name(),
+                language = self.server.language_id(),
+                running_version = %drift.running,
+                pinned_version = %drift.pinned,
+                "server version drift: running {} is not the blessed {} ({})",
+                drift.running,
+                drift.pinned,
+                drift.platform,
+            );
+        }
+
         // Send initialized notification
         self.notify("initialized", json!({})).await?;
 
@@ -1488,6 +1511,16 @@ mod tests {
         assert_eq!(client.server_version(), Some("1.2.3"));
         assert!(client.wants_did_save());
 
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_version_flag_reports_verbatim() -> Result<()> {
+        // The lsm-03 test lever: `--server-version` reports the given string
+        // verbatim as `serverInfo.version`, captured at initialize.
+        let (mut client, _dir) = spawn_and_init(&["--server-version", "9.9.9-drifted"]).await?;
+        assert_eq!(client.server_version(), Some("9.9.9-drifted"));
         client.shutdown().await?;
         Ok(())
     }
