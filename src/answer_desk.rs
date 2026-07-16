@@ -43,8 +43,9 @@ use serde::Deserialize;
 /// Built-in tier-0 sensitive-path denylist, embedded as data (misc 201).
 ///
 /// Shipped with the binary and consulted by the answer-desk deny leg; the query
-/// auto-mount gate (a later ws43 ticket) reads the same list. User-extended via
-/// `[permissions] deny_paths`.
+/// auto-mount gate (`ensure_ephemeral_mounts` in `src/router.rs`, ws43-05)
+/// consumes the same compiled [`SensitiveDenylist`] — one source of truth.
+/// User-extended via `[permissions] deny_paths`.
 pub const DEFAULT_SENSITIVE_PATHS: &str = include_str!("../defaults/sensitive-paths.toml");
 
 /// The maintainer-dictated teaching a sensitive-file deny carries.

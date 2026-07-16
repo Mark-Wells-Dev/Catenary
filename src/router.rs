@@ -2409,10 +2409,28 @@ impl ProjectConfigNudges {
     }
 }
 
+/// The auto-mount verdict for one touched path (ephemeral-roots ticket 02,
+/// sensitive-path gate ws43-05).
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EphemeralMountVerdict {
+    /// Mount this canonical enclosing project root.
+    Mount(PathBuf),
+    /// An enclosing root would have mounted, but the touched path matches the
+    /// answer desk's sensitive-path denylist — the conversion is refused
+    /// (ws43-05). Carries the root that would have mounted, for the refusal
+    /// recording. The search result itself is untouched (decision 025): the hit
+    /// still streams, it just stays unenriched because nothing mounted.
+    RefusedSensitive(PathBuf),
+    /// Nothing to convert: the path is covered by a tracked root, or no
+    /// enclosing repository root is detectable.
+    NoMount,
+}
+
 /// Decides whether a touched path warrants mounting an enclosing ephemeral root.
 ///
-/// Returns the canonical enclosing project root to mount, or `None` when no
-/// mount is warranted. `Some(root)` iff:
+/// Returns [`EphemeralMountVerdict::Mount`] with the canonical enclosing project
+/// root iff:
 ///
 /// - the touched path is **not** already inside any tracked root (equal to or
 ///   under one — the "outside every mounted root" test, which also rejects a
@@ -2420,10 +2438,21 @@ impl ProjectConfigNudges {
 /// - an enclosing project root is detectable by walking repository markers
 ///   (`.git`/`.svn`/`.hg`/`.jj`) up from the path
 ///   ([`crate::companions::enclosing_worktree_root`]), and
-/// - that root is not itself already tracked.
+/// - that root is not itself already tracked, and
+/// - the touched path does **not** match the sensitive-path denylist (ws43-05):
+///   a sensitive path NEVER converts into a mount — no root registration, no
+///   server spawn, no tracker entry — and yields
+///   [`EphemeralMountVerdict::RefusedSensitive`] instead. The gate lives in the
+///   decision itself, not in a caller, so any future caller inherits it without
+///   re-wiring. It governs mount CONVERSION only: an in-root sensitive path is
+///   already `NoMount` via the covered test above, and results are never
+///   dropped (decision 025 — the walk runs with the user's own permissions).
 ///
-/// `canonical_touched` should be canonicalized by the caller when the path
-/// exists so the comparison lines up with the tracker's canonical roots; a glob
+/// `denylist` is the answer desk's own compiled
+/// [`crate::answer_desk::SensitiveDenylist`] — one source of truth for the
+/// pattern logic, never a fork. `canonical_touched` should be canonicalized by
+/// the caller when the path exists so the comparison lines up with the
+/// tracker's canonical roots (and the denylist's path-spelling rule); a glob
 /// pattern or not-yet-existing path (which cannot canonicalize) still resolves
 /// its enclosing repository root by lexical ancestor walk. Scope guard: only the single
 /// enclosing root is returned — never a sibling — and companion templating is
@@ -2432,19 +2461,29 @@ impl ProjectConfigNudges {
 fn ephemeral_root_to_mount(
     canonical_touched: &Path,
     tracked: &HashSet<PathBuf>,
-) -> Option<PathBuf> {
-    // Already inside a tracked root → covered, no ephemeral mount.
+    denylist: &crate::answer_desk::SensitiveDenylist,
+) -> EphemeralMountVerdict {
+    // Already inside a tracked root → covered, no ephemeral mount. The
+    // sensitive gate never fires here — it governs mount conversion only.
     if tracked.iter().any(|r| canonical_touched.starts_with(r)) {
-        return None;
+        return EphemeralMountVerdict::NoMount;
     }
-    let root = crate::companions::enclosing_worktree_root(canonical_touched)?;
+    let Some(root) = crate::companions::enclosing_worktree_root(canonical_touched) else {
+        return EphemeralMountVerdict::NoMount;
+    };
     let root = root.canonicalize().unwrap_or(root);
     // Belt-and-suspenders vs the check above (a canonicalization mismatch): the
     // enclosing root is already a tracked root.
     if tracked.contains(&root) {
-        return None;
+        return EphemeralMountVerdict::NoMount;
     }
-    Some(root)
+    // The sensitive-path gate (ws43-05): checked exactly where a conversion
+    // would otherwise happen, so a covered path or a no-root path never
+    // records a spurious refusal.
+    if denylist.is_sensitive(canonical_touched) {
+        return EphemeralMountVerdict::RefusedSensitive(root);
+    }
+    EphemeralMountVerdict::Mount(root)
 }
 
 /// Delivery-side unlink of durable-lock ledger entries for a served file set
@@ -2932,6 +2971,17 @@ fn resolve_touched_paths(paths: &[PathBuf], cwd: Option<&Path>) -> Vec<PathBuf> 
 /// accepted slight stall); existing roots are never torn down here, so other
 /// roots' work is not blocked. Scope guard: only enclosing roots mount, never
 /// siblings, and companion templating is never applied.
+///
+/// The sensitive-path gate (ws43-05): a touched path matching the answer
+/// desk's sensitive-path denylist NEVER converts into a mount — no root
+/// registration, no server spawn, no tracker entry. The gate is on MOUNT
+/// STATE, not on search results (decision 025 — the hit still streams, it
+/// simply stays unenriched). The denylist is compiled per call from the same
+/// source the answer desk uses (the embedded defaults plus the daemon
+/// config's `[permissions] deny_paths`) — mounting is rare, so the per-call
+/// load is cheap and stays consistent with the desk's per-dispatch load. A
+/// refusal is recorded as an `info!` action event — firehose-only, no TUI
+/// finding, no interrupt (an unenriched hit is not urgent).
 #[cfg(unix)]
 async fn ensure_ephemeral_mounts(
     ctx: &HookDispatchContext,
@@ -2943,6 +2993,8 @@ async fn ensure_ephemeral_mounts(
         return;
     };
     let mounts = &ctx.ephemeral_mounts;
+    let denylist =
+        crate::answer_desk::SensitiveDenylist::load(&ctx.primary.config.permissions().deny_paths);
     let mut mounted = false;
     for path in touched {
         // Canonicalize when the path exists so the comparison lines up with the
@@ -2955,18 +3007,33 @@ async fn ensure_ephemeral_mounts(
         mounts.touch_covering(&canonical, now);
         ctx.worktree_mounts.touch_covering(&canonical, now);
         let existing: HashSet<PathBuf> = tracker.global_roots().into_iter().collect();
-        if let Some(root) = ephemeral_root_to_mount(&canonical, &existing) {
-            let contributor = ephemeral_contributor(&root);
-            tracker.set_roots(&contributor, vec![root.clone()]);
-            mounts.touch(&root, now);
-            mounted = true;
-            info!(
-                source = Source::DaemonDispatch.as_str(),
-                session_id = %session_id,
-                root = %root.display(),
-                contributor = %contributor,
-                "mounted ephemeral root on out-of-root activity",
-            );
+        match ephemeral_root_to_mount(&canonical, &existing, &denylist) {
+            EphemeralMountVerdict::Mount(root) => {
+                let contributor = ephemeral_contributor(&root);
+                tracker.set_roots(&contributor, vec![root.clone()]);
+                mounts.touch(&root, now);
+                mounted = true;
+                info!(
+                    source = Source::DaemonDispatch.as_str(),
+                    session_id = %session_id,
+                    root = %root.display(),
+                    contributor = %contributor,
+                    "mounted ephemeral root on out-of-root activity",
+                );
+            }
+            EphemeralMountVerdict::RefusedSensitive(root) => {
+                // Recording-only (ws43-05): `info!` is firehose-only per the
+                // tracing conventions — never a TUI finding or an interrupt.
+                info!(
+                    source = Source::DaemonDispatch.as_str(),
+                    session_id = %session_id,
+                    path = %canonical.display(),
+                    root = %root.display(),
+                    "sensitive-path gate: refused ephemeral mount for a sensitive \
+                     touched path — the hit streams unenriched",
+                );
+            }
+            EphemeralMountVerdict::NoMount => {}
         }
     }
     if mounted {
@@ -12745,20 +12812,21 @@ mod tests {
         let base = dir.path().canonicalize().expect("canonicalize");
         let (project, file) = marker_project(&base, "Lattice");
         let file = file.canonicalize().expect("canonicalize file");
+        let deny = crate::answer_desk::SensitiveDenylist::load(&[]);
 
         // Outside every tracked root, enclosing `.git` detectable → mount it.
         let empty = HashSet::new();
         assert_eq!(
-            ephemeral_root_to_mount(&file, &empty),
-            Some(project.clone()),
+            ephemeral_root_to_mount(&file, &empty, &deny),
+            EphemeralMountVerdict::Mount(project.clone()),
             "an out-of-root file mounts its enclosing project root",
         );
 
         // Already inside a tracked root → covered, no mount.
         let tracked: HashSet<PathBuf> = std::iter::once(project).collect();
         assert_eq!(
-            ephemeral_root_to_mount(&file, &tracked),
-            None,
+            ephemeral_root_to_mount(&file, &tracked, &deny),
+            EphemeralMountVerdict::NoMount,
             "a file under a tracked root is already covered",
         );
 
@@ -12766,7 +12834,70 @@ mod tests {
         let orphan = base.join("loose.txt");
         std::fs::write(&orphan, "x").expect("write");
         let orphan = orphan.canonicalize().expect("canon");
-        assert_eq!(ephemeral_root_to_mount(&orphan, &empty), None);
+        assert_eq!(
+            ephemeral_root_to_mount(&orphan, &empty, &deny),
+            EphemeralMountVerdict::NoMount,
+        );
+    }
+
+    #[test]
+    fn ephemeral_mount_gate_refuses_sensitive_conversion_only() {
+        // The sensitive-path gate (ws43-05) — one source of truth: the gate
+        // consumes the ANSWER DESK's own compiled `SensitiveDenylist` (imported
+        // from `crate::answer_desk`), so a path the desk flags is exactly a
+        // path the gate refuses. No forked pattern logic exists to drift.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, plain) = marker_project(&base, "Lattice");
+        let plain = plain.canonicalize().expect("canonicalize plain file");
+        let secret = project.join("server.pem");
+        std::fs::write(&secret, "hello secret\n").expect("write secret");
+        let secret = secret.canonicalize().expect("canonicalize secret");
+
+        let deny = crate::answer_desk::SensitiveDenylist::load(&[]);
+        assert!(
+            deny.is_sensitive(&secret),
+            "the answer desk's denylist flags the fixture — the gate's premise",
+        );
+
+        // Sensitive + out-of-root + enclosing root detectable → the conversion
+        // is REFUSED (never a mount), carrying the root it would have mounted.
+        let empty = HashSet::new();
+        assert_eq!(
+            ephemeral_root_to_mount(&secret, &empty, &deny),
+            EphemeralMountVerdict::RefusedSensitive(project.clone()),
+            "a sensitive out-of-root path never converts into a mount",
+        );
+
+        // Non-sensitive path in the same project mounts exactly as today.
+        assert_eq!(
+            ephemeral_root_to_mount(&plain, &empty, &deny),
+            EphemeralMountVerdict::Mount(project.clone()),
+            "a non-sensitive out-of-root path still mounts",
+        );
+
+        // In-root sensitive path (root already tracked) → NoMount, not a
+        // refusal: the gate governs mount conversion only.
+        let tracked: HashSet<PathBuf> = std::iter::once(project.clone()).collect();
+        assert_eq!(
+            ephemeral_root_to_mount(&secret, &tracked, &deny),
+            EphemeralMountVerdict::NoMount,
+            "an in-root sensitive path changes nothing — no spurious refusal",
+        );
+
+        // A user `[permissions] deny_paths` extension gates through the same
+        // desk-loaded list — the desk's semantics, not a parallel matcher.
+        let user_deny = crate::answer_desk::SensitiveDenylist::load(&["**/vaulted/**".to_string()]);
+        let vaulted_dir = project.join("vaulted");
+        std::fs::create_dir_all(&vaulted_dir).expect("mkdir vaulted");
+        let vaulted = vaulted_dir.join("plan.md");
+        std::fs::write(&vaulted, "q3\n").expect("write vaulted");
+        let vaulted = vaulted.canonicalize().expect("canonicalize vaulted");
+        assert_eq!(
+            ephemeral_root_to_mount(&vaulted, &empty, &user_deny),
+            EphemeralMountVerdict::RefusedSensitive(project),
+            "user deny_paths extensions refuse conversion too",
+        );
     }
 
     #[test]
@@ -13209,6 +13340,53 @@ mod tests {
             .find(|(p, _)| Path::new(p) == project)
             .expect("enclosing project mounted ephemerally on out-of-root grep");
         assert!(entry.1, "the activity-mounted root is classed ephemeral");
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grep_out_of_root_sensitive_path_streams_hit_but_never_mounts() {
+        // The sensitive-path gate on query auto-mount (ws43-05): a query
+        // touching a sensitive out-of-root path still returns its hit
+        // (decision 025 — complete output), but the enclosing root NEVER
+        // converts into a mount — no tracker entry, hence no server spawn.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, _) = marker_project(&base, "Lattice");
+        // `server.pem` matches the shipped `**/*.pem` denylist entry.
+        let secret = project.join("server.pem");
+        std::fs::write(&secret, "hello secret\n").expect("write secret");
+
+        // No mounted roots — the file is outside every root.
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let resp = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "tool/grep",
+                "pattern": "hello",
+                "paths": [secret.display().to_string()],
+            }),
+        )
+        .await;
+        // The hit still streams — the gate is on mount state, never on results.
+        assert!(
+            resp.contains("hello"),
+            "the sensitive hit is still returned (unenriched): {resp}",
+        );
+
+        // But nothing mounted: the enclosing project never appears on the board.
+        let classes = roots_ls_classes(&ipc_path).await;
+        assert!(
+            classes.iter().all(|(p, _)| Path::new(p) != project),
+            "a sensitive touched path never converts into a mount: {classes:?}",
+        );
 
         shutdown.cancel();
     }
