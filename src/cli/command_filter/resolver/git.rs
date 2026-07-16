@@ -368,6 +368,12 @@ fn resolve_apply(
     state: &State,
     relocated: bool,
 ) -> Result<SegmentClass, Unresolved> {
+    // `--check` verifies the patch and mutates nothing (wf-05) — NoWrite by
+    // classification: no booking, so no state query for the barrier or a
+    // relocated repo to poison.
+    if apply_check_mode(args) {
+        return Ok(SegmentClass::NoWrite);
+    }
     barrier_check(state)?;
     if relocated {
         return Err(relocated_repo());
@@ -478,6 +484,30 @@ fn resolve_apply(
         }
     }
     Ok(SegmentClass::Recorded(writes))
+}
+
+/// Whether the apply argv is in `--check` mode: verify the patch, write
+/// nothing. Git honors `--check` over conflicting apply modes (`--index`,
+/// `--cached`, `--3way`) wherever it sits in argv, so its presence makes the
+/// command a pure read (wf-05). Only a real flag token counts: the walk stops
+/// at `--` (everything after is a path) and steps over the value of a
+/// space-form value flag, mirroring [`resolve_apply`]. A later `--no-check`
+/// re-arms the write (parse-options last-wins).
+fn apply_check_mode(args: &[String]) -> bool {
+    let mut check = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--" => break,
+            "--check" => check = true,
+            "--no-check" => check = false,
+            // Space-form value flags: the next token is a value, not a flag.
+            "-p" | "--strip" | "--whitespace" | "--exclude" | "--include" => i += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    check
 }
 
 /// Extract the path column from `git apply --numstat` output

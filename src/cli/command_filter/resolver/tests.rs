@@ -1791,6 +1791,70 @@ fn git_apply_records_the_numstat_set() {
     );
 }
 
+// `git apply --check` verifies the patch and mutates nothing — NoWrite, no
+// booking (wf-05). Git honors `--check` over conflicting apply modes, so it
+// wins wherever it sits in argv.
+
+#[test]
+fn git_apply_check_is_no_write() {
+    let t = git_repo();
+    let root = root_of(&t);
+    commit(&root, "a.rs", "one\ntwo\n");
+    write(&root, "a.rs", "one\nTWO\n");
+    let diff = git_capture(&root, &["diff"]);
+    std::fs::write(root.join("change.patch"), &diff).expect("write patch");
+    std::fs::write(root.join("has--check.patch"), &diff).expect("write patch");
+    git(&root, &["checkout", "-q", "--", "a.rs"]);
+    for cmd in [
+        // Position: first, last, between other flags.
+        "git apply --check change.patch",
+        "git apply change.patch --check",
+        "git apply -p1 --check -R change.patch",
+        // Combinations: `--check` wins over the mutating modes.
+        "git apply --check --index change.patch",
+        "git apply --check --cached change.patch",
+        "git apply --check --3way change.patch",
+    ] {
+        assert_eq!(classify(cmd, Some(&root)), SegmentClass::NoWrite, "{cmd}");
+    }
+    // The same patch without `--check` books exactly as today.
+    assert_eq!(
+        ok("git apply change.patch", &root),
+        BTreeSet::from([root.join("a.rs")]),
+    );
+    // Parse-options last-wins: a later `--no-check` re-arms the write…
+    assert_eq!(
+        ok("git apply --check --no-check change.patch", &root),
+        BTreeSet::from([root.join("a.rs")]),
+    );
+    // …and a later `--check` wins it back.
+    assert_eq!(
+        classify("git apply --no-check --check change.patch", Some(&root)),
+        SegmentClass::NoWrite,
+    );
+    // A path merely containing `--check` is not the flag.
+    assert_eq!(
+        ok("git apply has--check.patch", &root),
+        BTreeSet::from([root.join("a.rs")]),
+    );
+    // A space-form value flag consumes the next token: this `--check` is the
+    // (bogus) value of `--whitespace`, not the flag — still a write.
+    assert_eq!(
+        ok("git apply --whitespace --check change.patch", &root),
+        BTreeSet::from([root.join("a.rs")]),
+    );
+}
+
+#[test]
+fn git_apply_check_after_dashdash_is_a_path_not_a_flag() {
+    // After a `--` separator tokens are paths: a patch operand spelled
+    // `--check` does not flip the command into check mode, so the write path
+    // runs (and denies here — the "patch" doesn't exist).
+    let t = tmp();
+    let op = err("git apply -- --check", Some(t.path()));
+    assert_eq!(op.construct, "git-missing-patch");
+}
+
 // The queries resolve repo-relative results against the *root*, not the cwd —
 // proven by running from a subdirectory.
 
