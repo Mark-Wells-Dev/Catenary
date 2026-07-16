@@ -1459,3 +1459,53 @@ fn test_glob_listing_hint_never_fuses_in_merged_stream() -> Result<()> {
     drop(bridge);
     Ok(())
 }
+
+// ── worktree diff/land teaching stubs (wf-03) ───────────────────────────
+
+/// The retired `worktree diff` / `worktree land` verbs are transition-period
+/// teaching stubs: any invocation shape (bare, with the old flags) prints the
+/// git-native landing flow on stderr and exits `2` — distinct from success and
+/// from generic error `1`. No daemon is needed; the stub never touches one.
+/// (The stubs get deleted in a later release — this test goes with them.)
+#[test]
+fn worktree_diff_and_land_stubs_teach_and_exit_2() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path().to_str().expect("tempdir path");
+
+    for argv in [
+        vec!["worktree", "diff", "/some/worktree"],
+        vec!["worktree", "diff", "/some/worktree", "--name-only"],
+        vec!["worktree", "land", "/some/worktree"],
+        vec!["worktree", "land", "/some/worktree", "--keep"],
+    ] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+        isolate_env(&mut cmd, root);
+        let out = cmd.args(&argv).output().expect("run worktree stub");
+
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{argv:?} must exit 2, got {:?}",
+            out.status.code(),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let verb = argv[1];
+        assert!(
+            stderr.contains(&format!("`catenary worktree {verb}` is retired")),
+            "{argv:?} must name the retired verb; stderr:\n{stderr}"
+        );
+        for step in [
+            "commit the work in the worktree",
+            "git diff main...<branch>",
+            "git merge --squash <branch>",
+            "catenary worktree rm <path>",
+            "merge bracket transfers any unpaid worker debt automatically",
+            "catenary diagnostics",
+        ] {
+            assert!(
+                stderr.contains(step),
+                "{argv:?} teaching missing {step:?}; stderr:\n{stderr}"
+            );
+        }
+    }
+}

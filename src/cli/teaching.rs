@@ -110,8 +110,10 @@ Work in isolated subagents
 /// adds the dispatch flow: the host's `isolation: "worktree"` fires the
 /// `WorktreeCreate` hook, which runs the worktree add itself, relocates the
 /// root out of the repo, and anchors the subagent — where a hand-run
-/// `catenary worktree add` anchors nothing. Capability voice throughout: it
-/// states what each flow does, never what is forbidden.
+/// `catenary worktree add` anchors nothing. Landing is git-native (wf-03: the
+/// `worktree diff`/`land` verbs retired) — the section teaches the merge flow
+/// and the merge bracket's automatic debt transfer (wf-01). Capability voice
+/// throughout: it states what each flow does, never what is forbidden.
 const DISPATCH_ISOLATED_WORK: &str = "\
 Dispatching isolated work
   Coverage is automatic — you never manage roots. Two agents in one workspace
@@ -121,10 +123,13 @@ Dispatching isolated work
   outside the repo (so language servers pick up no recursive roots), and
   anchors the subagent's workspace there. Hand-running `catenary worktree add`
   for an agent skips that anchoring — the agent stays pinned to the main tree
-  and its file access prompts against the wrong workspace. Review and clean up
-  with `catenary worktree diff` and `catenary worktree land` (WorktreeRemove
-  never fires — a known upstream Claude Code bug, so `land`/`rm` is the
-  cleanup path).";
+  and its file access prompts against the wrong workspace. Land finished work
+  git-natively: commit in the branch, review with `git diff main...<branch>`,
+  `git merge --squash <branch>` in the owning repo, commit, then
+  `catenary worktree rm <path>` (WorktreeRemove never fires — a known
+  upstream Claude Code bug, so `rm` is the cleanup path). The merge bracket
+  transfers unpaid worker debt automatically; pay it with
+  `catenary diagnostics`.";
 
 /// Tier 3 — compact flag synopses. Long forms only, natural clusters
 /// brace-collapsed; only the two flags that need disambiguation (`--glob` vs
@@ -694,8 +699,9 @@ mod tests {
     fn claude_payload_carries_the_dispatch_section() {
         // A declared client whose installed hook set registers WorktreeCreate
         // (Claude Code) gets the dispatch teaching: the isolation flag, the
-        // hook's anchoring, the hand-run gap, the review/cleanup commands, and
-        // the WorktreeRemove-never-fires cleanup note.
+        // hook's anchoring, the hand-run gap, the git-native landing flow
+        // (wf-03), the WorktreeRemove-never-fires cleanup note, and the merge
+        // bracket's automatic debt transfer (wf-01).
         let body = render(
             Some(&fixture_surface()),
             &["make".to_string()],
@@ -706,9 +712,12 @@ mod tests {
             "isolation: \"worktree\"",
             "WorktreeCreate hook creates the worktree itself",
             "catenary worktree add",
-            "catenary worktree diff",
-            "catenary worktree land",
-            "WorktreeRemove\n  never fires",
+            "git diff main...<branch>",
+            "git merge --squash <branch>",
+            "catenary worktree rm <path>",
+            "(WorktreeRemove never fires",
+            "transfers unpaid worker debt automatically",
+            "catenary diagnostics",
         ] {
             assert!(
                 body.contains(needle),

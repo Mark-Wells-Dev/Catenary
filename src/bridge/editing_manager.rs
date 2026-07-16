@@ -85,7 +85,7 @@ struct BatchFile {
 /// and [`Session::status`](super::session::Session::status) reads
 /// [`has_debt`](crate::lock::has_debt) across the session's roots. This batch
 /// survives only to NAME the candidate set (the paths an agent edited) for the
-/// Stop-block and subagent status, and to feed the worktree-land debt transfer.
+/// Stop-block and subagent status.
 ///
 /// The batch is the set of covered files this agent has edited, each carrying a
 /// `delivered` flag. The flag no longer gates anything; the retained

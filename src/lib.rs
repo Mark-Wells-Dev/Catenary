@@ -61,7 +61,5 @@ pub mod tui;
 pub mod worktree_create;
 /// Guarded in-house disposal of Catenary-created worktrees (misc 151).
 pub mod worktree_dispose;
-/// The `worktree diff` / `worktree land` lifecycle verbs (misc 158).
-pub mod worktree_land;
 /// Bounded directory-deletion watch for subagent worktree roots (ticket 05).
 pub mod worktree_watch;

@@ -605,50 +605,6 @@ pub fn extract_command_names(cmd: &str) -> Vec<String> {
     parse::parse(cmd).command_positions()
 }
 
-/// The literal worktree-path operand of a `catenary worktree land <path>` command,
-/// if the command is exactly that shape (misc 189).
-///
-/// The daemon reads this from the `PreToolUse` shell command to look the landing
-/// worktree's owner up in the diagnostics ledger and transfer its unpaid debt (the
-/// arming leg moved off the content-based resolver arm). Walks the top-level
-/// pipeline commands for a `catenary` word whose argv recognizes as
-/// [`Sub::WorktreeLand`] and returns the first non-flag operand after `land` — the
-/// same operand [`resolver::catenary`] resolves the write-set against. A computed
-/// (`$VAR` / `$(…)`) operand is rejected: its spelling is not the real path, so it
-/// yields `None` and the arming falls through to no transfer (fail-closed, matching
-/// the resolver's opaque-path denial). `None` for any other command shape.
-#[must_use]
-pub fn worktree_land_path(command: &str) -> Option<String> {
-    let script = parse::parse(command);
-    for pipeline in &script.pipelines {
-        for cmd in &pipeline.commands {
-            if cmd.name.as_deref() != Some("catenary") {
-                continue;
-            }
-            if !matches!(
-                recognize_catenary_argv(&cmd.argv),
-                Recog::Agent(Sub::WorktreeLand)
-            ) {
-                continue;
-            }
-            // The worktree path is the first non-flag operand after `worktree land`
-            // (argv indices 0 = `worktree`, 1 = `land`). It must be literal — a
-            // computed operand's spelling is not the path, so decline.
-            for (i, word) in cmd.argv.iter().enumerate().skip(2) {
-                if word.len() > 1 && word.starts_with('-') {
-                    continue; // a flag (`--keep`), not the path operand
-                }
-                let meta = cmd.argv_meta.get(i).copied().unwrap_or_default();
-                // Literal iff no runtime substitution or live expansion reached the
-                // word — the same predicate the resolver's opaque-path gate uses.
-                let literal = !meta.value_subs && !meta.process_subs && !meta.any_live();
-                return literal.then(|| word.clone());
-            }
-        }
-    }
-    None
-}
-
 // ── Catenary command canonical-form matcher (ADR 013/014) ───────────────
 //
 // Catenary's own commands run under a *fail-closed canonical-form* regime
@@ -735,15 +691,16 @@ enum Sub {
     /// fires upstream). Bare-only lifecycle: it mutates the on-disk worktree
     /// set and must run as the sole command.
     WorktreeRm,
-    /// `catenary worktree diff` — the complete worktree-vs-branch-point diff
-    /// (misc 158/166: commit-aware — committed work included). Search-class: no
-    /// handoff, complete client-owned output (a `git apply` patch), so it chains
-    /// and pipes like `grep`/`glob`.
+    /// `catenary worktree diff` — retired to a transition-period teaching stub
+    /// (wf-03): the CLI prints the git-native review/landing flow and exits 2.
+    /// Kept recognized (Search-class, as before) so the stub can teach; the
+    /// variant deletes with the stub in a later release.
     WorktreeDiff,
-    /// `catenary worktree land` — apply a worktree's diff into its owning repo
-    /// (misc 158). Bare-only lifecycle: it writes to the owning repo (its
-    /// write-set resolves through the same filter as `git apply`) and removes the
-    /// worktree, so it must run as the sole command.
+    /// `catenary worktree land` — retired to a transition-period teaching stub
+    /// (wf-03): the patch engine is gone, `git merge` carries landing (and its
+    /// debt transfer) now, and the CLI prints that flow and exits 2. Kept
+    /// recognized (bare-only lifecycle, as before) so the stub can teach; the
+    /// variant deletes with the stub in a later release.
     WorktreeLand,
 }
 
@@ -838,10 +795,10 @@ fn recognize_catenary_sub(rest: &[&str]) -> Recog {
         (Some("worktree"), Some("ls")) => Recog::Agent(Sub::WorktreeLs),
         (Some("worktree"), Some("add")) => Recog::Agent(Sub::WorktreeAdd),
         (Some("worktree"), Some("rm")) => Recog::Agent(Sub::WorktreeRm),
-        // `worktree diff` is Search-class (a complete `git apply` patch on
-        // stdout, pipe-friendly); `worktree land` is a bare-only lifecycle verb
-        // that writes the diff into the owning repo (misc 158). Split before the
-        // bare-word arms so the two-word forms are matched exactly.
+        // `worktree diff`/`worktree land` retired to teaching stubs (wf-03):
+        // still recognized in their old classes (Search / bare-only lifecycle)
+        // so an invocation reaches the CLI stub, which prints the git-native
+        // flow and exits 2. These arms delete with the stubs in a later release.
         (Some("worktree"), Some("diff")) => Recog::Agent(Sub::WorktreeDiff),
         (Some("worktree"), Some("land")) => Recog::Agent(Sub::WorktreeLand),
         (Some("grep"), _) => Recog::Agent(Sub::Grep),
@@ -1315,7 +1272,7 @@ fn catenary_occ_denial(occ: &CatenaryOcc) -> Option<String> {
 
 /// The recognized agent-facing command surface, for "unknown subcommand" denials.
 const CATENARY_SURFACE: &str = "Available: `grep`, `glob`, `query`, `diagnostics`, \
-     `editing start`, `pin`, `unpin`, `roots`, `worktree ls/add/rm/diff/land`, \
+     `editing start`, `pin`, `unpin`, `roots`, `worktree ls/add/rm`, \
      `commands`, `primer`, `version`. Run `catenary primer` for the workflow.";
 
 fn unknown_subcommand_denial() -> String {
@@ -1359,8 +1316,8 @@ fn stdin_denial(sub: Sub) -> Option<String> {
         Sub::WorktreeLs => Some(
             "`catenary worktree ls` takes no stdin — invoke it first in the pipeline.".to_string(),
         ),
-        // `worktree diff` takes a path argument, not stdin: a pipe INTO it is a
-        // no-op, though its diff output pipes freely (into `git apply`, a pager).
+        // `worktree diff` (a retired teaching stub, wf-03) takes no stdin: a
+        // pipe INTO it is a no-op; its teaching output pipes freely.
         Sub::WorktreeDiff => Some(
             "`catenary worktree diff` takes no stdin — invoke it first in the pipeline."
                 .to_string(),
@@ -1487,8 +1444,10 @@ fn worktree_add_dispatch_denial() -> String {
      WorktreeCreate hook creates the worktree itself, relocates it outside the \
      repo, and anchors the subagent's workspace there. A hand-run add skips \
      that anchoring — the agent stays pinned to the main tree and its file \
-     access prompts against the wrong workspace. Review and clean up with \
-     `catenary worktree diff` and `catenary worktree land`."
+     access prompts against the wrong workspace. Land finished work with git: \
+     commit in the worktree's branch, review with `git diff main...<branch>`, \
+     `git merge --squash <branch>` in the owning repo, commit, then \
+     `catenary worktree rm <path>`."
         .to_string()
 }
 
@@ -1506,8 +1465,9 @@ fn worktree_add_dispatch_denial() -> String {
 fn worktree_rm_force_dispatch_denial() -> String {
     "Don't hand-run `catenary worktree rm --force` — discarding a worktree with \
      uncommitted work is the maintainer's lever, not the agent's. On a \
-     WorktreeCreate host the worktree lifecycle is: review with `catenary \
-     worktree diff`, keep with `catenary worktree land`, dispose clean with \
+     WorktreeCreate host the worktree lifecycle is git-native: commit in the \
+     worktree's branch, review with `git diff main...<branch>`, keep with \
+     `git merge --squash <branch>` (then commit), dispose clean with \
      `catenary worktree rm` (bare `rm` refuses a dirty worktree on its own). \
      Surface the dirty worktree for review — don't force-drop the work."
         .to_string()
@@ -4473,18 +4433,20 @@ mod tests {
             assert!(
                 msg.contains("isolation: \"worktree\"")
                     && msg.contains("WorktreeCreate")
-                    && msg.contains("worktree diff")
-                    && msg.contains("worktree land"),
-                "{cmd} must teach the dispatch flow and the cleanup verbs, got: {msg}",
+                    && msg.contains("git merge --squash")
+                    && msg.contains("worktree rm"),
+                "{cmd} must teach the dispatch flow and the git-native landing, got: {msg}",
             );
         }
     }
 
     #[test]
     fn worktree_cleanup_verbs_survive_the_dispatch_deny() {
-        // The deny is surgical (misc 177): `rm` and `land` are the sanctioned
-        // cleanup path (WorktreeRemove never fires upstream), and `ls`/`diff`
-        // are reads — all stay available to WorktreeCreate clients.
+        // The deny is surgical (misc 177): `rm` is the sanctioned cleanup path
+        // (WorktreeRemove never fires upstream) and `ls` is a read — both stay
+        // available to WorktreeCreate clients. The retired `land`/`diff` stubs
+        // (wf-03) stay reachable too, so their teaching can print; their
+        // entries delete with the stubs in a later release.
         for cmd in [
             "catenary worktree rm /some/path",
             "catenary worktree land /wt",
@@ -4539,8 +4501,8 @@ mod tests {
             assert!(
                 msg.contains("--force")
                     && msg.contains("maintainer's lever")
-                    && msg.contains("worktree diff")
-                    && msg.contains("worktree land")
+                    && msg.contains("git diff main...")
+                    && msg.contains("git merge --squash")
                     && msg.contains("worktree rm"),
                 "{cmd} must teach the worktree lifecycle and the maintainer's lever, got: {msg}",
             );
@@ -4587,9 +4549,9 @@ mod tests {
 
     #[test]
     fn worktree_diff_is_search_class_pipes_and_chains() {
-        // `catenary worktree diff <path>` is Search-class (misc 158): its diff is
-        // complete client-owned output (a `git apply` patch), so it pipes and
-        // chains like `grep`/`glob`.
+        // `catenary worktree diff` retired to a teaching stub (wf-03) but keeps
+        // its Search class during the transition, so every old invocation shape
+        // reaches the stub (which prints the git-native flow and exits 2).
         assert_eq!(
             analyze_catenary_command("catenary worktree diff /wt", None),
             CatenaryAction::Allow { has_foreign: false },
@@ -4608,8 +4570,10 @@ mod tests {
 
     #[test]
     fn worktree_land_is_bare_only_lifecycle() {
-        // `land` writes the diff into the owning repo and removes the worktree:
-        // bare-only lifecycle (misc 158).
+        // `catenary worktree land` retired to a teaching stub (wf-03) but keeps
+        // its bare-only lifecycle class during the transition, so a bare
+        // invocation reaches the stub (which prints the git-native flow and
+        // exits 2).
         assert_eq!(
             analyze_catenary_command("catenary worktree land /wt", None),
             CatenaryAction::Allow { has_foreign: false },
@@ -4634,50 +4598,6 @@ mod tests {
                 CatenaryAction::Deny(_),
             ),
             "worktree land must not pipe out",
-        );
-    }
-
-    #[test]
-    fn worktree_land_path_extracts_the_literal_worktree_operand() {
-        // The daemon reads the worktree path off the land command to look the
-        // owner's unpaid debt up (misc 189). The first non-flag operand after
-        // `land` is the path; `--keep` is skipped.
-        assert_eq!(
-            worktree_land_path("catenary worktree land /wt"),
-            Some("/wt".to_string()),
-            "the bare path operand is extracted",
-        );
-        assert_eq!(
-            worktree_land_path("catenary worktree land --keep /wt"),
-            Some("/wt".to_string()),
-            "a flag before the path is skipped",
-        );
-        assert_eq!(
-            worktree_land_path("catenary worktree land /wt --keep"),
-            Some("/wt".to_string()),
-            "a trailing flag does not shadow the path",
-        );
-    }
-
-    #[test]
-    fn worktree_land_path_is_none_for_non_land_and_computed_operands() {
-        // Only a `catenary worktree land` command yields a path; a computed
-        // operand is rejected (its spelling is not the real path — fail-closed,
-        // matching the resolver's opaque-path denial).
-        assert_eq!(
-            worktree_land_path("catenary worktree diff /wt"),
-            None,
-            "diff is not a land",
-        );
-        assert_eq!(
-            worktree_land_path("git apply patch"),
-            None,
-            "a foreign command is not a land",
-        );
-        assert_eq!(
-            worktree_land_path("catenary worktree land $WT"),
-            None,
-            "a computed (`$VAR`) operand is declined",
         );
     }
 

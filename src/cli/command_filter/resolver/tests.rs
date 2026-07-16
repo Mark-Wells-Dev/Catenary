@@ -2001,111 +2001,23 @@ fn patch_output_relocation_is_opaque() {
     );
 }
 
-// ── catenary worktree land: write-set resolution (misc 158) ──────────────────
-
-/// Build a real git repo + linked worktree + sidecar, returning
-/// `(tempdir, repo_root, worktree)`. The repo and the worktree are distinct
-/// subdirs of one tempdir (so parallel tests never collide on a shared sibling
-/// name). The sidecar records the owning repo so the resolver can map the
-/// worktree's changed paths onto it (the land write-set).
-fn land_fixture() -> (TempDir, PathBuf, PathBuf) {
-    let root_dir = tmp();
-    let repo = root_dir.path().join("repo");
-    std::fs::create_dir_all(&repo).expect("mkdir repo");
-    git(&repo, &["init", "-q"]);
-    git(&repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
-    commit(&repo, "README.md", "hello\n");
-
-    let worktree = root_dir.path().join("wt");
-    git(
-        &repo,
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "-b",
-            "topic",
-            worktree.to_str().expect("wt path"),
-        ],
-    );
-    let worktree = worktree.canonicalize().expect("canonicalize wt");
-    let repo = repo.canonicalize().expect("canonicalize repo");
-
-    // A sidecar beside the worktree dir naming the owning repo (the minimal shape
-    // the resolver reads: `worktree`, `source_repo`).
-    let meta = serde_json::json!({
-        "worktree": worktree,
-        "source_repo": repo,
-        "base_commit": "",
-        "branch": "topic",
-        "name": "agent-x",
-        "agent_id": "x",
-        "session_id": "s",
-        "created_at": "2026-07-08T00:00:00Z",
-        "class": "agent",
-        "vcs": "git",
-    });
-    let leaf = worktree.file_name().expect("leaf");
-    let sidecar = worktree.with_file_name(format!("{}.meta.json", leaf.to_string_lossy()));
-    std::fs::write(&sidecar, serde_json::to_string(&meta).expect("meta")).expect("write sidecar");
-
-    (root_dir, repo, worktree)
-}
+// ── catenary: every form is NoWrite (wf-03) ──────────────────────────────────
 
 #[test]
-fn worktree_land_records_changed_paths_mapped_onto_owning_repo() {
-    // `catenary worktree land <wt>` resolves to the worktree's changed paths
-    // (tracked mod + untracked) mapped onto the owning repo root — the write-set
-    // that arms the diagnostics batch exactly like `git apply` (misc 158).
-    let (_dir, repo, worktree) = land_fixture();
-    // A tracked modification and an untracked new file in the worktree.
-    write(&worktree, "README.md", "hello world\n");
-    write(&worktree, "new.txt", "brand new\n");
-
-    let cmd = format!("catenary worktree land {}", worktree.to_string_lossy());
-    let got = resolve_command(&cmd, Some(&repo))
-        .unwrap_or_else(|op| panic!("expected land to resolve, got {op:?}"))
-        .writes;
-
-    let expected: BTreeSet<PathBuf> = [repo.join("README.md"), repo.join("new.txt")]
-        .into_iter()
-        .collect();
-    assert_eq!(
-        got, expected,
-        "land's write-set is the changed paths mapped onto the owning repo",
-    );
-}
-
-#[test]
-fn worktree_land_opaque_path_is_denied() {
-    // A computed worktree argument can't be resolved — Opaque, naming the form.
-    let op = err("catenary worktree land $WT", None);
-    assert_eq!(op.construct, "worktree-land-opaque-path");
-}
-
-#[test]
-fn worktree_land_unregistered_path_is_denied() {
-    // A path with no sidecar is not a registered worktree — Opaque, fail-closed.
+fn catenary_verbs_record_nothing() {
+    // No catenary form introduces attributable working-tree content: the one
+    // write verb, `worktree land`, retired to a teaching stub (wf-03) — the
+    // git-native merge flow carries landing now — and the read verbs never
+    // wrote. All resolve to an empty write-set.
     let t = tmp();
-    let op = resolve_command(
-        &format!("catenary worktree land {}", t.path().to_string_lossy()),
-        Some(t.path()),
-    )
-    .expect_err("no sidecar");
-    assert_eq!(op.construct, "worktree-land-not-registered");
-}
-
-#[test]
-fn worktree_diff_and_ls_record_nothing() {
-    // Read-only catenary verbs introduce no attributable working-tree content.
-    let (_dir, repo, worktree) = land_fixture();
     for cmd in [
-        format!("catenary worktree diff {}", worktree.to_string_lossy()),
-        "catenary worktree ls".to_string(),
-        "catenary grep foo".to_string(),
+        "catenary worktree diff /wt",
+        "catenary worktree land /wt",
+        "catenary worktree ls",
+        "catenary grep foo",
     ] {
         assert_eq!(
-            resolve_command(&cmd, Some(&repo))
+            resolve_command(cmd, Some(t.path()))
                 .unwrap_or_else(|op| panic!("{cmd:?} should resolve, got {op:?}"))
                 .writes,
             BTreeSet::new(),

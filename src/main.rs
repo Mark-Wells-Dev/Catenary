@@ -499,23 +499,21 @@ enum WorktreeCommand {
         #[arg(long)]
         force: bool,
     },
-    /// Print a worktree's complete diff vs HEAD (tracked changes plus untracked
-    /// files as new-file hunks; a valid `git apply` patch).
+    /// Retired: prints the git-native landing flow (commit in the branch,
+    /// `git diff main...<branch>`, `git merge --squash <branch>`, commit,
+    /// `catenary worktree rm <path>`) and exits 2.
     Diff {
-        /// Path of the worktree to diff.
-        path: PathBuf,
-        /// Print only the changed paths, one per line, instead of the full diff.
-        #[arg(long)]
-        name_only: bool,
+        /// Ignored — the retired stub teaches regardless of arguments.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        args: Vec<String>,
     },
-    /// Land a worktree's changes into its owning repo (`git apply --3way`), arm
-    /// the diagnostics batch, and remove the worktree. Never commits.
+    /// Retired: prints the git-native landing flow (commit in the branch,
+    /// `git diff main...<branch>`, `git merge --squash <branch>`, commit,
+    /// `catenary worktree rm <path>`) and exits 2.
     Land {
-        /// Path of the worktree to land.
-        path: PathBuf,
-        /// Land the changes without removing the worktree afterward.
-        #[arg(long)]
-        keep: bool,
+        /// Ignored — the retired stub teaches regardless of arguments.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        args: Vec<String>,
     },
 }
 
@@ -1011,11 +1009,17 @@ fn main() -> Result<()> {
                 WorktreeCommand::Rm { path, force } => {
                     build_runtime()?.block_on(cli::worktree::run_rm(&mut out, path, force))
                 }
-                WorktreeCommand::Diff { path, name_only } => {
-                    cli::worktree::run_diff(&mut out, &path, name_only)
+                // Transition-period teaching stubs (wf-03): `worktree diff` and
+                // `worktree land` retired to the git-native flow. Each prints
+                // the flow and exits 2 (distinct from success and from generic
+                // error 1). These stubs get deleted in a later release.
+                WorktreeCommand::Diff { args: _ } => {
+                    eprint!("{}", cli::worktree::retired_stub_message("diff"));
+                    std::process::exit(2);
                 }
-                WorktreeCommand::Land { path, keep } => {
-                    build_runtime()?.block_on(cli::worktree::run_land(&mut out, path, keep))
+                WorktreeCommand::Land { args: _ } => {
+                    eprint!("{}", cli::worktree::retired_stub_message("land"));
+                    std::process::exit(2);
                 }
             }
         }

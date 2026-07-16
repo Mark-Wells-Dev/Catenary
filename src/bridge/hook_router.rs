@@ -213,37 +213,21 @@ impl HookRouter {
                     }
                     // Resolved shell writes attribute exactly like edits
                     // (ws38 ticket 02): covered targets enter the caller's
-                    // modified-set, the first one entering editing mode.
-                    //
-                    // `catenary worktree land` is the one exception (misc 189):
-                    // its resolved write-set is the whole landed diff, but the
-                    // ruling says debt *transfers* from the owner, never
-                    // duplicates. So a land arms only the subset of the landed
-                    // files whose owner left them UNPAID — read from the owner's
-                    // ledger, not the git content. A worktree whose worker paid
-                    // (or whose batch died with a bounced daemon, bug 79) arms
-                    // nothing.
+                    // modified-set, the first one entering editing mode. The
+                    // former `catenary worktree land` exception (misc 189)
+                    // retired with the land engine (wf-03): landing is
+                    // git-native now, and the merge bracket
+                    // (`merge_debt_transfer`, wf-01) owns the worktree debt
+                    // transfer.
                     if !writes.is_empty() {
                         for write in &writes {
                             self.session.record_activity_touch(write);
                         }
-                        if let Some(land_path) = command
-                            .as_deref()
-                            .and_then(crate::cli::command_filter::worktree_land_path)
-                        {
-                            self.handle_worktree_land_debt_transfer(
-                                &land_path,
-                                &writes,
-                                session_id.as_deref(),
-                                &agent_id,
-                            );
-                        } else {
-                            self.handle_shell_write_accumulation(
-                                &writes,
-                                session_id.as_deref(),
-                                &agent_id,
-                            );
-                        }
+                        self.handle_shell_write_accumulation(
+                            &writes,
+                            session_id.as_deref(),
+                            &agent_id,
+                        );
                     }
                 }
                 DispatchResult { result }
@@ -767,126 +751,6 @@ impl HookRouter {
                 self.session
                     .editing
                     .record_unverified_edit(session_id, agent_id, name);
-            }
-        }
-    }
-
-    /// Transfer a landed worktree's **unpaid** diagnostics debt to the landing
-    /// agent (misc 189) — the ruled land/ledger seam.
-    ///
-    /// Landing a worktree takes on its content, and — per the maintainer's ruling
-    /// — its debt: exactly the files the worker left **unpaid** (never ran
-    /// `catenary diagnostics` over), and nothing more. Debt follows unpaid
-    /// content and *transfers*; it never duplicates. This replaces the retired
-    /// content-based arm (which armed the whole landed diff regardless of
-    /// payment, and split inconsistently at larger file counts — misc 189's dig).
-    ///
-    /// Reads the worktree's sidecar for the owner's `source_repo`, then reads the
-    /// worktree ROOT's durable lock ledger ([`crate::lock::due_files`]) for the
-    /// owner's still-unpaid debt — the files edited in the worktree but never
-    /// diagnosed (root-ownership stage 3: debt is a property of the root, read by
-    /// pure path algebra — no identity below the hook). A worktree whose worker
-    /// **paid** (empty ledger), whose worker **never edited** (no lock dir), or
-    /// whose lock **retired** all present the same debt-free ledger and arm
-    /// nothing (the never-lock-out doctrine).
-    ///
-    /// `landed` is the land's resolved write-set (the applied files, mapped onto
-    /// the owning repo). The transfer is the owner-unpaid set intersected with
-    /// what actually landed ([`crate::worktree_land::owner_unpaid_landed`]): a
-    /// file the owner never paid but that did not land (a conflict) transfers no
-    /// debt. Each transferred path is recorded into the landing agent's batch
-    /// exactly like a covered edit, the first one entering editing mode.
-    ///
-    /// A missing/unparseable sidecar, or a non-covered owner session, arms
-    /// nothing — a silent no-op, never a lock-out.
-    fn handle_worktree_land_debt_transfer(
-        &self,
-        land_path: &str,
-        landed: &[PathBuf],
-        session_id: Option<&str>,
-        agent_id: &str,
-    ) {
-        // Canonicalize the worktree path the same way the daemon land handler
-        // does, so the owner's canonical batch paths strip-prefix cleanly.
-        let worktree = Path::new(land_path)
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(land_path));
-
-        // The owner's identity: session + owning repo from the sidecar, agent id
-        // from the worktree's leaf directory name.
-        let sidecar = crate::worktree_create::sidecar_path(&worktree);
-        let Some(meta) = std::fs::read_to_string(&sidecar)
-            .ok()
-            .and_then(|c| serde_json::from_str::<crate::worktree_create::WorktreeMeta>(&c).ok())
-        else {
-            return; // not a registered worktree — nothing to transfer
-        };
-        // The owner's still-unpaid debt, read from the WORKTREE ROOT's durable
-        // ledger (root-ownership stage 3): debt is a property of the root, so a
-        // land inherits exactly the touch files the worker left in the worktree's
-        // lock dir — the files edited but never diagnosed. A worktree whose worker
-        // paid (empty ledger), never edited (no lock dir), or whose lock retired
-        // all present a debt-free ledger and arm nothing (the never-lock-out
-        // doctrine). This supersedes the in-memory `(session, agent)` batch read:
-        // no identity below the hook, and the ledger survives daemon churn.
-        let owner_unpaid = crate::lock::due_files(&worktree);
-        if owner_unpaid.is_empty() {
-            return;
-        }
-
-        // The unpaid files that actually landed, mapped onto the owning repo —
-        // the exact debt to transfer (misc 189: debt follows unpaid content and
-        // transfers, never duplicates).
-        let landed_set: std::collections::BTreeSet<PathBuf> = landed.iter().cloned().collect();
-        let transfer = crate::worktree_land::owner_unpaid_landed(
-            &owner_unpaid,
-            &worktree,
-            &meta.source_repo,
-            &landed_set,
-        );
-
-        if transfer.is_empty() {
-            return;
-        }
-
-        // Book the transferred (unpaid-landed) files into the owning repo's
-        // durable LEDGER under the landing agent's identity (root-ownership stage
-        // 3). Debt is a property of the root: the landing agent now owes exactly
-        // these files in the owning repo, so a later `catenary diagnostics` there
-        // serves them. The owner is `<client>+<session>+<agent>` — the same tuple
-        // the landing agent's own edit seam acquires with (`self.client_name` is
-        // the host `format`), so the transfer never leaves the landing agent
-        // denied on its own root. Files are canonicalized inside `book_transferred`
-        // so they land on the canonical ledger the serve reads (misc 193).
-        let owner = crate::lock::Owner::new(
-            self.client_name.clone(),
-            session_id.unwrap_or_default(),
-            agent_id,
-        );
-        // Canonicalize the owning-repo root so its ledger encoding matches the one
-        // a later cwd → root serve resolves (misc 193).
-        let landing_root = meta
-            .source_repo
-            .canonicalize()
-            .unwrap_or_else(|_| meta.source_repo.clone());
-        let transfer_files: Vec<PathBuf> = transfer.iter().cloned().collect();
-        crate::lock::book_transferred(&landing_root, &owner, &transfer_files);
-
-        // Also record the transferred files into the in-memory batch (the board's
-        // editing/working status and the Stop-block still read it), the first one
-        // entering editing mode. The LEDGER is the debt source of truth; this
-        // keeps the observability surface in step.
-        let mut started = self.session.editing.is_editing(session_id, agent_id);
-        for path in &transfer {
-            // Canonicalize (when it exists) before the coverage check and record,
-            // matching `handle_shell_write_accumulation`'s canonical alignment.
-            let path = path.canonicalize().unwrap_or_else(|_| path.clone());
-            if self.session.covered_for_diagnostics(&path) {
-                if !started {
-                    let _ = self.session.editing.start_editing(session_id, agent_id);
-                    started = true;
-                }
-                self.record_covered_write(&path, session_id, agent_id, "landed");
             }
         }
     }

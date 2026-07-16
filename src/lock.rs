@@ -1072,15 +1072,17 @@ pub fn unlink_delivered(root: &Path, files: &[PathBuf]) -> Vec<(PathBuf, UnlinkO
 /// Books a set of files into `root`'s ledger under `owner`, creating the lock
 /// dir + owner file if the root is not yet locked (root-ownership stage 3).
 ///
-/// The daemon-side booking seam for the worktree-land debt transfer: a landed
-/// worktree's unpaid files become the landing agent's debt, booked directly into
-/// the owning repo's ledger (identity lives at the land hook, forwarded here) so
-/// a later `catenary diagnostics` in the landing repo serves them. Distinct from
-/// the edit-seam [`acquire_in`] — this is a bulk transfer, not a per-edit
-/// acquisition, so it books unconditionally (the caller already resolved the
-/// transfer set) without the booking/coverage gate. Each file is canonicalized so
-/// its touch leaf matches the canonical ledger a later `due_files`/serve reads
-/// (misc 193). Best-effort: a failed create never blocks the land.
+/// The bulk booking seam behind the merge bracket's debt transfer
+/// ([`merge_transfer_in`], wf-01) and the Book-direction reconcile
+/// ([`reconcile_bracket_in`]): a merged worktree's unpaid files become the
+/// merging agent's debt, booked directly into the owning repo's ledger
+/// (identity lives at the hook, forwarded here) so a later
+/// `catenary diagnostics` there serves them. Distinct from the edit-seam
+/// [`acquire_in`] — this is a bulk transfer, not a per-edit acquisition, so it
+/// books unconditionally (the caller already resolved the transfer set) without
+/// the booking/coverage gate. Each file is canonicalized so its touch leaf
+/// matches the canonical ledger a later `due_files`/serve reads (misc 193).
+/// Best-effort: a failed create never blocks the caller.
 pub fn book_transferred_in(locks_base: &Path, root: &Path, owner: &Owner, files: &[PathBuf]) {
     if files.is_empty() {
         return;
@@ -1097,12 +1099,6 @@ pub fn book_transferred_in(locks_base: &Path, root: &Path, owner: &Owner, files:
         let file = file.canonicalize().unwrap_or_else(|_| file.clone());
         book_file(&lock_dir, root, &file);
     }
-}
-
-/// Production wrapper for [`book_transferred_in`] resolving the base through
-/// [`locks_dir`].
-pub fn book_transferred(root: &Path, owner: &Owner, files: &[PathBuf]) {
-    book_transferred_in(&locks_dir(), root, owner, files);
 }
 
 /// The direction a reconcile bracket drives the ledger (root-ownership stage 5).
@@ -1284,7 +1280,7 @@ pub fn merge_transfer(
 ///
 /// The whole-set convenience over [`unlink_delivered`], used where the caller
 /// holds a flat file list rather than a per-root grouping (the diagnostics
-/// delivery seam and the worktree-land ledger prune). Each file is canonicalized
+/// delivery seam). Each file is canonicalized
 /// inside [`unlink_delivered_in`] so a symlinked-prefix alias pays the canonical
 /// ledger it booked against (misc 193). Best-effort: a file that resolves to no
 /// root unlinks nothing and reports [`UnlinkOutcome::NoRoot`]. Returns every
@@ -1315,7 +1311,7 @@ pub fn unlink_delivered_by_root(files: &[PathBuf]) -> Vec<(PathBuf, UnlinkOutcom
 /// `<locks_base>/<encoded-root>/` (owner file, ledger, and all) — release leg 2
 /// (root retirement).
 ///
-/// Called when a worktree lands / is removed / vanishes: the lock and its ledger
+/// Called when a worktree is removed / vanishes: the lock and its ledger
 /// go with the kitchen. Idempotent — retiring an already-absent lock is a no-op.
 /// Best-effort; a partial failure leaves the reaper to finish.
 pub fn retire_in(locks_base: &Path, root: &Path) {
@@ -2257,10 +2253,10 @@ mod tests {
 
     #[test]
     fn book_transferred_books_into_the_ledger_under_an_owner() {
-        // The worktree-land debt transfer seam: files become the landing agent's
-        // debt in the owning repo's ledger, served by a later `catenary
-        // diagnostics` there. Booking creates the lock dir + owner file when the
-        // root is not yet locked.
+        // The bulk booking seam behind the merge bracket (wf-01): files become
+        // the merging agent's debt in the owning repo's ledger, served by a
+        // later `catenary diagnostics` there. Booking creates the lock dir +
+        // owner file when the root is not yet locked.
         let fx = Fixture::new();
         let f1 = fx.file("src/a.rs");
         let f2 = fx.file("src/b.rs");

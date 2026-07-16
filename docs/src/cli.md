@@ -408,8 +408,6 @@ prepare a change in isolation and land it when it is ready.
 ```bash
 catenary worktree add my-feature          # create a feats-class worktree for a branch
 catenary worktree ls                      # list Catenary-managed worktrees
-catenary worktree diff <path>             # print the worktree's full diff vs its branch point
-catenary worktree land <path>             # apply + stage the changes, then retire the worktree
 catenary worktree rm <path>               # remove a worktree
 catenary worktree rm --force <path>       # discard a superseded dirty worktree
 ```
@@ -418,13 +416,26 @@ catenary worktree rm --force <path>       # discard a superseded dirty worktree
 |------------|-------------|
 | `add <branch> [path]` | Create a durable worktree for `<branch>` (default path under Catenary's state dir; pass an explicit `path` to override). Adds a sibling symlink for discovery. |
 | `ls` | List Catenary-managed worktrees — path, class, creator, age, clean/dirty, and (for `feats` worktrees) ahead/behind counts. |
-| `diff <path>` | Print the worktree's complete diff vs its **branch point** (the merge-base of its creation base and current `HEAD`) — tracked changes, untracked files as new-file hunks, **and committed work** — as a valid `git apply` patch. `--name-only` prints just the changed paths. |
-| `land <path>` | Apply the worktree's diff into the owning repo with `git apply --3way`, **stage** the result, arm a diagnostics batch over the changed files, delete the branch, and retire the root. It **never commits** — you review and commit. Committed worktree work lands as an uncommitted change. `--keep` lands without removing the worktree. |
 | `rm <path>` | Remove a worktree class-appropriately. A dirty worktree is never auto-reaped — `rm` refuses to discard uncaptured work. `--force` is the explicit exception: it discards a dirty (superseded or abandoned) worktree through the proper disposal path — retiring the root and sweeping the registry — and names the dropped work. |
 
-`land` stages but does not commit, so the changes land in your index for review.
-A dirty worktree is never removed automatically: unlanded work is always kept
-until you land or explicitly remove it.
+**Landing is git-native.** Worktree work lands with git itself, not a Catenary
+verb:
+
+1. commit the work in the worktree, on its branch
+2. review it: `git diff main...<branch>`
+3. in the owning repo: `git merge --squash <branch>`
+4. commit the result
+5. remove the worktree: `catenary worktree rm <path>`
+
+The merge bracket transfers any unpaid worker debt automatically; pay it with
+`catenary diagnostics`. A dirty worktree is never removed automatically:
+unlanded work is always kept until you land or explicitly remove it.
+
+The former `catenary worktree diff` / `catenary worktree land` verbs are
+retired: the land patch engine (`git apply` reimplementing `git merge`) refused
+on routine owning-repo drift, so both verbs are transition-period teaching
+stubs that print the git-native flow above and exit `2`. The stubs will be
+deleted in a later release.
 
 > **Agent surface:** on hosts whose installed hook set registers the
 > `WorktreeCreate` hook (today Claude Code), agent-side `catenary worktree add`
@@ -434,11 +445,10 @@ until you land or explicitly remove it.
 > itself. A hand-run add anchors nothing, leaving the subagent pinned to the
 > main tree. On the same hosts, agent-side `catenary worktree rm --force` — the
 > dirty-discard lever — is denied too (misc 188): discarding uncommitted work
-> is the maintainer's lever, not the agent's. The read/cleanup verbs stay
-> available (`diff` to review, `land` to keep, bare `rm` to dispose a clean
-> worktree — bare `rm` refuses a dirty worktree on its own), and human terminal
-> use is unaffected — hooks only filter agent tool calls, so operators keep
-> `--force`.
+> is the maintainer's lever, not the agent's. The git-native landing flow and
+> bare `rm` (which refuses a dirty worktree on its own) stay available, and
+> human terminal use is unaffected — hooks only filter agent tool calls, so
+> operators keep `--force`.
 
 ### `catenary doctor`
 

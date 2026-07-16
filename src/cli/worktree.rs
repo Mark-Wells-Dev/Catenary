@@ -17,16 +17,12 @@
 //!   on the caller's captured-work assertion (the force-shaped landing path); a
 //!   feats worktree refuses dirty (uncommitted or unpushed). Served by the daemon
 //!   (`tool/worktree-rm`), which reaps the mount, disposes, and firehose-logs.
-//! - `diff <path>` — the COMPLETE unified diff of a worktree vs `HEAD` (tracked
-//!   changes plus untracked files as new-file hunks; misc 158). Search-class:
-//!   pipe-friendly, complete output, `git apply`-consumable. `--name-only` lists
-//!   the changed paths. Filesystem-local (runs git against the worktree).
-//! - `land <path>` — apply that complete diff into the OWNING repo via
-//!   `git apply --3way` and remove the worktree on success (misc 158). Served by
-//!   the daemon (`tool/worktree-land`), which reaps the mount, applies (a plain
-//!   `--check` first, so a refusal leaves the owning repo untouched), and
-//!   disposes. `--keep` skips removal. The diagnostics batch arms via the
-//!   `PreToolUse` hook's write-set resolver, exactly like `git apply`.
+//!
+//! The former `diff` and `land` verbs retired to teaching stubs (wf-03, closing
+//! bugs 115/119): landing is git-native now — commit in the branch, review with
+//! `git diff main...<branch>`, `git merge --squash <branch>`, commit, then
+//! `catenary worktree rm <path>`. The stubs ([`retired_stub_message`]) print
+//! that flow and exit 2; they get deleted in a later release.
 
 use std::path::{Path, PathBuf};
 
@@ -200,130 +196,28 @@ pub async fn run_rm(out: &mut Output, path: PathBuf, force: bool) -> Result<()> 
     Ok(())
 }
 
-/// Absolutize a possibly-relative path against the current directory, then
-/// canonicalize when the target exists (so it matches the daemon's canonical
-/// registry keys). Falls back to the absolute-but-uncanonicalized form when the
-/// path does not exist — the daemon names that state honestly.
-fn absolutize(path: &Path) -> PathBuf {
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |c| c.join(path))
-    };
-    abs.canonicalize().unwrap_or(abs)
-}
-
-/// `catenary worktree diff <path>` — print the complete unified diff of a
-/// worktree vs `HEAD` (misc 158).
+/// The teaching message the retired `worktree diff` / `worktree land` stubs
+/// print (wf-03, closing bugs 115/119).
 ///
-/// Tracked changes plus untracked non-ignored files as new-file hunks — a valid
-/// unified diff a `git apply` consumes. `--name-only` prints just the changed
-/// paths, one per line (the write-set primitive `land` and the hook use).
-/// Filesystem-local: runs git directly against the worktree, no daemon needed.
+/// The patch engine (`git apply` reimplementing `git merge`) is gone; landing is
+/// git-native and the merge bracket (wf-01) carries the debt transfer. The
+/// message names the verb invoked and teaches the exact sequence, one step per
+/// line. The stubs exit 2 (distinct from success and from generic error 1).
 ///
-/// # Errors
-///
-/// Returns an error if the path is not a git worktree, is missing/unmounted, or
-/// git is unavailable — the message names the state, never a bare not-found.
-pub fn run_diff(out: &mut Output, path: &Path, name_only: bool) -> Result<()> {
-    let worktree = absolutize(path);
-    if name_only {
-        let names = crate::worktree_land::worktree_changed_paths(&worktree)?;
-        for name in &names {
-            let _ = out.writeln(format_args!("{name}"));
-        }
-    } else {
-        let diff = crate::worktree_land::worktree_diff(&worktree)?;
-        // The diff already carries its own newlines; write it verbatim so it stays
-        // `git apply`-consumable byte-for-byte.
-        let _ = out.write_str(format_args!("{diff}"));
-    }
-    Ok(())
-}
-
-/// `catenary worktree land <path>` — apply the worktree's complete diff into its
-/// owning repo and remove the worktree (misc 158).
-///
-/// Served by the daemon (`tool/worktree-land`), which reaps any live mount,
-/// applies the diff via `git apply --3way` (validated with a plain `--check`
-/// first, so a refusal leaves the owning repo untouched), and disposes the
-/// worktree (unless `keep`). On any failure the worktree is kept untouched and
-/// the error names the cause. The diagnostics batch arms on the `PreToolUse`
-/// hook round-trip by transferring the worktree owner's **unpaid** debt to the
-/// landing agent (misc 189) — a paid worktree lands debt-free.
-///
-/// # Errors
-///
-/// Returns an error if no daemon is running or the response is invalid. A refusal
-/// (an apply conflict, local commits, a non-git worktree, a missing path) is
-/// printed, not an error — the caller still exits successfully.
-pub async fn run_land(out: &mut Output, path: PathBuf, keep: bool) -> Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    let abs = absolutize(&path);
-
-    let ipc_path = crate::router::socket_path();
-    let stream = tokio::net::UnixStream::connect(&ipc_path)
-        .await
-        .context("no daemon running — start a Catenary session first")?;
-
-    let (reader, mut writer) = stream.into_split();
-    let request = serde_json::json!({
-        "method": "tool/worktree-land",
-        "path": abs.display().to_string(),
-        "keep": keep,
-    });
-    let mut payload = serde_json::to_string(&request)?;
-    payload.push('\n');
-    writer.write_all(payload.as_bytes()).await?;
-
-    let mut buf_reader = BufReader::new(reader);
-    let mut line = String::new();
-    buf_reader.read_line(&mut line).await?;
-
-    let response: serde_json::Value =
-        serde_json::from_str(line.trim()).context("invalid response from daemon")?;
-    let status = response
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-
-    match status {
-        "ok" => {
-            let removed = response
-                .get("removed")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            let count = response
-                .get("paths")
-                .and_then(|v| v.as_array())
-                .map_or(0, Vec::len);
-            let noun = if count == 1 { "file" } else { "files" };
-            if removed {
-                let _ = out.writeln(format_args!(
-                    "landed {count} {noun} into the owning repo; worktree removed",
-                ));
-            } else {
-                let _ = out.writeln(format_args!(
-                    "landed {count} {noun} into the owning repo; worktree kept",
-                ));
-            }
-        }
-        "empty" => {
-            let _ = out.writeln(format_args!(
-                "nothing to land — the worktree matches HEAD (worktree kept)",
-            ));
-        }
-        "refused" | "not_ours" | "error" => {
-            let msg = response
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("worktree not landed");
-            let _ = out.writeln(format_args!("{msg}"));
-        }
-        _ => anyhow::bail!("unexpected response from daemon"),
-    }
-    Ok(())
+/// NOTE: these stubs are transition-period teaching only — they (and this
+/// function) get deleted in a later release.
+#[must_use]
+pub fn retired_stub_message(verb: &str) -> String {
+    format!(
+        "`catenary worktree {verb}` is retired — land worktree work with git itself:\n\
+         \x20 1. commit the work in the worktree, on its branch\n\
+         \x20 2. review it: git diff main...<branch>\n\
+         \x20 3. in the owning repo: git merge --squash <branch>\n\
+         \x20 4. commit the result\n\
+         \x20 5. remove the worktree: catenary worktree rm <path>\n\
+         The merge bracket transfers any unpaid worker debt automatically; pay it \
+         with `catenary diagnostics`.\n"
+    )
 }
 
 /// Humanize an RFC 3339 timestamp into a compact relative age (`3h`, `2d`, `5m`,
@@ -350,7 +244,32 @@ fn humanize_age(created_at: &str) -> String {
     reason = "tests use expect for readable assertions"
 )]
 mod tests {
-    use super::humanize_age;
+    use super::{humanize_age, retired_stub_message};
+
+    #[test]
+    fn retired_stub_names_the_verb_and_teaches_the_git_native_flow() {
+        // The transition stubs (wf-03) must name the invoked verb and carry the
+        // exact landing sequence, one step per line, plus the debt note. (The
+        // stubs delete in a later release — this test goes with them.)
+        for verb in ["diff", "land"] {
+            let msg = retired_stub_message(verb);
+            assert!(
+                msg.starts_with(&format!("`catenary worktree {verb}` is retired")),
+                "stub names the invoked verb: {msg}"
+            );
+            for step in [
+                "commit the work in the worktree",
+                "git diff main...<branch>",
+                "git merge --squash <branch>",
+                "commit the result",
+                "catenary worktree rm <path>",
+                "merge bracket transfers any unpaid worker debt automatically",
+                "`catenary diagnostics`",
+            ] {
+                assert!(msg.contains(step), "stub missing {step:?}: {msg}");
+            }
+        }
+    }
 
     #[test]
     fn humanize_age_buckets() {
