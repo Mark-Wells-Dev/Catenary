@@ -17,7 +17,8 @@ use crate::logging::reaper::ReapPolicy;
 use super::commands::{self, CommandsConfig};
 use super::{
     Config, IconConfig, LanguageConfig, LinterConfig, NotificationConfig, PermissionsConfig,
-    RegistryConfig, RootsConfig, ServerBinding, ServerDef, ToolsConfig, default_log_retention_days,
+    RegistryConfig, RootsConfig, ServerBinding, ServerDef, ServersConfig, ToolsConfig,
+    default_log_retention_days,
 };
 
 /// Embedded default classification config (lowest-priority layer).
@@ -82,6 +83,9 @@ pub(super) struct RawConfig {
 
     #[serde(default)]
     permissions: Option<PermissionsConfig>,
+
+    #[serde(default)]
+    servers: Option<ServersConfig>,
 
     #[serde(default)]
     linter: RawLinterSection,
@@ -578,8 +582,8 @@ fn parse_linter_defaults(contents: &str) -> Result<HashMap<String, LinterConfig>
 /// Later source wins per-key; keys absent from the later source are preserved.
 ///
 /// **Structured sections** (`notifications`, `icons`, `tools`,
-/// `observability`, `roots`, `registry`): `Option<T>` on `Config`. `None` means
-/// the source
+/// `observability`, `roots`, `registry`, `permissions`, `servers`):
+/// `Option<T>` on `Config`. `None` means the source
 /// did not mention the section; `Some` means it was present (even if all values
 /// match defaults). Merge only overwrites when the later source is `Some`, so an
 /// earlier source's explicit setting survives an unrelated later source.
@@ -622,6 +626,9 @@ fn merge(config: &mut Config, other: RawConfig) {
     }
     if other.permissions.is_some() {
         config.permissions = other.permissions;
+    }
+    if other.servers.is_some() {
+        config.servers = other.servers;
     }
     for (key, value) in other.linter.rule {
         config.linter.insert(key, value);
@@ -1360,6 +1367,31 @@ servers = []
 
         // Loads without error (warn-only); the project config carries no
         // permission policy — the section never reaches enforcement.
+        let result = load_project_config(dir.path())?;
+        assert!(result.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn project_servers_section_is_warned_and_ignored() -> Result<()> {
+        // `[servers]` is user-config-only (lsm 02, mirroring `[roots]` /
+        // `[permissions]`): a project `.catenary.toml` carrying it must
+        // warn-and-ignore, never adopt it — a public repo must never steer
+        // which binary a server spawn executes on a private machine.
+        // `[servers]` is absent from `PROJECT_CONFIG_ALLOWED_KEYS`, so the
+        // unsupported-key warning fires and `ProjectConfig` (which has no
+        // servers field) drops it structurally.
+        assert!(!PROJECT_CONFIG_ALLOWED_KEYS.contains(&"servers"));
+
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "[servers]\nprefer_managed = false\n",
+        )?;
+
+        // Loads without error (warn-only); the project config carries no
+        // spawn policy — the section never reaches resolution.
         let result = load_project_config(dir.path())?;
         assert!(result.is_some());
 

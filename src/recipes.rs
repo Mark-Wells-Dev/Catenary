@@ -1057,6 +1057,33 @@ impl BlessedManifest {
         self.meta.min_schema <= MANIFEST_SCHEMA_VERSION
     }
 
+    /// The preferred blessed row's pinned version for `server` (lsm 02 —
+    /// managed-home spawn resolution), or `None` when no usable pin exists.
+    ///
+    /// The preferred row mirrors [`Self::version_drift`]: the row keyed by
+    /// this host's platform token when present, else the first row by
+    /// platform-key order (deterministic). Returns `None` when:
+    ///
+    /// - `server` is absent from the blessed set — no pin exists;
+    /// - `server` is exempt from version pinning ([`VERSION_PIN_EXEMPT`] —
+    ///   rust-analyzer, rustup-proxied by design): resolution must never
+    ///   consult the managed home for it, so no pin is ever reported.
+    ///
+    /// This is the version [`crate::managed_home::resolve_spawn_program`]
+    /// looks up in the managed home — the pin *names* the version; resolution
+    /// never scans the home for a "latest".
+    #[must_use]
+    pub fn pinned_version(&self, server: &str) -> Option<&str> {
+        if VERSION_PIN_EXEMPT.contains(&server) {
+            return None;
+        }
+        let rows = self.blessed.get(server)?;
+        let entry = current_platform_token()
+            .and_then(|token| rows.get(token))
+            .or_else(|| rows.values().next())?;
+        Some(&entry.version)
+    }
+
     /// Detects `serverInfo.version` drift for `server` against its blessed
     /// rows (lsm 03 — PATH-residue detection, advisory only).
     ///
@@ -1114,13 +1141,18 @@ impl BlessedManifest {
     }
 }
 
-/// Servers exempt from version-drift detection by design (lsm 03).
+/// Servers exempt from version pinning by design (lsm 03, extended in lsm 02).
 ///
 /// rust-analyzer is rustup-proxied and tracks the user's toolchain — its
 /// version legitimately moves with every `rustup update`, and its blessed rows
 /// carry verbatim host-riding `--version` lines rather than a comparable pin
 /// (the health check already understands the rustup proxy shim, misc 162). A
-/// toolchain-tracking RA must never draw a drift finding.
+/// toolchain-tracking RA must never draw a drift finding
+/// ([`BlessedManifest::version_drift`]), and spawn resolution must never
+/// consult the managed server home for it
+/// ([`BlessedManifest::pinned_version`] returns `None`, so
+/// [`crate::managed_home::resolve_spawn_program`] falls through to
+/// PATH/rustup): RA should track the user's toolchain, not Catenary's pin.
 const VERSION_PIN_EXEMPT: &[&str] = &["rust-analyzer"];
 
 /// A detected mismatch between a running server's reported
@@ -2050,6 +2082,55 @@ tier = "cargo-locked"
             seed_manifest().version_drift("rust-analyzer", "1.96.0"),
             None
         );
+    }
+
+    // ── pinned_version (lsm 02) ─────────────────────────────────────
+
+    #[test]
+    fn pinned_version_returns_the_preferred_rows_pin() {
+        // A single row on any platform is the pin.
+        let manifest = drift_manifest("srv", &[("alpha", "5.6.0", None)]);
+        assert_eq!(manifest.pinned_version("srv"), Some("5.6.0"));
+        // An unblessed server carries no pin.
+        assert_eq!(manifest.pinned_version("other"), None);
+    }
+
+    #[test]
+    fn pinned_version_prefers_this_hosts_platform_row() {
+        // Mirrors `version_drift`'s preferred-row rule; on an unpinned host
+        // the fallback is the first row by platform-key order, which this
+        // test cannot distinguish — skip there.
+        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => "1.1.1",
+            ("macos", "aarch64") => "2.2.2",
+            _ => return,
+        };
+        let manifest = drift_manifest(
+            "srv",
+            &[
+                ("linux-x86_64", "1.1.1", Some("verified-on-linux")),
+                ("macos-arm64", "2.2.2", Some("verified-on-macos")),
+            ],
+        );
+        assert_eq!(manifest.pinned_version("srv"), Some(expected));
+    }
+
+    #[test]
+    fn pinned_version_exempts_toolchain_tracking_rust_analyzer() {
+        // rust-analyzer never reports a pin (lsm 02): resolution must never
+        // consult the managed home for it, in ANY configuration — RA tracks
+        // the user's toolchain via PATH/rustup.
+        let manifest = drift_manifest(
+            "rust-analyzer",
+            &[(
+                "linux-x86_64",
+                "rust-analyzer 1.95.0 (5980761 2026-04-14)",
+                Some("verified-on-linux"),
+            )],
+        );
+        assert_eq!(manifest.pinned_version("rust-analyzer"), None);
+        // The seed manifest agrees — the shipped RA rows report no pin.
+        assert_eq!(seed_manifest().pinned_version("rust-analyzer"), None);
     }
 
     #[test]

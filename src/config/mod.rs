@@ -163,6 +163,52 @@ pub struct PermissionsConfig {
     pub deny_host_glob: bool,
 }
 
+/// Managed-server spawn policy (`[servers]`, lsm 02).
+///
+/// User-level only — the same trust rule as `[roots]` and `[permissions]`: a
+/// project `.catenary.toml` carrying `[servers]` is warned-and-ignored (it is
+/// not in [`crate::config::parse::PROJECT_CONFIG_ALLOWED_KEYS`]), so a public
+/// repo can never steer which binary a server spawn executes on a private
+/// machine.
+///
+/// # Examples
+///
+/// ```toml
+/// [servers]
+/// prefer_managed = false   # opt out: always resolve servers on PATH
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServersConfig {
+    /// Prefer the Catenary-managed server home for spawn resolution
+    /// (`[servers] prefer_managed`, default `true`).
+    ///
+    /// When `true`, a server whose blessed-manifest row is pinned spawns the
+    /// managed install at the row's pinned version
+    /// (`<data_dir>/catenary/servers/<name>/<version>/bin/`) when one exists;
+    /// PATH resolution remains the fallback. `false` restores plain PATH
+    /// resolution for users who manage their own servers. A `[lsp.server.*]`
+    /// `path` override always wins over the managed home — an explicitly
+    /// configured executable is its own opt-out. See
+    /// [`crate::managed_home::resolve_spawn_program`].
+    #[serde(default = "default_prefer_managed")]
+    pub prefer_managed: bool,
+}
+
+impl Default for ServersConfig {
+    fn default() -> Self {
+        Self {
+            prefer_managed: default_prefer_managed(),
+        }
+    }
+}
+
+/// serde default for [`ServersConfig::prefer_managed`] — the managed home is
+/// preferred unless the user opts out.
+const fn default_prefer_managed() -> bool {
+    true
+}
+
 /// External signed-registry configuration (`[registry]`, tui-rework 08).
 ///
 /// Controls the signed-registry loader ([`crate::registry`]): whether the daemon
@@ -277,6 +323,13 @@ pub struct Config {
     /// `None` when no source specified `[permissions]`. User-config only; read
     /// via [`Config::permissions`].
     pub permissions: Option<PermissionsConfig>,
+
+    /// Managed-server spawn policy (`[servers]`, lsm 02).
+    ///
+    /// `None` when no source specified `[servers]` (⇒ the managed home is
+    /// preferred, the default). User-config only; read via
+    /// [`Config::prefer_managed`].
+    pub servers: Option<ServersConfig>,
 
     /// Standalone-linter definitions keyed by linter name (`[linter.rule.*]`).
     ///
@@ -557,6 +610,16 @@ impl Config {
     pub fn permissions(&self) -> PermissionsConfig {
         self.permissions.clone().unwrap_or_default()
     }
+
+    /// Whether spawn resolution prefers the managed server home
+    /// (`[servers] prefer_managed`, lsm 02). Defaults to `true` when the
+    /// section is absent.
+    #[must_use]
+    pub fn prefer_managed(&self) -> bool {
+        self.servers
+            .as_ref()
+            .is_none_or(|servers| servers.prefer_managed)
+    }
 }
 
 impl Default for Config {
@@ -573,6 +636,7 @@ impl Default for Config {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: quarantine::Quarantine::new(),
         }
@@ -1728,6 +1792,43 @@ command = "rust-analyzer"
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         fs::write(&path, "[permissions]\nbogus = true\n").expect("write");
+
+        assert!(Config::load_from_sources(&[path]).is_err());
+    }
+
+    #[test]
+    fn servers_absent_prefers_managed_by_default() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "")?;
+
+        let config = Config::load_from_sources(&[path])?;
+        assert!(config.servers.is_none());
+        assert!(
+            config.prefer_managed(),
+            "prefer_managed defaults to true (lsm 02)"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn servers_prefer_managed_false_parses_from_user_config() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[servers]\nprefer_managed = false\n")?;
+
+        let config = Config::load_from_sources(&[path])?;
+        assert!(!config.prefer_managed(), "the PATH opt-out is honored");
+
+        Ok(())
+    }
+
+    #[test]
+    fn servers_rejects_unknown_field() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[servers]\nbogus = true\n").expect("write");
 
         assert!(Config::load_from_sources(&[path]).is_err());
     }

@@ -1957,7 +1957,17 @@ impl LspClientManager {
             // Lost the claim race — loop and wait on the winner's marker.
         };
 
-        let program = server_def.program(server_name);
+        // Spawn resolution (lsm 02): a pinned blessed server prefers its
+        // managed-home install; the user's `path` override or
+        // `[servers] prefer_managed = false` opt back out to PATH.
+        let program = crate::managed_home::resolve_spawn_program(
+            &crate::managed_home::ManagedHome::resolve(),
+            &crate::recipes::active_manifest(),
+            server_name,
+            &server_def,
+            self.config.prefer_managed(),
+        );
+        let program = program.as_str();
         info!(
             source = Source::LspLifecycle.as_str(),
             server = server_name,
@@ -2219,7 +2229,15 @@ impl LspClientManager {
             anyhow::bail!("Single-file LSP server '{server_name}' ({lang}) is dead");
         }
 
-        let program = server_def.program(server_name);
+        // Spawn resolution (lsm 02): same order as the per-root spawn — the
+        // managed home for a pinned blessed server, PATH as the fallback.
+        let program = crate::managed_home::resolve_spawn_program(
+            &crate::managed_home::ManagedHome::resolve(),
+            &crate::recipes::active_manifest(),
+            server_name,
+            &server_def,
+            self.config.prefer_managed(),
+        );
         info!(
             "Spawning single-file LSP server for {lang}: {} {}",
             program,
@@ -2228,7 +2246,7 @@ impl LspClientManager {
 
         let args: Vec<&str> = server_def.args.iter().map(String::as_str).collect();
         let mut client = LspClient::spawn(
-            program,
+            &program,
             &args,
             lang,
             server_name,
@@ -3660,6 +3678,7 @@ mod tests {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         }
@@ -3738,6 +3757,7 @@ mod tests {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })
@@ -3783,6 +3803,7 @@ mod tests {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         });
@@ -3821,6 +3842,7 @@ mod tests {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })
@@ -3868,6 +3890,7 @@ mod tests {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })
@@ -3915,6 +3938,7 @@ mod tests {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })
@@ -3965,6 +3989,7 @@ mod tests {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })
@@ -4231,6 +4256,7 @@ mod tests {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         });
@@ -4725,6 +4751,7 @@ mod tests {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         });
@@ -5231,6 +5258,7 @@ mod tests {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         });
@@ -5292,6 +5320,7 @@ mod tests {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         });
@@ -5352,6 +5381,7 @@ mod tests {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         });
@@ -5777,6 +5807,7 @@ mod tests {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         });
@@ -7336,6 +7367,7 @@ mod tests {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })
@@ -7378,6 +7410,7 @@ mod tests {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })
@@ -8199,6 +8232,7 @@ mod tests {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })
@@ -8699,6 +8733,7 @@ mod tests {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })
@@ -8738,6 +8773,7 @@ mod tests {
             roots: None,
             registry: None,
             permissions: None,
+            servers: None,
             linter: HashMap::new(),
             quarantined: crate::config::Quarantine::new(),
         })

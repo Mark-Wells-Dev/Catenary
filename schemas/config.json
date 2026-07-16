@@ -843,6 +843,18 @@
       },
       "type": "object"
     },
+    "ServersConfig": {
+      "additionalProperties": false,
+      "description": "Managed-server spawn policy (`[servers]`, lsm 02).\n\nUser-level only — the same trust rule as `[roots]` and `[permissions]`: a project `.catenary.toml` carrying `[servers]` is warned-and-ignored (it is not in [`crate::config::parse::PROJECT_CONFIG_ALLOWED_KEYS`]), so a public repo can never steer which binary a server spawn executes on a private machine.\n\n# Examples\n\n```toml [servers] prefer_managed = false   # opt out: always resolve servers on PATH ```",
+      "properties": {
+        "prefer_managed": {
+          "default": true,
+          "description": "Prefer the Catenary-managed server home for spawn resolution (`[servers] prefer_managed`, default `true`).\n\nWhen `true`, a server whose blessed-manifest row is pinned spawns the managed install at the row's pinned version (`<data_dir>/catenary/servers/<name>/<version>/bin/`) when one exists; PATH resolution remains the fallback. `false` restores plain PATH resolution for users who manage their own servers. A `[lsp.server.*]` `path` override always wins over the managed home — an explicitly configured executable is its own opt-out. See [`crate::managed_home::resolve_spawn_program`].",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "StringOrVec": {
       "anyOf": [
         {
@@ -980,6 +992,17 @@
       "anyOf": [
         {
           "$ref": "#/definitions/RootsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "servers": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ServersConfig"
         },
         {
           "type": "null"

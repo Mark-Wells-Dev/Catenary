@@ -112,6 +112,13 @@ platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
+# rust-analyzer is VERSION-PIN EXEMPT (VERSION_PIN_EXEMPT, src/recipes.rs):
+# rustup-proxied and toolchain-coupled, so RA tracks the user's toolchain, not
+# these rows' pins — its rows carry verbatim host-riding `--version` lines, not
+# comparable pins. Drift detection (lsm 03) never flags it, and spawn
+# resolution (lsm 02) never consults the managed server home for it: RA always
+# resolves via PATH/rustup (the health check understands the rustup proxy shim,
+# misc 162).
 [blessed.rust-analyzer.linux-x86_64]
 version = "rust-analyzer 1.95.0 (5980761 2026-04-14)"
 platform = "linux-x86_64"

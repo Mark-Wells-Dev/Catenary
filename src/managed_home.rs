@@ -20,14 +20,23 @@
 //! [`crate::install`] asks this type for the version dir when it translates
 //! "install `<recipe>` at `<version>`" into the contained invocation.
 //!
-//! Spawn resolution — which binary a server *spawn* uses — is deliberately not
-//! here (ls-manager 02). After this ticket installs land in the managed home
-//! while resolution still finds servers on `$PATH`; that intermediate state is
-//! expected.
+//! Spawn resolution — which binary a server *spawn* uses — lives here too
+//! (ls-manager 02, [`resolve_spawn_program`]): for a server whose blessed
+//! manifest row is pinned, the managed install at the row's pinned version is
+//! preferred over `$PATH`, so the blessed fleet is immune to system churn BY
+//! CONSTRUCTION for managed installs. PATH resolution remains the opt-out
+//! (`[servers] prefer_managed = false`, or an explicit `[lsp.server.*]`
+//! `path` override), and rust-analyzer is exempt by design
+//! ([`crate::recipes::BlessedManifest::pinned_version`]).
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+use tracing::debug;
+
+use crate::config::ServerDef;
+use crate::recipes::BlessedManifest;
+use crate::source::Source;
 
 /// The Catenary-managed server home: the single owner of every
 /// install-destination path.
@@ -87,6 +96,97 @@ impl ManagedHome {
     pub fn bin_dir(&self, server: &str, version: &str) -> Result<PathBuf> {
         Ok(self.version_dir(server, version)?.join("bin"))
     }
+
+    /// The managed executable for `server` at exactly `version` —
+    /// `<root>/<server>/<version>/bin/<bin_name>` — when it exists and is
+    /// executable, else `None`.
+    ///
+    /// Exactness is deliberate (lsm 02): the pin names the version; anything
+    /// else in the home is a stale previous version (GC's business, not
+    /// resolution's), so there is no "latest" scan. A segment that fails
+    /// validation resolves to `None` — a defensive fall-through, never an
+    /// error on the spawn path.
+    #[must_use]
+    pub fn pinned_executable(
+        &self,
+        server: &str,
+        version: &str,
+        bin_name: &str,
+    ) -> Option<PathBuf> {
+        if validate_segment("bin name", bin_name).is_err() {
+            return None;
+        }
+        let candidate = self.bin_dir(server, version).ok()?.join(bin_name);
+        is_executable(&candidate).then_some(candidate)
+    }
+}
+
+/// Spawn resolution (lsm 02): the executable a server spawn runs.
+///
+/// Resolution order, first hit wins:
+///
+/// 1. **The user's `path` override** ([`ServerDef::path`]) — a user who
+///    explicitly configured an executable has opted out; the managed home is
+///    never consulted.
+/// 2. **The managed home**, when `prefer_managed` is on (`[servers]
+///    prefer_managed`, user-config only) and the server's blessed manifest
+///    row is pinned ([`BlessedManifest::pinned_version`] — rust-analyzer is
+///    the deliberate exemption and reports no pin): the exact pinned
+///    version's `bin/<key>` if it exists and is executable. The binary name
+///    is the server key itself — the key IS the executable (misc 162); no
+///    per-server name is ever hardcoded here.
+/// 3. **PATH**, as today: the server key, resolved by the OS at spawn.
+///
+/// A managed-home hit emits one `debug!` event (observability, not user
+/// noise) and matches the pin by construction, so it can never draw an
+/// lsm-03 drift finding.
+#[must_use]
+pub fn resolve_spawn_program(
+    home: &ManagedHome,
+    manifest: &BlessedManifest,
+    server_name: &str,
+    server_def: &ServerDef,
+    prefer_managed: bool,
+) -> String {
+    if server_def.path.is_some() {
+        // An explicit executable override wins over the managed home.
+        return server_def.program(server_name).to_owned();
+    }
+    if prefer_managed
+        && let Some(version) = manifest.pinned_version(server_name)
+        && let Some(executable) = home.pinned_executable(server_name, version, server_name)
+    {
+        let program = executable.to_string_lossy().into_owned();
+        debug!(
+            source = Source::LspLifecycle.as_str(),
+            server = server_name,
+            version = version,
+            program = %program,
+            "spawn resolved to the managed home: {server_name} {version}",
+        );
+        return program;
+    }
+    server_def.program(server_name).to_owned()
+}
+
+/// Whether `path` names an existing, executable file (following symlinks).
+///
+/// On non-Unix platforms existence of a regular file is the whole check —
+/// there are no execute bits to consult.
+fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    true
 }
 
 /// Refuse a path segment that is not one plain component.
@@ -261,5 +361,156 @@ mod tests {
             expose_executable(&version_dir, &outside, "srv").is_err(),
             "a version dir never links out of itself",
         );
+    }
+
+    // ── spawn resolution (lsm 02) ─────────────────────────────────────
+
+    /// A manifest with one blessed row for `server` pinning `version`.
+    ///
+    /// The row's platform key is a synthetic token no host matches, so the
+    /// preferred-row lookup falls back to it deterministically on every
+    /// platform.
+    fn pinned_manifest(server: &str, version: &str) -> BlessedManifest {
+        let mut rows = std::collections::BTreeMap::new();
+        rows.insert(
+            "synthetic".to_string(),
+            crate::recipes::BlessedEntry {
+                version: version.to_string(),
+                platform: "synthetic".to_string(),
+                date: "2026-07-14".to_string(),
+                tier: None,
+            },
+        );
+        let mut blessed = std::collections::BTreeMap::new();
+        blessed.insert(server.to_string(), rows);
+        BlessedManifest {
+            blessed,
+            ..BlessedManifest::default()
+        }
+    }
+
+    /// Stages an executable at `<home>/<server>/<version>/bin/<server>`.
+    fn stage_managed_executable(home: &ManagedHome, server: &str, version: &str) -> PathBuf {
+        let bin_dir = home.bin_dir(server, version).expect("bin dir derives");
+        std::fs::create_dir_all(&bin_dir).expect("mkdir bin");
+        let executable = bin_dir.join(server);
+        std::fs::write(&executable, b"#!/bin/sh\n").expect("write stub");
+        #[cfg(unix)]
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("mark executable");
+        executable
+    }
+
+    #[test]
+    fn resolve_prefers_the_pinned_managed_executable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = ManagedHome::at(tmp.path().join("servers"));
+        let staged = stage_managed_executable(&home, "srv", "1.0.0");
+        let manifest = pinned_manifest("srv", "1.0.0");
+        let def = ServerDef::default();
+
+        let program = resolve_spawn_program(&home, &manifest, "srv", &def, true);
+        assert_eq!(
+            PathBuf::from(&program),
+            staged,
+            "a pinned row with a managed install resolves to the managed binary",
+        );
+    }
+
+    #[test]
+    fn resolve_path_override_wins_over_the_managed_home() {
+        // A user who explicitly configured an executable has opted out — the
+        // managed home is never consulted, even with an install present.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = ManagedHome::at(tmp.path().join("servers"));
+        stage_managed_executable(&home, "srv", "1.0.0");
+        let manifest = pinned_manifest("srv", "1.0.0");
+        let def = ServerDef {
+            path: Some("/opt/custom/srv".to_string()),
+            ..ServerDef::default()
+        };
+
+        let program = resolve_spawn_program(&home, &manifest, "srv", &def, true);
+        assert_eq!(program, "/opt/custom/srv");
+    }
+
+    #[test]
+    fn resolve_prefer_managed_false_resolves_on_path() {
+        // The opt-out: the managed home is ignored wholesale.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = ManagedHome::at(tmp.path().join("servers"));
+        stage_managed_executable(&home, "srv", "1.0.0");
+        let manifest = pinned_manifest("srv", "1.0.0");
+        let def = ServerDef::default();
+
+        let program = resolve_spawn_program(&home, &manifest, "srv", &def, false);
+        assert_eq!(program, "srv", "the key resolves on PATH as today");
+    }
+
+    #[test]
+    fn resolve_empty_home_falls_back_to_path() {
+        // A pinned row with no managed install: PATH fallback, no error.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = ManagedHome::at(tmp.path().join("servers"));
+        let manifest = pinned_manifest("srv", "1.0.0");
+        let def = ServerDef::default();
+
+        let program = resolve_spawn_program(&home, &manifest, "srv", &def, true);
+        assert_eq!(program, "srv");
+    }
+
+    #[test]
+    fn resolve_pin_names_the_version_exactly_no_latest_scan() {
+        // Only the pinned version counts: an install at a DIFFERENT version is
+        // a stale leftover (GC's business), never a resolution candidate.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = ManagedHome::at(tmp.path().join("servers"));
+        stage_managed_executable(&home, "srv", "0.9.0");
+        let manifest = pinned_manifest("srv", "1.0.0");
+        let def = ServerDef::default();
+
+        let program = resolve_spawn_program(&home, &manifest, "srv", &def, true);
+        assert_eq!(program, "srv");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_skips_a_non_executable_managed_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = ManagedHome::at(tmp.path().join("servers"));
+        let staged = stage_managed_executable(&home, "srv", "1.0.0");
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o644))
+            .expect("strip exec bits");
+        let manifest = pinned_manifest("srv", "1.0.0");
+        let def = ServerDef::default();
+
+        let program = resolve_spawn_program(&home, &manifest, "srv", &def, true);
+        assert_eq!(
+            program, "srv",
+            "a non-executable entry is not a spawn candidate"
+        );
+    }
+
+    #[test]
+    fn resolve_never_consults_the_managed_home_for_rust_analyzer() {
+        // The deliberate exemption (lsm 02): rustup-proxied and
+        // toolchain-coupled, RA resolves via PATH/rustup in ALL
+        // configurations — even with a manifest row AND a managed install
+        // staged at that row's version.
+        let version = "rust-analyzer 1.95.0 (5980761 2026-04-14)";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = ManagedHome::at(tmp.path().join("servers"));
+        stage_managed_executable(&home, "rust-analyzer", version);
+        let manifest = pinned_manifest("rust-analyzer", version);
+        let def = ServerDef::default();
+
+        for prefer_managed in [true, false] {
+            let program =
+                resolve_spawn_program(&home, &manifest, "rust-analyzer", &def, prefer_managed);
+            assert_eq!(
+                program, "rust-analyzer",
+                "RA resolves on PATH with prefer_managed = {prefer_managed}",
+            );
+        }
     }
 }
