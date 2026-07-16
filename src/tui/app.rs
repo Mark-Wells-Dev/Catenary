@@ -20,6 +20,7 @@ use crate::health::{FindingCode, servers::server_binary_installed};
 use crate::install::{
     BlessedRecipe, CommandRunner, InstallPlan, ProcessRunner, TarballFetcher, UreqFetcher,
 };
+use crate::managed_home::ManagedHome;
 use crate::recipes::{BlessedManifest, InstallRecipe};
 use crate::state_snapshot::Snapshot;
 
@@ -140,6 +141,9 @@ pub struct App<'a> {
     runner: Box<dyn CommandRunner>,
     /// The tarball fetcher the npm verified-install path fetches through.
     fetcher: Box<dyn TarballFetcher>,
+    /// The managed server home installs land in (ls-manager 01). Production
+    /// resolves `<data_dir>/catenary/servers/`; tests inject a tempdir home.
+    home: ManagedHome,
 
     /// The `generated_at` the findings were built from.
     last_generated_at: String,
@@ -216,6 +220,7 @@ impl<'a> App<'a> {
             blessed: crate::recipes::default_blessed_manifest().unwrap_or_default(),
             runner: Box::new(ProcessRunner),
             fetcher: Box::new(UreqFetcher),
+            home: ManagedHome::resolve(),
             last_generated_at: String::new(),
             needs_rebuild: true,
             env_findings,
@@ -256,11 +261,13 @@ impl<'a> App<'a> {
         blessed: BlessedManifest,
         runner: Box<dyn CommandRunner>,
         fetcher: Box<dyn TarballFetcher>,
+        home: ManagedHome,
     ) {
         self.recipes = recipes;
         self.blessed = blessed;
         self.runner = runner;
         self.fetcher = fetcher;
+        self.home = home;
         self.recompute_findings();
         self.rebuild_rows();
     }
@@ -823,7 +830,7 @@ impl<'a> App<'a> {
         let Some(blessed) = self.available_install() else {
             return false;
         };
-        let plan = InstallPlan::resolve(&blessed).map_err(|e| format!("{e:#}"));
+        let plan = InstallPlan::resolve(&blessed, &self.home).map_err(|e| format!("{e:#}"));
         self.pending_install = Some(InstallState::new(blessed.server().to_owned(), plan));
         true
     }
@@ -1288,6 +1295,7 @@ mod tests {
         icons: &'a IconSet,
         blessed: BlessedManifest,
         calls: &Rc<RefCell<Vec<String>>>,
+        home: ManagedHome,
     ) -> App<'a> {
         let mut app = app_with(theme, icons, snap_with_servers(1), Config::default());
         app.inject_install_env(
@@ -1295,6 +1303,7 @@ mod tests {
             blessed,
             Box::new(RecordingRunner(calls.clone())),
             Box::new(NoFetch),
+            home,
         );
         app.problem_rows = vec![suggestion_row("taplo")];
         app.focus = Pane::Problems;
@@ -1309,21 +1318,39 @@ mod tests {
         let calls = Rc::new(RefCell::new(Vec::new()));
 
         // A matching-version manifest entry unlocks the offer.
-        let app = install_app(&theme, &icons, blessed_manifest("taplo", "0.10.0"), &calls);
+        let app = install_app(
+            &theme,
+            &icons,
+            blessed_manifest("taplo", "0.10.0"),
+            &calls,
+            ManagedHome::at(PathBuf::from("/mh")),
+        );
         assert!(
             app.available_install().is_some(),
             "a blessed suggestion offers an install",
         );
 
         // An empty manifest (production reality) offers nothing.
-        let app = install_app(&theme, &icons, BlessedManifest::default(), &calls);
+        let app = install_app(
+            &theme,
+            &icons,
+            BlessedManifest::default(),
+            &calls,
+            ManagedHome::at(PathBuf::from("/mh")),
+        );
         assert!(
             app.available_install().is_none(),
             "an unblessed suggestion is structurally unofferable",
         );
 
         // A version-skewed entry does not match the recipe pin.
-        let app = install_app(&theme, &icons, blessed_manifest("taplo", "0.9.0"), &calls);
+        let app = install_app(
+            &theme,
+            &icons,
+            blessed_manifest("taplo", "0.9.0"),
+            &calls,
+            ManagedHome::at(PathBuf::from("/mh")),
+        );
         assert!(
             app.available_install().is_none(),
             "a version-skewed manifest entry does not unlock the offer",
@@ -1358,6 +1385,7 @@ mod tests {
             blessed_manifest("taplo", "0.10.0"),
             Box::new(RecordingRunner(Rc::new(RefCell::new(Vec::new())))),
             Box::new(NoFetch),
+            ManagedHome::at(PathBuf::from("/mh")),
         );
         app.problem_rows = vec![problem_row(Owner::Global), suggestion_row("taplo")];
         app.focus = Pane::Problems;
@@ -1422,7 +1450,16 @@ mod tests {
         let theme = Theme::new();
         let icons = IconSet::from_config(crate::config::IconConfig::default());
         let calls = Rc::new(RefCell::new(Vec::new()));
-        let mut app = install_app(&theme, &icons, blessed_manifest("taplo", "0.10.0"), &calls);
+        // The confirm executes the plan (which prepares the managed-home
+        // version dir on disk), so the injected home must root in a tempdir.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut app = install_app(
+            &theme,
+            &icons,
+            blessed_manifest("taplo", "0.10.0"),
+            &calls,
+            ManagedHome::at(tmp.path().join("servers")),
+        );
 
         app.begin_action();
         assert!(

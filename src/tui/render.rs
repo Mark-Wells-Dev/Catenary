@@ -807,6 +807,7 @@ pub fn install_overlay_lines(state: &InstallState, theme: &Theme) -> Vec<Line<'s
                 format!("{}@{}", plan.package(), plan.version()),
                 theme,
             ));
+            lines.push(kv("into", plan.destination().display().to_string(), theme));
             if let Some(url) = plan.fetch_url() {
                 lines.push(kv("fetch", url.to_string(), theme));
             }
@@ -1951,6 +1952,7 @@ mod tests {
     #[test]
     fn install_overlay_previews_pinned_command_and_verification() {
         use crate::install::{BlessedRecipe, InstallPlan};
+        use crate::managed_home::ManagedHome;
         use crate::recipes::{
             BlessedEntry, BlessedManifest, Ecosystem, InstallRecipe, VerificationTier,
         };
@@ -1980,7 +1982,8 @@ mod tests {
         );
         manifest.blessed.insert("taplo".to_string(), per_platform);
         let blessed = BlessedRecipe::resolve("taplo", &recipe, &manifest).expect("blessed");
-        let plan = InstallPlan::resolve(&blessed).expect("plan");
+        let home = ManagedHome::at(std::path::PathBuf::from("/mh"));
+        let plan = InstallPlan::resolve(&blessed, &home).expect("plan");
         let state = InstallState::new("taplo".to_string(), Ok(plan));
 
         let lines = install_overlay_lines(&state, &Theme::new());
@@ -1995,6 +1998,10 @@ mod tests {
             "shows the exact pinned command: {text}",
         );
         assert!(text.contains("--locked"), "states the verification: {text}");
+        assert!(
+            text.contains("/mh/taplo/0.10.0"),
+            "names the managed-home destination: {text}",
+        );
         assert!(
             text.contains("Enter") && text.contains("install"),
             "offers explicit consent: {text}",

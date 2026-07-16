@@ -182,7 +182,12 @@ pub struct Runtime {
 /// `vscode-eslint-language-server` case, which needs an `eslint` co-install,
 /// could later reuse this mechanism (it stays exempt for now — it also needs a
 /// settings block).
+///
+/// The schema is **closed** (`deny_unknown_fields`), like [`InstallRecipe`]'s:
+/// a co-install naming any destination is a schema error — the managed server
+/// home owns destinations (ls-manager 01).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CoInstall {
     /// The npm package identifier (e.g. `typescript`).
     pub package: String,
@@ -202,7 +207,14 @@ pub struct CoInstall {
 /// fails to deserialize (the schema test relies on this). `hash` is optional at
 /// draft stage — the `refresh-recipes` tooling fills it mechanically for the
 /// hash-carrying tiers; a fabricated hash is never shipped.
+///
+/// The schema is **closed** (`deny_unknown_fields`): recipes are declarative
+/// and never name install destinations — the managed server home
+/// ([`crate::managed_home::ManagedHome`]) owns them (ls-manager 01) — so a
+/// recipe carrying a destination (or any other unknown key) is a schema error,
+/// not silently ignored data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InstallRecipe {
     /// The ecosystem the package is installed from.
     pub ecosystem: Ecosystem,
@@ -1198,6 +1210,54 @@ mod tests {
         for (name, recipe) in &recipes {
             assert!(recipe.draft, "recipe `{name}` must be a draft");
         }
+    }
+
+    #[test]
+    fn recipe_naming_a_destination_is_a_schema_error() {
+        // Recipes are declarative and never name destinations — the managed
+        // server home owns them (ls-manager 01). The schema is closed, so a
+        // destination (or any unknown key) fails the parse loudly.
+        let with_destination = r#"
+[recipe.srv]
+ecosystem = "cargo"
+package = "srv-cli"
+version = "1.0.0"
+tier = "cargo-locked"
+destination = "/usr/local"
+"#;
+        assert!(
+            parse_recipes(with_destination).is_err(),
+            "a recipe naming a destination must fail to parse",
+        );
+        let co_install_with_destination = r#"
+[recipe.srv]
+ecosystem = "npm"
+package = "srv"
+version = "1.0.0"
+tier = "npm-tarball-sha512"
+
+[[recipe.srv.co_install]]
+package = "companion"
+version = "2.0.0"
+destination = "/usr/local"
+"#;
+        assert!(
+            parse_recipes(co_install_with_destination).is_err(),
+            "a co-install naming a destination must fail to parse",
+        );
+        // The same document without the unknown key parses — the rejection is
+        // the destination, not the shape.
+        let clean = r#"
+[recipe.srv]
+ecosystem = "cargo"
+package = "srv-cli"
+version = "1.0.0"
+tier = "cargo-locked"
+"#;
+        assert!(
+            parse_recipes(clean).is_ok(),
+            "the closed schema still parses"
+        );
     }
 
     #[test]

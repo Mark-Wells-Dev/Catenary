@@ -5,22 +5,44 @@
 //! consented, verified install.
 //!
 //! Given a pinned [`InstallRecipe`] that has cleared the **blessing gate**, this
-//! module produces and executes the per-ecosystem install:
+//! module produces and executes the per-ecosystem install — into the **managed
+//! server home** ([`ManagedHome`], ls-manager 01):
+//! `<data_dir>/catenary/servers/<name>/<version>/…`, a Catenary-owned prefix
+//! that a `pacman -Syu` or `npm update -g` can never rewrite out from under the
+//! version-pinned warranty. Every version dir is self-contained and exposes
+//! executables at `bin/` (the ruled invariant). Recipes stay declarative — they
+//! never name destinations; the containment below is keyed off the recipe's
+//! ecosystem field alone:
 //!
-//! - **npm** — fetch the pinned registry tarball, verify its sha512 against the
-//!   recipe (FAIL on mismatch — never install an unverified artifact), then
-//!   `npm install -g` the *verified* file with `--ignore-scripts` (install
-//!   scripts never run).
-//! - **cargo** — `cargo install <pkg> --version =<v> --locked` (cargo verifies
-//!   the registry index checksums).
-//! - **pip** — the `--require-hashes` form when the recipe carries a digest;
-//!   refuses politely when it does not (the recipe explains why).
-//! - **go** — `go install <pkg>@v<v>` (the Go checksum DB verifies transparently).
+//! - **npm** — fetch the pinned registry tarballs — the server *and* every
+//!   pinned `co_install` companion — verify each sha512 against the recipe
+//!   (FAIL on any mismatch — never install an unverified artifact, never
+//!   install half the set), then `npm install -g --prefix <version-dir>` the
+//!   *verified* files in one invocation with `--ignore-scripts` (install
+//!   scripts never run). Executables land in `bin/`, packages side by side in
+//!   `lib/node_modules/`, where Node's require walk resolves a companion from
+//!   inside the same version dir — the pinned pair travels as one unit and
+//!   cannot drift independently.
+//! - **cargo** — `cargo install <pkg> --version =<v> --locked --root
+//!   <version-dir>` (cargo verifies the registry index checksums and lands
+//!   binaries in `<root>/bin` — conforms natively).
+//! - **pip** — a venv per server version (`python3 -m venv <version-dir>`),
+//!   then the venv's own pip runs the `--require-hashes` form when the recipe
+//!   carries a digest; refuses politely when it does not (the recipe explains
+//!   why). Entry-point scripts land in the venv's `bin/`, which *is* the
+//!   version dir's `bin/` — `pip --target` can't generate entry-point scripts,
+//!   so the venv is the containment vehicle. **Known residual:** the venv
+//!   couples to the system python it was created from — a python minor bump can
+//!   break it; doctor detects the broken server, a recipe reinstall (recreating
+//!   the venv) cures.
+//! - **go** — `GOBIN=<version-dir>/bin go install <pkg>@v<v>` (the Go checksum
+//!   DB verifies transparently; `GOBIN` drops the binary in `bin/` — conforms
+//!   natively).
 //!
 //! Every command is spawned as **argv** ([`InstallCommand`]) — never a shell
 //! string — and there is no `curl | bash` anywhere. Execution runs through two
 //! injectable seams, the [`CommandRunner`] (spawns argv, captures output) and the
-//! [`TarballFetcher`] (fetches the npm tarball), so the engine's logic is tested
+//! [`TarballFetcher`] (fetches the npm tarballs), so the engine's logic is tested
 //! against fixtures without touching the network or installing anything global.
 //!
 //! **Blessing is structural, not a runtime filter.** The install action takes a
@@ -40,9 +62,11 @@
 )]
 
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::managed_home::ManagedHome;
 use crate::recipes::{BlessedEntry, BlessedManifest, Ecosystem, InstallRecipe, VerificationTier};
 
 /// The npm registry the tarball URL is derived against.
@@ -157,6 +181,9 @@ pub struct InstallCommand {
     program: String,
     /// The literal argument vector.
     args: Vec<String>,
+    /// Environment variables set for this command alone (the go containment's
+    /// `GOBIN`). Derived by the managed home, never recipe data.
+    envs: Vec<(String, String)>,
 }
 
 impl InstallCommand {
@@ -165,7 +192,14 @@ impl InstallCommand {
         Self {
             program: program.to_owned(),
             args: args.iter().map(|s| (*s).to_owned()).collect(),
+            envs: Vec::new(),
         }
+    }
+
+    /// Add an environment variable to the command's own environment.
+    fn env(mut self, key: &str, value: &str) -> Self {
+        self.envs.push((key.to_owned(), value.to_owned()));
+        self
     }
 
     /// The program name.
@@ -180,11 +214,25 @@ impl InstallCommand {
         &self.args
     }
 
+    /// The per-command environment variables.
+    #[must_use]
+    pub fn envs(&self) -> &[(String, String)] {
+        &self.envs
+    }
+
     /// The command rendered as a single display line (for the consent overlay
-    /// only — it is never executed as a string).
+    /// only — it is never executed as a string). Per-command env vars render as
+    /// a `KEY=value` prefix, the way a user would state them.
     #[must_use]
     pub fn display(&self) -> String {
-        let mut out = self.program.clone();
+        let mut out = String::new();
+        for (key, value) in &self.envs {
+            out.push_str(key);
+            out.push('=');
+            out.push_str(value);
+            out.push(' ');
+        }
+        out.push_str(&self.program);
         for a in &self.args {
             out.push(' ');
             out.push_str(a);
@@ -193,34 +241,73 @@ impl InstallCommand {
     }
 }
 
-/// `cargo install <package> --version =<version> --locked`.
-fn cargo_install_command(package: &str, version: &str) -> InstallCommand {
+/// `cargo install <package> --version =<version> --locked --root <version-dir>`
+/// — `--root` lands the binaries in `<version-dir>/bin`, conforming to the
+/// managed-home invariant natively.
+fn cargo_install_command(package: &str, version: &str, version_dir: &Path) -> InstallCommand {
     let version_arg = format!("={version}");
+    let root = version_dir.to_string_lossy();
     InstallCommand::new(
         "cargo",
-        &["install", package, "--version", &version_arg, "--locked"],
+        &[
+            "install",
+            package,
+            "--version",
+            &version_arg,
+            "--locked",
+            "--root",
+            &root,
+        ],
     )
 }
 
-/// `go install <package>@v<version>` (the version's `v` prefix is normalized).
-fn go_install_command(package: &str, version: &str) -> InstallCommand {
+/// `GOBIN=<version-dir>/bin go install <package>@v<version>` (the version's `v`
+/// prefix is normalized) — `GOBIN` drops the built binary in `bin/`, conforming
+/// to the managed-home invariant natively; go's build cache stays go's own.
+fn go_install_command(package: &str, version: &str, version_dir: &Path) -> InstallCommand {
     let module = format!("{package}@{}", go_version(version));
-    InstallCommand::new("go", &["install", &module])
+    let gobin = version_dir.join("bin");
+    InstallCommand::new("go", &["install", &module]).env("GOBIN", &gobin.to_string_lossy())
 }
 
-/// `npm install -g <artifact> --ignore-scripts` — `artifact` is the path to the
-/// already-fetched-and-verified local tarball, so install scripts never run and
-/// no unverified bytes are installed.
-fn npm_install_command(artifact: &str) -> InstallCommand {
-    InstallCommand::new("npm", &["install", "-g", artifact, "--ignore-scripts"])
+/// `npm install -g --prefix <version-dir> <artifacts…> --ignore-scripts` —
+/// `artifacts` are paths to already-fetched-and-verified local tarballs (the
+/// server plus its pinned co-install companions), so install scripts never run
+/// and no unverified bytes are installed. One invocation installs the whole
+/// pinned set: with `--prefix`, executables land in `<version-dir>/bin` and
+/// packages side by side in `<version-dir>/lib/node_modules/`, where Node's
+/// require walk resolves a companion from inside the same version dir.
+fn npm_install_command(version_dir: &Path, artifacts: &[&str]) -> InstallCommand {
+    let prefix = version_dir.to_string_lossy();
+    let mut args = vec!["install", "-g", "--prefix", prefix.as_ref()];
+    args.extend_from_slice(artifacts);
+    args.push("--ignore-scripts");
+    InstallCommand::new("npm", &args)
 }
 
-/// `pip install --require-hashes --no-deps -r <requirements>` — the hash-checked
-/// install. `--no-deps` keeps `--require-hashes` self-consistent: the recipe
-/// pins one artifact's sha256, so the pinned package is the whole (hashed) set.
-fn pip_install_command(requirements_path: &str) -> InstallCommand {
+/// `python3 -m venv <version-dir>` — the pip containment vehicle.
+///
+/// pip has no npm-`--prefix` equivalent that keeps a server runnable:
+/// `--target` installs libraries but generates no entry-point scripts. So each
+/// pip server gets a venv **at** the version dir — the venv's `bin/` *is* the
+/// invariant's `bin/`, entry points included.
+///
+/// **Known residual** (stated, not hidden): the venv couples to the system
+/// python it was created from — a python minor bump can break it. doctor
+/// detects the broken server; a recipe reinstall (recreating the venv) cures.
+fn venv_create_command(version_dir: &Path) -> InstallCommand {
+    InstallCommand::new("python3", &["-m", "venv", &version_dir.to_string_lossy()])
+}
+
+/// `<version-dir>/bin/pip install --require-hashes --no-deps -r <requirements>`
+/// — the hash-checked install, run through the venv's **own** pip so every
+/// artifact lands inside the version dir. `--no-deps` keeps `--require-hashes`
+/// self-consistent: the recipe pins one artifact's sha256, so the pinned
+/// package is the whole (hashed) set.
+fn pip_install_command(version_dir: &Path, requirements_path: &str) -> InstallCommand {
+    let pip = version_dir.join("bin").join("pip");
     InstallCommand::new(
-        "pip",
+        &pip.to_string_lossy(),
         &[
             "install",
             "--require-hashes",
@@ -258,24 +345,39 @@ fn go_version(version: &str) -> String {
 
 // ── the resolved install plan ────────────────────────────────────────
 
+/// One pinned npm artifact of a plan: the server package itself or a
+/// `co_install` companion. Both install by the same mechanics — fetch, verify
+/// the SRI sha512, install the verified file `--ignore-scripts`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NpmArtifact {
+    /// `<package>@<version>`, for log and consent-overlay lines.
+    label: String,
+    /// The pinned registry tarball URL.
+    url: String,
+    /// The expected SRI sha512 (`sha512-<base64>`) from the recipe.
+    sri: String,
+}
+
 /// The per-ecosystem step a plan runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PlanKind {
-    /// npm — fetch `url`, verify against `sri` (SRI sha512), then install the
-    /// verified artifact with `--ignore-scripts`.
+    /// npm — fetch every pinned tarball (the server plus its co-install
+    /// companions), verify each against its SRI sha512, then install the
+    /// verified set into the version dir in one `--prefix`ed,
+    /// `--ignore-scripts` invocation.
     NpmTarball {
-        /// The pinned registry tarball URL.
-        url: String,
-        /// The expected SRI sha512 (`sha512-<base64>`) from the recipe.
-        sri: String,
+        /// The pinned artifacts; the server's own package is first.
+        artifacts: Vec<NpmArtifact>,
     },
-    /// cargo/go — a single self-verifying command.
+    /// cargo/go — a single self-verifying command, already contained
+    /// (`--root` / `GOBIN` name the version dir).
     Direct {
         /// The pinned install command.
         command: InstallCommand,
     },
-    /// pip — a `--require-hashes` requirements install; the string is the
-    /// requirements-file line.
+    /// pip — a venv at the version dir, then a `--require-hashes` requirements
+    /// install through the venv's own pip; the string is the requirements-file
+    /// line.
     PipRequireHashes {
         /// The `<package>==<version> --hash=sha256:<hex>` requirement line.
         requirement: String,
@@ -284,10 +386,11 @@ enum PlanKind {
 
 /// A fully resolved, blessed install action for one server.
 ///
-/// Built by [`InstallPlan::resolve`] from a [`BlessedRecipe`]; executed by
-/// [`execute`]. It carries exactly the pinned data — package, version, ecosystem,
-/// verification tier, and the per-ecosystem step — so the consent overlay can
-/// state honestly what will run and how it is verified.
+/// Built by [`InstallPlan::resolve`] from a [`BlessedRecipe`] and the
+/// [`ManagedHome`]; executed by [`execute`]. It carries exactly the pinned data
+/// — package, version, ecosystem, verification tier, the managed-home
+/// destination, and the per-ecosystem step — so the consent overlay can state
+/// honestly what will run, how it is verified, and where it lands.
 #[derive(Debug, Clone)]
 pub struct InstallPlan {
     /// The ecosystem the artifact installs from.
@@ -298,21 +401,31 @@ pub struct InstallPlan {
     package: String,
     /// The exact pinned version.
     version: String,
+    /// The managed-home version dir the install lands in
+    /// (`<data_dir>/catenary/servers/<name>/<version>/`).
+    destination: PathBuf,
     /// The per-ecosystem step.
     kind: PlanKind,
 }
 
 impl InstallPlan {
-    /// Resolve the install plan for a blessed recipe.
+    /// Resolve the install plan for a blessed recipe, destined for `home`.
+    ///
+    /// The destination is derived here — `home.version_dir(server, version)` —
+    /// and nowhere else: the recipe is declarative and carries no destination.
     ///
     /// # Errors
     ///
     /// Returns an error when the ecosystem requires a content hash the recipe
-    /// does not carry: an **npm** recipe with no tarball sha512 (Catenary refuses
-    /// to install an unverified npm artifact), or a **pip** recipe with no
-    /// `--require-hashes` digest (refused politely, echoing the recipe's note).
-    pub fn resolve(blessed: &BlessedRecipe) -> Result<Self> {
+    /// does not carry: an **npm** recipe with no tarball sha512 — for the server
+    /// or for any `co_install` companion (the pinned set installs as one unit,
+    /// so one unverifiable member refuses the whole plan) — or a **pip** recipe
+    /// with no `--require-hashes` digest (refused politely, echoing the
+    /// recipe's note). Also errs when the server name or version is not a plain
+    /// path segment (defensive; blessed data never is).
+    pub fn resolve(blessed: &BlessedRecipe, home: &ManagedHome) -> Result<Self> {
         let r = blessed.recipe();
+        let destination = home.version_dir(blessed.server(), &r.version)?;
         let kind = match r.ecosystem {
             Ecosystem::Npm => {
                 let sri = r.hash.clone().ok_or_else(|| {
@@ -322,16 +435,34 @@ impl InstallPlan {
                         blessed.server()
                     )
                 })?;
-                PlanKind::NpmTarball {
+                let mut artifacts = vec![NpmArtifact {
+                    label: format!("{}@{}", r.package, r.version),
                     url: npm_tarball_url(&r.package, &r.version),
                     sri,
+                }];
+                for co in &r.co_install {
+                    let sri = co.hash.clone().ok_or_else(|| {
+                        anyhow!(
+                            "npm co-install `{}` for `{}` is version-pinned but carries no \
+                             tarball sha512; the pinned set installs as one unit and Catenary \
+                             will not install an unverified npm artifact",
+                            co.package,
+                            blessed.server()
+                        )
+                    })?;
+                    artifacts.push(NpmArtifact {
+                        label: format!("{}@{}", co.package, co.version),
+                        url: npm_tarball_url(&co.package, &co.version),
+                        sri,
+                    });
                 }
+                PlanKind::NpmTarball { artifacts }
             }
             Ecosystem::Cargo => PlanKind::Direct {
-                command: cargo_install_command(&r.package, &r.version),
+                command: cargo_install_command(&r.package, &r.version, &destination),
             },
             Ecosystem::Go => PlanKind::Direct {
-                command: go_install_command(&r.package, &r.version),
+                command: go_install_command(&r.package, &r.version, &destination),
             },
             Ecosystem::Pip => {
                 let hash = r.hash.clone().ok_or_else(|| {
@@ -354,6 +485,7 @@ impl InstallPlan {
             tier: r.tier,
             package: r.package.clone(),
             version: r.version.clone(),
+            destination,
             kind,
         })
     }
@@ -382,11 +514,20 @@ impl InstallPlan {
         &self.version
     }
 
-    /// The tarball URL fetched-and-verified before install (npm only).
+    /// The managed-home version dir this install lands in —
+    /// `<data_dir>/catenary/servers/<name>/<version>/`, self-contained, with
+    /// executables at `bin/` (the ruled invariant, ls-manager 01).
+    #[must_use]
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    /// The tarball URL fetched-and-verified before install (npm only; the
+    /// server's own artifact — co-install companions follow the same path).
     #[must_use]
     pub fn fetch_url(&self) -> Option<&str> {
         match &self.kind {
-            PlanKind::NpmTarball { url, .. } => Some(url),
+            PlanKind::NpmTarball { artifacts } => artifacts.first().map(|a| a.url.as_str()),
             PlanKind::Direct { .. } | PlanKind::PipRequireHashes { .. } => None,
         }
     }
@@ -406,18 +547,28 @@ impl InstallPlan {
         }
     }
 
-    /// The command that runs, rendered for the consent overlay. For npm the
-    /// verified-tarball path is shown as a placeholder (it is staged at execution
-    /// time); the string is display-only and never executed.
+    /// The command that runs, rendered for the consent overlay — it names the
+    /// managed-home destination (`--prefix`/`--root`/`GOBIN`/the venv dir). For
+    /// npm the verified-tarball paths are shown as labelled placeholders (they
+    /// are staged at execution time); the string is display-only and never
+    /// executed.
     #[must_use]
     pub fn display_command(&self) -> String {
         match &self.kind {
-            PlanKind::NpmTarball { .. } => npm_install_command("<verified tarball>").display(),
+            PlanKind::NpmTarball { artifacts } => {
+                let placeholders: Vec<String> = artifacts
+                    .iter()
+                    .map(|a| format!("<verified {}.tgz>", a.label))
+                    .collect();
+                let refs: Vec<&str> = placeholders.iter().map(String::as_str).collect();
+                npm_install_command(&self.destination, &refs).display()
+            }
             PlanKind::Direct { command } => command.display(),
             PlanKind::PipRequireHashes { requirement } => {
                 format!(
-                    "{}   (requirements: {requirement})",
-                    pip_install_command("<requirements>").display()
+                    "{} && {}   (requirements: {requirement})",
+                    venv_create_command(&self.destination).display(),
+                    pip_install_command(&self.destination, "<requirements>").display()
                 )
             }
         }
@@ -490,6 +641,7 @@ impl CommandRunner for ProcessRunner {
     fn run(&self, command: &InstallCommand) -> Result<CommandOutcome> {
         let output = std::process::Command::new(&command.program)
             .args(&command.args)
+            .envs(command.envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(std::process::Stdio::null())
             .output()
             .with_context(|| format!("spawning `{}`", command.program))?;
@@ -551,54 +703,119 @@ impl InstallOutcome {
 
 /// Execute a resolved install plan through the injected seams.
 ///
-/// npm fetches, verifies (aborting before any install on mismatch — an
-/// unverified artifact is never installed), stages the verified bytes to a temp
-/// file, then installs from it with `--ignore-scripts`. cargo/go run their single
-/// self-verifying command. pip stages the hashed requirements file and runs
-/// `--require-hashes`. All output is captured and returned in the outcome log.
+/// Every leg lands in the plan's managed-home destination
+/// (`<data_dir>/catenary/servers/<name>/<version>/`) and nowhere else. npm
+/// fetches and verifies **every** pinned artifact (server + co-install
+/// companions; aborting before any install on the first mismatch — an
+/// unverified artifact is never installed, and the set never lands
+/// half-installed), stages the verified bytes to temp files, then installs them
+/// in one `--prefix`ed invocation with `--ignore-scripts`. cargo/go run their
+/// single self-verifying command, contained via `--root`/`GOBIN`. pip creates
+/// the venv at the version dir, stages the hashed requirements file, and runs
+/// the venv's own pip with `--require-hashes`. All output is captured and
+/// returned in the outcome log.
 #[must_use]
 pub fn execute(
     plan: &InstallPlan,
     runner: &dyn CommandRunner,
     fetcher: &dyn TarballFetcher,
 ) -> InstallOutcome {
+    let log = vec![format!("managed home: {}", plan.destination.display())];
     match &plan.kind {
-        PlanKind::NpmTarball { url, sri } => execute_npm(url, sri, runner, fetcher),
-        PlanKind::Direct { command } => run_command(runner, command, Vec::new()),
-        PlanKind::PipRequireHashes { requirement } => execute_pip(requirement, runner),
+        PlanKind::NpmTarball { artifacts } => {
+            execute_npm(artifacts, &plan.destination, runner, fetcher, log)
+        }
+        PlanKind::Direct { command } => {
+            // cargo/go land binaries in `<version-dir>/bin` themselves
+            // (`--root` / `GOBIN`); pre-create it so the contained invocation
+            // never depends on the tool's own directory creation.
+            if let Err(e) = std::fs::create_dir_all(plan.destination.join("bin")) {
+                return InstallOutcome::failed(
+                    log,
+                    &format!("could not create {}: {e}", plan.destination.display()),
+                );
+            }
+            run_command(runner, command, log)
+        }
+        PlanKind::PipRequireHashes { requirement } => {
+            execute_pip(requirement, &plan.destination, runner, log)
+        }
     }
 }
 
-/// npm: fetch → verify → stage → `npm install -g … --ignore-scripts`.
+/// npm: fetch → verify (every artifact, before anything installs) → stage →
+/// one `npm install -g --prefix <version-dir> … --ignore-scripts`.
 fn execute_npm(
-    url: &str,
-    sri: &str,
+    artifacts: &[NpmArtifact],
+    version_dir: &Path,
     runner: &dyn CommandRunner,
     fetcher: &dyn TarballFetcher,
+    mut log: Vec<String>,
 ) -> InstallOutcome {
-    let mut log = vec![format!("fetching {url}")];
-    let bytes = match fetcher.fetch(url) {
-        Ok(b) => b,
-        Err(e) => return InstallOutcome::failed(log, &format!("fetch failed: {e:#}")),
-    };
-    log.push(format!("verifying sha512 over {} bytes", bytes.len()));
-    if let Err(e) = verify_sha512(&bytes, sri) {
-        // Never install unverified bytes: stop here, no command runs.
-        return InstallOutcome::failed(log, &e.to_string());
+    // Verify the WHOLE pinned set first: a mismatch on any member (server or
+    // companion) aborts before a single command runs, so the unit either lands
+    // complete or not at all.
+    let mut staged = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        log.push(format!("fetching {}", artifact.url));
+        let bytes = match fetcher.fetch(&artifact.url) {
+            Ok(b) => b,
+            Err(e) => return InstallOutcome::failed(log, &format!("fetch failed: {e:#}")),
+        };
+        log.push(format!(
+            "verifying sha512 over {} bytes ({})",
+            bytes.len(),
+            artifact.label
+        ));
+        if let Err(e) = verify_sha512(&bytes, &artifact.sri) {
+            // Never install unverified bytes: stop here, no command runs.
+            return InstallOutcome::failed(log, &e.to_string());
+        }
+        log.push(format!("sha512 verified ({})", artifact.label));
+        match stage_temp(&bytes, ".tgz") {
+            Ok(f) => staged.push(f),
+            Err(e) => {
+                return InstallOutcome::failed(log, &format!("could not stage artifact: {e:#}"));
+            }
+        }
     }
-    log.push("sha512 verified".to_owned());
-    let staged = match stage_temp(&bytes, ".tgz") {
-        Ok(f) => f,
-        Err(e) => return InstallOutcome::failed(log, &format!("could not stage artifact: {e:#}")),
-    };
-    let command = npm_install_command(&staged.path().to_string_lossy());
+    if let Err(e) = std::fs::create_dir_all(version_dir) {
+        return InstallOutcome::failed(
+            log,
+            &format!("could not create {}: {e}", version_dir.display()),
+        );
+    }
+    let staged_paths: Vec<String> = staged
+        .iter()
+        .map(|f| f.path().to_string_lossy().into_owned())
+        .collect();
+    let refs: Vec<&str> = staged_paths.iter().map(String::as_str).collect();
+    let command = npm_install_command(version_dir, &refs);
     run_command(runner, &command, log)
-    // `staged` drops here (after the install has run), deleting the temp file.
+    // `staged` drops here (after the install has run), deleting the temp files.
 }
 
-/// pip: stage the hashed requirements file → `pip install --require-hashes`.
-fn execute_pip(requirement: &str, runner: &dyn CommandRunner) -> InstallOutcome {
-    let mut log = vec!["staging --require-hashes requirements".to_owned()];
+/// pip: create the venv at the version dir → stage the hashed requirements
+/// file → the venv's own `pip install --require-hashes`.
+fn execute_pip(
+    requirement: &str,
+    version_dir: &Path,
+    runner: &dyn CommandRunner,
+    mut log: Vec<String>,
+) -> InstallOutcome {
+    if let Err(e) = std::fs::create_dir_all(version_dir) {
+        return InstallOutcome::failed(
+            log,
+            &format!("could not create {}: {e}", version_dir.display()),
+        );
+    }
+    log.push(format!("creating venv at {}", version_dir.display()));
+    let venv = run_command(runner, &venv_create_command(version_dir), log);
+    if !venv.success {
+        return venv;
+    }
+    let mut log = venv.log;
+    log.push("staging --require-hashes requirements".to_owned());
     let staged = match stage_temp(requirement.as_bytes(), ".txt") {
         Ok(f) => f,
         Err(e) => {
@@ -606,7 +823,7 @@ fn execute_pip(requirement: &str, runner: &dyn CommandRunner) -> InstallOutcome 
         }
     };
     log.push(format!("requirements: {requirement}"));
-    let command = pip_install_command(&staged.path().to_string_lossy());
+    let command = pip_install_command(version_dir, &staged.path().to_string_lossy());
     run_command(runner, &command, log)
 }
 
@@ -849,6 +1066,29 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
+    use crate::recipes::CoInstall;
+
+    /// A fixed managed home for plan-shape assertions (never executed against,
+    /// so nothing is ever created under it).
+    fn fixed_home() -> ManagedHome {
+        ManagedHome::at(PathBuf::from("/mh"))
+    }
+
+    /// Whether an argv token names a staged tarball.
+    fn is_tgz(arg: &str) -> bool {
+        Path::new(arg)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("tgz"))
+    }
+
+    /// A managed home rooted in a tempdir — the data dir pointed at a tempdir
+    /// subdir, in the `isolate_env` mislocation-detector spirit — for tests
+    /// that execute a plan (execution creates real directories).
+    fn temp_home() -> (tempfile::TempDir, ManagedHome) {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let home = ManagedHome::at(tmp.path().join("servers"));
+        (tmp, home)
+    }
 
     /// A recording fake runner: captures every command it is asked to run and
     /// replies with a scripted success/failure.
@@ -896,6 +1136,36 @@ mod tests {
         fn fetch(&self, url: &str) -> Result<Vec<u8>> {
             self.fetched.borrow_mut().push(url.to_owned());
             Ok(self.bytes.clone())
+        }
+    }
+
+    /// A fetcher serving distinct fixture bodies per URL (the multi-artifact
+    /// npm path: server tarball + co-install companion tarballs), recording
+    /// every URL fetched.
+    struct MapFetcher {
+        bodies: std::collections::BTreeMap<String, Vec<u8>>,
+        fetched: RefCell<Vec<String>>,
+    }
+
+    impl MapFetcher {
+        fn new(bodies: &[(&str, &[u8])]) -> Self {
+            Self {
+                bodies: bodies
+                    .iter()
+                    .map(|(url, bytes)| ((*url).to_owned(), bytes.to_vec()))
+                    .collect(),
+                fetched: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl TarballFetcher for MapFetcher {
+        fn fetch(&self, url: &str) -> Result<Vec<u8>> {
+            self.fetched.borrow_mut().push(url.to_owned());
+            self.bodies
+                .get(url)
+                .cloned()
+                .ok_or_else(|| anyhow!("no fixture body for {url}"))
         }
     }
 
@@ -1048,14 +1318,28 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             VerificationTier::CargoLocked,
         );
         let blessed = BlessedRecipe::resolve("taplo", &r, &manifest("taplo", "0.10.0")).unwrap();
-        let plan = InstallPlan::resolve(&blessed).expect("cargo resolves");
+        let plan = InstallPlan::resolve(&blessed, &fixed_home()).expect("cargo resolves");
         let PlanKind::Direct { command } = &plan.kind else {
             panic!("cargo is a direct command")
         };
         assert_eq!(command.program(), "cargo");
         assert_eq!(
             command.args(),
-            ["install", "taplo-cli", "--version", "=0.10.0", "--locked"]
+            [
+                "install",
+                "taplo-cli",
+                "--version",
+                "=0.10.0",
+                "--locked",
+                "--root",
+                "/mh/taplo/0.10.0"
+            ],
+            "the install is contained in the managed-home version dir via --root",
+        );
+        assert_eq!(
+            plan.destination(),
+            Path::new("/mh/taplo/0.10.0"),
+            "the plan names its managed-home destination",
         );
     }
 
@@ -1069,7 +1353,7 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             VerificationTier::GoChecksumdb,
         );
         let blessed = BlessedRecipe::resolve("gopls", &r, &manifest("gopls", "v0.22.0")).unwrap();
-        let plan = InstallPlan::resolve(&blessed).expect("go resolves");
+        let plan = InstallPlan::resolve(&blessed, &fixed_home()).expect("go resolves");
         let PlanKind::Direct { command } = &plan.kind else {
             panic!("go is a direct command")
         };
@@ -1077,6 +1361,12 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
         assert_eq!(
             command.args(),
             ["install", "golang.org/x/tools/gopls@v0.22.0"]
+        );
+        // The containment leg: GOBIN names the version dir's bin/.
+        assert_eq!(
+            command.envs(),
+            [("GOBIN".to_owned(), "/mh/gopls/v0.22.0/bin".to_owned())],
+            "GOBIN pins the binary into the managed-home version dir",
         );
         // A bare version gets the `v` prefix.
         assert_eq!(go_version("1.2.3"), "v1.2.3");
@@ -1111,7 +1401,11 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             &manifest("bash-language-server", "5.6.0"),
         )
         .unwrap();
-        let plan = InstallPlan::resolve(&blessed).expect("npm resolves");
+        let (_tmp, home) = temp_home();
+        let plan = InstallPlan::resolve(&blessed, &home).expect("npm resolves");
+        let dest = home
+            .version_dir("bash-language-server", "5.6.0")
+            .expect("version dir");
 
         let runner = FakeRunner::ok();
         let fetcher = FakeFetcher::new(bytes);
@@ -1127,21 +1421,29 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             fetcher.fetched.borrow().as_slice(),
             ["https://registry.npmjs.org/bash-language-server/-/bash-language-server-5.6.0.tgz"]
         );
-        // Ran `npm install -g <verified tarball> --ignore-scripts` — argv, install
-        // scripts disabled, artifact a staged local path.
+        // Ran `npm install -g --prefix <version-dir> <verified tarball>
+        // --ignore-scripts` — argv, install scripts disabled, artifact a staged
+        // local path, contained in the managed-home version dir.
         let calls = runner.calls.borrow();
         assert_eq!(calls.len(), 1);
         let cmd = &calls[0];
         assert_eq!(cmd.program(), "npm");
         assert_eq!(cmd.args()[0], "install");
         assert_eq!(cmd.args()[1], "-g");
+        assert_eq!(cmd.args()[2], "--prefix");
+        assert_eq!(
+            cmd.args()[3],
+            dest.to_string_lossy().as_ref(),
+            "the prefix is the managed-home version dir",
+        );
         assert!(
-            std::path::Path::new(&cmd.args()[2])
+            std::path::Path::new(&cmd.args()[4])
                 .extension()
                 .is_some_and(|e| e == "tgz"),
             "installs the staged tarball path"
         );
-        assert_eq!(cmd.args()[3], "--ignore-scripts");
+        assert_eq!(cmd.args()[5], "--ignore-scripts");
+        assert!(dest.is_dir(), "the version dir is created for the install");
     }
 
     #[test]
@@ -1163,7 +1465,8 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             &manifest("bash-language-server", "5.6.0"),
         )
         .unwrap();
-        let plan = InstallPlan::resolve(&blessed).unwrap();
+        let (_tmp, home) = temp_home();
+        let plan = InstallPlan::resolve(&blessed, &home).unwrap();
 
         let runner = FakeRunner::ok();
         let fetcher = FakeFetcher::new(b"TAMPERED bytes".to_vec());
@@ -1178,6 +1481,10 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             outcome.log.iter().any(|l| l.contains("mismatch")),
             "the failure names the mismatch: {:?}",
             outcome.log,
+        );
+        assert!(
+            !plan.destination().exists(),
+            "a refused install leaves no version dir behind",
         );
     }
 
@@ -1195,7 +1502,8 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             &manifest("bash-language-server", "5.6.0"),
         )
         .unwrap();
-        let err = InstallPlan::resolve(&blessed).expect_err("npm without a hash refuses");
+        let err =
+            InstallPlan::resolve(&blessed, &fixed_home()).expect_err("npm without a hash refuses");
         assert!(
             err.to_string().contains("unverified"),
             "the refusal is explicit: {err}",
@@ -1219,7 +1527,11 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             &manifest("cmake-language-server", "0.1.11"),
         )
         .unwrap();
-        let plan = InstallPlan::resolve(&blessed).expect("pip with a hash resolves");
+        let (_tmp, home) = temp_home();
+        let plan = InstallPlan::resolve(&blessed, &home).expect("pip with a hash resolves");
+        let dest = home
+            .version_dir("cmake-language-server", "0.1.11")
+            .expect("version dir");
         let PlanKind::PipRequireHashes { requirement } = &plan.kind else {
             panic!("pip is a require-hashes install")
         };
@@ -1227,17 +1539,30 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             requirement,
             "cmake-language-server==0.1.11 --hash=sha256:1111111111111111111111111111111111111111111111111111111111111111"
         );
-        // The install runs `pip install --require-hashes --no-deps -r <file>`.
+        // The install is a venv at the version dir, then the venv's OWN pip
+        // running `install --require-hashes --no-deps -r <file>` — everything
+        // lands inside the version dir, entry points in its bin/.
         let runner = FakeRunner::ok();
         let fetcher = FakeFetcher::new(Vec::new());
         let outcome = execute(&plan, &runner, &fetcher);
         assert!(outcome.success, "{:?}", outcome.log);
         let calls = runner.calls.borrow();
-        assert_eq!(calls[0].program(), "pip");
-        assert_eq!(calls[0].args()[0], "install");
-        assert_eq!(calls[0].args()[1], "--require-hashes");
-        assert_eq!(calls[0].args()[2], "--no-deps");
-        assert_eq!(calls[0].args()[3], "-r");
+        assert_eq!(calls.len(), 2, "venv creation, then the hashed install");
+        assert_eq!(calls[0].program(), "python3");
+        assert_eq!(
+            calls[0].args(),
+            ["-m", "venv", dest.to_string_lossy().as_ref()],
+            "the venv is created AT the managed-home version dir",
+        );
+        assert_eq!(
+            calls[1].program(),
+            dest.join("bin").join("pip").to_string_lossy().as_ref(),
+            "the hashed install runs through the venv's own pip",
+        );
+        assert_eq!(calls[1].args()[0], "install");
+        assert_eq!(calls[1].args()[1], "--require-hashes");
+        assert_eq!(calls[1].args()[2], "--no-deps");
+        assert_eq!(calls[1].args()[3], "-r");
     }
 
     #[test]
@@ -1255,7 +1580,8 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             &manifest("cmake-language-server", "0.1.11"),
         )
         .unwrap();
-        let err = InstallPlan::resolve(&blessed).expect_err("pip without a hash refuses");
+        let err =
+            InstallPlan::resolve(&blessed, &fixed_home()).expect_err("pip without a hash refuses");
         assert!(
             err.to_string().contains("closure hashes pending"),
             "echoes the note: {err}"
@@ -1271,7 +1597,8 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
             VerificationTier::CargoLocked,
         );
         let blessed = BlessedRecipe::resolve("taplo", &r, &manifest("taplo", "0.10.0")).unwrap();
-        let plan = InstallPlan::resolve(&blessed).unwrap();
+        let (_tmp, home) = temp_home();
+        let plan = InstallPlan::resolve(&blessed, &home).unwrap();
         let runner = FakeRunner {
             calls: RefCell::new(Vec::new()),
             succeed: false,
@@ -1338,6 +1665,408 @@ hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
                 text.contains('=') || text.contains('@'),
                 "the form is pinned: {text}",
             );
+        }
+    }
+
+    // ── the managed server home (ls-manager 01) ──────────────────────
+
+    #[test]
+    fn npm_co_install_companion_installs_into_the_same_version_dir() {
+        let server_bytes = b"pretend typescript-language-server tarball".to_vec();
+        let companion_bytes = b"pretend typescript tarball".to_vec();
+        let mut r = recipe(
+            Ecosystem::Npm,
+            "typescript-language-server",
+            "4.4.0",
+            VerificationTier::NpmTarballSha512,
+        );
+        r.hash = Some(format!(
+            "sha512-{}",
+            base64_standard(&sha512(&server_bytes))
+        ));
+        r.co_install = vec![CoInstall {
+            package: "typescript".to_owned(),
+            version: "5.5.4".to_owned(),
+            hash: Some(format!(
+                "sha512-{}",
+                base64_standard(&sha512(&companion_bytes))
+            )),
+        }];
+        let blessed = BlessedRecipe::resolve(
+            "typescript-language-server",
+            &r,
+            &manifest("typescript-language-server", "4.4.0"),
+        )
+        .unwrap();
+        let (_tmp, home) = temp_home();
+        let plan = InstallPlan::resolve(&blessed, &home).expect("npm with companion resolves");
+        let dest = home
+            .version_dir("typescript-language-server", "4.4.0")
+            .expect("version dir");
+
+        let server_url = "https://registry.npmjs.org/typescript-language-server/-/typescript-language-server-4.4.0.tgz";
+        let companion_url = "https://registry.npmjs.org/typescript/-/typescript-5.5.4.tgz";
+        let runner = FakeRunner::ok();
+        let fetcher = MapFetcher::new(&[
+            (server_url, server_bytes.as_slice()),
+            (companion_url, companion_bytes.as_slice()),
+        ]);
+        let outcome = execute(&plan, &runner, &fetcher);
+        assert!(outcome.success, "{:?}", outcome.log);
+
+        // Both pinned tarballs were fetched-and-verified.
+        assert_eq!(
+            fetcher.fetched.borrow().as_slice(),
+            [server_url, companion_url]
+        );
+        // ONE npm invocation carries the whole pinned set into ONE prefix — the
+        // structural require-walk pin: with a shared `--prefix`, npm lands both
+        // packages side by side in `<version-dir>/lib/node_modules/`, where
+        // Node's require walk resolves the companion from inside the same
+        // version dir. The pair travels as one unit.
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 1, "the pinned set installs in one invocation");
+        let cmd = &calls[0];
+        assert_eq!(cmd.program(), "npm");
+        assert_eq!(cmd.args()[2], "--prefix");
+        assert_eq!(cmd.args()[3], dest.to_string_lossy().as_ref());
+        let tarballs = cmd.args().iter().filter(|a| is_tgz(a)).count();
+        assert_eq!(
+            tarballs,
+            2,
+            "server and companion tarballs install together: {:?}",
+            cmd.args(),
+        );
+        assert_eq!(
+            cmd.args().last().map(String::as_str),
+            Some("--ignore-scripts")
+        );
+    }
+
+    #[test]
+    fn npm_companion_hash_mismatch_installs_nothing() {
+        let server_bytes = b"the real server tarball".to_vec();
+        let mut r = recipe(
+            Ecosystem::Npm,
+            "typescript-language-server",
+            "4.4.0",
+            VerificationTier::NpmTarballSha512,
+        );
+        r.hash = Some(format!(
+            "sha512-{}",
+            base64_standard(&sha512(&server_bytes))
+        ));
+        r.co_install = vec![CoInstall {
+            package: "typescript".to_owned(),
+            version: "5.5.4".to_owned(),
+            // Pins the hash of DIFFERENT bytes than the fetcher will return.
+            hash: Some(format!(
+                "sha512-{}",
+                base64_standard(&sha512(b"the real companion bytes"))
+            )),
+        }];
+        let blessed = BlessedRecipe::resolve(
+            "typescript-language-server",
+            &r,
+            &manifest("typescript-language-server", "4.4.0"),
+        )
+        .unwrap();
+        let (_tmp, home) = temp_home();
+        let plan = InstallPlan::resolve(&blessed, &home).unwrap();
+
+        let runner = FakeRunner::ok();
+        let fetcher = MapFetcher::new(&[
+            (
+                "https://registry.npmjs.org/typescript-language-server/-/typescript-language-server-4.4.0.tgz",
+                server_bytes.as_slice(),
+            ),
+            (
+                "https://registry.npmjs.org/typescript/-/typescript-5.5.4.tgz",
+                b"TAMPERED companion bytes".as_slice(),
+            ),
+        ]);
+        let outcome = execute(&plan, &runner, &fetcher);
+
+        assert!(!outcome.success, "a companion mismatch fails the set");
+        assert!(
+            runner.calls.borrow().is_empty(),
+            "NOTHING installs when any member of the pinned set fails to verify \
+             — the unit never lands half-installed",
+        );
+        assert!(
+            !plan.destination().exists(),
+            "a refused install leaves no version dir behind",
+        );
+    }
+
+    #[test]
+    fn npm_co_install_without_hash_refuses() {
+        let mut r = recipe(
+            Ecosystem::Npm,
+            "typescript-language-server",
+            "4.4.0",
+            VerificationTier::NpmTarballSha512,
+        );
+        r.hash = Some(format!("sha512-{}", base64_standard(&sha512(b"srv"))));
+        r.co_install = vec![CoInstall {
+            package: "typescript".to_owned(),
+            version: "5.5.4".to_owned(),
+            hash: None,
+        }];
+        let blessed = BlessedRecipe::resolve(
+            "typescript-language-server",
+            &r,
+            &manifest("typescript-language-server", "4.4.0"),
+        )
+        .unwrap();
+        let err = InstallPlan::resolve(&blessed, &fixed_home())
+            .expect_err("a hashless companion refuses the whole plan");
+        assert!(
+            err.to_string().contains("co-install `typescript`"),
+            "the refusal names the companion: {err}",
+        );
+    }
+
+    #[test]
+    fn display_command_names_the_managed_home_destination() {
+        let mut npm = recipe(
+            Ecosystem::Npm,
+            "bash-language-server",
+            "5.6.0",
+            VerificationTier::NpmTarballSha512,
+        );
+        npm.hash = Some(format!("sha512-{}", base64_standard(&sha512(b"x"))));
+        let mut pip = recipe(
+            Ecosystem::Pip,
+            "cmake-language-server",
+            "0.1.11",
+            VerificationTier::PipHashes,
+        );
+        pip.hash = Some("sha256:1111".to_owned());
+        let cases = [
+            (
+                recipe(
+                    Ecosystem::Cargo,
+                    "taplo-cli",
+                    "0.10.0",
+                    VerificationTier::CargoLocked,
+                ),
+                "--root /mh/srv/0.10.0",
+            ),
+            (
+                recipe(
+                    Ecosystem::Go,
+                    "golang.org/x/tools/gopls",
+                    "v0.22.0",
+                    VerificationTier::GoChecksumdb,
+                ),
+                "GOBIN=/mh/srv/v0.22.0/bin",
+            ),
+            (npm, "--prefix /mh/srv/5.6.0"),
+            (pip, "venv /mh/srv/0.1.11"),
+        ];
+        for (r, expected) in cases {
+            let blessed = BlessedRecipe::resolve("srv", &r, &manifest("srv", &r.version)).unwrap();
+            let plan = InstallPlan::resolve(&blessed, &fixed_home()).expect("plan resolves");
+            let shown = plan.display_command();
+            assert!(
+                shown.contains(expected),
+                "the consent overlay names the managed home: {shown}",
+            );
+        }
+    }
+
+    /// An installer emulator: performs each ecosystem's *filesystem effect*
+    /// using ONLY the argv/env the containment code built — npm honors
+    /// `--prefix`, cargo honors `--root`, go honors `GOBIN`, venv/pip write
+    /// where the command names. If a built invocation named anywhere outside
+    /// the version dir, files would land there and the no-strays walk in the
+    /// containment test would fail.
+    struct EmulatingRunner;
+
+    impl EmulatingRunner {
+        fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a String> {
+            args.iter()
+                .position(|a| a == flag)
+                .and_then(|i| args.get(i + 1))
+        }
+    }
+
+    impl CommandRunner for EmulatingRunner {
+        fn run(&self, command: &InstallCommand) -> Result<CommandOutcome> {
+            let args = command.args();
+            match command.program() {
+                "npm" => {
+                    let prefix = PathBuf::from(
+                        Self::arg_after(args, "--prefix").expect("npm carries --prefix"),
+                    );
+                    let node_modules = prefix.join("lib").join("node_modules");
+                    let bin = prefix.join("bin");
+                    for (i, _tgz) in args.iter().filter(|a| is_tgz(a)).enumerate() {
+                        let pkg = node_modules.join(format!("pkg{i}"));
+                        std::fs::create_dir_all(&pkg)?;
+                        std::fs::write(pkg.join("package.json"), b"{}")?;
+                        std::fs::create_dir_all(&bin)?;
+                        std::fs::write(bin.join(format!("pkg{i}")), b"#!node")?;
+                    }
+                }
+                "cargo" => {
+                    let root = PathBuf::from(
+                        Self::arg_after(args, "--root").expect("cargo carries --root"),
+                    );
+                    let bin = root.join("bin");
+                    std::fs::create_dir_all(&bin)?;
+                    std::fs::write(bin.join(&args[1]), b"elf")?;
+                }
+                "go" => {
+                    let gobin = command
+                        .envs()
+                        .iter()
+                        .find(|(k, _)| k == "GOBIN")
+                        .map(|(_, v)| PathBuf::from(v))
+                        .expect("go carries GOBIN");
+                    std::fs::create_dir_all(&gobin)?;
+                    std::fs::write(gobin.join("gopls"), b"elf")?;
+                }
+                "python3" => {
+                    // `python3 -m venv <dir>`.
+                    let dir = PathBuf::from(args.get(2).expect("venv names its dir"));
+                    let bin = dir.join("bin");
+                    std::fs::create_dir_all(&bin)?;
+                    std::fs::write(bin.join("pip"), b"#!py")?;
+                }
+                pip if pip.ends_with("/pip") => {
+                    // The venv's own pip: entry points land beside it.
+                    let bin = Path::new(pip).parent().expect("pip lives in bin/");
+                    std::fs::write(bin.join("cmake-language-server"), b"#!py")?;
+                }
+                other => panic!("unexpected program `{other}`"),
+            }
+            Ok(CommandOutcome {
+                success: true,
+                code: Some(0),
+                output: String::new(),
+            })
+        }
+    }
+
+    /// Every file under `dir`, recursively.
+    fn files_under(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(files_under(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_ecosystem_lands_contained_with_a_bin_dir_and_no_strays() {
+        // The acceptance pin: point the data dir at a tempdir subdir, install
+        // per ecosystem through an emulator that honors only the argv/env the
+        // containment code built, then assert the ruled invariant (executables
+        // at `<name>/<version>/bin/`) and that NOTHING landed outside the
+        // version dir.
+        let npm_bytes = b"npm server tarball".to_vec();
+        let companion_bytes = b"npm companion tarball".to_vec();
+        let mut npm = recipe(
+            Ecosystem::Npm,
+            "typescript-language-server",
+            "4.4.0",
+            VerificationTier::NpmTarballSha512,
+        );
+        npm.hash = Some(format!("sha512-{}", base64_standard(&sha512(&npm_bytes))));
+        npm.co_install = vec![CoInstall {
+            package: "typescript".to_owned(),
+            version: "5.5.4".to_owned(),
+            hash: Some(format!(
+                "sha512-{}",
+                base64_standard(&sha512(&companion_bytes))
+            )),
+        }];
+        let mut pip = recipe(
+            Ecosystem::Pip,
+            "cmake-language-server",
+            "0.1.11",
+            VerificationTier::PipHashes,
+        );
+        pip.hash = Some(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+        );
+        let cases = [
+            ("typescript-language-server", npm),
+            (
+                "taplo",
+                recipe(
+                    Ecosystem::Cargo,
+                    "taplo-cli",
+                    "0.10.0",
+                    VerificationTier::CargoLocked,
+                ),
+            ),
+            (
+                "gopls",
+                recipe(
+                    Ecosystem::Go,
+                    "golang.org/x/tools/gopls",
+                    "v0.22.0",
+                    VerificationTier::GoChecksumdb,
+                ),
+            ),
+            ("cmake-language-server", pip),
+        ];
+        let fetcher = MapFetcher::new(&[
+            (
+                "https://registry.npmjs.org/typescript-language-server/-/typescript-language-server-4.4.0.tgz",
+                npm_bytes.as_slice(),
+            ),
+            (
+                "https://registry.npmjs.org/typescript/-/typescript-5.5.4.tgz",
+                companion_bytes.as_slice(),
+            ),
+        ]);
+        for (server, r) in cases {
+            let (tmp, home) = temp_home();
+            let blessed =
+                BlessedRecipe::resolve(server, &r, &manifest(server, &r.version)).unwrap();
+            let plan = InstallPlan::resolve(&blessed, &home).expect("plan resolves");
+            let outcome = execute(&plan, &EmulatingRunner, &fetcher);
+            assert!(outcome.success, "{server}: {:?}", outcome.log);
+
+            let dest = home.version_dir(server, &r.version).expect("version dir");
+            // The ruled invariant: a runnable executable at `<version-dir>/bin/`.
+            let bin_entries = files_under(&dest.join("bin"));
+            assert!(
+                !bin_entries.is_empty(),
+                "{server}: the version dir exposes executables at bin/",
+            );
+            // No strays: everything under the data-dir stand-in lives inside
+            // the version dir (the mislocation-detector spirit).
+            for file in files_under(tmp.path()) {
+                assert!(
+                    file.starts_with(&dest),
+                    "{server}: `{}` landed outside the version dir {}",
+                    file.display(),
+                    dest.display(),
+                );
+            }
+            // The npm require-walk structural pin: the companion is a SIBLING
+            // of the server package in the same `lib/node_modules/`.
+            if server == "typescript-language-server" {
+                let node_modules = dest.join("lib").join("node_modules");
+                assert!(
+                    node_modules.join("pkg0").is_dir() && node_modules.join("pkg1").is_dir(),
+                    "server and companion sit side by side in the version dir's \
+                     lib/node_modules, where Node's require walk finds the companion",
+                );
+            }
         }
     }
 }

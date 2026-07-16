@@ -3,13 +3,15 @@
 
 //! Filesystem path resolvers for Catenary's base directories.
 //!
-//! Catenary keeps its data across three XDG base directories, each chosen for
+//! Catenary keeps its data across several XDG base directories, each chosen for
 //! its durability semantics:
 //!
 //! - [`state_dir`] — durable, per-host state (the Unix socket).
 //! - [`runtime_dir`] — ephemeral, tmpfs-backed runtime files (the `state.json`
 //!   snapshot).
 //! - [`cache_dir`] — regenerable, high-volume telemetry (the JSONL firehose).
+//! - [`data_dir`] — regenerable installed artifacts (the managed server home,
+//!   `catenary/servers/<name>/<version>/`).
 //!
 //! [`encode_cwd`] flattens an absolute path into a single filesystem-safe
 //! directory-name component, used as the per-root shard key in the firehose tree.
@@ -92,6 +94,27 @@ pub fn cache_dir() -> PathBuf {
     std::env::var_os("CATENARY_CACHE_DIR")
         .map(PathBuf::from)
         .or_else(dirs::cache_dir)
+        .unwrap_or_else(state_dir)
+}
+
+/// Resolve the Catenary data directory.
+///
+/// Home for regenerable *installed artifacts* — the managed server home
+/// (`catenary/servers/<name>/<version>/`, see
+/// [`crate::managed_home::ManagedHome`]) lives here. Like the cache, its
+/// contents are regenerable (a recipe reinstall recreates any server), but they
+/// are deliberately **not** cache: a routine cache purge must not delete a
+/// pinned language server out from under its users.
+///
+/// Resolution order:
+/// 1. `CATENARY_DATA_DIR` environment variable (cross-platform override).
+/// 2. `dirs::data_dir()` (`XDG_DATA_HOME` on Linux).
+/// 3. [`state_dir`] as a fallback when no data dir is configured.
+#[must_use]
+pub fn data_dir() -> PathBuf {
+    std::env::var_os("CATENARY_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(dirs::data_dir)
         .unwrap_or_else(state_dir)
 }
 

@@ -38,10 +38,10 @@ use serde_json::{Value, json};
 /// homes the JSONL firehose (`db::cache_dir()`).
 ///
 /// Also sets the `CATENARY_STATE_DIR` / `CATENARY_RUNTIME_DIR` /
-/// `CATENARY_CACHE_DIR` / `CATENARY_CONFIG_DIR` overrides to the same subdirs
-/// — the portable leg of the isolation. The `dirs` crate honors the XDG vars
-/// only on Linux; on macOS they are inert and the overrides carry the whole
-/// isolation.
+/// `CATENARY_CACHE_DIR` / `CATENARY_CONFIG_DIR` / `CATENARY_DATA_DIR`
+/// overrides to the same subdirs — the portable leg of the isolation. The
+/// `dirs` crate honors the XDG vars only on Linux; on macOS they are inert and
+/// the overrides carry the whole isolation.
 ///
 /// Clears all `CATENARY_*` env vars that could leak from the user's
 /// shell and override test-specific settings. Clears `PATH` so built-in
@@ -90,6 +90,7 @@ pub fn isolate_env(cmd: &mut Command, root: &str) {
     cmd.env("CATENARY_RUNTIME_DIR", xdg_runtime_dir(root));
     cmd.env("CATENARY_CACHE_DIR", xdg_cache_home(root));
     cmd.env("CATENARY_CONFIG_DIR", xdg_config_home(root));
+    cmd.env("CATENARY_DATA_DIR", xdg_data_home(root));
     // Config-WRITE isolation (bug 109) is complete on every platform via the line
     // above: `paths::config_dir()` resolves `CATENARY_CONFIG_DIR` FIRST — before
     // the `dirs` crate's `XDG_CONFIG_HOME` (Linux) / `~/Library/Application
@@ -252,6 +253,11 @@ pub fn xdg_state_home(root: impl AsRef<Path>) -> PathBuf {
 }
 
 /// The `XDG_DATA_HOME` subdir [`isolate_env`] configures under `root`.
+///
+/// `paths::data_dir()` resolves here, so the managed server home
+/// (`catenary/servers/<name>/<version>/`, ls-manager 01) lives under
+/// `$XDG_DATA_HOME/catenary/`. Test-side code computing managed-home paths
+/// must resolve through this helper.
 pub fn xdg_data_home(root: impl AsRef<Path>) -> PathBuf {
     root.as_ref().join("data")
 }

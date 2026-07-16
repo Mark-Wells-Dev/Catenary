@@ -35,6 +35,8 @@ pub mod lock;
 pub mod logging;
 /// LSP client implementation and server management.
 pub mod lsp;
+/// The Catenary-managed server home: contained install destinations (ls-manager 01).
+pub mod managed_home;
 /// MCP server implementation and type definitions.
 pub mod mcp;
 /// Desktop notification support (OS-level notifications for error events).
