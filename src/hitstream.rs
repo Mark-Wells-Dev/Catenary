@@ -8,24 +8,31 @@
 //! annotator** on a streamed hit protocol. Every dependency failure degrades to
 //! "less enrichment," never "no results."
 //!
-//! This module is the skeleton for that rework. It coexists with the current
-//! `catenary grep`/`glob` query path (`router::METHOD_GREP` / `METHOD_GLOB`);
-//! nothing here is wired into the user-visible commands yet — that cutover is a
-//! later ticket. What lands here is the load-bearing structure:
+//! This module coexists with the current `catenary grep`/`glob` query path
+//! (`router::METHOD_GREP` / `METHOD_GLOB`); the user-visible `catenary grep`
+//! CLI has not cut over yet (the ws43-02 cutover seam — see the module notes on
+//! [`engine`] and [`frame`]). What lives here is the load-bearing structure:
 //!
 //! 1. The wire protocol — [`HitFrame`] (CLI → daemon) and [`AnnotationFrame`]
 //!    (daemon → CLI), an internally-tagged frame stream on the existing socket,
 //!    with an [`HitFrame::End`] / [`AnnotationFrame::End`] terminator and honest
-//!    unknown-frame rejection on both sides.
-//! 2. The CLI walk ([`walk`]) that walks and matches, emitting **ordered**
-//!    [`HitBatch`]es of canonical-path hits, and two sinks selectable at the
-//!    seam: [`stdout_unannotated`] (the degrade path — built first) and
+//!    unknown-frame rejection on both sides. Since ws43-02 an annotated hit
+//!    carries the executor's tri-state anchor (`#trail` / top-level / `#?`),
+//!    and [`frame::AnnotatedHit::render_grep_line`] reproduces today's grep
+//!    output shape from it.
+//! 2. The CLI walk ([`walk`]) that walks and matches — the full `catenary grep`
+//!    flag surface since ws43-02, through the query executor's own
+//!    matcher/searcher constructors — emitting **ordered** [`HitBatch`]es of
+//!    canonical-path hits, and two sinks selectable at the seam:
+//!    [`stdout_unannotated`] (the degrade path — built first) and
 //!    [`daemon_stream`] (batches out, annotation-batches back, ordered emission
 //!    preserved).
 //! 3. The daemon annotator ([`annotate_connection`]) — read batch → await
-//!    (budgeted) → write batch, a native async citizen. For this ticket the
-//!    annotator answers pass-through verdicts; the real enrichment migration is a
-//!    later ticket.
+//!    (budgeted) → write batch, a native async citizen. Since ws43-02 the
+//!    router serves the REAL enricher ([`crate::bridge::GrepHitEnricher`]: the
+//!    executor's LSP enrichment, migrated), with the WS31 observation nudge and
+//!    the query auto-mount (ws43-05 sensitive-path gate included) riding each
+//!    annotation call.
 //!
 //! ## Invariants (ruled; not renegotiable)
 //!
@@ -103,16 +110,20 @@ pub fn canonicalize_hit_path(path: &Path) -> PathBuf {
 /// A single grep hit, canonical-path, as it crosses the wire.
 ///
 /// The atom the walk emits and the daemon annotates. `path` is canonical (see
-/// [`canonicalize_hit_path`]); `line`/`column` are 1-based (ripgrep display
-/// convention); `text` is the full matched source line, verbatim, newline
-/// stripped.
+/// [`canonicalize_hit_path`]); `line` is 1-based (ripgrep display convention);
+/// `column` is the 1-based column of the first match on the line, or `0` when
+/// the line carries no match — a context line (`-A`/`-B`/`-C`) or an inverted
+/// selection (`-v`), which are hits with no match column (mirroring the query
+/// engine's convention); `text` is the full matched source line, verbatim,
+/// newline stripped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireHit {
     /// Canonical absolute path of the matched file.
     pub path: PathBuf,
     /// 1-based line of the match.
     pub line: u32,
-    /// 1-based column of the first match on the line.
+    /// 1-based column of the first match on the line; `0` for a line with no
+    /// match (context or inverted selection).
     pub column: u32,
     /// The full source line at the hit, verbatim and newline-stripped.
     pub text: String,
@@ -120,9 +131,10 @@ pub struct WireHit {
 
 impl WireHit {
     /// Renders this hit as one self-contained result line, unannotated:
-    /// `path:line:column:text`. The degrade spelling — no `#scope`, no anchor —
-    /// so a hit that never reaches the annotator still prints a complete,
-    /// grep-parseable line.
+    /// `path:line:column:text`. The protocol skeleton's wire-debug spelling — no
+    /// `#scope`, no anchor — so a hit that never reaches the annotator still
+    /// prints a complete, grep-parseable line. The user-visible `catenary grep`
+    /// degrade spelling is [`Self::render_grep_unannotated`].
     #[must_use]
     pub fn render_unannotated(&self) -> String {
         format!(
@@ -132,6 +144,19 @@ impl WireHit {
             self.column,
             self.text
         )
+    }
+
+    /// Renders this hit as one `catenary grep` result line in the degrade
+    /// spelling: `display:line#?:text` — the could-not-enrich marker, exactly
+    /// what today's daemon-less twin prints for a hit with no covering server.
+    /// Byte-identical to a pass-through
+    /// [`AnnotatedHit`](frame::AnnotatedHit)'s
+    /// [`render_grep_line`](frame::AnnotatedHit::render_grep_line), which is
+    /// what makes daemon-absent, wedged-daemon, old-daemon, and blown-budget
+    /// streams print the same result bytes (ws43-02).
+    #[must_use]
+    pub fn render_grep_unannotated(&self, display_path: &str) -> String {
+        format!("{display_path}:{}#?:{}", self.line, self.text)
     }
 }
 

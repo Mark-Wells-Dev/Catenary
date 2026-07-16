@@ -15,6 +15,8 @@ pub mod filesystem_manager;
 mod grep_server;
 /// Path utilities shared by bridge components.
 mod handler;
+/// The ws43 hit-batch enricher: grep's LSP enrichment as a `BatchEnricher`.
+mod hitstream_enricher;
 /// Application dispatch for hook requests.
 mod hook_router;
 /// Standalone-linter diagnostic feeder (blessed + SARIF adapters).
@@ -39,10 +41,14 @@ pub use editing_guardrail::EditingGuardrail;
 pub use editing_manager::EditingManager;
 pub use file_tools::GlobOutcome;
 pub use grep_server::{
-    GrepFlags, GrepOutcome, GrepSkips, HunkChunk, HunkSpool, ShapedOutput, StreamOutcome,
-    grep_stream,
+    GrepFlags, GrepOutcome, GrepSkips, HunkChunk, HunkSpool, ShapedOutput, SkipRecord,
+    StreamOutcome, grep_stream,
 };
 pub use handler::expand_tilde;
+pub use hitstream_enricher::GrepHitEnricher;
+// The ws43 hitstream engine builds its CLI-side walk matcher/searcher through
+// the grep executor's constructors so the two walks cannot drift (ws43-02).
+pub(crate) use grep_server::{build_matcher, build_searcher};
 pub use hook_router::HookRouter;
 pub use hook_router::is_edit_tool;
 pub use path_security::PathValidator;
@@ -153,7 +159,9 @@ impl SourceLines {
 /// `documentSymbol` traffic appears as children of the calling scope
 /// in the TUI.
 ///
-/// Shared by [`grep_server::GrepServer`] and [`file_tools::GlobServer`].
+/// Shared by [`grep_server::GrepServer`] (via its shared enrichment core, which
+/// the ws43 hitstream annotator also runs) and [`file_tools::GlobServer`] —
+/// glob-shared plumbing that stays until glob's own streaming cutover (ws43-03).
 pub(super) async fn ensure_symbols(
     symbol_index: Option<&Arc<std::sync::Mutex<SymbolIndex>>>,
     client_manager: &LspClientManager,

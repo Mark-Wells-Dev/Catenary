@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! The daemon-side annotator skeleton (ws43).
+//! The daemon-side annotator loop (ws43).
 //!
 //! The daemon stops being a query executor and becomes a bounded enrichment
 //! annotator on the streamed hit protocol. Its shape — the structure that
@@ -11,11 +11,13 @@
 //! budget yields a pass-through verdict on a complete, unannotated batch, never a
 //! dropped hit.
 //!
-//! For this ticket the enrichment step is a pass-through stub: the annotator
-//! answers `passed-through` verdicts (real enrichment migration is a later
-//! ticket). What is load-bearing now is the async loop, the budget seam, the
-//! bounded in-flight window for pipelining with ordered emission, and the law:
-//! **no await while holding a lock guard.**
+//! Since ws43-02 the production enricher is real: the grep executor's LSP
+//! enrichment lives in [`crate::bridge::GrepHitEnricher`], and the router's
+//! `tool/hitstream` arm serves it (wrapped with the query auto-mount). The
+//! [`PassThroughEnricher`] remains as the degrade spelling and the protocol
+//! tests' stub. What is load-bearing here is the async loop, the budget seam,
+//! the bounded in-flight window for pipelining with ordered emission, and the
+//! law: **no await while holding a lock guard.**
 //!
 //! An old daemon that predates this protocol never reaches this loop — it answers
 //! the unknown method the same way it answers any unknown request, and the CLI's
@@ -179,8 +181,12 @@ where
     }
 }
 
-/// Serves one connection with the default pass-through enricher and budget — the
-/// convenience entry point the router's new-method arm calls in this ticket.
+/// Serves one connection with the default pass-through enricher and budget.
+///
+/// Since ws43-02 the router's `tool/hitstream` arm serves the REAL enricher
+/// ([`crate::bridge::GrepHitEnricher`], wrapped with the query auto-mount);
+/// this pass-through entry point remains for protocol tests and as the
+/// reference degrade spelling.
 ///
 /// # Errors
 ///

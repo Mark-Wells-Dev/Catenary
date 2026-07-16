@@ -188,6 +188,7 @@ impl BatchEnricher for SlowFirstBatch {
             .map(|h| AnnotatedHit {
                 hit: h,
                 anchor: Some("x".to_string()),
+                enriched: true,
             })
             .collect())
     }

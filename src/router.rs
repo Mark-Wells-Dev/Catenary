@@ -3049,6 +3049,50 @@ async fn ensure_ephemeral_mounts(
     }
 }
 
+/// The daemon-side annotator behind the `tool/hitstream` dispatch arm (ws43-02).
+///
+/// Wraps the bridge's [`crate::bridge::GrepHitEnricher`] (the grep executor's
+/// LSP enrichment, migrated) with the router-level query auto-mount: before a
+/// batch is enriched, [`ensure_ephemeral_mounts`] runs over the batch's
+/// distinct canonical hit paths, so an out-of-root batch is served by the
+/// freshly-mounted root's server — the same pre-execute mount the `tool/grep`
+/// arm performs, keyed on the canonical paths the batches carry (the CLI
+/// canonicalizes at the walk seam). The sensitive-path gate (ws43-05) lives
+/// inside `ensure_ephemeral_mounts` and rides along unweakened: a refused
+/// mount leaves the hit streaming, unenriched.
+///
+/// The whole call — mount, nudge, enrichment — runs under the annotator's
+/// per-batch budget ([`crate::hitstream::ANNOTATION_BATCH_BUDGET`]): a cold
+/// mount or a slow settle blows the budget into a pass-through verdict on a
+/// complete batch (degrade-only), and later batches find the mount warm.
+#[cfg(unix)]
+struct HitstreamGrepAnnotator<'a> {
+    /// Dispatch context for the auto-mount (root tracker, ephemeral mounts).
+    ctx: &'a HookDispatchContext,
+    /// The migrated grep enrichment (pool readiness, WS31 nudge, `#scope`
+    /// anchors).
+    inner: crate::bridge::GrepHitEnricher,
+}
+
+#[cfg(unix)]
+impl crate::hitstream::BatchEnricher for HitstreamGrepAnnotator<'_> {
+    async fn enrich(
+        &self,
+        hits: Vec<crate::hitstream::WireHit>,
+    ) -> Result<Vec<crate::hitstream::frame::AnnotatedHit>> {
+        // The batch's distinct files are the touched paths — dedup keeps the
+        // mount pass linear in files, not hits.
+        let touched: Vec<PathBuf> = hits
+            .iter()
+            .map(|h| h.path.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        ensure_ephemeral_mounts(self.ctx, &touched, Instant::now(), "").await;
+        self.inner.enrich(hits).await
+    }
+}
+
 /// Core daemon component that manages MCP and hook socket connections.
 ///
 /// Binds two Unix domain sockets: one for MCP connections from `catenary
@@ -6065,15 +6109,29 @@ async fn handle_hook_dispatch(
     //
     // `tool/hitstream` is opened by the CLI-owns-the-walk engine. The method
     // line has already been read; the CLI now streams `HitFrame` batches on this
-    // same connection. The daemon annotates each batch under budget (pass-through
-    // in this ticket) and streams `AnnotationFrame` batches back, preserving batch
-    // order. A malformed frame or a socket fault tears the connection down; the
-    // CLI, seeing an incomplete annotation stream, degrades to the unannotated
-    // stdout stream — the same fallback as daemon-absent (degrade-only). This arm
-    // is a native async citizen: read batch → await (budgeted) → write batch, no
-    // lock guard held across an await.
+    // same connection. The daemon annotates each batch under budget with the
+    // REAL grep enrichment (ws43-02: the executor's LSP enrichment migrated into
+    // [`crate::bridge::GrepHitEnricher`]) and streams `AnnotationFrame` batches
+    // back, preserving batch order. The WS31 observation nudge and the query
+    // auto-mount (with its ws43-05 sensitive-path gate) ride each annotation
+    // call, keyed on the canonical hit paths the batches carry. A malformed
+    // frame or a socket fault tears the connection down; the CLI, seeing an
+    // incomplete annotation stream, degrades to the unannotated stdout stream —
+    // the same fallback as daemon-absent (degrade-only). This arm is a native
+    // async citizen: read batch → await (budgeted) → write batch, no lock guard
+    // held across an await.
     if method == METHOD_HITSTREAM {
-        crate::hitstream::serve_passthrough(&mut buf_reader, &mut writer).await?;
+        let annotator = HitstreamGrepAnnotator {
+            ctx: &ctx,
+            inner: ctx.primary.grep.hitstream_enricher(),
+        };
+        crate::hitstream::annotate_connection(
+            &mut buf_reader,
+            &mut writer,
+            &annotator,
+            crate::hitstream::ANNOTATION_BATCH_BUDGET,
+        )
+        .await?;
         return Ok(());
     }
 

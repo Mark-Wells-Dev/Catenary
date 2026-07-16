@@ -2,6 +2,20 @@
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 //! Grep tool: ripgrep + symbol index pipeline with LSP enrichment.
+//!
+//! ## ws43 status (query streaming)
+//!
+//! The query-streaming rework (ws43) replaces this daemon-side executor with a
+//! CLI-owned walk ([`crate::hitstream::engine`]) plus a daemon-side annotator
+//! ([`super::hitstream_enricher::GrepHitEnricher`]). The enrichment itself has
+//! already migrated (ws43-02): the executor and the annotator both run the
+//! shared core below ([`anchor_context`], [`nudge_observed_files`]), so the two
+//! cannot drift. This executor (`GrepServer::execute` and the `tool/grep`
+//! dispatch arm) RETIRES for grep once the `catenary grep` CLI cutover
+//! completes; it is kept live meanwhile because the CLI still calls it and the
+//! integration suite drives `tool/grep` directly. Pieces shared with the glob
+//! executor (`ensure_symbols`, `expand_search_paths`, the chunked framing)
+//! stay until glob's own cutover (ws43-03).
 
 use super::session::ExcludeSet;
 use anyhow::{Context, Result, anyhow};
@@ -144,7 +158,12 @@ struct GrepHit {
 
 /// The `#scope` graph coordinate appended to a grep line — a containment trail,
 /// not a resolvable path. The `#` scheme carries degradation natively (bug 48).
-enum Anchor {
+///
+/// `pub(super)` since ws43-02: the hitstream annotator
+/// ([`super::hitstream_enricher`]) maps this tri-state onto the wire
+/// [`AnnotatedHit`](crate::hitstream::frame::AnnotatedHit) so the executor and
+/// the annotator share one anchor semantics.
+pub(super) enum Anchor {
     /// Enriched, inside a scope → `#<trail>`: the `/`-joined chain of enclosing
     /// *named* symbols (slugified), outermost→hit. Already joined.
     Scope(String),
@@ -638,70 +657,31 @@ impl GrepServer {
             )
             .await;
 
-        // Step 2a: Route the changed-set nudge (WS31 Consumer A) under the
-        // walk-breadth gate (ticket 04). Enriched `grep`'s reverse-direction
-        // enrichment is whole-tree, so a covered root is a `Full` walk: the
-        // ripgrep walk already statted every visited file, so the engine reuses
-        // those observations (group by root, root-relative), diffs against the
-        // per-root baseline, routes the delta per server, AND reaps deletions
-        // (a baseline entry the full walk did not visit). A root with no
-        // covering server is `WalkBreadth::None` — the `(no LSP)` case — and is
-        // skipped entirely (no diff, no nudge). `--count` grep never reaches
-        // `run`, so it pays nothing. No edited-set exclusion for grep.
-        //
-        // Reaping is gated per-root by whether the walk actually spanned the
-        // whole registered root (WS31-review C1): a `Full` breadth only means a
-        // covering server exists, not that the walk covered the root. A
-        // path-scoped grep (`!input.paths.is_empty()`) or a pathless grep whose
-        // cwd is a *subdir* of the root walked only a subtree, so it cannot
-        // assert that an unvisited baseline entry is gone — it is add/update
-        // only (`reap = false`), exactly like a scoped `glob`. Only a pathless
-        // grep whose walked scope is an ancestor-or-equal of the registered root
-        // reaps. The walked scopes are canonicalized so they compare against the
-        // canonicalized roots `resolve_root` returns.
-        {
-            let mut by_root: HashMap<PathBuf, Vec<(PathBuf, i64)>> = HashMap::new();
-            for (abs, mtime) in &rg.files {
-                if let Some(root) = self.fs_manager.resolve_root(abs)
-                    && let Ok(rel) = abs.strip_prefix(&root)
-                {
-                    by_root
-                        .entry(root)
-                        .or_default()
-                        .push((rel.to_path_buf(), *mtime));
-                }
-            }
-            // The scopes the walk actually covered, canonicalized to match the
-            // canonical form of registered roots (see `run_daemon_main`).
-            let walked_scopes: Vec<PathBuf> = effective_roots
+        // Step 2a: Route the changed-set nudge (WS31 Consumer A). The shared
+        // [`nudge_observed_files`] carries the walk-breadth gate and the reap
+        // rules; the executor's contribution is the reap eligibility: only a
+        // pathless grep — whose walked scopes (canonicalized, so they compare
+        // against the canonicalized roots `resolve_root` returns) may cover a
+        // whole registered root — passes scopes at all. `--count` grep never
+        // reaches `run`, so it pays nothing. No edited-set exclusion for grep.
+        let reap_scopes: Option<Vec<PathBuf>> = input.paths.is_empty().then(|| {
+            effective_roots
                 .iter()
                 .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
-                .collect();
-            let no_exclude: HashSet<PathBuf> = HashSet::new();
-            for (root, observed) in &by_root {
-                let breadth = if self.client_manager.has_covering_watchers(root).await {
-                    WalkBreadth::Full
-                } else {
-                    WalkBreadth::None
-                };
-                if !breadth.runs_engine() {
-                    continue;
-                }
-                // Only reap when the walk truly covered the whole root: a
-                // pathless grep whose walked scope is an ancestor-or-equal of
-                // this registered root. A path-scoped grep, or a cwd below the
-                // root, walked only a subtree → add/update only.
-                let covered_whole_root = input.paths.is_empty()
-                    && walked_scopes.iter().any(|scope| root.starts_with(scope));
-                let reap = breadth.reaps() && covered_whole_root;
-                self.client_manager
-                    .nudge_changed_set(root, observed, &no_exclude, reap)
-                    .await;
-            }
-        }
+                .collect()
+        });
+        nudge_observed_files(
+            &self.client_manager,
+            &self.fs_manager,
+            &rg.files,
+            reap_scopes.as_deref(),
+        )
+        .await;
 
-        // Step 2b: Populate (or refresh) symbol index for matched files.
-        super::ensure_symbols(
+        // Steps 2b–3: symbol-index population plus per-file anchor coverage —
+        // the shared enrichment core ([`anchor_context`], ws43-02) the hitstream
+        // annotator also runs, so the executor and the annotator cannot drift.
+        let anchors = anchor_context(
             self.symbol_index.as_ref(),
             &self.client_manager,
             &self.fs_manager,
@@ -709,52 +689,6 @@ impl GrepServer {
             parent_id,
         )
         .await;
-
-        // Step 3: documentSymbol outlines for the matched files — the sole
-        // source of the `#scope` anchor. `ensure_symbols` (Step 2b) already
-        // fetched them; here we read every symbol per matched file in one
-        // index query, then walk each hit's ancestry locally. The per-hit nav
-        // suite (references / call hierarchy / implementation / type hierarchy)
-        // no longer fires: references *are* the hits, resolution is dropped, and
-        // impl/super/sub targets are themselves hits — so this is goto-tier and
-        // essentially free (`O(files)`, no per-hit round-trip).
-        let path_refs: Vec<&Path> = rg_paths.iter().map(PathBuf::as_path).collect();
-        let file_symbols: HashMap<PathBuf, Vec<Symbol>> =
-            self.symbol_index
-                .as_ref()
-                .map_or_else(HashMap::new, |index_mutex| {
-                    let index = index_mutex
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    index
-                        .query_scoped(&path_refs, &ScopeFilter::AnyDepth, "*", None, false)
-                        .unwrap_or_default()
-                });
-
-        // Per-file documentSymbol coverage, for the `#?` degradation marker. A
-        // file with indexed symbols is covered. For a symbol-less file the two
-        // causes are indistinguishable from the index alone — "enriched, but
-        // genuinely empty" (no `#`) versus "could not enrich" (`#?`) — so we
-        // consult the live server registry: a documentSymbol-capable, alive
-        // server for the file means coverage (`get_servers` already filters dead
-        // servers, disabled methods, and file-pattern mismatches). No round-trip.
-        let mut uncovered: HashSet<PathBuf> = HashSet::new();
-        for path in &rg_paths {
-            if file_symbols.contains_key(path) {
-                continue;
-            }
-            let servers = self
-                .client_manager
-                .get_servers(
-                    path,
-                    LspServer::supports_document_symbols,
-                    Some(DispatchMethod::DocumentSymbol),
-                )
-                .await;
-            if servers.is_empty() {
-                uncovered.insert(path.clone());
-            }
-        }
 
         if cancel.is_cancelled() {
             return Err(crate::mcp::RequestCancelled.into());
@@ -767,26 +701,14 @@ impl GrepServer {
         let mut hits: Vec<GrepHit> = Vec::new();
         for (file_str, line_map) in &rg.file_line_texts {
             let file_path = PathBuf::from(file_str);
-            let could_not_enrich = uncovered.contains(&file_path);
-            let symbols = file_symbols.get(&file_path);
             for (&line_1, texts) in line_map {
                 let line_0 = line_1 - 1;
                 let matched_text = texts.first().map(|(t, _)| t.clone()).unwrap_or_default();
-                let anchor = if could_not_enrich {
-                    Anchor::Unknown
-                } else {
-                    let trail = symbols.map_or_else(Vec::new, |s| scope_trail(s, line_0));
-                    if trail.is_empty() {
-                        Anchor::TopLevel
-                    } else {
-                        Anchor::Scope(trail.join("/"))
-                    }
-                };
                 hits.push(GrepHit {
                     file: file_path.clone(),
                     line: line_0,
                     matched_text,
-                    anchor,
+                    anchor: anchors.anchor_for(&file_path, line_0),
                 });
             }
         }
@@ -1064,6 +986,175 @@ impl GrepServer {
 
         Ok(RipgrepMatches::merge(parts))
     }
+
+    /// Builds the ws43 hit-batch enricher from this server's shared
+    /// infrastructure (pool, filesystem manager, symbol index) — the daemon-side
+    /// annotator for the streamed `catenary grep` engine. The enricher runs the
+    /// same shared core ([`anchor_context`], [`nudge_observed_files`]) this
+    /// executor runs, so the two paths cannot drift while they coexist.
+    #[must_use]
+    pub fn hitstream_enricher(&self) -> super::hitstream_enricher::GrepHitEnricher {
+        super::hitstream_enricher::GrepHitEnricher::new(
+            Arc::clone(&self.client_manager),
+            Arc::clone(&self.fs_manager),
+            self.symbol_index.clone(),
+        )
+    }
+}
+
+// ─── Shared enrichment core (executor + ws43 hitstream annotator) ────────
+//
+// The pieces below are the single implementation of grep's LSP enrichment,
+// called by BOTH the legacy query executor (`GrepServer::run`, above) and the
+// streamed-engine annotator (`super::hitstream_enricher`). When the `catenary
+// grep` CLI cutover completes, the executor path retires and these become the
+// annotator's alone; until then, living here — beside the executor that used to
+// inline them — keeps the two callers on one implementation (ws43-02: move
+// logic, don't duplicate it).
+
+/// Per-file enrichment context for a set of matched paths: the `documentSymbol`
+/// outlines (the sole source of the `#scope` anchor) plus the set of files that
+/// could not be enriched at all.
+///
+/// Built once per query (executor) or once per hit-batch (annotator) by
+/// [`anchor_context`]; consumed per hit via [`Self::anchor_for`].
+pub(super) struct AnchorContext {
+    /// `documentSymbol` outlines per matched file.
+    file_symbols: HashMap<PathBuf, Vec<Symbol>>,
+    /// Files with no `documentSymbol` coverage (no live capable server): their
+    /// hits carry the `#?` could-not-enrich marker.
+    uncovered: HashSet<PathBuf>,
+}
+
+impl AnchorContext {
+    /// The `#scope` anchor for a hit in `file` at 0-based `line_0`: `#?` when
+    /// the file could not be enriched, no anchor when the hit is genuinely
+    /// top-level, and the slugified containment trail otherwise.
+    pub(super) fn anchor_for(&self, file: &Path, line_0: u32) -> Anchor {
+        if self.uncovered.contains(file) {
+            return Anchor::Unknown;
+        }
+        let trail = self
+            .file_symbols
+            .get(file)
+            .map_or_else(Vec::new, |s| scope_trail(s, line_0));
+        if trail.is_empty() {
+            Anchor::TopLevel
+        } else {
+            Anchor::Scope(trail.join("/"))
+        }
+    }
+}
+
+/// Builds the [`AnchorContext`] for `paths`.
+///
+/// Populates (or refreshes) the symbol index for the matched files
+/// ([`super::ensure_symbols`]), reads every symbol per file in one index query,
+/// and classifies per-file coverage for the `#?` degradation marker. A file
+/// with indexed symbols is covered. For a symbol-less file the two causes are
+/// indistinguishable from the index alone — "enriched, but genuinely empty"
+/// (no `#`) versus "could not enrich" (`#?`) — so the live server registry
+/// decides: a `documentSymbol`-capable, alive server for the file means
+/// coverage (`get_servers` already filters dead servers, disabled methods, and
+/// file-pattern mismatches). No round-trip. The per-hit nav suite (references /
+/// call hierarchy / implementation / type hierarchy) does not fire: this is
+/// goto-tier and essentially free (`O(files)`, no per-hit round-trip).
+pub(super) async fn anchor_context(
+    symbol_index: Option<&Arc<std::sync::Mutex<SymbolIndex>>>,
+    client_manager: &LspClientManager,
+    fs_manager: &FilesystemManager,
+    paths: &[PathBuf],
+    parent_id: Option<&str>,
+) -> AnchorContext {
+    super::ensure_symbols(symbol_index, client_manager, fs_manager, paths, parent_id).await;
+
+    let path_refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    let file_symbols: HashMap<PathBuf, Vec<Symbol>> =
+        symbol_index.map_or_else(HashMap::new, |index_mutex| {
+            let index = index_mutex
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            index
+                .query_scoped(&path_refs, &ScopeFilter::AnyDepth, "*", None, false)
+                .unwrap_or_default()
+        });
+
+    let mut uncovered: HashSet<PathBuf> = HashSet::new();
+    for path in paths {
+        if file_symbols.contains_key(path) {
+            continue;
+        }
+        let servers = client_manager
+            .get_servers(
+                path,
+                LspServer::supports_document_symbols,
+                Some(DispatchMethod::DocumentSymbol),
+            )
+            .await;
+        if servers.is_empty() {
+            uncovered.insert(path.clone());
+        }
+    }
+
+    AnchorContext {
+        file_symbols,
+        uncovered,
+    }
+}
+
+/// Routes the WS31 changed-set nudge (Consumer A) for a set of observed files
+/// under the walk-breadth gate (ticket 04).
+///
+/// `observed_files` are `(absolute path, mtime-nanos)` observations — every
+/// file the caller's walk visited (executor) or the canonical hit paths of one
+/// batch, freshly statted (annotator). They are grouped by registered root
+/// (root-relative), diffed against the per-root baseline, and the delta routed
+/// per server. A root with no covering server is `WalkBreadth::None` — the
+/// `(no LSP)` case — and is skipped entirely (no diff, no nudge).
+///
+/// Reaping is gated per-root by whether the walk actually spanned the whole
+/// registered root (WS31-review C1): `reap_scopes`, when `Some`, carries the
+/// canonicalized scopes a *pathless* walk covered, and a root reaps only when
+/// one of them is an ancestor-or-equal of it. `None` — a path-scoped query, or
+/// the annotator's per-batch nudge, whose hit set never proves absence — is
+/// add/update only, exactly like a scoped `glob`.
+pub(super) async fn nudge_observed_files(
+    client_manager: &LspClientManager,
+    fs_manager: &FilesystemManager,
+    observed_files: &[(PathBuf, i64)],
+    reap_scopes: Option<&[PathBuf]>,
+) {
+    let mut by_root: HashMap<PathBuf, Vec<(PathBuf, i64)>> = HashMap::new();
+    for (abs, mtime) in observed_files {
+        if let Some(root) = fs_manager.resolve_root(abs)
+            && let Ok(rel) = abs.strip_prefix(&root)
+        {
+            by_root
+                .entry(root)
+                .or_default()
+                .push((rel.to_path_buf(), *mtime));
+        }
+    }
+    let no_exclude: HashSet<PathBuf> = HashSet::new();
+    for (root, observed) in &by_root {
+        let breadth = if client_manager.has_covering_watchers(root).await {
+            WalkBreadth::Full
+        } else {
+            WalkBreadth::None
+        };
+        if !breadth.runs_engine() {
+            continue;
+        }
+        // Only reap when the walk truly covered the whole root: a pathless
+        // walk whose scope is an ancestor-or-equal of this registered root. A
+        // subtree walk cannot assert that an unvisited baseline entry is gone.
+        let covered_whole_root =
+            reap_scopes.is_some_and(|scopes| scopes.iter().any(|scope| root.starts_with(scope)));
+        let reap = breadth.reaps() && covered_whole_root;
+        client_manager
+            .nudge_changed_set(root, observed, &no_exclude, reap)
+            .await;
+    }
 }
 
 // ─── Matcher / searcher construction ───────────────────────────────────
@@ -1080,7 +1171,12 @@ impl GrepServer {
 /// # Errors
 ///
 /// Returns an error if the (possibly escaped) pattern is not a valid regex.
-fn build_matcher(pattern: &str, flags: &GrepFlags) -> Result<RegexMatcher> {
+///
+/// Crate-visible since ws43-02 (re-exported `pub(crate)` from `bridge`): the
+/// hitstream engine ([`crate::hitstream::engine`]) builds its CLI-side walk
+/// matcher through this same constructor, so the two walks' matching semantics
+/// cannot drift.
+pub fn build_matcher(pattern: &str, flags: &GrepFlags) -> Result<RegexMatcher> {
     let effective = if flags.fixed_strings {
         regex::escape(pattern)
     } else {
@@ -1102,7 +1198,10 @@ fn build_matcher(pattern: &str, flags: &GrepFlags) -> Result<RegexMatcher> {
 
 /// Builds a line searcher honoring the context (`-A`/`-B`/`-C`) and invert
 /// (`-v`) flags. Line numbers are always on (the grep line format needs them).
-fn build_searcher(flags: &GrepFlags) -> Searcher {
+///
+/// Crate-visible since ws43-02: shared with the hitstream engine's CLI-side
+/// walk (see [`build_matcher`]).
+pub fn build_searcher(flags: &GrepFlags) -> Searcher {
     SearcherBuilder::new()
         .line_number(true)
         .before_context(flags.before_context)
@@ -1755,19 +1854,24 @@ impl Sink for MatchSink<'_> {
 
 // ─── Alternation splitting ────────────────────────────────────────────
 
-/// One file the ripgrep walk skipped instead of searching: its absolute path,
-/// why it was skipped, and whether the path was explicitly **named** (a file
-/// root — a positional arg or a glob that expanded to it) versus reached by a
-/// directory walk. Folded into the wire-ready [`GrepSkips`] by
-/// [`GrepSkips::from_records`] (misc 135, bug 62).
+/// One file the ripgrep walk skipped instead of searching.
+///
+/// Carries the absolute path, why it was skipped, and whether the path was
+/// explicitly **named** (a file root — a positional arg or a glob that
+/// expanded to it) versus reached by a directory walk. Folded into the
+/// wire-ready [`GrepSkips`] by [`GrepSkips::from_records`] (misc 135, bug 62).
+///
+/// `pub` since ws43-02: the hitstream engine's CLI-side walk records the same
+/// skips (its [`WalkSummary`](crate::hitstream::engine::WalkSummary) carries
+/// them), so a skip is reported identically whichever walk found it.
 #[derive(Debug)]
-struct SkipRecord {
+pub struct SkipRecord {
     /// Absolute path of the skipped file.
-    path: PathBuf,
+    pub path: PathBuf,
     /// Why the classifier treated it as unsearchable.
-    reason: BinarySkip,
+    pub reason: BinarySkip,
     /// The path was explicitly named (per-file reporting) vs walked (aggregated).
-    named: bool,
+    pub named: bool,
 }
 
 /// Result of a ripgrep line search.

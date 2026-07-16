@@ -336,6 +336,10 @@ impl ExcludeSet {
 /// `to_params`) before dispatch. An empty input yields an empty result; callers
 /// distinguish "no path arguments" (search `cwd`) from "arguments that matched
 /// nothing" (empty result) before calling this.
+///
+/// Shared by the grep and glob executors: when grep's streamed-engine cutover
+/// completes (ws43-02 seam) this expansion moves CLI-side for grep, but the
+/// daemon-side copy stays for glob until glob's own cutover (ws43-03).
 #[must_use]
 pub fn expand_search_paths(
     paths: &[PathBuf],

@@ -78,31 +78,53 @@ impl AnnotationVerdict {
 /// A single hit as the daemon returns it: the wire hit plus its (optional)
 /// enrichment.
 ///
-/// For this ticket the annotator is a pass-through skeleton, so `anchor` is
-/// always `None`; the field is the seam the later enrichment migration fills. A
-/// `None` anchor renders identically to the CLI's own unannotated spelling, so a
-/// pass-through annotation-batch and a daemon-absent batch print the same bytes.
+/// The anchor state is tri-valued, mirroring the grep executor's `Anchor`
+/// (ws43-02, the enrichment migration):
+///
+/// - `anchor: Some(trail)` — enriched, inside a scope (`#trail`);
+/// - `anchor: None, enriched: true` — enriched, genuinely top-level (no `#` at
+///   all — there is no graph coordinate to report);
+/// - `anchor: None, enriched: false` — could not be enriched (no covering
+///   server, blown budget, pass-through) — the `#?` marker, so degradation is
+///   never misread as top-level.
+///
+/// `enriched` is a serde-default `false` field, so a frame from a peer that
+/// predates it parses as could-not-enrich — the honest degrade reading.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnnotatedHit {
     /// The hit, unchanged from the batch the CLI sent.
     #[serde(flatten)]
     pub hit: WireHit,
-    /// The enrichment coordinate for this hit, or `None` when the hit was not
-    /// enriched (the pass-through skeleton, or a genuinely top-level hit).
+    /// The `#scope` containment trail for this hit, or `None` when the hit has
+    /// no scope coordinate (top-level, or not enriched — `enriched` splits the
+    /// two).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
+    /// Whether enrichment actually covered this hit's file. `false` for a
+    /// pass-through hit (budget, no server, degrade), which renders the `#?`
+    /// could-not-enrich marker in the grep line shape.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enriched: bool,
 }
 
 impl AnnotatedHit {
-    /// Wraps a wire hit with no enrichment — the pass-through spelling.
+    /// Wraps a wire hit with no enrichment — the pass-through spelling
+    /// (`enriched: false`, rendering the `#?` marker in the grep line shape).
     #[must_use]
     pub const fn passthrough(hit: WireHit) -> Self {
-        Self { hit, anchor: None }
+        Self {
+            hit,
+            anchor: None,
+            enriched: false,
+        }
     }
 
-    /// Renders this hit as one result line. With no anchor this is byte-identical
-    /// to [`WireHit::render_unannotated`], so a pass-through batch and a
-    /// daemon-absent batch print the same bytes (the degrade-only invariant).
+    /// Renders this hit as one result line in the protocol skeleton's
+    /// wire-debug spelling (`path:line:column…`). With no anchor this is
+    /// byte-identical to [`WireHit::render_unannotated`], so a pass-through
+    /// batch and a daemon-absent batch print the same bytes (the degrade-only
+    /// invariant). The user-visible `catenary grep` shape is
+    /// [`Self::render_grep_line`]; the CLI cutover switches the sinks to it.
     #[must_use]
     pub fn render(&self) -> String {
         self.anchor.as_ref().map_or_else(
@@ -118,6 +140,29 @@ impl AnnotatedHit {
                 )
             },
         )
+    }
+
+    /// Renders this hit as one `catenary grep` result line — today's CLI output
+    /// shape, byte-compatible with the grep executor's `render_hit_line`:
+    ///
+    /// - scoped: `display:line#trail:text`
+    /// - top-level: `display:line:text`
+    /// - could not enrich: `display:line#?:text`
+    ///
+    /// `display_path` is the CLI-side display spelling (cwd-relative, or the
+    /// absolute fallback) — display mapping is the CLI's job, so the canonical
+    /// wire path never prints directly. A pass-through hit renders identically
+    /// to [`WireHit::render_grep_unannotated`], which is what keeps the degrade
+    /// matrix byte-identical on results.
+    #[must_use]
+    pub fn render_grep_line(&self, display_path: &str) -> String {
+        match (&self.anchor, self.enriched) {
+            (Some(trail), _) => {
+                format!("{display_path}:{}#{trail}:{}", self.hit.line, self.hit.text)
+            }
+            (None, true) => format!("{display_path}:{}:{}", self.hit.line, self.hit.text),
+            (None, false) => format!("{display_path}:{}#?:{}", self.hit.line, self.hit.text),
+        }
     }
 }
 
@@ -262,7 +307,82 @@ mod tests {
         let annotated = AnnotatedHit {
             hit: sample_hit(),
             anchor: Some("mod_a/f".to_string()),
+            enriched: true,
         };
         assert_eq!(annotated.render(), "/w/src/a.rs:3:1#mod_a/f:fn f() {");
+    }
+
+    // ─── grep line shape (ws43-02: the cutover rendering) ──────────────────
+
+    #[test]
+    fn grep_line_scoped_hit_carries_the_trail() {
+        let annotated = AnnotatedHit {
+            hit: sample_hit(),
+            anchor: Some("mod_a/f".to_string()),
+            enriched: true,
+        };
+        assert_eq!(
+            annotated.render_grep_line("src/a.rs"),
+            "src/a.rs:3#mod_a/f:fn f() {"
+        );
+    }
+
+    #[test]
+    fn grep_line_top_level_hit_has_no_anchor() {
+        let annotated = AnnotatedHit {
+            hit: sample_hit(),
+            anchor: None,
+            enriched: true,
+        };
+        assert_eq!(
+            annotated.render_grep_line("src/a.rs"),
+            "src/a.rs:3:fn f() {"
+        );
+    }
+
+    #[test]
+    fn grep_line_unenriched_hit_marks_could_not_enrich() {
+        // A pass-through (or budget-blown, or no-server) hit renders the `#?`
+        // marker — degradation is never misread as top-level.
+        let annotated = AnnotatedHit::passthrough(sample_hit());
+        assert_eq!(
+            annotated.render_grep_line("src/a.rs"),
+            "src/a.rs:3#?:fn f() {"
+        );
+    }
+
+    #[test]
+    fn grep_line_passthrough_matches_unannotated_grep_spelling() {
+        // The degrade-only invariant in the grep shape: a pass-through
+        // annotation-batch and a daemon-absent batch print the same bytes.
+        let hit = sample_hit();
+        let annotated = AnnotatedHit::passthrough(hit.clone());
+        assert_eq!(
+            annotated.render_grep_line("src/a.rs"),
+            hit.render_grep_unannotated("src/a.rs")
+        );
+    }
+
+    #[test]
+    fn enriched_flag_roundtrips_and_defaults_false() {
+        let annotated = AnnotatedHit {
+            hit: sample_hit(),
+            anchor: None,
+            enriched: true,
+        };
+        let line = serde_json::to_string(&annotated).expect("serialize");
+        assert!(
+            line.contains("\"enriched\":true"),
+            "flag on the wire: {line}"
+        );
+        let back: AnnotatedHit = serde_json::from_str(&line).expect("parse");
+        assert_eq!(back, annotated);
+
+        // A frame from a peer that predates the field parses as could-not-enrich
+        // (the honest degrade reading), never as top-level.
+        let legacy = r#"{"path":"/w/src/a.rs","line":3,"column":1,"text":"fn f() {"}"#;
+        let parsed: AnnotatedHit = serde_json::from_str(legacy).expect("parse legacy");
+        assert!(!parsed.enriched, "absent field reads as unenriched");
+        assert_eq!(parsed.render_grep_line("src/a.rs"), "src/a.rs:3#?:fn f() {");
     }
 }

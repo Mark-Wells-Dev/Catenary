@@ -118,6 +118,9 @@ impl<W: std::io::Write> ResultSink<W> {
 /// same spelling), which is exactly what makes daemon-absent, wedged-daemon, and
 /// old-daemon degrade to the same stream.
 ///
+/// Returns the walk's [`WalkSummary`] so the caller can report skips
+/// (misc 135) — the CLI cutover folds them into the stderr skip lines.
+///
 /// # Errors
 ///
 /// Returns an error if the walk fails to start (bad pattern) or a write fails.
@@ -126,14 +129,15 @@ pub fn stdout_unannotated<W: std::io::Write>(
     roots: &[std::path::PathBuf],
     options: &super::engine::WalkOptions,
     sink: &mut ResultSink<W>,
-) -> Result<()> {
-    super::engine::walk(pattern, roots, options, |batch: HitBatch| {
+) -> Result<super::engine::WalkSummary> {
+    let summary = super::engine::walk(pattern, roots, options, |batch: HitBatch| {
         for hit in &batch.hits {
             sink.write_line(&hit.render_unannotated())?;
         }
         Ok(())
     })?;
-    sink.flush()
+    sink.flush()?;
+    Ok(summary)
 }
 
 /// The daemon-stream sink: send hit-batches to the daemon, read annotation-batches
@@ -161,6 +165,10 @@ pub fn stdout_unannotated<W: std::io::Write>(
 /// caller degrades to [`stdout_unannotated`], which produces the identical
 /// unannotated result stream.
 ///
+/// Returns the walk's [`WalkSummary`](super::engine::WalkSummary) so the caller
+/// can report skips (misc 135) — the CLI cutover folds them into the stderr
+/// skip lines.
+///
 /// # Errors
 ///
 /// Returns an error if the walk fails to start, a frame read/write fails, or the
@@ -173,7 +181,7 @@ pub async fn daemon_stream<R, Wr, Wo>(
     reader: R,
     writer: Wr,
     sink: &mut ResultSink<Wo>,
-) -> Result<()>
+) -> Result<super::engine::WalkSummary>
 where
     R: tokio::io::AsyncBufRead + Unpin,
     Wr: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -190,7 +198,7 @@ where
     let roots = roots.to_vec();
     let options = options.clone();
 
-    let walk_task = tokio::task::spawn_blocking(move || -> Result<u64> {
+    let walk_task = tokio::task::spawn_blocking(move || -> Result<super::engine::WalkSummary> {
         super::engine::walk(&pattern, &roots, &options, |batch| {
             // A closed receiver (the writer died) aborts the walk — no point
             // reading the tree for a stream nobody is draining.
@@ -217,14 +225,20 @@ where
             super::write_frame(&mut writer, &frame).await?;
             sent += 1;
         }
-        let total = walk_task
+        let summary = walk_task
             .await
             .context("join walk task")?
             .context("walk for daemon stream")?;
-        debug_assert_eq!(sent, total, "every walked batch was sent");
-        super::write_frame(&mut writer, &HitFrame::End { batches: total }).await?;
+        debug_assert_eq!(sent, summary.batches, "every walked batch was sent");
+        super::write_frame(
+            &mut writer,
+            &HitFrame::End {
+                batches: summary.batches,
+            },
+        )
+        .await?;
         writer.shutdown().await.context("shutdown hit writer")?;
-        Ok::<(), anyhow::Error>(())
+        Ok::<super::engine::WalkSummary, anyhow::Error>(summary)
     });
 
     // Reader half (current task): read annotation-batches, reassemble into seq
@@ -237,8 +251,9 @@ where
     // a writer fault is reported if the reader succeeded.
     let write_result = writer_task.await.context("join writer task")?;
     read_result?;
-    write_result?;
-    sink.flush()
+    let summary = write_result?;
+    sink.flush()?;
+    Ok(summary)
 }
 
 /// Reads annotation-batches from `reader`, reassembles them into `seq` order, and
