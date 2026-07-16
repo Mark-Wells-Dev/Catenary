@@ -656,11 +656,39 @@ pub fn run_session_start(format: HostFormat) {
     let lines = ipc_exchange(stream, &request);
     let nudge = session_start_nudge_from_response(&lines);
 
+    // Auto-install announcement (lsm 05): the daemon kicked one or more
+    // background installs for this session's roots and returned the
+    // user-visible lines. Ride the `systemMessage` surface — the user-facing
+    // notification channel `SessionStart` offers — one builder line per
+    // announcement, at Info (an announcement, never an alarm).
+    if let Some(announcement) = auto_install_announcement_from_response(&lines) {
+        for line in announcement.lines() {
+            builder.push_direct(Severity::Info, line);
+        }
+    }
+
     let ctx = with_project_config_line(
         with_bridge_mismatch_line(with_orphan_line(session_start_context(announce, format))),
         nudge.as_deref(),
     );
     emit_session_start(builder, ctx.as_deref());
+}
+
+/// The `auto_install_announcement` lines the daemon returned in its
+/// `session-start/clear-editing` response, or `None` (lsm 05).
+///
+/// Present only when the daemon actually kicked one or more background
+/// installs this dispatch (an in-flight duplicate announces nothing), so the
+/// CLI renders exactly what was kicked. Mirrors
+/// [`session_start_nudge_from_response`].
+#[must_use]
+fn auto_install_announcement_from_response(lines: &[String]) -> Option<String> {
+    let line = lines.first()?;
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    value
+        .get("auto_install_announcement")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 /// The `session_start_nudge` line the daemon returned in its

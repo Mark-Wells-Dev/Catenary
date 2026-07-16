@@ -551,6 +551,57 @@ pub fn strike_findings(servers: &[crate::state_snapshot::ServerEntry]) -> Vec<Fi
     findings
 }
 
+/// Auto-install findings from the live daemon board (lsm 05): the
+/// doctor-visible half of every background auto-install.
+///
+/// A `failed` record is the ruled skip-with-finding — one
+/// [`Severity::Warning`] naming the reason, with the retry semantics in the
+/// fix-it (no retry loop; the next session start's detection retries
+/// naturally). An `installing`/`installed` record renders as non-problem
+/// [`Severity::Info`] inventory, so every auto-install leaves a doctor-visible
+/// trace (the announcement floor). Records live exactly as long as the daemon;
+/// with the daemon down there is no board and no findings.
+#[must_use]
+pub fn auto_install_findings(entries: &[crate::state_snapshot::AutoInstallEntry]) -> Vec<Finding> {
+    entries
+        .iter()
+        .map(|entry| match entry.status.as_str() {
+            "failed" => Finding::new(
+                FindingCode::ServerAutoInstallFailed,
+                Severity::Warning,
+                format!(
+                    "{}: auto-install of {} failed — {}",
+                    entry.server,
+                    entry.version,
+                    entry.detail.as_deref().unwrap_or("no reason recorded"),
+                ),
+            )
+            .with_fix_it(
+                "Auto-install does not retry on its own; the next session start's detection \
+                 retries naturally. Check network access, or install through the guided \
+                 install (`catenary`, problems pane)."
+                    .to_string(),
+            ),
+            "installed" => Finding::new(
+                FindingCode::ServerAutoInstall,
+                Severity::Info,
+                format!(
+                    "{}: auto-installed {} into the managed home",
+                    entry.server, entry.version,
+                ),
+            ),
+            _ => Finding::new(
+                FindingCode::ServerAutoInstall,
+                Severity::Info,
+                format!(
+                    "{}: auto-install of {} in progress",
+                    entry.server, entry.version,
+                ),
+            ),
+        })
+        .collect()
+}
+
 /// One warn-tier finding per configured, routed **unverified** server
 /// (diagnostics-debt 04b / DESIGN §"The blessed set").
 ///
@@ -1199,6 +1250,46 @@ mod tests {
     fn binary_exists_finds_and_rejects() {
         assert!(binary_exists("sh"));
         assert!(!binary_exists("catenary_nonexistent_binary_xyz"));
+    }
+
+    #[test]
+    fn auto_install_findings_warn_on_failure_and_note_the_rest() {
+        // lsm 05: a failed record is the skip-with-finding Warning naming the
+        // reason; installing/installed records are non-problem Info inventory
+        // (the doctor-visible announcement floor).
+        let entry = |status: &str, detail: Option<&str>| crate::state_snapshot::AutoInstallEntry {
+            server: "gopls".to_string(),
+            version: "v0.20.0".to_string(),
+            status: status.to_string(),
+            detail: detail.map(str::to_string),
+            at: "2026-07-16T00:00:00.000Z".to_string(),
+        };
+
+        let failed = auto_install_findings(&[entry("failed", Some("registry unreachable"))]);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].code, FindingCode::ServerAutoInstallFailed);
+        assert_eq!(failed[0].severity, Severity::Warning);
+        assert!(
+            failed[0].message.contains("registry unreachable"),
+            "the finding names the reason: {}",
+            failed[0].message,
+        );
+        assert!(
+            failed[0]
+                .fix_it
+                .as_deref()
+                .is_some_and(|f| f.contains("next session start")),
+            "the fix-it states the natural-retry semantics",
+        );
+
+        let rest = auto_install_findings(&[entry("installing", None), entry("installed", None)]);
+        assert_eq!(rest.len(), 2);
+        assert!(
+            rest.iter().all(|f| f.severity == Severity::Info
+                && f.code == FindingCode::ServerAutoInstall
+                && !f.is_problem()),
+            "non-failure records are Info inventory: {rest:?}",
+        );
     }
 
     #[test]

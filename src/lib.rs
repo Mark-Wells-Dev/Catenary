@@ -9,6 +9,8 @@
 /// The answer desk: Catenary answers Claude Code read-class permission prompts
 /// and redacts secrets from tool output (misc 201).
 pub mod answer_desk;
+/// Background auto-install of missing blessed servers (ls-manager 05).
+pub mod auto_install;
 /// Bridge logic between MCP and LSP.
 pub mod bridge;
 /// Two-stage bucketing for grep tier 3 and glob tier 3 output.

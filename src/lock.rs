@@ -1388,6 +1388,14 @@ pub fn reap_paid_idle_locks(now: SystemTime, idle_timeout: Duration) -> Vec<Stri
 /// configured server, or which a linter rule routes to). Over-booking a
 /// configured-but-dead server is safe — it renders honestly at serve time and
 /// retires — so the static view intentionally errs toward covering.
+///
+/// Convergence note (lsm 05): this static view also over-books files whose
+/// server is configured-but-not-installed (the language books, but no binary
+/// can ever serve the debt — it renders and retires as above). `[servers]
+/// auto_install` narrows that gap toward zero: a blessed server a root's
+/// markers want is background-installed at session start, so by serve time the
+/// booking is usually honest coverage rather than a benign over-book. No
+/// booking-side change is needed — the gap closes from the install side.
 pub struct Booking {
     /// File extension (no dot) → language books (has a configured server).
     extensions: std::collections::HashMap<String, bool>,

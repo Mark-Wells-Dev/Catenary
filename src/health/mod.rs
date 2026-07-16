@@ -182,6 +182,15 @@ pub enum FindingCode {
     /// [`Severity::Info`]: running your own version is a choice, not a fault,
     /// and nothing gates on it.
     ServerVersionDrift,
+    /// A background auto-install record on the running daemon (lsm 05) — an
+    /// `installing`/`installed` standing, rendered as non-problem
+    /// [`Severity::Info`] inventory (the doctor-visible half of the
+    /// announcement floor).
+    ServerAutoInstall,
+    /// A background auto-install that failed this daemon lifetime (lsm 05) —
+    /// skip-with-finding: a [`Severity::Warning`] naming the reason; the next
+    /// session start's detection retries naturally.
+    ServerAutoInstallFailed,
     /// The running daemon serves a different build than this binary.
     VersionSkew,
     /// A connected bridge links a different `catenary-mcp` protocol version than
@@ -250,6 +259,8 @@ impl FindingCode {
             Self::ServerEnrichmentOnly => "server-enrichment-only",
             Self::ServerReady => "server-ready",
             Self::ServerVersionDrift => "server-version-drift",
+            Self::ServerAutoInstall => "server-auto-install",
+            Self::ServerAutoInstallFailed => "server-auto-install-failed",
             Self::VersionSkew => "version-skew",
             Self::BridgeVersionMismatch => "bridge-version-mismatch",
             Self::HooksStale => "hooks-stale",

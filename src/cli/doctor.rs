@@ -205,11 +205,20 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
     // daemon's board stays down until a restart/remount, even when doctor's
     // own fresh probe succeeds — surface that split honestly. Read from the
     // same snapshot the activity ledger came from; daemon down ⇒ no board ⇒
-    // no findings.
-    let strike_findings = read_snapshot()
-        .map(|s| crate::health::servers::strike_findings(&s.servers))
+    // no findings. The board also carries the auto-install records (lsm 05):
+    // a failed background install is the ruled skip-with-finding Warning, and
+    // an installing/installed record is the doctor-visible half of the
+    // announcement.
+    let board_findings = read_snapshot()
+        .map(|s| {
+            let mut findings = crate::health::servers::strike_findings(&s.servers);
+            findings.extend(crate::health::servers::auto_install_findings(
+                &s.auto_installs,
+            ));
+            findings
+        })
         .unwrap_or_default();
-    render_findings(out, &strike_findings, show_diff);
+    render_findings(out, &board_findings, show_diff);
 
     // ── Languages section (the routing table) ────────────────────────
     let _ = out.writeln(format_args!(""));

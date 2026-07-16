@@ -176,6 +176,7 @@ pub struct PermissionsConfig {
 /// ```toml
 /// [servers]
 /// prefer_managed = false   # opt out: always resolve servers on PATH
+/// auto_install = true      # opt in: background-install missing blessed servers
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -193,12 +194,28 @@ pub struct ServersConfig {
     /// [`crate::managed_home::resolve_spawn_program`].
     #[serde(default = "default_prefer_managed")]
     pub prefer_managed: bool,
+
+    /// Auto-install missing blessed servers in the background
+    /// (`[servers] auto_install`, default `false` — opt-in, lsm 05).
+    ///
+    /// When `true`, the `SessionStart` hook's daemon dispatch detects, from the
+    /// session's root markers, blessed servers that are needed but not
+    /// resolvable for spawn (no managed install at the pin, nothing on `PATH`)
+    /// and kicks a daemon-side **background** install through the same engine
+    /// as the guided install ([`crate::install`]); session start never waits on
+    /// it. Completion pre-warms the server for live matching roots. User-config
+    /// only, like the rest of `[servers]` — a project `.catenary.toml` can
+    /// never opt a machine into installing software. See
+    /// [`crate::auto_install`].
+    #[serde(default)]
+    pub auto_install: bool,
 }
 
 impl Default for ServersConfig {
     fn default() -> Self {
         Self {
             prefer_managed: default_prefer_managed(),
+            auto_install: false,
         }
     }
 }
@@ -619,6 +636,16 @@ impl Config {
         self.servers
             .as_ref()
             .is_none_or(|servers| servers.prefer_managed)
+    }
+
+    /// Whether missing blessed servers are auto-installed in the background
+    /// (`[servers] auto_install`, lsm 05). Defaults to `false` — an opt-in;
+    /// an absent section runs nothing.
+    #[must_use]
+    pub fn auto_install(&self) -> bool {
+        self.servers
+            .as_ref()
+            .is_some_and(|servers| servers.auto_install)
     }
 }
 
@@ -1831,6 +1858,40 @@ command = "rust-analyzer"
         fs::write(&path, "[servers]\nbogus = true\n").expect("write");
 
         assert!(Config::load_from_sources(&[path]).is_err());
+    }
+
+    #[test]
+    fn servers_auto_install_defaults_off() -> anyhow::Result<()> {
+        // lsm 05: auto_install is opt-in — an absent section and a `[servers]`
+        // section that omits the key both run nothing.
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "")?;
+        let config = Config::load_from_sources(&[path])?;
+        assert!(!config.auto_install(), "absent section defaults off");
+
+        let path = dir.path().join("config2.toml");
+        fs::write(&path, "[servers]\nprefer_managed = true\n")?;
+        let config = Config::load_from_sources(&[path])?;
+        assert!(!config.auto_install(), "omitted key defaults off");
+
+        Ok(())
+    }
+
+    #[test]
+    fn servers_auto_install_parses_from_user_config() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[servers]\nauto_install = true\n")?;
+
+        let config = Config::load_from_sources(&[path])?;
+        assert!(config.auto_install(), "the opt-in is honored (lsm 05)");
+        assert!(
+            config.prefer_managed(),
+            "prefer_managed keeps its default alongside auto_install"
+        );
+
+        Ok(())
     }
 
     #[test]

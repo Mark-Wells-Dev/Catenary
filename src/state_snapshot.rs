@@ -535,6 +535,31 @@ pub struct Milestone {
     pub scope: Option<String>,
 }
 
+/// One background auto-install's current standing (lsm 05), keyed by server —
+/// the daemon-lifetime record behind the doctor finding and TUI awareness.
+///
+/// Written by the daemon's [`crate::auto_install::AutoInstaller`] at kick
+/// (`installing`), landing (`installed`), and failure (`failed`, with the
+/// reason in `detail`). One entry per server: a later transition overwrites the
+/// earlier one, so the record always reads the latest state. Like every
+/// snapshot record it lives exactly as long as the daemon — a fresh daemon
+/// starts clean and the next session start's detection retries naturally.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AutoInstallEntry {
+    /// Canonical server name (the `[lsp.server.*]` key).
+    pub server: String,
+    /// The blessed pinned version being installed.
+    pub version: String,
+    /// Current standing: `installing` / `installed` / `failed`.
+    pub status: String,
+    /// The failure reason, present only for `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// When the entry last transitioned (ISO 8601).
+    pub at: String,
+}
+
 /// A configured language made live by tracked-session activity, with the
 /// provenance that triggered it (tui-rework 09, items 4–5).
 ///
@@ -589,6 +614,10 @@ pub struct Snapshot {
     /// provenance (schema 3). The health model's suggestion/Fatal gate and the
     /// finding provenance read this ledger.
     pub activity_languages: Vec<LanguageActivity>,
+    /// Background auto-install standings, one per server (lsm 05).
+    /// Serde-additive — a snapshot from a daemon predating the field defaults
+    /// to empty.
+    pub auto_installs: Vec<AutoInstallEntry>,
 }
 
 impl Snapshot {
@@ -668,6 +697,10 @@ struct SnapshotState {
     /// files, bounded. Serialized into [`Snapshot::activity_languages`] as the
     /// health model's suggestion/Fatal gate and provenance source (tui-rework 09).
     activity_languages: BTreeMap<(String, String), BTreeSet<String>>,
+    /// Background auto-install standings keyed by server (lsm 05). One entry
+    /// per server — a later transition (`installing` → `installed`/`failed`)
+    /// overwrites the earlier — serialized into [`Snapshot::auto_installs`].
+    auto_installs: BTreeMap<String, AutoInstallEntry>,
     /// The observed bridge↔daemon protocol-version mismatch (ws41-02), set the
     /// moment a disagreeing hello arrives and cleared once the versions agree.
     /// Serialized into the `daemon` block so `catenary doctor`, the TUI board,
@@ -1013,6 +1046,7 @@ impl SnapshotState {
             alerts: self.alerts.iter().collect(),
             activity: self.activity.iter().collect(),
             activity_languages: self.activity_languages(),
+            auto_installs: self.auto_installs.values().collect(),
         };
         serde_json::to_string_pretty(&view).unwrap_or_else(|e| {
             tracing::debug!(error = %e, "state.json serialization failed");
@@ -1032,6 +1066,7 @@ struct SnapshotView<'a> {
     alerts: Vec<&'a Alert>,
     activity: Vec<&'a Milestone>,
     activity_languages: Vec<LanguageActivity>,
+    auto_installs: Vec<&'a AutoInstallEntry>,
 }
 
 /// Shared inner state plus flush coordination.
@@ -1152,6 +1187,7 @@ impl SnapshotWriter {
                 alerts: VecDeque::new(),
                 activity: VecDeque::new(),
                 activity_languages: BTreeMap::new(),
+                auto_installs: BTreeMap::new(),
                 bridge_mismatch: None,
                 dirty: false,
                 urgent: false,
@@ -1370,6 +1406,36 @@ impl SnapshotWriter {
         }
     }
 
+    /// Records a background auto-install standing (lsm 05) — keyed by server,
+    /// so a completion/failure overwrites the `installing` record. Flushes
+    /// promptly (urgent): the record is the doctor/TUI-visible half of the
+    /// announcement, and a stale `installing` after a landed install misreports
+    /// exactly what the operator is watching for.
+    pub fn record_auto_install(
+        &self,
+        server: &str,
+        version: &str,
+        status: &str,
+        detail: Option<&str>,
+    ) {
+        {
+            let mut state = self.inner.lock_state();
+            state.auto_installs.insert(
+                server.to_owned(),
+                AutoInstallEntry {
+                    server: server.to_owned(),
+                    version: version.to_owned(),
+                    status: status.to_owned(),
+                    detail: detail.map(str::to_owned),
+                    at: now_iso(),
+                },
+            );
+            state.dirty = true;
+            state.urgent = true;
+        }
+        self.inner.notify.notify_one();
+    }
+
     /// Prunes the language-activity ledger of every bucket rooted at `root`
     /// (bug 93): the provenance source a retired root must leave behind.
     ///
@@ -1508,6 +1574,7 @@ mod tests {
             alerts: VecDeque::new(),
             activity: VecDeque::new(),
             activity_languages: BTreeMap::new(),
+            auto_installs: BTreeMap::new(),
             bridge_mismatch: None,
             dirty: false,
             urgent: false,
@@ -2535,6 +2602,41 @@ mod tests {
             snapshot.daemon.bridge_mismatch.is_none(),
             "an agreeing pairing leaves no record — the finding self-clears",
         );
+    }
+
+    #[test]
+    fn auto_install_records_round_trip_latest_state_per_server() {
+        // lsm 05: one record per server — a failure overwrites the earlier
+        // `installing` — and the reader parses it back for the doctor finding.
+        let mut state = fresh_state();
+        state.auto_installs.insert(
+            "gopls".to_string(),
+            AutoInstallEntry {
+                server: "gopls".to_string(),
+                version: "v0.20.0".to_string(),
+                status: "installing".to_string(),
+                detail: None,
+                at: now_iso(),
+            },
+        );
+        state.auto_installs.insert(
+            "gopls".to_string(),
+            AutoInstallEntry {
+                server: "gopls".to_string(),
+                version: "v0.20.0".to_string(),
+                status: "failed".to_string(),
+                detail: Some("registry unreachable".to_string()),
+                at: now_iso(),
+            },
+        );
+
+        let json = state.to_json(&[], &[]);
+        let snapshot: Snapshot = serde_json::from_str(&json).expect("reader parses writer output");
+        assert_eq!(snapshot.auto_installs.len(), 1, "latest state per server");
+        let entry = &snapshot.auto_installs[0];
+        assert_eq!(entry.server, "gopls");
+        assert_eq!(entry.status, "failed");
+        assert_eq!(entry.detail.as_deref(), Some("registry unreachable"));
     }
 
     #[tokio::test]

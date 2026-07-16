@@ -1399,6 +1399,30 @@ servers = []
     }
 
     #[test]
+    fn project_servers_auto_install_is_ignored() -> Result<()> {
+        // lsm 05 trust-boundary pin: `auto_install = true` in a project
+        // `.catenary.toml` is warned-and-ignored exactly like the rest of
+        // `[servers]` — a public repo can never opt a private machine into
+        // installing software. The drop is structural (`ProjectConfig` has no
+        // servers field), so the new key inherits the boundary for free; this
+        // test pins it against a future project-scope loosening.
+        assert!(!PROJECT_CONFIG_ALLOWED_KEYS.contains(&"servers"));
+
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join(".catenary.toml"),
+            "[servers]\nauto_install = true\n",
+        )?;
+
+        // Loads without error (warn-only); nothing reaches detection — the
+        // loaded project config exposes no auto-install policy at all.
+        let result = load_project_config(dir.path())?;
+        assert!(result.is_some());
+
+        Ok(())
+    }
+
+    #[test]
     fn test_load_project_config_language_and_server_only() -> Result<()> {
         let dir = tempdir()?;
         fs::write(

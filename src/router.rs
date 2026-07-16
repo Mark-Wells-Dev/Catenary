@@ -952,6 +952,67 @@ fn session_start_project_config_nudge(
     None
 }
 
+/// Detect-and-kick background auto-installs for this `SessionStart` (lsm 05),
+/// returning the joined user-visible announcement lines, or `None` when
+/// nothing kicked.
+///
+/// Gated on the user-config-only `[servers] auto_install` opt-in (default
+/// `false` — detection runs nothing). Detection reads the session's own roots
+/// from the `SessionStart` host payload ([`extract_session_roots`], the misc-202
+/// seam: the `RootTracker` is not yet populated here) and asks the
+/// [`crate::auto_install::AutoInstaller`] which blessed servers those roots
+/// want but cannot spawn. Each missing server is **kicked as a background
+/// task** — the dispatch is a spawn, never an await, so session start returns
+/// immediately whether or not an install runs. Install completion fires the
+/// pin pre-warm machinery (`spawn_all`, the same fire-and-forget leg
+/// `tool/roots-add` runs) so coverage arrives promptly for every live mounted
+/// root whose markers match.
+///
+/// Announcements are per actual kick: a server already in flight (a duplicate
+/// session start) announces nothing, so the user is told about every
+/// auto-install exactly once per attempt.
+#[cfg(unix)]
+fn session_start_auto_install(
+    ctx: &HookDispatchContext,
+    raw: &serde_json::Value,
+) -> Option<String> {
+    let config = &ctx.primary.config;
+    if !config.auto_install() {
+        return None;
+    }
+    let roots: Vec<PathBuf> = extract_session_roots(raw)
+        .into_iter()
+        .map(|root| {
+            let path = PathBuf::from(root);
+            path.canonicalize().unwrap_or(path)
+        })
+        .collect();
+    if roots.is_empty() {
+        return None;
+    }
+    let missing = ctx.auto_installer.detect(&roots, config);
+    let mut lines = Vec::new();
+    for server in &missing {
+        let primary = ctx.primary.clone();
+        let kicked = ctx.auto_installer.kick(server, move || {
+            // Install completion is a coverage change: run the same
+            // fire-and-forget `spawn_all` pre-warm a `catenary pin` runs
+            // (`sync_roots`' prewarm leg), so the new server spawns for every
+            // live mounted root whose markers match rather than lazily on the
+            // next query.
+            tokio::spawn(async move { primary.spawn_all().await });
+        });
+        if kicked {
+            lines.push(crate::auto_install::announce_line(server));
+        }
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
 /// Live session board over the daemon's per-session registry.
 ///
 /// Implements [`crate::state_snapshot::SessionBoard`]: at each snapshot flush
@@ -1419,6 +1480,13 @@ struct HookDispatchContext {
     /// 202). Fires the missing-config pointer once per served root per daemon
     /// instance; a repeat `SessionStart` on the same root is silent.
     project_config_nudges: ProjectConfigNudges,
+    /// Background auto-installer for missing blessed servers (lsm 05). The
+    /// `SessionStart` dispatch detects missing servers from root markers and
+    /// kicks daemon-side background installs through it — the dispatch is a
+    /// spawn, never an await, so session-start latency is flat. Owns the
+    /// per-server in-flight dedupe, the concurrency cap, and the
+    /// once-per-lifetime failure-warn ledger.
+    auto_installer: crate::auto_install::AutoInstaller,
     /// Identity→(path, metadata) registry for Catenary-created worktrees
     /// (misc 150). Registered at `worktree-create/log-payload`, rehydrated from
     /// sidecars at startup; anchors the identity-keyed `SubagentStop` reap and the
@@ -3140,6 +3208,14 @@ pub struct SessionManager {
     /// unredirectable in-process: `std::env::set_var` is forbidden under Rust
     /// 2024, so `config_dir()` always resolves the real `~/.config`).
     config_path_override: Option<PathBuf>,
+    /// Override for the background auto-installer (lsm 05). `None` in
+    /// production — [`Self::with_session`] then builds the real installer
+    /// (seed recipes, live manifest, the real managed home and
+    /// process/network seams). An in-process test injects one with stubbed
+    /// seams via [`Self::auto_installer_override`] so a dispatch test can
+    /// exercise the real background-task path without touching the network,
+    /// the toolchain, or the operator's managed home.
+    auto_installer_override: Option<crate::auto_install::AutoInstaller>,
     /// Once-per-pairing dedup for the bridge↔daemon version-mismatch interrupt
     /// (ws41-02). Holds the [`catenary_mcp::VersionMismatch::pairing_key`] of
     /// every `(bridge, daemon)` pairing that has already fired its one
@@ -3201,6 +3277,7 @@ impl SessionManager {
             disconnect: Arc::new(tokio::sync::Notify::new()),
             worktree_watch_rx: std::sync::Mutex::new(None),
             config_path_override: None,
+            auto_installer_override: None,
             mismatch_interrupts: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
@@ -3250,6 +3327,7 @@ impl SessionManager {
             disconnect: Arc::new(tokio::sync::Notify::new()),
             worktree_watch_rx: std::sync::Mutex::new(None),
             config_path_override: None,
+            auto_installer_override: None,
             mismatch_interrupts: Arc::new(std::sync::Mutex::new(HashSet::new())),
         })
     }
@@ -3571,6 +3649,22 @@ impl SessionManager {
         self
     }
 
+    /// Inject a stub-seamed background auto-installer (lsm 05, test-only).
+    ///
+    /// Must be called **before** [`Self::with_session`], which reads the
+    /// override into [`HookDispatchContext`]. In-process router tests inject
+    /// an installer whose runner/fetcher are stubs and whose managed home is a
+    /// tempdir, so a `session-start/clear-editing` dispatch exercises the real
+    /// detection→kick→background-task path without touching the network, the
+    /// toolchain, or the operator's managed home. No production caller: the
+    /// daemon leaves the override `None` and builds the real installer.
+    #[cfg(test)]
+    #[must_use]
+    fn auto_installer_override(mut self, installer: crate::auto_install::AutoInstaller) -> Self {
+        self.auto_installer_override = Some(installer);
+        self
+    }
+
     /// Enables session-aware hook dispatch.
     ///
     /// Once set, hook connections create per-`session_id` [`Session`]
@@ -3659,6 +3753,14 @@ impl SessionManager {
             &crate::paths::agents_worktrees_dir(),
         ));
 
+        // The background auto-installer (lsm 05): production builds the real
+        // one against the daemon snapshot (its doctor/TUI-visible records); a
+        // test injects a stub-seamed installer via `auto_installer_override`.
+        let auto_installer = self
+            .auto_installer_override
+            .clone()
+            .unwrap_or_else(|| crate::auto_install::AutoInstaller::new(session.snapshot.clone()));
+
         self.hook_ctx = Some(HookDispatchContext {
             sessions,
             search_limiter: SearchLimiter::with_default_permits(),
@@ -3673,6 +3775,7 @@ impl SessionManager {
             first_sightings: FirstSightings::new(),
             promoted_prefixes: PromotedPrefixes::new(),
             project_config_nudges: ProjectConfigNudges::new(),
+            auto_installer,
             worktree_registry,
             worktree_mounts: WorktreeMounts::new(),
             subagents,
@@ -7185,16 +7288,34 @@ async fn handle_hook_dispatch(
         None
     };
 
+    // ── SessionStart auto-install detection (lsm 05) ─────────────────────
+    //
+    // Opt-in (`[servers] auto_install`, user-config only): detect blessed
+    // servers the session's roots want but cannot spawn, and kick each as a
+    // daemon-side background task. The kick is a spawn, never an await —
+    // session-start latency is flat whether or not an install runs. The
+    // returned announcement rides the response; the CLI surfaces it on the
+    // user-visible `systemMessage` channel.
+    let auto_install_announcement = if method == "session-start/clear-editing" {
+        session_start_auto_install(&ctx, &raw)
+    } else {
+        None
+    };
+
     let envelope = HookResponseEnvelope {
         result: result.result,
     };
 
-    let response = if session_start_nudge.is_some() || merged_nudge.is_some() {
+    let response = if session_start_nudge.is_some()
+        || merged_nudge.is_some()
+        || auto_install_announcement.is_some()
+    {
         // A nudge rides alongside any result on its own wire field —
         // `session_start_nudge` (misc 202; the CLI folds it into the
-        // SessionStart context) or `merged_nudge` (wf-04; the CLI surfaces it
-        // as a Stop-time `systemMessage`, never a gate). A hook that never
-        // nudges keeps the plain envelope.
+        // SessionStart context), `merged_nudge` (wf-04; the CLI surfaces it
+        // as a Stop-time `systemMessage`, never a gate), or
+        // `auto_install_announcement` (lsm 05; a SessionStart-time
+        // `systemMessage`). A hook that never nudges keeps the plain envelope.
         let mut obj = serde_json::to_value(&envelope)
             .ok()
             .and_then(|v| v.as_object().cloned())
@@ -7207,6 +7328,12 @@ async fn handle_hook_dispatch(
         }
         if let Some(nudge) = merged_nudge {
             obj.insert("merged_nudge".to_string(), serde_json::Value::String(nudge));
+        }
+        if let Some(announcement) = auto_install_announcement {
+            obj.insert(
+                "auto_install_announcement".to_string(),
+                serde_json::Value::String(announcement),
+            );
         }
         serde_json::to_string(&serde_json::Value::Object(obj))?
     } else if envelope.result.is_some() {
@@ -9016,6 +9143,299 @@ mod tests {
             inject(&hook_roundtrip(&ipc_path, &req("conv-2")).await),
             "a distinct conversation is its own first sighting",
         );
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
+    // ── SessionStart auto-install dispatch (lsm 05) ──────────────────────
+
+    const AUTO_SERVER: &str = "lsm05-router-ls";
+    const AUTO_VERSION: &str = "1.0.0";
+    const AUTO_MARKER: &str = "lsm05-router.marker";
+
+    /// A config opted into auto-install with one marked language bound to
+    /// [`AUTO_SERVER`].
+    fn auto_install_config(auto_install: bool) -> crate::config::Config {
+        let mut config = crate::config::Config::default_with_classification();
+        config.servers = Some(crate::config::ServersConfig {
+            prefer_managed: true,
+            auto_install,
+        });
+        let mut lang = crate::config::LanguageConfig {
+            root_markers: Some(vec![AUTO_MARKER.to_string()]),
+            servers: Some(vec![crate::config::ServerBinding::new(AUTO_SERVER)]),
+            ..crate::config::LanguageConfig::default()
+        };
+        lang.compile_markers().expect("plain marker compiles");
+        config
+            .language
+            .insert("lsm05-router-lang".to_string(), lang);
+        config
+    }
+
+    /// A manifest blessing [`AUTO_SERVER`] at [`AUTO_VERSION`] under a
+    /// synthetic platform token (deterministic preferred-row fallback).
+    fn auto_install_manifest() -> crate::recipes::BlessedManifest {
+        let mut rows = std::collections::BTreeMap::new();
+        rows.insert(
+            "synthetic".to_string(),
+            crate::recipes::BlessedEntry {
+                version: AUTO_VERSION.to_string(),
+                platform: "synthetic".to_string(),
+                date: "2026-07-16".to_string(),
+                tier: None,
+            },
+        );
+        let mut blessed = std::collections::BTreeMap::new();
+        blessed.insert(AUTO_SERVER.to_string(), rows);
+        crate::recipes::BlessedManifest {
+            blessed,
+            ..crate::recipes::BlessedManifest::default()
+        }
+    }
+
+    /// A cargo-class recipe map for [`AUTO_SERVER`] at [`AUTO_VERSION`].
+    fn auto_install_recipes() -> std::collections::BTreeMap<String, crate::recipes::InstallRecipe> {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            AUTO_SERVER.to_string(),
+            crate::recipes::InstallRecipe {
+                ecosystem: crate::recipes::Ecosystem::Cargo,
+                package: AUTO_SERVER.to_string(),
+                version: AUTO_VERSION.to_string(),
+                tier: crate::recipes::VerificationTier::CargoLocked,
+                draft: false,
+                hash: None,
+                note: None,
+                conformance: true,
+                co_install: Vec::new(),
+                artifact: std::collections::BTreeMap::new(),
+                runtime: None,
+            },
+        );
+        map
+    }
+
+    /// A stub install runner: reports success and stages the managed
+    /// executable at the pin, standing in for `cargo install --root`.
+    struct AutoStagingRunner {
+        home_root: PathBuf,
+        runs: Arc<AtomicUsize>,
+    }
+
+    impl crate::install::CommandRunner for AutoStagingRunner {
+        fn run(
+            &self,
+            _command: &crate::install::InstallCommand,
+        ) -> anyhow::Result<crate::install::CommandOutcome> {
+            use std::os::unix::fs::PermissionsExt;
+
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            let home = crate::managed_home::ManagedHome::at(self.home_root.clone());
+            let bin = home.bin_dir(AUTO_SERVER, AUTO_VERSION).expect("bin dir");
+            std::fs::create_dir_all(&bin).expect("mkdir");
+            let exe = bin.join(AUTO_SERVER);
+            std::fs::write(&exe, b"#!/bin/sh\n").expect("write");
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            Ok(crate::install::CommandOutcome {
+                success: true,
+                code: Some(0),
+                output: String::new(),
+            })
+        }
+    }
+
+    /// A fetcher no cargo-class plan reaches.
+    struct AutoNoFetch;
+    impl crate::install::TarballFetcher for AutoNoFetch {
+        fn fetch(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("unexpected fetch of {url}")
+        }
+    }
+
+    /// The `session-start/clear-editing` request for a session rooted at `cwd`.
+    fn session_start_request(cwd: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "method": "session-start/clear-editing",
+            "format": "claude",
+            "session_id": "lsm05-session",
+            "host_payload": {
+                "cwd": cwd.display().to_string(),
+                "source": "startup",
+            },
+        })
+    }
+
+    /// The `auto_install_announcement` field of a dispatch response, if any.
+    fn announcement_of(response: &str) -> Option<String> {
+        let trimmed = response.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        serde_json::from_str::<serde_json::Value>(trimmed)
+            .ok()?
+            .get("auto_install_announcement")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_start_kicks_background_auto_install_and_announces() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        std::fs::write(root.join(AUTO_MARKER), b"").expect("write marker");
+        let home_root = dir.path().join("servers");
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let installer = crate::auto_install::AutoInstaller::with_parts(
+            crate::managed_home::ManagedHome::at(home_root.clone()),
+            auto_install_recipes(),
+            Some(Arc::new(auto_install_manifest())),
+            Box::new(AutoStagingRunner {
+                home_root: home_root.clone(),
+                runs: runs.clone(),
+            }),
+            Box::new(AutoNoFetch),
+            None,
+        );
+
+        let logging = LoggingServer::new();
+        let session = Arc::new(crate::bridge::session::Session::new(
+            auto_install_config(true),
+            vec![],
+            logging.clone(),
+            "daemon".into(),
+            tokio::runtime::Handle::current(),
+            None,
+        ));
+        let config_path = dir
+            .path()
+            .join("config")
+            .join("catenary")
+            .join("config.toml");
+        let manager = Arc::new(
+            SessionManager::bind_at(&mcp_socket_in(dir.path()), &ipc_path, logging)
+                .expect("bind")
+                .config_path_override(config_path)
+                .auto_installer_override(installer)
+                .with_session(session),
+        );
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        // First SessionStart: the missing blessed server is detected and
+        // kicked; the response carries the user-visible announcement. The
+        // response arrives without waiting on the install (the dispatch is a
+        // spawn) — the roundtrip completing at all while the install work runs
+        // in the background is the wiring under test.
+        let response = hook_roundtrip(&ipc_path, &session_start_request(&root)).await;
+        let announcement =
+            announcement_of(&response).expect("first session start announces the kick");
+        assert!(
+            announcement.contains(AUTO_SERVER) && announcement.contains(AUTO_VERSION),
+            "the announcement names the server and pin: {announcement}",
+        );
+        assert!(
+            announcement.contains("take minutes"),
+            "a cargo (compile-class) recipe announces the minutes-class delay: {announcement}",
+        );
+
+        // The background install lands in the managed home at the pin.
+        let home = crate::managed_home::ManagedHome::at(home_root.clone());
+        let mut landed = false;
+        for _ in 0..500 {
+            if home
+                .pinned_executable(AUTO_SERVER, AUTO_VERSION, AUTO_SERVER)
+                .is_some()
+            {
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(landed, "the background install landed in the managed home");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "exactly one install ran");
+
+        // A repeat SessionStart finds the server resolvable — detection is
+        // silent, no re-kick, no re-announcement.
+        let response = hook_roundtrip(&ipc_path, &session_start_request(&root)).await;
+        assert_eq!(
+            announcement_of(&response),
+            None,
+            "a landed install is no longer missing: {response}",
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "no second install ran");
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_start_auto_install_off_by_default_runs_nothing() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        std::fs::write(root.join(AUTO_MARKER), b"").expect("write marker");
+        let home_root = dir.path().join("servers");
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let installer = crate::auto_install::AutoInstaller::with_parts(
+            crate::managed_home::ManagedHome::at(home_root.clone()),
+            auto_install_recipes(),
+            Some(Arc::new(auto_install_manifest())),
+            Box::new(AutoStagingRunner {
+                home_root: home_root.clone(),
+                runs: runs.clone(),
+            }),
+            Box::new(AutoNoFetch),
+            None,
+        );
+
+        let logging = LoggingServer::new();
+        // The default: `[servers]` present but auto_install omitted/false.
+        let session = Arc::new(crate::bridge::session::Session::new(
+            auto_install_config(false),
+            vec![],
+            logging.clone(),
+            "daemon".into(),
+            tokio::runtime::Handle::current(),
+            None,
+        ));
+        let config_path = dir
+            .path()
+            .join("config")
+            .join("catenary")
+            .join("config.toml");
+        let manager = Arc::new(
+            SessionManager::bind_at(&mcp_socket_in(dir.path()), &ipc_path, logging)
+                .expect("bind")
+                .config_path_override(config_path)
+                .auto_installer_override(installer)
+                .with_session(session),
+        );
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let response = hook_roundtrip(&ipc_path, &session_start_request(&root)).await;
+        assert_eq!(
+            announcement_of(&response),
+            None,
+            "auto_install = false detects and announces nothing: {response}",
+        );
+        // Give any (buggy) background work a beat to surface, then assert
+        // nothing ran at all — the acceptance's "detection runs nothing".
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "no install ran");
 
         shutdown.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;

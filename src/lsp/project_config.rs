@@ -106,8 +106,14 @@ fn render(server: &str, convention: &crate::recipes::ProjectConfigConvention) ->
 /// Mirrors the sub-root resolution predicate ([`crate::lsp::manager`]'s
 /// `dir_has_marker`): the exact-vs-glob split matches
 /// [`crate::config::language::LanguageConfig::marker_set`], so the nudge reads the
-/// same project boundary the server instances do.
-fn dir_has_marker(dir: &Path, markers: &[String], compiled: &[crate::lsp::glob::LspGlob]) -> bool {
+/// same project boundary the server instances do. Shared with the auto-install
+/// detection ([`crate::auto_install`], lsm 05), which binds roots to languages
+/// through the same predicate.
+pub(crate) fn dir_has_marker(
+    dir: &Path,
+    markers: &[String],
+    compiled: &[crate::lsp::glob::LspGlob],
+) -> bool {
     for m in markers {
         if !is_glob_pattern(m) && dir.join(m).exists() {
             return true;
