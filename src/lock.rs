@@ -27,6 +27,10 @@
 //! - `dir/`, a mirrored tree of empty **touch files** `<relpath>.lock`, one per
 //!   due file. The `.lock` suffix is deliberate: language servers demonstrably
 //!   index agent-explored state dirs, and ledger entries must not read as source.
+//! - `.root`, the **root record** — the canonical root path in full (the dir
+//!   name's encoding is lossy), written at first booking so the bare-serve
+//!   enumeration can recover every indebted kitchen without a cwd to key from
+//!   (bug 121, [`debtor_roots_in`]).
 //!
 //! # Lifecycle
 //!
@@ -196,6 +200,50 @@ fn claim_marker(lock_dir: &Path) -> PathBuf {
     lock_dir.join(".claimed")
 }
 
+/// The root-record file inside a root's lock directory (bug 121).
+///
+/// The lock dir's NAME is [`crate::paths::encode_cwd`]-flattened — lossy, so
+/// the root path cannot be recovered from it. The record carries the canonical
+/// root path itself, letting the bare-serve enumeration ([`debtor_roots_in`])
+/// recover every kitchen whose ledger holds debt without a cwd to key from.
+/// Like `.claimed`, the name is filesystem-safe and never owner-shaped (no `+`
+/// separators, so [`read_owner_name`] skips it), and it lives beside `dir/` —
+/// never inside the touch-tree, so it is not miscounted as a due file.
+fn root_record(lock_dir: &Path) -> PathBuf {
+    lock_dir.join(".root")
+}
+
+/// Writes the canonical root path into the lock dir's root record, once.
+///
+/// Rename-over (the bug-109 idiom), so a reader sees the whole path or no
+/// record — never a torn one. Write-if-absent: the record's content is a pure
+/// function of the lock dir's own name (same encoding input), so re-booking
+/// never needs to rewrite it. Best-effort: a failed write leaves the lock dir
+/// exactly as before the fix — the root simply stays invisible to the
+/// all-kitchens enumeration until a later booking lands the record.
+fn record_root(lock_dir: &Path, root: &Path) {
+    let record = root_record(lock_dir);
+    if record.exists() {
+        return;
+    }
+    let tmp = lock_dir.join(format!(".root.tmp.{}", std::process::id()));
+    if std::fs::write(&tmp, root.to_string_lossy().as_bytes()).is_ok()
+        && std::fs::rename(&tmp, &record).is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Reads the lock dir's root record, or `None` when absent/unreadable (a lock
+/// dir booked before the record existed, or a transient FS error).
+fn read_root_record(lock_dir: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(root_record(lock_dir)).ok()?;
+    if text.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(text))
+}
+
 /// The touch-file path for a due file, mirrored under `dir/` with a `.lock`
 /// suffix: `dir/<root-relative-path>.lock`.
 ///
@@ -284,6 +332,10 @@ fn touch_owner(lock_dir: &Path, owner_name: &str) {
 /// mirrored parent directories as needed. Best-effort: a booking failure never
 /// blocks the edit (the gate still reads daemon-side debt this stage).
 fn book_file(lock_dir: &Path, root: &Path, file: &Path) {
+    // Every booking seam funnels through here, so a lock dir with debt always
+    // carries its root record (bug 121) — the bare-serve enumeration can name
+    // the kitchen without a cwd to key from.
+    record_root(lock_dir, root);
     let touch = touch_file(lock_dir, root, file);
     if let Some(parent) = touch.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -383,6 +435,115 @@ pub fn has_debt_in(locks_base: &Path, root: &Path) -> bool {
 #[must_use]
 pub fn has_debt(root: &Path) -> bool {
     has_debt_in(&locks_dir(), root)
+}
+
+/// Every root whose ledger holds unpaid debt under `locks_base`, recovered from
+/// each lock dir's root record (bug 121).
+///
+/// The all-kitchens answer the bare serve's enumeration needs: the lock-dir
+/// name encoding is lossy, so this reads the `.root` record a booking wrote.
+/// Each recovered path is self-checked — its encoding must reproduce the lock
+/// dir's own name (a corrupted or collided record is skipped) and the root must
+/// still exist as a directory (a vanished kitchen's leftovers are the retire /
+/// reap legs' business, not a serve's). A lock dir booked before the record
+/// existed has no record and is skipped — invisible exactly as it was pre-fix,
+/// and self-healing: the next booking lands the record. Sorted for stable
+/// output. Best-effort: an unreadable `locks_base` yields an empty list.
+#[must_use]
+pub fn debtor_roots_in(locks_base: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(locks_base) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let lock_dir = entry.path();
+        if !lock_dir.is_dir() || due_count(&lock_dir) == 0 {
+            continue;
+        }
+        let Some(root) = read_root_record(&lock_dir) else {
+            continue;
+        };
+        let record_matches_dir = lock_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name == crate::paths::encode_cwd(&root));
+        if record_matches_dir && root.is_dir() {
+            out.push(root);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Production wrapper for [`debtor_roots_in`] resolving the base through
+/// [`locks_dir`].
+#[must_use]
+pub fn debtor_roots() -> Vec<PathBuf> {
+    debtor_roots_in(&locks_dir())
+}
+
+/// The kitchens a **bare** `catenary diagnostics` from `cwd` serves — the cwd's
+/// enclosing lock root plus every other debt-holding root attributable to the
+/// same identity (bug 121).
+///
+/// The ledger, not the cwd, is the truth: the edit seam books each file into
+/// its OWN resolved root, so a session's debt can span kitchens the caller is
+/// not standing in. The serve path is identity-free by ruling (identity lives
+/// at the hook), so attribution here is pure filesystem fact — the owner FILES
+/// the edit seam titled:
+///
+/// - **Anchored** — the cwd's root holds a lock: serve that root plus every
+///   debtor root titled with the SAME owner tuple. Another identity's kitchen
+///   is never pulled.
+/// - **Unanchored** (cwd root unlocked, or cwd outside any root): when every
+///   debtor root shares ONE owner, attribution is unambiguous — serve them
+///   (the honest answer for "cwd outside any root with debt elsewhere").
+///   When multiple identities hold debt, no path-algebraic fact says which is
+///   the caller's, so no extra kitchen is pulled — the serve degrades to the
+///   cwd root's own ledger, exactly the pre-fix contract. Ownerless debtor
+///   dirs (a crashed acquisition) are never attributed.
+///
+/// The hook-side owner gate vets every root this returns against the caller's
+/// real identity before the CLI runs, so a foreign kitchen in the would-serve
+/// set denies there rather than serving here (hookless boxes keep their
+/// existing ungated posture). The cwd root, when resolvable, is always first —
+/// and included regardless of debt, preserving the single-root contract (an
+/// empty ledger answers `[no edited files]`).
+#[must_use]
+pub fn bare_serve_roots_in(locks_base: &Path, cwd: &Path) -> Vec<PathBuf> {
+    let cwd_root = resolve_lock_root(cwd);
+    let debtors: Vec<PathBuf> = debtor_roots_in(locks_base)
+        .into_iter()
+        .filter(|r| Some(r) != cwd_root.as_ref())
+        .collect();
+    let anchor = cwd_root
+        .as_deref()
+        .and_then(|root| owner_of_in(locks_base, root));
+    let extras: Vec<PathBuf> = if let Some(anchor) = anchor {
+        debtors
+            .into_iter()
+            .filter(|root| owner_of_in(locks_base, root).is_some_and(|o| o == anchor))
+            .collect()
+    } else {
+        let owned: Vec<(Owner, PathBuf)> = debtors
+            .into_iter()
+            .filter_map(|root| owner_of_in(locks_base, &root).map(|o| (o, root)))
+            .collect();
+        let unambiguous = !owned.is_empty() && owned.windows(2).all(|pair| pair[0].0 == pair[1].0);
+        if unambiguous {
+            owned.into_iter().map(|(_, root)| root).collect()
+        } else {
+            Vec::new()
+        }
+    };
+    cwd_root.into_iter().chain(extras).collect()
+}
+
+/// Production wrapper for [`bare_serve_roots_in`] resolving the base through
+/// [`locks_dir`].
+#[must_use]
+pub fn bare_serve_roots(cwd: &Path) -> Vec<PathBuf> {
+    bare_serve_roots_in(&locks_dir(), cwd)
 }
 
 /// The subset of `candidates` still DUE (undiagnosed) on their roots' ledgers
@@ -2884,5 +3045,198 @@ mod tests {
             "the outer root renders as unlocked"
         );
         assert!(!has_debt_in(&locks, &fx.root), "outer has no debt");
+    }
+
+    /// A tempdir carrying several sibling repo roots (each with a `.git`
+    /// marker) around one shared `locks/` base — the bug-121 multi-kitchen
+    /// enumeration/policy fixture.
+    struct MultiFixture {
+        dir: tempfile::TempDir,
+    }
+
+    impl MultiFixture {
+        fn new(repos: &[&str]) -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            for name in repos {
+                let root = dir.path().join(name);
+                std::fs::create_dir_all(root.join(".git")).expect("mk .git");
+                std::fs::create_dir_all(root.join("src")).expect("mk src");
+            }
+            Self { dir }
+        }
+
+        fn locks(&self) -> PathBuf {
+            self.dir.path().join("locks")
+        }
+
+        fn root(&self, name: &str) -> PathBuf {
+            self.dir
+                .path()
+                .join(name)
+                .canonicalize()
+                .expect("canon root")
+        }
+
+        /// Book a covered edit in `repo` under `owner`, asserting admission.
+        /// Returns the booked file's canonical path.
+        fn book(&self, repo: &str, rel: &str, owner: &Owner) -> PathBuf {
+            let file = self.root(repo).join(rel);
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent).expect("mk parent");
+            }
+            std::fs::write(&file, b"").expect("write file");
+            assert!(
+                matches!(
+                    acquire_in(
+                        &self.locks(),
+                        &file,
+                        owner,
+                        &rust_booking(),
+                        SystemTime::now()
+                    ),
+                    Acquired::Ours
+                ),
+                "the booking edit must be admitted"
+            );
+            file
+        }
+
+        /// A cwd outside every repo root (no repository marker).
+        fn scratch(&self) -> PathBuf {
+            let p = self.dir.path().join("scratch");
+            std::fs::create_dir_all(&p).expect("mk scratch");
+            p
+        }
+    }
+
+    #[test]
+    fn booking_writes_the_root_record_and_debtor_roots_finds_it() {
+        let fx = MultiFixture::new(&["repo-a"]);
+        let a = Owner::new("claude", "sess-a", "");
+        let file = fx.book("repo-a", "src/main.rs", &a);
+
+        assert_eq!(
+            debtor_roots_in(&fx.locks()),
+            vec![fx.root("repo-a")],
+            "the booked kitchen is enumerable via its root record"
+        );
+
+        // Payment empties the ledger — the kitchen leaves the debtor list
+        // (the lock dir itself survives: payment is parole, not release).
+        let _ = unlink_delivered_in(&fx.locks(), &fx.root("repo-a"), &[file]);
+        assert!(
+            debtor_roots_in(&fx.locks()).is_empty(),
+            "a paid kitchen is not a debtor"
+        );
+    }
+
+    #[test]
+    fn debtor_roots_skips_recordless_lock_dirs_and_rebooking_heals() {
+        let fx = MultiFixture::new(&["repo-a"]);
+        let a = Owner::new("claude", "sess-a", "");
+        fx.book("repo-a", "src/main.rs", &a);
+
+        // A pre-record lock dir (booked before the fix): no `.root`, so the
+        // enumeration cannot recover the kitchen — invisible exactly as
+        // pre-fix, never a guess.
+        let lock_dir = root_lock_dir_in(&fx.locks(), &fx.root("repo-a"));
+        std::fs::remove_file(lock_dir.join(".root")).expect("drop record");
+        assert!(
+            debtor_roots_in(&fx.locks()).is_empty(),
+            "a recordless lock dir is skipped, not guessed at"
+        );
+
+        // The next booking self-heals the record.
+        fx.book("repo-a", "src/other.rs", &a);
+        assert_eq!(
+            debtor_roots_in(&fx.locks()),
+            vec![fx.root("repo-a")],
+            "re-booking lands the record and the kitchen is enumerable again"
+        );
+    }
+
+    #[test]
+    fn bare_serve_roots_anchored_pulls_same_owner_kitchens_only() {
+        let fx = MultiFixture::new(&["repo-a", "repo-b", "repo-c"]);
+        let ours = Owner::new("claude", "sess-a", "");
+        let theirs = Owner::new("claude", "sess-b", "");
+        fx.book("repo-a", "src/main.rs", &ours);
+        fx.book("repo-b", "src/main.rs", &ours);
+        fx.book("repo-c", "src/main.rs", &theirs);
+
+        // Anchored in repo-a (our lock): our other indebted kitchen rides
+        // along; the other identity's kitchen is never pulled.
+        assert_eq!(
+            bare_serve_roots_in(&fx.locks(), &fx.root("repo-a")),
+            vec![fx.root("repo-a"), fx.root("repo-b")],
+            "the anchored bare serve pulls the anchor owner's kitchens only"
+        );
+    }
+
+    #[test]
+    fn bare_serve_roots_unanchored_single_owner_serves_the_debt() {
+        let fx = MultiFixture::new(&["repo-a", "repo-b"]);
+        let a = Owner::new("claude", "sess-a", "");
+        fx.book("repo-a", "src/main.rs", &a);
+        fx.book("repo-b", "src/main.rs", &a);
+
+        // cwd outside ANY root, all debt held by one identity: attribution is
+        // unambiguous — the ledger, not the cwd, is the truth (bug 121 pin).
+        assert_eq!(
+            bare_serve_roots_in(&fx.locks(), &fx.scratch()),
+            vec![fx.root("repo-a"), fx.root("repo-b")],
+            "an unanchored bare serve with one debtor identity serves its debt"
+        );
+    }
+
+    #[test]
+    fn bare_serve_roots_unanchored_ambiguous_serves_nothing() {
+        let fx = MultiFixture::new(&["repo-a", "repo-b"]);
+        fx.book("repo-a", "src/main.rs", &Owner::new("claude", "sess-a", ""));
+        fx.book("repo-b", "src/main.rs", &Owner::new("claude", "sess-b", ""));
+
+        // Two identities hold debt and no anchor says which is the caller's:
+        // no path-algebraic fact can attribute, so nothing is pulled.
+        assert!(
+            bare_serve_roots_in(&fx.locks(), &fx.scratch()).is_empty(),
+            "an unanchored bare serve never guesses between identities"
+        );
+    }
+
+    #[test]
+    fn bare_serve_roots_includes_the_unlocked_cwd_root_first() {
+        let fx = MultiFixture::new(&["repo-a", "repo-b"]);
+        let a = Owner::new("claude", "sess-a", "");
+        fx.book("repo-b", "src/main.rs", &a);
+
+        // The cwd's root is unlocked (nothing edited there) — it still leads
+        // the served set (the single-root contract), and the one debtor
+        // identity's kitchen rides along (the bug-121 sighting's shape).
+        assert_eq!(
+            bare_serve_roots_in(&fx.locks(), &fx.root("repo-a")),
+            vec![fx.root("repo-a"), fx.root("repo-b")],
+            "the unlocked cwd root leads; the sibling kitchen's debt is served"
+        );
+    }
+
+    #[test]
+    fn bare_serve_roots_never_attributes_ownerless_debt() {
+        let fx = MultiFixture::new(&["repo-a", "repo-b"]);
+        let a = Owner::new("claude", "sess-a", "");
+        fx.book("repo-b", "src/main.rs", &a);
+
+        // Strip the owner file: a crashed acquisition's ownerless debt has no
+        // identity to attribute — never pulled from elsewhere.
+        let lock_dir = root_lock_dir_in(&fx.locks(), &fx.root("repo-b"));
+        let owner_name = read_owner_name(&lock_dir)
+            .expect("read owner")
+            .expect("owner present");
+        std::fs::remove_file(lock_dir.join(owner_name)).expect("drop owner");
+
+        assert_eq!(
+            bare_serve_roots_in(&fx.locks(), &fx.root("repo-a")),
+            vec![fx.root("repo-a")],
+            "ownerless debt is never attributed to the caller"
+        );
     }
 }

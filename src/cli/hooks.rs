@@ -2147,9 +2147,12 @@ fn handle_start_editing_hook(hook_json: &serde_json::Value, format: HostFormat) 
 /// this hook stages nothing. Its sole job is the OWNER GATE: only the lock holder
 /// may pull a locked root's ledger via **bare** `catenary diagnostics`. The hook
 /// is the one seam with identity, so it — not the identity-less serve path —
-/// answers "is this the owner?". A non-owner is denied naming the owed root and
-/// taught `catenary claim <root>`; the owner (or an unlocked root) is allowed
-/// silently and the CLI runs `tool/editing-stop`.
+/// answers "is this the owner?". Since the bare due set spans kitchens (bug 121),
+/// the gate sweeps every root the serve would pull
+/// ([`crate::lock::bare_serve_roots`] — the hook mirrors the serve's enumeration
+/// exactly). A non-owner is denied naming the owed root and taught
+/// `catenary claim <root>`; the owner (or an unlocked root) is allowed silently
+/// and the CLI runs `tool/editing-stop`.
 ///
 /// **Scoped** `catenary diagnostics <path…>` names explicit paths and serves them
 /// regardless of ownership or debt — the pull-anything arm (a diagnose of a named
@@ -2170,16 +2173,18 @@ fn handle_done_editing_hook(
         return;
     }
 
-    // Bare form: resolve the cwd's kitchen and gate on ownership. An unresolvable
-    // cwd (scratch dir, no VCS checkout) resolves to no root — nothing to gate,
-    // allow (the serve then answers `[no edited files]`).
+    // Bare form: resolve every kitchen the serve would pull and gate each on
+    // ownership. The bare due set spans roots (bug 121): the cwd's root plus
+    // every same-owner debtor root (`bare_serve_roots` documents the
+    // attribution policy — the hook mirrors the serve's enumeration exactly, so
+    // whatever the identity-free serve would pull is vetted HERE, the one seam
+    // with identity). An empty would-serve set (unresolvable cwd, no debt
+    // anywhere) gates nothing — allow (the serve then answers
+    // `[no edited files]`).
     let cwd = extract_cwd_str(hook_json, format).map_or_else(
         || std::env::current_dir().unwrap_or_default(),
         PathBuf::from,
     );
-    let Some(root) = crate::lock::resolve_lock_root(&cwd) else {
-        return;
-    };
 
     let owner = crate::lock::Owner::new(
         format.as_str(),
@@ -2190,10 +2195,13 @@ fn handle_done_editing_hook(
     // Only a LOCKED root held by ANOTHER owner is gated. An unlocked root (no
     // lock dir), or one this caller owns, serves freely. `owner_of` reads the
     // owner file by pure path algebra — canonical root, matching the ledger seam.
-    if let Some(holder) = crate::lock::owner_of(&root)
-        && holder != owner
-    {
-        print!("{}", format_deny(&diagnostics_locked_deny(&root), format));
+    for root in crate::lock::bare_serve_roots(&cwd) {
+        if let Some(holder) = crate::lock::owner_of(&root)
+            && holder != owner
+        {
+            print!("{}", format_deny(&diagnostics_locked_deny(&root), format));
+            return;
+        }
     }
 }
 

@@ -5504,8 +5504,10 @@ async fn handle_hook_dispatch(
     // snapshot): the daemon now serves diagnoses against the on-disk lock
     // ledger — the durable touch-tree the edit seam booked — so the batch a bare
     // run computes over IS the due set read from disk (`crate::lock::due_files`),
-    // keyed by the caller's cwd → root by pure path algebra (no identity below
-    // the hook). There is no mirror and therefore no drift.
+    // enumerated over the caller's kitchens by pure path algebra — the cwd's
+    // root plus every same-owner debtor root (`crate::lock::bare_serve_roots`,
+    // bug 121; no identity below the hook). There is no mirror and therefore no
+    // drift.
     if method == "tool/editing-stop" {
         // Scoped paths from the request. The CLI resolves relative paths against
         // its cwd before dispatch, so these are absolute. The bare form sends an
@@ -5542,44 +5544,56 @@ async fn handle_hook_dispatch(
             PathBuf::from,
         );
 
-        // Resolve the kitchen the bare form pays: the enclosing lock root of the
-        // caller's cwd. The batch a bare run computes over IS this root's due set
-        // read from disk. A scoped run names its own files and needs no root
-        // resolution for the diagnose set (delivery groups by each file's root).
-        let bare_root: Option<PathBuf> = crate::lock::resolve_lock_root(&caller_cwd);
+        // Resolve the kitchens the bare form pays (bug 121): the enclosing lock
+        // root of the caller's cwd PLUS every other root whose ledger holds
+        // debt attributable to the same owner — the edit seam books each file
+        // into its OWN resolved root, so a session's debt can span kitchens the
+        // caller is not standing in (`crate::lock::bare_serve_roots` documents
+        // the attribution policy). A scoped run names its own files and needs
+        // no root resolution for the diagnose set (delivery groups by each
+        // file's root).
+        let bare_roots: Vec<PathBuf> = if scoped {
+            Vec::new()
+        } else {
+            crate::lock::bare_serve_roots(&caller_cwd)
+        };
 
         // The diagnose set:
         // - scoped: exactly the named paths (served regardless of debt);
-        // - bare:   the root's ledger due set (`crate::lock::due_files`), the
-        //           single source of truth — no in-memory mirror.
+        // - bare:   the union of the served roots' ledger due sets
+        //           (`crate::lock::due_files`), the single source of truth — no
+        //           in-memory mirror. Ledgers are disjoint (a file books into
+        //           its innermost root), and the receipt groups per root, so
+        //           the concatenation renders one section per kitchen.
         let diag_files: Vec<PathBuf> = if scoped {
             scoped_files.clone()
         } else {
-            bare_root
-                .as_deref()
-                .map(crate::lock::due_files)
-                .unwrap_or_default()
+            bare_roots
+                .iter()
+                .flat_map(|root| crate::lock::due_files(root))
+                .collect()
         };
 
         // The held-open document owner (root-ownership stage 3): the ROOT, not an
         // identity key. Documents a diagnose round opens are tagged with their
         // root, so root retirement / the paid-idle reap closes them — no identity
         // below the hook. A scoped run tags each file's own root; the bare run
-        // tags the resolved kitchen. `process_files_batched` takes one owner for
-        // the whole round, so a scoped run spanning roots tags them all under the
-        // first resolved root — acceptable: the reap closes the union on teardown.
+        // tags its first served kitchen (the cwd's root when resolvable).
+        // `process_files_batched` takes one owner for the whole round, so a run
+        // spanning roots tags them all under the first resolved root —
+        // acceptable: the reap closes the union on teardown.
         let doc_owner: Option<String> = if scoped {
             scoped_files
                 .first()
                 .and_then(|f| crate::lock::resolve_lock_root(f))
                 .map(|r| r.to_string_lossy().into_owned())
         } else {
-            bare_root.as_ref().map(|r| r.to_string_lossy().into_owned())
+            bare_roots.first().map(|r| r.to_string_lossy().into_owned())
         };
 
         // The takeover breadcrumb (root-ownership stage 3, deliverable 7): the
         // first serve after a `catenary claim` reads-and-removes the marker and
-        // leads its receipt with the claimed line. Bare pays the resolved
+        // leads its receipt with the claimed line. Bare pays every served
         // kitchen; a scoped run checks the roots it names. One-shot — a later
         // serve on the same root (no new claim) sees nothing.
         let claimed_roots: Vec<PathBuf> = if scoped {
@@ -5591,7 +5605,7 @@ async fn handle_hook_dispatch(
             roots.dedup();
             roots
         } else {
-            bare_root.iter().cloned().collect()
+            bare_roots.clone()
         };
         let claimed = claimed_roots
             .iter()

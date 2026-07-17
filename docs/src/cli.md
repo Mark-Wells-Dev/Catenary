@@ -190,7 +190,11 @@ diagnoses the current **ledger** — the durable, on-disk set of files edited
 since their last diagnosis, kept per workspace root (the "kitchen"): it opens
 every due file on its server, waits for each to settle, and prints a
 **per-file receipt** — every diagnosed file listed, its errors and warnings
-beneath it, or `[clean]` beside it when the file is clean. Diagnosing a file
+beneath it, or `[clean]` beside it when the file is clean. Edits book into
+each file's *own* root, so one session's debt can span kitchens; the bare run
+serves **every kitchen holding your debt** — the cwd's root plus your other
+indebted roots — with the receipt grouped per root, so debt one kitchen over
+is never invisible from where you stand. Diagnosing a file
 pays it off: it leaves the ledger. So once you have run bare and served the
 edited set, the debt is paid — a repeat bare run with no intervening edit
 finds an empty ledger and answers `[no edited files]`. To re-check specific
@@ -255,15 +259,23 @@ followed by a commit proceeds regardless of what the receipt reports.
 one editor (the durable lock, one-cook-per-kitchen). Only the lock **holder** may
 pull a locked root's ledger with the **bare** form: a non-owner's bare
 `catenary diagnostics` is denied, naming the owed root and teaching `catenary
-claim <root>` to take it (and its debt) over. The **scoped** form serves named
+claim <root>` to take it (and its debt) over. The gate vets **every** kitchen a
+bare run would pull, and the serve pulls only kitchens attributable to one
+holder — another agent's root never rides along. When your cwd is outside any
+root (or your cwd's root is unlocked), the bare run still serves your booked
+debt so long as its attribution is unambiguous (all debt-holding kitchens share
+one holder) — the ledger, not the cwd, is the truth; with multiple holders'
+debt and no anchor, it serves nothing extra and answers `[no edited files]`
+(stand in one of your kitchens, or scope). The **scoped** form serves named
 paths regardless of ownership — a diagnose of a named file is a read, not a
 payment against someone else's kitchen. On a **hookless** box (no plugin, a
 scripted or CI invocation) the bare owner gate does not apply; the scoped form is
 the CLI-only lint surface — `doctor` → `pin` → `diagnostics .` works with no host
 plugin at all:
 
-- **Bare** `catenary diagnostics` pays the edited set for the current root's
-  ledger; on an empty ledger it answers `[no edited files]`.
+- **Bare** `catenary diagnostics` pays the edited set for every kitchen holding
+  the caller's debt (the cwd's root leading); on empty ledgers it answers
+  `[no edited files]`.
 - **Scoped** `catenary diagnostics <path…>` — including `catenary diagnostics .`
   — **serves the diagnostics on demand**: it diagnoses the named paths (mounting
   an enclosing project root ephemerally when needed) and prints the receipt.

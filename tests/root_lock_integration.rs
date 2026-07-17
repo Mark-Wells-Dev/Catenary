@@ -397,6 +397,86 @@ fn bare_diagnostics_owner_gate_daemon_down() -> Result<()> {
     Ok(())
 }
 
+/// The bug-121 owner gate sweeps every kitchen the bare serve would pull, not
+/// just the cwd's root: with debt booked in a SIBLING root, the owner's bare
+/// run from an unrelated root is allowed (the extra kitchen is their own),
+/// while another identity's bare run from the same cwd is denied naming the
+/// owed sibling — pulling it would pay debt the caller does not own. All
+/// daemon-down: the would-serve enumeration and the owner files are filesystem
+/// facts.
+#[test]
+fn bare_diagnostics_gate_sweeps_sibling_kitchens() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let home_str = home.path().to_str().context("home utf-8")?;
+    let repo_a = home.path().join("repo-a");
+    let repo_b = home.path().join("repo-b");
+    for repo in [&repo_a, &repo_b] {
+        std::fs::create_dir_all(repo.join(".git"))?;
+        std::fs::create_dir_all(repo.join("src"))?;
+    }
+    let repo_a = repo_a.canonicalize()?;
+    let repo_b = repo_b.canonicalize()?;
+    let file = repo_b.join("src/main.rs");
+    std::fs::write(&file, b"fn f() {}\n")?;
+
+    // Session A books a covered edit into repo B's ledger — while standing in
+    // repo A (the bug-121 sighting's shape: booking follows the file's root).
+    let edit = run_hook(
+        home_str,
+        &json!({
+            "session_id": "session-a",
+            "cwd": repo_a.to_str().context("repo a utf-8")?,
+            "tool_name": "Edit",
+            "tool_input": { "file_path": file.to_str().context("file utf-8")? },
+        }),
+    )?;
+    assert!(
+        deny_reason(&edit).is_none(),
+        "the booking edit must be admitted, got: {edit}"
+    );
+
+    // The OWNER's bare run from repo A is allowed: the would-serve sweep finds
+    // repo B, but its holder is the caller.
+    let ours = run_hook(
+        home_str,
+        &json!({
+            "session_id": "session-a",
+            "cwd": repo_a.to_str().context("repo a utf-8")?,
+            "tool_name": "Bash",
+            "tool_input": { "command": "catenary diagnostics" },
+        }),
+    )?;
+    assert!(
+        deny_reason(&ours).is_none(),
+        "the owner's bare diagnostics must be allowed across kitchens, got: {ours}"
+    );
+
+    // ANOTHER identity's bare run from the same cwd is denied naming the owed
+    // sibling root — its debt is session A's to diagnose, not session B's.
+    let theirs = run_hook(
+        home_str,
+        &json!({
+            "session_id": "session-b",
+            "cwd": repo_a.to_str().context("repo a utf-8")?,
+            "tool_name": "Bash",
+            "tool_input": { "command": "catenary diagnostics" },
+        }),
+    )?;
+    let reason =
+        deny_reason(&theirs).context("a non-owner's cross-kitchen bare pull must be denied")?;
+    let repo_b_str = repo_b.to_str().context("repo b utf-8")?;
+    assert!(
+        reason.contains("root locked:") && reason.contains(repo_b_str),
+        "the deny names the owed sibling root, got: {reason}"
+    );
+    assert!(
+        reason.contains("catenary claim"),
+        "the deny teaches the takeover path, got: {reason}"
+    );
+
+    Ok(())
+}
+
 /// Bare `catenary diagnostics` against an UNLOCKED root is never owner-gated: with
 /// no lock holder to protect, any session may pull. The gate fires only on a root
 /// another agent holds.
