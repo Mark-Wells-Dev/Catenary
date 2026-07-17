@@ -30,6 +30,7 @@
 
 pub mod config_checks;
 pub mod install_checks;
+pub mod pulse;
 pub mod servers;
 pub mod skew;
 
@@ -198,6 +199,11 @@ pub enum FindingCode {
     /// the versions agree; the cure names the older side (`/mcp` or a binary
     /// bounce).
     BridgeVersionMismatch,
+    /// A hook-active session with no live MCP bridge connection (pulse-05) —
+    /// the session runs degraded (no roots channel, no notifications, no
+    /// heartbeat in the daemon census). Persists while the condition holds;
+    /// a bridge connecting clears it. A [`Severity::Warning`].
+    SessionPulseless,
     /// Installed host hooks diverge from the shipped set.
     HooksStale,
     /// Installed host hooks are missing from the plugin cache.
@@ -263,6 +269,7 @@ impl FindingCode {
             Self::ServerAutoInstallFailed => "server-auto-install-failed",
             Self::VersionSkew => "version-skew",
             Self::BridgeVersionMismatch => "bridge-version-mismatch",
+            Self::SessionPulseless => "session-pulseless",
             Self::HooksStale => "hooks-stale",
             Self::HooksMissing => "hooks-missing",
             Self::HooksUnreadable => "hooks-unreadable",

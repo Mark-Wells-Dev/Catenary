@@ -3073,6 +3073,14 @@ impl SessionManager {
         let session_key = format!("mcp:{conn_id}");
 
         count.fetch_add(1, Ordering::Relaxed);
+        // Census flush (pulse-05): the snapshot reads the shared counter at
+        // flush time; touching here publishes the connect promptly so the
+        // pulseless-session finding clears the moment a bridge arrives. The
+        // matching disconnect touch rides the ConnectionGuard drop below.
+        let census_snapshot = mismatch_snapshot.clone();
+        if let Some(writer) = &census_snapshot {
+            writer.touch();
+        }
 
         tokio::spawn(async move {
             let span = tracing::info_span!(
@@ -3082,7 +3090,11 @@ impl SessionManager {
             );
             let span_for_blocking = span.clone();
             async {
-                let _guard = ConnectionGuard { count, disconnect };
+                let _guard = ConnectionGuard {
+                    count,
+                    disconnect,
+                    census_snapshot,
+                };
 
                 info!(
                     source = Source::DaemonDispatch.as_str(),
@@ -3354,6 +3366,11 @@ impl SessionManager {
                 tracker: root_tracker.clone(),
                 ephemeral_mounts: ephemeral_mounts.clone(),
             }));
+            // Wire the live MCP bridge census (pulse-05): each flush reads the
+            // same connection counter the shutdown grace window keys on, so
+            // `state.json` carries `daemon.mcp_connections` — the half of the
+            // pulseless-session comparison the session board cannot know.
+            snapshot.set_bridge_census(Arc::clone(&self.connection_count));
         }
 
         // Bounded worktree-deletion watch (ticket 05): the prompt teardown
@@ -3761,6 +3778,10 @@ impl SessionManager {
 struct ConnectionGuard {
     count: Arc<AtomicUsize>,
     disconnect: Arc<tokio::sync::Notify>,
+    /// Daemon snapshot writer, touched after the decrement so the flushed
+    /// bridge census (`daemon.mcp_connections`, pulse-05) reflects the
+    /// disconnect promptly. `None` outside daemon mode.
+    census_snapshot: Option<Arc<crate::state_snapshot::SnapshotWriter>>,
 }
 
 #[cfg(unix)]
@@ -3768,6 +3789,9 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.count.fetch_sub(1, Ordering::AcqRel);
         self.disconnect.notify_one();
+        if let Some(writer) = &self.census_snapshot {
+            writer.touch();
+        }
     }
 }
 

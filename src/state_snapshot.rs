@@ -27,7 +27,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -60,6 +60,9 @@ use crate::lsp::{InstanceKey, ServerLifecycle};
 ///   reader predating it, so no schema bump is warranted. Misc 167 adds
 ///   server-entry `strikes`/`benched` (the demand-revive strike ledger) the
 ///   same way: serde-additive, defaulting to `0`/`None` on older readers.
+///   Pulse-05 adds the daemon block's `mcp_connections` (the live MCP bridge
+///   census the pulseless-session finding compares against): serde-additive,
+///   absent ⇒ unknown on older snapshots.
 const SCHEMA: u32 = 3;
 
 /// Default coalescing window for non-urgent flushes.
@@ -152,8 +155,13 @@ impl DaemonInfo {
     }
 
     /// Builds the serialized `daemon` block, stamping `generated_at` now and
-    /// folding in any observed bridge↔daemon version mismatch.
-    fn to_meta<'a>(&'a self, bridge_mismatch: Option<&'a BridgeMismatch>) -> DaemonMeta<'a> {
+    /// folding in any observed bridge↔daemon version mismatch plus the live
+    /// MCP bridge census (pulse-05).
+    fn to_meta<'a>(
+        &'a self,
+        bridge_mismatch: Option<&'a BridgeMismatch>,
+        mcp_connections: Option<usize>,
+    ) -> DaemonMeta<'a> {
         DaemonMeta {
             instance_id: &self.instance_id,
             pid: self.pid,
@@ -161,6 +169,7 @@ impl DaemonInfo {
             started_at: &self.started_at,
             generated_at: now_iso(),
             bridge_mismatch,
+            mcp_connections,
         }
     }
 }
@@ -177,6 +186,13 @@ struct DaemonMeta<'a> {
     /// The observed bridge↔daemon protocol-version mismatch, if any (ws41-02).
     #[serde(skip_serializing_if = "Option::is_none")]
     bridge_mismatch: Option<&'a BridgeMismatch>,
+    /// The number of live MCP bridge connections at flush time (pulse-05) —
+    /// the daemon's bridge census, read from the same counter the shutdown
+    /// grace window keys on. `None` (omitted) when no census is wired
+    /// (transport-only mode); serde-additive on schema 3, so a reader
+    /// predating the field sees "unknown", never a false zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp_connections: Option<usize>,
 }
 
 /// Live progress for a server entry.
@@ -298,6 +314,24 @@ pub struct ClientInfo {
     /// practice (kept for forward-compat with hosts that add it).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+}
+
+impl ClientInfo {
+    /// Whether this host client pairs each session with an MCP bridge
+    /// connection to the daemon (pulse-05).
+    ///
+    /// The pulseless-session exemption keys on this capability, not on a
+    /// blanket host allow/deny: a session whose client never establishes MCP
+    /// is exempt from the finding (there is no bridge to lose), while a future
+    /// bridged host joins by being added here. Today only Claude Code
+    /// (`claude`) runs the per-session `catenary` bridge; Antigravity sessions
+    /// have no session-bound MCP bridge, and an `unknown` client (a session
+    /// created without a `format` field) is exempt because its capability
+    /// cannot be defended either way.
+    #[must_use]
+    pub fn establishes_mcp_bridge(&self) -> bool {
+        self.name == "claude"
+    }
 }
 
 /// A session's current activity, derived at snapshot-build time from the
@@ -660,6 +694,12 @@ pub struct DaemonSnapshot {
     /// Absent on agreement and on snapshots from daemons predating the field.
     #[serde(default)]
     pub bridge_mismatch: Option<BridgeMismatch>,
+    /// The number of live MCP bridge connections at flush time (pulse-05).
+    /// `None` when the snapshot comes from a daemon predating the census (or
+    /// one running without it) — "unknown", which readers must treat as
+    /// silence, never as zero.
+    #[serde(default)]
+    pub mcp_connections: Option<u64>,
 }
 
 /// Current UTC time as an ISO 8601 string with millisecond precision.
@@ -1030,7 +1070,14 @@ impl SnapshotState {
     ///
     /// `sessions` is pulled from the [`SessionBoard`] by the caller (outside
     /// this struct's lock) and injected here, sorted by id for stable output.
-    fn to_json(&self, sessions: &[SessionEntry], roots: &[RootEntry]) -> String {
+    /// `mcp_connections` is the live bridge census, read from the wired
+    /// counter by the caller (pulse-05).
+    fn to_json(
+        &self,
+        sessions: &[SessionEntry],
+        roots: &[RootEntry],
+        mcp_connections: Option<usize>,
+    ) -> String {
         let mut servers: Vec<&ServerEntry> = self.servers.values().collect();
         servers.sort_by(|a, b| a.id.cmp(&b.id));
         let mut sessions: Vec<&SessionEntry> = sessions.iter().collect();
@@ -1039,7 +1086,9 @@ impl SnapshotState {
         roots.sort_by(|a, b| a.path.cmp(&b.path));
         let view = SnapshotView {
             schema: SCHEMA,
-            daemon: self.daemon.to_meta(self.bridge_mismatch.as_ref()),
+            daemon: self
+                .daemon
+                .to_meta(self.bridge_mismatch.as_ref(), mcp_connections),
             servers,
             sessions,
             roots,
@@ -1083,6 +1132,11 @@ struct Inner {
     /// Live root source (the daemon's `RootTracker`), wired once alongside the
     /// session board. Pulled at flush; absent until set (empty root board).
     root_board: OnceLock<Arc<dyn RootBoard>>,
+    /// Live MCP bridge census (pulse-05): the daemon's connection counter,
+    /// shared by the `SessionManager` accept loop. Read (never mutated) at
+    /// flush time; absent until wired (`mcp_connections` omitted from the
+    /// snapshot — "unknown", never a false zero).
+    bridge_census: OnceLock<Arc<AtomicUsize>>,
 }
 
 impl Inner {
@@ -1131,9 +1185,15 @@ impl Inner {
         // lock-order inversion with the SessionManager locks the boards acquire).
         let sessions = self.sessions();
         let roots = self.roots();
+        // The bridge census is a bare atomic — reading it takes no lock, so it
+        // rides the same pull (pulse-05). Unwired ⇒ `None` ⇒ field omitted.
+        let mcp_connections = self
+            .bridge_census
+            .get()
+            .map(|census| census.load(Ordering::Acquire));
         let json = {
             let state = self.lock_state();
-            state.to_json(&sessions, &roots)
+            state.to_json(&sessions, &roots, mcp_connections)
         };
         match write_atomic(&self.path, &json) {
             Ok(()) => {
@@ -1198,6 +1258,7 @@ impl SnapshotWriter {
             flush_count: AtomicU64::new(0),
             session_board: OnceLock::new(),
             root_board: OnceLock::new(),
+            bridge_census: OnceLock::new(),
         });
         let task_inner = inner.clone();
         runtime.spawn(async move { flush_loop(task_inner).await });
@@ -1355,6 +1416,19 @@ impl SnapshotWriter {
     /// serializes any already-tracked roots.
     pub fn set_root_board(&self, board: Arc<dyn RootBoard>) {
         if self.inner.root_board.set(board).is_ok() {
+            self.touch();
+        }
+    }
+
+    /// Wires the live MCP bridge census (pulse-05): the daemon's connection
+    /// counter, whose value each flush serializes as the daemon block's
+    /// `mcp_connections`.
+    ///
+    /// Called once, alongside the session/root boards. Subsequent calls are
+    /// ignored (set-once). Marks the snapshot dirty so the first flush after
+    /// wiring carries the census.
+    pub fn set_bridge_census(&self, census: Arc<AtomicUsize>) {
+        if self.inner.bridge_census.set(census).is_ok() {
             self.touch();
         }
     }
@@ -1633,7 +1707,7 @@ mod tests {
         state.update_state(&key, &ServerLifecycle::Probing);
 
         let json: serde_json::Value =
-            serde_json::from_str(&state.to_json(&[], &[])).expect("valid json");
+            serde_json::from_str(&state.to_json(&[], &[], None)).expect("valid json");
         let server = &json["servers"][0];
         // Full lifecycle — NOT the lossy display_state ("initializing").
         assert_eq!(server["state"], "probing");
@@ -2223,6 +2297,63 @@ mod tests {
         );
     }
 
+    // ── MCP bridge census (pulse-05) ───────────────────────────────────
+
+    #[tokio::test]
+    async fn bridge_census_serializes_when_wired_and_absent_when_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = SnapshotWriter::with_coalesce(
+            &Handle::current(),
+            dir.path(),
+            daemon_info(),
+            Duration::from_millis(20),
+        );
+
+        // Unwired: the field is omitted — unknown, never a false zero.
+        writer.touch();
+        let ready = poll_until(|| read_snapshot(&writer).is_some()).await;
+        assert!(ready, "snapshot should flush");
+        let json = read_snapshot(&writer).expect("state.json written");
+        assert!(
+            json["daemon"].get("mcp_connections").is_none(),
+            "no census wired — the field is absent",
+        );
+
+        // Wired: each flush reads the live counter.
+        let census = Arc::new(AtomicUsize::new(2));
+        writer.set_bridge_census(census.clone());
+        let ready = poll_until(|| {
+            read_snapshot(&writer).is_some_and(|j| j["daemon"]["mcp_connections"] == 2)
+        })
+        .await;
+        assert!(ready, "wired census should serialize its live value");
+
+        // The census is read at flush time, so a change + touch re-publishes —
+        // the connect/disconnect touches in the accept path ride exactly this.
+        census.store(0, Ordering::Release);
+        writer.touch();
+        let ready = poll_until(|| {
+            read_snapshot(&writer).is_some_and(|j| j["daemon"]["mcp_connections"] == 0)
+        })
+        .await;
+        assert!(ready, "a census change is visible on the next flush");
+    }
+
+    #[test]
+    fn daemon_snapshot_census_defaults_none_on_legacy_snapshots() {
+        // Serde-additive guarantee: a snapshot written before the census field
+        // parses with `None` — readers see unknown, never a false zero (which
+        // would fabricate pulseless-session findings from old snapshots).
+        let daemon: DaemonSnapshot = serde_json::from_str(
+            r#"{"instance_id":"daemon:x","pid":1,"version":"v","started_at":"t","generated_at":"t"}"#,
+        )
+        .expect("legacy daemon block parses");
+        assert_eq!(
+            daemon.mcp_connections, None,
+            "absent census reads unknown, not zero"
+        );
+    }
+
     // ── Session board (ticket 05) ──────────────────────────────────────
 
     /// A `SessionBoard` backed by a mutable vec, so a test can change the
@@ -2503,12 +2634,17 @@ mod tests {
                 idle_remaining_secs: Some(312),
             },
         ];
-        let json = state.to_json(std::slice::from_ref(&session), &roots);
+        let json = state.to_json(std::slice::from_ref(&session), &roots, Some(3));
 
         let snapshot: Snapshot = serde_json::from_str(&json).expect("reader parses writer output");
         assert_eq!(snapshot.schema, SCHEMA);
         assert_eq!(snapshot.daemon.pid, 4242);
         assert!(!snapshot.daemon.generated_at.is_empty());
+        assert_eq!(
+            snapshot.daemon.mcp_connections,
+            Some(3),
+            "the bridge census round-trips onto the daemon block (pulse-05)"
+        );
 
         assert_eq!(snapshot.servers.len(), 1);
         let server = &snapshot.servers[0];
@@ -2571,7 +2707,7 @@ mod tests {
             bridge_version: Some("2.0.1".to_string()),
             daemon_version: "2.0.2".to_string(),
         });
-        let json = state.to_json(&[], &[]);
+        let json = state.to_json(&[], &[], None);
         let snapshot: Snapshot = serde_json::from_str(&json).expect("reader parses writer output");
         let recorded = snapshot
             .daemon
@@ -2586,7 +2722,7 @@ mod tests {
             bridge_version: None,
             daemon_version: "2.0.2".to_string(),
         });
-        let json = state.to_json(&[], &[]);
+        let json = state.to_json(&[], &[], None);
         let snapshot: Snapshot = serde_json::from_str(&json).expect("parse");
         let recorded = snapshot.daemon.bridge_mismatch.expect("mismatch present");
         assert!(
@@ -2596,7 +2732,7 @@ mod tests {
 
         // Agreement clears the record — no daemon block field.
         state.bridge_mismatch = None;
-        let json = state.to_json(&[], &[]);
+        let json = state.to_json(&[], &[], None);
         let snapshot: Snapshot = serde_json::from_str(&json).expect("parse");
         assert!(
             snapshot.daemon.bridge_mismatch.is_none(),
@@ -2630,7 +2766,7 @@ mod tests {
             },
         );
 
-        let json = state.to_json(&[], &[]);
+        let json = state.to_json(&[], &[], None);
         let snapshot: Snapshot = serde_json::from_str(&json).expect("reader parses writer output");
         assert_eq!(snapshot.auto_installs.len(), 1, "latest state per server");
         let entry = &snapshot.auto_installs[0];

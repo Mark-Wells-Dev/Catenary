@@ -108,6 +108,24 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
         let _ = out.writeln(format_args!(""));
     }
 
+    // Pulseless sessions (pulse-05) — the daemon's snapshot carries both
+    // halves of the comparison (the session board's hook recency and the
+    // daemon block's live MCP bridge census), so doctor derives the same
+    // finding the TUI board shows, from the same `health::pulse` model.
+    // Daemon down (no snapshot) or a daemon predating the census → silence;
+    // a snapshot frozen by daemon death ages out of the recency window.
+    if let Some(snap) = read_snapshot() {
+        let pulseless = crate::health::pulse::pulseless_findings(
+            &snap.sessions,
+            snap.daemon.mcp_connections,
+            chrono::Utc::now(),
+            crate::health::pulse::PULSELESS_RECENCY_WINDOW,
+        );
+        if render_findings(out, &pulseless, show_diff) {
+            let _ = out.writeln(format_args!(""));
+        }
+    }
+
     // Config migration walk — runs before the load so its rename guidance can
     // print above a config-load error. A non-empty set also lets the load-error
     // path drop the self-referential "run catenary doctor" pointer.

@@ -1042,6 +1042,7 @@ mod tests {
                 started_at: "2026-07-07T12:00:00Z".to_string(),
                 generated_at: crate::state_snapshot::now_iso(),
                 bridge_mismatch: None,
+                mcp_connections: None,
             },
             ..Snapshot::default()
         };
@@ -1186,6 +1187,7 @@ mod tests {
                 started_at: "2026-07-07T12:00:00Z".to_string(),
                 generated_at: "2026-07-07T12:01:20Z".to_string(),
                 bridge_mismatch: None,
+                mcp_connections: None,
             },
             ..Snapshot::default()
         };

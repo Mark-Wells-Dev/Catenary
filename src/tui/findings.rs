@@ -245,6 +245,9 @@ pub fn gather(
 /// Hermetic given its inputs, so this is the seam the fleet-scale render tests
 /// drive: a synthetic snapshot + an injected config produce a deterministic
 /// finding set independent of the machine's real config files or install state.
+/// (One clock read: the pulseless-session check (pulse-05) compares session
+/// recency against now, so its findings age out as wall time passes — tests
+/// stamp `last_seen` relative to now.)
 #[must_use]
 #[allow(clippy::implicit_hasher, reason = "callers use the default hasher")]
 pub fn gather_snapshot(
@@ -278,6 +281,25 @@ pub fn gather_snapshot(
         out.push(OwnedFinding {
             finding: f,
             owner: Owner::Global,
+        });
+    }
+
+    // ── Pulseless sessions (pulse-05) ────────────────────────────────
+    // A hook-active, bridge-capable session while the daemon's MCP bridge
+    // census reads zero is running silently degraded — no roots channel, no
+    // notifications, no heartbeat in the connection census. One shared model
+    // (`health::pulse`) derives it for doctor and the TUI; each finding is
+    // owned by its session's client node. A standing derivation: it clears on
+    // its own the moment a bridge connects (or the session goes idle).
+    for session in crate::health::pulse::pulseless_sessions(
+        &snapshot.sessions,
+        snapshot.daemon.mcp_connections,
+        chrono::Utc::now(),
+        crate::health::pulse::PULSELESS_RECENCY_WINDOW,
+    ) {
+        out.push(OwnedFinding {
+            finding: crate::health::pulse::pulseless_finding(session),
+            owner: Owner::Client(session.client.name.clone()),
         });
     }
 
@@ -608,6 +630,78 @@ mod tests {
                 .any(|f| f.finding.code == crate::health::FindingCode::BridgeVersionMismatch),
             "silence is the healthy state",
         );
+    }
+
+    /// A snapshot whose daemon census reads `mcp_connections` and whose board
+    /// holds one just-active claude session (pulse-05 harness).
+    fn pulseless_snapshot(mcp_connections: Option<u64>) -> Snapshot {
+        use crate::state_snapshot::{ClientInfo, DaemonSnapshot, SessionEntry};
+
+        Snapshot {
+            daemon: DaemonSnapshot {
+                mcp_connections,
+                ..DaemonSnapshot::default()
+            },
+            sessions: vec![SessionEntry {
+                id: "sess-A".to_string(),
+                client: ClientInfo {
+                    name: "claude".to_string(),
+                    version: None,
+                },
+                last_seen: crate::state_snapshot::now_iso(),
+                ..SessionEntry::default()
+            }],
+            ..Snapshot::default()
+        }
+    }
+
+    #[test]
+    fn pulseless_session_surfaces_client_owned_warning() {
+        let findings = gather_snapshot(
+            &pulseless_snapshot(Some(0)),
+            &Config::default(),
+            HashSet::new(),
+            &no_home(),
+            &no_manifest(),
+        );
+        let f = findings
+            .iter()
+            .find(|f| f.finding.code == crate::health::FindingCode::SessionPulseless)
+            .expect("a hook-active session with a zero bridge census surfaces the finding");
+        assert_eq!(
+            f.owner,
+            Owner::Client("claude".to_string()),
+            "owned by the session's client node",
+        );
+        assert_eq!(f.finding.severity, Severity::Warning, "warn-class");
+        assert!(f.finding.message.contains("sess-A"), "names the session");
+        assert!(
+            f.finding
+                .fix_it
+                .as_deref()
+                .expect("remedy carried")
+                .contains("/mcp"),
+            "carries the resume-or-/mcp remedy",
+        );
+    }
+
+    #[test]
+    fn bridged_or_unknown_census_raises_no_pulseless_finding() {
+        for census in [Some(1), None] {
+            let findings = gather_snapshot(
+                &pulseless_snapshot(census),
+                &Config::default(),
+                HashSet::new(),
+                &no_home(),
+                &no_manifest(),
+            );
+            assert!(
+                !findings
+                    .iter()
+                    .any(|f| f.finding.code == crate::health::FindingCode::SessionPulseless),
+                "census {census:?}: a live bridge (or an unknown census) is silence",
+            );
+        }
     }
 
     #[test]
