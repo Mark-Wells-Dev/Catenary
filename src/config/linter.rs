@@ -7,8 +7,9 @@
 //! actionlint, yamllint, or any SARIF-emitting tool) that Catenary runs over the
 //! modified-file set during `catenary diagnostics`, translating its output into
 //! LSP-shaped diagnostics that merge with the LSP feeder's. The blessed adapters
-//! (keyed by linter name) and the generic SARIF adapter live in
-//! [`crate::bridge::linter`]; this module owns only the config shape + routing
+//! (keyed by linter name) and the generic SARIF adapter live in the shared
+//! [`crate::linter`] core (which the `catenary grep` lint sink also drives,
+//! daemon-free — ws43-04); this module owns only the config shape + routing
 //! glob compilation.
 
 use std::path::Path;

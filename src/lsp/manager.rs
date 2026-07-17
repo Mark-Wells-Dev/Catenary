@@ -757,18 +757,19 @@ impl LspClientManager {
     /// The user config's `[linter.rule.*]` unioned with the root's project
     /// `[linter.rule.*]`, the project winning on a name collision (so a project entry
     /// can override or `disable` a user-configured linter). Each entry carries
-    /// its compiled routing globs, ready for [`LinterConfig::matches`].
+    /// its compiled routing globs, ready for [`LinterConfig::matches`]. The
+    /// merge itself is the shared core's
+    /// [`merge_effective_linters`](crate::linter::merge_effective_linters) —
+    /// the same rule the CLI-side lint router applies (ws43-04), so query-time
+    /// and diagnostics-time routing cannot drift.
     ///
     /// [`LinterConfig::matches`]: crate::config::LinterConfig::matches
     #[must_use]
     pub fn effective_linters(&self, root: &Path) -> HashMap<String, crate::config::LinterConfig> {
-        let mut linters = self.config.linter.clone();
-        if let Some(r) = self.fs.root(root) {
-            for (name, linter) in &r.config().linter {
-                linters.insert(name.clone(), linter.clone());
-            }
-        }
-        linters
+        let project = self.fs.root(root);
+        let empty = HashMap::new();
+        let project_linters = project.as_ref().map_or(&empty, |r| &r.config().linter);
+        crate::linter::merge_effective_linters(&self.config.linter, project_linters)
     }
 
     /// The effective language configuration for a `(root, lang)` pair (bug 81 /

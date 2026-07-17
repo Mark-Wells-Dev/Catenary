@@ -902,6 +902,22 @@ output is picked by the **name**: `shellcheck`, `actionlint`, and `yamllint`
 use hand-rolled parsers; every other name falls to a generic **SARIF**
 adapter (see [Custom linters (SARIF)](#custom-linters-sarif)).
 
+### Lint annotation in `catenary grep`
+
+The same rules route `catenary grep` hits: a hit in a lint-covered file is
+annotated by a **locally-spawned linter** instead of the daemon — the file's
+hits never ride to the daemon at all. A diagnostic on the matched line rides
+the anchor slot as `#<source>/<code>`
+(`build.sh:12#shellcheck/SC2086:echo $HOME`); a line the linter verified clean
+renders covered (no marker). Because the linter runs CLI-side, this works with
+**no daemon at all** — lint annotation is part of the degrade story, not an
+enrichment extra. A missing, failing, or wedged linter degrades that file's
+hits to the `#?` pass-through spelling with one stderr advisory — never an
+error, never a dropped hit. Root resolution without a daemon uses the file's
+enclosing repository root (`.git` and friends), where the daemon uses its
+registered-roots ledger; the effective linter set and the routing globs are
+identical.
+
 ### Built-in linter defaults
 
 Catenary ships a batteries-included default set (`defaults/linters.toml`),

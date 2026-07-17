@@ -20,8 +20,8 @@ mod handler;
 mod hitstream_enricher;
 /// Application dispatch for hook requests.
 mod hook_router;
-/// Standalone-linter diagnostic feeder (blessed + SARIF adapters).
-mod linter;
+/// Daemon-side adapter binding the shared linter core to the diagnostics batch.
+pub mod linter;
 /// Path validation for LSP-aware operations and config file protection.
 pub mod path_security;
 /// Shared container for tool servers and cross-tool infrastructure.

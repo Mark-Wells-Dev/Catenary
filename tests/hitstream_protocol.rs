@@ -34,8 +34,8 @@ use catenary_cli::hitstream::annotator::{BatchEnricher, annotate_connection};
 use catenary_cli::hitstream::engine::WalkOptions;
 use catenary_cli::hitstream::frame::{AnnotatedHit, AnnotationVerdict};
 use catenary_cli::hitstream::{
-    ANNOTATION_BATCH_BUDGET, GrepRender, HIT_BATCH_SIZE, PassThroughEnricher, ResultSink, WireHit,
-    daemon_stream, stdout_unannotated,
+    ANNOTATION_BATCH_BUDGET, GrepRender, HIT_BATCH_SIZE, LintAnnotator, PassThroughEnricher,
+    ResultSink, WireHit, daemon_stream, lint_stream, stdout_unannotated,
 };
 
 /// Writes `body` to `dir/name`, creating parent dirs.
@@ -81,6 +81,21 @@ async fn stream_through<E>(
 where
     E: BatchEnricher + Send + Sync + 'static,
 {
+    stream_through_with_lint(pattern, roots, enricher, budget, None).await
+}
+
+/// [`stream_through`] with an optional local lint annotator riding the stream
+/// (ws43-04).
+async fn stream_through_with_lint<E>(
+    pattern: &str,
+    roots: &[PathBuf],
+    enricher: E,
+    budget: std::time::Duration,
+    lint: Option<LintAnnotator>,
+) -> Result<(String, bool)>
+where
+    E: BatchEnricher + Send + Sync + 'static,
+{
     // Two duplex pipes: one carries CLI→daemon hit-frames, one carries
     // daemon→CLI annotation-frames.
     let (cli_writes, daemon_reads) = tokio::io::duplex(64 * 1024);
@@ -103,6 +118,7 @@ where
             roots,
             &WalkOptions::default(),
             None,
+            lint,
             cli_reader,
             cli_writes,
             &GrepRender::default(),
@@ -308,6 +324,7 @@ async fn daemon_absent_and_unknown_method_degrade_identically() -> Result<()> {
             &roots,
             &WalkOptions::default(),
             None,
+            None,
             cli_reader,
             cli_writes,
             &GrepRender::default(),
@@ -365,6 +382,7 @@ async fn silent_daemon_deadline_completes_unannotated() -> Result<()> {
             "needle",
             &roots,
             &WalkOptions::default(),
+            None,
             None,
             cli_reader,
             cli_writes,
@@ -463,5 +481,232 @@ async fn budget_verdict_present_per_batch() -> Result<()> {
         .await
         .context("join annotator")?
         .context("annotator run")?;
+    Ok(())
+}
+
+// ─── the local linter sink (ws43-04) ────────────────────────────────────────
+
+/// A repo fixture (a `.git` marker so the CLI-side lint router discovers the
+/// root): `aaa.txt` (no linter routes it) and `zzz.sh` (lint-covered), each
+/// with `needle` lines.
+fn lint_fixture() -> Result<(tempfile::TempDir, Vec<PathBuf>, PathBuf)> {
+    let tmp = tempfile::tempdir().context("tempdir")?;
+    std::fs::create_dir(tmp.path().join(".git")).context("git marker")?;
+    write_file(tmp.path(), "aaa.txt", "needle text one\nneedle text two\n")?;
+    write_file(tmp.path(), "zzz.sh", "needle $HOME\nneedle done\n")?;
+    let root = tmp.path().canonicalize().context("canonicalize root")?;
+    let sh = root.join("zzz.sh");
+    Ok((tmp, vec![root], sh))
+}
+
+/// A lint annotator whose one linter is `mocklint` emitting a shellcheck
+/// finding on line 1 of every file it is handed.
+fn mocklint_annotator(budget: std::time::Duration) -> Result<LintAnnotator> {
+    use catenary_cli::bridge::filesystem_manager::FilesystemManager;
+    use catenary_cli::config::LinterConfig;
+
+    let linter = LinterConfig::new(
+        env!("CARGO_BIN_EXE_mocklint"),
+        vec![
+            "--format".to_string(),
+            "shellcheck".to_string(),
+            "--diag".to_string(),
+            "SC2086|1|8|Double quote to prevent globbing".to_string(),
+        ],
+        vec!["**/*.sh".to_string()],
+    )
+    .context("compile linter config")?;
+    let layer: std::collections::HashMap<String, LinterConfig> =
+        std::iter::once(("shellcheck".to_string(), linter)).collect();
+    Ok(LintAnnotator::with_budget(
+        layer,
+        std::sync::Arc::new(FilesystemManager::new()),
+        budget,
+    ))
+}
+
+/// An enricher that anchors every hit with a fixed `#x` trail and records
+/// every path it is handed — the probe for the "lint-covered hits never touch
+/// the daemon" pin.
+struct RecordingEnricher {
+    seen: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
+}
+impl BatchEnricher for RecordingEnricher {
+    async fn enrich(
+        &self,
+        hits: Vec<WireHit>,
+        _observed: Vec<(PathBuf, i64)>,
+        _weight: Option<catenary_cli::hitstream::EnrichmentWeight>,
+    ) -> anyhow::Result<Vec<AnnotatedHit>> {
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.extend(hits.iter().map(|h| h.path.clone()));
+        }
+        Ok(hits
+            .into_iter()
+            .map(|h| AnnotatedHit::scoped(h, "x".to_string()))
+            .collect())
+    }
+}
+
+/// The mixed-coverage stream (ws43-04): daemon-covered hits annotate via the
+/// daemon (`#x`), lint-covered hits via the local linter sink
+/// (`#shellcheck/SC2086` on the diagnostic line, the covered top-level
+/// spelling elsewhere), ordering intact — and the daemon NEVER sees a
+/// lint-covered hit.
+#[tokio::test]
+async fn mixed_coverage_splits_by_coverage_and_merges_in_order() -> Result<()> {
+    let (_tmp, roots, sh) = lint_fixture()?;
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let enricher = RecordingEnricher {
+        seen: std::sync::Arc::clone(&seen),
+    };
+    let lint = mocklint_annotator(ANNOTATION_BATCH_BUDGET)?;
+
+    let (streamed, degraded) = stream_through_with_lint(
+        "needle",
+        &roots,
+        enricher,
+        ANNOTATION_BATCH_BUDGET,
+        Some(lint),
+    )
+    .await?;
+    assert!(!degraded, "a healthy mixed exchange never degrades");
+
+    let lines: Vec<&str> = streamed.lines().collect();
+    assert_eq!(
+        lines.len(),
+        4,
+        "every hit is emitted exactly once: {lines:?}"
+    );
+    // Walk order (path-sorted): aaa.txt's hits, then zzz.sh's.
+    assert!(
+        lines[0].contains("aaa.txt:1#x:") && lines[1].contains("aaa.txt:2#x:"),
+        "daemon-covered hits carry the daemon's anchor, in order: {lines:?}",
+    );
+    assert!(
+        lines[2].contains("zzz.sh:1#shellcheck/SC2086:"),
+        "a lint diagnostic on the hit's line becomes its source/code trail: {lines:?}",
+    );
+    assert!(
+        lines[3].contains("zzz.sh:2:") && !lines[3].contains('#'),
+        "a lint-verified clean line renders covered (no marker): {lines:?}",
+    );
+
+    // The never-touch-the-daemon pin: the daemon annotator saw the .txt hits
+    // and never the lint-covered .sh.
+    let seen_paths: Vec<PathBuf> = seen.lock().expect("seen probe").clone();
+    assert!(
+        seen_paths.iter().any(|p| p.ends_with("aaa.txt")),
+        "the daemon annotated the uncovered file's hits",
+    );
+    assert!(
+        !seen_paths.iter().any(|p| p == &sh),
+        "a lint-covered hit never travels to the daemon: {seen_paths:?}",
+    );
+    Ok(())
+}
+
+/// The wedged-linter pin (ws43-04): a sleep-stub linter blows its budget, its
+/// batch passes through (`#?`), the stream completes with ordering intact, and
+/// the daemon leg is untouched.
+#[cfg(unix)]
+#[tokio::test]
+async fn wedged_linter_passes_through_and_the_stream_completes() -> Result<()> {
+    use catenary_cli::bridge::filesystem_manager::FilesystemManager;
+    use catenary_cli::config::LinterConfig;
+    use std::os::unix::fs::PermissionsExt;
+
+    let (tmp, roots, _sh) = lint_fixture()?;
+    // A genuine wedge: the script ignores its file arguments and sleeps (bare
+    // `sleep 60 <files>` would error out instantly instead of wedging).
+    let wedge = tmp.path().join("stub-wedge");
+    std::fs::write(&wedge, "#!/bin/sh\nsleep 60\n").context("write wedge stub")?;
+    std::fs::set_permissions(&wedge, std::fs::Permissions::from_mode(0o755))
+        .context("chmod wedge stub")?;
+    let linter = LinterConfig::new(
+        wedge.to_string_lossy().into_owned(),
+        vec![],
+        vec!["**/*.sh".to_string()],
+    )
+    .context("compile linter config")?;
+    let layer: std::collections::HashMap<String, LinterConfig> =
+        std::iter::once(("wedged".to_string(), linter)).collect();
+    let lint = LintAnnotator::with_budget(
+        layer,
+        std::sync::Arc::new(FilesystemManager::new()),
+        std::time::Duration::from_millis(100),
+    );
+
+    let (streamed, degraded) = stream_through_with_lint(
+        "needle",
+        &roots,
+        PassThroughEnricher,
+        ANNOTATION_BATCH_BUDGET,
+        Some(lint),
+    )
+    .await?;
+    assert!(!degraded, "a wedged LINTER is not a daemon-stream degrade");
+
+    let lines: Vec<&str> = streamed.lines().collect();
+    assert_eq!(
+        lines.len(),
+        4,
+        "every hit survives the blown budget: {lines:?}"
+    );
+    assert!(
+        lines[2].contains("zzz.sh:1#?:") && lines[3].contains("zzz.sh:2#?:"),
+        "a budget-blown linter's hits pass through, in order: {lines:?}",
+    );
+    Ok(())
+}
+
+/// The no-daemon pin (ws43-04), library leg: [`lint_stream`] annotates
+/// lint-covered hits with no daemon anywhere — the linter sink is part of the
+/// degrade story, not an enrichment-only extra.
+#[tokio::test]
+async fn lint_stream_annotates_lint_covered_hits_with_no_daemon() -> Result<()> {
+    let (_tmp, roots, _sh) = lint_fixture()?;
+    let lint = mocklint_annotator(ANNOTATION_BATCH_BUDGET)?;
+
+    let mut out: Vec<u8> = Vec::new();
+    let report = {
+        let mut sink = ResultSink::new(&mut out);
+        lint_stream(
+            "needle",
+            &roots,
+            &WalkOptions::default(),
+            lint,
+            &GrepRender::default(),
+            &mut sink,
+        )
+        .await
+        .context("lint stream")?
+    };
+    assert!(!report.degraded);
+    assert!(
+        report.lint_advisories.is_empty(),
+        "a healthy lint run records no advisory: {:?}",
+        report.lint_advisories,
+    );
+
+    let streamed = String::from_utf8(out).context("utf-8")?;
+    let lines: Vec<&str> = streamed.lines().collect();
+    assert_eq!(
+        lines.len(),
+        4,
+        "complete results without a daemon: {lines:?}"
+    );
+    assert!(
+        lines[0].contains("aaa.txt:1#?:") && lines[1].contains("aaa.txt:2#?:"),
+        "uncovered hits keep the unannotated degrade spelling: {lines:?}",
+    );
+    assert!(
+        lines[2].contains("zzz.sh:1#shellcheck/SC2086:"),
+        "lint annotation arrives with the daemon STOPPED: {lines:?}",
+    );
+    assert!(
+        lines[3].contains("zzz.sh:2:") && !lines[3].contains('#'),
+        "the verified clean line renders covered: {lines:?}",
+    );
     Ok(())
 }

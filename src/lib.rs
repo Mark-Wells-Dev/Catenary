@@ -31,6 +31,8 @@ pub mod hitstream;
 pub mod hook;
 /// Guided-install engine: consented, verified per-ecosystem installs (tui-rework 06).
 pub mod install;
+/// Shared standalone-linter core: spawn, parse, severity, routing (ws43-04).
+pub mod linter;
 /// The durable root lock — one cook per kitchen (root-ownership stage 2).
 pub mod lock;
 /// Multi-sink tracing dispatcher for Catenary telemetry.

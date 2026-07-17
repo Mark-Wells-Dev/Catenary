@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! The two hit-batch sinks (ws43), selectable at the walk seam.
+//! The hit-batch sinks (ws43), selectable at the walk seam.
 //!
 //! - [`stdout_unannotated`] — the degrade path, built first. The walk's ordered
 //!   hit-batches print straight to stdout with no daemon round-trip: exactly what
@@ -10,6 +10,21 @@
 //! - [`daemon_stream`] — batches out to the daemon, annotation-batches back,
 //!   reassembled into batch-sequence order before emission. A small in-flight
 //!   window pipelines the exchange without ever reordering output.
+//! - [`lint_stream`] — the daemon-absent arm with lint routing active (ws43-04):
+//!   lint-covered hits still come back lint-annotated with no daemon at all.
+//!
+//! ## The lint stage (ws43-04)
+//!
+//! Both streaming sinks route each batch through
+//! [`lint_stage`](super::lint::lint_stage) between the walk and the wire:
+//! lint-covered hits (the shared routing rules — see [`crate::linter`]) are
+//! annotated by **locally-spawned linters** and never travel to the daemon;
+//! the daemon receives each batch minus its lint-claimed hits (a lint-only
+//! batch still ships a hit-less frame so the observation nudge lands and the
+//! annotation stream stays seq-contiguous). The resolved lint annotations ride
+//! the retention buffer, so a daemon-side degrade downstream never loses them
+//! — the merged emission below re-interleaves both annotator's answers into
+//! the walk's exact hit order.
 //!
 //! ## Degrade in place (ws43-02)
 //!
@@ -41,6 +56,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result};
 
 use super::frame::{AnnotatedBatch, AnnotatedHit, AnnotationFrame, EnrichmentWeight, HitFrame};
+use super::lint::{LintAnnotator, LintedBatch};
 use super::{HIT_BATCH_SIZE, HitBatch, IN_FLIGHT_WINDOW, STREAM_READ_DEADLINE, WireHit};
 
 /// Connects to the daemon's IPC socket and opens the hit-batch annotation stream,
@@ -214,9 +230,11 @@ pub fn stdout_unannotated<W: std::io::Write>(
     Ok(summary)
 }
 
-/// What one [`daemon_stream`] run did: the walk's summary, plus whether the
-/// annotation stream degraded mid-exchange (the caller's cue for a one-line
-/// stderr advisory — results are complete either way).
+/// What one [`daemon_stream`] (or [`lint_stream`]) run did.
+///
+/// The walk's summary, whether the annotation stream degraded mid-exchange
+/// (the caller's cue for a one-line stderr advisory — results are complete
+/// either way), and the lint sink's advisory lines (ws43-04).
 pub struct DaemonStreamReport {
     /// The walk summary (batch count, skips). `observed` has been taken — it
     /// was shipped on the [`HitFrame::End`] terminator.
@@ -224,6 +242,10 @@ pub struct DaemonStreamReport {
     /// True when the annotation stream faulted or stalled and the remainder of
     /// the results were emitted unannotated in place. Never fewer results.
     pub degraded: bool,
+    /// One line per lint-sink degrade cause (absent linter, blown budget,
+    /// spawn/parse failure) — stderr-bound, never an error, never a dropped
+    /// hit. Empty on a healthy (or lint-less) run.
+    pub lint_advisories: Vec<String>,
 }
 
 /// The daemon-stream sink: send hit-batches to the daemon, read annotation-batches
@@ -244,15 +266,22 @@ pub struct DaemonStreamReport {
 /// `seq` order before writing a line — a slow batch delays emission but never
 /// reorders it.
 ///
+/// With a lint annotator (ws43-04), each batch rides the lint stage first:
+/// lint-covered hits are annotated by locally-spawned linters and stripped
+/// from the daemon frames — they never touch the daemon — and their resolved
+/// annotations travel on the retention copy, re-interleaved at emission.
+///
 /// Every sent batch is retained until its annotation is emitted. On any
 /// annotation-stream fault — a malformed frame (old daemon), premature EOF, a
 /// terminator gap, or no frame within [`STREAM_READ_DEADLINE`] while an
 /// annotation is outstanding (an accepts-then-silent daemon) — the emitter
 /// switches to the degrade path in place: the retained batches and the rest of
-/// the walk emit unannotated, in order, with nothing duplicated and nothing
-/// dropped. `reap_scopes` rides the [`HitFrame::End`] terminator with the walk's
-/// observation set (ws43-02 reap parity); a zero-match walk ships neither
-/// (executor parity — a query with no matches never nudged).
+/// the walk emit with their daemon parts unannotated (lint annotations
+/// survive — they never depended on the daemon), in order, with nothing
+/// duplicated and nothing dropped. `reap_scopes` rides the [`HitFrame::End`]
+/// terminator with the walk's observation set (ws43-02 reap parity); a
+/// zero-match walk ships neither (executor parity — a query with no matches
+/// never nudged).
 ///
 /// # Errors
 ///
@@ -266,11 +295,16 @@ pub struct DaemonStreamReport {
     clippy::similar_names,
     reason = "`reader` and `render` are the two distinct seams this function joins"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the one linear pipeline: walk, lint stage, writer, reader, emitter — splitting it would scatter the shutdown discipline"
+)]
 pub async fn daemon_stream<R, Wr, Wo>(
     pattern: &str,
     roots: &[std::path::PathBuf],
     options: &super::engine::WalkOptions,
     reap_scopes: Option<Vec<PathBuf>>,
+    lint: Option<LintAnnotator>,
     reader: R,
     writer: Wr,
     render: &GrepRender,
@@ -284,23 +318,31 @@ where
     use tokio::sync::mpsc;
 
     // The walk is CPU/IO-bound and synchronous (ripgrep). Run it on a blocking
-    // task; hand each ordered batch to the async writer over a bounded channel
+    // task; hand each ordered batch to the async pipeline over a bounded channel
     // whose capacity IS the in-flight window — so the walk cannot race ahead and
     // buffer a whole result set (streaming invariant).
-    let (batch_tx, mut batch_rx) = mpsc::channel::<HitBatch>(IN_FLIGHT_WINDOW);
+    let (batch_tx, batch_rx) = mpsc::channel::<HitBatch>(IN_FLIGHT_WINDOW);
     let pattern = pattern.to_string();
     let roots = roots.to_vec();
     let options = options.clone();
 
     let walk_task = tokio::task::spawn_blocking(move || -> Result<super::engine::WalkSummary> {
         super::engine::walk(&pattern, &roots, &options, |batch| {
-            // A closed receiver (the writer died) aborts the walk — no point
+            // A closed receiver (the pipeline died) aborts the walk — no point
             // reading the tree for a stream nobody is draining.
             batch_tx
                 .blocking_send(batch)
                 .map_err(|_| anyhow::anyhow!("annotation stream closed"))
         })
     });
+
+    // The lint stage (ws43-04), between the walk and the daemon writer:
+    // partitions each batch by lint coverage and resolves the lint-covered
+    // hits' annotations locally (budgeted subprocess runs), so lint hits never
+    // travel to the daemon and their annotations ride retention — immune to
+    // any daemon-side degrade below.
+    let (staged_tx, mut staged_rx) = mpsc::channel::<LintedBatch>(IN_FLIGHT_WINDOW);
+    let lint_task = tokio::spawn(super::lint::lint_stage(lint, batch_rx, staged_tx));
 
     // Degrade latch, shared with the writer: once set, no further byte is
     // written to the daemon (a wedged peer must not block the degrade drain).
@@ -311,7 +353,7 @@ where
     // fault. Unbounded by type, bounded in practice: the writer's socket write
     // backpressures the bounded walk channel, so retention holds only the
     // in-flight window the daemon has accepted but not yet annotated.
-    let (retain_tx, mut retain_rx) = mpsc::unbounded_channel::<HitBatch>();
+    let (retain_tx, mut retain_rx) = mpsc::unbounded_channel::<LintedBatch>();
 
     // Writer half runs CONCURRENTLY with the emitter below, so the daemon can
     // drain hit-frames and answer annotation-frames while the CLI is still
@@ -322,19 +364,31 @@ where
     let writer_task = tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
         let mut writer = writer;
-        while let Some(mut batch) = batch_rx.recv().await {
+        while let Some(mut batch) = staged_rx.recv().await {
+            // The daemon's share of the batch: everything the lint mask did
+            // not claim. A lint-only batch still ships its (hit-less) frame so
+            // the observation nudge lands and the annotation stream stays
+            // seq-contiguous — the lint-covered HITS never touch the daemon.
+            let daemon_hits: Vec<WireHit> = batch
+                .hits
+                .iter()
+                .zip(&batch.lint_mask)
+                .filter(|&(_, &is_lint)| !is_lint)
+                .map(|(hit, _)| hit.clone())
+                .collect();
             let frame_batch = HitFrame::Batch {
                 seq: batch.seq,
-                hits: batch.hits.clone(),
+                hits: daemon_hits,
                 // Observations ride the wire only — the retention copy exists
-                // to re-emit HITS unannotated on a degrade, and a degraded
-                // stream nudges nothing.
+                // to re-emit HITS on a degrade, and a degraded stream nudges
+                // nothing.
                 observed: std::mem::take(&mut batch.observed),
                 // Grep batches are weight-less: anchor enrichment, the
                 // pre-ws43-03 wire, byte-identical.
                 weight: None,
             };
-            // Retention next: the emitter owns this copy from here on.
+            // Retention next: the emitter owns this copy (hits, route mask,
+            // and resolved lint annotations) from here on.
             let _ = retain_tx.send(batch);
             if !writer_degraded.load(Ordering::Acquire) {
                 let bounded = tokio::time::timeout(
@@ -417,25 +471,42 @@ where
         degraded_flag.store(true, Ordering::Release);
     }
     let summary = writer_task.await.context("join writer task")??;
+    // The lint stage has drained by the time the writer is done (it feeds the
+    // writer); joining it collects the run's advisory ledger.
+    let lint_advisories = lint_task.await.context("join lint stage")?;
     let degraded = emit_result?;
     sink.flush()?;
-    Ok(DaemonStreamReport { summary, degraded })
+    Ok(DaemonStreamReport {
+        summary,
+        degraded,
+        lint_advisories,
+    })
 }
 
-/// The emitter loop behind [`daemon_stream`]: ordered annotated emission while
-/// the stream is healthy, in-place unannotated completion once it is not.
+/// The emitter loop behind [`daemon_stream`]: ordered merged emission while
+/// the stream is healthy, in-place completion once it is not.
+///
+/// A batch emits when BOTH its parts are present: its retention copy (the hit
+/// order, the route mask, and the already-resolved lint annotations) and its
+/// daemon annotation-batch (released in seq order by the reorder buffer). On
+/// any daemon-stream fault the remainder emits with the daemon part
+/// unannotated — the lint annotations ride retention, so they survive every
+/// daemon degrade (the ws43-04 no-daemon pin holds mid-stream too).
 ///
 /// Returns whether the stream degraded. Errors only on a result-sink write
 /// failure.
 async fn emit_stream<Wo: std::io::Write>(
-    retain_rx: &mut tokio::sync::mpsc::UnboundedReceiver<HitBatch>,
+    retain_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LintedBatch>,
     ann_rx: &mut tokio::sync::mpsc::Receiver<AnnotationFrame>,
     render: &GrepRender,
     sink: &mut ResultSink<Wo>,
 ) -> Result<bool> {
-    let mut retained: VecDeque<HitBatch> = VecDeque::new();
+    let mut retained: VecDeque<LintedBatch> = VecDeque::new();
     let mut retention_open = true;
     let mut reorder = ReorderBuffer::new();
+    // Daemon annotation-batches the reorder buffer has released, in seq order,
+    // awaiting their retention twins.
+    let mut ready: VecDeque<AnnotatedBatch> = VecDeque::new();
     // The per-read deadline clock: reset whenever an annotation arrives or the
     // outstanding set transitions from empty. Armed only while an annotation is
     // actually outstanding, so a long quiet walk (nothing sent, nothing owed)
@@ -446,13 +517,25 @@ async fn emit_stream<Wo: std::io::Write>(
     // Healthy loop: any `break` is the degrade signal; the one success exit
     // returns directly.
     'healthy: loop {
-        // Prune retention: everything below the reorder watermark has been
-        // emitted annotated.
-        while retained
+        // Emit every seq whose daemon annotation AND retention copy are both
+        // present. Both queues are in seq order, so the fronts pair exactly.
+        while ready
             .front()
-            .is_some_and(|batch| batch.seq < reorder.next)
+            .zip(retained.front())
+            .is_some_and(|(ann, batch)| ann.seq == batch.seq)
         {
-            retained.pop_front();
+            if let (Some(ann), Some(batch)) = (ready.pop_front(), retained.pop_front()) {
+                emit_merged(&batch, Some(&ann), render, sink)?;
+            }
+        }
+        // A released annotation whose seq does not match the retention front
+        // is a protocol violation — degrade rather than stall.
+        if ready
+            .front()
+            .zip(retained.front())
+            .is_some_and(|(ann, batch)| ann.seq != batch.seq)
+        {
+            break 'healthy;
         }
         if ann_done {
             // Every retention send (and the close) was enqueued before our
@@ -460,22 +543,21 @@ async fn emit_stream<Wo: std::io::Write>(
             // could exist — drain the queue non-blocking to observe it.
             while retention_open {
                 match retain_rx.try_recv() {
-                    Ok(batch) => {
-                        if batch.seq >= reorder.next {
-                            retained.push_back(batch);
-                        }
-                    }
+                    Ok(batch) => retained.push_back(batch),
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                         retention_open = false;
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 }
             }
-            while retained
+            while ready
                 .front()
-                .is_some_and(|batch| batch.seq < reorder.next)
+                .zip(retained.front())
+                .is_some_and(|(ann, batch)| ann.seq == batch.seq)
             {
-                retained.pop_front();
+                if let (Some(ann), Some(batch)) = (ready.pop_front(), retained.pop_front()) {
+                    emit_merged(&batch, Some(&ann), render, sink)?;
+                }
             }
             if retention_open || !retained.is_empty() {
                 // The daemon terminated before our walk finished, or a batch
@@ -494,14 +576,10 @@ async fn emit_stream<Wo: std::io::Write>(
             frame = ann_rx.recv() => match frame {
                 Some(AnnotationFrame::Batch { batch }) => {
                     wait_since = tokio::time::Instant::now();
-                    for ready in reorder.offer(batch) {
-                        emit_annotated(&ready, render, sink)?;
-                    }
+                    ready.extend(reorder.offer(batch));
                 }
                 Some(AnnotationFrame::End { batches }) => {
-                    for ready in reorder.drain_in_order() {
-                        emit_annotated(&ready, render, sink)?;
-                    }
+                    ready.extend(reorder.drain_in_order());
                     if reorder.emitted == batches {
                         ann_done = true;
                     } else {
@@ -514,12 +592,10 @@ async fn emit_stream<Wo: std::io::Write>(
                 None => break 'healthy,
             },
             batch = retain_rx.recv(), if retention_open => if let Some(batch) = batch {
-                if batch.seq >= reorder.next {
-                    if retained.is_empty() {
-                        wait_since = tokio::time::Instant::now();
-                    }
-                    retained.push_back(batch);
+                if retained.is_empty() {
+                    wait_since = tokio::time::Instant::now();
                 }
+                retained.push_back(batch);
             } else {
                 retention_open = false;
                 // The terminator is on the wire — the daemon now owes its
@@ -534,18 +610,16 @@ async fn emit_stream<Wo: std::io::Write>(
     }
 
     // Degrade drain: emit everything not yet emitted, in seq order — the
-    // retained window first, then the rest of the walk as it streams in.
-    // Nothing re-emits (the watermark guards) and nothing is dropped.
+    // retained window first, then the rest of the walk as it streams in. The
+    // daemon parts render unannotated; the lint parts keep their resolved
+    // annotations (they never depended on the daemon). Nothing re-emits
+    // (emission pops retention) and nothing is dropped.
     while let Some(batch) = retained.pop_front() {
-        if batch.seq >= reorder.next {
-            emit_unannotated(&batch, render, sink)?;
-        }
+        emit_merged(&batch, None, render, sink)?;
     }
     while retention_open {
         if let Some(batch) = retain_rx.recv().await {
-            if batch.seq >= reorder.next {
-                emit_unannotated(&batch, render, sink)?;
-            }
+            emit_merged(&batch, None, render, sink)?;
         } else {
             retention_open = false;
         }
@@ -553,28 +627,92 @@ async fn emit_stream<Wo: std::io::Write>(
     Ok(true)
 }
 
-/// Emits one annotated batch's hits in order through the result sink.
-fn emit_annotated<Wo: std::io::Write>(
-    batch: &AnnotatedBatch,
+/// Emits one retained batch's hits in the walk's exact order, re-interleaving
+/// the two annotators' answers by the route mask: a lint-routed hit takes its
+/// resolved lint annotation from the batch, everything else takes the daemon's
+/// annotation — or the unannotated degrade spelling when the daemon part is
+/// absent (daemon-less stream, or a mid-exchange degrade).
+///
+/// Defensive by construction: a daemon part that runs short (a protocol
+/// violation) degrades the remaining daemon-routed hits to the unannotated
+/// spelling — never a dropped hit, never a stall.
+fn emit_merged<Wo: std::io::Write>(
+    batch: &LintedBatch,
+    daemon: Option<&AnnotatedBatch>,
     render: &GrepRender,
     sink: &mut ResultSink<Wo>,
 ) -> Result<()> {
-    for hit in &batch.hits {
-        sink.write_line(&render.annotated_line(hit))?;
+    let mut daemon_hits = daemon.map(|ann| ann.hits.iter());
+    let mut lint_hits = batch.lint.iter();
+    for (i, hit) in batch.hits.iter().enumerate() {
+        let annotated = if batch.lint_mask.get(i).copied().unwrap_or(false) {
+            lint_hits.next()
+        } else {
+            daemon_hits.as_mut().and_then(Iterator::next)
+        };
+        let line = annotated.map_or_else(
+            || render.unannotated_line(hit),
+            |ann| render.annotated_line(ann),
+        );
+        sink.write_line(&line)?;
     }
     Ok(())
 }
 
-/// Emits one retained batch's hits unannotated (the degrade spelling).
-fn emit_unannotated<Wo: std::io::Write>(
-    batch: &HitBatch,
+/// The daemon-absent streaming sink with lint routing active (ws43-04).
+///
+/// The walk's ordered batches ride the lint stage — lint-covered hits
+/// annotated by locally-spawned linters, everything else in the unannotated
+/// degrade spelling — and emit in walk order.
+///
+/// This is what makes the linter sink part of the degrade story rather than an
+/// enrichment-only extra: diagnostics-shaped lint annotation for pure-lint
+/// files works with **no daemon at all**. For a hit no linter covers the bytes
+/// are identical to [`stdout_unannotated`], so the daemon-absent stream only
+/// ever gains annotation, never loses parity.
+///
+/// # Errors
+///
+/// Returns an error if the walk fails to start (bad pattern) or a result-sink
+/// write fails. Linter faults are never errors — they degrade to pass-through
+/// hits plus advisories on the report.
+pub async fn lint_stream<Wo: std::io::Write>(
+    pattern: &str,
+    roots: &[std::path::PathBuf],
+    options: &super::engine::WalkOptions,
+    lint: LintAnnotator,
     render: &GrepRender,
     sink: &mut ResultSink<Wo>,
-) -> Result<()> {
-    for hit in &batch.hits {
-        sink.write_line(&render.unannotated_line(hit))?;
+) -> Result<DaemonStreamReport> {
+    use tokio::sync::mpsc;
+
+    let (batch_tx, batch_rx) = mpsc::channel::<HitBatch>(IN_FLIGHT_WINDOW);
+    let pattern = pattern.to_string();
+    let roots = roots.to_vec();
+    let options = options.clone();
+    let walk_task = tokio::task::spawn_blocking(move || -> Result<super::engine::WalkSummary> {
+        super::engine::walk(&pattern, &roots, &options, |batch| {
+            batch_tx
+                .blocking_send(batch)
+                .map_err(|_| anyhow::anyhow!("lint stream closed"))
+        })
+    });
+    let (staged_tx, mut staged_rx) = mpsc::channel::<LintedBatch>(IN_FLIGHT_WINDOW);
+    let lint_task = tokio::spawn(super::lint::lint_stage(Some(lint), batch_rx, staged_tx));
+
+    // Emit in walk order as the staged batches arrive — there is no second
+    // annotator to reassemble around, so ordered emission is arrival order.
+    while let Some(batch) = staged_rx.recv().await {
+        emit_merged(&batch, None, render, sink)?;
     }
-    Ok(())
+    let summary = walk_task.await.context("join walk task")??;
+    let lint_advisories = lint_task.await.context("join lint stage")?;
+    sink.flush()?;
+    Ok(DaemonStreamReport {
+        summary,
+        degraded: false,
+        lint_advisories,
+    })
 }
 
 /// The glob-side annotation exchange (ws43-03): streams `files` to the daemon

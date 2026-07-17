@@ -2251,7 +2251,9 @@ async fn run_grep(
 ) -> Result<()> {
     use catenary_cli::bridge::session::{ExcludeSet, ResolvedGlob, expand_search_paths};
     use catenary_cli::hitstream::engine::{WalkOptions, validate_inputs};
-    use catenary_cli::hitstream::{GrepRender, daemon_stream, sink, stdout_unannotated};
+    use catenary_cli::hitstream::{
+        GrepRender, LintAnnotator, daemon_stream, lint_stream, sink, stdout_unannotated,
+    };
 
     // stdin mode: no paths + a readable piped/redirected stream. A plain
     // ripgrep pass over the stream, same flags, no enrichment, no daemon.
@@ -2345,14 +2347,25 @@ async fn run_grep(
     // any result byte.
     let connection = if queried {
         let socket = catenary_cli::router::socket_path();
-        let connected = sink::connect_daemon(&socket).await.ok();
-        if connected.is_none() {
+        sink::connect_daemon(&socket).await.ok()
+    } else {
+        None
+    };
+    // The user `[linter.rule.*]` layer for the local lint sink (ws43-04).
+    // Daemon-less, the config load is load-bearing (the honesty markers) and
+    // stays a hard error; daemon-served it is best-effort — a broken config
+    // degrades to no lint routing (everything rides to the daemon, the
+    // pre-ws43-04 behavior), never a failed search.
+    let user_linters = if queried {
+        if connection.is_some() {
+            catenary_cli::config::Config::load().ok().map(|c| c.linter)
+        } else {
             emit_no_daemon_marker();
             let config =
                 catenary_cli::config::Config::load().context("load config for daemon-less grep")?;
             emit_quarantine_marker(config.quarantined.summary().as_deref());
+            Some(config.linter)
         }
-        connected
     } else {
         None
     };
@@ -2368,6 +2381,11 @@ async fn run_grep(
     };
     let render = GrepRender::new(Some(canonical_cwd.clone()));
     let mut err = cli::Output::stderr(false);
+    // The local lint annotator (ws43-04): routes lint-covered hits to
+    // locally-spawned linters. Construction is free — routing and subprocess
+    // work are lazy, so the projection paths below never pay for it.
+    let lint_annotator =
+        user_linters.map(|linters| LintAnnotator::new(linters, std::sync::Arc::clone(&fs_manager)));
 
     // ── `--count`: a CLI-side projection over the walk (context cleared, every
     // hit is a match line), no daemon, no enrichment — the retired executor's
@@ -2444,34 +2462,67 @@ async fn run_grep(
     let stream_result = if queried && !search_roots.is_empty() {
         let mut result_sink = catenary_cli::hitstream::ResultSink::new(&mut anchored_out);
         let reap_scopes = paths.is_empty().then(|| vec![canonical_cwd.clone()]);
-        match connection {
-            Some((daemon_reader, daemon_writer)) => daemon_stream(
-                &pattern,
-                &search_roots,
-                &options,
-                reap_scopes,
-                daemon_reader,
-                daemon_writer,
-                &render,
-                &mut result_sink,
-            )
-            .await
-            .map(|report| {
-                if report.degraded {
-                    // The mid-stream degrade advisory: results are complete,
-                    // enrichment is not — never silent (stderr only, so stdout
-                    // stays byte-identical to the degrade matrix's other arms).
-                    eprintln!(
-                        "[annotation stream degraded \u{2014} results complete, unenriched; \
-                         run: catenary doctor]"
-                    );
-                }
-                report.summary
-            }),
-            None => {
-                stdout_unannotated(&pattern, &search_roots, &options, &render, &mut result_sink)
+        let report = match connection {
+            Some((daemon_reader, daemon_writer)) => {
+                daemon_stream(
+                    &pattern,
+                    &search_roots,
+                    &options,
+                    reap_scopes,
+                    lint_annotator,
+                    daemon_reader,
+                    daemon_writer,
+                    &render,
+                    &mut result_sink,
+                )
+                .await
             }
-        }
+            // Daemon absent: the lint sink still annotates lint-covered hits
+            // (ws43-04 — pool-less lint work requires no daemon); everything
+            // else prints the unannotated degrade spelling, byte-identical to
+            // stdout_unannotated. The bare degrade path remains only for a
+            // config too broken to build a router (unreachable here — the
+            // daemon-less config load above is a hard error).
+            None => match lint_annotator {
+                Some(annotator) => {
+                    lint_stream(
+                        &pattern,
+                        &search_roots,
+                        &options,
+                        annotator,
+                        &render,
+                        &mut result_sink,
+                    )
+                    .await
+                }
+                None => {
+                    stdout_unannotated(&pattern, &search_roots, &options, &render, &mut result_sink)
+                        .map(|summary| catenary_cli::hitstream::DaemonStreamReport {
+                            summary,
+                            degraded: false,
+                            lint_advisories: Vec::new(),
+                        })
+                }
+            },
+        };
+        report.map(|report| {
+            if report.degraded {
+                // The mid-stream degrade advisory: results are complete,
+                // enrichment is not — never silent (stderr only, so stdout
+                // stays byte-identical to the degrade matrix's other arms).
+                eprintln!(
+                    "[annotation stream degraded \u{2014} results complete, unenriched; \
+                     run: catenary doctor]"
+                );
+            }
+            // The lint sink's degrade advisories (ws43-04): absent, wedged, or
+            // failed linters — one line per cause, stderr only, results are
+            // complete either way.
+            for advisory in &report.lint_advisories {
+                eprintln!("{advisory}");
+            }
+            report.summary
+        })
     } else {
         drop(connection);
         Ok(catenary_cli::hitstream::WalkSummary::default())

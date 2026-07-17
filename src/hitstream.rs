@@ -27,10 +27,15 @@
 //! 2. The CLI walk ([`walk`]) that walks and matches — the full `catenary grep`
 //!    flag surface since ws43-02, through the query executor's own
 //!    matcher/searcher constructors — emitting **ordered** [`HitBatch`]es of
-//!    canonical-path hits, and two sinks selectable at the seam:
-//!    [`stdout_unannotated`] (the degrade path — built first) and
+//!    canonical-path hits, and the sinks selectable at the seam:
+//!    [`stdout_unannotated`] (the degrade path — built first),
 //!    [`daemon_stream`] (batches out, annotation-batches back, ordered emission
-//!    preserved).
+//!    preserved), and [`lint_stream`] (daemon absent, lint routing active).
+//!    Since ws43-04 the grep stream feeds TWO annotator kinds: the daemon (the
+//!    stateful annotator — LSP enrichment needs the pool) and locally-spawned
+//!    linters ([`lint`] — the stateless annotator); lint-covered hits route to
+//!    the local linter sink and never touch the daemon, so lint annotation
+//!    survives with no daemon at all.
 //! 3. The daemon annotator ([`annotate_connection`]) — read batch → await
 //!    (budgeted) → write batch, a native async citizen. Since ws43-02 the
 //!    router serves the REAL enricher ([`crate::bridge::HitstreamEnricher`]:
@@ -62,6 +67,7 @@ use serde::{Deserialize, Serialize};
 pub mod annotator;
 pub mod engine;
 pub mod frame;
+pub mod lint;
 pub mod sink;
 
 pub use annotator::{BatchEnricher, PassThroughEnricher, annotate_connection, serve_passthrough};
@@ -69,8 +75,10 @@ pub use engine::{Hit, HitBatch, WalkOptions, WalkSummary, walk};
 pub use frame::{
     AnnotatedBatch, AnnotatedHit, AnnotationFrame, AnnotationVerdict, EnrichmentWeight, HitFrame,
 };
+pub use lint::{LintAnnotator, LintedBatch};
 pub use sink::{
-    DaemonStreamReport, GrepRender, ResultSink, annotate_paths, daemon_stream, stdout_unannotated,
+    DaemonStreamReport, GrepRender, ResultSink, annotate_paths, daemon_stream, lint_stream,
+    stdout_unannotated,
 };
 
 /// The IPC method string the CLI sends as the hit-stream handshake's first line.

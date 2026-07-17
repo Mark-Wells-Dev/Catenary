@@ -1,16 +1,51 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Linter feeder — the second diagnostic feeder behind the [`DiagnosticFeeder`]
-//! port (workstream 34 ticket 01).
+//! The shared standalone-linter core (ws43-04).
+//!
+//! Spawn discipline, output parsing, severity mapping, and routing —
+//! stateless, pool-less, and callable with **no daemon at all**.
+//!
+//! Two surfaces consume this core, and neither duplicates its logic:
+//!
+//! - The **daemon diagnostics pipeline** (`catenary diagnostics`), through the
+//!   [`LinterFeeder`](crate::bridge::linter::LinterFeeder) adapter in
+//!   `src/bridge/linter.rs` — the second diagnostic feeder behind the
+//!   `DiagnosticFeeder` port (workstream 34 ticket 01).
+//! - The **CLI query sink** (`catenary grep`), through
+//!   [`LintAnnotator`](crate::hitstream::lint::LintAnnotator) — lint-covered
+//!   hit batches stream to locally-spawned linters instead of the daemon
+//!   (ws43-04), so pool-less lint work never requires a daemon.
 //!
 //! The canonical internal diagnostic shape is **LSP-diagnostic JSON**
 //! (`source` / `code` / `range` / `severity` / `message`) — what the diagnostics
-//! aggregator already consumes from language servers. A linter feeder's whole
-//! job is to translate a standalone linter's output into that shape so the
-//! downstream merge/format pass runs feeder-blind. The LSP client is the
-//! protocol-native feeder and is left as-is; this module integrates the linter
-//! feeders at the diagnostics batch.
+//! aggregator already consumes from language servers. A linter adapter's whole
+//! job is to translate a standalone linter's output into that shape so every
+//! downstream pass runs feeder-blind.
+//!
+//! ## Routing — the source of truth
+//!
+//! Which linter covers which file is **config-derived, per root**:
+//!
+//! 1. The effective linter set for a root is the user `[linter.rule.*]` unioned
+//!    with the root's project `.catenary.toml` `[linter.rule.*]`, the project
+//!    winning on a name collision ([`merge_effective_linters`] — the single
+//!    merge both the daemon's
+//!    [`LspClientManager::effective_linters`](crate::lsp::LspClientManager::effective_linters)
+//!    and the CLI-side [`LintRouter`] call).
+//! 2. A root's `[linter] disable = true` drops the whole set for that root.
+//! 3. A file routes to an enabled linter when its root-relative path matches a
+//!    routing glob **or** its `#!` interpreter basename is declared
+//!    ([`FilesystemManager::linter_routes`](crate::bridge::filesystem_manager::FilesystemManager::linter_routes)
+//!    — the one routing predicate, shared by the editing gate, the diagnostics
+//!    fan-out, and the query sink).
+//!
+//! Daemon-side, the owning root comes from the registered-roots ledger;
+//! CLI-side (no ledger without a daemon), [`LintRouter`] resolves it as the
+//! enclosing worktree root
+//! ([`companions::enclosing_worktree_root`](crate::companions::enclosing_worktree_root))
+//! — the same discovery the daemon's query auto-mount uses, so both sides
+//! answer the same root for any file inside a repository.
 //!
 //! Adapters:
 //! - **Blessed** (hand-rolled, keyed by linter name): [`shellcheck`],
@@ -21,27 +56,32 @@
 //! Operational invariants every adapter owns:
 //! - **Exit code is not failure.** Linters exit nonzero when they find issues;
 //!   parsing keys on output, never on exit status.
-//! - **Fail-soft.** A linter that is not installed is skipped with one notify; a
-//!   parse failure drops that linter's diagnostics with a `warn!`. Neither ever
-//!   crashes or poisons the diagnostics batch.
+//! - **Fail-soft.** A linter that is not installed, fails to spawn, or emits
+//!   unparseable output yields a typed [`LinterRunOutcome`] the caller degrades
+//!   on — a warn plus a dropped feed daemon-side, a stderr advisory plus
+//!   pass-through hits CLI-side. Never a crash, never a poisoned batch, never a
+//!   dropped hit.
+//! - **Argv, never shell.** The linter command and its files are spawned as an
+//!   argv vector; no shell ever interprets a path.
 
 mod actionlint;
+mod router;
 mod sarif;
 mod shellcheck;
 mod yamllint;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde_json::{Value, json};
-use tracing::{debug, warn};
+use tracing::debug;
 
-use crate::bridge::filesystem_manager::FilesystemManager;
 use crate::config::LinterConfig;
-use crate::lsp::LspClientManager;
 
-/// LSP-shaped diagnostics produced by a feeder for a single file.
+pub use router::{LintJob, LintRouter};
+
+/// LSP-shaped diagnostics produced by a linter run for a single file.
 ///
 /// `diagnostics` are LSP-diagnostic JSON objects (`source` / `code` / `range` /
 /// `severity` / `message`); `command` is the producing linter's command, used
@@ -49,7 +89,7 @@ use crate::lsp::LspClientManager;
 ///
 /// A **present result with empty `diagnostics`** means the linter ran and found
 /// nothing — a verification, not an absence (bug 56 ruling 2 / ticket 06): the
-/// downstream feeder records it so the file classifies Clean. A linter that
+/// downstream consumer records it so the file classifies Clean. A linter that
 /// never completed (not installed, spawn or parse failure) emits no result for
 /// the file at all, leaving it unverified.
 pub struct FeederDiagnostics {
@@ -73,104 +113,74 @@ pub struct RawLinterDiag {
     pub diagnostic: Value,
 }
 
-/// Port: a feeder that publishes LSP-shaped diagnostics for a set of files.
+/// What one linter run did — the typed fail-soft seam.
 ///
-/// The LSP client is the protocol-native feeder (not refactored onto this
-/// trait, to avoid a risky rewrite of the diagnostics path); [`LinterFeeder`] is
-/// the subprocess-and-parse adapter that runs standalone linters.
+/// The core never logs or prints: each consumer maps the outcome onto its own
+/// degrade surface (the daemon feeder warns into the firehose, the CLI query
+/// sink advises on stderr), so the spawn/parse discipline lives here once and
+/// the reporting discipline lives with each surface.
+pub enum LinterRunOutcome {
+    /// Spawn and parse both succeeded. One [`FeederDiagnostics`] per file the
+    /// linter was handed — its diagnostics, or an empty vec for a file it found
+    /// nothing wrong with (a verification, never an absence).
+    Completed(Vec<FeederDiagnostics>),
+    /// The linter's command was not found — not installed. The caller skips it
+    /// with one notify; never a hard error.
+    NotInstalled,
+    /// The linter failed to spawn (permissions, exec format, …).
+    SpawnFailed(String),
+    /// The linter ran but its output did not parse; its diagnostics are
+    /// dropped rather than poisoning the batch.
+    ParseFailed(String),
+}
+
+/// The effective linter set for one root.
+///
+/// The user `[linter.rule.*]` unioned with the root's project
+/// `[linter.rule.*]`, the project winning on a name collision (so a project
+/// entry can override or `disable` a user-configured linter).
+///
+/// The single merge rule — the daemon's
+/// [`LspClientManager::effective_linters`](crate::lsp::LspClientManager::effective_linters)
+/// and the CLI-side [`LintRouter`] both delegate here, so query-time routing
+/// and diagnostics-time routing cannot drift.
+#[must_use]
 #[allow(
-    async_fn_in_trait,
-    reason = "single in-process adapter; the future is awaited in place in the diagnostics batch, never spawned across threads"
+    clippy::implicit_hasher,
+    reason = "both layers are config-owned std HashMaps; generalizing the hasher buys nothing"
 )]
-pub trait DiagnosticFeeder {
-    /// Produces LSP-shaped diagnostics for `files`.
-    ///
-    /// Fail-soft: an absent linter is skipped, a parse failure drops that
-    /// linter's diagnostics, and the returned set carries whatever succeeded.
-    async fn feed(&self, files: &[PathBuf]) -> Vec<FeederDiagnostics>;
-}
-
-/// The standalone-linter adapter behind the [`DiagnosticFeeder`] port.
-///
-/// Borrows the shared [`LspClientManager`] (effective linter set + per-root
-/// `disable_lint`) and [`FilesystemManager`] (root resolution) for the duration
-/// of one diagnostics batch.
-pub struct LinterFeeder<'a> {
-    manager: &'a LspClientManager,
-    fs: &'a FilesystemManager,
-}
-
-impl<'a> LinterFeeder<'a> {
-    /// Builds a feeder over the shared managers for one diagnostics batch.
-    pub const fn new(manager: &'a LspClientManager, fs: &'a FilesystemManager) -> Self {
-        Self { manager, fs }
+pub fn merge_effective_linters(
+    user: &HashMap<String, LinterConfig>,
+    project: &HashMap<String, LinterConfig>,
+) -> HashMap<String, LinterConfig> {
+    let mut linters = user.clone();
+    for (name, linter) in project {
+        linters.insert(name.clone(), linter.clone());
     }
-}
-
-impl DiagnosticFeeder for LinterFeeder<'_> {
-    async fn feed(&self, files: &[PathBuf]) -> Vec<FeederDiagnostics> {
-        // Group the batch by owning root: routing globs and the effective linter
-        // set are both per-root.
-        let mut by_root: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
-        for file in files {
-            if let Some(root) = self.fs.resolve_root(file) {
-                by_root.entry(root).or_default().push(file.clone());
-            }
-        }
-
-        let mut out = Vec::new();
-        for (root, root_files) in by_root {
-            if self.manager.is_lint_disabled(&root) {
-                continue;
-            }
-            let linters = self.manager.effective_linters(&root);
-            // Deterministic linter order for stable output.
-            let mut names: Vec<&String> = linters.keys().collect();
-            names.sort();
-            for name in names {
-                let Some(linter) = linters.get(name) else {
-                    continue;
-                };
-                if linter.disable || linter.command.is_empty() {
-                    continue;
-                }
-                let matching: Vec<PathBuf> = root_files
-                    .iter()
-                    .filter(|f| {
-                        f.strip_prefix(&root)
-                            .is_ok_and(|rel| self.fs.linter_routes(linter, f, rel))
-                    })
-                    .cloned()
-                    .collect();
-                if matching.is_empty() {
-                    continue;
-                }
-                out.extend(run_linter(name, linter, &root, &matching).await);
-            }
-        }
-        out
-    }
+    linters
 }
 
 /// Runs one linter over its matching files and translates the output.
 ///
-/// Fail-soft throughout: a not-installed linter, a spawn error, or a parse
-/// failure each yields an empty result (after one `warn!`) rather than
-/// propagating. Exit status is **not** consulted — linters exit nonzero when
-/// they find issues.
+/// The spawn discipline lives here, once, for every consumer: the command and
+/// its files are an **argv vector** (never a shell), stdin is null, output is
+/// captured, and `kill_on_drop` ties the subprocess lifetime to this future —
+/// a caller that times the future out (the CLI's annotation budget) or drops it
+/// (cancel-on-disconnect, bug 98) also stops the child.
 ///
-/// A completed run (spawn + parse both succeeded) emits one [`FeederDiagnostics`]
-/// per file it was handed — carrying that file's diagnostics, or an empty vec for
-/// a file it found nothing wrong with. An empty result is a verification, not an
-/// absence (bug 56 ruling 2 / ticket 06); the fail-soft early returns above emit
-/// nothing, so a linter that never completed leaves its files unverified rather
-/// than falsely clean.
-async fn run_linter(
+/// Exit status is **not** consulted — linters exit nonzero when they find
+/// issues. A [`LinterRunOutcome::Completed`] carries one [`FeederDiagnostics`]
+/// per file the linter was handed — with that file's diagnostics, or an empty
+/// vec for a file it found nothing wrong with (bug 56 ruling 2 / ticket 06: an
+/// empty result is a verification, not an absence). The failure outcomes emit
+/// nothing per-file, so a linter that never completed leaves its files
+/// unverified rather than falsely clean.
+pub async fn run_linter(
     name: &str,
     linter: &LinterConfig,
     root: &Path,
     files: &[PathBuf],
-) -> Vec<FeederDiagnostics> {
+) -> LinterRunOutcome {
     let mut cmd = tokio::process::Command::new(&linter.command);
     cmd.args(&linter.args);
     for file in files {
@@ -179,33 +189,18 @@ async fn run_linter(
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    // The diagnostics pipeline carries no CancellationToken; its only
-    // cancellation is the future drop on cancel-on-disconnect. Without this
-    // tokio lets the child outlive the dropped future, so an in-flight lint
-    // over the whole batch keeps running detached with its output going
-    // nowhere (bug 98). kill_on_drop ties the subprocess lifetime to this
-    // future so the disconnect stops it.
+    // Tie the subprocess to this future: a dropped or timed-out future must
+    // never leave a detached linter running with its output going nowhere
+    // (bug 98; the CLI's per-batch budget relies on this too).
     cmd.kill_on_drop(true);
 
     let output = match cmd.output().await {
         Ok(output) => output,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Not installed → ONE notify, skip (not a hard error).
-            warn!(
-                linter = name,
-                command = %linter.command,
-                "linter '{name}' not found ({}); skipping — install it or set \
-                 [linter.rule.{name}] disable = true",
-                linter.command,
-            );
-            return Vec::new();
+            return LinterRunOutcome::NotInstalled;
         }
         Err(e) => {
-            warn!(
-                linter = name,
-                "linter '{name}' failed to run: {e}; skipping"
-            );
-            return Vec::new();
+            return LinterRunOutcome::SpawnFailed(e.to_string());
         }
     };
 
@@ -213,13 +208,7 @@ async fn run_linter(
     let parsed = match parse_output(name, &stdout) {
         Ok(parsed) => parsed,
         Err(e) => {
-            // Parse failure → drop this linter's diagnostics + warn, never poison
-            // the batch.
-            warn!(
-                linter = name,
-                "linter '{name}' output parse failed: {e}; dropping its diagnostics",
-            );
-            return Vec::new();
+            return LinterRunOutcome::ParseFailed(format!("{e:#}"));
         }
     };
 
@@ -240,18 +229,20 @@ async fn run_linter(
     // Emit a per-file result for every file the linter ran against — with its
     // diagnostics, or an empty vec for a file it found nothing wrong with. The
     // empty results are the verifications (bug 56 ruling 2 / ticket 06): the
-    // feeder records them so the file classifies Clean rather than dropping to
-    // NoResults, mirroring `retrieve_diagnostics`' record-even-with-zero rule.
-    // Only reached once spawn + parse both succeed, so a linter that never
-    // completed emits nothing and leaves its files unverified.
-    files
-        .iter()
-        .map(|file| FeederDiagnostics {
-            file: file.clone(),
-            command: linter.command.clone(),
-            diagnostics: by_file.remove(file).unwrap_or_default(),
-        })
-        .collect()
+    // consumer records them so the file classifies Clean rather than dropping
+    // to NoResults, mirroring `retrieve_diagnostics`' record-even-with-zero
+    // rule. Only reached once spawn + parse both succeed, so a linter that
+    // never completed emits nothing and leaves its files unverified.
+    LinterRunOutcome::Completed(
+        files
+            .iter()
+            .map(|file| FeederDiagnostics {
+                file: file.clone(),
+                command: linter.command.clone(),
+                diagnostics: by_file.remove(file).unwrap_or_default(),
+            })
+            .collect(),
+    )
 }
 
 /// Dispatches parsing to the blessed adapter keyed by linter name, else SARIF.
@@ -262,7 +253,7 @@ async fn run_linter(
 /// # Errors
 ///
 /// Returns an error when the adapter cannot parse the output (malformed JSON,
-/// missing required structure); the caller drops + warns.
+/// missing required structure); the caller drops + degrades.
 fn parse_output(name: &str, output: &str) -> Result<Vec<RawLinterDiag>> {
     if output.trim().is_empty() {
         return Ok(Vec::new());
@@ -312,7 +303,7 @@ fn resolve_reported_file(reported: &str, root: &Path, candidates: &[PathBuf]) ->
 /// Linters report 1-based line/column; LSP ranges are 0-based, so each
 /// coordinate is decremented (saturating, so a `0` or absent coordinate maps to
 /// `0`). The diagnostics formatter adds 1 back for display.
-pub(super) fn lsp_range(start_line: u64, start_col: u64, end_line: u64, end_col: u64) -> Value {
+pub(crate) fn lsp_range(start_line: u64, start_col: u64, end_line: u64, end_col: u64) -> Value {
     json!({
         "start": { "line": to_zero_based(start_line), "character": to_zero_based(start_col) },
         "end": { "line": to_zero_based(end_line), "character": to_zero_based(end_col) },
@@ -327,7 +318,8 @@ const fn to_zero_based(n: u64) -> u64 {
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
-    reason = "tests use expect for readable assertions"
+    clippy::panic,
+    reason = "tests use expect/panic for readable assertions"
 )]
 mod tests {
     use super::*;
@@ -341,7 +333,7 @@ mod tests {
     #[test]
     fn parse_output_malformed_json_errors() {
         // A malformed blessed-adapter document surfaces an error so the runner
-        // drops + warns (fail-soft) rather than crashing the batch.
+        // reports ParseFailed (fail-soft) rather than crashing the batch.
         assert!(parse_output("shellcheck", "{not json").is_err());
         assert!(parse_output("actionlint", "{not json").is_err());
         // Unknown linter name falls to the SARIF adapter.
@@ -388,11 +380,32 @@ mod tests {
         assert_eq!(lsp_range(0, 0, 0, 0)["start"]["line"], 0);
     }
 
+    #[test]
+    fn merge_effective_linters_project_wins() {
+        let user_entry =
+            LinterConfig::new("shellcheck", vec![], vec!["**/*.sh".to_string()]).expect("compile");
+        let mut project_entry = user_entry.clone();
+        project_entry.disable = true;
+        let user: HashMap<String, LinterConfig> =
+            std::iter::once(("shellcheck".to_string(), user_entry)).collect();
+        let project: HashMap<String, LinterConfig> =
+            std::iter::once(("shellcheck".to_string(), project_entry)).collect();
+
+        let merged = merge_effective_linters(&user, &project);
+        assert!(
+            merged.get("shellcheck").is_some_and(|l| l.disable),
+            "a project entry overrides the user entry by name",
+        );
+        // With no project overlay the user entry stands.
+        let merged = merge_effective_linters(&user, &HashMap::new());
+        assert!(merged.get("shellcheck").is_some_and(|l| !l.disable));
+    }
+
     #[tokio::test]
-    async fn feed_skips_uninstalled_linter() {
+    async fn run_linter_not_installed_is_typed_not_fatal() {
         // A bogus command exercises the not-installed fail-soft path without any
-        // real linter binary: spawn fails with NotFound, run_linter returns
-        // empty, and the batch survives.
+        // real linter binary: spawn fails with NotFound and the outcome is the
+        // typed NotInstalled — the caller degrades, the batch survives.
         let linter = LinterConfig::new(
             "catenary-nonexistent-linter-xyz",
             vec![],
@@ -402,9 +415,12 @@ mod tests {
         let root = Path::new("/proj");
         let files = vec![PathBuf::from("/proj/x.sh")];
         let out = run_linter("catenary-nonexistent-linter-xyz", &linter, root, &files).await;
-        assert!(out.is_empty(), "uninstalled linter is skipped, not fatal");
-        // A linter that never ran emits nothing, so the downstream feeder records
-        // no result and the file stays unverified — never falsely `[clean]`
+        assert!(
+            matches!(out, LinterRunOutcome::NotInstalled),
+            "an uninstalled linter is a typed skip, not fatal"
+        );
+        // A linter that never ran emits nothing, so the consumer records no
+        // result and the file stays unverified — never falsely `[clean]`
         // (bug 56 ruling 2 / ticket 06). Contrast the clean-run case below.
     }
 
@@ -412,15 +428,19 @@ mod tests {
     async fn run_linter_clean_run_records_empty_result_per_file() {
         // A linter that runs to completion and reports nothing (`true` exits 0 with
         // empty stdout) is a verification: run_linter emits one result per file it
-        // was handed, each carrying empty diagnostics, so the feeder records the
+        // was handed, each carrying empty diagnostics, so the consumer records the
         // file Clean instead of dropping it (bug 56 ruling 2 / ticket 06). This is
         // the ran-and-found-nothing half of the distinction that
-        // feed_skips_uninstalled_linter covers for never-ran.
+        // run_linter_not_installed_is_typed_not_fatal covers for never-ran.
         let linter =
             LinterConfig::new("true", vec![], vec!["**/*.sh".to_string()]).expect("compile");
         let root = Path::new("/proj");
         let files = vec![PathBuf::from("/proj/a.sh"), PathBuf::from("/proj/b.sh")];
-        let out = run_linter("shellcheck", &linter, root, &files).await;
+        let LinterRunOutcome::Completed(out) =
+            run_linter("shellcheck", &linter, root, &files).await
+        else {
+            panic!("a clean run completes");
+        };
         assert_eq!(
             out.len(),
             2,
