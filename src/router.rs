@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -2706,6 +2706,21 @@ impl crate::hitstream::BatchEnricher for HitstreamAnnotator<'_> {
     }
 }
 
+/// Grace window between the MCP connection census reaching zero and the
+/// daemon's "last client disconnected" exit (pulse-03).
+///
+/// Host-driven bridge churn — SIGINT at session transitions, resumes, model
+/// switches — drops the census to zero for moments at a time; exiting on the
+/// instant zero tore down the warm LSP fleet four times in 25 minutes during
+/// the 2026-07-17 incident. The accept loop instead arms this window and
+/// exits only if the census is still zero when it expires; a connection
+/// arriving during the window disarms it. Ticket 90's abandoned-daemon exit
+/// is debounced, not replaced — a genuinely abandoned daemon still exits,
+/// one grace window late. Tests inject a smaller window via
+/// [`SessionManager::disconnect_grace_override`].
+#[cfg(unix)]
+const DISCONNECT_GRACE: Duration = Duration::from_mins(1);
+
 /// Core daemon component that manages MCP and hook socket connections.
 ///
 /// Binds two Unix domain sockets: one for MCP connections from `catenary
@@ -2738,6 +2753,16 @@ pub struct SessionManager {
     root_tracker: Option<RootTracker>,
     shutdown: CancellationToken,
     disconnect: Arc<tokio::sync::Notify>,
+    /// Grace window for the debounced last-client exit (pulse-03). Defaults
+    /// to [`DISCONNECT_GRACE`]; tests shrink it via
+    /// [`Self::disconnect_grace_override`] so expiry paths run in
+    /// milliseconds.
+    disconnect_grace: Duration,
+    /// Observability seam for the exit grace window: `true` while the window
+    /// is armed (census at zero, exit pending). Written only by
+    /// [`Self::accept_loop`]; read by tests to sequence deterministically
+    /// against arm/disarm instead of racing the clock.
+    grace_armed: AtomicBool,
     /// Receiver for worktree-deletion events from the [`crate::worktree_watch`]
     /// watcher, stashed by [`Self::with_session`] and taken once by
     /// [`Self::spawn_worktree_watch_reaper`]. `None` until `with_session` wires
@@ -2820,6 +2845,8 @@ impl SessionManager {
             root_tracker: None,
             shutdown: CancellationToken::new(),
             disconnect: Arc::new(tokio::sync::Notify::new()),
+            disconnect_grace: DISCONNECT_GRACE,
+            grace_armed: AtomicBool::new(false),
             worktree_watch_rx: std::sync::Mutex::new(None),
             config_path_override: None,
             auto_installer_override: None,
@@ -2870,6 +2897,8 @@ impl SessionManager {
             root_tracker: None,
             shutdown: CancellationToken::new(),
             disconnect: Arc::new(tokio::sync::Notify::new()),
+            disconnect_grace: DISCONNECT_GRACE,
+            grace_armed: AtomicBool::new(false),
             worktree_watch_rx: std::sync::Mutex::new(None),
             config_path_override: None,
             auto_installer_override: None,
@@ -2886,8 +2915,13 @@ impl SessionManager {
     /// responses.
     ///
     /// Returns `Ok(())` when the daemon should shut down. Three triggers:
-    /// - Last MCP client disconnected (disconnect notify, count == 0)
-    /// - `catenary stop` received on the IPC socket (shutdown token)
+    /// - Last MCP client disconnected (disconnect notify, count == 0) and the
+    ///   count is still zero when the grace window expires (pulse-03): bridge
+    ///   churn at session transitions is normal host behavior, so the exit is
+    ///   debounced by [`DISCONNECT_GRACE`] — a connection arriving during the
+    ///   window disarms it and the warm LSP fleet survives.
+    /// - `catenary stop` received on the IPC socket (shutdown token) —
+    ///   deliberate stops do not debounce.
     /// - External signal cancelled the shutdown token
     ///
     /// On exit, socket files are removed so new bridges start a fresh
@@ -2899,10 +2933,27 @@ impl SessionManager {
     pub async fn accept_loop(&self) -> Result<()> {
         use std::os::fd::AsRawFd;
 
+        // Debounced last-client exit (pulse-03): when the disconnect census
+        // hits zero this holds the deadline after which the daemon exits.
+        // `None` = disarmed. The timer future is recreated from this absolute
+        // deadline on every select pass, so the loop keeps accepting (and
+        // serving IPC) while the window runs.
+        let mut grace_deadline: Option<tokio::time::Instant> = None;
+
         loop {
+            // Copied into the timer arm so the handler bodies below can
+            // mutate the original without borrowing against its future.
+            let deadline = grace_deadline;
             tokio::select! {
                 result = self.mcp_listener.accept() => {
                     let (stream, _addr) = result.context("accept MCP connection")?;
+                    if grace_deadline.take().is_some() {
+                        self.grace_armed.store(false, Ordering::Release);
+                        info!(
+                            source = Source::DaemonLifecycle.as_str(),
+                            "grace disarmed: client connected",
+                        );
+                    }
                     let fd = stream.as_raw_fd();
                     self.handle_mcp_connection(stream, fd);
                 }
@@ -2940,6 +2991,30 @@ impl SessionManager {
                     return Ok(());
                 }
                 () = self.disconnect.notified() => {
+                    if self.connection_count.load(Ordering::Acquire) == 0
+                        && grace_deadline.is_none()
+                    {
+                        grace_deadline =
+                            Some(tokio::time::Instant::now() + self.disconnect_grace);
+                        self.grace_armed.store(true, Ordering::Release);
+                        info!(
+                            source = Source::DaemonLifecycle.as_str(),
+                            "last client disconnected — exit armed ({}s grace)",
+                            self.disconnect_grace.as_secs(),
+                        );
+                    }
+                }
+                () = async move {
+                    match deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    grace_deadline = None;
+                    self.grace_armed.store(false, Ordering::Release);
+                    // Re-check the census at expiry — the authoritative test.
+                    // A client that connected during the window (however it
+                    // was counted) keeps the daemon alive.
                     if self.connection_count.load(Ordering::Acquire) == 0 {
                         info!(
                             source = Source::DaemonLifecycle.as_str(),
@@ -3177,6 +3252,18 @@ impl SessionManager {
     #[must_use]
     pub fn ipc_path(&self) -> &Path {
         &self.ipc_socket_path
+    }
+
+    /// Shrinks the last-client-disconnect grace window (pulse-03, test-only).
+    ///
+    /// Production always debounces the last-client exit by
+    /// [`DISCONNECT_GRACE`]; tests inject a small window so expiry-path
+    /// tests run in milliseconds instead of a minute. No production caller.
+    #[cfg(test)]
+    #[must_use]
+    const fn disconnect_grace_override(mut self, grace: Duration) -> Self {
+        self.disconnect_grace = grace;
+        self
     }
 
     /// Redirect `pin`/`unpin` config persistence to `path` (bug 109, test-only).
@@ -7064,6 +7151,19 @@ mod tests {
         .expect("bind")
     }
 
+    /// Polls `cond` until it holds, capped at 5 s. Progress-aware
+    /// synchronization for the lifecycle tests — the test advances the moment
+    /// the condition holds instead of sleeping a fixed wall-clock interval.
+    async fn wait_until(what: &str, cond: impl Fn() -> bool + Send + Sync) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !cond() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("condition not reached within 5s: {what}"));
+    }
+
     // ── SocketCleanupGuard (bug 111) ───────────────────────────────
 
     /// An armed guard unlinks both socket files on drop — the failed-boot
@@ -7774,11 +7874,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_on_last_disconnect() {
+        const GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+
         let dir = tempfile::tempdir().expect("create tempdir");
         let mcp_path = mcp_socket_in(dir.path());
         let ipc_path = ipc_socket_in(dir.path());
 
-        let manager = Arc::new(bind_in(dir.path()));
+        let manager = Arc::new(bind_in(dir.path()).disconnect_grace_override(GRACE));
         let m = Arc::clone(&manager);
         let handle = tokio::spawn(async move { m.accept_loop().await });
 
@@ -7786,10 +7888,12 @@ mod tests {
         let stream = tokio::net::UnixStream::connect(&mcp_path)
             .await
             .expect("connect");
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(manager.connection_count(), 1);
+        wait_until("one connection counted", || manager.connection_count() == 1).await;
 
-        // Disconnect — last client gone, accept_loop should exit.
+        // Disconnect — last client gone, nothing reconnects, so the loop
+        // exits once the grace window expires (pulse-03: debounced, not
+        // immediate).
+        let dropped_at = std::time::Instant::now();
         drop(stream);
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
@@ -7798,6 +7902,10 @@ mod tests {
             .expect("task should not panic");
 
         assert!(result.is_ok(), "accept_loop should return Ok");
+        assert!(
+            dropped_at.elapsed() >= GRACE,
+            "exit must wait out the grace window, not fire on the disconnect",
+        );
 
         // Sockets removed so new bridges start a fresh daemon.
         assert!(
@@ -7815,7 +7923,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let mcp_path = mcp_socket_in(dir.path());
 
-        let manager = Arc::new(bind_in(dir.path()));
+        let manager = Arc::new(
+            bind_in(dir.path()).disconnect_grace_override(std::time::Duration::from_millis(50)),
+        );
         let m = Arc::clone(&manager);
         let handle = tokio::spawn(async move { m.accept_loop().await });
 
@@ -7826,18 +7936,25 @@ mod tests {
         let stream2 = tokio::net::UnixStream::connect(&mcp_path)
             .await
             .expect("connect 2");
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(manager.connection_count(), 2);
+        wait_until("two connections counted", || {
+            manager.connection_count() == 2
+        })
+        .await;
 
-        // Disconnect first — daemon should stay alive.
+        // Disconnect first — daemon should stay alive, and a non-last
+        // disconnect never arms the exit window.
         drop(stream1);
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(
             !handle.is_finished(),
             "accept_loop should still be running with one client",
         );
+        assert!(
+            !manager.grace_armed.load(Ordering::Acquire),
+            "a disconnect that leaves clients connected must not arm the exit window",
+        );
 
-        // Disconnect second — daemon should exit.
+        // Disconnect second — daemon should exit after the grace window.
         drop(stream2);
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
@@ -7845,6 +7962,110 @@ mod tests {
             .expect("accept_loop should exit within 5s")
             .expect("task should not panic");
 
+        assert!(result.is_ok(), "accept_loop should return Ok");
+    }
+
+    /// Bridge churn survival (pulse-03, acceptance 1): the census drops to
+    /// zero, the exit window arms, and a client reconnecting within the
+    /// window disarms it — the daemon (and its warm LSP fleet) survives. The
+    /// production 60 s grace stays in place so the test never races the
+    /// clock: it sequences on the armed flag, not on elapsed time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grace_window_disarmed_by_reconnect() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mcp_path = mcp_socket_in(dir.path());
+
+        let manager = Arc::new(bind_in(dir.path()));
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move { m.accept_loop().await });
+
+        let stream1 = tokio::net::UnixStream::connect(&mcp_path)
+            .await
+            .expect("connect 1");
+        wait_until("one connection counted", || manager.connection_count() == 1).await;
+
+        // Last client drops: the census hits zero and the loop arms the exit
+        // window instead of dying.
+        drop(stream1);
+        wait_until("exit window armed", || {
+            manager.grace_armed.load(Ordering::Acquire)
+        })
+        .await;
+        assert!(
+            !handle.is_finished(),
+            "arming the window must not exit the loop",
+        );
+
+        // A client returns within the window: the accept disarms the exit
+        // and the loop keeps serving.
+        let stream2 = tokio::net::UnixStream::connect(&mcp_path)
+            .await
+            .expect("connect 2");
+        wait_until("exit window disarmed", || {
+            !manager.grace_armed.load(Ordering::Acquire)
+        })
+        .await;
+        wait_until("reconnect counted", || manager.connection_count() == 1).await;
+        assert!(
+            !handle.is_finished(),
+            "reconnect within the window must keep the daemon alive",
+        );
+
+        // Deliberate stop is untouched by the debounce: the shutdown token
+        // exits immediately, grace window or not.
+        drop(stream2);
+        manager.shutdown_token().cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("accept_loop should exit within 5s")
+            .expect("task should not panic");
+        assert!(result.is_ok(), "accept_loop should return Ok");
+    }
+
+    /// The expiry re-check is authoritative (pulse-03): a census that
+    /// recovered during the window aborts the exit at expiry (here the count
+    /// is bumped directly, the same seam `stop_ack_reports_live_connection_
+    /// count` uses, so no accept ran and no disarm raced the timer), and a
+    /// later return to zero arms a fresh window that, unanswered, exits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grace_expiry_recheck_spares_recovered_census() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+
+        let manager = Arc::new(
+            bind_in(dir.path()).disconnect_grace_override(std::time::Duration::from_millis(250)),
+        );
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move { m.accept_loop().await });
+
+        // Census at zero: arm the window.
+        manager.disconnect.notify_one();
+        wait_until("exit window armed", || {
+            manager.grace_armed.load(Ordering::Acquire)
+        })
+        .await;
+
+        // The census recovers during the window without an accept — the
+        // count itself is what expiry re-checks.
+        manager.connection_count.fetch_add(1, Ordering::Relaxed);
+
+        // Expiry disarms without exiting.
+        wait_until("expiry passed without exit", || {
+            !manager.grace_armed.load(Ordering::Acquire)
+        })
+        .await;
+        assert!(
+            !handle.is_finished(),
+            "a recovered census must survive window expiry",
+        );
+
+        // Back to zero: a fresh window arms and, unanswered, exits with the
+        // last-client record.
+        manager.connection_count.fetch_sub(1, Ordering::Relaxed);
+        manager.disconnect.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("accept_loop should exit within 5s")
+            .expect("task should not panic");
         assert!(result.is_ok(), "accept_loop should return Ok");
     }
 
