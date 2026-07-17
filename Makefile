@@ -480,15 +480,16 @@ rustglob:
 # maintainer's nightly distribution channel as one word, now including the
 # bounce (the v2 release day ran an entire session against a 30-commit-stale
 # binary and daemon because the raw ritual was skipped). Prints the version
-# pair first so the skew being fixed is visible, then stops the daemon: the
-# respawn heals the rename-swap marker (misc 182), so live bridges revive
-# the NEW build and replay their sessions on their own — the bounce is safe
-# to automate. `--force` skips the TTY confirmation (the bounce is the
-# point here); no daemon running is a clean no-op.
+# pair first so the skew being fixed is visible, then bounces via `catenary
+# restart` (pulse 04): it writes no intent marker and starts the new daemon
+# itself, so the bounce works even with no live sessions and needs no manual
+# `catenary start` afterward. Live bridges see the death as a crash, heal the
+# rename-swap marker (misc 182), and reconnect to the NEW build on their own.
+# Restart never prompts; no daemon running is a clean leg of the bounce.
 install:
 	@cargo install --path . --locked
 	@catenary version
-	@catenary stop --force
+	@catenary restart
 	@$(MAKE) --no-print-directory sweep
 
 # Continuous target-dir garbage collection. Cargo never deletes artifacts, and

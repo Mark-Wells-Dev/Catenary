@@ -107,6 +107,15 @@ fn stop_daemon(state_home: &str) -> Result<()> {
     if sock.exists() {
         bail!("daemon socket still present after stop");
     }
+    // Pulse 04: `catenary stop` now declares a standing stop intent, under
+    // which a freshly spawned bridge waits connect-only and never respawns
+    // the daemon. This helper's contract is a *bounce* — the next spawned
+    // bridge must bring the daemon back with its own env (servers, roots) —
+    // so clear the marker, making the death read as a crash.
+    let marker = common::xdg_runtime_dir(state_home).join("daemon.intent");
+    if marker.exists() {
+        std::fs::remove_file(&marker).context("clear daemon.intent after stop")?;
+    }
     Ok(())
 }
 

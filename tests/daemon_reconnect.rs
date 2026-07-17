@@ -299,3 +299,183 @@ fn catenary_start_recovers_a_stopped_daemon() -> Result<()> {
     let _ = run_catenary(&state_home, &["stop", "--force"]);
     Ok(())
 }
+
+// ── The lifecycle verbs and the intent marker (pulse 04) ─────────────
+
+/// The daemon intent marker path under a test state home:
+/// `runtime_dir()/daemon.intent`.
+fn intent_marker(state_home: &str) -> PathBuf {
+    xdg_runtime_dir(state_home).join("daemon.intent")
+}
+
+/// Reads the marker's mode word (its first line), or `None` when absent.
+fn intent_mode(state_home: &str) -> Option<String> {
+    let content = std::fs::read_to_string(intent_marker(state_home)).ok()?;
+    content.lines().next().map(str::trim).map(str::to_string)
+}
+
+/// Pulse 04: `catenary stop` records the `stop` intent (stop means stop —
+/// bridges wait instead of respawning), and `catenary start` — the one resume
+/// verb — clears it before bringing the daemon back.
+#[test]
+fn stop_records_stop_intent_and_start_clears_it() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?.to_string();
+    let (ipc_sock, mcp_sock) = socket_paths(&state_home);
+
+    let up = run_catenary(&state_home, &["start"])?;
+    assert!(up.status.success(), "start must exit 0");
+    assert!(ipc_sock.exists(), "daemon up after start");
+    assert_eq!(
+        intent_mode(&state_home),
+        None,
+        "no intent marker while the daemon runs",
+    );
+
+    let stop = run_catenary(&state_home, &["stop", "--force"])?;
+    assert!(stop.status.success(), "stop must exit 0");
+    assert_eq!(
+        intent_mode(&state_home).as_deref(),
+        Some("stop"),
+        "stop must leave the `stop` intent on disk",
+    );
+    let out = String::from_utf8_lossy(&stop.stdout);
+    assert!(
+        out.contains("staying stopped"),
+        "stop teaches the new semantics, got:\n{out}",
+    );
+    assert!(wait_gone(&mcp_sock), "sockets removed after stop");
+
+    // `start` is the one resume verb: it clears the marker and brings the
+    // daemon back.
+    let resume = run_catenary(&state_home, &["start"])?;
+    assert!(resume.status.success(), "resume start must exit 0");
+    assert_eq!(
+        intent_mode(&state_home),
+        None,
+        "start must clear the stop intent",
+    );
+    assert!(ipc_sock.exists(), "daemon back up after start");
+
+    let _ = run_catenary(&state_home, &["stop", "--force"]);
+    Ok(())
+}
+
+/// Pulse 04, census-zero leg: `catenary restart` produces a running daemon
+/// when none was running, and clears a leftover stop marker so the bounce
+/// cannot be misread as a declared outage.
+#[test]
+fn restart_starts_a_daemon_at_census_zero_and_clears_leftover_marker() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?.to_string();
+    let (ipc_sock, _mcp_sock) = socket_paths(&state_home);
+
+    // Seed a leftover `stop` marker (e.g. a `stop` whose `start` never came).
+    let marker = intent_marker(&state_home);
+    std::fs::create_dir_all(marker.parent().context("marker parent")?)?;
+    std::fs::write(&marker, "stop\n2026-07-17T00:00:00Z\n")?;
+    assert!(!ipc_sock.exists(), "no daemon before restart");
+
+    let restart = run_catenary(&state_home, &["restart"])?;
+    assert!(
+        restart.status.success(),
+        "restart must exit 0, stderr:\n{}",
+        String::from_utf8_lossy(&restart.stderr),
+    );
+    let out = String::from_utf8_lossy(&restart.stdout);
+    assert!(
+        out.contains("No daemon was running"),
+        "census-zero restart names the missing old daemon, got:\n{out}",
+    );
+    assert!(
+        out.contains("Daemon started"),
+        "restart starts the new daemon itself, got:\n{out}",
+    );
+    assert!(ipc_sock.exists(), "restart must produce a running daemon");
+    assert_eq!(
+        intent_mode(&state_home),
+        None,
+        "restart must leave no marker (a leftover one is cleared)",
+    );
+
+    let _ = run_catenary(&state_home, &["stop", "--force"]);
+    Ok(())
+}
+
+/// Pulse 04: `catenary restart` bounces a running daemon — old one stopped,
+/// new one started — and leaves no intent marker behind.
+#[test]
+fn restart_bounces_a_running_daemon_without_a_marker() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?.to_string();
+    let (ipc_sock, _mcp_sock) = socket_paths(&state_home);
+
+    let up = run_catenary(&state_home, &["start"])?;
+    assert!(up.status.success(), "start must exit 0");
+    assert!(ipc_sock.exists(), "daemon up before restart");
+
+    let restart = run_catenary(&state_home, &["restart"])?;
+    assert!(
+        restart.status.success(),
+        "restart must exit 0, stderr:\n{}",
+        String::from_utf8_lossy(&restart.stderr),
+    );
+    let out = String::from_utf8_lossy(&restart.stdout);
+    assert!(
+        out.contains("Daemon stopped"),
+        "restart reports the old daemon stopped, got:\n{out}",
+    );
+    assert!(
+        out.contains("Daemon started"),
+        "restart reports the new daemon started, got:\n{out}",
+    );
+    assert!(ipc_sock.exists(), "a daemon must be running after restart");
+    assert_eq!(
+        intent_mode(&state_home),
+        None,
+        "restart writes no intent marker",
+    );
+
+    let _ = run_catenary(&state_home, &["stop", "--force"]);
+    Ok(())
+}
+
+/// Pulse 04: `catenary quit` records the `quit` intent before the daemon
+/// dies, and its output names the consequence (failed MCP server until
+/// `catenary start` plus a fresh session).
+#[test]
+fn quit_records_quit_intent() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?.to_string();
+    let (ipc_sock, mcp_sock) = socket_paths(&state_home);
+
+    let up = run_catenary(&state_home, &["start"])?;
+    assert!(up.status.success(), "start must exit 0");
+    assert!(ipc_sock.exists(), "daemon up before quit");
+
+    let quit = run_catenary(&state_home, &["quit", "--force"])?;
+    assert!(
+        quit.status.success(),
+        "quit must exit 0, stderr:\n{}",
+        String::from_utf8_lossy(&quit.stderr),
+    );
+    assert_eq!(
+        intent_mode(&state_home).as_deref(),
+        Some("quit"),
+        "quit must leave the `quit` intent on disk",
+    );
+    assert!(wait_gone(&mcp_sock), "sockets removed after quit");
+
+    // `start` resumes from a quit exactly as from a stop: marker cleared,
+    // daemon up.
+    let resume = run_catenary(&state_home, &["start"])?;
+    assert!(resume.status.success(), "start after quit must exit 0");
+    assert_eq!(
+        intent_mode(&state_home),
+        None,
+        "start must clear the quit intent",
+    );
+
+    let _ = run_catenary(&state_home, &["stop", "--force"]);
+    Ok(())
+}

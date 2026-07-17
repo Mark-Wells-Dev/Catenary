@@ -850,8 +850,8 @@ fn recognize_catenary_sub(rest: &[&str]) -> Recog {
         (Some("commands"), _) => Recog::Agent(Sub::Commands),
         (
             Some(
-                "hook" | "start" | "stop" | "debug" | "config" | "doctor" | "install" | "update"
-                | "daemon",
+                "hook" | "start" | "stop" | "restart" | "quit" | "debug" | "config" | "doctor"
+                | "install" | "update" | "daemon",
             ),
             _,
         ) => Recog::NotAgent,
@@ -5267,6 +5267,33 @@ mod tests {
     fn recognize_catenary_start_stays_not_agent() {
         assert_eq!(recognize_catenary_sub(&["start"]), Recog::NotAgent);
         assert!(deny_text("catenary start").contains("host CLI hooks"));
+    }
+
+    /// `catenary restart` / `catenary quit` (pulse 04) are daemon-lifecycle
+    /// verbs like `start`/`stop`: host-CLI-only, never agent-invocable — an
+    /// agent must not bounce the daemon or end other sessions' bridges. They
+    /// classify `NotAgent` (accurate host-CLI teaching, not an
+    /// unknown-subcommand denial), and they stay OUT of the agent-available
+    /// surface listing.
+    #[test]
+    fn recognize_catenary_restart_and_quit_stay_not_agent() {
+        assert_eq!(recognize_catenary_sub(&["restart"]), Recog::NotAgent);
+        assert_eq!(recognize_catenary_sub(&["quit"]), Recog::NotAgent);
+        assert_eq!(
+            recognize_catenary_sub(&["quit", "--force"]),
+            Recog::NotAgent,
+        );
+        assert!(deny_text("catenary restart").contains("host CLI hooks"));
+        assert!(deny_text("catenary quit").contains("host CLI hooks"));
+        assert!(deny_text("catenary quit --force").contains("host CLI hooks"));
+        // The agent-available listing in the denial must not name the
+        // host-only lifecycle verbs.
+        for verb in ["`restart`", "`quit`", "`start`", "`stop`"] {
+            assert!(
+                !CATENARY_SURFACE.contains(verb),
+                "{verb} must stay out of the agent-available surface listing",
+            );
+        }
     }
 
     // ---- Foreign regime unaffected ----

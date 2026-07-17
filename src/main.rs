@@ -346,24 +346,48 @@ enum Command {
 
     /// Start the Catenary daemon explicitly.
     ///
-    /// The counterpart to `stop`: brings the daemon up through the same
-    /// single-instance start-or-connect path the bridge uses, so a manual
-    /// `catenary stop` (or a killed daemon) has a one-command remedy without a
-    /// per-session `/mcp` reconnect. Idempotent — if a daemon is already up, it
-    /// connects, reports that, and leaves it running. Live sessions reconnect
-    /// transparently once the daemon is back (bug 80).
+    /// The counterpart to `stop` and the one resume verb (pulse 04): clears
+    /// any stop/quit intent marker, then brings the daemon up through the same
+    /// single-instance start-or-connect path the bridge uses. Idempotent — if
+    /// a daemon is already up, it connects, reports that, and leaves it
+    /// running. Bridges left waiting by a `catenary stop` resume spawning and
+    /// reconnect on their own once the marker clears.
     Start,
 
-    /// Stop the running Catenary daemon.
+    /// Stop the running Catenary daemon — and keep it stopped.
     ///
-    /// With a terminal on stdin and one or more connected sessions, prints the
-    /// session board (host, workspace roots, connected-since) and asks for
-    /// confirmation before disconnecting them — declining leaves the daemon
-    /// running. `--force` skips the prompt, as does a non-interactive stdin
-    /// (scripts, the documented upgrade flow); the post-stop reconnect warning
-    /// is unchanged.
+    /// Records the `stop` intent marker before the shutdown, so bridges wait
+    /// connect-only instead of respawning the daemon; `catenary start`
+    /// resumes, `catenary restart` bounces. With a terminal on stdin and one
+    /// or more connected sessions, prints the session board (host, workspace
+    /// roots, connected-since) and asks for confirmation before disconnecting
+    /// them — declining leaves the daemon running. `--force` skips the prompt,
+    /// as does a non-interactive stdin (scripts).
     Stop {
         /// Stop without the interactive confirmation prompt, even when live
+        /// sessions are connected.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Restart the Catenary daemon: stop, then start, in one command.
+    ///
+    /// Writes no intent marker — and clears any leftover one first — so the
+    /// old daemon's death reads as a crash and live bridges reconnect through
+    /// it. Starts the new daemon itself, so it works even with no live
+    /// sessions. No confirmation prompt: a restart is a bounce, not an
+    /// outage.
+    Restart,
+
+    /// Quit Catenary: stop the daemon and end connected bridge sessions.
+    ///
+    /// Records the `quit` intent marker before the shutdown: live bridges
+    /// exit when the socket drops, and freshly spawned ones exit immediately.
+    /// Affected sessions show catenary as a failed MCP server until
+    /// `catenary start` plus a fresh session (or a host retry). Confirms like
+    /// `stop` when live sessions are connected; `--force` skips the prompt.
+    Quit {
+        /// Quit without the interactive confirmation prompt, even when live
         /// sessions are connected.
         #[arg(long)]
         force: bool,
@@ -1108,6 +1132,20 @@ fn main() -> Result<()> {
         }
         #[cfg(not(unix))]
         Some(Command::Stop { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        #[cfg(unix)]
+        Some(Command::Restart) => {
+            let mut out = cli::Output::stdout(false);
+            build_runtime()?.block_on(run_restart(&mut out))
+        }
+        #[cfg(not(unix))]
+        Some(Command::Restart) => Err(anyhow::anyhow!("daemon mode requires Unix")),
+        #[cfg(unix)]
+        Some(Command::Quit { force }) => {
+            let mut out = cli::Output::stdout(false);
+            build_runtime()?.block_on(run_quit(&mut out, force))
+        }
+        #[cfg(not(unix))]
+        Some(Command::Quit { .. }) => Err(anyhow::anyhow!("daemon mode requires Unix")),
         #[cfg(unix)]
         Some(Command::Version) => {
             let mut out = cli::Output::stdout(false);
@@ -2067,17 +2105,25 @@ fn drain_db_at(db: &Path) -> u64 {
 
 /// Starts the Catenary daemon explicitly and idempotently (bug 80, leg 2).
 ///
-/// Delegates to [`catenary_cli::router::ensure_daemon_running`] — the same
-/// single-instance start path the bridge init uses — and prints whether a daemon
-/// was already up or a fresh one was started. Synchronous (no tokio runtime):
-/// the start path is blocking socket I/O and a process spawn.
+/// The one resume verb (pulse 04): clears any stop/quit intent marker
+/// unconditionally first, so bridges left waiting by a `catenary stop` (or
+/// exiting under a `quit`) may spawn and reconnect again. Then delegates to
+/// [`catenary_cli::router::ensure_daemon_running`] — the same single-instance
+/// start path the bridge init uses — and prints whether a daemon was already
+/// up or a fresh one was started. Synchronous (no tokio runtime): the start
+/// path is blocking socket I/O and a process spawn.
 ///
 /// # Errors
 ///
-/// Returns an error if the daemon cannot be started.
+/// Returns an error if the intent marker cannot be cleared or the daemon
+/// cannot be started.
 #[cfg(unix)]
 fn run_start(out: &mut cli::Output) -> Result<()> {
     use catenary_cli::router::DaemonStartOutcome;
+
+    // `start` is the one resume verb: clear any declared stop/quit intent
+    // before bringing the daemon up (pulse 04).
+    catenary_cli::daemon_intent::clear()?;
 
     match catenary_cli::router::ensure_daemon_running()? {
         DaemonStartOutcome::AlreadyRunning => {
@@ -2090,46 +2136,169 @@ fn run_start(out: &mut cli::Output) -> Result<()> {
     Ok(())
 }
 
-/// Stops the running Catenary daemon.
+/// Stops the running Catenary daemon — and keeps it stopped (pulse 04).
 ///
-/// Connects to the daemon's IPC socket and sends a shutdown request.
-/// If no daemon is running, prints a message and returns successfully.
+/// Records the `stop` intent marker, then connects to the daemon's IPC socket
+/// and sends a shutdown request. If no daemon is running, the intent is still
+/// recorded (stop is a declared state, not just a kill) and a message says so.
 ///
 /// With a terminal on stdin and one or more sessions on the `state.json`
 /// board, the human is shown the board (host, roots, connected-since) and
 /// asked to confirm *before* the kill — declining exits `0` with the daemon
 /// still running (feedback 08 finding 3). `force` (`--force`) and a
-/// non-interactive stdin (scripts, the documented upgrade flow) skip straight
-/// to the stop; the post-stop note (bridges respawn and reconnect on their
-/// own — bug 80) prints either way.
+/// non-interactive stdin (scripts) skip straight to the stop; the post-stop
+/// note (bridges wait for the next `catenary start`) prints either way.
+///
+/// # Errors
+///
+/// Returns an error if the intent marker cannot be written or the shutdown
+/// request fails after connecting.
+#[cfg(unix)]
+async fn run_stop(out: &mut cli::Output, force: bool) -> Result<()> {
+    if !confirm_with_live_sessions(out, force, render_stop_board, "Stop the daemon anyway?")? {
+        return Ok(());
+    }
+
+    // WRITE ORDERING IS LOAD-BEARING (pulse 04): the `stop` intent lands on
+    // disk BEFORE the shutdown request is sent, so no bridge can observe the
+    // daemon's death without the explanation already readable — a bridge that
+    // saw the socket drop first would read "crash" and respawn the daemon we
+    // are deliberately stopping.
+    catenary_cli::daemon_intent::write(catenary_cli::daemon_intent::Intent::Stop)?;
+
+    let Some(connections) = send_daemon_shutdown().await? else {
+        let _ = out.writeln(format_args!(
+            "No daemon running — stop intent recorded; bridges will wait until \
+             `catenary start`"
+        ));
+        return Ok(());
+    };
+
+    let _ = out.writeln(format_args!(
+        "Daemon stopped — and staying stopped. Run `catenary start` to resume \
+         or `catenary restart` to bounce."
+    ));
+
+    // The shutdown ack reports how many bridges were connected. Each bridge's
+    // reader sees the socket close, reads the `stop` marker, and waits
+    // connect-only — never respawning (pulse 02) — until a `catenary start`
+    // clears the marker and the bridge reattaches on its own.
+    if connections > 0 {
+        let plural = if connections == 1 { "" } else { "s" };
+        let _ = out.writeln(format_args!(
+            "note: {connections} connected session{plural} will wait and reattach at \
+             the next `catenary start`",
+        ));
+    }
+    Ok(())
+}
+
+/// Restarts the Catenary daemon: stop, then start, in one command (pulse 04).
+///
+/// Writes no intent marker — and clears any leftover one first — so the old
+/// daemon's death reads as a crash and live bridges reconnect through it
+/// (pulse 02's absent-marker path). The new daemon is started here, through
+/// the same single-instance path as `catenary start`, so the bounce works at
+/// census zero: it does not depend on any live bridge respawning it. No
+/// confirmation prompt — a restart is a bounce, not an outage.
+///
+/// # Errors
+///
+/// Returns an error if the marker cannot be cleared, the shutdown request
+/// fails after connecting, or the new daemon cannot be started.
+#[cfg(unix)]
+async fn run_restart(out: &mut cli::Output) -> Result<()> {
+    // A leftover stop/quit marker would misread this bounce as a declared
+    // outage: clear it FIRST so the death that follows reads as a crash and
+    // bridges reconnect through it.
+    catenary_cli::daemon_intent::clear()?;
+
+    if send_daemon_shutdown().await?.is_some() {
+        let _ = out.writeln(format_args!("Daemon stopped"));
+        // Wait for the old daemon's teardown to finish (its Drop removes the
+        // socket files) before starting the new one — otherwise the start
+        // probe can mistake the dying listener for a live daemon, or the old
+        // daemon's cleanup can unlink the new daemon's freshly bound sockets.
+        wait_daemon_teardown().await;
+    } else {
+        let _ = out.writeln(format_args!("No daemon was running"));
+    }
+
+    // Start the new daemon ourselves — the census-zero leg: with no live
+    // bridge around to respawn it, the restart still produces a running
+    // daemon. `AlreadyRunning` here means a bridge won the respawn race in
+    // the gap, which is the same outcome: a fresh daemon is up.
+    catenary_cli::router::ensure_daemon_running()?;
+    let _ = out.writeln(format_args!("Daemon started"));
+    Ok(())
+}
+
+/// Quits Catenary: stops the daemon and ends connected bridge sessions
+/// (pulse 04).
+///
+/// Records the `quit` intent marker, then sends the daemon shutdown. Live
+/// bridges obey the marker at socket loss and exit; freshly spawned bridges
+/// exit at spawn (pulse 02's decision table). Affected sessions show catenary
+/// as a failed MCP server until `catenary start` plus a fresh session (or a
+/// host retry). Confirms like `stop` when live sessions are connected;
+/// `--force` and a non-interactive stdin skip the prompt.
+///
+/// # Errors
+///
+/// Returns an error if the intent marker cannot be written or the shutdown
+/// request fails after connecting.
+#[cfg(unix)]
+async fn run_quit(out: &mut cli::Output, force: bool) -> Result<()> {
+    if !confirm_with_live_sessions(out, force, render_quit_board, "Quit anyway?")? {
+        return Ok(());
+    }
+
+    // WRITE ORDERING IS LOAD-BEARING (pulse 04): the `quit` intent lands on
+    // disk BEFORE the shutdown request is sent, so no bridge can observe the
+    // daemon's death without the explanation already readable — a bridge that
+    // saw the socket drop first would read "crash" and respawn the daemon
+    // instead of ending its session.
+    catenary_cli::daemon_intent::write(catenary_cli::daemon_intent::Intent::Quit)?;
+
+    let Some(connections) = send_daemon_shutdown().await? else {
+        let _ = out.writeln(format_args!(
+            "No daemon running — quit intent recorded; new bridge sessions will \
+             exit until `catenary start`"
+        ));
+        return Ok(());
+    };
+
+    let _ = out.writeln(format_args!("Daemon stopped"));
+    if connections > 0 {
+        let plural = if connections == 1 { "" } else { "s" };
+        let _ = out.writeln(format_args!(
+            "note: {connections} connected session{plural} will end — catenary shows \
+             as a failed MCP server there until `catenary start` plus a fresh \
+             session (or a host retry)",
+        ));
+    }
+    Ok(())
+}
+
+/// Sends `tool/shutdown` to the daemon over its IPC socket (pulse 04).
+///
+/// Returns `Ok(None)` when no daemon answers the socket, and
+/// `Ok(Some(connections))` — the shutdown ack's connected-bridge count — when
+/// the daemon acknowledged the stop. Shared by `stop`, `restart`, and `quit`;
+/// any intent marker must already be on disk when this is called (the
+/// load-bearing write ordering).
 ///
 /// # Errors
 ///
 /// Returns an error if the shutdown request fails after connecting.
 #[cfg(unix)]
-async fn run_stop(out: &mut cli::Output, force: bool) -> Result<()> {
+async fn send_daemon_shutdown() -> Result<Option<u64>> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    // Human-TTY confirmation: the daemon already records its connected sessions
-    // in the `state.json` snapshot, so read the board and confirm before the
-    // disconnect rather than apologizing after. Only a real terminal on stdin
-    // can answer, so a piped/redirected stdin (and `--force`) proceeds silently.
-    if !force && std::io::stdin().is_terminal() {
-        let sessions = live_session_board();
-        if !sessions.is_empty() {
-            let _ = out.writeln(format_args!("{}", render_stop_board(&sessions)));
-            if !confirm_stop(out)? {
-                let _ = out.writeln(format_args!("Left the daemon running."));
-                return Ok(());
-            }
-        }
-    }
 
     let ipc_path = catenary_cli::router::socket_path();
 
     let Ok(stream) = tokio::net::UnixStream::connect(&ipc_path).await else {
-        let _ = out.writeln(format_args!("No daemon running"));
-        return Ok(());
+        return Ok(None);
     };
 
     let (reader, mut writer) = stream.into_split();
@@ -2142,34 +2311,66 @@ async fn run_stop(out: &mut cli::Output, force: bool) -> Result<()> {
     let mut line = String::new();
     buf_reader.read_line(&mut line).await?;
 
-    let _ = out.writeln(format_args!("Daemon stopped"));
-
-    // The shutdown ack reports how many bridges were connected. Each bridge's
-    // reader sees the socket close and runs the bug-80 reconnect: respawn the
-    // daemon (connect_or_start), replay the captured initialize, resume — the
-    // host↔bridge stdio link never breaks, so no `/mcp` is needed and a
-    // deliberate stop with live sessions is really a bounce. Note it so the
-    // brief blip isn't mysterious.
     let connections = serde_json::from_str::<serde_json::Value>(line.trim())
         .ok()
         .and_then(|v| v.get("connections").and_then(serde_json::Value::as_u64))
         .unwrap_or(0);
-    if connections > 0 {
-        let plural = if connections == 1 { "" } else { "s" };
-        // Bug 80's reconnect-aware proxy made this a bounce, not a strand:
-        // each live bridge respawns the daemon and replays its session on
-        // its own — no `/mcp` needed. The old static "a bridge from an older
-        // build may need `/mcp`" guess retired here (ws41-02): a version
-        // mismatch is now *detected*, not guessed — the daemon fires one
-        // desktop interrupt and carries a persistent `catenary doctor` / TUI /
-        // `SessionStart` reminder naming the older side, so the cure is stated
-        // only when a mismatch is actually observed.
-        let _ = out.writeln(format_args!(
-            "note: {connections} connected session{plural} will respawn the daemon and \
-             reconnect on their own",
-        ));
+    Ok(Some(connections))
+}
+
+/// Waits for the stopped daemon's teardown to finish (pulse 04): polls until
+/// its socket files are gone (the daemon's Drop removes them after the
+/// graceful LSP shutdown), attempt-bounded so a wedged teardown cannot hang
+/// the verb. Best-effort — on backstop expiry the caller proceeds anyway.
+#[cfg(unix)]
+async fn wait_daemon_teardown() {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+    // Generous: a graceful LSP shutdown can take seconds under load. This
+    // backstop only trips on a genuinely wedged teardown.
+    const MAX_POLLS: u32 = 600;
+
+    let ipc_path = catenary_cli::router::socket_path();
+    let mcp_path = catenary_cli::router::mcp_socket_path();
+    for _ in 0..MAX_POLLS {
+        if !ipc_path.exists() && !mcp_path.exists() {
+            return;
+        }
+        tokio::time::sleep(POLL).await;
     }
-    Ok(())
+}
+
+/// TTY confirmation gate shared by `stop` and `quit` (pulse 04).
+///
+/// The daemon already records its connected sessions in the `state.json`
+/// snapshot, so read the board and confirm before the disconnect rather than
+/// apologizing after. Only a real terminal on stdin can answer, so a
+/// piped/redirected stdin (and `force`) proceeds silently; with live sessions
+/// the board is rendered by `render` and the human answers `prompt`. Returns
+/// whether the verb should proceed; declining prints the left-running notice.
+///
+/// # Errors
+///
+/// Returns an error if writing the prompt or reading the reply fails.
+#[cfg(unix)]
+fn confirm_with_live_sessions(
+    out: &mut cli::Output,
+    force: bool,
+    render: fn(&[catenary_cli::state_snapshot::SessionEntry]) -> String,
+    prompt: &str,
+) -> Result<bool> {
+    if force || !std::io::stdin().is_terminal() {
+        return Ok(true);
+    }
+    let sessions = live_session_board();
+    if sessions.is_empty() {
+        return Ok(true);
+    }
+    let _ = out.writeln(format_args!("{}", render(&sessions)));
+    if confirm_disconnect(out, prompt)? {
+        return Ok(true);
+    }
+    let _ = out.writeln(format_args!("Left the daemon running."));
+    Ok(false)
 }
 
 /// Reads the daemon's `state.json` snapshot and returns its session board.
@@ -2196,12 +2397,36 @@ fn live_session_board() -> Vec<catenary_cli::state_snapshot::SessionEntry> {
 /// Returns the board as a multi-line string with no trailing prompt.
 #[cfg(unix)]
 fn render_stop_board(sessions: &[catenary_cli::state_snapshot::SessionEntry]) -> String {
+    render_session_board(sessions, "lose Catenary tooling if the daemon stops")
+}
+
+/// Renders the pre-quit session board for the TTY confirmation (pulse 04):
+/// same facts as the stop board, with quit's named consequence — the sessions
+/// end, and catenary shows as a failed MCP server there until `catenary
+/// start` plus a fresh session.
+#[cfg(unix)]
+fn render_quit_board(sessions: &[catenary_cli::state_snapshot::SessionEntry]) -> String {
+    render_session_board(
+        sessions,
+        "end — catenary will show as a failed MCP server there until \
+         `catenary start` plus a fresh session",
+    )
+}
+
+/// Shared session-board renderer for the lifecycle confirmations: a header
+/// naming the count and `consequence`, then each session's client,
+/// connected-since, and workspace roots.
+#[cfg(unix)]
+fn render_session_board(
+    sessions: &[catenary_cli::state_snapshot::SessionEntry],
+    consequence: &str,
+) -> String {
     use catenary_cli::tui::format::elapsed_short;
 
     let n = sessions.len();
     let plural = if n == 1 { "" } else { "s" };
     let mut lines = vec![
-        format!("{n} connected session{plural} will lose Catenary tooling if the daemon stops:"),
+        format!("{n} connected session{plural} will {consequence}:"),
         String::new(),
     ];
     for session in sessions {
@@ -2228,7 +2453,8 @@ fn render_stop_board(sessions: &[catenary_cli::state_snapshot::SessionEntry]) ->
     lines.join("\n")
 }
 
-/// Prompts the human at the terminal: stop the daemon anyway? Defaults to *no*.
+/// Prompts the human at the terminal with `prompt` (e.g. "Stop the daemon
+/// anyway?"). Defaults to *no*.
 ///
 /// Reads one line from stdin. Only an explicit `y`/`yes` (case-insensitive)
 /// confirms; anything else — a bare Enter, `n`, or EOF — declines, so the safe
@@ -2238,10 +2464,10 @@ fn render_stop_board(sessions: &[catenary_cli::state_snapshot::SessionEntry]) ->
 ///
 /// Returns an error if writing the prompt or reading the reply fails.
 #[cfg(unix)]
-fn confirm_stop(out: &mut cli::Output) -> Result<bool> {
+fn confirm_disconnect(out: &mut cli::Output, prompt: &str) -> Result<bool> {
     use std::io::Write;
 
-    out.write_str(format_args!("\nStop the daemon anyway? [y/N] "))?;
+    out.write_str(format_args!("\n{prompt} [y/N] "))?;
     out.flush()?;
 
     let mut answer = String::new();
@@ -4240,6 +4466,70 @@ mod tests {
         assert!(
             matches!(forced.command, Some(Command::Stop { force: true })),
             "`--force` sets the skip-prompt flag",
+        );
+    }
+
+    // ── CLI restart/quit subcommand tests (pulse 04) ──────────────
+
+    #[test]
+    fn restart_parses_and_never_confirms() {
+        use clap::Parser;
+        let bare = Args::try_parse_from(["catenary", "restart"]).expect("bare restart parses");
+        assert!(
+            matches!(bare.command, Some(Command::Restart)),
+            "bare `catenary restart` parses",
+        );
+        // Restart never confirms, so there is no prompt to skip: `--force`
+        // does not parse.
+        assert!(
+            Args::try_parse_from(["catenary", "restart", "--force"]).is_err(),
+            "restart has no `--force` — it never prompts",
+        );
+    }
+
+    #[test]
+    fn quit_defaults_to_confirming() {
+        use clap::Parser;
+        let bare = Args::try_parse_from(["catenary", "quit"]).expect("bare quit parses");
+        assert!(
+            matches!(bare.command, Some(Command::Quit { force: false })),
+            "bare `catenary quit` keeps the confirmation prompt",
+        );
+        let forced =
+            Args::try_parse_from(["catenary", "quit", "--force"]).expect("quit --force parses");
+        assert!(
+            matches!(forced.command, Some(Command::Quit { force: true })),
+            "`--force` sets the skip-prompt flag",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quit_board_names_the_failed_mcp_server_consequence() {
+        use catenary_cli::state_snapshot::{ClientInfo, SessionEntry, now_iso};
+
+        let sessions = vec![SessionEntry {
+            client: ClientInfo {
+                name: "claude".to_string(),
+                version: None,
+            },
+            started_at: now_iso(),
+            roots: vec!["/home/mark/Projects/Catenary".to_string()],
+            ..SessionEntry::default()
+        }];
+
+        let board = render_quit_board(&sessions);
+        assert!(
+            board.starts_with("1 connected session will end"),
+            "quit header names the ended session: {board}",
+        );
+        assert!(
+            board.contains("failed MCP server"),
+            "quit board names the failed-MCP-server consequence: {board}",
+        );
+        assert!(
+            board.contains("`catenary start`"),
+            "quit board names the remedy: {board}",
         );
     }
 

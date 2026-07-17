@@ -504,38 +504,67 @@ full `initialize` request/response JSON, and capabilities list.
 | `--diff` | Show a unified diff for every stale host file (`hooks.json`, the constrained-bash helper) |
 | `--nocolor` | Disable colored output |
 
-### `catenary start` / `catenary stop`
+### `catenary start` / `stop` / `restart` / `quit`
 
-`catenary start` brings the daemon up explicitly — the counterpart to `stop`.
-It is idempotent: if a daemon is already running it connects, reports that, and
-leaves it running. You rarely need it, because the bridge starts (and
-transparently reconnects) the daemon on demand; it exists so a manual `stop` or
-a killed daemon has a one-command remedy without a per-session `/mcp` reconnect.
+The daemon-lifecycle verbs. Their contract rides a tiny intent marker
+(`daemon.intent` under the runtime dir) that every bridge consults when the
+daemon is unreachable — so a bridge always knows whether a dead daemon is a
+crash to recover from, a deliberate stop to wait out, or a quit to obey:
+
+| Marker | Written by | Bridges |
+|--------|------------|---------|
+| absent | a crash (or `restart`) | respawn the daemon and reconnect on their own |
+| `stop` | `catenary stop` | wait, never spawning, until `catenary start` |
+| `quit` | `catenary quit` | end their sessions (live ones at socket loss, new ones at spawn) |
+
+`catenary start` brings the daemon up explicitly and is the one resume verb:
+it clears any stop/quit marker first, then starts (or connects to) the daemon
+through the same single-instance path the bridge uses. Idempotent — if a
+daemon is already running it connects, reports that, and leaves it running.
 
 ```sh
-catenary start   # bring the daemon up (idempotent)
+catenary start   # clear any stop/quit intent, bring the daemon up (idempotent)
 ```
 
-`catenary stop` stops the running daemon. When you run it in an interactive terminal and
-sessions are still connected, it prints the session board first — each
-connected session's host, workspace root(s), and how long it has been
-connected (read from the `state.json` snapshot) — and asks for confirmation
-before disconnecting anyone. Declining (the default) exits `0` with the
-daemon left running.
+`catenary stop` stops the daemon — and keeps it stopped. It records the `stop`
+marker *before* the shutdown, so bridges wait instead of respawning; resume
+with `catenary start`, or bounce with `catenary restart`. In an interactive
+terminal with sessions still connected, it prints the session board first —
+each connected session's host, workspace root(s), and how long it has been
+connected (read from the `state.json` snapshot) — and asks for confirmation.
+Declining (the default) exits `0` with the daemon left running. `--force`
+skips the prompt, and a non-interactive stdin skips it too.
 
 ```sh
 catenary stop            # confirm before disconnecting live sessions
-catenary stop --force    # skip the prompt (scripts, upgrade flow)
+catenary stop --force    # skip the prompt (scripts)
 ```
 
-`--force` skips the prompt, and a non-interactive stdin skips it too, so
-scripts and the documented upgrade flow are unaffected. After the stop, a
-warning names how many sessions lost tooling — each needs a `/mcp` reconnect,
-since a host restart alone won't respawn the daemon.
+`catenary restart` is stop → start as one command. It writes no marker (and
+clears any leftover one), so the old daemon's death reads as a crash and live
+bridges reconnect through it — and it starts the new daemon itself, so it
+works with no sessions connected at all. No confirmation prompt: a restart is
+a bounce, not an outage. `make install` uses it to bounce onto a freshly
+installed binary.
+
+```sh
+catenary restart   # bounce: old daemon down, new daemon up, bridges reattach
+```
+
+`catenary quit` is the shutdown verb: it records the `quit` marker, then stops
+the daemon — live bridges end their sessions at socket loss, and new ones exit
+at spawn. Affected sessions show catenary as a failed MCP server until
+`catenary start` plus a fresh session (or a host retry). It confirms like
+`stop`; `--force` skips.
+
+```sh
+catenary quit            # confirm, then stop the daemon and end bridge sessions
+catenary quit --force    # skip the prompt
+```
 
 | Flag | Description |
 |------|-------------|
-| `--force` | Stop without the confirmation prompt, even with live sessions |
+| `--force` | `stop`/`quit`: skip the confirmation prompt, even with live sessions |
 
 ### `catenary version`
 
