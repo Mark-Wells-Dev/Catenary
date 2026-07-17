@@ -6432,23 +6432,36 @@ impl Drop for SessionManager {
 
 // ── Bridge proxy ────────────────────────────────────────────────────
 
-/// Maximum number of attempts to connect to the daemon.
+/// Maximum number of attempts [`ensure_daemon_running`] (`catenary start`)
+/// makes to reach a spawned daemon's socket before reporting failure.
+///
+/// This budget belongs to the explicit CLI verb only. The bridge's own connect
+/// paths retired their give-up budgets (workstream "pulse"): the bridge never
+/// kills itself, so its loops retry indefinitely via
+/// [`connect_with_tenacity`].
 const MAX_CONNECT_ATTEMPTS: u32 = 10;
 
-/// Delay between connection retry attempts.
+/// Delay between connection retry attempts in [`ensure_daemon_running`].
 const CONNECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Maximum number of full connect-or-start *rounds* a mid-session reconnect
-/// makes before giving up (bug 80, leg 1).
+/// Backoff floor for the bridge's indefinite connect loop (pulse 02).
+const CONNECT_BACKOFF_FLOOR: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Backoff cap for the bridge's indefinite connect loop (pulse 02).
+const CONNECT_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How much accumulated waiting elapses between "still waiting" progress logs
+/// in the bridge's indefinite connect loop (pulse 02).
+const WAIT_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How much accumulated waiting must pass after a daemon spawn before the
+/// bridge's connect loop concludes the spawn failed and respawns (pulse 02).
 ///
-/// A reconnect must out-persist the one-shot init: a killed daemon respawns
-/// under whatever load killed it, and under heavy contention a fresh daemon can
-/// take longer than one [`MAX_CONNECT_ATTEMPTS`] round (~1s) to bind its socket.
-/// Where init can fail and let the host retry, a stranded mid-session bridge is
-/// exactly the bug-80 orphan state — so the reconnect retries the whole
-/// start-or-connect round, attempt-structured (not wall-clock-bounded), before
-/// conceding.
-const MAX_RECONNECT_ROUNDS: u32 = 30;
+/// Long enough that a daemon binding slowly under heavy load is never doubled
+/// up on; short enough that a spawn that crashed before binding is retried
+/// promptly — the loop is indefinite, so this paces respawns rather than
+/// bounding them.
+const SPAWN_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Runs the bridge proxy: connect-or-start the daemon, then proxy
 /// stdin/stdout to/from the daemon socket.
@@ -6457,10 +6470,15 @@ const MAX_RECONNECT_ROUNDS: u32 = 30;
 /// path. This avoids any interaction between the tokio runtime's
 /// internal epoll/signal state and the blocking I/O threads.
 ///
+/// The startup connect retired its give-up budget (pulse 02): the bridge waits
+/// indefinitely for a daemon (the host owns the stdio link, so the bridge
+/// never kills itself), exiting cleanly only when the intent marker says
+/// `quit`.
+///
 /// # Errors
 ///
-/// Returns an error if the daemon cannot be started, the connection
-/// fails, or the daemon closes the connection before stdin.
+/// Returns an error if the bridge recursed into itself, the version handshake
+/// fails, or the proxy hits a genuine non-retry failure.
 #[cfg(unix)]
 pub fn run_bridge() -> Result<()> {
     // Guard against recursive spawning. If the daemon subprocess
@@ -6472,45 +6490,183 @@ pub fn run_bridge() -> Result<()> {
              re-entered the bridge path instead of the daemon path"
         );
     }
-    let stream = connect_or_start_daemon()?;
+    // Startup cannot observe stdin without consuming handshake bytes, so the
+    // stdin probe always answers "open" here — the loop runs until a daemon
+    // answers or the intent marker says quit. A host that hangs up mid-wait
+    // kills the process (or the handshake sees EOF right after connect).
+    let stream = match connect_or_start_daemon(|| true) {
+        TenaciousOutcome::Connected(stream) => stream,
+        TenaciousOutcome::StdinClosed | TenaciousOutcome::QuitRequested => return Ok(()),
+    };
     proxy_stdio(stream)
 }
 
-/// Connects to a running daemon or starts one.
-///
-/// Implements the start-or-connect sequence:
-/// 1. Try to connect to the MCP socket.
-/// 2. If connection fails and a stale socket file exists, remove it.
-/// 3. Spawn a daemon process (`catenary daemon`).
-/// 4. Retry connection with backoff.
-///
-/// # Errors
-///
-/// Returns an error if the daemon cannot be reached after all retry attempts.
+/// The outcome of the bridge's tenacious connect loop (pulse 02).
 #[cfg(unix)]
-fn connect_or_start_daemon() -> Result<std::os::unix::net::UnixStream> {
-    let mcp_path = mcp_socket_path();
-    let mut daemon_spawned = false;
+#[derive(Debug, PartialEq, Eq)]
+enum TenaciousOutcome<T> {
+    /// A daemon connection was established.
+    Connected(T),
+    /// The host's stdin closed while waiting — the only unconditional
+    /// self-exit (the host hung up; the stdio link is already gone).
+    StdinClosed,
+    /// The intent marker said `quit` — the one marker-sanctioned self-exit.
+    QuitRequested,
+}
 
-    for attempt in 0..MAX_CONNECT_ATTEMPTS {
-        if let Ok(stream) = std::os::unix::net::UnixStream::connect(&mcp_path) {
+/// Runs one indefinite connect-or-spawn wait (pulse 02).
+///
+/// The bridge never kills itself: self-exit destroys the host↔bridge stdio
+/// link from the wrong side, and recovery then depends on host mercy. So this
+/// loop retries with capped exponential backoff ([`CONNECT_BACKOFF_FLOOR`]
+/// doubling to [`CONNECT_BACKOFF_CAP`]) for as long as the host's stdin is
+/// open, consulting the daemon intent marker each tick — at socket-loss and at
+/// spawn-time alike. A marker appearing mid-wait takes effect on the next
+/// tick.
+///
+/// Decision table, consulted every tick:
+///
+/// - stdin closed → [`TenaciousOutcome::StdinClosed`] (the only unconditional
+///   self-exit).
+/// - marker `quit` → [`TenaciousOutcome::QuitRequested`] (the one
+///   marker-sanctioned self-exit), checked before connecting so a quit is
+///   obeyed promptly.
+/// - marker `stop` → connect-only: keep trying the socket, never spawn. A
+///   later `catenary start` clears the marker, so the next tick may spawn
+///   again.
+/// - marker absent → connect-or-spawn (the ordinary crash path): respawns are
+///   paced by [`SPAWN_RETRY_INTERVAL`] of accumulated waiting, so a daemon
+///   binding slowly under load is never doubled up on while a spawn that died
+///   before binding is still retried.
+///
+/// Fully closure-parameterized so the retry policy is unit-testable without
+/// sockets, daemons, or wall-clock sleeps.
+#[cfg(unix)]
+fn connect_with_tenacity<T>(
+    mut try_connect: impl FnMut() -> Option<T>,
+    mut spawn: impl FnMut() -> Result<()>,
+    mut stdin_open: impl FnMut() -> bool,
+    mut read_intent: impl FnMut() -> Option<crate::daemon_intent::Intent>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> TenaciousOutcome<T> {
+    use crate::daemon_intent::Intent;
+
+    let mut backoff = CONNECT_BACKOFF_FLOOR;
+    let mut waited_total = Duration::ZERO;
+    let mut since_progress = Duration::ZERO;
+    // Accumulated waiting since the last spawn attempt; `None` while no spawn
+    // is in flight (a spawn is then allowed immediately).
+    let mut since_spawn: Option<Duration> = None;
+    let mut waiting = false;
+
+    loop {
+        if !stdin_open() {
             info!(
                 source = Source::DaemonLifecycle.as_str(),
-                attempt, "connected to daemon",
+                "stdin closed while waiting for the daemon — ending bridge session",
             );
-            return Ok(stream);
+            return TenaciousOutcome::StdinClosed;
+        }
+        let intent = read_intent();
+        let mode = intent.map_or("absent", Intent::as_str);
+        if intent == Some(Intent::Quit) {
+            info!(
+                source = Source::DaemonLifecycle.as_str(),
+                "daemon.intent says quit — bridge obeying the one sanctioned self-exit",
+            );
+            return TenaciousOutcome::QuitRequested;
+        }
+        if let Some(stream) = try_connect() {
+            if waiting {
+                info!(
+                    source = Source::DaemonLifecycle.as_str(),
+                    waited_secs = waited_total.as_secs(),
+                    "daemon link healed — connected after waiting",
+                );
+            } else {
+                info!(
+                    source = Source::DaemonLifecycle.as_str(),
+                    "connected to daemon",
+                );
+            }
+            return TenaciousOutcome::Connected(stream);
         }
 
-        let last_attempt = attempt == MAX_CONNECT_ATTEMPTS - 1;
-        if last_attempt {
-            anyhow::bail!(
-                "failed to connect to Catenary daemon \
-                 after {MAX_CONNECT_ATTEMPTS} attempts ({})",
-                mcp_path.display(),
+        if !waiting {
+            waiting = true;
+            info!(
+                source = Source::DaemonLifecycle.as_str(),
+                mode, "daemon unreachable — bridge entering wait mode (indefinite retry)",
             );
         }
 
-        if !daemon_spawned {
+        if intent.is_none() {
+            // Connect-or-spawn: today's crash path. Spawn when none is in
+            // flight or the last one has outlived its grace window.
+            let spawn_due = since_spawn.is_none_or(|since| since >= SPAWN_RETRY_INTERVAL);
+            if spawn_due {
+                match spawn() {
+                    Ok(()) => since_spawn = Some(Duration::ZERO),
+                    Err(e) => {
+                        // A failed spawn launched nothing — leave the pacing
+                        // unarmed so the next tick retries it.
+                        debug!(
+                            source = Source::DaemonLifecycle.as_str(),
+                            error = %e,
+                            "daemon spawn attempt failed — will retry",
+                        );
+                    }
+                }
+            }
+        } else {
+            // `stop`: connect-only — never spawn while the daemon is
+            // deliberately down. Reset the pacing so a cleared marker may
+            // spawn on its very next tick.
+            since_spawn = None;
+        }
+
+        debug!(
+            source = Source::DaemonLifecycle.as_str(),
+            mode,
+            backoff_ms = backoff.as_millis(),
+            "daemon connect tick failed — backing off",
+        );
+        sleep(backoff);
+        waited_total = waited_total.saturating_add(backoff);
+        since_progress = since_progress.saturating_add(backoff);
+        if let Some(since) = &mut since_spawn {
+            *since = since.saturating_add(backoff);
+        }
+        if since_progress >= WAIT_PROGRESS_INTERVAL {
+            since_progress = Duration::ZERO;
+            info!(
+                source = Source::DaemonLifecycle.as_str(),
+                mode,
+                waited_secs = waited_total.as_secs(),
+                "still waiting for the daemon",
+            );
+        }
+        backoff = (backoff * 2).min(CONNECT_BACKOFF_CAP);
+    }
+}
+
+/// Connects to a running daemon or starts one, waiting indefinitely (pulse 02).
+///
+/// Each tick tries the MCP socket; when the intent marker allows a spawn, it
+/// clears stale socket files and spawns `catenary daemon` — the same
+/// single-instance start path `catenary start` uses. Never gives up while
+/// `stdin_open` answers true; see [`connect_with_tenacity`] for the decision
+/// table.
+#[cfg(unix)]
+fn connect_or_start_daemon(
+    stdin_open: impl FnMut() -> bool,
+) -> TenaciousOutcome<std::os::unix::net::UnixStream> {
+    let mcp_path = mcp_socket_path();
+    connect_with_tenacity(
+        || std::os::unix::net::UnixStream::connect(&mcp_path).ok(),
+        || {
+            // Clear stale socket files (a crashed daemon may leave them), then
+            // spawn through the shared path.
             if mcp_path.exists() {
                 let _ = std::fs::remove_file(&mcp_path);
             }
@@ -6518,16 +6674,11 @@ fn connect_or_start_daemon() -> Result<std::os::unix::net::UnixStream> {
             if ipc_path.exists() {
                 let _ = std::fs::remove_file(&ipc_path);
             }
-            spawn_daemon()?;
-            daemon_spawned = true;
-        }
-
-        std::thread::sleep(CONNECT_RETRY_DELAY);
-    }
-
-    anyhow::bail!(
-        "failed to connect to Catenary daemon ({})",
-        mcp_path.display(),
+            spawn_daemon()
+        },
+        stdin_open,
+        crate::daemon_intent::read,
+        std::thread::sleep,
     )
 }
 
@@ -6722,8 +6873,8 @@ fn proxy_stdio(stream: std::os::unix::net::UnixStream) -> Result<()> {
 /// write-half here and bumps `generation`. The writer (stdin) thread writes to
 /// the current half; on failure it waits on the condvar for a newer generation,
 /// then retries the pending line against the reconnected socket. `done` is set
-/// when either direction ends terminally (stdin EOF, stdout gone, or reconnect
-/// exhausted) so the other side stops.
+/// when either direction ends terminally (stdin EOF, stdout gone, or a
+/// marker-sanctioned quit) so the other side stops.
 #[cfg(unix)]
 struct SocketSlot {
     /// The current daemon write-half, or `None` once the proxy is done.
@@ -6751,15 +6902,17 @@ struct SocketSlot {
 ///   same single-instance path the init used, then replaying `init_line` —
 ///   installs the fresh write-half into the slot, bumps the generation, notifies
 ///   the writer, and resumes reading from the new socket. Reconnection is
-///   attempt-structured (bounded by [`MAX_CONNECT_ATTEMPTS`] per socket), never
-///   wall-clock-bounded.
+///   indefinite (pulse 02): capped exponential backoff for as long as stdin is
+///   open, consulting the daemon intent marker each tick — the bridge never
+///   kills itself.
 /// - **writer**: reads stdin→daemon line by line. On a write failure (the daemon
 ///   just died) it waits for a newer generation, then rewrites the same line to
 ///   the reconnected socket, so no host request is dropped by the swap.
 ///
-/// Returns `Ok(())` when stdin closes (host ended the session) or the stdout
-/// pipe breaks (host killed the process); `Err` only when reconnection is
-/// exhausted.
+/// Returns `Ok(())` when stdin closes (host ended the session), the stdout
+/// pipe breaks (host killed the process), or the intent marker says `quit`
+/// (the one marker-sanctioned self-exit); `Err` only on a genuine non-retry
+/// failure (e.g. cloning the reconnected socket).
 #[cfg(unix)]
 #[allow(
     clippy::too_many_lines,
@@ -6898,9 +7051,19 @@ fn proxy_with_reconnect(stream: std::os::unix::net::UnixStream, init_line: &str)
             }
             cvar.notify_all();
         }
-        // Reconnect: respawn the daemon (if absent) and replay init.
-        match reconnect_daemon(init_line) {
-            Ok(fresh) => {
+        // Reconnect: respawn the daemon (if absent) and replay init, waiting
+        // indefinitely — for as long as the host's stdin stays open (pulse 02).
+        // The writer thread sets `done` on stdin EOF, so the wait consults it
+        // each tick.
+        let outcome = reconnect_daemon(init_line, || {
+            let (lock, _cvar) = &*slot;
+            let s = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            !s.done
+        });
+        match outcome {
+            ReconnectOutcome::Reconnected(fresh) => {
                 let new_write = match fresh.try_clone().context("clone reconnected socket") {
                     Ok(w) => w,
                     Err(e) => break Err(e),
@@ -6917,15 +7080,23 @@ fn proxy_with_reconnect(stream: std::os::unix::net::UnixStream, init_line: &str)
                 cvar.notify_all();
                 reader = fresh;
             }
-            Err(e) => {
-                // Reconnection exhausted — stop both directions.
+            // Stdin closed mid-wait: the host hung up — a clean exit, exactly
+            // as if EOF had landed while connected.
+            ReconnectOutcome::StdinClosed => break Ok(()),
+            // The one marker-sanctioned self-exit: stop both directions and
+            // end the session cleanly.
+            ReconnectOutcome::QuitRequested => {
+                info!(
+                    source = Source::DaemonLifecycle.as_str(),
+                    "daemon.intent quit obeyed — ending bridge session",
+                );
                 let (lock, cvar) = &*slot;
                 if let Ok(mut s) = lock.lock() {
                     s.done = true;
                     s.writer = None;
                 }
                 cvar.notify_all();
-                break Err(e);
+                break Ok(());
             }
         }
     };
@@ -6936,36 +7107,41 @@ fn proxy_with_reconnect(stream: std::os::unix::net::UnixStream, init_line: &str)
     result
 }
 
+/// The outcome of a mid-session reconnect wait (pulse 02).
+#[cfg(unix)]
+enum ReconnectOutcome {
+    /// A fresh daemon socket, initialize replayed and swallowed — resume the
+    /// byte proxy on it.
+    Reconnected(std::os::unix::net::UnixStream),
+    /// The host's stdin closed mid-wait — end the session cleanly.
+    StdinClosed,
+    /// The intent marker said `quit` — end the session cleanly.
+    QuitRequested,
+}
+
 /// Reconnects to the daemon after a mid-session loss, respawning it if absent
 /// and replaying the captured initialize (bug 80, leg 1).
 ///
-/// Retries the full start-or-connect round up to [`MAX_RECONNECT_ROUNDS`] times.
-/// Each round uses [`connect_or_start_daemon`] — the exact single-instance
-/// start-or-connect path the bridge init took, so a killed daemon is respawned
-/// through the same stale-socket cleanup and attempt-bounded retry (no
-/// wall-clock bound) — then replays `init_line` against the fresh daemon and
-/// **swallows** its initialize response (the host already received one at session
-/// start; a second would corrupt the MCP stream). The extra rounds out-persist
-/// the one-shot init so a fresh daemon that binds slowly under heavy load still
-/// heals the session instead of stranding it. The fresh socket is returned ready
-/// for the resumed byte proxy.
-///
-/// # Errors
-///
-/// Returns an error only after every round fails to reach or re-handshake a
-/// daemon.
+/// The round budget retired (pulse 02): the wait is indefinite, so this never
+/// "exhausts". Each round uses [`connect_or_start_daemon`] — the exact
+/// single-instance start-or-connect path the bridge init took, itself an
+/// indefinite capped-backoff wait that consults the daemon intent marker each
+/// tick — then replays `init_line` against the fresh daemon and **swallows**
+/// its initialize response (the host already received one at session start; a
+/// second would corrupt the MCP stream). A daemon that dies mid-handshake (a
+/// respawn racing its own predecessor's teardown) just starts another round.
+/// The only exits are the fresh socket, stdin EOF (`stdin_open` answering
+/// false), and a `quit` marker.
 #[cfg(unix)]
-fn reconnect_daemon(init_line: &str) -> Result<std::os::unix::net::UnixStream> {
+fn reconnect_daemon(init_line: &str, mut stdin_open: impl FnMut() -> bool) -> ReconnectOutcome {
     use std::io::Write;
 
-    let mut last_err: Option<anyhow::Error> = None;
-    for round in 0..MAX_RECONNECT_ROUNDS {
-        let socket = match connect_or_start_daemon() {
-            Ok(s) => s,
-            Err(e) => {
-                last_err = Some(e.context("reconnect to daemon"));
-                continue;
-            }
+    let mut round: u64 = 0;
+    loop {
+        let socket = match connect_or_start_daemon(&mut stdin_open) {
+            TenaciousOutcome::Connected(s) => s,
+            TenaciousOutcome::StdinClosed => return ReconnectOutcome::StdinClosed,
+            TenaciousOutcome::QuitRequested => return ReconnectOutcome::QuitRequested,
         };
 
         // Replay the captured initialize so the fresh daemon rebuilds the MCP
@@ -6986,19 +7162,22 @@ fn reconnect_daemon(init_line: &str) -> Result<std::os::unix::net::UnixStream> {
                     source = Source::DaemonLifecycle.as_str(),
                     round, "reconnected to daemon and replayed initialize",
                 );
-                return Ok(socket);
+                return ReconnectOutcome::Reconnected(socket);
             }
             Err(e) => {
-                // The daemon we just reached died mid-handshake (a respawn racing
-                // its own predecessor's teardown). Drop it and try another round.
-                last_err = Some(e.context("replay initialize to reconnected daemon"));
+                // The daemon we just reached died mid-handshake. Pace the next
+                // round so a flapping daemon never spins this loop hot.
+                debug!(
+                    source = Source::DaemonLifecycle.as_str(),
+                    round,
+                    error = %e,
+                    "reconnected daemon died mid-handshake — retrying",
+                );
+                round += 1;
+                std::thread::sleep(CONNECT_BACKOFF_FLOOR);
             }
         }
     }
-
-    Err(last_err.unwrap_or_else(|| {
-        anyhow!("failed to reconnect to daemon after {MAX_RECONNECT_ROUNDS} rounds")
-    }))
 }
 
 /// Announces the bridge's protocol version to the daemon during the handshake
@@ -13530,5 +13709,271 @@ mod tests {
         // The router constant re-exports the protocol module's owner (ws43), so
         // the two spellings can never drift.
         assert_eq!(METHOD_HITSTREAM, crate::hitstream::HITSTREAM_METHOD);
+    }
+
+    // ── Bridge tenacity: the indefinite connect loop (pulse 02) ────────
+
+    use crate::daemon_intent::Intent;
+    use std::cell::{Cell, RefCell};
+
+    /// No marker, daemon unreachable: the loop retries far past both retired
+    /// give-up budgets (the startup 10-attempt budget and the reconnect
+    /// 30-round budget, ~300 ticks combined) without erroring, respawn
+    /// allowed, and connects the moment a socket appears.
+    #[test]
+    fn tenacity_outlives_the_retired_budgets_and_respawns() {
+        let connects = Cell::new(0u32);
+        let spawns = Cell::new(0u32);
+
+        let outcome = connect_with_tenacity(
+            || {
+                connects.set(connects.get() + 1);
+                (connects.get() > 350).then_some(())
+            },
+            || {
+                spawns.set(spawns.get() + 1);
+                Ok(())
+            },
+            || true,
+            || None,
+            |_| {},
+        );
+
+        assert_eq!(outcome, TenaciousOutcome::Connected(()));
+        assert_eq!(
+            connects.get(),
+            351,
+            "every tick tries the socket — no budget cuts the loop short",
+        );
+        assert!(spawns.get() >= 1, "the no-marker crash path may spawn");
+    }
+
+    /// The backoff starts at the floor (100 ms), doubles each tick, and caps
+    /// at 5 s.
+    #[test]
+    fn tenacity_backoff_doubles_to_cap() {
+        let connects = Cell::new(0u32);
+        let sleeps = RefCell::new(Vec::new());
+
+        let outcome = connect_with_tenacity(
+            || {
+                connects.set(connects.get() + 1);
+                (connects.get() > 10).then_some(())
+            },
+            || Ok(()),
+            || true,
+            || None,
+            |d| sleeps.borrow_mut().push(d),
+        );
+
+        assert_eq!(outcome, TenaciousOutcome::Connected(()));
+        let millis: Vec<u128> = sleeps
+            .borrow()
+            .iter()
+            .map(std::time::Duration::as_millis)
+            .collect();
+        assert_eq!(
+            millis,
+            vec![100, 200, 400, 800, 1600, 3200, 5000, 5000, 5000, 5000],
+            "capped exponential backoff: 100 ms doubling to a 5 s cap",
+        );
+    }
+
+    /// Marker `stop`: connect-only — the loop never spawns, but reattaches as
+    /// soon as a socket appears.
+    #[test]
+    fn tenacity_stop_marker_never_spawns_and_reattaches() {
+        let connects = Cell::new(0u32);
+        let spawns = Cell::new(0u32);
+
+        let outcome = connect_with_tenacity(
+            || {
+                connects.set(connects.get() + 1);
+                (connects.get() > 50).then_some(())
+            },
+            || {
+                spawns.set(spawns.get() + 1);
+                Ok(())
+            },
+            || true,
+            || Some(Intent::Stop),
+            |_| {},
+        );
+
+        assert_eq!(
+            outcome,
+            TenaciousOutcome::Connected(()),
+            "a socket appearing under `stop` is reattached to",
+        );
+        assert_eq!(spawns.get(), 0, "`stop` means never spawn");
+    }
+
+    /// A `stop` marker cleared mid-wait (a `catenary start` happened) is
+    /// picked up on the next tick: the loop may spawn again.
+    #[test]
+    fn tenacity_cleared_stop_marker_reenables_spawn() {
+        let connects = Cell::new(0u32);
+        let spawns = Cell::new(0u32);
+        let intent_reads = Cell::new(0u32);
+
+        let outcome = connect_with_tenacity(
+            || {
+                connects.set(connects.get() + 1);
+                (connects.get() > 10).then_some(())
+            },
+            || {
+                spawns.set(spawns.get() + 1);
+                Ok(())
+            },
+            || true,
+            || {
+                intent_reads.set(intent_reads.get() + 1);
+                (intent_reads.get() <= 5).then_some(Intent::Stop)
+            },
+            |_| {},
+        );
+
+        assert_eq!(outcome, TenaciousOutcome::Connected(()));
+        assert_eq!(
+            spawns.get(),
+            1,
+            "no spawn while stopped; exactly one after the marker cleared",
+        );
+    }
+
+    /// Marker `quit` at socket-loss/spawn-time: prompt exit — consulted before
+    /// the connect attempt, so nothing is tried and nothing is spawned.
+    #[test]
+    fn tenacity_quit_marker_exits_promptly() {
+        let connects = Cell::new(0u32);
+        let spawns = Cell::new(0u32);
+        let sleeps = Cell::new(0u32);
+
+        let outcome = connect_with_tenacity(
+            || {
+                connects.set(connects.get() + 1);
+                Some(())
+            },
+            || {
+                spawns.set(spawns.get() + 1);
+                Ok(())
+            },
+            || true,
+            || Some(Intent::Quit),
+            |_| sleeps.set(sleeps.get() + 1),
+        );
+
+        assert_eq!(outcome, TenaciousOutcome::QuitRequested);
+        assert_eq!(connects.get(), 0, "quit wins before the connect attempt");
+        assert_eq!(spawns.get(), 0, "quit never spawns");
+        assert_eq!(sleeps.get(), 0, "quit never waits");
+    }
+
+    /// A `quit` marker appearing mid-wait takes effect on the next tick.
+    #[test]
+    fn tenacity_quit_marker_mid_wait_takes_next_tick() {
+        let intent_reads = Cell::new(0u32);
+        let sleeps = Cell::new(0u32);
+
+        let outcome = connect_with_tenacity(
+            || None::<()>,
+            || Ok(()),
+            || true,
+            || {
+                intent_reads.set(intent_reads.get() + 1);
+                (intent_reads.get() > 3).then_some(Intent::Quit)
+            },
+            |_| sleeps.set(sleeps.get() + 1),
+        );
+
+        assert_eq!(outcome, TenaciousOutcome::QuitRequested);
+        assert_eq!(
+            sleeps.get(),
+            3,
+            "three no-marker waiting ticks, then the quit is obeyed",
+        );
+    }
+
+    /// Stdin EOF is the only unconditional self-exit: the loop ends cleanly
+    /// the tick it observes the closed stdin, however long it has waited.
+    #[test]
+    fn tenacity_stdin_eof_exits_clean() {
+        let stdin_polls = Cell::new(0u32);
+        let sleeps = Cell::new(0u32);
+
+        let outcome = connect_with_tenacity(
+            || None::<()>,
+            || Ok(()),
+            || {
+                stdin_polls.set(stdin_polls.get() + 1);
+                stdin_polls.get() <= 5
+            },
+            || None,
+            |_| sleeps.set(sleeps.get() + 1),
+        );
+
+        assert_eq!(outcome, TenaciousOutcome::StdinClosed);
+        assert_eq!(sleeps.get(), 5, "the loop exits the tick stdin closes");
+    }
+
+    /// Respawns are paced by [`SPAWN_RETRY_INTERVAL`] of accumulated waiting:
+    /// a slow-binding daemon is not doubled up on each tick, but a spawn that
+    /// died before binding IS retried once the grace lapses.
+    #[test]
+    fn tenacity_respawn_paced_by_grace_interval() {
+        let connects = Cell::new(0u32);
+        let spawns = Cell::new(0u32);
+
+        let outcome = connect_with_tenacity(
+            || {
+                connects.set(connects.get() + 1);
+                // Backoff accumulates 31.3 s over ticks 0-10, so the grace
+                // (30 s) lapses exactly once before the tick-12 connect.
+                (connects.get() > 12).then_some(())
+            },
+            || {
+                spawns.set(spawns.get() + 1);
+                Ok(())
+            },
+            || true,
+            || None,
+            |_| {},
+        );
+
+        assert_eq!(outcome, TenaciousOutcome::Connected(()));
+        assert_eq!(
+            spawns.get(),
+            2,
+            "one spawn up front, one respawn after the grace lapsed",
+        );
+    }
+
+    /// A failed spawn attempt (nothing launched) does not arm the pacing —
+    /// the very next tick retries it.
+    #[test]
+    fn tenacity_failed_spawn_retries_next_tick() {
+        let connects = Cell::new(0u32);
+        let spawns = Cell::new(0u32);
+
+        let outcome = connect_with_tenacity(
+            || {
+                connects.set(connects.get() + 1);
+                (connects.get() > 3).then_some(())
+            },
+            || {
+                spawns.set(spawns.get() + 1);
+                anyhow::bail!("exe missing mid-swap")
+            },
+            || true,
+            || None,
+            |_| {},
+        );
+
+        assert_eq!(outcome, TenaciousOutcome::Connected(()));
+        assert_eq!(
+            spawns.get(),
+            3,
+            "a spawn that launched nothing is retried every tick",
+        );
     }
 }

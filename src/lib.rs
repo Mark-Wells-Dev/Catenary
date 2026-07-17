@@ -21,6 +21,9 @@ pub mod cli;
 pub mod companions;
 /// Configuration handling for language servers and session settings.
 pub mod config;
+/// The daemon intent marker: maintainer-declared `stop`/`quit` modes the
+/// bridge's indefinite retry loops obey (workstream "pulse").
+pub mod daemon_intent;
 /// Diagnostic noise filtering for LSP server output.
 pub mod filter;
 /// Health model: typed findings shared by `catenary doctor` and the TUI.
