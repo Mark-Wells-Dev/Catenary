@@ -442,9 +442,9 @@ fn test_glob_pattern_single_match_has_no_header() -> Result<()> {
     Ok(())
 }
 
-/// The daemon still accepts multiple pattern positionals (arity 1 is enforced
-/// CLI-side, not daemon-side): each pattern's matches are listed, with no header
-/// on any of them.
+/// A brace alternation is the one-pattern spelling for several patterns
+/// (arity 1 is grammar since VERBS; ws43-03 made the CLI the only surface):
+/// every alternative's matches are listed, with no header on any of them.
 #[test]
 fn test_glob_multiple_patterns_list_without_headers() -> Result<()> {
     let dir = common::canonical_tempdir()?;
@@ -454,7 +454,7 @@ fn test_glob_multiple_patterns_list_without_headers() -> Result<()> {
     let mut bridge = spawn_no_lsp(&dir.path().to_string_lossy())?;
     bridge.initialize()?;
 
-    let text = bridge.call_tool_text("glob", &json!({ "paths": ["*.rs", "*.txt"] }))?;
+    let text = bridge.call_tool_text("glob", &json!({ "paths": ["{*.rs,*.txt}"] }))?;
 
     assert!(
         !text.contains("files match") && !text.contains("file matches"),
@@ -1223,6 +1223,83 @@ fn test_glob_dir_prints_complete_listing() -> Result<()> {
     Ok(())
 }
 
+/// The ruled weight lever on the finding's own shape (ws43-03): a plain
+/// directory listing of several files yields LISTING-weight output — each
+/// file's top-level symbols only, no nested tree (the recorded finding was
+/// 45–360KB of full outlines for plain listings) — and `--outline` restores
+/// the full tree. Pinned by SHAPE (which nodes render), not byte count.
+#[test]
+fn test_glob_listing_shape_defaults_to_listing_weight() -> Result<()> {
+    let dir = common::canonical_tempdir()?;
+    // Four files, each with a nested definition under a top-level container.
+    for f in 0..4 {
+        std::fs::write(
+            dir.path().join(format!("file_{f}.{MOCK_EXT}")),
+            format!("struct Top_{f} {{\nfn nested_{f}\n}}\n"),
+        )?;
+    }
+
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    let listing = bridge.call_tool_text(
+        "glob",
+        &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
+    )?;
+    for f in 0..4 {
+        assert!(
+            listing.contains(&format!("file_{f}.{MOCK_EXT}")),
+            "every path always lists (decision 025): {listing}"
+        );
+        assert!(
+            listing.contains(&format!("struct Top_{f} {{")),
+            "listing weight keeps each file's top-level structure: {listing}"
+        );
+        assert!(
+            !listing.contains(&format!("fn nested_{f}")),
+            "listing weight renders NO nested tree — the ruled lever: {listing}"
+        );
+    }
+
+    // `--outline` opts up to the full picture on demand.
+    let full = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "paths": [dir.path().to_string_lossy().to_string()],
+            "outline": true,
+        }),
+    )?;
+    for f in 0..4 {
+        assert!(
+            full.contains(&format!("fn nested_{f}")),
+            "--outline restores the full tree: {full}"
+        );
+    }
+    Ok(())
+}
+
+/// The single-file outline shape keeps the FULL tree as its default — the
+/// weight lever trims listings, never the explicit file read.
+#[test]
+fn test_glob_single_file_keeps_full_outline_default() -> Result<()> {
+    let dir = common::canonical_tempdir()?;
+    let file = dir.path().join(format!("nested.{MOCK_EXT}"));
+    std::fs::write(&file, "struct Outer {\nfn inner\n}\n")?;
+
+    let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
+    bridge.initialize()?;
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({ "paths": [file.to_string_lossy().to_string()] }),
+    )?;
+    assert!(
+        text.contains("struct Outer {") && text.contains("fn inner"),
+        "a single matched file defaults to its fully-expanded outline: {text}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_glob_outline_suppress() -> Result<()> {
     let dir = common::canonical_tempdir()?;
@@ -1258,8 +1335,12 @@ fn test_glob_outline_suppress() -> Result<()> {
 fn test_glob_full_expansion_nested_children() -> Result<()> {
     let dir = common::canonical_tempdir()?;
     // A file with nested definitions: Outer { contains inner }; leaf is
-    // top-level. Full expansion shows each node on its own indented line — the
-    // old `/`-collapse marker (a container shown as `Outer {/`) is gone.
+    // top-level. With `--outline`, full expansion shows each node on its own
+    // indented line — the old `/`-collapse marker (a container shown as
+    // `Outer {/`) is gone. Without it, this directory listing is a listing
+    // shape, so the ruled default is TOP-LEVEL structure only (ws43-03): the
+    // nested child stays out of the default render and `--outline` restores
+    // the full tree.
     std::fs::write(
         dir.path().join(format!("nested.{MOCK_EXT}")),
         "struct Outer {\nfn inner\n}\nfn leaf\n\n\n\n\n\n\n",
@@ -1268,9 +1349,26 @@ fn test_glob_full_expansion_nested_children() -> Result<()> {
     let mut bridge = spawn_with_mockls_and_config(&dir.path().to_string_lossy(), None)?;
     bridge.initialize()?;
 
-    let text = bridge.call_tool_text(
+    // The ruled listing-weight default: top-level symbols only, no nested tree.
+    let listing = bridge.call_tool_text(
         "glob",
         &json!({ "paths": [dir.path().to_string_lossy().to_string()] }),
+    )?;
+    assert!(
+        listing.contains("struct Outer {") && listing.contains("fn leaf"),
+        "listing weight keeps the top-level structure: {listing}"
+    );
+    assert!(
+        !listing.contains("fn inner"),
+        "listing weight shows no nested tree — `--outline` opts up: {listing}"
+    );
+
+    let text = bridge.call_tool_text(
+        "glob",
+        &json!({
+            "paths": [dir.path().to_string_lossy().to_string()],
+            "outline": true,
+        }),
     )?;
 
     // The container renders without the collapse marker; its child is expanded
@@ -2178,8 +2276,7 @@ fn test_grep_outside_roots_lsp_warning() -> Result<()> {
     Ok(())
 }
 
-/// Glob from a directory outside all workspace roots shows the LSP
-/// warning header.
+/// Glob from a directory outside all workspace roots degrades per-file.
 #[test]
 fn test_glob_outside_roots_lsp_warning() -> Result<()> {
     let root = common::canonical_tempdir()?;
@@ -2199,15 +2296,17 @@ fn test_glob_outside_roots_lsp_warning() -> Result<()> {
         &json!({ "paths": [outside.path().to_string_lossy().as_ref()] }),
     )?;
 
-    // Should contain the LSP warning.
+    // Degradation is per-file since ws43-03: an uncovered text file carries
+    // the `no outline` marker rather than a `(no LSP)` scope header — the
+    // same retirement grep made in ws43-02 (its header became the per-line
+    // `#?` marker). The listing itself stays complete.
     assert!(
-        text.contains("no LSP"),
-        "glob outside roots should show LSP warning: {text}"
+        text.contains("outside.txt  (1 line, no outline)"),
+        "glob outside roots should carry the per-file `no outline` marker: {text}"
     );
-    // Should list the file in the outside directory.
     assert!(
-        text.contains("outside.txt"),
-        "Should list file outside roots: {text}"
+        !text.contains("no LSP"),
+        "the `(no LSP)` scope header is retired (replaced by per-file markers): {text}"
     );
     Ok(())
 }

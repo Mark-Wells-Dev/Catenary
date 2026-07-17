@@ -20,7 +20,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, warn};
 
 use crate::bridge::EditingGuardrail;
-use crate::bridge::GlobOutcome;
 use crate::bridge::HookRouter;
 use crate::bridge::filesystem_manager::Root;
 use crate::bridge::session::Session;
@@ -60,15 +59,15 @@ pub fn socket_path() -> PathBuf {
         .join("catenary.sock")
 }
 
-// ── IPC request/response types for CLI tool commands ─────────────
+// ── IPC method for CLI search commands ─────────────
 //
-// Grep has no envelope types here anymore: `catenary grep` cut over to the
-// streamed hitstream engine in ws43-02 (`METHOD_HITSTREAM` below), and the
-// `tool/grep` executor arm retired with it. The glob request/response pair
-// stays until glob's own cutover (ws43-03).
-
-/// IPC method string for glob requests.
-pub const METHOD_GLOB: &str = "tool/glob";
+// No query envelope types remain here: `catenary grep` cut over to the
+// streamed hitstream engine in ws43-02 and `catenary glob` in ws43-03
+// (`METHOD_HITSTREAM` below); the `tool/grep` and `tool/glob` executor arms
+// retired with them. With the `tool/glob` arm went its per-search firehose
+// telemetry (the `search`-span shard, `glob/<ts>_<uuid>.jsonl`) — exactly as
+// grep's went in ws43-02: annotation-batch traffic is instrumented on the
+// hitstream arm instead.
 
 /// IPC method string for the ws43 hit-batch annotation stream.
 ///
@@ -81,215 +80,6 @@ pub const METHOD_GLOB: &str = "tool/glob";
 /// string is owned by the protocol module ([`crate::hitstream::HITSTREAM_METHOD`])
 /// and re-exported here.
 pub const METHOD_HITSTREAM: &str = crate::hitstream::HITSTREAM_METHOD;
-
-/// Compact, lexically-sortable UTC timestamp prefix for per-invocation search
-/// files (`grep/<ts>_<uuid>.jsonl`).
-///
-/// The firehose's per-tool reaper evicts oldest-first by this prefix, so it must
-/// sort lexically — millisecond UTC, no separators (e.g. `20260609T143210123Z`).
-fn search_timestamp() -> String {
-    chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ").to_string()
-}
-
-/// CLI-side cwd string for a search record's project field; empty when the
-/// caller reported no cwd.
-fn search_cwd(cwd: Option<&Path>) -> String {
-    cwd.map(|p| p.display().to_string()).unwrap_or_default()
-}
-
-/// IPC request payload for `catenary glob`.
-///
-/// Sent as a JSON line over the daemon IPC socket with
-/// `"method": "tool/glob"`. The daemon resolves relative paths
-/// against `cwd` before dispatching to the glob pipeline.
-///
-/// Wire format:
-/// ```json
-/// {"method": "tool/glob", "cwd": "/path", "paths": ["src/"]}
-/// ```
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct GlobRequest {
-    /// Working directory from the CLI process.
-    ///
-    /// `None` when the caller has no meaningful cwd. When absent, the
-    /// daemon falls back to searching all workspace roots.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<PathBuf>,
-    /// Literal file/directory paths.
-    ///
-    /// All positional arguments are concrete filesystem paths — the
-    /// shell is the only glob engine. Each is dispatched through the
-    /// appropriate handler (file outline, directory listing).
-    #[serde(default)]
-    pub paths: Vec<PathBuf>,
-    /// Glob patterns to exclude from results (repeatable `--exclude-pattern`).
-    ///
-    /// Empty for a query with no exclusion. Each pattern is resolved in
-    /// [`Self::to_params`] (basename → `**/<name>`, slash-bearing → `cwd`) and
-    /// matched as a union daemon-side. Accepts a lone string or an array on the
-    /// wire (a single-pattern spelling still works).
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "deserialize_string_or_seq"
-    )]
-    pub exclude: Vec<String>,
-    /// Include files ignored by `.gitignore`.
-    #[serde(default)]
-    pub include_gitignored: bool,
-    /// Include hidden files and directories.
-    #[serde(default)]
-    pub include_hidden: bool,
-    /// Return a path count instead of rendered results (`--count`).
-    #[serde(default)]
-    pub count: bool,
-}
-
-impl GlobRequest {
-    /// Resolves relative paths against `cwd` and produces a
-    /// `GlobInput`-compatible JSON value for the glob pipeline.
-    ///
-    /// - Paths are resolved against `cwd` (relative → absolute).
-    /// - `targets_hidden` is checked on paths to auto-enable
-    ///   `include_hidden` for explicit hidden targets.
-    /// - Basename `exclude` patterns (no `/`) get a `**/` prefix for
-    ///   depth-independent matching; patterns with `/` are resolved
-    ///   against `cwd`.
-    fn to_params(&self) -> serde_json::Value {
-        let mut include_hidden = self.include_hidden;
-
-        let mut params = serde_json::json!({
-            "include_gitignored": self.include_gitignored,
-            "count": self.count,
-        });
-
-        // Check for hidden targeting on relative paths.
-        for p in &self.paths {
-            let s = p.to_string_lossy();
-            if !p.is_absolute() && crate::bridge::session::ResolvedGlob::targets_hidden(&s) {
-                include_hidden = true;
-            }
-        }
-
-        // Resolve relative paths against cwd.
-        params["paths"] = serde_json::Value::Array(
-            self.paths
-                .iter()
-                .map(|p| {
-                    let s = if p.is_absolute() {
-                        p.to_string_lossy().into_owned()
-                    } else {
-                        self.cwd.as_ref().map_or_else(
-                            || p.to_string_lossy().into_owned(),
-                            |cwd| cwd.join(p).to_string_lossy().into_owned(),
-                        )
-                    };
-                    serde_json::Value::String(s)
-                })
-                .collect(),
-        );
-        params["include_hidden"] = serde_json::Value::Bool(include_hidden);
-
-        if !self.exclude.is_empty() {
-            // `--exclude-pattern` is repeatable (bug 89): resolve each pattern
-            // independently — a basename (no `/`) becomes a depth-independent
-            // `**/<name>`, a slash-bearing pattern resolves against `cwd` — and
-            // pass the whole set so every collected pattern reaches the
-            // daemon-side matcher (the bug-73 leak class — no pattern silently
-            // dropped by expansion, the named-dir walk, or `--count`).
-            params["exclude"] = serde_json::Value::Array(
-                self.exclude
-                    .iter()
-                    .map(|exclude| {
-                        let effective = if exclude.contains('/') {
-                            self.cwd.as_ref().map_or_else(
-                                || exclude.clone(),
-                                |cwd| resolve_relative(exclude, cwd),
-                            )
-                        } else {
-                            format!("**/{exclude}")
-                        };
-                        serde_json::Value::String(effective)
-                    })
-                    .collect(),
-            );
-        }
-        params
-    }
-}
-
-/// Deserializes an `exclude` field from either a single string or an array of
-/// strings.
-///
-/// `--exclude-pattern` is repeatable (bug 89), so the CLI always sends the
-/// exclude set as a JSON array. Accepting a lone string too keeps the wire
-/// tolerant of a single-pattern spelling (`"exclude": "tests/**"`), so a caller
-/// that sends one pattern the obvious way is understood rather than rejected —
-/// a scalar folds into a one-element set. A missing field yields an empty set
-/// (excludes nothing).
-fn deserialize_string_or_seq<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize;
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum StringOrSeq {
-        One(String),
-        Many(Vec<String>),
-    }
-
-    Ok(match StringOrSeq::deserialize(deserializer)? {
-        StringOrSeq::One(s) => vec![s],
-        StringOrSeq::Many(v) => v,
-    })
-}
-
-/// IPC response for `catenary glob`.
-///
-/// Returned as a JSON line over the daemon IPC socket.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct GlobResponse {
-    /// Rendered glob output (empty for a `--count` response).
-    pub output: String,
-    /// Resolved-path count, present only for a `--count` response.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub paths: Option<usize>,
-    /// Glob-pattern arguments (original spelling) that expanded to zero
-    /// matches. The CLI renders each as a loud
-    /// `no matches for pattern: <pattern>` line (misc 118). Empty for a
-    /// `--count` response and for any query where every pattern matched.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub no_match_patterns: Vec<String>,
-    /// Display paths of matched directories, for the CLI's teaching moment 4
-    /// hint (`for its listing: catenary glob '<dir>/*'`, on stderr). Empty for a
-    /// `--count` response and when no pattern matched a directory.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub dir_hints: Vec<String>,
-    /// Result basenames carrying a glob metacharacter, for the CLI's teaching
-    /// moment 3 note (the escaped `'\*.md'` spelling, on stderr). Empty for a
-    /// `--count` response and when no matched name bore a metacharacter.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub metachar_names: Vec<String>,
-    /// A usage error (an invalid pattern or argument the query never ran on).
-    /// `Some` routes the CLI to stderr + exit 2. Omitted for every successful
-    /// query, so a normal response is byte-for-byte unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// Resolves a pattern path against a base directory if it is relative.
-///
-/// Tilde-expands the pattern first. Absolute paths and `~` paths are
-/// returned as-is. Relative paths are joined to `base`.
-fn resolve_relative(pattern: &str, base: &Path) -> String {
-    let expanded = crate::bridge::expand_tilde(pattern);
-    if Path::new(&expanded).is_absolute() {
-        return expanded;
-    }
-    base.join(&expanded).to_string_lossy().into_owned()
-}
 
 /// Unlinks two bound socket files unless disarmed first.
 ///
@@ -989,44 +779,10 @@ fn root_is_ephemeral(sources: &[String]) -> bool {
             .all(|s| s.starts_with(EPHEMERAL_CONTRIBUTOR_PREFIX))
 }
 
-/// Bounds concurrent `catenary grep`/`glob` walks daemon-wide so one session's
-/// monster search cannot starve concurrent sessions (misc 140 phase 2, decision
-/// 029 §5 — a daemon-side guard, invisible to any single caller's output).
-///
-/// A shared, FIFO [`tokio::sync::Semaphore`]: each search acquires one permit for
-/// the duration of its walk and releases it before streaming results, so a burst
-/// of sessions can never pile up unbounded parallel walks that thrash the daemon
-/// — excess searches queue fairly and the runtime keeps serving other sessions'
-/// requests. The permit count leaves headroom below saturation.
-#[cfg(unix)]
-#[derive(Clone)]
-struct SearchLimiter {
-    semaphore: Arc<tokio::sync::Semaphore>,
-}
-
-#[cfg(unix)]
-impl SearchLimiter {
-    /// Creates a limiter with `permits` concurrent-search slots (at least one).
-    fn new(permits: usize) -> Self {
-        Self {
-            semaphore: Arc::new(tokio::sync::Semaphore::new(permits.max(1))),
-        }
-    }
-
-    /// A limiter sized to the host's parallelism — the default daemon guard.
-    fn with_default_permits() -> Self {
-        let permits = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-        Self::new(permits)
-    }
-
-    /// Acquires a search permit, awaiting a free slot. The owned permit is held
-    /// for the walk's duration and released on drop. `None` only if the
-    /// semaphore were closed (it never is) — the caller then proceeds unlimited,
-    /// which is safe.
-    async fn acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        Arc::clone(&self.semaphore).acquire_owned().await.ok()
-    }
-}
+// The `SearchLimiter` (misc 140 phase 2's daemon-wide walk bound) retired with
+// the ws43-03 cutover: no daemon-side query walk remains for either verb, so
+// there is nothing left to bound — annotation batches are already granular and
+// budgeted per batch.
 
 /// Per-root diagnose admission control (misc 197 stage 1, re-keyed to the root in
 /// root-ownership stage 3).
@@ -1210,9 +966,6 @@ struct HookDispatchContext {
     /// `Session` (per-session state) and `HookRouter` (turn counter,
     /// debounce).
     sessions: Arc<std::sync::Mutex<HashMap<String, SessionEntry>>>,
-    /// Bounds concurrent grep/glob walks so one session's monster search cannot
-    /// starve the others (misc 140 phase 2).
-    search_limiter: SearchLimiter,
     /// Daemon's primary session — used as the template for creating
     /// per-session sessions via [`Session::new_for_daemon`].
     primary: Arc<Session>,
@@ -2896,33 +2649,36 @@ async fn ensure_ephemeral_mounts(
     }
 }
 
-/// The daemon-side annotator behind the `tool/hitstream` dispatch arm (ws43-02).
+/// The daemon-side annotator behind the `tool/hitstream` dispatch arm
+/// (ws43-02 grep, ws43-03 glob).
 ///
-/// Wraps the bridge's [`crate::bridge::GrepHitEnricher`] (the grep executor's
-/// LSP enrichment, migrated) with the router-level query auto-mount: before a
-/// batch is enriched, [`ensure_ephemeral_mounts`] runs over the batch's
-/// distinct canonical hit paths, so an out-of-root batch is served by the
-/// freshly-mounted root's server — the same pre-execute mount the `tool/grep`
-/// arm performs, keyed on the canonical paths the batches carry (the CLI
-/// canonicalizes at the walk seam). The sensitive-path gate (ws43-05) lives
-/// inside `ensure_ephemeral_mounts` and rides along unweakened: a refused
-/// mount leaves the hit streaming, unenriched.
+/// Wraps the bridge's [`crate::bridge::HitstreamEnricher`] (the retired query
+/// executors' LSP enrichment, migrated) with the router-level query
+/// auto-mount: before a batch is enriched, [`ensure_ephemeral_mounts`] runs
+/// over the batch's distinct canonical hit paths, so an out-of-root batch is
+/// served by the freshly-mounted root's server — the same pre-execute mount
+/// the retired `tool/grep`/`tool/glob` arms performed, keyed on the canonical
+/// paths the batches carry (the CLI canonicalizes at the walk seam).
+/// Mount-on-query thus rides the annotation batches for BOTH verbs. The
+/// sensitive-path gate (ws43-05) lives inside `ensure_ephemeral_mounts` and
+/// rides along unweakened: a refused mount leaves the hit streaming,
+/// unenriched.
 ///
 /// The whole call — mount, nudge, enrichment — runs under the annotator's
 /// per-batch budget ([`crate::hitstream::ANNOTATION_BATCH_BUDGET`]): a cold
 /// mount or a slow settle blows the budget into a pass-through verdict on a
 /// complete batch (degrade-only), and later batches find the mount warm.
 #[cfg(unix)]
-struct HitstreamGrepAnnotator<'a> {
+struct HitstreamAnnotator<'a> {
     /// Dispatch context for the auto-mount (root tracker, ephemeral mounts).
     ctx: &'a HookDispatchContext,
-    /// The migrated grep enrichment (pool readiness, WS31 nudge, `#scope`
-    /// anchors).
-    inner: crate::bridge::GrepHitEnricher,
+    /// The migrated enrichment (pool readiness, WS31 nudge, `#scope` anchors,
+    /// weighted outlines).
+    inner: crate::bridge::HitstreamEnricher,
 }
 
 #[cfg(unix)]
-impl crate::hitstream::BatchEnricher for HitstreamGrepAnnotator<'_> {
+impl crate::hitstream::BatchEnricher for HitstreamAnnotator<'_> {
     /// The walk-level observation nudge (ws43-02 reap parity) delegates
     /// straight to the migrated enricher — no auto-mount here: observations
     /// are coherence bookkeeping for roots already served, not a query that
@@ -2935,6 +2691,7 @@ impl crate::hitstream::BatchEnricher for HitstreamGrepAnnotator<'_> {
         &self,
         hits: Vec<crate::hitstream::WireHit>,
         observed: Vec<(PathBuf, i64)>,
+        weight: Option<crate::hitstream::EnrichmentWeight>,
     ) -> Result<Vec<crate::hitstream::frame::AnnotatedHit>> {
         // The batch's distinct files are the touched paths — dedup keeps the
         // mount pass linear in files, not hits.
@@ -2945,7 +2702,7 @@ impl crate::hitstream::BatchEnricher for HitstreamGrepAnnotator<'_> {
             .into_iter()
             .collect();
         ensure_ephemeral_mounts(self.ctx, &touched, Instant::now(), "").await;
-        self.inner.enrich(hits, observed).await
+        self.inner.enrich(hits, observed, weight).await
     }
 }
 
@@ -3551,7 +3308,6 @@ impl SessionManager {
 
         self.hook_ctx = Some(HookDispatchContext {
             sessions,
-            search_limiter: SearchLimiter::with_default_permits(),
             primary: session,
             _logging: self.logging.clone(),
             root_tracker: Some(root_tracker),
@@ -5006,105 +4762,6 @@ fn merged_nudge_message(merged: &[PathBuf]) -> String {
     }
 }
 
-// ── Daemon-less in-process search (bug 80, leg 4) ────────────────────
-//
-// When the daemon is down, `catenary glob` degrades honestly: it runs the
-// daemon's own search pipeline in-process with no LSP manager, so stdout is
-// byte-identical to a daemon-served answer over a tree with no language-server
-// coverage. This is the in-process twin of the `METHOD_GLOB` daemon dispatch
-// arm — same `to_params`, same `execute`, same outcome→response conversion
-// (the `no_match_indices` remap) — so the two paths cannot drift. The honesty
-// marker (`[no daemon …]`) is the CLI's responsibility and lives on stderr
-// only; this produces the stdout body unchanged. Grep's twin retired with the
-// ws43-02 cutover: daemon-less `catenary grep` is now simply the hitstream
-// engine's unannotated sink — the CLI owns the walk in both modes.
-
-/// A daemon-less search result paired with an optional config-degradation
-/// advisory (bug 110).
-///
-/// `glob` never consumes the `[commands]` section, so a quarantined
-/// section must only degrade *loudly*, never fatally: the search still runs on
-/// the valid config remainder, and `quarantine_warning` — when present — carries
-/// the single stderr line the CLI prints once per invocation to name the
-/// quarantined section(s). Kept off the wire [`GlobResponse`]
-/// type: the advisory is a daemon-less-CLI concern, printed at the `print_stderr`
-/// boundary in `main.rs`, not part of the daemon protocol.
-#[cfg(unix)]
-pub struct DaemonlessOutcome<T> {
-    /// The search response the daemon would have built.
-    pub response: T,
-    /// A single stderr advisory naming any quarantined config section(s), or
-    /// `None` on a clean load. Printed once per CLI invocation.
-    pub quarantine_warning: Option<String>,
-}
-
-/// Runs a `catenary glob` request in-process, daemon-less (bug 80, leg 4).
-///
-/// The in-process twin of the `METHOD_GLOB` daemon arm: same [`GlobRequest::to_params`],
-/// same `execute`, same zero-match index→original-spelling remap. Returns the
-/// [`GlobResponse`] the daemon would build for a tree with no LSP coverage,
-/// paired with any config-quarantine advisory (bug 110) — glob never consumes
-/// `[commands]`, so a quarantined section only degrades loudly.
-///
-/// # Errors
-///
-/// Returns an error if the config cannot be loaded or the glob pipeline faults.
-#[cfg(unix)]
-pub async fn run_glob_daemon_less(req: &GlobRequest) -> Result<DaemonlessOutcome<GlobResponse>> {
-    let config = crate::config::Config::load().context("load config for daemon-less glob")?;
-    let quarantine_warning = config.quarantined.summary();
-    let search = crate::bridge::DaemonlessSearch::from_config(config);
-
-    let params = req.to_params();
-    let cancel = CancellationToken::new();
-    let outcome = search.glob.execute(&params, None, &cancel).await;
-
-    let response = match outcome {
-        Ok(GlobOutcome::Rendered {
-            output,
-            no_match_indices,
-            dir_hints,
-            metachar_names,
-        }) => {
-            let no_match_patterns = no_match_indices
-                .into_iter()
-                .filter_map(|i| req.paths.get(i))
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect();
-            GlobResponse {
-                output,
-                paths: None,
-                no_match_patterns,
-                dir_hints,
-                metachar_names,
-                error: None,
-            }
-        }
-        Ok(GlobOutcome::Count { paths }) => GlobResponse {
-            output: String::new(),
-            paths: Some(paths),
-            no_match_patterns: Vec::new(),
-            dir_hints: Vec::new(),
-            metachar_names: Vec::new(),
-            error: None,
-        },
-        // A usage error (invalid pattern/argument): stderr + exit 2 at the CLI.
-        Err(e) => GlobResponse {
-            output: String::new(),
-            paths: None,
-            no_match_patterns: Vec::new(),
-            dir_hints: Vec::new(),
-            metachar_names: Vec::new(),
-            error: Some(format!("{e:#}")),
-        },
-    };
-
-    Ok(DaemonlessOutcome {
-        response,
-        quarantine_warning,
-    })
-}
-
 /// Races `pipeline` against client disconnect (bug 24): resolves `Some(outcome)`
 /// when the pipeline completes first, `None` when the client's read half
 /// completes first (EOF, error, or any stray byte — a well-behaved client
@@ -5804,26 +5461,30 @@ async fn handle_hook_dispatch(
 
     // ── Hit-batch annotation stream (ws43) ──────────────────────
     //
-    // `tool/hitstream` is opened by `catenary grep` — since ws43-02 the ONLY
-    // grep surface the daemon serves (the `tool/grep` executor arm retired).
-    // The method line has already been read; the CLI now streams `HitFrame`
-    // batches on this same connection. The daemon annotates each batch under
-    // budget with the REAL grep enrichment (the executor's LSP enrichment,
-    // migrated into [`crate::bridge::GrepHitEnricher`]) and streams
-    // `AnnotationFrame` batches back, preserving batch order. The per-batch
-    // WS31 hit nudge and the query auto-mount (with its ws43-05 sensitive-path
-    // gate) ride each annotation call, keyed on the canonical hit paths the
-    // batches carry; the walk-level observation set on the `End` terminator
-    // feeds the executor's once-per-walk nudge/reap rule (`observe_walk`). A
-    // malformed frame or a socket fault tears the connection down; the CLI,
-    // seeing an incomplete annotation stream, completes its results
-    // unannotated in place — the same output as daemon-absent (degrade-only).
-    // This arm is a native async citizen: read batch → await (budgeted) →
-    // write batch, no lock guard held across an await.
+    // `tool/hitstream` is opened by `catenary grep` (ws43-02) and `catenary
+    // glob` (ws43-03) — the ONLY search surface the daemon serves (the
+    // `tool/grep` and `tool/glob` executor arms retired). The method line has
+    // already been read; the CLI now streams `HitFrame` batches on this same
+    // connection. The daemon annotates each batch under budget with the REAL
+    // enrichment (the executors' LSP enrichment, migrated into
+    // [`crate::bridge::HitstreamEnricher`]) at the batch's requested weight —
+    // grep anchors for a weight-less batch, listing/outline bodies for a
+    // weighted one — and streams `AnnotationFrame` batches back, preserving
+    // batch order. The per-batch WS31 nudge and the query auto-mount (with its
+    // ws43-05 sensitive-path gate) ride each annotation call, keyed on the
+    // canonical hit paths the batches carry; the walk-level observation set on
+    // the `End` terminator feeds the executor's once-per-walk nudge/reap rule
+    // (`observe_walk` — grep only; glob ships no reap scopes, a scoped walk
+    // never proves absence). A malformed frame or a socket fault tears the
+    // connection down; the CLI, seeing an incomplete annotation stream,
+    // completes its results unannotated in place — the same output as
+    // daemon-absent (degrade-only). This arm is a native async citizen: read
+    // batch → await (budgeted) → write batch, no lock guard held across an
+    // await.
     if method == METHOD_HITSTREAM {
-        let annotator = HitstreamGrepAnnotator {
+        let annotator = HitstreamAnnotator {
             ctx: &ctx,
-            inner: ctx.primary.grep.hitstream_enricher(),
+            inner: ctx.primary.hitstream_enricher(),
         };
         crate::hitstream::annotate_connection(
             &mut buf_reader,
@@ -5832,154 +5493,6 @@ async fn handle_hook_dispatch(
             crate::hitstream::ANNOTATION_BATCH_BUDGET,
         )
         .await?;
-        return Ok(());
-    }
-
-    // ── Glob query ──────────────────────────────────────────────
-    //
-    // `tool/glob` is sent by `catenary glob`. Resolves relative
-    // patterns against `cwd`, dispatches to the glob pipeline, and
-    // returns the rendered output as a `GlobResponse`.
-    if method == METHOD_GLOB {
-        let glob_req: GlobRequest = serde_json::from_value(raw.clone())
-            .map_err(|e| anyhow!("invalid glob request: {e}"))?;
-
-        let params = glob_req.to_params();
-        let parent_id = uuid::Uuid::new_v4().to_string();
-        let cancel = CancellationToken::new();
-
-        // Per-invocation search scope: the firehose shards this glob into its
-        // own glob/<ts>_<uuid>.jsonl. The span carries the scope fields onto the
-        // command record and the LSP requests it instruments. (Responses, emitted
-        // on the shared LSP reader loop, fall back to the server file — same as
-        // session-scoped LSP responses.)
-        let search_ts = search_timestamp();
-        let cwd = search_cwd(glob_req.cwd.as_deref());
-        let span = tracing::info_span!(
-            "search",
-            search_id = %parent_id,
-            tool = "glob",
-            search_ts = %search_ts,
-            cwd = %cwd,
-        );
-
-        span.in_scope(|| {
-            emit_hook_event(
-                tracing::Level::INFO,
-                "cli",
-                &method,
-                Some(&parent_id),
-                &raw.to_string(),
-                "incoming hook",
-            );
-        });
-
-        // Ephemeral mount (ticket 02): an outlined path outside every mounted
-        // root mounts its enclosing project root so the listing is enriched from
-        // the fresh server. Refreshes the idle clock of any covering ephemeral
-        // root. Instrumented with the search span so the mount event shards into
-        // this glob's firehose scope.
-        let glob_touched = resolve_touched_paths(&glob_req.paths, glob_req.cwd.as_deref());
-        ensure_ephemeral_mounts(&ctx, &glob_touched, Instant::now(), "")
-            .instrument(span.clone())
-            .await;
-
-        // Bound concurrent walks so one session's monster listing cannot starve
-        // the others (misc 140 phase 2) — the same shared limiter as grep. Held
-        // for the walk; dropped at the end of the block.
-        let _search_permit = ctx.search_limiter.acquire().await;
-
-        // Race glob execution against client disconnect so a killed
-        // CLI process doesn't leave the pipeline running indefinitely.
-        let raced = race_against_disconnect(
-            ctx.primary
-                .glob
-                .execute(&params, Some(&parent_id), &cancel)
-                .instrument(span.clone()),
-            &mut buf_reader,
-        )
-        .await;
-        let Some(result) = raced else {
-            // The token reaches walk internals that dropping the execute
-            // future alone cannot stop.
-            cancel.cancel();
-            debug!(
-                source = Source::DaemonDispatch.as_str(),
-                "glob client disconnected — query cancelled",
-            );
-            span.in_scope(|| {
-                emit_hook_event(
-                    tracing::Level::INFO,
-                    "cli",
-                    &method,
-                    Some(&parent_id),
-                    "client disconnected",
-                    "outgoing hook response",
-                );
-            });
-            return Ok(());
-        };
-        let response = match result {
-            Ok(GlobOutcome::Rendered {
-                output,
-                no_match_indices,
-                dir_hints,
-                metachar_names,
-            }) => {
-                // Map each zero-match index back to the argument's
-                // ORIGINAL spelling. `to_params` resolves `glob_req.paths`
-                // to the absolute `params.paths` 1:1 in order, so the
-                // index the glob pipeline reports lines up with
-                // `glob_req.paths` — showing what the agent typed, the
-                // way `path does not exist` does (misc 118).
-                let no_match_patterns = no_match_indices
-                    .into_iter()
-                    .filter_map(|i| glob_req.paths.get(i))
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect();
-                GlobResponse {
-                    output,
-                    paths: None,
-                    no_match_patterns,
-                    dir_hints,
-                    metachar_names,
-                    error: None,
-                }
-            }
-            Ok(GlobOutcome::Count { paths }) => GlobResponse {
-                output: String::new(),
-                paths: Some(paths),
-                no_match_patterns: Vec::new(),
-                dir_hints: Vec::new(),
-                metachar_names: Vec::new(),
-                error: None,
-            },
-            Err(e) => GlobResponse {
-                output: String::new(),
-                paths: None,
-                no_match_patterns: Vec::new(),
-                dir_hints: Vec::new(),
-                metachar_names: Vec::new(),
-                error: Some(format!("{e:#}")),
-            },
-        };
-
-        let mut payload = serde_json::to_vec(&response)?;
-
-        span.in_scope(|| {
-            emit_hook_event(
-                tracing::Level::INFO,
-                "cli",
-                &method,
-                Some(&parent_id),
-                std::str::from_utf8(&payload).unwrap_or_default(),
-                "outgoing hook response",
-            );
-        });
-
-        payload.push(b'\n');
-        writer.write_all(&payload).await?;
-        writer.shutdown().await?;
         return Ok(());
     }
 
@@ -13774,172 +13287,13 @@ mod tests {
         assert!(result.is_empty(), "nonexistent paths should be skipped");
     }
 
-    // ── IPC request/response type tests ──────────────────────────
-
-    /// The fairness guard (misc 140 phase 2): the shared search limiter bounds
-    /// concurrent walks. Deterministic — asserts permit accounting, never timing.
-    #[test]
-    fn search_limiter_permits_are_bounded() {
-        let limiter = SearchLimiter::new(2);
-        assert_eq!(limiter.semaphore.available_permits(), 2);
-        let p1 = limiter.semaphore.try_acquire().expect("permit 1");
-        let p2 = limiter.semaphore.try_acquire().expect("permit 2");
-        assert_eq!(limiter.semaphore.available_permits(), 0);
-        assert!(
-            limiter.semaphore.try_acquire().is_err(),
-            "no third permit while both are held — a burst of searches queues",
-        );
-        drop(p1);
-        assert_eq!(limiter.semaphore.available_permits(), 1);
-        assert!(
-            limiter.semaphore.try_acquire().is_ok(),
-            "a freed permit admits a queued search",
-        );
-        drop(p2);
-    }
-
-    /// The limiter never deadlocks: a zero request clamps to at least one permit.
-    #[test]
-    fn search_limiter_clamps_to_at_least_one_permit() {
-        assert_eq!(SearchLimiter::new(0).semaphore.available_permits(), 1);
-    }
-
-    /// `GlobRequest` roundtrips through JSON with all fields.
-    #[test]
-    fn glob_request_roundtrip_full() {
-        let req = GlobRequest {
-            cwd: Some(PathBuf::from("/workspace")),
-            paths: vec![PathBuf::from("src/"), PathBuf::from("tests/")],
-            exclude: vec!["target/**".to_string(), "vendor/**".to_string()],
-            include_gitignored: false,
-            include_hidden: true,
-            count: false,
-        };
-        let json = serde_json::to_string(&req).expect("serialize");
-        let parsed: GlobRequest = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(parsed.cwd, Some(PathBuf::from("/workspace")));
-        assert_eq!(
-            parsed.paths,
-            vec![PathBuf::from("src/"), PathBuf::from("tests/")]
-        );
-        // A repeated `--exclude-pattern` roundtrips as a full set (bug 89).
-        assert_eq!(
-            parsed.exclude,
-            vec!["target/**".to_string(), "vendor/**".to_string()]
-        );
-        assert!(!parsed.include_gitignored);
-        assert!(parsed.include_hidden);
-    }
-
-    /// `GlobRequest` deserializes with defaults for optional fields.
-    #[test]
-    fn glob_request_minimal() {
-        let json = r#"{"cwd":"/home","paths":["src/"]}"#;
-        let req: GlobRequest = serde_json::from_str(json).expect("deserialize");
-        assert_eq!(req.cwd, Some(PathBuf::from("/home")));
-        assert_eq!(req.paths, vec![PathBuf::from("src/")]);
-        assert!(req.exclude.is_empty());
-        assert!(!req.include_gitignored);
-        assert!(!req.include_hidden);
-    }
-
-    /// `GlobResponse` roundtrips through JSON.
-    #[test]
-    fn glob_response_roundtrip() {
-        let resp = GlobResponse {
-            output: "src/\n  main.rs (42 lines)".to_string(),
-            paths: None,
-            no_match_patterns: vec!["src/**/none.rs".to_string()],
-            dir_hints: vec!["src".to_string()],
-            metachar_names: Vec::new(),
-            error: None,
-        };
-        let json = serde_json::to_string(&resp).expect("serialize");
-        assert!(
-            !json.contains("metachar_names"),
-            "an empty teaching vec is omitted: {json}"
-        );
-        assert!(
-            !json.contains("error"),
-            "a successful response omits the error field: {json}"
-        );
-        let parsed: GlobResponse = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(parsed.output, "src/\n  main.rs (42 lines)");
-        assert!(parsed.paths.is_none());
-        assert_eq!(parsed.no_match_patterns, vec!["src/**/none.rs".to_string()]);
-        assert_eq!(parsed.dir_hints, vec!["src".to_string()]);
-        assert!(parsed.metachar_names.is_empty());
-        assert!(parsed.error.is_none());
-    }
-
-    /// IPC method constants match expected wire values.
+    /// IPC method constants match expected wire values. `tool/glob` retired
+    /// with the ws43-03 cutover — the hitstream arm is the only search method.
     #[test]
     fn method_constants() {
-        assert_eq!(METHOD_GLOB, "tool/glob");
         assert_eq!(METHOD_HITSTREAM, "tool/hitstream");
         // The router constant re-exports the protocol module's owner (ws43), so
         // the two spellings can never drift.
         assert_eq!(METHOD_HITSTREAM, crate::hitstream::HITSTREAM_METHOD);
-    }
-
-    // ── repeatable --exclude-pattern to_params (bug 89) ──────────
-
-    /// `GlobRequest::to_params` resolves EVERY collected exclude with the
-    /// per-pattern rule (basename → `**/<name>`, slash-bearing → `cwd`) and
-    /// emits them all — both spellings reach the array (bug 89).
-    #[test]
-    fn glob_to_params_resolves_every_exclude() {
-        let req = GlobRequest {
-            cwd: Some(PathBuf::from("/proj")),
-            paths: vec![PathBuf::from("src/")],
-            exclude: vec!["target".to_string(), "docs/**".to_string()],
-            include_gitignored: false,
-            include_hidden: false,
-            count: false,
-        };
-        let params = req.to_params();
-        let excludes = params["exclude"].as_array().expect("exclude is an array");
-        // Basename gets the depth-independent `**/` prefix; slash-bearing
-        // resolves against cwd.
-        assert_eq!(
-            excludes,
-            &vec![
-                serde_json::Value::String("**/target".to_string()),
-                serde_json::Value::String("/proj/docs/**".to_string()),
-            ]
-        );
-    }
-
-    /// The wire accepts an `exclude` array (the repeatable form) — and a lone
-    /// string still folds into a one-element set (bug 89).
-    #[test]
-    fn glob_request_accepts_array_exclude() {
-        let json = r#"{"cwd":"/tmp","paths":["src/"],"exclude":["a/**","b/**"]}"#;
-        let req: GlobRequest = serde_json::from_str(json).expect("deserialize");
-        assert_eq!(req.exclude, vec!["a/**".to_string(), "b/**".to_string()]);
-    }
-
-    // ── resolve_relative tests ──────────────────────────────────
-
-    #[test]
-    fn resolve_relative_absolute_unchanged() {
-        let result = resolve_relative("/tmp/src/**/*.rs", Path::new("/home/user"));
-        assert_eq!(result, "/tmp/src/**/*.rs");
-    }
-
-    #[test]
-    fn resolve_relative_relative_joined() {
-        let result = resolve_relative("src/**/*.rs", Path::new("/home/user/project"));
-        assert_eq!(result, "/home/user/project/src/**/*.rs");
-    }
-
-    #[test]
-    fn resolve_relative_tilde_expanded() {
-        let result = resolve_relative("~/src/**/*.rs", Path::new("/home/user/project"));
-        // Tilde-expanded paths are absolute → not joined to base.
-        assert!(
-            !result.starts_with("/home/user/project"),
-            "tilde path should not be joined to base"
-        );
     }
 }

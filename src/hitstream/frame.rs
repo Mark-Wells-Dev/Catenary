@@ -22,6 +22,36 @@ use serde::{Deserialize, Serialize};
 
 use super::WireHit;
 
+/// The enrichment weight a hit batch requests (ws43-03).
+///
+/// Computed **CLI-side** from the query shape and carried on each
+/// [`HitFrame::Batch`]: absent for a grep batch (anchor enrichment — the
+/// pre-weight wire, byte-identical), present for a glob batch (outline
+/// enrichment at the named weight). The annotator honors the requested weight;
+/// the per-batch budget still bounds everything. Version skew degrades
+/// gracefully in both directions: an old daemon ignoring the field
+/// anchor-enriches (over-enrichment the CLI reads as outline-less and renders
+/// unenriched — never fewer paths), and an old CLI sends no weight, getting
+/// exactly the grep behavior it always got.
+///
+/// There is deliberately **no enrichment-off weight** (`--paths` was rejected
+/// by ruling): a first-class off-switch becomes the taught habit and the
+/// product dies by opt-out. `--count` covers tallies; a pipeline needing bare
+/// paths strips indented enrichment downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrichmentWeight {
+    /// Listing weight — the ruled default for listing shapes: each file's
+    /// **top-level** symbols only, no nested tree. The finding this ruled
+    /// lever answers: 45–360KB of full symbol outlines for plain directory
+    /// listings, reproduced five times by five different agents.
+    Listing,
+    /// The full picture: the fully-expanded types-and-callables outline tree.
+    /// `--outline` opts up to it on demand; it stays the default for the
+    /// single-file outline shape (`catenary glob src/main.rs`).
+    Outline,
+}
+
 /// One frame of the CLI → daemon hit stream.
 ///
 /// The CLI emits an ordered sequence of [`HitFrame::Batch`] frames — each a
@@ -50,6 +80,14 @@ pub enum HitFrame {
         /// paths, the previous add/update-only behavior.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         observed: Vec<(PathBuf, i64)>,
+        /// The requested enrichment weight (ws43-03): `None` for a grep batch
+        /// (anchor enrichment — serializes byte-identically to the pre-weight
+        /// wire), `Some` for a glob batch (outline enrichment at the named
+        /// weight). Unknown-field tolerance carries the skew: an old daemon
+        /// ignores it and over-enriches (anchors the CLI reads as
+        /// outline-less), which degrades gracefully.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        weight: Option<EnrichmentWeight>,
     },
     /// The terminator: no more batches follow. Carries the total batch count so
     /// the daemon and the CLI agree on how many annotation-batches to expect,
@@ -84,14 +122,15 @@ pub enum HitFrame {
 }
 
 impl HitFrame {
-    /// A plain batch with no observations — the shape an old CLI sends (and
-    /// the protocol tests' spelling).
+    /// A plain batch with no observations and no weight — the shape an old
+    /// CLI sends (and the protocol tests' spelling).
     #[must_use]
     pub const fn batch(seq: u64, hits: Vec<WireHit>) -> Self {
         Self::Batch {
             seq,
             hits,
             observed: Vec::new(),
+            weight: None,
         }
     }
 
@@ -162,9 +201,27 @@ pub struct AnnotatedHit {
     pub anchor: Option<String>,
     /// Whether enrichment actually covered this hit's file. `false` for a
     /// pass-through hit (budget, no server, degrade), which renders the `#?`
-    /// could-not-enrich marker in the grep line shape.
+    /// could-not-enrich marker in the grep line shape. For a glob (weighted)
+    /// hit, `false` renders the same `no outline` marker an uncovered file
+    /// always carried — degradation is never misread as "empty file".
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enriched: bool,
+    /// The file's rendered outline body at the batch's requested weight
+    /// (ws43-03, glob batches only): one node per line
+    /// (`<line>  <declaration source>`), nested nodes tab-indented, **no base
+    /// indent** — the CLI re-indents each line for its listing position. No
+    /// trailing newline. `None` for a grep hit, for a covered file with no
+    /// symbols (`enriched` splits that from could-not-enrich), and for a
+    /// suppressed outline. Absent from an old daemon's frames — the CLI reads
+    /// that as outline-less and renders the listing unenriched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outline: Option<String>,
+    /// The file has symbols but its outline is suppressed by config
+    /// (`[tools.glob] outline_suppress`) — the CLI renders the
+    /// `[symbols available]` flag in place of the body. Serde-default `false`,
+    /// so old-daemon frames parse honestly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub suppressed: bool,
 }
 
 impl AnnotatedHit {
@@ -176,6 +233,32 @@ impl AnnotatedHit {
             hit,
             anchor: None,
             enriched: false,
+            outline: None,
+            suppressed: false,
+        }
+    }
+
+    /// An enriched hit inside a scope — the `#trail` spelling.
+    #[must_use]
+    pub const fn scoped(hit: WireHit, trail: String) -> Self {
+        Self {
+            hit,
+            anchor: Some(trail),
+            enriched: true,
+            outline: None,
+            suppressed: false,
+        }
+    }
+
+    /// An enriched, genuinely top-level hit (no graph coordinate to report).
+    #[must_use]
+    pub const fn top_level(hit: WireHit) -> Self {
+        Self {
+            hit,
+            anchor: None,
+            enriched: true,
+            outline: None,
+            suppressed: false,
         }
     }
 
@@ -288,12 +371,53 @@ mod tests {
             "batch carries the frame tag: {line}"
         );
         assert!(
-            !line.contains("observed"),
-            "an observation-less batch serializes exactly as before (old-daemon \
-             compatibility): {line}"
+            !line.contains("observed") && !line.contains("weight"),
+            "an observation-less, weight-less batch serializes exactly as before \
+             (old-daemon compatibility): {line}"
         );
         let back: HitFrame = serde_json::from_str(&line).expect("parse batch");
         assert_eq!(back, frame, "hit batch roundtrips");
+    }
+
+    #[test]
+    fn hit_frame_batch_weight_roundtrips_and_defaults_none() {
+        // The ws43-03 weight lever on the wire: a glob batch names its weight;
+        // a weight-less (grep / old-CLI) batch parses as `None`.
+        let frame = HitFrame::Batch {
+            seq: 0,
+            hits: vec![sample_hit()],
+            observed: Vec::new(),
+            weight: Some(EnrichmentWeight::Listing),
+        };
+        let line = serde_json::to_string(&frame).expect("serialize batch");
+        assert!(
+            line.contains("\"weight\":\"listing\""),
+            "the requested weight rides the batch frame: {line}"
+        );
+        let back: HitFrame = serde_json::from_str(&line).expect("parse batch");
+        assert_eq!(back, frame, "weighted batch roundtrips");
+
+        let full = HitFrame::Batch {
+            seq: 1,
+            hits: Vec::new(),
+            observed: Vec::new(),
+            weight: Some(EnrichmentWeight::Outline),
+        };
+        let line = serde_json::to_string(&full).expect("serialize batch");
+        assert!(
+            line.contains("\"weight\":\"outline\""),
+            "--outline opts up on the wire: {line}"
+        );
+
+        // A field-less batch (old CLI, or grep) reads as weight-less.
+        let legacy: HitFrame = serde_json::from_str(
+            r#"{"frame":"batch","seq":1,"hits":[{"path":"/w/src/a.rs","line":3,"column":1,"text":"fn f() {"}]}"#,
+        )
+        .expect("parse legacy batch");
+        assert!(
+            matches!(legacy, HitFrame::Batch { weight: None, .. }),
+            "absent weight reads as None (anchor enrichment)"
+        );
     }
 
     #[test]
@@ -302,6 +426,7 @@ mod tests {
             seq: 1,
             hits: vec![sample_hit()],
             observed: vec![(PathBuf::from("/w/src/a.rs"), 7)],
+            weight: None,
         };
         let line = serde_json::to_string(&frame).expect("serialize batch");
         let back: HitFrame = serde_json::from_str(&line).expect("parse batch");
@@ -413,11 +538,7 @@ mod tests {
 
     #[test]
     fn annotated_hit_with_anchor_renders_scope() {
-        let annotated = AnnotatedHit {
-            hit: sample_hit(),
-            anchor: Some("mod_a/f".to_string()),
-            enriched: true,
-        };
+        let annotated = AnnotatedHit::scoped(sample_hit(), "mod_a/f".to_string());
         assert_eq!(annotated.render(), "/w/src/a.rs:3:1#mod_a/f:fn f() {");
     }
 
@@ -425,11 +546,7 @@ mod tests {
 
     #[test]
     fn grep_line_scoped_hit_carries_the_trail() {
-        let annotated = AnnotatedHit {
-            hit: sample_hit(),
-            anchor: Some("mod_a/f".to_string()),
-            enriched: true,
-        };
+        let annotated = AnnotatedHit::scoped(sample_hit(), "mod_a/f".to_string());
         assert_eq!(
             annotated.render_grep_line("src/a.rs"),
             "src/a.rs:3#mod_a/f:fn f() {"
@@ -438,11 +555,7 @@ mod tests {
 
     #[test]
     fn grep_line_top_level_hit_has_no_anchor() {
-        let annotated = AnnotatedHit {
-            hit: sample_hit(),
-            anchor: None,
-            enriched: true,
-        };
+        let annotated = AnnotatedHit::top_level(sample_hit());
         assert_eq!(
             annotated.render_grep_line("src/a.rs"),
             "src/a.rs:3:fn f() {"
@@ -474,11 +587,7 @@ mod tests {
 
     #[test]
     fn enriched_flag_roundtrips_and_defaults_false() {
-        let annotated = AnnotatedHit {
-            hit: sample_hit(),
-            anchor: None,
-            enriched: true,
-        };
+        let annotated = AnnotatedHit::top_level(sample_hit());
         let line = serde_json::to_string(&annotated).expect("serialize");
         assert!(
             line.contains("\"enriched\":true"),
@@ -493,5 +602,58 @@ mod tests {
         let parsed: AnnotatedHit = serde_json::from_str(legacy).expect("parse legacy");
         assert!(!parsed.enriched, "absent field reads as unenriched");
         assert_eq!(parsed.render_grep_line("src/a.rs"), "src/a.rs:3#?:fn f() {");
+    }
+
+    // ─── glob outline carriage (ws43-03) ────────────────────────────────────
+
+    #[test]
+    fn outline_fields_roundtrip_and_default_absent() {
+        let annotated = AnnotatedHit {
+            hit: sample_hit(),
+            anchor: None,
+            enriched: true,
+            outline: Some("3  fn f() {\n\t5  fn g() {".to_string()),
+            suppressed: false,
+        };
+        let line = serde_json::to_string(&annotated).expect("serialize");
+        assert!(line.contains("\"outline\""), "outline on the wire: {line}");
+        let back: AnnotatedHit = serde_json::from_str(&line).expect("parse");
+        assert_eq!(back, annotated, "outline roundtrips");
+
+        // An anchor-shaped hit from an old daemon (no outline fields) parses
+        // outline-less and unsuppressed — the CLI renders the listing
+        // unenriched, never fewer paths.
+        let legacy =
+            r#"{"path":"/w/src/a.rs","line":3,"column":1,"text":"fn f() {","enriched":true}"#;
+        let parsed: AnnotatedHit = serde_json::from_str(legacy).expect("parse legacy");
+        assert!(parsed.outline.is_none(), "absent outline reads as None");
+        assert!(!parsed.suppressed, "absent suppressed reads as false");
+
+        // A grep hit never serializes the glob fields — the grep wire is
+        // byte-identical to the pre-weight protocol.
+        let grep_hit = serde_json::to_string(&AnnotatedHit::top_level(sample_hit()))
+            .expect("serialize grep hit");
+        assert!(
+            !grep_hit.contains("outline") && !grep_hit.contains("suppressed"),
+            "grep hits carry no glob fields: {grep_hit}"
+        );
+    }
+
+    #[test]
+    fn suppressed_flag_roundtrips() {
+        let annotated = AnnotatedHit {
+            hit: sample_hit(),
+            anchor: None,
+            enriched: true,
+            outline: None,
+            suppressed: true,
+        };
+        let line = serde_json::to_string(&annotated).expect("serialize");
+        assert!(
+            line.contains("\"suppressed\":true"),
+            "suppression on the wire: {line}"
+        );
+        let back: AnnotatedHit = serde_json::from_str(&line).expect("parse");
+        assert_eq!(back, annotated);
     }
 }

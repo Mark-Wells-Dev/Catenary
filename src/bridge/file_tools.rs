@@ -1,43 +1,71 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-//! Glob tool handler: the structural read.
+//! The glob pipeline: the structural read.
 //!
 //! glob is grep's counterpart: where grep enriches a *hit* by where it lives,
-//! glob enriches a *file* by what's in it. Each path is dispatched by type:
-//! - File path → header `path  (N lines)` + the file's **fully-expanded**
-//!   `documentSymbol` outline, one node per line, re-indented by tree depth.
+//! glob enriches a *file* by what's in it. Each resolved path is dispatched by
+//! type:
+//! - File path → header `path  (N lines)` + the file's `documentSymbol`
+//!   outline, one node per line, re-indented by tree depth.
 //! - Directory path → its immediate entries (one level, not recursive): files
 //!   get their outline; subdirectories get `name/  (N files, M dirs)` — the
 //!   immediate child counts that track the active flags, a preview of the next
 //!   glob.
 //!
-//! **Enrich always.** Every file with symbols is outlined and every directory
-//! shows its child counts — there is no per-file size gate and no file-count
-//! gate (both were intent-guesses that shave the wrong end). A file whose
-//! language has no server, or whose `documentSymbol` fails, is listed with a
-//! `no outline` marker rather than silently outline-less. The kind is implicit
-//! in each declaration source line — no `SymbolKind` ever surfaces.
+//! ## ws43-03: the CLI owns the walk
 //!
-//! The output is always complete (decision 025): the full outline prints, with
-//! no volume branch — the host caps only the final read at the end of a pipeline.
+//! Since the glob cutover this module is the **CLI-side** pipeline: `catenary
+//! glob` expands its pattern gitignore-aware in-process
+//! ([`build_glob_plan`]), streams the plan's file set to the daemon annotator
+//! over `tool/hitstream` batches, and renders the listing itself
+//! ([`render_glob_plan`]) with whatever enrichment came back. The daemon-side
+//! query executor (`GlobServer`, the `tool/glob` arm, the daemon-less twin)
+//! retired with the cutover; the daemon's only glob surface is the outline
+//! leg of the hitstream annotator
+//! ([`HitstreamEnricher`](super::hitstream_enricher::HitstreamEnricher)),
+//! which runs the outline render helpers kept here. Every dependency failure
+//! degrades to "less enrichment," never "no paths."
+//!
+//! ## The ruled enrichment weight (ws43-03)
+//!
+//! **Listing shapes get top-level structure by default.** The finding: 45 to
+//! 360KB of full symbol outlines for plain directory listings, reproduced five
+//! times by five different agents. A listing shape (a matched directory, or
+//! more than one matched file) requests [`EnrichmentWeight::Listing`] — each
+//! file's top-level symbols only, no nested tree. `--outline` opts up to the
+//! full tree on demand; the single-file outline shape (`catenary glob
+//! src/main.rs`) keeps the full tree as its default. There is deliberately
+//! **no enrichment-off flag** (`--paths` was rejected by ruling: a first-class
+//! off-switch becomes the taught habit and the product dies by opt-out;
+//! `--count` covers tallies, and a pipeline needing bare paths strips indented
+//! enrichment downstream).
+//!
+//! A file whose language has no server, or whose `documentSymbol` fails, is
+//! listed with a `no outline` marker rather than silently outline-less — the
+//! same marker every degrade arm (daemon absent, old daemon, stream fault,
+//! deadline) renders, so the listing bytes are identical across the matrix.
+//! The kind is implicit in each declaration source line — no `SymbolKind` ever
+//! surfaces.
+//!
+//! The output is always complete (decision 025): every path always lists, with
+//! no volume branch — budgets bound enrichment only, and the host caps only
+//! the final read at the end of a pipeline.
 
 use anyhow::{Result, anyhow};
 use ignore::WalkBuilder;
-use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
 
-use super::NO_LSP_LABEL;
 use super::SourceLines;
 use super::filesystem_manager::{
     FilesystemManager, STAT_RETRY_ATTEMPTS, format_file_size, mtime_nanos,
 };
 use super::session::{ArgResolution, ExcludeSet, expand_glob_patterns_grouped_cancellable};
-use crate::lsp::{LspClientManager, WalkBreadth};
-use crate::symbol_index::{Symbol, SymbolIndex};
+use crate::hitstream::AnnotatedHit;
+use crate::symbol_index::Symbol;
 
 /// Test-only per-stage operation counters for the glob expansion path.
 ///
@@ -84,38 +112,6 @@ pub(crate) mod probe {
     }
 }
 
-/// Input for the `glob` tool.
-#[derive(Debug, Deserialize)]
-pub struct GlobInput {
-    /// Literal file/directory paths (from shell expansion).
-    ///
-    /// Each path is dispatched through the appropriate handler
-    /// (file outline, directory listing) without glob interpretation.
-    #[serde(default)]
-    pub paths: Vec<PathBuf>,
-    /// Glob patterns to exclude from results (repeatable `--exclude-pattern`).
-    ///
-    /// Empty for a query with no exclusion. The router resolves each pattern
-    /// before dispatch; a path is excluded when any matches.
-    #[serde(default)]
-    pub exclude: Vec<String>,
-    /// Include gitignored files (default: false).
-    #[serde(default)]
-    pub include_gitignored: bool,
-    /// Include hidden/dot files (default: false).
-    #[serde(default)]
-    pub include_hidden: bool,
-    /// Working directory for cwd-scoped searches (relative patterns).
-    #[serde(default)]
-    pub cwd: Option<PathBuf>,
-    /// Return a path count instead of rendered results (default: false).
-    ///
-    /// Short-circuits LSP enrichment: the pipeline reports the number of
-    /// resolved filesystem paths, never a rendered tree.
-    #[serde(default)]
-    pub count: bool,
-}
-
 /// A filesystem entry collected during the glob directory pipeline.
 #[allow(
     clippy::struct_excessive_bools,
@@ -144,870 +140,614 @@ struct GlobEntry {
     is_snapshot: bool,
 }
 
-/// Outcome of a glob query.
+// ─── The CLI-side glob plan (ws43-03) ─────────────────────────────────
+
+/// One file's enrichment as it came back over the annotation stream — the
+/// CLI-side reading of an [`AnnotatedHit`]'s glob fields.
 ///
-/// Normal queries render the complete tree to stdout; `--count`
-/// (`GlobInput::count`) short-circuits to a path count.
-pub enum GlobOutcome {
-    /// The complete rendered tree output for stdout.
-    Rendered {
-        /// The complete output for stdout.
-        output: String,
-        /// Indices (into the request's `paths`) of glob-pattern arguments that
-        /// expanded to zero matches. The daemon reports these positionally so
-        /// the CLI can render a loud per-argument
-        /// `no matches for pattern: <pattern>` line against the *original*
-        /// argument spelling (misc 118).
-        no_match_indices: Vec<usize>,
-        /// Display paths of directories the query's patterns matched (VERBS
-        /// teaching moment 4). The CLI emits a `for its listing: catenary glob
-        /// '<dir>/*'` hint per directory on **stderr**, so the old spelling
-        /// `glob src` (a self-matching directory) hands over the listing form.
-        /// Deduplicated, in first-seen order.
-        dir_hints: Vec<String>,
-        /// Result basenames that carry a glob metacharacter (VERBS teaching
-        /// moment 3). The CLI emits a note teaching the escaped `'\*.md'`
-        /// spelling on **stderr**; the result paths themselves stay byte-exact
-        /// (ws35). Deduplicated, in first-seen order.
-        metachar_names: Vec<String>,
-    },
-    /// `--count` summary: number of resolved filesystem paths.
-    Count {
-        /// Number of paths the query resolves to. The positional is a pattern,
-        /// so this is the pattern's match set — each match counted once, file or
-        /// directory alike (misc 184: one pattern, one set, one number). `--count`
-        /// is the sole tally on the search surface (the cardinality header
-        /// retired with the VERBS streams ruling).
-        paths: usize,
-    },
+/// Built from the annotation batches via [`FileEnrichment::from_annotations`];
+/// a file missing from the map (daemon absent, old daemon, stream fault,
+/// deadline, or a pass-through batch) renders exactly as `covered: false` —
+/// the `no outline` marker, the same spelling an uncovered file always
+/// carried. Degrade-only: enrichment quality varies, the listing never does.
+pub struct FileEnrichment {
+    /// Whether enrichment covered the file (the wire `enriched` flag). `false`
+    /// renders the `no outline` marker on a text file.
+    pub covered: bool,
+    /// The file has symbols but its outline is config-suppressed — renders the
+    /// `[symbols available]` flag in place of the body.
+    pub suppressed: bool,
+    /// The rendered outline body (no base indent; the renderer re-indents each
+    /// line for its listing position). `None` for a covered file with no
+    /// symbols.
+    pub outline: Option<String>,
 }
 
-/// The daemon-side render of a glob query plus the structured teaching signals
-/// the CLI turns into stderr notes (VERBS teaching moments 2–4).
-///
-/// The daemon cannot write to the CLI's stderr — it returns these signals over
-/// IPC and the CLI (which owns the streams) emits the teaching, so teaching
-/// lives in the binary at the point of use, never the hook.
-struct RenderedGlob {
-    /// The complete stdout body (results only — no header).
-    output: String,
-    /// Argument indices whose pattern expanded to zero matches (misc 118).
-    no_match_indices: Vec<usize>,
-    /// Display paths of matched directories (teaching moment 4).
-    dir_hints: Vec<String>,
-    /// Result basenames carrying a glob metacharacter (teaching moment 3).
-    metachar_names: Vec<String>,
-}
-
-// ─── Glob tool server ─────────────────────────────────────────────────
-
-/// Glob tool server: file/directory browsing.
-pub struct GlobServer {
-    pub(super) client_manager: Arc<LspClientManager>,
-    pub(super) fs_manager: Arc<FilesystemManager>,
-    pub(super) symbol_index: Option<Arc<Mutex<SymbolIndex>>>,
-    /// Glob patterns whose outlines are suppressed from automatic display (an
-    /// explicit user opt-out, e.g. generated/vendored files — not an
-    /// intent-guess gate). Symbols remain available; the entry is flagged
-    /// `[symbols available]` instead of outlined.
-    pub(super) outline_suppress: Vec<globset::GlobMatcher>,
-}
-
-impl GlobServer {
-    /// Execute a glob query with the given parameters.
-    ///
-    /// `parent_id` is a UUID for LSP event correlation — propagated to
-    /// `ensure_symbols` so that `documentSymbol` traffic appears as
-    /// children of this glob scope in the TUI.
-    pub async fn execute(
-        &self,
-        params: &serde_json::Value,
-        parent_id: Option<&str>,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<GlobOutcome> {
-        let mut input: GlobInput = serde_json::from_value(params.clone())
-            .map_err(|e| anyhow!("Invalid arguments: {e}"))?;
-
-        if input.paths.is_empty() {
-            return Err(anyhow!("no paths provided"));
-        }
-
-        // Canonicalize the incoming pattern paths and cwd at this ingestion seam,
-        // once (misc 193, mirroring grep's cwd canonicalization in `b9145d5`):
-        // roots are canonical (the daemon canonicalizes `CATENARY_ROOTS` and every
-        // ephemeral mount), but the host passes its raw pattern spelling. On a
-        // symlinked-tempdir host (macOS `$TMPDIR` → `/private/var/…`, or any
-        // symlinked prefix) the two spellings differ, so a raw pattern base makes
-        // the expansion walk emit raw-spelled resolved paths that fail
-        // `resolve_root`'s canonical prefix check. Each in-root file then renders
-        // `(no LSP)` under its raw spelling, and its `ensure_and_wait_for_paths` /
-        // `ensure_symbols` never spawn a server for the canonical root, so the
-        // outline is lost (`no outline`) even though the root is served. (The
-        // scoped changed-set nudge already survives this: its observations are
-        // canonicalized in `collect_scoped_observations`; the display and
-        // enrichment are the legs that read the raw resolved path directly.)
-        // Canonicalizing each pattern's metachar-free base here keeps the walk,
-        // `resolve_root`, the display `strip_prefix`, and the enrichment all
-        // canonical-to-canonical, matching the convention `handle_file_accumulation`
-        // / `ensure_ephemeral_mounts` already follow. A not-yet-existing base keeps
-        // its spelling (canonicalize can't resolve it), so a zero-match pattern
-        // still reports honestly.
-        for path in &mut input.paths {
-            *path = canonicalize_pattern_base(path);
-        }
-        input.cwd = input
-            .cwd
-            .as_ref()
-            .map(|c| c.canonicalize().unwrap_or_else(|_| c.clone()));
-
-        tracing::debug!("glob: {} path(s)", input.paths.len());
-
-        // Compile the exclude set. `--exclude-pattern` is repeatable (bug 89):
-        // the CLI router resolves each pattern against cwd before dispatch, so
-        // each is absolute (or the `**/<name>` basename form) here, and a path
-        // is excluded when any matches. An empty set excludes nothing.
-        let exclude = ExcludeSet::compile(&input.exclude)?;
-
-        // Count mode short-circuits enrichment — report the number of resolved
-        // paths, not a rendered tree. The count walks run off the runtime thread
-        // so a massive directory is cancellable mid-walk (misc 140 phase 2).
-        if input.count {
-            let paths = self
-                .count_paths_off_thread(
-                    input.paths.clone(),
-                    input.include_gitignored,
-                    input.include_hidden,
-                    exclude.clone(),
-                    cancel,
+impl FileEnrichment {
+    /// Folds annotation-stream hits into the per-file enrichment map the
+    /// renderer consumes. Later duplicates win (harmless — the daemon answers
+    /// one hit per file).
+    #[must_use]
+    pub fn from_annotations(hits: Vec<AnnotatedHit>) -> HashMap<PathBuf, Self> {
+        hits.into_iter()
+            .map(|h| {
+                (
+                    h.hit.path,
+                    Self {
+                        covered: h.enriched,
+                        suppressed: h.suppressed,
+                        outline: h.outline,
+                    },
                 )
-                .await?;
-            return Ok(GlobOutcome::Count { paths });
+            })
+            .collect()
+    }
+}
+
+/// One node of the built listing: pre-rendered text (headers, subdirectory
+/// entries, broken-symlink/snapshot lines), or a file whose header line and
+/// outline body depend on enrichment.
+enum PlanNode {
+    /// A complete pre-rendered chunk (may span several lines, each
+    /// newline-terminated).
+    Text(String),
+    /// A file rendered at enrichment time.
+    File(FileNode),
+}
+
+/// A file entry whose final render depends on the enrichment map: the header
+/// line's descriptor (`no outline`) and flags (`[symbols available]`,
+/// `gitignored`), plus the outline body beneath it.
+struct FileNode {
+    /// The collected entry (name, counts, symlink/snapshot classification).
+    entry: GlobEntry,
+    /// Indent of the entry's header line: `""` for a directly-matched file,
+    /// `"\t"` for a directory-listing entry.
+    entry_indent: &'static str,
+    /// Indent prepended to every outline body line: one level deeper than the
+    /// header.
+    outline_indent: &'static str,
+}
+
+/// The built glob listing, pre-enrichment.
+///
+/// Every path is already resolved and ordered (complete output, decision 025
+/// — budgets bound enrichment only), alongside the file set that wants
+/// outlines and the teaching signals the CLI turns into stderr notes (VERBS
+/// teaching moments 2–4). Built CLI-side by [`build_glob_plan`]; rendered by
+/// [`render_glob_plan`] once the annotation exchange (or its degrade arm)
+/// resolves.
+pub struct GlobPlan {
+    /// The listing's nodes, in render order.
+    nodes: Vec<PlanNode>,
+    /// The pattern expanded to zero matches — the CLI renders the loud
+    /// `no matches for pattern` report (misc 118) against the original
+    /// argument spelling.
+    pub no_match: bool,
+    /// Display paths of matched directories (teaching moment 4): the CLI emits
+    /// a `for its listing: catenary glob '<dir>/*'` hint per directory on
+    /// stderr. Deduplicated, in first-seen order.
+    pub dir_hints: Vec<String>,
+    /// Result basenames carrying a glob metacharacter (teaching moment 3): the
+    /// CLI teaches the escaped `'\*.md'` spelling on stderr; the result paths
+    /// themselves stay byte-exact (ws35). Deduplicated, in first-seen order.
+    pub metachar_names: Vec<String>,
+    /// The files whose outlines the annotation exchange requests, in listing
+    /// order, deduplicated. Everything the listing shows except directories,
+    /// broken symlinks, and snapshot sidecars — the retired executor's
+    /// enrich-always set.
+    pub enrich_files: Vec<PathBuf>,
+    /// The scoped-nudge observations (WS31 ticket 04): each resolved file, and
+    /// each resolved directory's immediate entries, with walk-time mtimes.
+    /// Shipped on the first annotation batch so the daemon's changed-set nudge
+    /// lands before any outline is derived (the executor's nudge-then-anchor
+    /// order). Add/update only — a scoped walk never reaps.
+    pub observations: Vec<(PathBuf, i64)>,
+    /// Whether the query resolved a listing shape (a matched directory, or
+    /// more than one matched file) — the ruled listing-weight default. A
+    /// single matched file is the file-outline shape and keeps the full tree.
+    pub listing_shape: bool,
+}
+
+/// Builds the glob plan for one pattern (the arity-1 positional, absolute
+/// and base-canonicalized).
+///
+/// Expands the pattern gitignore-aware, applies the exclude set, and lays out
+/// the complete listing with its enrichment file set.
+/// This is the retired daemon executor's dispatch loop
+/// (`handle_literal_paths`), run CLI-side: a matched directory contributes its
+/// header and one-level entries; a matched file contributes its header line.
+/// The scope-level `(no LSP)` label retired with the cutover — the CLI cannot
+/// see the daemon's mounted roots, and degradation is per-file (`no outline`),
+/// mirroring grep's ws43-02 retirement of its `(no LSP)`/`cwd:` headers for
+/// the per-line `#?` marker.
+///
+/// # Errors
+///
+/// Returns an error if a matched directory disappears mid-walk (its
+/// canonicalization or enumeration fails) — the retired executor's same
+/// usage-error class.
+pub fn build_glob_plan(
+    fs_manager: &FilesystemManager,
+    pattern: &Path,
+    exclude: &ExcludeSet,
+    include_gitignored: bool,
+    include_hidden: bool,
+) -> Result<GlobPlan> {
+    let cancel = CancellationToken::new();
+    let mut groups = expand_glob_patterns_grouped_cancellable(
+        std::slice::from_ref(&pattern.to_path_buf()),
+        include_gitignored,
+        include_hidden,
+        &cancel,
+    );
+    // Apply the compiled exclude to the pattern's matches (bug 73): filtering
+    // here — before the flat set feeds the scoped observations and the layout
+    // loop — keeps the listing, the nudge, and `--count` (which filters
+    // identically) in agreement, and leaves a fully-excluded pattern with an
+    // empty set, so it reports the honest `no matches for pattern` rather than
+    // vanishing.
+    apply_exclude_to_groups(fs_manager, &mut groups, exclude);
+    let resolved: Vec<PathBuf> = groups
+        .iter()
+        .flat_map(|g| g.resolved.iter().cloned())
+        .collect();
+
+    // The scoped-nudge observations (WS31 ticket 04), gathered under the same
+    // visibility and exclude filters the listing applies. They ride the first
+    // annotation batch.
+    let observations =
+        collect_scoped_observations(&resolved, include_gitignored, include_hidden, exclude);
+
+    // The ruled weight shape: exactly one matched path, and it is a file →
+    // the file-outline shape (full tree by default). Anything else — a
+    // matched directory, several files, or nothing — is a listing.
+    let listing_shape = resolved.len() != 1 || resolved[0].is_dir();
+
+    let mut plan = GlobPlan {
+        nodes: Vec::new(),
+        no_match: resolved.is_empty(),
+        dir_hints: Vec::new(),
+        metachar_names: Vec::new(),
+        enrich_files: Vec::new(),
+        observations,
+        listing_shape,
+    };
+    let mut enrich_seen: HashSet<PathBuf> = HashSet::new();
+
+    for path in &resolved {
+        // Teaching moment 3: a matched name that carries a glob metacharacter
+        // is reachable only by the escaped spelling (`'\*.md'`). Record its
+        // basename so the CLI teaches it; the result path stays byte-exact.
+        if let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned())
+            && name.contains(['*', '?', '[', ']', '{', '}'])
+            && !plan.metachar_names.contains(&name)
+        {
+            plan.metachar_names.push(name);
         }
+        // Directories first — `is_dir()` follows symlinks, so a symlink-to-dir
+        // lists its contents (rather than rendering as a single file header).
+        // This dir-first order matches `collect_scoped_observations` so the
+        // listing and the changed-set nudge classify a symlink-to-dir the same
+        // way (WS31-review walk-2).
+        if path.is_dir() {
+            // Teaching moment 4: the pattern resolved a directory; record its
+            // display path so the CLI hands over the listing spelling
+            // (`catenary glob '<dir>/*'`).
+            let hint = path.to_string_lossy().into_owned();
+            if !plan.dir_hints.contains(&hint) {
+                plan.dir_hints.push(hint);
+            }
+            plan_dir(
+                &mut plan,
+                &mut enrich_seen,
+                fs_manager,
+                path,
+                exclude,
+                include_gitignored,
+                include_hidden,
+            )?;
+        } else if path_is_file_or_symlink_with_retry(path) {
+            // Re-stat with a bounded retry: a transient
+            // `is_file()`/`is_symlink()` miss (an atomic-rename write racing
+            // this fresh stat) must not silently skip a matched file that the
+            // pattern expansion already confirmed present on disk.
+            plan_file(&mut plan, &mut enrich_seen, fs_manager, path);
+        }
+        // Skip non-existent paths silently — the expansion shouldn't produce
+        // them, but be defensive.
+    }
+    Ok(plan)
+}
 
-        // cwd-scoped search: present when the original pattern was relative.
-        let cwd = input.cwd.as_deref();
+/// Lays out one matched directory: its `dir/  (N files, M dirs)` header, its
+/// sorted subdirectory entries (child counts, no recursion), then its sorted
+/// file entries as enrichment-dependent [`FileNode`]s — the retired
+/// `handle_glob_dir` + `render_dir` shape, minus the index reads (enrichment
+/// now arrives over the annotation stream).
+fn plan_dir(
+    plan: &mut GlobPlan,
+    enrich_seen: &mut HashSet<PathBuf>,
+    fs_manager: &FilesystemManager,
+    dir: &Path,
+    exclude: &ExcludeSet,
+    include_gitignored: bool,
+    include_hidden: bool,
+) -> Result<()> {
+    let canonical = dir
+        .canonicalize()
+        .map_err(|e| anyhow!("Path does not exist: {}: {e}", dir.display()))?;
 
-        // Run pipeline — handlers return the complete output. Existing paths
-        // dispatch directly; unexpanded glob patterns are expanded daemon-side.
-        // The output is always complete (decision 025): the full outline prints,
-        // with no volume branch — the host caps only the final read. `cancel` is
-        // threaded into the directory walk so a disconnected client's listing
-        // stops promptly instead of running to completion (misc 140).
-        let rendered = self
-            .handle_literal_paths(&input.paths, &input, &exclude, cwd, parent_id, cancel)
-            .await?;
+    let entries = collect_dir_entries(
+        fs_manager,
+        &canonical,
+        include_gitignored,
+        include_hidden,
+        exclude,
+        &CancellationToken::new(),
+    )?;
 
-        Ok(GlobOutcome::Rendered {
-            output: rendered.output,
-            no_match_indices: rendered.no_match_indices,
-            dir_hints: rendered.dir_hints,
-            metachar_names: rendered.metachar_names,
-        })
+    // The target's own count = its immediate entries (what this glob
+    // enumerated), split into files and directories — the same split a subdir
+    // child entry shows, so the two forms agree.
+    let target_files = entries.iter().filter(|e| !e.is_dir).count();
+    let target_dirs = entries.iter().filter(|e| e.is_dir).count();
+    let mut header = String::new();
+    let _ = writeln!(
+        header,
+        "{}/  {}",
+        canonical.display(),
+        dir_count_suffix(target_files, target_dirs)
+    );
+    plan.nodes.push(PlanNode::Text(header));
+
+    if entries.is_empty() {
+        return Ok(());
     }
 
-    /// Single file: header `path  (N lines)` + its fully-expanded outline.
-    ///
-    /// Enrich always — the file is outlined whenever it has symbols (the
-    /// `outline_threshold` size gate is gone). A file whose language has no
-    /// server, or whose `documentSymbol` returned nothing, carries the
-    /// `no outline` degradation marker; a file matched by `outline_suppress`
-    /// keeps its `[symbols available]` flag in place of the body. Returns the
-    /// complete output.
-    fn handle_glob_file(&self, path: &Path, cwd: Option<&Path>) -> String {
-        let mut full = String::new();
+    let indent = "\t";
+    let (dirs, files): (Vec<GlobEntry>, Vec<GlobEntry>) =
+        entries.into_iter().partition(|e| e.is_dir);
 
-        // Context header: `cwd: ~/…` for cwd-scoped, absolute path for absolute.
-        let display = if let Some(cwd) = cwd {
-            let compressed = super::compress_home(cwd);
-            if self.fs_manager.resolve_root(cwd).is_some() {
-                let _ = writeln!(full, "cwd: {compressed}");
-            } else {
-                let _ = writeln!(full, "cwd: {compressed} {NO_LSP_LABEL}");
+    // Subdirectories first (sorted), each with its immediate child counts.
+    let mut dirs = dirs;
+    dirs.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut dir_text = String::new();
+    for d in &dirs {
+        let (files_n, subdirs_n) =
+            count_dir_children(&d.abs_path, include_gitignored, include_hidden, exclude);
+        let descriptor = dir_count_suffix(files_n, subdirs_n);
+        let flags = compute_entry_flags(false, false, d.is_gitignored);
+        render_entry_line(&mut dir_text, d, &descriptor, &flags, indent);
+    }
+    if !dir_text.is_empty() {
+        plan.nodes.push(PlanNode::Text(dir_text));
+    }
+
+    // Files (sorted), each an enrichment-dependent node (enrich always).
+    let mut files = files;
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    for f in files {
+        if f.is_broken_symlink || f.is_snapshot {
+            let mut line = String::new();
+            let flags = compute_entry_flags(false, false, f.is_gitignored);
+            render_entry_line(&mut line, &f, "", &flags, indent);
+            plan.nodes.push(PlanNode::Text(line));
+            continue;
+        }
+        if enrich_seen.insert(f.abs_path.clone()) {
+            plan.enrich_files.push(f.abs_path.clone());
+        }
+        plan.nodes.push(PlanNode::File(FileNode {
+            entry: f,
+            entry_indent: indent,
+            outline_indent: "\t\t",
+        }));
+    }
+    Ok(())
+}
+
+/// Lays out one directly-matched file: its `path  (N lines)` header (absolute
+/// display) as an enrichment-dependent [`FileNode`] — the retired
+/// `handle_glob_file` shape. A snapshot sidecar renders its dedicated
+/// `[snapshot]` form and requests no enrichment.
+fn plan_file(
+    plan: &mut GlobPlan,
+    enrich_seen: &mut HashSet<PathBuf>,
+    fs_manager: &FilesystemManager,
+    path: &Path,
+) {
+    let display = path.to_string_lossy().into_owned();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let metadata = std::fs::metadata(path).ok();
+
+    if is_snapshot(&name) {
+        let mut line = String::new();
+        let _ = writeln!(line, "{display} [snapshot]");
+        plan.nodes.push(PlanNode::Text(line));
+        return;
+    }
+
+    let line_count = metadata
+        .as_ref()
+        .and_then(|m| fs_manager.line_count(path, m));
+    // Header parity with the retired executor: a text file carries its line
+    // count; anything else (binary, or a broken symlink whose metadata read
+    // failed) carries its byte size.
+    let binary_size = if line_count.is_none() {
+        Some(format_file_size(metadata.map_or(0, |m| m.len())))
+    } else {
+        None
+    };
+
+    if enrich_seen.insert(path.to_path_buf()) {
+        plan.enrich_files.push(path.to_path_buf());
+    }
+    plan.nodes.push(PlanNode::File(FileNode {
+        entry: GlobEntry {
+            name: display,
+            abs_path: path.to_path_buf(),
+            is_dir: false,
+            line_count,
+            binary_size,
+            // A directly-matched symlink renders by its named spelling (no
+            // `-> target` arrow) — the retired `handle_glob_file` shape.
+            is_symlink: false,
+            symlink_target: None,
+            is_broken_symlink: false,
+            is_gitignored: false,
+            is_snapshot: false,
+        },
+        entry_indent: "",
+        outline_indent: "\t",
+    }));
+}
+
+/// Renders the built plan with the enrichment that actually arrived.
+///
+/// Every path in the plan always renders (decision 025 — complete output);
+/// the map only decides each file's descriptor (`no outline`), flags
+/// (`[symbols available]`, `gitignored`), and outline body. An empty map — the
+/// degrade matrix's every arm — renders the complete listing, unenriched, with
+/// the same bytes daemon-absent always produced.
+#[must_use]
+#[allow(
+    clippy::implicit_hasher,
+    reason = "the map is always the std-hasher one FileEnrichment::from_annotations builds"
+)]
+pub fn render_glob_plan(plan: &GlobPlan, enrichment: &HashMap<PathBuf, FileEnrichment>) -> String {
+    let mut out = String::new();
+    for node in &plan.nodes {
+        match node {
+            PlanNode::Text(text) => out.push_str(text),
+            PlanNode::File(node) => {
+                render_file_node(&mut out, node, enrichment.get(&node.entry.abs_path));
             }
-            path.strip_prefix(cwd).map_or_else(
-                |_| path.to_string_lossy().to_string(),
-                |rel| rel.to_string_lossy().to_string(),
-            )
-        } else {
-            // Absolute pattern outside workspace roots: LSP warning.
-            if self.fs_manager.resolve_root(path).is_none() {
-                let _ = writeln!(full, "{NO_LSP_LABEL}");
-            }
-            path.to_string_lossy().to_string()
-        };
+        }
+    }
+    out
+}
 
-        let metadata = std::fs::metadata(path).ok();
+/// Renders one enrichment-dependent file node: the header line (descriptor +
+/// flags), then the re-indented outline body when one arrived.
+fn render_file_node(out: &mut String, node: &FileNode, enrichment: Option<&FileEnrichment>) {
+    let covered = enrichment.is_some_and(|e| e.covered);
+    let suppressed = covered && enrichment.is_some_and(|e| e.suppressed);
+    let outline = if covered && !suppressed {
+        enrichment.and_then(|e| e.outline.as_deref())
+    } else {
+        None
+    };
+    // "Has symbols" as the wire tells it: an outline body arrived, or the
+    // outline is suppressed (symbols exist behind the flag). A covered file
+    // with neither has no symbols; an uncovered file could not be enriched —
+    // both carry the `no outline` marker, exactly the retired executor's
+    // spelling for each.
+    let has_symbols = suppressed || outline.is_some();
+    let mark_no_outline = node.entry.line_count.is_some() && !has_symbols;
+    let descriptor = file_descriptor(&node.entry, mark_no_outline);
+    let flags = compute_entry_flags(has_symbols, suppressed, node.entry.is_gitignored);
+    render_entry_line(out, &node.entry, &descriptor, &flags, node.entry_indent);
+    if let Some(body) = outline {
+        for line in body.lines() {
+            let _ = writeln!(out, "{}{line}", node.outline_indent);
+        }
+    }
+}
 
-        // Detect snapshot or broken symlink.
-        let name = path
+/// Counts the filesystem paths a glob query resolves to (`--count`).
+///
+/// Under the one-verb form every positional is a **pattern**, so the count is
+/// the pattern's match set — each match counted once, file or directory alike
+/// (misc 184: one pattern, one set, one number). The listing legitimately
+/// descends into a matched directory to render its contents; the count must
+/// not, or the two surfaces disagree whenever a pattern matches directories.
+///
+/// LSP enrichment is skipped — a count is pure filesystem, and reads **zero**
+/// file content bytes. Run CLI-side since the ws43-03 cutover (no daemon
+/// round-trip; the connection, if any, is dropped unused).
+#[must_use]
+pub fn count_glob_paths(
+    fs_manager: &FilesystemManager,
+    paths: &[PathBuf],
+    include_gitignored: bool,
+    include_hidden: bool,
+    exclude: &ExcludeSet,
+    cancel: &CancellationToken,
+) -> usize {
+    // Resolve every positional as a pattern (the one-verb form), apply the
+    // exclude to each match set, and tally the survivors. This mirrors the
+    // rendered listing's match set exactly, so `--count` and the listing
+    // agree under an exclude (bug 73).
+    let mut groups =
+        expand_glob_patterns_grouped_cancellable(paths, include_gitignored, include_hidden, cancel);
+    apply_exclude_to_groups(fs_manager, &mut groups, exclude);
+    let mut total = 0usize;
+    for group in &groups {
+        if cancel.is_cancelled() {
+            break;
+        }
+        total += group.resolved.len();
+    }
+    total
+}
+
+/// Collects the immediate children of a directory as `GlobEntry` rows.
+///
+/// Applies the visibility (hidden), gitignore, and `exclude` filters and
+/// detects per-entry flags (gitignored, snapshot, symlink, broken). Shared by
+/// [`plan_dir`] (which lays out the rows) and the `--count` walk's tests so
+/// the two never diverge. `canonical` must be the canonicalized directory
+/// path.
+///
+/// `cancel` is checked per entry; the CLI passes a fresh token (a killed CLI
+/// process simply dies), and the parameter keeps the walk's bounded-work tests
+/// honest.
+#[allow(clippy::too_many_lines, reason = "sequential per-entry classification")]
+fn collect_dir_entries(
+    fs_manager: &FilesystemManager,
+    canonical: &Path,
+    include_gitignored: bool,
+    include_hidden: bool,
+    exclude: &ExcludeSet,
+    cancel: &CancellationToken,
+) -> Result<Vec<GlobEntry>> {
+    // Build non-gitignored set for flag detection.
+    let non_ignored: HashSet<PathBuf> = if include_gitignored {
+        WalkBuilder::new(canonical)
+            .max_depth(Some(1))
+            .git_ignore(true)
+            .hidden(!include_hidden)
+            .build()
+            .flatten()
+            .map(ignore::DirEntry::into_path)
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    let walker = WalkBuilder::new(canonical)
+        .max_depth(Some(1))
+        .git_ignore(!include_gitignored)
+        .hidden(!include_hidden)
+        .build();
+
+    let mut entries = Vec::new();
+
+    for entry in walker.flatten() {
+        #[cfg(test)]
+        probe::COLLECT_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if cancel.is_cancelled() {
+            break;
+        }
+        let entry_path = entry.into_path();
+        if entry_path.as_path() == canonical {
+            continue;
+        }
+
+        let name = entry_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        if is_snapshot(&name) {
-            let _ = writeln!(full, "{display} [snapshot]");
-            return full;
+
+        // Apply exclude filter against the entry path.
+        if exclude.is_match(&entry_path, canonical) {
+            continue;
         }
 
-        let line_count = metadata
-            .as_ref()
-            .and_then(|m| self.fs_manager.line_count(path, m));
+        let is_gitignored = include_gitignored && !non_ignored.contains(&entry_path);
+        let is_snap = is_snapshot(&name);
 
-        // Resolve the outline once: whether the file has symbols, whether it is
-        // suppressed, and (when it will be rendered) the symbols themselves.
-        let suppressed = is_outline_suppressed(path, &self.outline_suppress, &self.fs_manager);
-        let (has_symbols, syms) = self
-            .symbol_index
-            .as_ref()
-            .and_then(|arc| arc.lock().ok())
-            .map_or((false, None), |idx| {
-                let hs = idx.has_symbols_for(path);
-                let syms = if hs && !suppressed {
-                    idx.query(".*", Some(std::slice::from_ref(&path.to_path_buf())))
-                        .ok()
-                        .map(|all| all.into_iter().map(|(_, s)| s).collect::<Vec<_>>())
-                } else {
-                    None
-                };
-                (hs, syms)
-            });
+        let metadata = entry_path
+            .symlink_metadata()
+            .map_err(|e| anyhow!("Failed to read metadata for {name}: {e}"))?;
 
-        // Header: `(N lines)`, plus `no outline` when a text file has no
-        // symbols, or `[symbols available]` when symbols exist but are
-        // suppressed. Binary files report a size and are never marked.
-        if let Some(lc) = line_count {
-            let lines = pluralize_lines(lc);
-            if has_symbols && suppressed {
-                let _ = writeln!(full, "{display}  ({lines}) [symbols available]");
-            } else if has_symbols {
-                let _ = writeln!(full, "{display}  ({lines})");
+        if metadata.file_type().is_symlink() {
+            let target = std::fs::read_link(&entry_path)
+                .map_or_else(|_| "?".to_string(), |t| t.to_string_lossy().to_string());
+            let resolved_meta = std::fs::metadata(&entry_path).ok();
+            let is_broken = resolved_meta.is_none();
+
+            let (line_count, binary_size) = if is_broken || is_snap {
+                (None, None)
             } else {
-                let _ = writeln!(full, "{display}  ({lines}, no outline)");
-            }
-        } else {
-            let size = metadata.map_or(0, |m| m.len());
-            let _ = writeln!(full, "{display}  ({})", format_file_size(size));
-        }
-
-        if let Some(syms) = syms {
-            let mut sources = SourceLines::new();
-            render_full_outline(&mut full, path, &syms, "\t", &mut sources);
-        }
-
-        full
-    }
-
-    /// Dispatch each resolved path through the file or directory handler.
-    ///
-    /// Every positional is a pattern (the one-verb form), expanded daemon-side
-    /// via the gitignore-aware `ignore` walker
-    /// ([`expand_glob_patterns_grouped_cancellable`](super::session::expand_glob_patterns_grouped_cancellable)).
-    /// A metachar-free argument is a self-matching literal — the glob whose only
-    /// match is that exact path — so a shell-expanded (unquoted) filename and its
-    /// quoted-pattern spelling resolve to the same set here, with uniform
-    /// gitignore semantics either way.
-    ///
-    /// Returns the rendered output plus the indices (into `paths`) of arguments
-    /// that expanded to zero matches — the CLI turns these into a loud
-    /// per-argument `no matches for pattern` report on **stderr**, with a
-    /// raw-string gitignore/hidden disclosure (misc 118 + the VERBS streams
-    /// ruling).
-    ///
-    /// stdout carries results only: no cardinality header precedes a pattern's
-    /// listings (`--count` is the sole tally; the header retired with the
-    /// streams ruling). A pattern that resolves a directory still renders that
-    /// directory's enriched listing — the enriched dir line is an entry, not a
-    /// header.
-    async fn handle_literal_paths(
-        &self,
-        paths: &[PathBuf],
-        input: &GlobInput,
-        exclude: &ExcludeSet,
-        cwd: Option<&Path>,
-        parent_id: Option<&str>,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<RenderedGlob> {
-        // Per-argument resolution so each pattern's zero-match report stays keyed
-        // to its argument index; the flat set drives the nudge. The pattern
-        // expansion runs off the runtime thread so a massive pattern base
-        // directory is cancellable mid-walk (misc 140 phase 2).
-        let mut groups = {
-            let paths = paths.to_vec();
-            let include_gitignored = input.include_gitignored;
-            let include_hidden = input.include_hidden;
-            let cancel = cancel.clone();
-            tokio::task::spawn_blocking(move || {
-                expand_glob_patterns_grouped_cancellable(
-                    &paths,
-                    include_gitignored,
-                    include_hidden,
-                    &cancel,
-                )
-            })
-            .await
-            .map_err(|e| anyhow!("glob path expansion task failed: {e}"))?
-        };
-
-        // Apply the compiled exclude to each glob pattern's matches so a pattern
-        // argument honors `--exclude-pattern` exactly as a named-directory
-        // argument does (bug 73). Filtering here — before the flat set feeds the
-        // scoped nudge and before the render loop — keeps the listing, the nudge,
-        // and the `--count` leg (which filters identically) in agreement, and
-        // leaves a pattern whose every match is excluded with an empty
-        // `resolved`, so it falls through to the honest `no matches for pattern`
-        // report below rather than vanishing.
-        apply_exclude_to_groups(&self.fs_manager, &mut groups, exclude);
-
-        let resolved: Vec<PathBuf> = groups
-            .iter()
-            .flat_map(|g| g.resolved.iter().cloned())
-            .collect();
-
-        // Scoped changed-set nudge (WS31 ticket 04): glob enriches with
-        // `documentSymbol` (outlines) only, so coherence is needed just for the
-        // files it lists — a `WalkBreadth::Scoped` walk of the glob pattern. Feed
-        // the pattern's files into the ticket-03 diff (add/update only — a scoped
-        // walk MUST NOT reap deletions, as it cannot assert a baseline entry
-        // outside its pattern is gone), route the delta to covering servers, and
-        // settle, BEFORE the outline queries below so they read the post-nudge
-        // state. A root with no covering server is `WalkBreadth::None` and is
-        // skipped. This runs before `ensure_symbols` for the same reason the
-        // grep/diagnostics nudges precede their reads.
-        self.nudge_scoped(&resolved, input, exclude).await;
-
-        let mut full = String::new();
-        let mut no_match_indices = Vec::new();
-        // Teaching signals (moments 3 & 4) collected as the render runs; the CLI
-        // emits the notes on stderr. First-seen order, deduplicated.
-        let mut dir_hints: Vec<String> = Vec::new();
-        let mut metachar_names: Vec<String> = Vec::new();
-        for (i, group) in groups.iter().enumerate() {
-            // Real walk cancellation (misc 140): the router fires this token when
-            // the CLI client disconnects. Between paths — after the awaits above
-            // and each path's own LSP round-trips — a fired token stops the
-            // listing before the next path. A cancelled walk yields no partial
-            // response (the router already returned); this just ends the work.
-            if cancel.is_cancelled() {
-                break;
-            }
-            if group.resolved.is_empty() {
-                // A pattern that matched nothing is reported loudly CLI-side on
-                // stderr (misc 118 + the VERBS streams ruling); nothing renders
-                // on stdout. Under the one-verb form every group is a pattern,
-                // so a zero-match argument is always a per-argument no-match — no
-                // cardinality header precedes the listings anymore (stdout is
-                // results only; `--count` is the sole tally).
-                no_match_indices.push(i);
-                continue;
-            }
-            for path in &group.resolved {
-                // Teaching moment 3: a matched name that carries a glob
-                // metacharacter is reachable only by the escaped spelling
-                // (`'\*.md'`). Record its basename so the CLI teaches it; the
-                // result path itself stays byte-exact (ws35).
-                if let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned())
-                    && name.contains(['*', '?', '[', ']', '{', '}'])
-                    && !metachar_names.contains(&name)
-                {
-                    metachar_names.push(name);
-                }
-                // Directories first — `is_dir()` follows symlinks, so a
-                // symlink-to-dir lists its contents (rather than rendering as a
-                // single file header). This dir-first order matches
-                // `collect_scoped_observations` so the listing and the changed-set
-                // nudge classify a symlink-to-dir the same way (WS31-review walk-2).
-                if path.is_dir() {
-                    // Teaching moment 4: the pattern resolved a directory; record
-                    // its display path so the CLI hands over the listing spelling
-                    // (`catenary glob '<dir>/*'`). Matches the listing's own
-                    // display: cwd-relative when cwd-scoped, else absolute.
-                    let hint = glob_display_path(path, cwd);
-                    if !dir_hints.contains(&hint) {
-                        dir_hints.push(hint);
-                    }
-                    let output = self
-                        .handle_glob_dir(path, input, exclude, cwd, parent_id, cancel)
-                        .await?;
-                    full.push_str(&output);
-                } else if path_is_file_or_symlink_with_retry(path) {
-                    // Re-stat with a bounded retry: a transient
-                    // `is_file()`/`is_symlink()` miss (an atomic-rename write racing
-                    // this fresh stat) must not silently skip a matched file that
-                    // the pattern expansion already confirmed present on disk.
-                    self.client_manager
-                        .ensure_and_wait_for_paths_bounded(
-                            std::slice::from_ref(path),
-                            crate::lsp::manager::QUERY_ENRICHMENT_BUDGET,
-                        )
-                        .await;
-                    super::ensure_symbols(
-                        self.symbol_index.as_ref(),
-                        &self.client_manager,
-                        &self.fs_manager,
-                        std::slice::from_ref(path),
-                        parent_id,
-                    )
-                    .await;
-                    full.push_str(&self.handle_glob_file(path, cwd));
-                }
-                // Skip non-existent paths silently — shell expansion
-                // shouldn't produce them, but be defensive.
-            }
-        }
-        Ok(RenderedGlob {
-            output: full,
-            no_match_indices,
-            dir_hints,
-            metachar_names,
-        })
-    }
-
-    /// Routes glob's scoped changed-set nudge (WS31 ticket 04,
-    /// [`WalkBreadth::Scoped`](crate::lsp::WalkBreadth::Scoped)).
-    ///
-    /// `resolved` is the glob pattern's resolved path set (from
-    /// [`expand_glob_patterns_grouped_cancellable`](super::session::expand_glob_patterns_grouped_cancellable)).
-    /// The breadth of a glob walk is exactly the
-    /// pattern, so the observation set is: each resolved file, and each resolved
-    /// directory's **immediate** entries (the files glob lists) — the same
-    /// visibility (`include_gitignored`/`include_hidden`) and `exclude` filters
-    /// the listing applies, so the nudge tracks only files the query surfaces.
-    /// Each observed file is statted (the per-file stat is the portable
-    /// correctness path). The set is grouped by workspace root and routed via
-    /// [`nudge_changed_set`](crate::lsp::LspClientManager::nudge_changed_set)
-    /// with `reap = false`: a scoped walk adds/updates only and never reaps a
-    /// deletion. Roots with no covering server are skipped
-    /// ([`WalkBreadth::None`](crate::lsp::WalkBreadth::None)).
-    async fn nudge_scoped(&self, resolved: &[PathBuf], input: &GlobInput, exclude: &ExcludeSet) {
-        let observations = collect_scoped_observations(resolved, input, exclude);
-        if observations.is_empty() {
-            return;
-        }
-
-        // Group by owning workspace root (root-relative path + mtime).
-        let mut by_root: HashMap<PathBuf, Vec<(PathBuf, i64)>> = HashMap::new();
-        for (abs, mtime) in observations {
-            if let Some(root) = self.fs_manager.resolve_root(&abs)
-                && let Ok(rel) = abs.strip_prefix(&root)
-            {
-                by_root
-                    .entry(root)
-                    .or_default()
-                    .push((rel.to_path_buf(), mtime));
-            }
-        }
-
-        let no_exclude: HashSet<PathBuf> = HashSet::new();
-        for (root, observed) in &by_root {
-            // Walk-breadth gate: a covered root is `Scoped` for glob, an
-            // uncovered one is `None` (skip). A scoped walk never reaps.
-            let breadth = if self.client_manager.has_covering_watchers(root).await {
-                WalkBreadth::Scoped
-            } else {
-                WalkBreadth::None
+                file_info(fs_manager, &entry_path, resolved_meta.as_ref())
             };
-            if !breadth.runs_engine() {
-                continue;
-            }
-            self.client_manager
-                .nudge_changed_set(root, observed, &no_exclude, breadth.reaps())
-                .await;
+
+            entries.push(GlobEntry {
+                name,
+                abs_path: entry_path,
+                is_dir: resolved_meta
+                    .as_ref()
+                    .is_some_and(std::fs::Metadata::is_dir),
+                line_count,
+                binary_size,
+                is_symlink: true,
+                symlink_target: Some(target),
+                is_broken_symlink: is_broken,
+                is_gitignored,
+                is_snapshot: is_snap,
+            });
+        } else if metadata.is_dir() {
+            entries.push(GlobEntry {
+                name: format!("{name}/"),
+                abs_path: entry_path,
+                is_dir: true,
+                line_count: None,
+                binary_size: None,
+                is_symlink: false,
+                symlink_target: None,
+                is_broken_symlink: false,
+                is_gitignored,
+                is_snapshot: false,
+            });
+        } else {
+            let (line_count, binary_size) = if is_snap {
+                (None, None)
+            } else {
+                file_info(fs_manager, &entry_path, Some(&metadata))
+            };
+            entries.push(GlobEntry {
+                name,
+                abs_path: entry_path,
+                is_dir: false,
+                line_count,
+                binary_size,
+                is_symlink: false,
+                symlink_target: None,
+                is_broken_symlink: false,
+                is_gitignored,
+                is_snapshot: is_snap,
+            });
         }
     }
 
-    /// Directory listing: the one-level structural read.
-    ///
-    /// Collects immediate children, applies visibility and exclude filters, and
-    /// renders them: files get their fully-expanded outline (or the `no outline`
-    /// marker), subdirectories get `name/  (N files, M dirs)` immediate child
-    /// counts (no recursion). The directory's own header carries the same
-    /// `(N files, M dirs)` count — a directory renders identically as a child
-    /// entry and as the glob target's header — so an empty directory is
-    /// `path/  (empty)`. Returns the complete output.
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "guard must live for all index queries"
-    )]
-    async fn handle_glob_dir(
-        &self,
-        dir: &Path,
-        input: &GlobInput,
-        exclude: &ExcludeSet,
-        cwd: Option<&Path>,
-        parent_id: Option<&str>,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<String> {
-        let canonical = dir
-            .canonicalize()
-            .map_err(|e| anyhow!("Path does not exist: {}: {e}", dir.display()))?;
+    Ok(entries)
+}
 
-        let entries = self
-            .collect_dir_entries_off_thread(
-                canonical.clone(),
-                input.include_gitignored,
-                input.include_hidden,
-                exclude.clone(),
-                cancel,
-            )
-            .await?;
-
-        // The target's own count = its immediate entries (what this glob
-        // enumerated), split into files and directories — the same split a
-        // subdir child entry shows, so the two forms agree.
-        let target_files = entries.iter().filter(|e| !e.is_dir).count();
-        let target_dirs = entries.iter().filter(|e| e.is_dir).count();
-        let target_suffix = dir_count_suffix(target_files, target_dirs);
-
-        // Context header: `cwd: ~/…` for cwd-scoped, absolute path for absolute.
-        let mut full = String::new();
-        if let Some(cwd) = cwd {
-            let compressed = super::compress_home(cwd);
-            if self.fs_manager.resolve_root(cwd).is_some() {
-                let _ = writeln!(full, "cwd: {compressed}");
-            } else {
-                let _ = writeln!(full, "cwd: {compressed} {NO_LSP_LABEL}");
-            }
-            let display = canonical.strip_prefix(cwd).map_or_else(
-                |_| canonical.to_string_lossy().to_string(),
-                |rel| rel.to_string_lossy().to_string(),
-            );
-            let _ = writeln!(full, "{display}/  {target_suffix}");
-        } else {
-            // Absolute pattern outside workspace roots: LSP warning.
-            if self.fs_manager.resolve_root(&canonical).is_none() {
-                let _ = writeln!(full, "{NO_LSP_LABEL}");
-            }
-            let _ = writeln!(full, "{}/  {target_suffix}", canonical.display());
-        }
-
-        if entries.is_empty() {
-            return Ok(full);
-        }
-
-        // Populate the symbol index for every listed file (enrich always).
-        let file_paths: Vec<PathBuf> = entries
-            .iter()
-            .filter(|e| !e.is_dir && !e.is_broken_symlink && !e.is_snapshot)
-            .map(|e| e.abs_path.clone())
-            .collect();
-        self.client_manager
-            .ensure_and_wait_for_paths_bounded(
-                &file_paths,
-                crate::lsp::manager::QUERY_ENRICHMENT_BUDGET,
-            )
-            .await;
-        super::ensure_symbols(
-            self.symbol_index.as_ref(),
-            &self.client_manager,
-            &self.fs_manager,
-            &file_paths,
-            parent_id,
+/// Extracts file info: `(line_count, binary_size)`.
+fn file_info(
+    fs_manager: &FilesystemManager,
+    path: &Path,
+    metadata: Option<&std::fs::Metadata>,
+) -> (Option<usize>, Option<String>) {
+    #[cfg(test)]
+    probe::FILE_INFO_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    metadata.map_or((None, None), |m| {
+        fs_manager.line_count(path, m).map_or_else(
+            || (None, Some(format_file_size(m.len()))),
+            |lc| (Some(lc), None),
         )
-        .await;
-
-        let ts_guard = self.symbol_index.as_ref().and_then(|m| m.lock().ok());
-
-        let content = render_dir(
-            &entries,
-            ts_guard.as_deref(),
-            &self.outline_suppress,
-            &self.fs_manager,
-            "\t",
-            input,
-            exclude,
-        );
-        full.push_str(&content);
-        Ok(full)
-    }
-
-    /// Extracts file info: `(line_count, binary_size)`.
-    ///
-    /// A free helper over [`FilesystemManager`] (not `&self`) so the directory
-    /// walk that calls it can run off the runtime thread in a `spawn_blocking`
-    /// task (misc 140 phase 2).
-    fn file_info(
-        fs_manager: &FilesystemManager,
-        path: &Path,
-        metadata: Option<&std::fs::Metadata>,
-    ) -> (Option<usize>, Option<String>) {
-        #[cfg(test)]
-        probe::FILE_INFO_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        metadata.map_or((None, None), |m| {
-            fs_manager.line_count(path, m).map_or_else(
-                || (None, Some(format_file_size(m.len()))),
-                |lc| (Some(lc), None),
-            )
-        })
-    }
-
-    /// Collects the immediate children of a directory as `GlobEntry` rows.
-    ///
-    /// Applies the visibility (hidden), gitignore, and `exclude` filters and
-    /// detects per-entry flags (gitignored, snapshot, symlink, broken). Shared
-    /// by [`Self::handle_glob_dir`] (which renders the rows) and
-    /// [`Self::count_paths`] (which counts them) so the two never diverge.
-    /// `canonical` must be the canonicalized directory path.
-    ///
-    /// `cancel` is checked per entry: a fired token (the CLI client disconnected)
-    /// stops the one-level enumeration so a directory of many children is not read
-    /// to completion for a client that is gone (misc 140). The walk is
-    /// `max_depth(1)`, so this bounds a single wide directory rather than a
-    /// recursive tree.
-    ///
-    /// A free helper over [`FilesystemManager`] (not `&self`) so
-    /// [`Self::collect_dir_entries_off_thread`] can run it in a `spawn_blocking`
-    /// task — a single massive directory is then cancellable mid-walk once off
-    /// the runtime thread (misc 140 phase 2).
-    #[allow(clippy::too_many_lines, reason = "sequential per-entry classification")]
-    fn collect_dir_entries(
-        fs_manager: &FilesystemManager,
-        canonical: &Path,
-        include_gitignored: bool,
-        include_hidden: bool,
-        exclude: &ExcludeSet,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<Vec<GlobEntry>> {
-        // Build non-gitignored set for flag detection.
-        let non_ignored: HashSet<PathBuf> = if include_gitignored {
-            WalkBuilder::new(canonical)
-                .max_depth(Some(1))
-                .git_ignore(true)
-                .hidden(!include_hidden)
-                .build()
-                .flatten()
-                .map(ignore::DirEntry::into_path)
-                .collect()
-        } else {
-            HashSet::new()
-        };
-
-        let walker = WalkBuilder::new(canonical)
-            .max_depth(Some(1))
-            .git_ignore(!include_gitignored)
-            .hidden(!include_hidden)
-            .build();
-
-        let mut entries = Vec::new();
-
-        for entry in walker.flatten() {
-            #[cfg(test)]
-            probe::COLLECT_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if cancel.is_cancelled() {
-                break;
-            }
-            let entry_path = entry.into_path();
-            if entry_path.as_path() == canonical {
-                continue;
-            }
-
-            let name = entry_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            // Apply exclude filter against the entry path.
-            if exclude.is_match(&entry_path, canonical) {
-                continue;
-            }
-
-            let is_gitignored = include_gitignored && !non_ignored.contains(&entry_path);
-            let is_snap = is_snapshot(&name);
-
-            let metadata = entry_path
-                .symlink_metadata()
-                .map_err(|e| anyhow!("Failed to read metadata for {name}: {e}"))?;
-
-            if metadata.file_type().is_symlink() {
-                let target = std::fs::read_link(&entry_path)
-                    .map_or_else(|_| "?".to_string(), |t| t.to_string_lossy().to_string());
-                let resolved_meta = std::fs::metadata(&entry_path).ok();
-                let is_broken = resolved_meta.is_none();
-
-                let (line_count, binary_size) = if is_broken || is_snap {
-                    (None, None)
-                } else {
-                    Self::file_info(fs_manager, &entry_path, resolved_meta.as_ref())
-                };
-
-                entries.push(GlobEntry {
-                    name,
-                    abs_path: entry_path,
-                    is_dir: resolved_meta
-                        .as_ref()
-                        .is_some_and(std::fs::Metadata::is_dir),
-                    line_count,
-                    binary_size,
-                    is_symlink: true,
-                    symlink_target: Some(target),
-                    is_broken_symlink: is_broken,
-                    is_gitignored,
-                    is_snapshot: is_snap,
-                });
-            } else if metadata.is_dir() {
-                entries.push(GlobEntry {
-                    name: format!("{name}/"),
-                    abs_path: entry_path,
-                    is_dir: true,
-                    line_count: None,
-                    binary_size: None,
-                    is_symlink: false,
-                    symlink_target: None,
-                    is_broken_symlink: false,
-                    is_gitignored,
-                    is_snapshot: false,
-                });
-            } else {
-                let (line_count, binary_size) = if is_snap {
-                    (None, None)
-                } else {
-                    Self::file_info(fs_manager, &entry_path, Some(&metadata))
-                };
-                entries.push(GlobEntry {
-                    name,
-                    abs_path: entry_path,
-                    is_dir: false,
-                    line_count,
-                    binary_size,
-                    is_symlink: false,
-                    symlink_target: None,
-                    is_broken_symlink: false,
-                    is_gitignored,
-                    is_snapshot: is_snap,
-                });
-            }
-        }
-
-        Ok(entries)
-    }
-
-    /// Runs [`Self::collect_dir_entries`] on a blocking thread (misc 140 phase 2).
-    ///
-    /// The one-level directory enumeration is synchronous; left on an async
-    /// runtime worker it would pin that thread, so the router's disconnect
-    /// `select!` could never poll its cancel branch — a single massive directory
-    /// would be read to completion for a dead client. `spawn_blocking` frees the
-    /// runtime to fire the cancel token, which the walk observes per entry
-    /// (mirroring grep's `ripgrep_matches_blocking`). Owned inputs move into the
-    /// task; `GlobEntry`/`ExcludeSet` are `Send`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if metadata reads fail or the blocking task panics.
-    async fn collect_dir_entries_off_thread(
-        &self,
-        canonical: PathBuf,
-        include_gitignored: bool,
-        include_hidden: bool,
-        exclude: ExcludeSet,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<Vec<GlobEntry>> {
-        let fs_manager = Arc::clone(&self.fs_manager);
-        let cancel = cancel.clone();
-        tokio::task::spawn_blocking(move || {
-            Self::collect_dir_entries(
-                &fs_manager,
-                &canonical,
-                include_gitignored,
-                include_hidden,
-                &exclude,
-                &cancel,
-            )
-        })
-        .await
-        .map_err(|e| anyhow!("glob directory walk task failed: {e}"))?
-    }
-
-    /// Counts the filesystem paths a glob query resolves to (`--count`).
-    ///
-    /// Under the one-verb form every positional is a **pattern**, so the count is
-    /// the pattern's match set — each match counted once, file or directory
-    /// alike (misc 184: one pattern, one set, one number). The listing
-    /// legitimately descends into a matched directory to render its contents; the
-    /// count must not, or the two surfaces disagree whenever a pattern matches
-    /// directories. With arity 1 the whole tally reduces to the single group's
-    /// match-set size; the old shape branch (a directly-named directory counting
-    /// by its listed entries) died with the name/pattern distinction.
-    ///
-    /// LSP enrichment is skipped — a count is pure filesystem, and reads **zero**
-    /// file content bytes.
-    ///
-    /// A free helper over [`FilesystemManager`] (not `&self`) so
-    /// [`Self::count_paths_off_thread`] can run it in a `spawn_blocking` task —
-    /// the pattern expansion is then cancellable mid-walk once off the runtime
-    /// thread (misc 140 phase 2). The expansion walk is the cancellable form, so
-    /// a fired token stops it promptly.
-    fn count_paths(
-        fs_manager: &FilesystemManager,
-        paths: &[PathBuf],
-        include_gitignored: bool,
-        include_hidden: bool,
-        exclude: &ExcludeSet,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> usize {
-        // Resolve every positional as a pattern (the one-verb form), apply the
-        // exclude to each match set, and tally the survivors. This mirrors the
-        // rendered listing's match set exactly, so `--count` and the listing
-        // agree under an exclude (bug 73).
-        let mut groups = expand_glob_patterns_grouped_cancellable(
-            paths,
-            include_gitignored,
-            include_hidden,
-            cancel,
-        );
-        apply_exclude_to_groups(fs_manager, &mut groups, exclude);
-        let mut total = 0usize;
-        for group in &groups {
-            if cancel.is_cancelled() {
-                break;
-            }
-            total += group.resolved.len();
-        }
-        total
-    }
-
-    /// Runs [`Self::count_paths`] on a blocking thread (misc 140 phase 2).
-    ///
-    /// Same rationale as [`Self::collect_dir_entries_off_thread`]: the count's
-    /// pattern-expansion walk is synchronous, so `spawn_blocking` keeps the
-    /// router's disconnect `select!` pollable and lets the cancel token actually
-    /// fire mid-walk.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the blocking task panics.
-    async fn count_paths_off_thread(
-        &self,
-        paths: Vec<PathBuf>,
-        include_gitignored: bool,
-        include_hidden: bool,
-        exclude: ExcludeSet,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<usize> {
-        let fs_manager = Arc::clone(&self.fs_manager);
-        let cancel = cancel.clone();
-        tokio::task::spawn_blocking(move || {
-            Self::count_paths(
-                &fs_manager,
-                &paths,
-                include_gitignored,
-                include_hidden,
-                &exclude,
-                &cancel,
-            )
-        })
-        .await
-        .map_err(|e| anyhow!("glob count walk task failed: {e}"))
-    }
+    })
 }
 
 // ─── Outline eligibility ──────────────────────────────────────────────
 
-/// Returns `true` if symbols are cached for the file in the index.
-fn has_symbols_available(path: &Path, symbol_index: Option<&SymbolIndex>) -> bool {
-    symbol_index.is_some_and(|idx| idx.has_symbols_for(path))
-}
-
 /// Returns `true` if the file matches any `outline_suppress` pattern.
-fn is_outline_suppressed(
+pub(super) fn is_outline_suppressed(
     abs_path: &Path,
     outline_suppress: &[globset::GlobMatcher],
     fs_manager: &FilesystemManager,
@@ -1025,19 +765,6 @@ fn is_outline_suppressed(
 /// Returns `true` if the filename matches the snapshot sidecar pattern.
 fn is_snapshot(name: &str) -> bool {
     name.contains(".catenary_snapshot_")
-}
-
-/// The display form a matched path renders as — cwd-relative when the query was
-/// cwd-scoped, else absolute — matching the listing headers
-/// ([`GlobServer::handle_glob_dir`] / [`GlobServer::handle_glob_file`]).
-///
-/// Used for teaching moment 4's directory-listing hint so the
-/// `catenary glob '<dir>/*'` suggestion reads the way the agent's own paths do.
-fn glob_display_path(path: &Path, cwd: Option<&Path>) -> String {
-    cwd.and_then(|cwd| path.strip_prefix(cwd).ok()).map_or_else(
-        || path.to_string_lossy().into_owned(),
-        |rel| rel.to_string_lossy().into_owned(),
-    )
 }
 
 // ─── Outline kind filter (types and callables only) ──────────────────
@@ -1078,7 +805,15 @@ fn is_callable_kind(kind: &str) -> bool {
 /// is gone — the children are expanded on their own indented lines. When the
 /// source line is unavailable (file unreadable or line out of range) the bare
 /// name is used so the node is never empty.
-fn render_symbol_line(out: &mut String, sym: &Symbol, indent: &str, source: Option<&str>) {
+///
+/// `pub(super)` since ws43-03: the hitstream annotator renders listing-weight
+/// bodies (top-level nodes only) through this same line shape.
+pub(super) fn render_symbol_line(
+    out: &mut String,
+    sym: &Symbol,
+    indent: &str,
+    source: Option<&str>,
+) {
     let text = source.map_or_else(|| sym.name.as_str(), str::trim_end);
     let _ = writeln!(out, "{indent}{}  {text}", sym.line + 1);
 }
@@ -1111,7 +846,11 @@ fn render_symbol_line(out: &mut String, sym: &Symbol, indent: &str, source: Opti
 /// height still yields the correct indent. Filtering happens at the render
 /// only: the symbol index stays complete (grep's `#scope` enrichment and symbol
 /// queries need the full tree).
-fn render_full_outline(
+///
+/// `pub(super)` since ws43-03: the daemon-side hitstream annotator renders
+/// `--outline` (full-weight) bodies through this, with an empty base indent —
+/// the CLI re-indents each line for its listing position.
+pub(super) fn render_full_outline(
     out: &mut String,
     file: &Path,
     syms: &[Symbol],
@@ -1187,14 +926,19 @@ fn dir_count_suffix(files: usize, dirs: usize) -> String {
 /// the same visibility (gitignore/hidden) and `exclude` filters the listing
 /// uses — *what globbing into this directory would enumerate*, the preview of
 /// the next glob. Cheap: one stat per entry, no content reads (unlike
-/// [`GlobServer::collect_dir_entries`]), so previewing a huge `target/` does not
+/// [`collect_dir_entries`]), so previewing a huge `target/` does not
 /// read 40 000 files. Symlinks are followed for the file/dir decision, matching
 /// the listing's classification.
-fn count_dir_children(dir: &Path, input: &GlobInput, exclude: &ExcludeSet) -> (usize, usize) {
+fn count_dir_children(
+    dir: &Path,
+    include_gitignored: bool,
+    include_hidden: bool,
+    exclude: &ExcludeSet,
+) -> (usize, usize) {
     let walker = WalkBuilder::new(dir)
         .max_depth(Some(1))
-        .git_ignore(!input.include_gitignored)
-        .hidden(!input.include_hidden)
+        .git_ignore(!include_gitignored)
+        .hidden(!include_hidden)
         .build();
     let mut files = 0usize;
     let mut dirs = 0usize;
@@ -1224,15 +968,15 @@ fn count_dir_children(dir: &Path, input: &GlobInput, exclude: &ExcludeSet) -> (u
 /// Only pattern groups ([`ArgResolution::is_pattern`]) are filtered: naming a
 /// file or directory is a direct request whose own path is never excluded — a
 /// named directory's *entries* are filtered downstream by the listing
-/// ([`GlobServer::collect_dir_entries`]) and count walks, so both argument kinds
+/// ([`collect_dir_entries`]) and count walks, so both argument kinds
 /// surface the same surviving set. A no-op when `exclude` is `None`.
 ///
-/// Shared by [`GlobServer::handle_literal_paths`] (rendered listing) and
-/// [`GlobServer::count_paths`] (`--count`) so the two never diverge, and applied
-/// before the flat set feeds glob's scoped nudge so the nudge tracks only the
-/// files the query surfaces. A pattern whose every match is excluded is left
-/// with an empty `resolved`, so it renders the honest `no matches for pattern`
-/// report rather than vanishing.
+/// Shared by [`build_glob_plan`] (rendered listing) and
+/// [`count_glob_paths`] (`--count`) so the two never diverge, and applied
+/// before the flat set feeds glob's scoped-nudge observations so the nudge
+/// tracks only the files the query surfaces. A pattern whose every match is
+/// excluded is left with an empty `resolved`, so it renders the honest
+/// `no matches for pattern` report rather than vanishing.
 ///
 /// A path is dropped when **any** pattern in the set matches it, so every
 /// collected `--exclude-pattern` reaches this leg (bug 89) exactly as it reaches
@@ -1262,7 +1006,7 @@ fn apply_exclude_to_groups(
 /// falling back to the path's parent, then the path itself, when no root owns
 /// it. `**/<name>` is depth-independent, so any ancestor root yields the same
 /// verdict. This mirrors the entry-level filter
-/// [`GlobServer::collect_dir_entries`] and the grep walk apply, so a
+/// [`collect_dir_entries`] and the grep walk apply, so a
 /// pattern-matched path is excluded on the same terms as a directory entry.
 fn path_matches_exclude(fs_manager: &FilesystemManager, exclude: &ExcludeSet, path: &Path) -> bool {
     let root = fs_manager
@@ -1272,81 +1016,7 @@ fn path_matches_exclude(fs_manager: &FilesystemManager, exclude: &ExcludeSet, pa
     exclude.is_match(path, &root)
 }
 
-// ─── Directory rendering ─────────────────────────────────────────────
-
-/// Renders a directory listing: subdirectories with their child counts, then
-/// files with their fully-expanded outlines.
-///
-/// Enrich always — every file with symbols is outlined (no size/count gate),
-/// unless matched by `outline_suppress` (which keeps a `[symbols available]`
-/// flag in its place). A file whose language has no server, or whose
-/// `documentSymbol` produced nothing, carries the `no outline` marker. Each
-/// subdirectory shows `name/  (N files, M dirs)` — its immediate child counts
-/// under the active flags, no recursion. Directories sort before files; both
-/// sort by name. `symbol_index` is `None` only outside the daemon; otherwise it
-/// is an index that may simply hold no symbols for an unserved file.
-#[allow(clippy::too_many_lines, reason = "sequential rendering pipeline")]
-fn render_dir(
-    entries: &[GlobEntry],
-    symbol_index: Option<&SymbolIndex>,
-    outline_suppress: &[globset::GlobMatcher],
-    fs_manager: &FilesystemManager,
-    indent: &str,
-    input: &GlobInput,
-    exclude: &ExcludeSet,
-) -> String {
-    // Outline nodes sit one level deeper than their file header.
-    let sym_base_indent = format!("{indent}\t");
-    let mut sources = SourceLines::new();
-    let mut result = String::new();
-
-    // Subdirectories first (sorted), each with its immediate child counts.
-    let mut dirs: Vec<&GlobEntry> = entries.iter().filter(|e| e.is_dir).collect();
-    dirs.sort_by(|a, b| a.name.cmp(&b.name));
-    for d in &dirs {
-        let (files, subdirs) = count_dir_children(&d.abs_path, input, exclude);
-        let descriptor = dir_count_suffix(files, subdirs);
-        let flags = compute_entry_flags(false, false, d.is_gitignored);
-        render_entry_line(&mut result, d, &descriptor, &flags, indent);
-    }
-
-    // Files (sorted), each with its fully-expanded outline (enrich always).
-    let mut files: Vec<&GlobEntry> = entries.iter().filter(|e| !e.is_dir).collect();
-    files.sort_by(|a, b| a.name.cmp(&b.name));
-    for f in &files {
-        if f.is_broken_symlink || f.is_snapshot {
-            let flags = compute_entry_flags(false, false, f.is_gitignored);
-            render_entry_line(&mut result, f, "", &flags, indent);
-            continue;
-        }
-
-        let has_symbols = has_symbols_available(&f.abs_path, symbol_index);
-        let suppressed =
-            has_symbols && is_outline_suppressed(&f.abs_path, outline_suppress, fs_manager);
-        // A text file (it has a line count) with no symbols degraded — mark it.
-        let mark_no_outline = f.line_count.is_some() && !has_symbols;
-        let descriptor = file_descriptor(f, mark_no_outline);
-        let flags = compute_entry_flags(has_symbols, suppressed, f.is_gitignored);
-        render_entry_line(&mut result, f, &descriptor, &flags, indent);
-
-        if has_symbols
-            && !suppressed
-            && let Some(idx) = symbol_index
-            && let Ok(all) = idx.query(".*", Some(std::slice::from_ref(&f.abs_path)))
-        {
-            let syms: Vec<Symbol> = all.into_iter().map(|(_, s)| s).collect();
-            render_full_outline(
-                &mut result,
-                &f.abs_path,
-                &syms,
-                &sym_base_indent,
-                &mut sources,
-            );
-        }
-    }
-
-    result
-}
+// ─── Entry rendering ─────────────────────────────────────────────────
 
 /// Computes the appended `[…]` flags for an entry: `symbols available` when the
 /// file has symbols that are suppressed from display, and `gitignored`.
@@ -1472,7 +1142,8 @@ fn path_is_file_or_symlink_with_retry_with(
 /// `--follow-links`, fs-coherence ticket 07).
 fn collect_scoped_observations(
     resolved: &[PathBuf],
-    input: &GlobInput,
+    include_gitignored: bool,
+    include_hidden: bool,
     exclude: &ExcludeSet,
 ) -> Vec<(PathBuf, i64)> {
     let mut observed: Vec<(PathBuf, i64)> = Vec::new();
@@ -1493,8 +1164,8 @@ fn collect_scoped_observations(
             let canonical_dir = path.canonicalize().ok();
             let walker = WalkBuilder::new(path)
                 .max_depth(Some(1))
-                .git_ignore(!input.include_gitignored)
-                .hidden(!input.include_hidden)
+                .git_ignore(!include_gitignored)
+                .hidden(!include_hidden)
                 .build();
             for entry in walker.flatten() {
                 let entry_is_symlink = entry.path_is_symlink();
@@ -1589,7 +1260,8 @@ fn component_has_metachar(component: &std::ffi::OsStr) -> bool {
 /// A relative pattern (no absolute base) or one whose base does not yet exist
 /// keeps its spelling (`canonicalize` can't resolve it) — a zero-match pattern
 /// still reports honestly, and a relative pattern carries no base to resolve.
-fn canonicalize_pattern_base(pattern: &Path) -> PathBuf {
+#[must_use]
+pub fn canonicalize_pattern_base(pattern: &Path) -> PathBuf {
     // Split into the metachar-free prefix (the walk's base) and the glob
     // remainder, mirroring `ResolvedGlob::base_dir`.
     let mut base = PathBuf::new();
@@ -1886,53 +1558,6 @@ mod tests {
         entry.binary_size = Some("1.5 MB".to_string());
         // A binary has no outline by nature — never the `no outline` marker.
         assert_eq!(file_descriptor(&entry, true), "(1.5 MB)");
-    }
-
-    // ─── has_symbols_available ───────────────────────────────────────
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_has_symbols_available_with_symbols() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/has_syms.rs");
-
-        idx.populate_from_document_symbols(
-            &path,
-            &serde_json::json!([{
-                "name": "foo",
-                "kind": 12,
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 1 } },
-                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } }
-            }]),
-        )
-        .expect("populate");
-
-        assert!(
-            has_symbols_available(&path, Some(&idx)),
-            "should return true when symbols exist"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn test_has_symbols_available_without_symbols() {
-        let idx = SymbolIndex::new().expect("create index");
-        let path = PathBuf::from("/test/no_syms.rs");
-
-        assert!(
-            !has_symbols_available(&path, Some(&idx)),
-            "should return false when no symbols"
-        );
-    }
-
-    #[test]
-    fn test_has_symbols_available_no_index() {
-        let path = PathBuf::from("/test/any.rs");
-
-        assert!(
-            !has_symbols_available(&path, None),
-            "should return false with no index"
-        );
     }
 
     // ─── is_outline_suppressed ──────────────────────────────────────
@@ -2244,7 +1869,7 @@ mod tests {
         // The filter is a RENDER-only concern: the symbol index still holds every
         // symbol (including the pruned local), so grep's `#scope` symbol-path
         // enrichment and symbol queries keep the full tree.
-        let idx = SymbolIndex::new().expect("create index");
+        let idx = crate::symbol_index::SymbolIndex::new().expect("create index");
         let path = PathBuf::from("/synthetic/enrich.rs");
         idx.populate_from_document_symbols(
             &path,
@@ -2465,15 +2090,10 @@ mod tests {
 
         // include_hidden / include_gitignored so neither visibility filter hides
         // the entry; the file itself is non-hidden, but this keeps it unambiguous.
-        let input: GlobInput = serde_json::from_value(serde_json::json!({
-            "include_hidden": true,
-            "include_gitignored": true,
-        }))
-        .expect("deserialize GlobInput");
-
         let observed = collect_scoped_observations(
             std::slice::from_ref(&linkdir),
-            &input,
+            true,
+            true,
             &ExcludeSet::default(),
         );
 
@@ -2497,30 +2117,7 @@ mod tests {
         );
     }
 
-    // ─── count_paths — dispatch parity with handle_literal_paths (WS31-review D1) ──
-
-    /// Builds a minimal [`GlobServer`] for unit tests. No LSP servers are
-    /// spawned — [`LspClientManager::new`] only stores the config/logging/fs
-    /// ports — so this is cheap and exercises the real filesystem dispatch in
-    /// [`GlobServer::count_paths`] / [`GlobServer::collect_dir_entries`].
-    fn test_glob_server() -> GlobServer {
-        use crate::config::Config;
-        use crate::logging::LoggingServer;
-        use crate::lsp::LspClientManager;
-
-        let fs_manager = Arc::new(FilesystemManager::new());
-        let client_manager = Arc::new(LspClientManager::new(
-            Config::default(),
-            LoggingServer::new(),
-            fs_manager.clone(),
-        ));
-        GlobServer {
-            client_manager,
-            fs_manager,
-            symbol_index: None,
-            outline_suppress: vec![],
-        }
-    }
+    // ─── count_glob_paths — dispatch parity with the plan build (WS31-review D1) ──
 
     /// T1 (retargeted for the VERBS one-verb form) — a symlink-to-dir pattern is
     /// a single self-matching path, so `--count` is `1` (the match counted once),
@@ -2552,18 +2149,12 @@ mod tests {
         let linkdir = base.join("linkdir");
         symlink(&realdir, &linkdir).expect("create linkdir symlink");
 
-        let server = test_glob_server();
-        let input: GlobInput = serde_json::from_value(serde_json::json!({
-            "paths": [linkdir.to_string_lossy()],
-            "count": true,
-        }))
-        .expect("deserialize GlobInput");
-
-        let count = GlobServer::count_paths(
-            &server.fs_manager,
-            &input.paths,
-            input.include_gitignored,
-            input.include_hidden,
+        let fs_manager = FilesystemManager::new();
+        let count = count_glob_paths(
+            &fs_manager,
+            &[linkdir],
+            false,
+            false,
             &ExcludeSet::default(),
             &tokio_util::sync::CancellationToken::new(),
         );
@@ -2615,94 +2206,211 @@ mod tests {
 
     // ─── zero-match pattern reporting (misc 118) ────────────────────
 
-    /// `execute` surfaces the index of a glob-pattern argument that expanded to
-    /// zero matches, so the CLI can report it loudly. A single unmatched pattern
-    /// resolves to nothing (no dispatch, no LSP), so this stays fast and
+    /// The plan build flags a pattern that expanded to zero matches, so the
+    /// CLI can report it loudly. A single unmatched pattern resolves to
+    /// nothing (no nodes, no enrichment set), so this stays fast and
     /// server-free.
     #[test]
     #[allow(clippy::expect_used, reason = "test assertions")]
-    fn execute_reports_zero_match_pattern_index() {
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    fn plan_reports_zero_match_pattern() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let base = tmp.path().canonicalize().expect("canonicalize base");
 
-        let server = test_glob_server();
+        let fs_manager = FilesystemManager::new();
         // A single absolute pattern whose base dir exists but matches no file.
-        let params = serde_json::json!({
-            "paths": [base.join("*.nomatch118").to_string_lossy()],
-        });
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let outcome = rt
-            .block_on(server.execute(&params, None, &cancel))
-            .expect("execute glob");
+        let plan = build_glob_plan(
+            &fs_manager,
+            &base.join("*.nomatch118"),
+            &ExcludeSet::default(),
+            false,
+            false,
+        )
+        .expect("build plan");
 
-        let GlobOutcome::Rendered {
-            output,
-            no_match_indices,
-            ..
-        } = outcome
-        else {
-            unreachable!("a non-count glob yields Rendered");
-        };
+        let output = render_glob_plan(&plan, &HashMap::new());
         assert!(
             output.is_empty(),
             "zero-match pattern renders nothing: {output:?}"
         );
-        assert_eq!(
-            no_match_indices,
-            vec![0],
-            "the sole pattern argument (index 0) is flagged as a no-match"
+        assert!(plan.no_match, "the sole pattern is flagged as a no-match");
+        assert!(
+            plan.enrich_files.is_empty(),
+            "nothing to enrich on a zero-match"
         );
     }
 
-    // ─── off-thread directory walk cancellation (misc 140 phase 2) ──────
+    // ─── the ruled listing-weight shape + render (ws43-03) ───────────
 
-    /// A single massive directory is cancellable mid-walk once the enumeration
-    /// runs off the runtime thread (`spawn_blocking`): a fired token quits the
-    /// walk instead of reading every child. Mirrors grep's
-    /// `ripgrep_matches_quits_when_token_fires` — the phase-1 pattern, now for
-    /// glob's residual sync walk.
+    /// The weight-shape rule: a matched directory or several matched files is
+    /// a listing (top-level weight by default); exactly one matched file is
+    /// the file-outline shape (full tree by default).
     #[test]
     #[allow(clippy::expect_used, reason = "test assertions")]
-    fn collect_dir_entries_off_thread_quits_on_cancel() {
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    fn plan_listing_shape_rule() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize base");
+        std::fs::write(base.join("a.rs"), "fn a() {}\n").expect("write a");
+        std::fs::write(base.join("b.rs"), "fn b() {}\n").expect("write b");
+        let fs_manager = FilesystemManager::new();
+        let plan = |pattern: PathBuf| {
+            build_glob_plan(&fs_manager, &pattern, &ExcludeSet::default(), false, false)
+                .expect("build plan")
+        };
+
+        assert!(
+            plan(base.clone()).listing_shape,
+            "a matched directory is a listing shape"
+        );
+        assert!(
+            plan(base.join("*.rs")).listing_shape,
+            "several matched files are a listing shape"
+        );
+        assert!(
+            !plan(base.join("a.rs")).listing_shape,
+            "a single matched file is the file-outline shape"
+        );
+    }
+
+    /// The render honors the enrichment map: an outline body re-indents under
+    /// its file header, a suppressed file carries `[symbols available]`, and a
+    /// file with no annotation (every degrade arm) carries `no outline` — with
+    /// the complete listing identical across all three.
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn render_plan_honors_enrichment_map() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize base");
+        let file = base.join("a.rs");
+        std::fs::write(&file, "fn a() {}\n").expect("write a");
+        let fs_manager = FilesystemManager::new();
+        let plan = build_glob_plan(&fs_manager, &base, &ExcludeSet::default(), false, false)
+            .expect("build plan");
+        assert_eq!(plan.enrich_files, vec![file.clone()], "one file to enrich");
+
+        // Degrade (empty map): complete listing, `no outline` marker.
+        let degraded = render_glob_plan(&plan, &HashMap::new());
+        assert!(
+            degraded.contains("a.rs  (1 line, no outline)"),
+            "an unannotated text file carries the no-outline marker: {degraded}"
+        );
+
+        // An outline body re-indents one level under the entry header.
+        let mut with_body = HashMap::new();
+        with_body.insert(
+            file.clone(),
+            FileEnrichment {
+                covered: true,
+                suppressed: false,
+                outline: Some("1  fn a() {\n\t2  fn nested()".to_string()),
+            },
+        );
+        let outlined = render_glob_plan(&plan, &with_body);
+        assert!(
+            outlined.contains("\ta.rs  (1 line)\n\t\t1  fn a() {\n\t\t\t2  fn nested()\n"),
+            "the body re-indents under the header, one level deeper: {outlined:?}"
+        );
+
+        // A suppressed outline keeps the `[symbols available]` flag in place
+        // of the body.
+        let mut suppressed = HashMap::new();
+        suppressed.insert(
+            file,
+            FileEnrichment {
+                covered: true,
+                suppressed: true,
+                outline: None,
+            },
+        );
+        let flagged = render_glob_plan(&plan, &suppressed);
+        assert!(
+            flagged.contains("a.rs  (1 line) [symbols available]"),
+            "a suppressed outline keeps the flag: {flagged}"
+        );
+
+        // The listing itself (header + entry line set) is identical across the
+        // three arms — enrichment only ever adds indented body lines or
+        // in-line markers, never drops a path (decision 025).
+        for text in [&degraded, &outlined, &flagged] {
+            assert!(
+                text.contains(&format!("{}/  (1 file, 0 dirs)", base.display())),
+                "the directory header always renders: {text}"
+            );
+            assert!(text.contains("a.rs"), "the entry always renders: {text}");
+        }
+    }
+
+    /// A covered file with no symbols renders `no outline` too — a covered
+    /// empty file and an uncovered one degrade to the same honest spelling.
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn render_plan_covered_empty_is_no_outline() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize base");
+        let file = base.join("a.rs");
+        std::fs::write(&file, "// nothing\n").expect("write a");
+        let fs_manager = FilesystemManager::new();
+        let plan = build_glob_plan(&fs_manager, &base, &ExcludeSet::default(), false, false)
+            .expect("build plan");
+
+        let mut covered_empty = HashMap::new();
+        covered_empty.insert(
+            file,
+            FileEnrichment {
+                covered: true,
+                suppressed: false,
+                outline: None,
+            },
+        );
+        let text = render_glob_plan(&plan, &covered_empty);
+        assert!(
+            text.contains("a.rs  (1 line, no outline)"),
+            "covered-but-empty carries the same no-outline marker: {text}"
+        );
+    }
+
+    // ─── directory walk cancellation ─────────────────────────────────
+
+    /// A fired token quits the one-level enumeration at the first entry — the
+    /// bounded-work property the cancel parameter keeps honest.
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn collect_dir_entries_quits_on_cancel() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let dir = tmp.path().canonicalize().expect("canonicalize");
         for i in 0..200 {
             std::fs::write(dir.join(format!("f{i}.txt")), "x\n").expect("write child");
         }
 
-        let server = test_glob_server();
+        let fs_manager = FilesystemManager::new();
 
         // Baseline: without cancellation the walk enumerates every child.
         let live = tokio_util::sync::CancellationToken::new();
-        let full = rt
-            .block_on(server.collect_dir_entries_off_thread(
-                dir.clone(),
-                false,
-                false,
-                ExcludeSet::default(),
-                &live,
-            ))
-            .expect("walk uncancelled");
+        let full = collect_dir_entries(
+            &fs_manager,
+            &dir,
+            false,
+            false,
+            &ExcludeSet::default(),
+            &live,
+        )
+        .expect("walk uncancelled");
         assert_eq!(full.len(), 200, "uncancelled walk lists every child");
 
-        // A token fired before the walk quits it at the first entry — the walk
-        // ran off-thread, so the token is actually observed.
+        // A token fired before the walk quits it at the first entry.
         let cancel = tokio_util::sync::CancellationToken::new();
         cancel.cancel();
-        let cancelled = rt
-            .block_on(server.collect_dir_entries_off_thread(
-                dir,
-                false,
-                false,
-                ExcludeSet::default(),
-                &cancel,
-            ))
-            .expect("walk cancelled");
+        let cancelled = collect_dir_entries(
+            &fs_manager,
+            &dir,
+            false,
+            false,
+            &ExcludeSet::default(),
+            &cancel,
+        )
+        .expect("walk cancelled");
         assert!(
             cancelled.is_empty(),
-            "a fired token quits the off-thread directory walk (got {} entries)",
+            "a fired token quits the directory walk (got {} entries)",
             cancelled.len(),
         );
     }
@@ -2757,13 +2465,13 @@ mod tests {
         let k = 6;
         let (_small_guard, small_base, _) = pathology_fixture(k, 100);
         let (_big_guard, big_base, _) = pathology_fixture(k, 5000);
-        let server = test_glob_server();
+        let fs_manager = FilesystemManager::new();
         let cancel = CancellationToken::new();
 
         // Small fixture: single-star `b*` expansion.
         probe::reset();
-        let _ = GlobServer::count_paths(
-            &server.fs_manager,
+        let _ = count_glob_paths(
+            &fs_manager,
             &[small_base.join("b*")],
             false,
             false,
@@ -2774,8 +2482,8 @@ mod tests {
 
         // Big fixture (50× the descendants): same single-star `b*`.
         probe::reset();
-        let _ = GlobServer::count_paths(
-            &server.fs_manager,
+        let _ = count_glob_paths(
+            &fs_manager,
             &[big_base.join("b*")],
             false,
             false,
@@ -2816,12 +2524,12 @@ mod tests {
 
         let n = 3000;
         let (_guard, base, _big) = pathology_fixture(3, n);
-        let server = test_glob_server();
+        let fs_manager = FilesystemManager::new();
         let cancel = CancellationToken::new();
 
         probe::reset();
-        let count = GlobServer::count_paths(
-            &server.fs_manager,
+        let count = count_glob_paths(
+            &fs_manager,
             &[base.join("big/*")],
             false,
             false,
@@ -2857,7 +2565,7 @@ mod tests {
         let k = 5;
         let n = 2000;
         let (_guard, base, _big) = pathology_fixture(k, n);
-        let server = test_glob_server();
+        let fs_manager = FilesystemManager::new();
         let cancel = CancellationToken::new();
 
         // Constructed total the pattern `b*/*` matches: `big/`'s n children
@@ -2865,8 +2573,8 @@ mod tests {
         let constructed = n + (k - 1);
 
         probe::reset();
-        let count = GlobServer::count_paths(
-            &server.fs_manager,
+        let count = count_glob_paths(
+            &fs_manager,
             &[base.join("b*/*")],
             false,
             false,
@@ -2936,10 +2644,10 @@ mod tests {
         (tmp, base)
     }
 
-    /// Runs [`GlobServer::count_paths`] for a single pattern argument.
-    fn misc184_count(server: &GlobServer, pattern: PathBuf) -> usize {
-        GlobServer::count_paths(
-            &server.fs_manager,
+    /// Runs [`count_glob_paths`] for a single pattern argument.
+    fn misc184_count(fs_manager: &FilesystemManager, pattern: PathBuf) -> usize {
+        count_glob_paths(
+            fs_manager,
             &[pattern],
             false,
             false,
@@ -2975,12 +2683,12 @@ mod tests {
     #[test]
     fn misc184_dir_match_count_equals_match_set() {
         let (_guard, base) = misc184_fixture();
-        let server = test_glob_server();
+        let fs_manager = FilesystemManager::new();
 
         // Directory-only match set: 3 dirs, 0 loose files — the sighting's
         // shape (45 dirs → count 753 pre-fix).
         let pattern = base.join("tickets/*");
-        let count = misc184_count(&server, pattern.clone());
+        let count = misc184_count(&fs_manager, pattern.clone());
         assert_eq!(count, 3, "tickets/* matches 3 dirs — each counts once");
         assert_eq!(
             count,
@@ -2991,7 +2699,7 @@ mod tests {
         // Mixed match set (the archive probe): 2 files + 2 dirs = 4, not
         // 4 + the dirs' children.
         let pattern = base.join("archive/*");
-        let count = misc184_count(&server, pattern.clone());
+        let count = misc184_count(&fs_manager, pattern.clone());
         assert_eq!(count, 4, "archive/* matches 2 files + 2 dirs — each once");
         assert_eq!(
             count,
@@ -3005,10 +2713,10 @@ mod tests {
     #[test]
     fn misc184_flat_file_match_count_unchanged() {
         let (_guard, base) = misc184_fixture();
-        let server = test_glob_server();
+        let fs_manager = FilesystemManager::new();
 
         let pattern = base.join("misc/*");
-        let count = misc184_count(&server, pattern.clone());
+        let count = misc184_count(&fs_manager, pattern.clone());
         assert_eq!(count, 4, "misc/* matches the 4 flat files");
         assert_eq!(
             count,
@@ -3023,13 +2731,13 @@ mod tests {
     #[test]
     fn misc184_recursive_count_equals_match_set() {
         let (_guard, base) = misc184_fixture();
-        let server = test_glob_server();
+        let fs_manager = FilesystemManager::new();
 
         // tickets/**/* matches every path below tickets/: 3 dirs + 6 files.
         // Pre-fix each matched dir also contributed its children, double-
         // counting every file.
         let pattern = base.join("tickets/**/*");
-        let count = misc184_count(&server, pattern.clone());
+        let count = misc184_count(&fs_manager, pattern.clone());
         assert_eq!(
             count, 9,
             "tickets/**/* matches 3 dirs + 6 files — each path once"

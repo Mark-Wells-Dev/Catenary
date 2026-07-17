@@ -22,6 +22,9 @@
 //! - **Query auto-mount fires from the annotation call**: a batch whose hits lie
 //!   outside every tracked root mounts the enclosing project root, and the hits
 //!   enrich from the freshly-attached server.
+//! - **The annotator honors the requested weight (ws43-03)**: a weighted glob
+//!   batch is answered with outline bodies — top-level only at listing weight,
+//!   the full tree at outline weight.
 
 mod common;
 
@@ -33,7 +36,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 use catenary_cli::hitstream::frame::{AnnotatedBatch, AnnotationFrame, HitFrame};
-use catenary_cli::hitstream::{HITSTREAM_METHOD, WireHit};
+use catenary_cli::hitstream::{EnrichmentWeight, HITSTREAM_METHOD, WireHit};
 use common::{
     BridgeProcess, grep_until_enriched, mockls_lsp_arg, read_merged_log, watched_file_changes,
 };
@@ -46,6 +49,16 @@ const PIN_BACKSTOP: Duration = Duration::from_secs(30);
 /// Opens one `tool/hitstream` connection, streams `hits` as a single batch plus
 /// the terminator, and returns the annotation-batches the daemon answered.
 fn hitstream_exchange(socket: &Path, hits: &[WireHit]) -> Result<Vec<AnnotatedBatch>> {
+    hitstream_exchange_weighted(socket, hits, None)
+}
+
+/// [`hitstream_exchange`] with the ws43-03 weight lever: `Some(weight)` sends a
+/// glob batch (outline enrichment at that weight), `None` a grep batch.
+fn hitstream_exchange_weighted(
+    socket: &Path,
+    hits: &[WireHit],
+    weight: Option<EnrichmentWeight>,
+) -> Result<Vec<AnnotatedBatch>> {
     let mut stream =
         std::os::unix::net::UnixStream::connect(socket).context("connect hitstream socket")?;
     stream
@@ -55,7 +68,12 @@ fn hitstream_exchange(socket: &Path, hits: &[WireHit]) -> Result<Vec<AnnotatedBa
     // The method-line handshake, then the frames — one JSON object per line.
     let mut payload = serde_json::to_vec(&json!({ "method": HITSTREAM_METHOD }))?;
     payload.push(b'\n');
-    let batch = HitFrame::batch(0, hits.to_vec());
+    let batch = HitFrame::Batch {
+        seq: 0,
+        hits: hits.to_vec(),
+        observed: Vec::new(),
+        weight,
+    };
     payload.extend(serde_json::to_vec(&batch)?);
     payload.push(b'\n');
     payload.extend(serde_json::to_vec(&HitFrame::end(1))?);
@@ -140,6 +158,89 @@ fn hitstream_annotation_matches_executor_enrichment() -> Result<()> {
         annotated.render_grep_line(&rel),
         executor_line,
         "annotation-batch rendering is byte-identical to the executor's line"
+    );
+    Ok(())
+}
+
+/// The annotator honors the requested weight (ws43-03): a weighted glob batch
+/// for a covered file answers outline bodies — the LISTING weight carries the
+/// file's top-level symbols only (no nested tree, the ruled default for
+/// listing shapes), and the OUTLINE weight (`--outline`, or the single-file
+/// shape) restores the fully-expanded tree. Same connection, same budget, same
+/// degrade-only verdicts as grep batches.
+#[test]
+fn hitstream_weighted_batch_answers_outlines() -> Result<()> {
+    let dir = common::canonical_tempdir()?;
+    let file = dir.path().join(format!("code.{MOCK_LANG}"));
+    std::fs::write(&file, "struct Outer {\nfn inner\n}\nfn leaf\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG, "");
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+    let socket = bridge.wait_for_ipc_socket()?;
+
+    // A glob hit names a file, not a line: the annotator keys on `path`.
+    let hit = WireHit {
+        path: file,
+        line: 0,
+        column: 0,
+        text: String::new(),
+    };
+
+    // Listing weight — retry until the server settles and a body arrives (a
+    // cold pool blows the first batch's budget into pass-through; degrade-only).
+    let deadline = Instant::now() + PIN_BACKSTOP;
+    let listing_body = loop {
+        let batches = hitstream_exchange_weighted(
+            &socket,
+            std::slice::from_ref(&hit),
+            Some(EnrichmentWeight::Listing),
+        )?;
+        assert_eq!(batches.len(), 1, "one annotation-batch per hit-batch");
+        assert_eq!(batches[0].hits.len(), 1, "the hit survives every verdict");
+        let annotated = &batches[0].hits[0];
+        if annotated.enriched
+            && let Some(body) = &annotated.outline
+        {
+            break body.clone();
+        }
+        if Instant::now() > deadline {
+            bail!(
+                "weighted batch never answered an outline (enriched={}, outline={:?})",
+                annotated.enriched,
+                annotated.outline
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert!(
+        listing_body.contains("1  struct Outer {") && listing_body.contains("4  fn leaf"),
+        "listing weight carries the top-level symbols: {listing_body:?}"
+    );
+    assert!(
+        !listing_body.contains("fn inner"),
+        "listing weight carries NO nested tree — the ruled lever: {listing_body:?}"
+    );
+
+    // Outline weight — the full picture, nested nodes tab-indented.
+    let batches = hitstream_exchange_weighted(
+        &socket,
+        std::slice::from_ref(&hit),
+        Some(EnrichmentWeight::Outline),
+    )?;
+    let annotated = &batches[0].hits[0];
+    let full_body = annotated
+        .outline
+        .as_ref()
+        .context("outline weight answers a body once the pool is warm")?;
+    assert!(
+        full_body.contains("1  struct Outer {") && full_body.contains("\t2  fn inner"),
+        "outline weight restores the fully-expanded tree: {full_body:?}"
+    );
+    assert!(
+        annotated.anchor.is_none(),
+        "a weighted hit carries no grep anchor"
     );
     Ok(())
 }

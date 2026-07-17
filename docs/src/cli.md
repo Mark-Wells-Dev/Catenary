@@ -150,8 +150,17 @@ each callable is one line. The top level shows everything, so a
 module-level constant stays. (The underlying symbol index is unfiltered;
 only the outline render applies this map.)
 
+**Listings default to top-level structure.** A listing shape — a matched
+directory, or several matched files — annotates each file with its
+top-level symbols only, no nested tree; `--outline` opts up to the full
+tree on demand. A single matched file (`catenary glob src/main.rs`) is the
+file-outline shape and always gets the full tree. There is deliberately no
+enrichment-off flag: `--count` covers tallies, and a pipeline that needs
+bare paths strips the indented enrichment downstream.
+
 ```bash
-catenary glob "src/*"                     # list a directory
+catenary glob "src/*"                     # list a directory (top-level structure)
+catenary glob "src/*" --outline           # the same listing, full outlines
 catenary glob src/main.rs                  # outline one file (self-matching literal)
 catenary glob "**/*.toml"                  # results only — no header
 catenary glob "**/*.rs" --exclude-pattern "tests/**"
@@ -170,6 +179,7 @@ freely — and `--count` answers "how many" without the listing.
 | `--count` | Report the path count instead of results (the sole tally) |
 | `--include-gitignored` | Include files ignored by .gitignore |
 | `--include-hidden` | Include hidden files and directories |
+| `--outline` | Full symbol outlines in listings (default: top-level structure; a single matched file is always full) |
 
 ### `catenary diagnostics`
 

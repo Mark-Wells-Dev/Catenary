@@ -11,13 +11,15 @@
 //! budget yields a pass-through verdict on a complete, unannotated batch, never a
 //! dropped hit.
 //!
-//! Since ws43-02 the production enricher is real: the grep executor's LSP
-//! enrichment lives in [`crate::bridge::GrepHitEnricher`], and the router's
-//! `tool/hitstream` arm serves it (wrapped with the query auto-mount). The
-//! [`PassThroughEnricher`] remains as the degrade spelling and the protocol
-//! tests' stub. What is load-bearing here is the async loop, the budget seam,
-//! the bounded in-flight window for pipelining with ordered emission, and the
-//! law: **no await while holding a lock guard.**
+//! Since ws43-02 the production enricher is real: the retired executors' LSP
+//! enrichment lives in [`crate::bridge::HitstreamEnricher`] — grep anchors for
+//! a weight-less batch, glob outline bodies at the batch's requested weight
+//! (ws43-03) — and the router's `tool/hitstream` arm serves it (wrapped with
+//! the query auto-mount). The [`PassThroughEnricher`] remains as the degrade
+//! spelling and the protocol tests' stub. What is load-bearing here is the
+//! async loop, the budget seam, the bounded in-flight window for pipelining
+//! with ordered emission, and the law: **no await while holding a lock
+//! guard.**
 //!
 //! An old daemon that predates this protocol never reaches this loop — it answers
 //! the unknown method the same way it answers any unknown request, and the CLI's
@@ -31,7 +33,9 @@ use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
 
 use super::ANNOTATION_BATCH_BUDGET;
-use super::frame::{AnnotatedBatch, AnnotatedHit, AnnotationFrame, AnnotationVerdict, HitFrame};
+use super::frame::{
+    AnnotatedBatch, AnnotatedHit, AnnotationFrame, AnnotationVerdict, EnrichmentWeight, HitFrame,
+};
 
 /// The enrichment step the annotator awaits per batch, under budget.
 ///
@@ -52,10 +56,17 @@ pub trait BatchEnricher: Send + Sync {
     /// what the budget times out. A pass-through implementation returns
     /// immediately; a real one awaits enrichment and returns whatever it
     /// resolved within the time it was given (the caller applies the budget).
+    ///
+    /// `weight` is the batch's requested enrichment weight (ws43-03): `None`
+    /// for a grep batch (anchor enrichment), `Some` for a glob batch — the
+    /// production enricher then answers each hit's file with an outline body
+    /// at that weight instead of a scope anchor. The annotator honors the
+    /// requested weight; the same per-batch budget bounds both shapes.
     fn enrich(
         &self,
         hits: Vec<super::WireHit>,
         observed: Vec<(std::path::PathBuf, i64)>,
+        weight: Option<EnrichmentWeight>,
     ) -> impl Future<Output = Result<Vec<AnnotatedHit>>> + Send;
 
     /// Consumes the walk's WS31 observation set from the [`HitFrame::End`]
@@ -93,6 +104,7 @@ impl BatchEnricher for PassThroughEnricher {
         &self,
         hits: Vec<super::WireHit>,
         _observed: Vec<(std::path::PathBuf, i64)>,
+        _weight: Option<EnrichmentWeight>,
     ) -> Result<Vec<AnnotatedHit>> {
         Ok(hits.into_iter().map(AnnotatedHit::passthrough).collect())
     }
@@ -113,6 +125,7 @@ pub async fn annotate_batch<E: BatchEnricher>(
     seq: u64,
     hits: Vec<super::WireHit>,
     observed: Vec<(std::path::PathBuf, i64)>,
+    weight: Option<EnrichmentWeight>,
     budget: Duration,
 ) -> AnnotatedBatch {
     // Keep an unannotated copy so a blown budget or an enrich error still returns
@@ -123,7 +136,7 @@ pub async fn annotate_batch<E: BatchEnricher>(
         .map(AnnotatedHit::passthrough)
         .collect();
 
-    match tokio::time::timeout(budget, enricher.enrich(hits, observed)).await {
+    match tokio::time::timeout(budget, enricher.enrich(hits, observed, weight)).await {
         Ok(Ok(annotated)) => AnnotatedBatch {
             seq,
             hits: annotated,
@@ -194,11 +207,12 @@ where
                 seq,
                 hits,
                 observed,
+                weight,
             } => {
                 // read → await (budgeted) → write. No lock guard is held across
                 // this await (the skeleton holds none; the ruled law binds the
                 // real enricher too).
-                let batch = annotate_batch(enricher, seq, hits, observed, budget).await;
+                let batch = annotate_batch(enricher, seq, hits, observed, weight, budget).await;
                 super::write_frame(writer, &AnnotationFrame::Batch { batch }).await?;
                 emitted += 1;
             }
@@ -233,7 +247,7 @@ where
 /// Serves one connection with the default pass-through enricher and budget.
 ///
 /// Since ws43-02 the router's `tool/hitstream` arm serves the REAL enricher
-/// ([`crate::bridge::GrepHitEnricher`], wrapped with the query auto-mount);
+/// ([`crate::bridge::HitstreamEnricher`], wrapped with the query auto-mount);
 /// this pass-through entry point remains for protocol tests and as the
 /// reference degrade spelling.
 ///
@@ -284,6 +298,7 @@ mod tests {
             &self,
             hits: Vec<WireHit>,
             _observed: Vec<(std::path::PathBuf, i64)>,
+            _weight: Option<EnrichmentWeight>,
         ) -> Result<Vec<AnnotatedHit>> {
             tokio::time::sleep(Duration::from_hours(1)).await;
             Ok(hits.into_iter().map(AnnotatedHit::passthrough).collect())
@@ -297,6 +312,7 @@ mod tests {
             &self,
             _hits: Vec<WireHit>,
             _observed: Vec<(std::path::PathBuf, i64)>,
+            _weight: Option<EnrichmentWeight>,
         ) -> Result<Vec<AnnotatedHit>> {
             Err(anyhow::anyhow!("enrichment unavailable"))
         }
@@ -309,6 +325,7 @@ mod tests {
             0,
             hits(3),
             Vec::new(),
+            None,
             Duration::from_secs(5),
         )
         .await;
@@ -335,6 +352,7 @@ mod tests {
             5,
             hits(4),
             Vec::new(),
+            None,
             Duration::from_millis(20),
         )
         .await;
@@ -354,6 +372,7 @@ mod tests {
             2,
             hits(2),
             Vec::new(),
+            None,
             Duration::from_secs(5),
         )
         .await;

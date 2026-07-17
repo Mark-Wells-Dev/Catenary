@@ -8,11 +8,14 @@
 //! annotator** on a streamed hit protocol. Every dependency failure degrades to
 //! "less enrichment," never "no results."
 //!
-//! Since the ws43-02 cutover this IS `catenary grep`: the CLI walks through
-//! [`engine`], streams through the sinks below, and the daemon's only grep
-//! surface is the `tool/hitstream` annotation arm (the `tool/grep` executor
-//! retired). Glob still rides the legacy query path (`router::METHOD_GLOB`)
-//! until its own cutover (ws43-03). The load-bearing structure:
+//! Since the ws43-02/-03 cutovers this IS `catenary grep` **and** `catenary
+//! glob`: the CLI walks (grep through [`engine`], glob through the plan build
+//! in `bridge::file_tools`), streams through the sinks below, and the daemon's
+//! only search surface is the `tool/hitstream` annotation arm (the `tool/grep`
+//! and `tool/glob` executor arms retired). Glob batches carry a CLI-computed
+//! [`EnrichmentWeight`] (the ruled listing-weight lever: listing shapes get
+//! top-level structure by default, `--outline` opts up); grep batches carry
+//! none. The load-bearing structure:
 //!
 //! 1. The wire protocol — [`HitFrame`] (CLI → daemon) and [`AnnotationFrame`]
 //!    (daemon → CLI), an internally-tagged frame stream on the existing socket,
@@ -30,10 +33,10 @@
 //!    preserved).
 //! 3. The daemon annotator ([`annotate_connection`]) — read batch → await
 //!    (budgeted) → write batch, a native async citizen. Since ws43-02 the
-//!    router serves the REAL enricher ([`crate::bridge::GrepHitEnricher`]: the
-//!    executor's LSP enrichment, migrated), with the WS31 observation nudge and
-//!    the query auto-mount (ws43-05 sensitive-path gate included) riding each
-//!    annotation call.
+//!    router serves the REAL enricher ([`crate::bridge::HitstreamEnricher`]:
+//!    the executors' LSP enrichment, migrated), with the WS31 observation
+//!    nudge and the query auto-mount (ws43-05 sensitive-path gate included)
+//!    riding each annotation call.
 //!
 //! ## Invariants (ruled; not renegotiable)
 //!
@@ -63,8 +66,12 @@ pub mod sink;
 
 pub use annotator::{BatchEnricher, PassThroughEnricher, annotate_connection, serve_passthrough};
 pub use engine::{Hit, HitBatch, WalkOptions, WalkSummary, walk};
-pub use frame::{AnnotatedBatch, AnnotatedHit, AnnotationFrame, AnnotationVerdict, HitFrame};
-pub use sink::{DaemonStreamReport, GrepRender, ResultSink, daemon_stream, stdout_unannotated};
+pub use frame::{
+    AnnotatedBatch, AnnotatedHit, AnnotationFrame, AnnotationVerdict, EnrichmentWeight, HitFrame,
+};
+pub use sink::{
+    DaemonStreamReport, GrepRender, ResultSink, annotate_paths, daemon_stream, stdout_unannotated,
+};
 
 /// The IPC method string the CLI sends as the hit-stream handshake's first line.
 ///

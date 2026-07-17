@@ -200,22 +200,21 @@ struct Covering {
 ///
 /// ```text
 /// None    ⇔  no covering server, OR raw/--count grep, OR a (no LSP) path
-/// Full    ⇔  covering server ∧ (enriched grep ∨ diagnostics)
-/// Scoped  ⇔  covering server ∧ glob   (breadth = the glob pattern)
+/// Full    ⇔  covering server ∧ (enriched query ∨ diagnostics)
 /// ```
 ///
 /// `None` ⇒ skip the engine entirely (raw grep, `--count`, `(no LSP)` pay
 /// nothing). `Full` ⇒ walk the registered-glob set in the root and reap
-/// deletions. `Scoped` ⇒ walk only the glob pattern, add/update only (a scoped
-/// walk cannot assert a baseline entry outside its pattern is gone).
+/// deletions. The old `Scoped` variant (glob's pattern-bounded walk) retired
+/// with the ws43-03 cutover: glob's scoped add/update-only nudge now rides the
+/// annotation batches (`reap_scopes: None` in `nudge_observed_files` — a
+/// scoped observation set still never reaps).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WalkBreadth {
     /// Skip the engine: no walk, no nudge.
     None,
     /// Full walk of the registered-glob set; reaps deletions.
     Full,
-    /// Scoped walk of the glob pattern; add/update only, never reaps.
-    Scoped,
 }
 
 impl WalkBreadth {
@@ -3023,9 +3022,10 @@ impl LspClientManager {
     /// ([`WalkBreadth::Full`] — enriched `grep`, `diagnostics`) passes `true`,
     /// so any baseline entry the walk did not visit is reaped as
     /// [`ChangeKind::Deleted`] (wire `FileChangeType` 3, gated by the `Delete`
-    /// watch-kind bit). A **scoped** walk ([`WalkBreadth::Scoped`] — `glob`)
-    /// passes `false` (add/update only): it cannot assert a baseline entry
-    /// outside its pattern is gone, so it must never reap.
+    /// watch-kind bit). A **scoped** observation set (`glob`'s annotation
+    /// batches, and the annotator's per-batch nudges) passes `false`
+    /// (add/update only): it cannot assert a baseline entry outside its scope
+    /// is gone, so it must never reap.
     ///
     /// **Delivery is best-effort and the per-root baseline is shared.** Step 3
     /// advances the baseline **once**, *before* the per-server notify loop, and

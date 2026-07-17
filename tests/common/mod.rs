@@ -298,10 +298,11 @@ pub struct BridgeProcess {
     _state_dir: Option<KeepOnPanic>,
     /// Isolated workspace root dir, owned by this process.
     root_dir: Option<tempfile::TempDir>,
-    /// Working directory for IPC tool queries.
+    /// Working directory for tool queries.
     ///
-    /// Set from `CATENARY_ROOTS` during spawn. Used as the `cwd` field
-    /// in `tool/grep` and `tool/glob` IPC requests.
+    /// Set from `CATENARY_ROOTS` during spawn. Used as the spawn cwd for the
+    /// `catenary grep`/`glob` CLI helpers and as the `cwd` field in the
+    /// remaining IPC requests (diagnostics).
     ipc_cwd: Option<PathBuf>,
 }
 
@@ -1001,27 +1002,121 @@ impl BridgeProcess {
         }
     }
 
-    /// Calls glob via the IPC socket and returns the output text.
+    /// Runs a glob query through the real `catenary glob` CLI (ws43-03: the
+    /// CLI owns the walk; the daemon serves only the `tool/hitstream`
+    /// annotation stream) and returns the results body.
     ///
-    /// `args` should contain the glob parameters (`paths`, and optionally
-    /// `exclude`, `page`, `include_gitignored`, `include_hidden`).
-    /// A `directory` field, if present, is used as the cwd.
+    /// `args` keeps the old IPC-helper shape (`paths` — exactly one pattern,
+    /// the arity-1 surface — and optionally `exclude`, `count`,
+    /// `include_gitignored`, `include_hidden`, `outline`, and a `directory`
+    /// cwd) so existing call sites migrate without rewriting each one; the
+    /// helper translates them to CLI argv. The returned body matches the
+    /// retired IPC `output` field: results only, trailing newline trimmed,
+    /// stderr advisories dropped.
     pub fn call_glob(&self, args: &Value) -> Result<String> {
-        let socket_path = self.wait_for_ipc_socket()?;
-        let mut request = args.clone();
-        let obj = request.as_object_mut().context("args must be an object")?;
-        obj.insert("method".to_string(), json!("tool/glob"));
-        self.resolve_ipc_cwd(obj);
+        let _ = self.wait_for_ipc_socket()?;
+        let out = self.glob_cli_output(args)?;
+        if !out.status.success() {
+            bail!(
+                "catenary glob exited {:?}; stderr:\n{}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        Ok(text.strip_suffix('\n').unwrap_or(&text).to_string())
+    }
 
-        let response =
-            ipc_tool_request(&socket_path, self.daemon_pid(), &Value::Object(obj.clone()))?;
-        let parsed: Value =
-            serde_json::from_str(&response).context("failed to parse glob response")?;
-        let output = parsed
-            .get("output")
-            .and_then(|o| o.as_str())
-            .context("no output in glob response")?;
-        Ok(output.to_string())
+    /// Spawns the `catenary glob` CLI against this test's isolated daemon
+    /// state, translating the old IPC-helper JSON args into argv.
+    fn glob_cli_output(&self, args: &Value) -> Result<std::process::Output> {
+        let obj = args.as_object().context("glob args must be an object")?;
+        let paths = obj
+            .get("paths")
+            .and_then(Value::as_array)
+            .context("glob args need `paths`")?;
+        let [pattern] = paths.as_slice() else {
+            bail!("glob is arity-1: pass exactly one pattern, got {paths:?}");
+        };
+        let pattern = pattern
+            .as_str()
+            .context("glob `paths` entries must be strings")?;
+
+        let mut command_line: Vec<String> = vec!["glob".to_string(), pattern.to_string()];
+        for pat in Self::string_or_seq(obj.get("exclude"))? {
+            command_line.push("--exclude-pattern".to_string());
+            command_line.push(pat);
+        }
+        let bool_flags = [
+            ("count", "--count"),
+            ("include_gitignored", "--include-gitignored"),
+            ("include_hidden", "--include-hidden"),
+            ("outline", "--outline"),
+        ];
+        for (key, flag) in bool_flags {
+            if obj.get(key).and_then(Value::as_bool) == Some(true) {
+                command_line.push(flag.to_string());
+            }
+        }
+
+        let cwd = obj
+            .get("directory")
+            .or_else(|| obj.get("cwd"))
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .or_else(|| self.ipc_cwd.clone())
+            .or_else(|| self.root_dir.as_ref().map(|d| d.path().to_path_buf()))
+            .context("glob CLI helper needs a cwd: pass `directory`, or spawn with a root")?;
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+        isolate_env(&mut cmd, &self.state_home);
+        cmd.args(&command_line)
+            .current_dir(&cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.output().context("run catenary glob CLI")
+    }
+
+    /// The `tool/glob` leg of [`Self::call_search_raw`]: runs the CLI and
+    /// rebuilds the retired IPC response object (`output`, `paths` from the
+    /// `--count` line, `no_match_patterns` from the stderr report, `error`
+    /// from an exit-2 usage refusal) so count/error pins keep their intent.
+    fn glob_raw(&self, args: &Value) -> Result<Value> {
+        let _ = self.wait_for_ipc_socket()?;
+        let out = self.glob_cli_output(args)?;
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        if out.status.code() == Some(2) {
+            return Ok(json!({ "output": "", "error": stderr.trim_end() }));
+        }
+        if !out.status.success() {
+            bail!(
+                "catenary glob exited {:?}; stderr:\n{stderr}",
+                out.status.code()
+            );
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let body = text.strip_suffix('\n').unwrap_or(&text).to_string();
+        // The loud per-pattern zero-match report rides stderr; rebuild the old
+        // `no_match_patterns` field from it.
+        let no_match_patterns: Vec<String> = stderr
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("no matches for pattern: ")
+                    .and_then(|rest| rest.strip_suffix(" (relative patterns anchor at cwd)"))
+                    .map(str::to_string)
+            })
+            .collect();
+        if args.get("count").and_then(Value::as_bool) == Some(true) {
+            let paths: u64 = body
+                .split_whitespace()
+                .next()
+                .context("count line starts with the path tally")?
+                .parse()
+                .with_context(|| format!("parse path tally from: {body}"))?;
+            return Ok(json!({ "output": "", "paths": paths }));
+        }
+        Ok(json!({ "output": body, "no_match_patterns": no_match_patterns }))
     }
 
     /// Calls a search and returns the full response object.
@@ -1029,24 +1124,16 @@ impl BridgeProcess {
     /// Unlike [`Self::call_grep`]/[`Self::call_glob`] (which extract only
     /// `output`), this returns the whole response — including the `--count`
     /// fields (`matches`/`files` for grep, `paths` for glob). `method` keeps
-    /// the historical IPC method-string spelling: `tool/glob` still goes over
-    /// IPC (until ws43-03), while `tool/grep` — whose executor retired in
-    /// ws43-02 — drives the real CLI and reassembles the old response shape
-    /// (`output`, `matches`/`files` parsed from the `--count` line, `error`
-    /// from an exit-2 usage refusal) so count/error pins keep their intent.
+    /// the historical IPC method-string spelling, but since ws43-02 (grep) and
+    /// ws43-03 (glob) both drive the real CLI — the executors retired — and
+    /// reassemble the old response shape so count/error pins keep their
+    /// intent.
     pub fn call_search_raw(&self, method: &str, args: &Value) -> Result<Value> {
-        if method == "tool/grep" {
-            return self.grep_raw(args);
+        match method {
+            "tool/grep" => self.grep_raw(args),
+            "tool/glob" => self.glob_raw(args),
+            other => bail!("unknown search method: {other} (the query executors retired)"),
         }
-        let socket_path = self.wait_for_ipc_socket()?;
-        let mut request = args.clone();
-        let obj = request.as_object_mut().context("args must be an object")?;
-        obj.insert("method".to_string(), json!(method));
-        self.resolve_ipc_cwd(obj);
-
-        let response =
-            ipc_tool_request(&socket_path, self.daemon_pid(), &Value::Object(obj.clone()))?;
-        serde_json::from_str(&response).context("failed to parse search response")
     }
 
     /// The `tool/grep` leg of [`Self::call_search_raw`]: runs the CLI and

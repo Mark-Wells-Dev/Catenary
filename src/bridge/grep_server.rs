@@ -6,12 +6,17 @@
 //!
 //! ## ws43 status (query streaming)
 //!
-//! The query-streaming rework (ws43) replaced the daemon-side grep executor
-//! with a CLI-owned walk ([`crate::hitstream::engine`]) plus a daemon-side
-//! annotator ([`super::hitstream_enricher::GrepHitEnricher`]). The executor
+//! The query-streaming rework (ws43) replaced the daemon-side query executors
+//! with CLI-owned walks (grep: [`crate::hitstream::engine`]; glob: the plan
+//! build in [`super::file_tools`]) plus one daemon-side annotator
+//! ([`super::hitstream_enricher::HitstreamEnricher`]). The grep executor
 //! (`GrepServer::execute`, the ripgrep parallel walk, the hunk shaping/spool,
-//! and the `tool/grep` dispatch arm) retired with the ws43-02 CLI cutover.
-//! What remains here is everything both walks always shared — and the
+//! and the `tool/grep` dispatch arm) retired with the ws43-02 CLI cutover;
+//! the glob executor and its `tool/glob` arm retired with ws43-03, and
+//! `GrepServer` (by then only the annotator-builder holder) retired with them
+//! — the annotator is built by
+//! [`Session::hitstream_enricher`](super::session::Session::hitstream_enricher).
+//! What remains here is everything the walks always shared — and the
 //! annotator still runs:
 //!
 //! - [`GrepFlags`] — the one flag surface the CLI, the walk, and stdin mode
@@ -23,12 +28,6 @@
 //! - the shared enrichment core ([`anchor_context`],
 //!   [`nudge_observed_files`]) behind the annotator;
 //! - stdin (stream) mode ([`grep_stream`]), which never involved the daemon.
-//!
-//! `GrepServer` itself survives as the daemon's holder of the shared
-//! infrastructure the annotator is built from
-//! ([`GrepServer::hitstream_enricher`]). Pieces shared with the glob executor
-//! (`ensure_symbols`, `expand_search_paths`) stay until glob's own cutover
-//! (ws43-03).
 
 use anyhow::{Result, anyhow};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
@@ -256,32 +255,6 @@ impl GrepSkips {
     }
 }
 
-/// Grep's daemon-side holder of the shared LSP infrastructure.
-///
-/// Since the ws43-02 cutover this no longer executes queries — the CLI owns
-/// the walk. It survives as the component the daemon builds the hit-batch
-/// annotator from ([`Self::hitstream_enricher`]).
-pub struct GrepServer {
-    pub(super) client_manager: Arc<LspClientManager>,
-    pub(super) fs_manager: Arc<FilesystemManager>,
-    pub(super) symbol_index: Option<Arc<std::sync::Mutex<SymbolIndex>>>,
-}
-
-impl GrepServer {
-    /// Builds the ws43 hit-batch enricher from this server's shared
-    /// infrastructure (pool, filesystem manager, symbol index) — the daemon-side
-    /// annotator for the streamed `catenary grep` engine, running the shared
-    /// enrichment core below.
-    #[must_use]
-    pub fn hitstream_enricher(&self) -> super::hitstream_enricher::GrepHitEnricher {
-        super::hitstream_enricher::GrepHitEnricher::new(
-            Arc::clone(&self.client_manager),
-            Arc::clone(&self.fs_manager),
-            self.symbol_index.clone(),
-        )
-    }
-}
-
 // ─── Shared enrichment core (the ws43 hitstream annotator's) ─────────────
 //
 // The pieces below are the single implementation of grep's LSP enrichment.
@@ -305,6 +278,20 @@ pub(super) struct AnchorContext {
 }
 
 impl AnchorContext {
+    /// Whether `file` could not be enriched at all (no `documentSymbol`
+    /// coverage — the `#?` / `no outline` degrade state).
+    pub(super) fn is_uncovered(&self, file: &Path) -> bool {
+        self.uncovered.contains(file)
+    }
+
+    /// The file's `documentSymbol` outline (every depth, ascending declaration
+    /// line — the index's stored order), or `None` when the file has no
+    /// indexed symbols. The ws43-03 outline annotator reads whole files from
+    /// the same context the grep anchors are derived from.
+    pub(super) fn symbols_for(&self, file: &Path) -> Option<&[Symbol]> {
+        self.file_symbols.get(file).map(Vec::as_slice)
+    }
+
     /// The `#scope` anchor for a hit in `file` at 0-based `line_0`: `#?` when
     /// the file could not be enriched, no anchor when the hit is genuinely
     /// top-level, and the slugified containment trail otherwise.

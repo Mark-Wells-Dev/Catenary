@@ -180,6 +180,13 @@ enum Command {
         /// Include hidden files and directories.
         #[arg(long)]
         include_hidden: bool,
+
+        /// Render each file's full symbol outline (the fully-expanded
+        /// types-and-callables tree). Listing shapes — a matched directory, or
+        /// several matched files — default to top-level structure only; a
+        /// single matched file always gets its full outline.
+        #[arg(long)]
+        outline: bool,
     },
 
     /// Print diagnostics for the files you've edited, or lint the named paths.
@@ -900,6 +907,7 @@ fn main() -> Result<()> {
             count,
             include_gitignored,
             include_hidden,
+            outline,
         }) => {
             // Arity 1 is grammar (VERBS teaching moment 1): the bare form and
             // N>1 are usage errors — teaching on stderr, exit 2 (clap's
@@ -918,6 +926,7 @@ fn main() -> Result<()> {
                 count,
                 include_gitignored,
                 include_hidden,
+                outline,
             ))
         }
         #[cfg(not(unix))]
@@ -1374,7 +1383,7 @@ fn compress_home(path: &Path) -> String {
 /// arguments at all (a cwd-scoped search — pathless grep binds to the cwd,
 /// bug 31), or at least one relative path/pattern argument, which is joined
 /// to the cwd before expansion (grep's CLI-side `run_grep`; glob's
-/// `GlobRequest::to_params`).
+/// CLI-side `run_glob`).
 ///
 /// Missing-path arguments count as "had arguments": a search whose only
 /// arguments were missing plain paths never queried, so its body is empty and
@@ -2722,58 +2731,6 @@ fn run_grep_stdin(
     Ok(())
 }
 
-/// Parsed daemon response for `catenary glob` over IPC.
-///
-/// A normal query carries rendered `output`; a `--count` query carries the
-/// `paths` total with an empty `output`. Fields absent from the wire default
-/// to empty/`None`, so an empty response line deserializes to
-/// [`SearchResponse::default`]. Grep no longer answers over this envelope —
-/// it streams on the hitstream engine (ws43-02); this stays for glob until
-/// glob's own cutover (ws43-03).
-#[cfg(unix)]
-#[derive(Default, serde::Deserialize)]
-struct SearchResponse {
-    /// Rendered tree output (empty for a count response).
-    #[serde(default)]
-    output: String,
-    /// glob `--count`: resolved-path total.
-    #[serde(default)]
-    paths: Option<usize>,
-    /// glob: original spellings of glob-pattern arguments that expanded to
-    /// zero matches, reported per-argument (misc 118).
-    #[serde(default)]
-    no_match_patterns: Vec<String>,
-    /// glob: display paths of matched directories, for the teaching moment 4
-    /// listing hint on stderr.
-    #[serde(default)]
-    dir_hints: Vec<String>,
-    /// glob: result basenames carrying a glob metacharacter, for the teaching
-    /// moment 3 escaped-spelling note on stderr.
-    #[serde(default)]
-    metachar_names: Vec<String>,
-    /// A usage error (invalid pattern/argument) that aborted the search.
-    /// `Some` routes the CLI to stderr + exit 2 on both the bare and `--count`
-    /// forms; `None` for every successful query.
-    #[serde(default)]
-    error: Option<String>,
-}
-
-/// Adapts a daemon-less [`GlobResponse`](catenary_cli::router::GlobResponse) into
-/// the CLI's [`SearchResponse`] (bug 80, leg 4).
-#[cfg(unix)]
-impl From<catenary_cli::router::GlobResponse> for SearchResponse {
-    fn from(r: catenary_cli::router::GlobResponse) -> Self {
-        Self {
-            output: r.output,
-            paths: r.paths,
-            no_match_patterns: r.no_match_patterns,
-            dir_hints: r.dir_hints,
-            metachar_names: r.metachar_names,
-            error: r.error,
-        }
-    }
-}
-
 /// Renders the `catenary grep --count` summary: `N matches in M files`.
 ///
 /// `matches` is the matching-line total (one per rendered leaf row); `files`
@@ -2806,19 +2763,6 @@ fn render_glob_count(out: &mut cli::Output, paths: usize) {
     let _ = out.writeln(format_args!("{paths} paths"));
 }
 
-/// Connects to the daemon IPC socket, returning `None` when the daemon is down.
-///
-/// The daemon-down signal for the honest-degradation path (bug 80, leg 4): a
-/// missing socket file or a refused connection means no daemon, so `catenary
-/// grep`/`glob` fall back to the in-process pipeline. Any *other* connect error
-/// also maps to `None` — a daemon that cannot be reached is, from the CLI's
-/// vantage, down.
-#[cfg(unix)]
-async fn connect_daemon_ipc() -> Option<tokio::net::UnixStream> {
-    let ipc_path = catenary_cli::router::socket_path();
-    tokio::net::UnixStream::connect(&ipc_path).await.ok()
-}
-
 /// The mandatory daemon-less honesty marker (bug 80, leg 4).
 ///
 /// Printed to **stderr only** — stdout stays byte-identical to a daemon-served
@@ -2847,68 +2791,56 @@ fn emit_quarantine_marker(warning: Option<&str>) {
     }
 }
 
-/// Sends a search request over an already-connected daemon IPC `stream` and
-/// returns the parsed [`SearchResponse`].
-///
-/// Serializes `request` with `method` injected, reads the response, and parses
-/// the single envelope. Glob's transport until its own streamed cutover
-/// (ws43-03) — grep left this envelope for the hitstream engine in ws43-02.
-/// Split from the connect step so the daemon-down branch can decide *before*
-/// connecting whether to fall back to the in-process pipeline (bug 80, leg 4).
-///
-/// # Errors
-///
-/// Returns an error if the query fails or the response is malformed.
+/// Resolves one glob `--exclude-pattern` argument — glob's historical
+/// per-pattern rule, run CLI-side since the ws43-03 cutover: a basename (no
+/// `/`) becomes the depth-independent `**/<name>`; a slash-bearing pattern is
+/// tilde-expanded and resolved against the invoking cwd.
 #[cfg(unix)]
-async fn search_ipc_on<R: serde::Serialize + Sync>(
-    stream: tokio::net::UnixStream,
-    method: &str,
-    request: &R,
-) -> Result<SearchResponse> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    let (reader, mut writer) = stream.into_split();
-
-    let mut envelope = serde_json::to_value(request)?;
-    envelope
-        .as_object_mut()
-        .context("request is not an object")?
-        .insert(
-            "method".to_string(),
-            serde_json::Value::String(method.to_string()),
-        );
-    let mut payload = serde_json::to_string(&envelope)?;
-    payload.push('\n');
-    writer.write_all(payload.as_bytes()).await?;
-
-    let mut buf_reader = BufReader::new(reader);
-    let mut line = String::new();
-    buf_reader.read_line(&mut line).await?;
-
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return Ok(SearchResponse::default());
+fn resolve_glob_exclude(pattern: &str, cwd: &Path) -> String {
+    if pattern.contains('/') {
+        let expanded = catenary_cli::bridge::expand_tilde(pattern);
+        if Path::new(&expanded).is_absolute() {
+            expanded
+        } else {
+            cwd.join(&expanded).to_string_lossy().into_owned()
+        }
+    } else {
+        format!("**/{pattern}")
     }
-    serde_json::from_str(trimmed).context("invalid search response from daemon")
 }
 
-/// Runs a glob query against the running daemon.
+/// Runs a glob query on the streamed engine (ws43-03: the CLI owns the walk).
 ///
 /// The one-verb form (VERBS): the single positional is a pattern, decoded
 /// syntactically, always — no `resolve_search_paths` literal-first probe, no
 /// `path does not exist` classification (a metachar-free absent forwards as a
 /// pattern and gets the loud zero-match report + disclosure, not a silent
-/// missing line). The daemon absolutizes the relative pattern against `cwd` and
-/// expands it gitignore-aware. Arity 1 is enforced by the caller
-/// ([`main`])/clap before this runs; `pattern` is exactly one argument.
+/// missing line). The CLI absolutizes a relative pattern against `cwd`,
+/// canonicalizes its metachar-free base (misc 193), and expands it
+/// gitignore-aware in-process; the complete listing is laid out before any
+/// enrichment (decision 025 — every path always lists).
 ///
-/// stdout carries results only; the loud zero-match line and the teaching
-/// moments ride stderr (the streams ruling).
+/// Enrichment streams over the daemon's `tool/hitstream` annotation arm at the
+/// ruled weight — listing shapes request top-level structure, `--outline` (or
+/// a single matched file) the full tree — and the degrade matrix is grep's:
+/// daemon absent, an old daemon, a mid-stream fault, or the owed-annotation
+/// deadline all yield the identical listing, unenriched (`no outline`), never
+/// fewer paths. stdout carries results only, written as ONE atomic block (bug
+/// 112); the loud zero-match line and the teaching moments ride stderr (the
+/// streams ruling).
 ///
 /// # Errors
 ///
-/// Returns an error if no daemon is running or the query fails.
+/// Returns an error if the cwd is unreadable or the config cannot be loaded.
 #[cfg(unix)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the sequential query pipeline: validate, expand, plan, enrich, render"
+)]
+#[allow(
+    clippy::fn_params_excessive_bools,
+    reason = "1:1 with the clap-parsed glob flag surface"
+)]
 async fn run_glob(
     out: &mut cli::Output,
     pattern: PathBuf,
@@ -2916,8 +2848,14 @@ async fn run_glob(
     count: bool,
     include_gitignored: bool,
     include_hidden: bool,
+    outline: bool,
 ) -> Result<()> {
-    use catenary_cli::router::{GlobRequest, METHOD_GLOB};
+    use catenary_cli::bridge::session::{ExcludeSet, ResolvedGlob};
+    use catenary_cli::bridge::{
+        FileEnrichment, build_glob_plan, canonicalize_pattern_base, count_glob_paths,
+        render_glob_plan,
+    };
+    use catenary_cli::hitstream::{EnrichmentWeight, annotate_paths, sink};
 
     let cwd = std::env::current_dir().context("cannot determine working directory")?;
 
@@ -2931,53 +2869,138 @@ async fn run_glob(
         missing: Vec::new(),
     };
 
-    let request = GlobRequest {
-        cwd: Some(cwd.clone()),
-        paths: resolved.forward.clone(),
-        exclude,
-        count,
+    // A usage error (an uncompilable --exclude-pattern) is stderr + exit 2 on
+    // both the bare and `--count` forms — the retired executor's same class.
+    let exclude_resolved: Vec<String> = exclude
+        .iter()
+        .map(|pattern| resolve_glob_exclude(pattern, &cwd))
+        .collect();
+    let exclude_set = match ExcludeSet::compile(&exclude_resolved) {
+        Ok(set) => set,
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::exit(2);
+        }
+    };
+
+    // The request-builder legs the daemon used to run, CLI-side: auto-enable
+    // hidden for a relative pattern that names a dotted target, absolutize
+    // against the cwd, canonicalize the metachar-free base (misc 193).
+    let include_hidden = include_hidden
+        || (!pattern.is_absolute() && ResolvedGlob::targets_hidden(&pattern.to_string_lossy()));
+    let abs_pattern = if pattern.is_absolute() {
+        pattern.clone()
+    } else {
+        cwd.join(&pattern)
+    };
+    let abs_pattern = canonicalize_pattern_base(&abs_pattern);
+
+    // The listing renders CLI-side, so the CLI needs the daemon's file
+    // classification (custom binary/text mappings) — the same config either
+    // mode of the retired pipeline read.
+    let config = catenary_cli::config::Config::load().context("load config for glob")?;
+    let classification =
+        catenary_cli::bridge::filesystem_manager::ClassificationTables::from_config(&config);
+    let fs_manager =
+        catenary_cli::bridge::filesystem_manager::FilesystemManager::with_classification(
+            classification,
+        );
+
+    // One connect attempt decides daemon-served vs daemon-less for this run —
+    // and carries the honesty markers (bug 80 leg 4 / bug 110), exactly as the
+    // retired IPC path emitted them: once per invocation, before any result
+    // byte, on `--count` too.
+    let socket = catenary_cli::router::socket_path();
+    let connection = sink::connect_daemon(&socket).await.ok();
+    if connection.is_none() {
+        emit_no_daemon_marker();
+        emit_quarantine_marker(config.quarantined.summary().as_deref());
+    }
+
+    // ── `--count`: a pure-filesystem projection over the expansion — no
+    // enrichment, so the connection (if any) drops unused: a clean teardown
+    // the daemon reads as EOF.
+    if count {
+        drop(connection);
+        let paths = count_glob_paths(
+            &fs_manager,
+            std::slice::from_ref(&abs_pattern),
+            include_gitignored,
+            include_hidden,
+            &exclude_set,
+            &tokio_util::sync::CancellationToken::new(),
+        );
+        render_glob_count(out, paths);
+        return Ok(());
+    }
+
+    // ── Lay out the complete listing (decision 025), then enrich it.
+    let plan = match build_glob_plan(
+        &fs_manager,
+        &abs_pattern,
+        &exclude_set,
         include_gitignored,
         include_hidden,
-    };
-    // Daemon-served when up; in-process (honestly labeled) when down.
-    let response = if let Some(stream) = connect_daemon_ipc().await {
-        search_ipc_on(stream, METHOD_GLOB, &request).await?
-    } else {
-        let outcome = catenary_cli::router::run_glob_daemon_less(&request).await?;
-        emit_no_daemon_marker();
-        emit_quarantine_marker(outcome.quarantine_warning.as_deref());
-        SearchResponse::from(outcome.response)
+    ) {
+        Ok(plan) => plan,
+        // A matched path that vanished mid-walk — the retired executor's same
+        // usage-error class: stderr + exit 2.
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::exit(2);
+        }
     };
 
-    // A usage error (an invalid pattern the query never ran on) is stderr +
-    // exit 2 (VERBS: the arity/bare/invalid-pattern class).
-    if let Some(msg) = &response.error {
-        eprintln!("{msg}");
-        std::process::exit(2);
-    }
-
-    if count {
-        render_glob_count(out, response.paths.unwrap_or(0));
+    // The ruled weight lever: `--outline` opts up to the full tree; a listing
+    // shape defaults to top-level structure; the single-file outline shape
+    // keeps the full tree. There is NO enrichment-off flag by ruling —
+    // `--count` covers tallies, and a pipeline needing bare paths strips
+    // indented enrichment downstream.
+    let weight = if outline || !plan.listing_shape {
+        EnrichmentWeight::Outline
     } else {
-        let mut err = cli::Output::stderr(false);
-        // `no_match_patterns`/`dir_hints`/`metachar_names` are daemon-reported
-        // (original argument spelling / display paths); move them into the kind
-        // while still borrowing `output` (disjoint fields).
-        let kind = SearchKind::Glob {
-            no_match_patterns: response.no_match_patterns,
-            dir_hints: response.dir_hints,
-            metachar_names: response.metachar_names,
-        };
-        render_search_outcome(
-            out,
-            &mut err,
-            &cwd,
-            &resolved,
-            &response.output,
-            true,
-            &kind,
-        );
-    }
+        EnrichmentWeight::Listing
+    };
+
+    let enrichment = match connection {
+        Some((reader, writer)) if !plan.enrich_files.is_empty() => {
+            let (hits, degraded) = annotate_paths(
+                reader,
+                writer,
+                &plan.enrich_files,
+                plan.observations.clone(),
+                weight,
+            )
+            .await;
+            if degraded {
+                // The mid-stream degrade advisory: the listing is complete,
+                // enrichment is not — never silent (stderr only, so stdout
+                // stays byte-identical to the degrade matrix's other arms).
+                eprintln!(
+                    "[annotation stream degraded \u{2014} results complete, unenriched; \
+                     run: catenary doctor]"
+                );
+            }
+            FileEnrichment::from_annotations(hits)
+        }
+        // Daemon absent (marker already emitted), or nothing to enrich.
+        _ => std::collections::HashMap::new(),
+    };
+
+    let body = render_glob_plan(&plan, &enrichment);
+    let mut err = cli::Output::stderr(false);
+    let kind = SearchKind::Glob {
+        // The zero-match report names the ORIGINAL argument spelling (misc
+        // 118), not the absolutized pattern.
+        no_match_patterns: plan
+            .no_match
+            .then(|| pattern.to_string_lossy().into_owned())
+            .into_iter()
+            .collect(),
+        dir_hints: plan.dir_hints,
+        metachar_names: plan.metachar_names,
+    };
+    render_search_outcome(out, &mut err, &cwd, &resolved, &body, true, &kind);
     Ok(())
 }
 
@@ -4480,6 +4503,7 @@ mod tests {
             count,
             include_gitignored,
             include_hidden,
+            outline,
         }) = args.command
         else {
             unreachable!("expected Glob command");
@@ -4489,6 +4513,10 @@ mod tests {
         assert!(!count);
         assert!(!include_gitignored);
         assert!(!include_hidden);
+        assert!(
+            !outline,
+            "listing weight is the default — --outline opts up"
+        );
     }
 
     #[test]
@@ -4565,6 +4593,7 @@ mod tests {
             "--count",
             "--include-gitignored",
             "--include-hidden",
+            "--outline",
         ]);
         let args = args.expect("glob with all flags should parse");
         let Some(Command::Glob {
@@ -4573,6 +4602,7 @@ mod tests {
             count,
             include_gitignored,
             include_hidden,
+            outline,
         }) = args.command
         else {
             unreachable!("expected Glob command");
@@ -4582,6 +4612,7 @@ mod tests {
         assert!(count);
         assert!(include_gitignored);
         assert!(include_hidden);
+        assert!(outline);
     }
 
     #[test]
@@ -4614,6 +4645,20 @@ mod tests {
         // `--page` was retired with paging (pipeable-output ticket 03).
         let result = Args::try_parse_from(["catenary", "glob", "src/", "--page", "2"]);
         assert!(result.is_err(), "glob --page should no longer parse");
+    }
+
+    #[test]
+    fn test_cli_glob_paths_flag_is_rejected() {
+        use clap::Parser;
+        // There is NO enrichment-off flag, by ruling (ws43-03): a first-class
+        // off-switch becomes the taught habit and the product dies by opt-out.
+        // `--count` covers tallies; a pipeline needing bare paths strips
+        // indented enrichment downstream.
+        let result = Args::try_parse_from(["catenary", "glob", "src/", "--paths"]);
+        assert!(
+            result.is_err(),
+            "glob --paths must not exist (ruled: no enrichment-off flag)"
+        );
     }
 
     #[test]

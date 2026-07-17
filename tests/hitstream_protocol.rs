@@ -196,6 +196,7 @@ impl BatchEnricher for SlowFirstBatch {
         &self,
         hits: Vec<WireHit>,
         _observed: Vec<(PathBuf, i64)>,
+        _weight: Option<catenary_cli::hitstream::EnrichmentWeight>,
     ) -> anyhow::Result<Vec<AnnotatedHit>> {
         // Tag each hit's anchor with a fixed trail so the output takes the
         // annotated (`#x`) spelling. A batch's first hit line identifies it.
@@ -207,11 +208,7 @@ impl BatchEnricher for SlowFirstBatch {
         }
         Ok(hits
             .into_iter()
-            .map(|h| AnnotatedHit {
-                hit: h,
-                anchor: Some("x".to_string()),
-                enriched: true,
-            })
+            .map(|h| AnnotatedHit::scoped(h, "x".to_string()))
             .collect())
     }
 }

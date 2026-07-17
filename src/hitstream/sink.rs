@@ -40,8 +40,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 
-use super::frame::{AnnotatedBatch, AnnotatedHit, AnnotationFrame, HitFrame};
-use super::{HitBatch, IN_FLIGHT_WINDOW, STREAM_READ_DEADLINE, WireHit};
+use super::frame::{AnnotatedBatch, AnnotatedHit, AnnotationFrame, EnrichmentWeight, HitFrame};
+use super::{HIT_BATCH_SIZE, HitBatch, IN_FLIGHT_WINDOW, STREAM_READ_DEADLINE, WireHit};
 
 /// Connects to the daemon's IPC socket and opens the hit-batch annotation stream,
 /// returning the buffered read half and the write half ready for
@@ -330,6 +330,9 @@ where
                 // to re-emit HITS unannotated on a degrade, and a degraded
                 // stream nudges nothing.
                 observed: std::mem::take(&mut batch.observed),
+                // Grep batches are weight-less: anchor enrichment, the
+                // pre-ws43-03 wire, byte-identical.
+                weight: None,
             };
             // Retention next: the emitter owns this copy from here on.
             let _ = retain_tx.send(batch);
@@ -574,6 +577,131 @@ fn emit_unannotated<Wo: std::io::Write>(
     Ok(())
 }
 
+/// The glob-side annotation exchange (ws43-03): streams `files` to the daemon
+/// as weighted hit batches and collects the annotated hits back.
+///
+/// The glob analogue of [`daemon_stream`], simpler by design: the listing is
+/// laid out before enrichment (its render interleaves headers and outlines, so
+/// there is no line-at-a-time emission to pipeline into), so this just chunks
+/// the file set into [`HIT_BATCH_SIZE`] batches — each hit a `line 0` marker
+/// for one file — stamps every batch with the CLI-computed `weight`, ships the
+/// scoped-nudge `observations` on the first batch (so the daemon's changed-set
+/// nudge lands before any outline is derived), and terminates with a
+/// reap-scope-less `End` (a scoped walk never proves absence, so glob never
+/// reaps).
+///
+/// The writer runs as its own task so a large listing cannot deadlock against
+/// the daemon's replies; the reader (this task) collects annotation batches
+/// under the per-read [`STREAM_READ_DEADLINE`]. Degrade-only, by construction:
+/// on ANY fault — daemon absent is the caller's arm; here a malformed frame
+/// (the old-daemon signal), premature EOF, a batch gap, or the deadline
+/// expiring against an accepts-then-silent daemon — whatever annotations
+/// already arrived are returned and `degraded` is `true`. The caller renders
+/// the complete listing either way; a file with no annotation simply renders
+/// unenriched.
+///
+/// Returns `(annotated hits, degraded)`.
+pub async fn annotate_paths<R, Wr>(
+    reader: R,
+    writer: Wr,
+    files: &[PathBuf],
+    observations: Vec<(PathBuf, i64)>,
+    weight: EnrichmentWeight,
+) -> (Vec<AnnotatedHit>, bool)
+where
+    R: tokio::io::AsyncBufRead + Unpin + Send + 'static,
+    Wr: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let batches: Vec<Vec<WireHit>> = files
+        .chunks(HIT_BATCH_SIZE)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|path| WireHit {
+                    path: path.clone(),
+                    // An outline hit names a file, not a line: `0` is the
+                    // no-coordinate spelling (grep uses it for context lines'
+                    // columns), and the annotator keys on `path` alone.
+                    line: 0,
+                    column: 0,
+                    text: String::new(),
+                })
+                .collect()
+        })
+        .collect();
+    let total = batches.len() as u64;
+
+    // Writer half: its own task, bounded per write, so a peer that stops
+    // reading can never wedge the exchange — the reader's deadline then
+    // degrades it.
+    let mut observations = Some(observations);
+    let frames: Vec<HitFrame> = batches
+        .into_iter()
+        .enumerate()
+        .map(|(seq, hits)| HitFrame::Batch {
+            seq: seq as u64,
+            hits,
+            observed: observations.take().unwrap_or_default(),
+            weight: Some(weight),
+        })
+        .chain(std::iter::once(HitFrame::End {
+            batches: total,
+            observed: Vec::new(),
+            reap_scopes: None,
+        }))
+        .collect();
+    let writer_task = tokio::spawn(async move {
+        let mut writer = writer;
+        for frame in &frames {
+            let bounded =
+                tokio::time::timeout(STREAM_READ_DEADLINE, super::write_frame(&mut writer, frame))
+                    .await;
+            if !matches!(bounded, Ok(Ok(()))) {
+                return false;
+            }
+        }
+        let _ = writer.shutdown().await;
+        true
+    });
+
+    // Reader: collect annotation batches until the terminator. A read fault,
+    // an unrecognized frame, EOF before the terminator, or the deadline —
+    // degrade in place with whatever arrived (never fewer paths: the caller's
+    // render is already complete).
+    let mut reader = reader;
+    let mut line = String::new();
+    let mut hits: Vec<AnnotatedHit> = Vec::new();
+    let mut received: u64 = 0;
+    let mut degraded = loop {
+        let read = tokio::time::timeout(
+            STREAM_READ_DEADLINE,
+            super::read_frame::<_, AnnotationFrame>(&mut reader, &mut line),
+        )
+        .await;
+        match read {
+            Ok(Ok(Some(AnnotationFrame::Batch { batch }))) => {
+                received += 1;
+                hits.extend(batch.hits);
+            }
+            Ok(Ok(Some(AnnotationFrame::End { .. }))) => {
+                // A terminator over a batch gap is still a degrade — the
+                // missing files render unenriched, loudly.
+                break received != total;
+            }
+            // Timeout, EOF before the terminator, or a malformed frame (the
+            // old-daemon signal).
+            _ => break true,
+        }
+    };
+
+    // Join the writer so a write-side fault surfaces as the degrade flag even
+    // when the daemon answered everything it was sent.
+    degraded |= !writer_task.await.unwrap_or(false);
+    (hits, degraded)
+}
+
 /// Restores batch-sequence order over annotation-batches that may arrive out of
 /// order (the in-flight window lets the daemon resolve a later batch before an
 /// earlier slow one).
@@ -704,16 +832,111 @@ mod tests {
         assert_eq!(absolute.display(Path::new("/w/src/a.rs")), "/w/src/a.rs");
     }
 
+    // ─── the glob annotation exchange (ws43-03) ────────────────────────────
+
+    /// The healthy roundtrip: every file batch is answered (pass-through here),
+    /// the terminator closes the exchange, and nothing degrades. Several
+    /// batches prove the chunking (more files than one batch holds).
+    #[tokio::test]
+    async fn annotate_paths_roundtrips_through_annotator() {
+        let (cli_writes, daemon_reads) = tokio::io::duplex(1024 * 1024);
+        let (daemon_writes, cli_reads) = tokio::io::duplex(1024 * 1024);
+        let daemon = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(daemon_reads);
+            let mut writer = daemon_writes;
+            crate::hitstream::serve_passthrough(&mut reader, &mut writer)
+                .await
+                .expect("serve annotation stream");
+        });
+
+        let files: Vec<PathBuf> = (0..(super::super::HIT_BATCH_SIZE * 2 + 5))
+            .map(|i| PathBuf::from(format!("/w/f{i}.rs")))
+            .collect();
+        let (hits, degraded) = annotate_paths(
+            tokio::io::BufReader::new(cli_reads),
+            cli_writes,
+            &files,
+            vec![(PathBuf::from("/w/f0.rs"), 7)],
+            crate::hitstream::EnrichmentWeight::Listing,
+        )
+        .await;
+
+        assert!(!degraded, "a healthy exchange never degrades");
+        assert_eq!(hits.len(), files.len(), "every file is answered");
+        assert!(
+            hits.iter().all(|h| !h.enriched && h.outline.is_none()),
+            "the pass-through annotator answers unenriched"
+        );
+        daemon.await.expect("join annotator");
+    }
+
+    /// Daemon gone mid-exchange (EOF before the terminator): degrade in place —
+    /// whatever arrived is returned, the flag is up, and the caller's complete
+    /// listing renders unenriched. The glob leg of the ws43 degrade matrix.
+    #[tokio::test]
+    async fn annotate_paths_degrades_on_immediate_close() {
+        let (cli_writes, daemon_reads) = tokio::io::duplex(1024 * 1024);
+        let (daemon_writes, cli_reads) = tokio::io::duplex(1024);
+        // The "daemon" closes both halves without answering.
+        drop(daemon_writes);
+        drop(daemon_reads);
+
+        let files = vec![PathBuf::from("/w/a.rs"), PathBuf::from("/w/b.rs")];
+        let (hits, degraded) = annotate_paths(
+            tokio::io::BufReader::new(cli_reads),
+            cli_writes,
+            &files,
+            Vec::new(),
+            crate::hitstream::EnrichmentWeight::Listing,
+        )
+        .await;
+
+        assert!(degraded, "EOF before the terminator is the degrade signal");
+        assert!(hits.is_empty(), "nothing arrived, nothing fabricated");
+    }
+
+    /// An unrecognized reply (the old-daemon signal — e.g. an unknown-method
+    /// error line instead of an annotation frame) degrades exactly like
+    /// daemon-absent: flag up, no annotations, never an error.
+    #[tokio::test]
+    async fn annotate_paths_degrades_on_malformed_reply() {
+        use tokio::io::AsyncWriteExt;
+
+        let (cli_writes, daemon_reads) = tokio::io::duplex(1024 * 1024);
+        let (mut daemon_writes, cli_reads) = tokio::io::duplex(1024 * 1024);
+        // An old daemon answering an unknown method with a non-frame line.
+        let daemon = tokio::spawn(async move {
+            daemon_writes
+                .write_all(b"{\"error\":\"unknown method\"}\n")
+                .await
+                .expect("write bogus reply");
+            drop(daemon_reads);
+        });
+
+        let files = vec![PathBuf::from("/w/a.rs")];
+        let (hits, degraded) = annotate_paths(
+            tokio::io::BufReader::new(cli_reads),
+            cli_writes,
+            &files,
+            Vec::new(),
+            crate::hitstream::EnrichmentWeight::Outline,
+        )
+        .await;
+
+        assert!(
+            degraded,
+            "a malformed frame is the old-daemon degrade signal"
+        );
+        assert!(hits.is_empty(), "no annotation is fabricated from garbage");
+        daemon.await.expect("join stub daemon");
+    }
+
     #[test]
     fn grep_render_lines_match_the_grep_shape() {
         let render = GrepRender::new(Some(PathBuf::from("/w")));
         let wire = hit("/w/src/a.rs", 3);
         assert_eq!(render.unannotated_line(&wire), "src/a.rs:3#?:line 3");
-        let scoped = AnnotatedHit {
-            hit: wire.clone(),
-            anchor: Some("mod/f".to_string()),
-            enriched: true,
-        };
+        let scoped = AnnotatedHit::scoped(wire.clone(), "mod/f".to_string());
         assert_eq!(render.annotated_line(&scoped), "src/a.rs:3#mod/f:line 3");
         assert_eq!(
             render.annotated_line(&AnnotatedHit::passthrough(wire.clone())),

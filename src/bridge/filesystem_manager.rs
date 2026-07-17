@@ -437,8 +437,8 @@ impl Root {
 /// Cross-tool filesystem classification cache.
 ///
 /// Single authority for file metadata: binary detection, line count,
-/// language ID, and shebang detection. Shared by `GrepServer` and
-/// `GlobServer` through `Session`.
+/// language ID, and shebang detection. Shared by the search pipelines and
+/// the hitstream annotator through `Session`.
 ///
 /// Also owns the workspace root list for longest-prefix root resolution
 /// and the classification lookup tables built from config.

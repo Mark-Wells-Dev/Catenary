@@ -58,4 +58,5 @@ Flag synopses (long forms)
     --count — report the path tally instead of the paths
     --include-gitignored — include files .gitignore hides
     --include-hidden — include hidden files and directories
+    --outline — full symbol outlines (listings default to top-level structure)
     full: catenary glob --help

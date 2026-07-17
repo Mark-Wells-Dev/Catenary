@@ -19,9 +19,7 @@ use tokio_util::sync::CancellationToken;
 use super::diagnostics_server::DiagnosticsServer;
 use super::editing_guardrail::EditingGuardrail;
 use super::editing_manager::EditingManager;
-use super::file_tools::GlobServer;
 use super::filesystem_manager::{FilesystemManager, Root};
-use super::grep_server::GrepServer;
 use super::handler::expand_tilde;
 use super::path_security::PathValidator;
 use crate::config::Config;
@@ -175,7 +173,7 @@ impl ResolvedGlob {
     ///
     /// Only meaningful for absolute patterns — the sole form path-argument
     /// expansion sees, because every relative path argument is absolutized
-    /// against the invoking `cwd` first (`GlobRequest::to_params` daemon-side;
+    /// against the invoking `cwd` first (the CLI-side request builders;
     /// grep's CLI-side `run_grep` since ws43-02) (bugs 31, 69). Relative
     /// patterns carry no base directory and yield an empty list; the relative
     /// form survives only for `--glob` scope filters, which match
@@ -332,15 +330,15 @@ impl ExcludeSet {
 /// filtered.
 ///
 /// Paths are expected to be absolute — every relative path argument is
-/// absolutized against the invoking `cwd` first (`GlobRequest::to_params`
-/// daemon-side; grep's CLI-side `run_grep`). An empty input yields an empty
-/// result; callers distinguish "no path arguments" (search `cwd`) from
-/// "arguments that matched nothing" (empty result) before calling this.
+/// absolutized against the invoking `cwd` first (grep's CLI-side `run_grep`).
+/// An empty input yields an empty result; callers distinguish "no path
+/// arguments" (search `cwd`) from "arguments that matched nothing" (empty
+/// result) before calling this.
 ///
-/// Shared across the search surfaces: since the ws43-02 cutover `catenary
-/// grep` runs this expansion **CLI-side** (in `run_grep`, before the walk);
-/// the daemon-side caller is the glob executor, which keeps it until glob's
-/// own cutover (ws43-03).
+/// Since the ws43 cutovers every expansion runs **CLI-side**: grep's name
+/// operands through this (in `run_grep`, before the walk), glob's one-verb
+/// pattern through [`expand_glob_patterns_grouped_cancellable`] (in the plan
+/// build). No daemon-side walk remains for either query verb.
 #[must_use]
 pub fn expand_search_paths(
     paths: &[PathBuf],
@@ -348,21 +346,6 @@ pub fn expand_search_paths(
     include_hidden: bool,
 ) -> Vec<PathBuf> {
     expand_search_paths_reporting(paths, include_gitignored, include_hidden).0
-}
-
-/// Like [`expand_search_paths`], but quits the moment `cancel` fires (misc 140
-/// phase 2) — the cancellable flat form glob's off-thread `--count` walk uses.
-#[must_use]
-pub fn expand_search_paths_cancellable(
-    paths: &[PathBuf],
-    include_gitignored: bool,
-    include_hidden: bool,
-    cancel: &CancellationToken,
-) -> Vec<PathBuf> {
-    expand_search_paths_grouped_cancellable(paths, include_gitignored, include_hidden, cancel)
-        .into_iter()
-        .flat_map(|g| g.resolved)
-        .collect()
 }
 
 /// One search-path argument's resolution: the concrete paths it contributed and
@@ -502,9 +485,9 @@ pub fn expand_search_paths_grouped_cancellable(
 /// disclosure (VERBS streams ruling); nothing is ever silently classified as a
 /// "path does not exist" the way a grep name operand is.
 ///
-/// Callers absolutize each relative positional against the request `cwd` before
-/// dispatch (`GlobRequest::to_params`), so `expand_cancellable` sees the
-/// absolute form it needs.
+/// Callers absolutize each relative positional against the invoking `cwd`
+/// first (`run_glob`, CLI-side since ws43-03), so `expand_cancellable` sees
+/// the absolute form it needs.
 #[must_use]
 pub fn expand_glob_patterns_grouped_cancellable(
     paths: &[PathBuf],
@@ -671,10 +654,12 @@ fn visible_entries(dir: &Path) -> HashSet<PathBuf> {
 pub struct Session {
     /// Session-wide configuration (shared with `LspClientManager`).
     pub config: Arc<Config>,
-    /// Grep tool server.
-    pub grep: GrepServer,
-    /// Glob tool server.
-    pub glob: GlobServer,
+    /// Glob patterns whose outlines are suppressed from automatic display
+    /// (`[tools.glob] outline_suppress` — an explicit user opt-out, e.g.
+    /// generated/vendored files, not an intent-guess gate). Symbols remain
+    /// available; the annotated hit is flagged `suppressed` instead of
+    /// outlined. Consumed by [`Self::hitstream_enricher`].
+    outline_suppress: Vec<globset::GlobMatcher>,
     /// Diagnostics pipeline for `PostToolUse` hook requests.
     pub diagnostics: Arc<DiagnosticsServer>,
     /// In-memory editing state (`start_editing`/`done_editing` lifecycle).
@@ -725,75 +710,17 @@ pub struct Session {
     diagnostics_in_flight: std::sync::atomic::AtomicBool,
 }
 
-/// A daemon-less `glob` executor, backed by an empty, never-spawned
-/// [`LspClientManager`] (bug 80, leg 4).
-///
-/// Built so the CLI can run the daemon's own glob pipeline in-process when the
-/// daemon is down, producing output byte-identical to a daemon-served answer
-/// with no language-server coverage. Grep no longer needs a daemon-less twin:
-/// since the ws43-02 cutover the CLI owns the grep walk in both modes, and the
-/// daemon-less case is simply the hitstream engine's unannotated sink.
-pub struct DaemonlessSearch {
-    /// The glob server, LSP-manager-empty.
-    pub glob: GlobServer,
-}
-
-impl DaemonlessSearch {
-    /// Builds a daemon-less glob server wired to an empty, never-spawned
-    /// [`LspClientManager`] — for the CLI to run in-process when the daemon is
-    /// down (bug 80, leg 4).
-    ///
-    /// Catenary is one binary: the search pipeline (walk, gitignore semantics,
-    /// pattern compilation, exclude handling, output rendering) is library code.
-    /// This constructs the *exact same* [`GlobServer`] the daemon serves, but
-    /// with no LSP manager backing — so `execute` takes the uncovered-file
-    /// rendering path the daemon already uses for a tree no language server
-    /// covers, and the stdout is byte-identical to a daemon-served answer with
-    /// no coverage.
-    ///
-    /// Unlike [`Session::new`], this performs **no** logging activation, opens
-    /// **no** JSONL firehose sink, and mirrors **no** snapshot — a throwaway CLI
-    /// process must not write telemetry or spawn servers. There are no roots: the
-    /// CLI resolves paths against `cwd`, and an empty root set means every hit is
-    /// uncovered — the honest daemon-less mode.
-    #[must_use]
-    pub fn from_config(config: Config) -> Self {
-        let config = Arc::new(config);
-        let logging = LoggingServer::new();
-
-        let classification = super::filesystem_manager::ClassificationTables::from_config(&config);
-        let fs_manager = Arc::new(FilesystemManager::with_classification(classification));
-
-        // No symbol index: without an LSP manager nothing populates it, and a
-        // never-populated index yields no outlines — exactly the uncovered
-        // render. Skipping it keeps the CLI process lean.
-        let symbol_index = None;
-
-        let glob_config = config
-            .tools
-            .as_ref()
-            .map_or_else(crate::config::GlobConfig::default, |t| t.glob.clone());
-        let outline_suppress = compile_outline_suppress(&glob_config.outline_suppress);
-
-        let client_manager = Arc::new(LspClientManager::new(config, logging, fs_manager.clone()));
-
-        Self {
-            glob: GlobServer {
-                client_manager,
-                fs_manager,
-                symbol_index,
-                outline_suppress,
-            },
-        }
-    }
-}
+// The `DaemonlessSearch` glob twin retired with the ws43-03 cutover: the CLI
+// owns the glob walk and render in both modes, and the daemon-less case is
+// simply the plan rendered with an empty enrichment map — exactly what grep's
+// twin became in ws43-02.
 
 /// Compiles glob-outline-suppression patterns into matchers.
 ///
 /// A basename pattern (no `/`) is prefixed with `**/` for depth-independent
 /// matching; a path pattern is used verbatim. Uncompilable patterns are
-/// dropped. Shared by [`Session::new`], [`Session::new_for_daemon`], and
-/// [`Session::daemon_less_search`] so the three constructions never drift.
+/// dropped. Shared by [`Session::new`] and [`Session::new_for_daemon`] so the
+/// constructions never drift.
 fn compile_outline_suppress(patterns: &[String]) -> Vec<globset::GlobMatcher> {
     patterns
         .iter()
@@ -897,22 +824,10 @@ impl Session {
             symbol_index.clone(),
         ));
 
-        let grep = GrepServer {
-            client_manager: client_manager.clone(),
-            fs_manager: fs_manager.clone(),
-            symbol_index: symbol_index.clone(),
-        };
         let outline_suppress = compile_outline_suppress(&glob_config.outline_suppress);
-        let glob = GlobServer {
-            client_manager: client_manager.clone(),
-            fs_manager: fs_manager.clone(),
-            symbol_index: symbol_index.clone(),
-            outline_suppress,
-        };
         Self {
             config,
-            grep,
-            glob,
+            outline_suppress,
             diagnostics,
             editing: EditingManager::new(),
             editing_guardrail: None,
@@ -953,17 +868,7 @@ impl Session {
 
         Self {
             config: primary.config.clone(),
-            grep: GrepServer {
-                client_manager: primary.client_manager.clone(),
-                fs_manager: primary.fs_manager.clone(),
-                symbol_index: primary.symbol_index.clone(),
-            },
-            glob: GlobServer {
-                client_manager: primary.client_manager.clone(),
-                fs_manager: primary.fs_manager.clone(),
-                symbol_index: primary.symbol_index.clone(),
-                outline_suppress,
-            },
+            outline_suppress,
             diagnostics: primary.diagnostics.clone(),
             editing: EditingManager::new(),
             editing_guardrail,
@@ -980,6 +885,22 @@ impl Session {
             last_seen: std::sync::Mutex::new(crate::state_snapshot::now_iso()),
             diagnostics_in_flight: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Builds the ws43 hit-batch enricher from this session's shared
+    /// infrastructure (pool, filesystem manager, symbol index, glob's
+    /// outline-suppression matchers) — the daemon-side annotator for the
+    /// streamed `catenary grep`/`catenary glob` engine, running the shared
+    /// enrichment core in `grep_server`. Built per `tool/hitstream`
+    /// connection, so the enricher's observation accumulator is one walk's.
+    #[must_use]
+    pub fn hitstream_enricher(&self) -> super::hitstream_enricher::HitstreamEnricher {
+        super::hitstream_enricher::HitstreamEnricher::new(
+            Arc::clone(&self.client_manager),
+            Arc::clone(&self.fs_manager),
+            self.symbol_index.clone(),
+            self.outline_suppress.clone(),
+        )
     }
 
     /// Records the session's most recent action and marks the snapshot dirty.

@@ -57,12 +57,17 @@ desktop-notification sink (error severity — the urgent interrupt). Warn/error
 events additionally feed the alert ring of the daemon-owned `state.json`
 snapshot (the TUI health surface). Every protocol message flows through it.
 
-Application servers (`GrepServer`, `GlobServer`, `DiagnosticsServer`)
-are the transformation layer. They receive application-level parameters
-from the IPC router, do work using `LspClient`, and return results.
-They do not log protocol messages — that is the boundary components'
-job. An application server is a black box: the protocol messages that
-went in and came out are linked by `parent_id` in the firehose records.
+Application servers (the `HitstreamEnricher` annotator behind the
+`tool/hitstream` arm, and `DiagnosticsServer`) are the transformation
+layer. They receive application-level parameters from the IPC router, do
+work using `LspClient`, and return results. Since the ws43 cutovers the
+search walks are CLI-side: `catenary grep`/`glob` walk and render
+in-process and stream hit batches to the annotator, which answers scope
+anchors (grep) or outline bodies at the requested weight (glob).
+Application servers do not log protocol messages — that is the boundary
+components' job. An application server is a black box: the protocol
+messages that went in and came out are linked by `parent_id` in the
+firehose records.
 
 ## Component diagram
 
@@ -70,7 +75,7 @@ went in and came out are linked by `parent_id` in the firehose records.
                 ┌─────────────────────────────────────────────────────┐
                 │                    Catenary daemon                  │
                 │                                                     │
-Agent ◄──CLI──► │  IPC router ──► GrepServer / GlobServer /           │
+Agent ◄──CLI──► │  IPC router ──► HitstreamEnricher /                 │
   (grep, glob,  │                  DiagnosticsServer                  │
    diagnostics) │                       │                             │
                 │                 LspClientManager                    │

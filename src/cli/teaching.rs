@@ -150,6 +150,7 @@ Flag synopses (long forms)
     --count — report the path tally instead of the paths
     --include-gitignored — include files .gitignore hides
     --include-hidden — include hidden files and directories
+    --outline — full symbol outlines (listings default to top-level structure)
     full: catenary glob --help";
 
 /// The per-agent debt line appended for the `SubagentStart` variant.
@@ -1248,18 +1249,19 @@ mod tests {
     #[test]
     fn payload_stays_in_the_token_band() {
         // Size guard: the ticket targets ~600–800 tokens. Using a ~4 chars/token
-        // proxy that band is ~2400–3200 chars; we allow a wider 2400..3600 window
+        // proxy that band is ~2400–3200 chars; we allow a wider 2400..3700 window
         // so ordinary wording tweaks, the small config-driven Tier 1, the brief
-        // isolated-subagents mention (misc 146), and the retired-bare-rerun
-        // contract line (root-ownership stage 3) don't trip it, while a tier being
-        // dropped or doubled (a ~1000-char swing) still does. Rendered against a
-        // minimal active fixture surface — a large real allowlist grows Tier 1
-        // further, which is expected and unbounded here.
+        // isolated-subagents mention (misc 146), the retired-bare-rerun
+        // contract line (root-ownership stage 3), and glob's `--outline` synopsis
+        // line (ws43-03) don't trip it, while a tier being dropped or doubled (a
+        // ~1000-char swing) still does. Rendered against a minimal active fixture
+        // surface — a large real allowlist grows Tier 1 further, which is
+        // expected and unbounded here.
         let chars = render(Some(&fixture_surface()), &["make".to_string()], None)
             .chars()
             .count();
         assert!(
-            (2400..=3600).contains(&chars),
+            (2400..=3700).contains(&chars),
             "teaching payload is {chars} chars (~{} tokens); expected the ~600–800 token band",
             chars / 4
         );

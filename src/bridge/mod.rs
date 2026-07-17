@@ -40,29 +40,25 @@ use crate::symbol_index::SymbolIndex;
 pub use diagnostics_server::DiagnosticsServer;
 pub use editing_guardrail::EditingGuardrail;
 pub use editing_manager::EditingManager;
-pub use file_tools::GlobOutcome;
+pub use file_tools::{
+    FileEnrichment, GlobPlan, build_glob_plan, canonicalize_pattern_base, count_glob_paths,
+    render_glob_plan,
+};
 pub use grep_server::{GrepFlags, GrepSkips, SkipRecord, StreamOutcome, grep_stream};
 pub use handler::expand_tilde;
-pub use hitstream_enricher::GrepHitEnricher;
+pub use hitstream_enricher::HitstreamEnricher;
 // The ws43 hitstream engine walks with the same matcher/searcher constructors
 // stdin mode uses, so the surfaces' matching semantics cannot drift (ws43-02).
 pub(crate) use grep_server::{build_matcher, build_searcher};
 pub use hook_router::HookRouter;
 pub use hook_router::is_edit_tool;
 pub use path_security::PathValidator;
-pub use session::DaemonlessSearch;
 
-/// Partial-result annotation emitted by `grep` and `glob` when a searched
-/// scope has no LSP coverage — the scope is outside every workspace root, or
-/// its owning root has no language server backing it.
-///
-/// This is the single source of truth for the label so both search surfaces
-/// emit it byte-for-byte identically (bug 31): a divergent wording would let an
-/// agent treat one surface's "incomplete" signal as authoritative. It is a
-/// result annotation, not a `warn!`/`error!` — it rides in the rendered output
-/// next to the affected scope, never silently dropped and never a substitution
-/// of another root's matches.
-pub(crate) const NO_LSP_LABEL: &str = "(no LSP \u{2014} see `catenary roots -h`)";
+// The `(no LSP …)` scope label (`NO_LSP_LABEL`) retired with the ws43 cutovers:
+// grep replaced it with the per-line `#?` could-not-enrich marker (ws43-02) and
+// glob with the per-file `no outline` marker (ws43-03) — the CLI owns the
+// render in both modes and cannot see the daemon's mounted roots, so
+// degradation is disclosed per result, never as a scope header.
 
 /// Compresses a path by replacing the `$HOME` prefix with `~`.
 pub(crate) fn compress_home(path: &Path) -> String {
@@ -157,9 +153,9 @@ impl SourceLines {
 /// `documentSymbol` traffic appears as children of the calling scope
 /// in the TUI.
 ///
-/// Shared by [`grep_server::GrepServer`] (via its shared enrichment core, which
-/// the ws43 hitstream annotator also runs) and [`file_tools::GlobServer`] —
-/// glob-shared plumbing that stays until glob's own streaming cutover (ws43-03).
+/// Since the ws43 cutovers the sole caller is the hitstream annotator's shared
+/// enrichment core (`grep_server::anchor_context`), which serves both grep
+/// anchors and glob outlines from the index this populates.
 pub(super) async fn ensure_symbols(
     symbol_index: Option<&Arc<std::sync::Mutex<SymbolIndex>>>,
     client_manager: &LspClientManager,
