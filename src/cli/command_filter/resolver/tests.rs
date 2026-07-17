@@ -778,6 +778,12 @@ fn sed_in_place_records_files_and_backups() {
         ok("sed --in-place=.orig 's/x/y/' a.rs", t.path()),
         paths(t.path(), &["a.rs", "a.rs.orig"]),
     );
+    // Combined short cluster: `-ni` is `-n -i` — still an in-place write
+    // (bug 122 acceptance).
+    assert_eq!(
+        ok("sed -ni 's/x/y/' a.rs", t.path()),
+        paths(t.path(), &["a.rs"]),
+    );
 }
 
 #[test]
@@ -786,6 +792,17 @@ fn sed_preview_is_no_write() {
     touch(t.path(), "a.rs");
     assert_eq!(ok("sed 's/x/y/' a.rs", t.path()), BTreeSet::new());
     assert_eq!(ok("sed -n '1,10p' a.rs", t.path()), BTreeSet::new());
+    // Bug 122 acceptance: the common line-range and pattern viewers book
+    // nothing.
+    assert_eq!(ok("sed -n '4855,4865p' a.rs", t.path()), BTreeSet::new());
+    assert_eq!(ok("sed -n '/pat/p' a.rs", t.path()), BTreeSet::new());
+    // Flag position: `-n` trailing (GNU permutes options around operands).
+    assert_eq!(ok("sed '1,10p' -n a.rs", t.path()), BTreeSet::new());
+    // `--expression=` long form is the same checked script.
+    assert_eq!(
+        ok("sed -n --expression='1,10p' a.rs", t.path()),
+        BTreeSet::new()
+    );
 }
 
 #[test]
@@ -819,6 +836,32 @@ fn sed_write_commands_are_surgically_denied() {
     assert_eq!(
         resolve_command("sed -i 's/a/b/w x' f", Some(t.path()))
             .expect_err("s///w")
+            .construct,
+        "sed-s-write-flag",
+    );
+    // Bug 122 pins: the `-e` operand form, one clean expression + one writer,
+    // the capital `W`, and `s///w` from a preview (no `-i`).
+    assert_eq!(
+        resolve_command("sed -e 'w dump' f", Some(t.path()))
+            .expect_err("-e w")
+            .construct,
+        "sed-write-command",
+    );
+    assert_eq!(
+        resolve_command("sed -n -e '1p' -e 'w dump' f", Some(t.path()))
+            .expect_err("clean + writer")
+            .construct,
+        "sed-write-command",
+    );
+    assert_eq!(
+        resolve_command("sed 'W dump' f", Some(t.path()))
+            .expect_err("W")
+            .construct,
+        "sed-write-command",
+    );
+    assert_eq!(
+        resolve_command("sed 's/x/y/w out.txt' f", Some(t.path()))
+            .expect_err("preview s///w")
             .construct,
         "sed-s-write-flag",
     );
@@ -881,6 +924,29 @@ fn sed_backup_template_suffix_is_opaque() {
             .expect_err("template suffix")
             .construct,
         "sed-backup-template",
+    );
+}
+
+#[test]
+fn sed_double_dash_operand_is_still_the_script() {
+    // `--` ends option parsing only (GNU getopt): the first operand after it
+    // is the script when none came via `-e`/`--expression`. Filing it as a
+    // file left the script empty, so `sed -- 'w out' f` read as print-only —
+    // an unbooked write (bug 122).
+    let t = tmp();
+    touch(t.path(), "f");
+    touch(t.path(), "g");
+    assert_eq!(ok("sed -n -- '1,10p' f", t.path()), BTreeSet::new());
+    assert_eq!(
+        resolve_command("sed -- 'w out.txt' f", Some(t.path()))
+            .expect_err("w after --")
+            .construct,
+        "sed-write-command",
+    );
+    // With a `-e` script already given, operands after `--` are all files.
+    assert_eq!(
+        ok("sed -i -e 's/x/y/' -- f g", t.path()),
+        paths(t.path(), &["f", "g"]),
     );
 }
 

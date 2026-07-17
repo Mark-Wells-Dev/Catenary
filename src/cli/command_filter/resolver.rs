@@ -2007,7 +2007,20 @@ fn parse_sed_argv(cmd: &SimpleCommand) -> Result<SedInvocation, Unresolved> {
             continue;
         }
         if after_ddash {
-            files.push((arg.clone(), meta));
+            // `--` ends option parsing only (GNU getopt): the first operand
+            // after it is still the script when none was given via
+            // `-e`/`--expression` — `sed -- 'w out' f` runs `w out`. Filing
+            // it as a file would leave the script empty and misread a
+            // write-capable invocation as print-only (bug 122).
+            if !positional_script_taken && scripts.is_empty() {
+                if meta.value_subs || meta.live_dollar || meta.live_glob {
+                    return Err(computed_script());
+                }
+                scripts.push(arg.clone());
+                positional_script_taken = true;
+            } else {
+                files.push((arg.clone(), meta));
+            }
             continue;
         }
         if arg == "--" {
