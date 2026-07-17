@@ -199,6 +199,10 @@ fn semver_lt(a: &str, b: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
 

@@ -65,10 +65,13 @@ check:
 # warnings`, CI's deny lever: the same warnings live in the editor/receipt, and go
 # red here. `--all-targets --all-features` is the broadest surface (lib, bins,
 # tests, benches; both `mockls` and `fuzzing`), a superset of the test/build
-# feature sets, so no gated module escapes the gate. Both `make check` and
+# feature sets, so no gated module escapes the gate. `--workspace` (misc 205)
+# gates the bridge crates' own targets too — without it their units are
+# lint-capped and the daemon's workspace-wide flycheck disagrees red-vs-green
+# with this gate. Both `make check` and
 # `.github/workflows/ci.yml` call this target — the flags live in one place.
 clippy:
-	@cargo clippy --all-targets --all-features --quiet -- -D warnings
+	@cargo clippy --workspace --all-targets --all-features --quiet -- -D warnings
 
 # Detect unused dependencies
 machete:
