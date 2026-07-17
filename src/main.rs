@@ -832,6 +832,12 @@ fn main() -> Result<()> {
             } else {
                 #[cfg(unix)]
                 {
+                    // Bridge path (host stdio ↔ daemon socket byte proxy):
+                    // install the stderr tracing subscriber before the proxy
+                    // starts, so the reconnect machinery's events reach the
+                    // host's per-process MCP stderr capture instead of a
+                    // subscriber-less registry.
+                    init_bridge_tracing();
                     catenary_cli::router::run_bridge()
                 }
                 #[cfg(not(unix))]
@@ -1609,6 +1615,55 @@ fn build_runtime() -> Result<tokio::runtime::Runtime> {
 fn run_dashboard() -> Result<()> {
     let config = catenary_cli::config::Config::load()?;
     catenary_cli::tui::run(config.icons.unwrap_or_default())
+}
+
+/// Install the bridge path's tracing subscriber: a compact `fmt` layer
+/// writing to STDERR.
+///
+/// The bridge is the byte proxy between the host's stdio and the daemon
+/// socket, and its stdout IS the MCP protocol channel — one stray line on
+/// stdout corrupts the session. The writer is therefore explicitly
+/// `std::io::stderr`, which the host captures per MCP-server process into its
+/// own timestamped log (Claude Code: `mcp-logs-…/*.jsonl`), making bridge
+/// lifecycle forensics (reconnect rounds, exe healing, exhaustion) visible
+/// with zero new infrastructure. Deliberately NOT the daemon's
+/// `LoggingServer` — that is the daemon's multi-sink port
+/// (firehose/notify/snapshot), wrong for a per-host proxy process.
+///
+/// Filter discipline mirrors the daemon: `CATENARY_LOG` overrides, else
+/// default everything to `warn` and allowlist Catenary's own crates at
+/// `debug`.
+#[cfg(unix)]
+fn init_bridge_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("CATENARY_LOG").unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("warn,catenary=debug,catenary_cli=debug")
+    });
+    // STDOUT PURITY: stdout carries MCP protocol bytes between host and
+    // bridge; nothing else may reach it. The writer choice is this one
+    // explicit argument — everything the subscriber emits goes to stderr.
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(bridge_fmt_layer(std::io::stderr))
+        .init();
+}
+
+/// The bridge subscriber's `fmt` layer shape, parameterized over the writer
+/// so tests can pin the output form with a capture writer: compact
+/// single-line, no ANSI colors (the lines transit the host's JSONL capture),
+/// with level and target included.
+#[cfg(unix)]
+fn bridge_fmt_layer<S>(
+    writer: impl for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+) -> impl tracing_subscriber::Layer<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    tracing_subscriber::fmt::layer()
+        .compact()
+        .with_ansi(false)
+        .with_level(true)
+        .with_target(true)
+        .with_writer(writer)
 }
 
 /// Runs the Catenary daemon on a dedicated thread with a 16 MB stack.
@@ -3567,6 +3622,74 @@ mod tests {
     fn drain_db_at_is_noop_when_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert_eq!(drain_db_at(&dir.path().join("catenary.db")), 0);
+    }
+
+    // ── Bridge tracing subscriber tests (pulse 01) ────────────────
+
+    /// Shared-buffer writer so the test can inspect what the bridge fmt
+    /// layer emits.
+    #[cfg(unix)]
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[cfg(unix)]
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for CaptureWriter {
+        type Writer = Self;
+
+        fn make_writer(&'w self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The bridge layer's lines transit the host's JSONL stderr capture:
+    /// one event must render as one plain (ANSI-free) line carrying the
+    /// level and target. The stderr-vs-stdout choice itself is pinned at
+    /// the single `bridge_fmt_layer(std::io::stderr)` call site in
+    /// `init_bridge_tracing`.
+    #[cfg(unix)]
+    #[test]
+    fn bridge_fmt_layer_is_single_line_plain_with_level_and_target() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = CaptureWriter(std::sync::Arc::clone(&buf));
+        let subscriber = tracing_subscriber::registry().with(bridge_fmt_layer(writer));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "catenary::bridge_pin", "reconnect round");
+        });
+        let text = String::from_utf8(buf.lock().expect("capture buffer lock").clone())
+            .expect("fmt output is UTF-8");
+        assert!(
+            !text.contains('\u{1b}'),
+            "ANSI escape leaked into capture: {text:?}"
+        );
+        assert_eq!(
+            text.trim_end_matches('\n').lines().count(),
+            1,
+            "one event must render as one line: {text:?}"
+        );
+        assert!(text.contains("WARN"), "level missing: {text:?}");
+        assert!(
+            text.contains("catenary::bridge_pin"),
+            "target missing: {text:?}"
+        );
+        assert!(
+            text.contains("reconnect round"),
+            "message missing: {text:?}"
+        );
     }
 
     // ── Stale-hooks notification tests ────────────────────────────
