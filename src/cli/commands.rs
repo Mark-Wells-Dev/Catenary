@@ -497,6 +497,15 @@ fn render_table(out: &mut Output, records: &[jsonl_reader::Record]) {
 
 /// Render records as a JSON array — the raw firehose lines (empty keys omitted,
 /// matching the on-disk shape), in chronological order.
+///
+/// Field naming is the on-disk firehose contract, not the table headers
+/// (bug 125): the timestamp key is `ts` (RFC3339 millis, UTC) — there is no
+/// `time` alias — and there is no `session` key: the session id rides in
+/// `scope_id`, which is self-describing (session id / search UUID /
+/// `server@root` / instance id). A record with no value for an optional key
+/// omits the key entirely — never an empty string masquerading as data — so a
+/// jq extraction that comes back empty means the key name is wrong, not that
+/// the field went unpopulated.
 fn render_json(out: &mut Output, records: &[jsonl_reader::Record]) {
     let json = serde_json::to_string_pretty(records).unwrap_or_default();
     let _ = out.writeln(format_args!("{json}"));
@@ -505,7 +514,7 @@ fn render_json(out: &mut Output, records: &[jsonl_reader::Record]) {
 /// The seven table cells for one record.
 fn record_cells(rec: &jsonl_reader::Record) -> Vec<String> {
     vec![
-        local_hms(&rec.ts),
+        local_iso(&rec.ts),
         rec.level.clone(),
         rec.kind.clone(),
         clip(&rec.scope_id, 14),
@@ -532,12 +541,22 @@ fn summary(rec: &jsonl_reader::Record) -> Option<String> {
     Some(clip(&target.to_string(), 160))
 }
 
-/// Format an RFC3339 timestamp as a local `HH:MM:SS`, falling back to the raw
-/// string when it does not parse.
-fn local_hms(ts: &str) -> String {
+/// Format an RFC3339 timestamp as a local, date-bearing ISO-8601
+/// `YYYY-MM-DDTHH:MM:SS`, falling back to the raw string when it does not
+/// parse.
+///
+/// Always date-bearing, not window-conditional (bug 125): a time-of-day-only
+/// cell turns ambiguous the moment a query window crosses midnight
+/// (`--since 7d`) — exactly the forensic moment this surface exists for.
+/// Grep-friendly and unambiguous beats compact.
+fn local_iso(ts: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(ts).map_or_else(
         |_| ts.to_string(),
-        |dt| dt.with_timezone(&Local).format("%H:%M:%S").to_string(),
+        |dt| {
+            dt.with_timezone(&Local)
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string()
+        },
     )
 }
 
@@ -936,6 +955,73 @@ mod tests {
         assert_eq!(
             cells.last().map(String::as_str),
             Some("rust-analyzer exited")
+        );
+    }
+
+    // ── bug 125: date-bearing table timestamps ──────────────────────
+
+    #[test]
+    fn table_timestamp_is_date_bearing_iso8601() {
+        // bug 125: a `HH:MM:SS`-only cell is ambiguous across a multi-day
+        // window (`--since 7d`). The TIME cell must carry the date — always,
+        // not window-conditionally. Expected value computed through the same
+        // local conversion so the assertion is timezone-independent.
+        let ts = "2026-06-09T10:11:12.000Z";
+        let expected = chrono::DateTime::parse_from_rfc3339(ts)
+            .expect("valid rfc3339")
+            .with_timezone(&Local)
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        assert_eq!(local_iso(ts), expected);
+
+        let cells = record_cells(&proto_record("textDocument/hover"));
+        assert_eq!(
+            cells.first().map(String::as_str),
+            Some(expected.as_str()),
+            "TIME cell carries the date"
+        );
+    }
+
+    #[test]
+    fn table_timestamp_falls_back_to_raw_when_unparseable() {
+        assert_eq!(local_iso("not-a-timestamp"), "not-a-timestamp");
+    }
+
+    // ── bug 125: JSON field naming/population ───────────────────────
+
+    #[test]
+    fn json_rows_carry_ts_and_scope_id_never_empty_strings() {
+        // bug 125: the JSON shape is the on-disk firehose contract — the
+        // timestamp key is `ts` (no `time` alias) and the session id rides in
+        // `scope_id` (no `session` key). Every row carries `ts`; a row class
+        // with no scope omits `scope_id` entirely per the emitter's
+        // skip-empty convention — never an empty string masquerading as data.
+        let with_scope = proto_record("tools/call"); // scope_id = server@root
+        let mut scopeless = proto_record("initialize");
+        scopeless.scope_id = String::new(); // e.g. a daemon-level event
+
+        let mut out = Output::buffer(400);
+        render_rows(&mut out, &[with_scope, scopeless], QueryFormat::Json);
+        let v: serde_json::Value =
+            serde_json::from_str(&out.into_string()).expect("valid json array");
+
+        for row in v.as_array().expect("array") {
+            assert!(
+                row.get("ts").and_then(serde_json::Value::as_str)
+                    == Some("2026-06-09T10:11:12.000Z"),
+                "every row carries a populated ts: {row}"
+            );
+            assert!(row.get("time").is_none(), "no `time` alias: {row}");
+            assert!(row.get("session").is_none(), "no `session` key: {row}");
+        }
+        assert_eq!(
+            v[0]["scope_id"], "rust-analyzer@/p",
+            "scoped row's scope_id populated"
+        );
+        assert!(
+            v[1].get("scope_id").is_none(),
+            "scopeless row omits the key rather than emitting \"\": {}",
+            v[1]
         );
     }
 

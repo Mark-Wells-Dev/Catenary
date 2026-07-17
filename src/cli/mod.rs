@@ -81,7 +81,7 @@ impl HostFormat {
 pub enum QueryFormat {
     /// Human-readable table.
     Table,
-    /// JSON array of structured rows.
+    /// JSON array of raw firehose records: timestamp key is `ts` (UTC), session id rides in `scope_id`; empty keys are omitted.
     Json,
 }
 

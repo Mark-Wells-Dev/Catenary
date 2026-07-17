@@ -366,6 +366,18 @@ catenary query --server rust-analyzer --level warn --follow
 | `--limit <n>` | Max rows (0 = unlimited; default 100) |
 | `--format <fmt>` | Output format: `table` (default) or `json` |
 
+Table rows carry a date-bearing local timestamp (`YYYY-MM-DDTHH:MM:SS`), so
+rows stay unambiguous across a multi-day window like `--since 7d`.
+
+`--format json` emits the **raw firehose records** — the field names are the
+on-disk keys, not the table headers. In particular there is no `time` key (the
+timestamp is `ts`, RFC3339 millis in UTC) and no `session` key (the session id
+rides in `scope_id`, which is self-describing: a session id, a search UUID, a
+`server@root`, or an instance id, depending on the record's scope). A record
+with no value for an optional key omits the key entirely rather than emitting
+an empty string — so a jq extraction like `.time // empty` coming back blank
+means the key name is wrong, not that the field went unpopulated.
+
 ### `catenary pin` / `catenary unpin` / `catenary roots`
 
 Manage workspace-root **lifetime**. Coverage is automatic — Catenary mounts and
