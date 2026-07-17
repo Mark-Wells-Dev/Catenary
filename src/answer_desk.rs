@@ -233,8 +233,9 @@ pub enum ScopeVerdict {
 /// The answer-desk verdict for one permission prompt.
 ///
 /// [`Decision::to_hook_json`] is the SINGLE place the wire field names
-/// (`decision`, `behavior`, `updatedInput`, `updatedPermissions`, `message`) are
-/// emitted, so a field rename is a one-place fix.
+/// (`hookSpecificOutput`, `hookEventName`, `decision`, `behavior`,
+/// `updatedInput`, `updatedPermissions`, `message`) are emitted, so a field
+/// rename is a one-place fix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     /// Deny the read (sensitive file). Carries the teaching message.
@@ -276,9 +277,21 @@ impl Decision {
     /// Renders the decision as the hook-response JSON, or `None` for
     /// [`Decision::NoDecision`] (nothing is printed — the human's prompt stands).
     ///
-    /// This is the ONE emission site for the wire schema:
-    /// `{"decision": {"behavior": "allow"|"deny", "updatedInput"?,
-    /// "updatedPermissions"?, "message"?}}`.
+    /// This is the ONE emission site for the wire schema. The documented
+    /// `PermissionRequest` envelope (bug 123 — hooks docs, fetched 2026-07-17)
+    /// nests the decision under `hookSpecificOutput`:
+    /// `{"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+    /// "decision": {"behavior": "allow"|"deny", "updatedInput"?,
+    /// "updatedPermissions"?, "message"?}}}`.
+    ///
+    /// TRANSITIONAL DUAL-SHAPE (bug 123): the same `decision` object is ALSO
+    /// emitted at the top level, alongside `hookSpecificOutput`. The host is
+    /// effectively-nightly and the schema paste that drove the original
+    /// implementation showed the fields without an envelope; hosts tolerate
+    /// unknown fields, both shapes carry the identical decision so no conflict is
+    /// possible, and the worst case of an unparsed response is the pre-fix status
+    /// quo (the dialog). The top-level copy is removable after attended live
+    /// verification.
     ///
     /// The `updatedInput` object pins the resolved realpath under `input_path_key`
     /// (the tool's file-path field name — `file_path` for Read, `path` for the
@@ -286,25 +299,23 @@ impl Decision {
     /// single `addDirectories` rule whose destination is **`session`** — the
     /// engraved rule (misc 201): the desk NEVER writes persistent client state, so
     /// `localSettings`/`projectSettings`/`userSettings` destinations never appear.
+    /// `updatedPermissions` and `message` ride inside the `decision` object in
+    /// BOTH copies.
     #[must_use]
     pub fn to_hook_json(&self, input_path_key: &str) -> Option<serde_json::Value> {
-        match self {
-            Self::NoDecision => None,
-            Self::Deny { message } => Some(serde_json::json!({
-                "decision": {
-                    "behavior": "deny",
-                    "message": message,
-                }
-            })),
+        let decision = match self {
+            Self::NoDecision => return None,
+            Self::Deny { message } => serde_json::json!({
+                "behavior": "deny",
+                "message": message,
+            }),
             Self::QuietAllow { realpath } | Self::LoudAllow { realpath } => {
-                Some(serde_json::json!({
-                    "decision": {
-                        "behavior": "allow",
-                        "updatedInput": {
-                            input_path_key: realpath.to_string_lossy(),
-                        },
-                    }
-                }))
+                serde_json::json!({
+                    "behavior": "allow",
+                    "updatedInput": {
+                        input_path_key: realpath.to_string_lossy(),
+                    },
+                })
             }
             Self::AlwaysReadAllow {
                 realpath,
@@ -326,9 +337,17 @@ impl Decision {
                         }
                     ]);
                 }
-                Some(serde_json::json!({ "decision": decision }))
+                decision
             }
-        }
+        };
+        Some(serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": decision,
+            },
+            // Transitional top-level copy — see the doc comment above.
+            "decision": decision,
+        }))
     }
 }
 
@@ -802,6 +821,13 @@ mod tests {
     }
 
     // ── Decision JSON emission ───────────────────────────────────────────
+    //
+    // The wire shape is TRANSITIONALLY dual (bug 123): the documented
+    // `hookSpecificOutput` envelope plus an identical top-level `decision`
+    // copy. The `json["decision"]` assertions below pin the transitional
+    // top-level copy; the `envelope_*` tests pin the documented envelope.
+    // When the top-level copy retires (after attended live verification),
+    // the top-level pins go with it.
 
     #[test]
     fn deny_json_carries_behavior_and_message() {
@@ -830,6 +856,74 @@ mod tests {
     #[test]
     fn no_decision_emits_nothing() {
         assert!(Decision::NoDecision.to_hook_json("file_path").is_none());
+    }
+
+    // ── The documented PermissionRequest envelope (bug 123) ─────────────
+
+    #[test]
+    fn envelope_allow_pins_documented_shape_verbatim() {
+        let d = Decision::QuietAllow {
+            realpath: PathBuf::from("/work/repo/src/main.rs"),
+        };
+        let json = d.to_hook_json("file_path").expect("allow emits json");
+        assert_eq!(
+            json["hookSpecificOutput"]["hookEventName"],
+            "PermissionRequest"
+        );
+        assert_eq!(json["hookSpecificOutput"]["decision"]["behavior"], "allow");
+        // The documented envelope, verbatim.
+        assert_eq!(
+            json["hookSpecificOutput"],
+            serde_json::json!({
+                "hookEventName": "PermissionRequest",
+                "decision": {
+                    "behavior": "allow",
+                    "updatedInput": { "file_path": "/work/repo/src/main.rs" },
+                }
+            })
+        );
+        // Both copies carry the identical decision.
+        assert_eq!(json["hookSpecificOutput"]["decision"], json["decision"]);
+    }
+
+    #[test]
+    fn envelope_deny_pins_documented_shape() {
+        let d = Decision::Deny {
+            message: SENSITIVE_DENY_MESSAGE.to_string(),
+        };
+        let json = d.to_hook_json("file_path").expect("deny emits json");
+        assert_eq!(
+            json["hookSpecificOutput"]["hookEventName"],
+            "PermissionRequest"
+        );
+        assert_eq!(json["hookSpecificOutput"]["decision"]["behavior"], "deny");
+        assert_eq!(
+            json["hookSpecificOutput"]["decision"]["message"],
+            SENSITIVE_DENY_MESSAGE
+        );
+        // Both copies carry the identical decision.
+        assert_eq!(json["hookSpecificOutput"]["decision"], json["decision"]);
+    }
+
+    #[test]
+    fn envelope_promotion_pins_updated_permissions_in_both_copies() {
+        let d = Decision::AlwaysReadAllow {
+            realpath: PathBuf::from("/docs/guide.md"),
+            prefix: PathBuf::from("/docs"),
+            promote: true,
+        };
+        let json = d.to_hook_json("file_path").expect("allow emits json");
+        assert_eq!(
+            json["hookSpecificOutput"]["hookEventName"],
+            "PermissionRequest"
+        );
+        assert_eq!(json["hookSpecificOutput"]["decision"]["behavior"], "allow");
+        // `updatedPermissions` rides INSIDE the decision object, in both copies.
+        let nested_perms = &json["hookSpecificOutput"]["decision"]["updatedPermissions"];
+        assert_eq!(nested_perms[0]["type"], "addDirectories");
+        assert_eq!(nested_perms[0]["destination"], "session");
+        assert_eq!(nested_perms[0]["directories"][0], "/docs");
+        assert_eq!(json["hookSpecificOutput"]["decision"], json["decision"]);
     }
 
     #[test]
