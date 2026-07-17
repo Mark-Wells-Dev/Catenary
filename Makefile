@@ -318,8 +318,9 @@ registry-selftest:
 # ── isolated server harness (tickets 00b / 00c) ───────────────────────
 # A hermetic "build and see" harness for eyeballing enriched `catenary
 # grep`/`glob` output against a language server under a PRIVATE daemon. Each
-# fixture binds the run to its OWN XDG bases under target/ (its own daemon +
-# socket, so it never touches the user's live daemon), points CATENARY_SERVERS
+# fixture binds the run to its OWN XDG bases under target/ plus a short
+# per-fixture socket dir (its own daemon + socket, so it never touches the
+# user's live daemon — see the socket-base note below), points CATENARY_SERVERS
 # at the one server it exercises, and CATENARY_ROOTS at its fixture dir. NONE of
 # these targets are part of `make check`/`make test` — manual inspection only,
 # so the default build never depends on Lattice or rust-analyzer.
@@ -339,21 +340,37 @@ registry-selftest:
 # index, so the first run can take a while), then tears the daemon down on exit
 # via the trap. Unlike the test harness's `isolate_env`, PATH/HOME are inherited,
 # so `lattice` / `rustup` resolve and rust-analyzer finds its toolchain.
+#
+# Socket base (misc 204): the sockets do NOT live under <home-dir>/state — a
+# deep invoking checkout (agent worktrees live ~100 bytes deep) pushes
+# <home>/state/catenary/catenary-mcp.sock past SUN_LEN (~108 bytes) and the
+# bind fails. Instead CATENARY_STATE_DIR points the isolated daemon (and the
+# query, so both resolve the same socket) at a short per-fixture dir,
+# $${XDG_RUNTIME_DIR:-/tmp}/cat-iso-<12-hex sha256 of <home-dir>>, using the
+# INVOKING user's runtime dir — never the fixture root's own deep prefix. The
+# hash keys the dir to the fixture home (which embeds $(CURDIR)), so parallel
+# fixtures and parallel worktrees never collide. Cleanup is best-effort: the
+# teardown trap removes the dir, a fresh run of the same fixture sweeps its
+# own stale leftovers first, and tmpfs/`/tmp` clearing backstops anything a
+# SIGKILL orphans. All other XDG bases stay under <home-dir> as before; only
+# the socket-bearing state dir moves. Production socket resolution is
+# untouched — this is fixture layout only.
 ISO_CAT := $(CURDIR)/target/debug/catenary
 define iso_run
 @cargo build --quiet --features mockls --bin catenary --bin mockls
 @mkdir -p $(1)/config $(1)/state $(1)/data $(1)/cache $(1)/runtime
-@sock=$(1)/state/catenary/catenary.sock; \
-	rm -f $$sock; \
-	$(2) $(ISO_CAT) daemon >$(1)/daemon.log 2>&1 & \
+@short=$${XDG_RUNTIME_DIR:-/tmp}/cat-iso-$$(printf '%s' '$(1)' | sha256sum | cut -c1-12); \
+	sock=$$short/catenary/catenary.sock; \
+	rm -rf $$short; mkdir -p $$short; \
+	$(2) CATENARY_STATE_DIR=$$short $(ISO_CAT) daemon >$(1)/daemon.log 2>&1 & \
 	dpid=$$!; \
-	trap 'kill $$dpid 2>/dev/null; wait $$dpid 2>/dev/null' EXIT INT TERM; \
+	trap 'kill $$dpid 2>/dev/null; wait $$dpid 2>/dev/null; rm -rf $$short' EXIT INT TERM; \
 	for i in $$(seq 1 150); do [ -S $$sock ] && break; sleep 0.1; done; \
 	if [ ! -S $$sock ]; then \
 		echo "iso_run: daemon failed to start (see $(1)/daemon.log):"; \
 		cat $(1)/daemon.log; exit 1; \
 	fi; \
-	$(2) $(ISO_CAT) $(3)
+	$(2) CATENARY_STATE_DIR=$$short $(ISO_CAT) $(3)
 endef
 
 # ── mock_edges (ticket 00b): mockls, offline, deterministic ───────────
