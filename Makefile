@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: bench bench-test build-release bump-guard check clippy conformance conformance-matrix deny flake-hunt fuzz install machete mdbook mockgrep mockglob mdgrep mdglob publish-backstop refresh-recipes registry-selftest rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc test test-ignored release release-patch release-minor release-major publish publish-check tag-current
+.PHONY: bench bench-test build-release bump-guard check clippy conformance conformance-matrix deny flake-hunt fuzz install machete mdbook mockgrep mockglob mdgrep mdglob publish-backstop refresh-recipes registry-selftest rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc sweep test test-ignored release release-patch release-minor release-major publish publish-check tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -32,7 +32,7 @@ bench-test:
 build-release:
 	@cargo build --release
 
-check:
+check: sweep
 	@PINNED=$$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml); \
 	 LATEST=$$(rustup run stable rustc --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1); \
 	 if [ -n "$$LATEST" ] && [ "$$PINNED" != "$$LATEST" ]; then \
@@ -464,10 +464,25 @@ rustglob:
 # the NEW build and replay their sessions on their own — the bounce is safe
 # to automate. `--force` skips the TTY confirmation (the bounce is the
 # point here); no daemon running is a clean no-op.
-install:
+install: sweep
 	@cargo install --path . --locked
 	@catenary version
 	@catenary stop --force
+
+# Continuous target-dir garbage collection. Cargo never deletes artifacts, and
+# on a nightly-rebuild machine every toolchain bump orphans the previous
+# vintage wholesale (observed: 500 GB of dead incremental/deps). `cargo sweep
+# --installed` deletes every artifact not produced by a currently-installed
+# toolchain — a no-op scan (seconds) when nothing is stale, a bulk reclaim the
+# morning after a toolchain bump. Riding `check` and `install` makes the GC
+# continuous; absent cargo-sweep it skips with a hint (CI runners and fresh
+# machines never break on it). One-time setup: cargo install cargo-sweep.
+sweep:
+	@if command -v cargo-sweep >/dev/null 2>&1; then \
+	   cargo sweep --installed | tail -1; \
+	 else \
+	   echo "sweep: cargo-sweep not installed — skipping stale-artifact GC (cargo install cargo-sweep)"; \
+	 fi
 
 # Verify we're in a good state for release
 pre-release-check:
