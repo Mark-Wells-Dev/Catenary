@@ -204,3 +204,11 @@ lto = true
 codegen-units = 1
 opt-level = 3
 strip = "symbols"
+
+# No debugger runs in this workflow — panic backtraces (file:line) are the
+# only debuginfo consumer, and line tables carry them at a fraction of full
+# debuginfo's size (full variable/type info fed ~100 GB of target/ bloat and
+# slowed every link for a debugger that never attaches). One-off override
+# when stepping is ever needed: CARGO_PROFILE_DEV_DEBUG=full make test.
+[profile.dev]
+debug = "line-tables-only"
