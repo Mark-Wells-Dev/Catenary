@@ -8,10 +8,11 @@
 //! annotator** on a streamed hit protocol. Every dependency failure degrades to
 //! "less enrichment," never "no results."
 //!
-//! This module coexists with the current `catenary grep`/`glob` query path
-//! (`router::METHOD_GREP` / `METHOD_GLOB`); the user-visible `catenary grep`
-//! CLI has not cut over yet (the ws43-02 cutover seam — see the module notes on
-//! [`engine`] and [`frame`]). What lives here is the load-bearing structure:
+//! Since the ws43-02 cutover this IS `catenary grep`: the CLI walks through
+//! [`engine`], streams through the sinks below, and the daemon's only grep
+//! surface is the `tool/hitstream` annotation arm (the `tool/grep` executor
+//! retired). Glob still rides the legacy query path (`router::METHOD_GLOB`)
+//! until its own cutover (ws43-03). The load-bearing structure:
 //!
 //! 1. The wire protocol — [`HitFrame`] (CLI → daemon) and [`AnnotationFrame`]
 //!    (daemon → CLI), an internally-tagged frame stream on the existing socket,
@@ -61,9 +62,9 @@ pub mod frame;
 pub mod sink;
 
 pub use annotator::{BatchEnricher, PassThroughEnricher, annotate_connection, serve_passthrough};
-pub use engine::{Hit, HitBatch, WalkOptions, walk};
+pub use engine::{Hit, HitBatch, WalkOptions, WalkSummary, walk};
 pub use frame::{AnnotatedBatch, AnnotatedHit, AnnotationFrame, AnnotationVerdict, HitFrame};
-pub use sink::{ResultSink, daemon_stream, stdout_unannotated};
+pub use sink::{DaemonStreamReport, GrepRender, ResultSink, daemon_stream, stdout_unannotated};
 
 /// The IPC method string the CLI sends as the hit-stream handshake's first line.
 ///
@@ -91,6 +92,19 @@ pub const HIT_BATCH_SIZE: usize = 64;
 /// reassembles annotation-batches into batch-sequence order before emission, so a
 /// slow batch delays but never reorders (the ordered-emission invariant).
 pub const IN_FLIGHT_WINDOW: usize = 4;
+
+/// The CLI-side per-read deadline on the annotation stream (ws43-02).
+///
+/// An accepts-then-silent daemon — the connection opened, batches were taken,
+/// no annotation ever comes back — is otherwise indistinguishable from a slow
+/// one. The deadline is a generous wall-clock bound on the gap between
+/// annotation frames, comfortably above [`ANNOTATION_BATCH_BUDGET`] (the
+/// daemon's own per-batch ceiling, which it answers within even when
+/// enrichment blows), and it is armed **only while an annotation is
+/// outstanding** — a long quiet stretch of the walk with nothing owed never
+/// trips it. Expiry is degrade-only: the stream completes unannotated in
+/// place, never fewer results.
+pub const STREAM_READ_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Canonicalizes a path at the walk ingestion seam (the hit-batch carries
 /// canonical paths).

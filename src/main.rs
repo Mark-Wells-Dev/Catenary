@@ -1372,9 +1372,9 @@ fn compress_home(path: &Path) -> String {
 
 /// Whether a search's scope was anchored at the invoking cwd: no path
 /// arguments at all (a cwd-scoped search — pathless grep binds to the cwd,
-/// bug 31), or at least one relative path/pattern argument, which the request
-/// builder (`GrepRequest::to_params`) joins to the cwd before the daemon
-/// expands it.
+/// bug 31), or at least one relative path/pattern argument, which is joined
+/// to the cwd before expansion (grep's CLI-side `run_grep`; glob's
+/// `GlobRequest::to_params`).
 ///
 /// Missing-path arguments count as "had arguments": a search whose only
 /// arguments were missing plain paths never queried, so its body is empty and
@@ -2190,25 +2190,45 @@ fn confirm_stop(out: &mut cli::Output) -> Result<bool> {
     Ok(answer == "y" || answer == "yes")
 }
 
-/// Runs a grep query against the running daemon, or a plain ripgrep pass over
-/// stdin when the stream is piped.
+/// Runs a grep query on the streamed hitstream engine (ws43-02: the CLI owns
+/// the walk), or a plain ripgrep pass over stdin when the stream is piped.
 ///
 /// When no path arguments are given and stdin is a readable stream (a pipe,
 /// socket, or redirected file — ripgrep's `is_readable_stdin` rule), this is
 /// stdin mode: a plain ripgrep pass over the stream, carrying the same flags but
 /// with no enrichment (a stream has no file/LSP context) and no daemon
-/// round-trip. Otherwise it connects to the daemon's IPC socket, sends a
-/// [`GrepRequest`], and prints the rendered output to stdout. A tty or
-/// `/dev/null` stdin is NOT readable, so a bare `catenary grep PAT` still
-/// searches the cwd.
+/// round-trip. A tty or `/dev/null` stdin is NOT readable, so a bare
+/// `catenary grep PAT` still searches the cwd.
+///
+/// Otherwise the CLI walks and matches itself (the [`hitstream engine`]), and
+/// the daemon — when one is up — serves only bounded enrichment over the
+/// streamed hit-batch protocol (`tool/hitstream`). Sink selection is the
+/// degrade matrix: daemon reachable → [`daemon_stream`]
+/// (annotated, ordered, complete); daemon absent → [`stdout_unannotated`] plus
+/// the honesty marker on stderr. Every dependency failure — no daemon, old
+/// daemon, wedged daemon, blown budget — yields the identical complete result
+/// stream with less annotation, never fewer results (decision 025: budgets
+/// bound enrichment only; there is no enrichment-off flag). `--count` and `-l`
+/// are CLI-side projections over the same walk — no daemon round-trip, no
+/// enrichment, exactly as the retired executor computed them.
+///
+/// [`hitstream engine`]: catenary_cli::hitstream::engine
+/// [`daemon_stream`]: catenary_cli::hitstream::daemon_stream
+/// [`stdout_unannotated`]: catenary_cli::hitstream::stdout_unannotated
 ///
 /// # Errors
 ///
-/// Returns an error if no daemon is running or the query fails.
+/// Returns an error if the working directory is unreadable, the daemon-less
+/// config load fails, or the stream faults in a way that is not a degrade
+/// (a result-sink write failure that is not a closed pipe).
 #[cfg(unix)]
 #[allow(
     clippy::too_many_arguments,
     reason = "1:1 with the clap-parsed grep flags"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the one linear cutover path: validate, expand, project or stream, teach"
 )]
 async fn run_grep(
     out: &mut cli::Output,
@@ -2220,7 +2240,9 @@ async fn run_grep(
     include_hidden: bool,
     flags: catenary_cli::bridge::GrepFlags,
 ) -> Result<()> {
-    use catenary_cli::router::{GrepRequest, METHOD_GREP};
+    use catenary_cli::bridge::session::{ExcludeSet, ResolvedGlob, expand_search_paths};
+    use catenary_cli::hitstream::engine::{WalkOptions, validate_inputs};
+    use catenary_cli::hitstream::{GrepRender, daemon_stream, sink, stdout_unannotated};
 
     // stdin mode: no paths + a readable piped/redirected stream. A plain
     // ripgrep pass over the stream, same flags, no enrichment, no daemon.
@@ -2241,9 +2263,15 @@ async fn run_grep(
     }
 
     let cwd = std::env::current_dir().context("cannot determine working directory")?;
+    // The canonical cwd is the display/observation seam: hit paths come off the
+    // walk canonical, so the cwd they are relativized against (and the reap
+    // scope a pathless walk reports) must be canonical too — the same
+    // ingestion-seam canonicalization the daemon executor performed on the
+    // request cwd.
+    let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
 
     let resolved = resolve_search_paths(&paths, &cwd);
-    // No path arguments means a cwd-scoped search; otherwise query only when
+    // No path arguments means a cwd-scoped search; otherwise search only when
     // at least one argument resolved to a path or pattern.
     let queried = paths.is_empty() || !resolved.forward.is_empty();
     let kind = SearchKind::Grep {
@@ -2251,67 +2279,363 @@ async fn run_grep(
         bre_alternation: pattern.contains("\\|"),
     };
 
-    let response = if queried {
-        let request = GrepRequest {
-            cwd: Some(cwd.clone()),
-            pattern,
-            paths: resolved.forward.clone(),
-            exclude,
-            count,
-            include_gitignored,
-            include_hidden,
-            // Opt into chunked framing (misc 140 phase 2). A daemon that predates
-            // it ignores the field and replies with the single envelope, which
-            // `search_ipc` still parses.
-            chunked: true,
-            flags,
-        };
-        // Daemon-served when up; in-process (honestly labeled) when down.
-        if let Some(stream) = connect_daemon_ipc().await {
-            search_ipc_on(stream, METHOD_GREP, &request).await?
-        } else {
-            let outcome = catenary_cli::router::run_grep_daemon_less(&request).await?;
-            emit_no_daemon_marker();
-            emit_quarantine_marker(outcome.quarantine_warning.as_deref());
-            SearchResponse::from(outcome.response)
+    // A usage error (uncompilable pattern, bug 105; invalid --type/--glob;
+    // invalid --exclude-pattern) is stderr + exit 2 on both the bare and
+    // `--count` forms — never a zero indistinguishable from a genuine no-match.
+    // Validated before any stream opens, so a started walk cannot fail on user
+    // input.
+    let exclude_resolved: Vec<String> = exclude
+        .iter()
+        .map(|pattern| resolve_exclude_pattern(pattern, &cwd))
+        .collect();
+    let exclude_set = match validate_inputs(&pattern, &flags)
+        .and_then(|()| ExcludeSet::compile(&exclude_resolved))
+    {
+        Ok(set) => set,
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::exit(2);
         }
-    } else {
-        SearchResponse::default()
     };
 
-    // A usage error (uncompilable pattern, bug 105) is stderr + exit 2 on both
-    // the bare and `--count` forms — never a zero indistinguishable from a
-    // genuine no-match, never a swallowed parse error the exit code hides.
-    if let Some(msg) = &response.error {
-        eprintln!("{msg}");
-        std::process::exit(2);
+    // Path expansion is CLI-side since ws43-02 (the request-builder legs the
+    // daemon used to run): absolutize each forwarded argument against the cwd,
+    // auto-enable hidden for a relative argument that names a dotted target,
+    // then expand patterns through the shared gitignore-aware walker.
+    let mut include_hidden = include_hidden;
+    for arg in &resolved.forward {
+        if !arg.is_absolute() && ResolvedGlob::targets_hidden(&arg.to_string_lossy()) {
+            include_hidden = true;
+        }
+    }
+    let abs_forward: Vec<PathBuf> = resolved
+        .forward
+        .iter()
+        .map(|p| {
+            if p.is_absolute() {
+                p.clone()
+            } else {
+                cwd.join(p)
+            }
+        })
+        .collect();
+    let search_roots: Vec<PathBuf> = if paths.is_empty() {
+        vec![canonical_cwd.clone()]
+    } else {
+        // Canonicalized per root: the walk emits canonical hit paths, so the
+        // roots it strips/observes under must be canonical too.
+        expand_search_paths(&abs_forward, include_gitignored, include_hidden)
+            .into_iter()
+            .map(|p| p.canonicalize().unwrap_or(p))
+            .collect()
+    };
+
+    // One connect attempt decides daemon-served vs daemon-less for this run —
+    // and carries the honesty markers (bug 80 leg 4 / bug 110), exactly as the
+    // retired IPC path emitted them: only when a search actually runs, before
+    // any result byte.
+    let connection = if queried {
+        let socket = catenary_cli::router::socket_path();
+        let connected = sink::connect_daemon(&socket).await.ok();
+        if connected.is_none() {
+            emit_no_daemon_marker();
+            let config =
+                catenary_cli::config::Config::load().context("load config for daemon-less grep")?;
+            emit_quarantine_marker(config.quarantined.summary().as_deref());
+        }
+        connected
+    } else {
+        None
+    };
+
+    let fs_manager =
+        std::sync::Arc::new(catenary_cli::bridge::filesystem_manager::FilesystemManager::new());
+    let options = WalkOptions {
+        flags: flags.clone(),
+        include_gitignored,
+        include_hidden,
+        exclude: std::sync::Arc::new(exclude_set),
+        fs_manager: Some(std::sync::Arc::clone(&fs_manager)),
+    };
+    let render = GrepRender::new(Some(canonical_cwd.clone()));
+    let mut err = cli::Output::stderr(false);
+
+    // ── `--count`: a CLI-side projection over the walk (context cleared, every
+    // hit is a match line), no daemon, no enrichment — the retired executor's
+    // dumb `grep -c` tally, computed where the walk now lives. Count takes
+    // precedence over `-l` (the more specific tally wins). The connection, if
+    // any, drops unused: a clean teardown the daemon reads as EOF.
+    if count {
+        drop(connection);
+        let (matches, files, skipped) = if queried && !search_roots.is_empty() {
+            grep_count_projection(
+                &pattern,
+                &search_roots,
+                &options,
+                &fs_manager,
+                &canonical_cwd,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("{e:#}");
+                std::process::exit(2);
+            })
+        } else {
+            (0, 0, catenary_cli::bridge::GrepSkips::default())
+        };
+        render_grep_count(out, matches, files, &skipped);
+        return Ok(());
     }
 
-    let mut err = cli::Output::stderr(false);
-    if count {
-        render_grep_count(
-            out,
-            response.matches.unwrap_or(0),
-            response.files.unwrap_or(0),
-            &response.skipped,
-        );
-    } else {
-        render_search_outcome(
-            out,
-            &mut err,
-            &cwd,
-            &resolved,
-            &response.output,
-            queried,
-            &kind,
-        );
-        // Skip lines follow the results/echo (and any missing-path lines), so a
-        // named path skipped instead of searched never silently vanishes (misc
-        // 135, bug 62). Nothing prints when nothing was skipped. Skips are
-        // teaching about the scope, so they ride stderr with the rest.
-        render_grep_skips(&mut err, &response.skipped);
+    // ── `-l`/`--files-with-matches`: the distinct matching files as display
+    // paths, one per line, sorted — a projection like `--count` (ripgrep drops
+    // context with `-l`), rendered through the same anchor/teaching shape as
+    // the bare form.
+    if flags.files_with_matches {
+        drop(connection);
+        let (lines, skipped) = if queried && !search_roots.is_empty() {
+            grep_files_projection(
+                &pattern,
+                &search_roots,
+                &options,
+                &fs_manager,
+                &render,
+                &canonical_cwd,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("{e:#}");
+                std::process::exit(2);
+            })
+        } else {
+            (Vec::new(), catenary_cli::bridge::GrepSkips::default())
+        };
+        if lines.is_empty() {
+            render_search_outcome(out, &mut err, &cwd, &resolved, "", queried, &kind);
+        } else {
+            let mut body = if cwd_anchored(&resolved) {
+                format!("cwd: {}\n", compress_home(&cwd))
+            } else {
+                String::new()
+            };
+            body.push_str(&lines.join("\n"));
+            let _ = out.write_block(&body);
+            for path in &resolved.missing {
+                let _ = err.writeln(format_args!("path does not exist: {path}"));
+            }
+        }
+        render_grep_skips(&mut err, &skipped);
+        return Ok(());
     }
+
+    // ── The bare form: stream the walk. Results ride stdout behind the lazy
+    // cwd anchor (misc 172 — written before the first result line, so an empty
+    // result keeps stdout empty and the anchor joins the stderr teaching
+    // instead); advisories and teaching ride stderr after the stream completes.
+    let anchor = (cwd_anchored(&resolved)).then(|| format!("cwd: {}\n", compress_home(&cwd)));
+    let mut anchored_out = AnchorFirstWriter::new(std::io::stdout(), anchor);
+    let stream_result = if queried && !search_roots.is_empty() {
+        let mut result_sink = catenary_cli::hitstream::ResultSink::new(&mut anchored_out);
+        let reap_scopes = paths.is_empty().then(|| vec![canonical_cwd.clone()]);
+        match connection {
+            Some((daemon_reader, daemon_writer)) => daemon_stream(
+                &pattern,
+                &search_roots,
+                &options,
+                reap_scopes,
+                daemon_reader,
+                daemon_writer,
+                &render,
+                &mut result_sink,
+            )
+            .await
+            .map(|report| {
+                if report.degraded {
+                    // The mid-stream degrade advisory: results are complete,
+                    // enrichment is not — never silent (stderr only, so stdout
+                    // stays byte-identical to the degrade matrix's other arms).
+                    eprintln!(
+                        "[annotation stream degraded \u{2014} results complete, unenriched; \
+                         run: catenary doctor]"
+                    );
+                }
+                report.summary
+            }),
+            None => {
+                stdout_unannotated(&pattern, &search_roots, &options, &render, &mut result_sink)
+            }
+        }
+    } else {
+        drop(connection);
+        Ok(catenary_cli::hitstream::WalkSummary::default())
+    };
+    let summary = match stream_result {
+        Ok(summary) => summary,
+        // A closed consumer (`| head`) ends the stream early — the pipe
+        // contract, not an error (matching the old single-write path, whose
+        // EPIPE was ignored).
+        Err(e) if is_broken_pipe(&e) => return Ok(()),
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::exit(2);
+        }
+    };
+
+    if anchored_out.wrote_any() {
+        // Results streamed: only the missing-path teaching remains from the
+        // non-empty arm of the outcome renderer.
+        for path in &resolved.missing {
+            let _ = err.writeln(format_args!("path does not exist: {path}"));
+        }
+    } else {
+        // Zero-match shape: stdout stayed empty; the cwd anchor and the
+        // zero-match teaching ride stderr.
+        render_search_outcome(out, &mut err, &cwd, &resolved, "", queried, &kind);
+    }
+    // Skip lines follow the results/echo (and any missing-path lines), so a
+    // named path skipped instead of searched never silently vanishes (misc
+    // 135, bug 62). Nothing prints when nothing was skipped.
+    let skipped = catenary_cli::bridge::GrepSkips::from_records(
+        &summary.skips,
+        &fs_manager,
+        Some(&canonical_cwd),
+    );
+    render_grep_skips(&mut err, &skipped);
     Ok(())
+}
+
+/// Resolves one `--exclude-pattern` argument against the invoking cwd — the
+/// request-builder leg the CLI owns since ws43-02 (tilde-expanded; absolute
+/// patterns pass through; relative patterns join the cwd).
+#[cfg(unix)]
+fn resolve_exclude_pattern(pattern: &str, cwd: &Path) -> String {
+    let expanded = catenary_cli::bridge::expand_tilde(pattern);
+    if Path::new(&expanded).is_absolute() {
+        return expanded;
+    }
+    cwd.join(&expanded).to_string_lossy().into_owned()
+}
+
+/// The `--count` projection over the streamed walk: matching lines (a line
+/// with several matches counts once — the walk emits one hit per selected
+/// line) and the distinct files holding them, with context cleared so a count
+/// never inflates from context lines and `-l` dropped (count wins when both
+/// are given).
+///
+/// # Errors
+///
+/// Returns an error if the walk fails.
+#[cfg(unix)]
+fn grep_count_projection(
+    pattern: &str,
+    roots: &[PathBuf],
+    options: &catenary_cli::hitstream::WalkOptions,
+    fs_manager: &catenary_cli::bridge::filesystem_manager::FilesystemManager,
+    cwd: &Path,
+) -> Result<(usize, usize, catenary_cli::bridge::GrepSkips)> {
+    let mut options = options.clone();
+    options.flags.before_context = 0;
+    options.flags.after_context = 0;
+    options.flags.files_with_matches = false;
+    let mut matches = 0usize;
+    let mut files: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let summary = catenary_cli::hitstream::walk(pattern, roots, &options, |batch| {
+        matches += batch.hits.len();
+        for hit in &batch.hits {
+            files.insert(hit.path.clone());
+        }
+        Ok(())
+    })?;
+    let skipped =
+        catenary_cli::bridge::GrepSkips::from_records(&summary.skips, fs_manager, Some(cwd));
+    Ok((matches, files.len(), skipped))
+}
+
+/// The `-l`/`--files-with-matches` projection: the distinct matching files as
+/// sorted display paths (context cleared — it never changes the file set).
+///
+/// # Errors
+///
+/// Returns an error if the walk fails.
+#[cfg(unix)]
+fn grep_files_projection(
+    pattern: &str,
+    roots: &[PathBuf],
+    options: &catenary_cli::hitstream::WalkOptions,
+    fs_manager: &catenary_cli::bridge::filesystem_manager::FilesystemManager,
+    render: &catenary_cli::hitstream::GrepRender,
+    cwd: &Path,
+) -> Result<(Vec<String>, catenary_cli::bridge::GrepSkips)> {
+    let mut options = options.clone();
+    options.flags.before_context = 0;
+    options.flags.after_context = 0;
+    options.flags.files_with_matches = false;
+    let mut files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let summary = catenary_cli::hitstream::walk(pattern, roots, &options, |batch| {
+        for hit in &batch.hits {
+            files.insert(render.display(&hit.path));
+        }
+        Ok(())
+    })?;
+    let skipped =
+        catenary_cli::bridge::GrepSkips::from_records(&summary.skips, fs_manager, Some(cwd));
+    Ok((files.into_iter().collect(), skipped))
+}
+
+/// Whether an error chain bottoms out in a closed pipe — the `| head` case,
+/// where the consumer finished early and the stream's end is the contract, not
+/// a failure.
+#[cfg(unix)]
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
+}
+
+/// A stdout wrapper that writes a prepared anchor line before the first result
+/// byte — the streaming spelling of the misc-172 scope disclosure: the anchor
+/// prints only when results actually follow, and it lands on stdout ahead of
+/// them (an explicit `2>/dev/null` cannot drop the scope), while an empty
+/// stream leaves stdout untouched so the zero-match shape holds.
+#[cfg(unix)]
+struct AnchorFirstWriter<W: std::io::Write> {
+    inner: W,
+    anchor: Option<String>,
+    wrote: bool,
+}
+
+#[cfg(unix)]
+impl<W: std::io::Write> AnchorFirstWriter<W> {
+    /// Wraps `inner`; `anchor` (when `Some`) is written once, immediately
+    /// before the first result byte.
+    const fn new(inner: W, anchor: Option<String>) -> Self {
+        Self {
+            inner,
+            anchor,
+            wrote: false,
+        }
+    }
+
+    /// True when at least one result byte was written (the anchor included).
+    const fn wrote_any(&self) -> bool {
+        self.wrote
+    }
+}
+
+#[cfg(unix)]
+impl<W: std::io::Write> std::io::Write for AnchorFirstWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(anchor) = self.anchor.take() {
+            self.inner.write_all(anchor.as_bytes())?;
+        }
+        self.wrote = true;
+        self.inner.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Returns `true` when stdin is a readable stream — a pipe (FIFO), a socket, or
@@ -2398,24 +2722,20 @@ fn run_grep_stdin(
     Ok(())
 }
 
-/// Parsed daemon response for `catenary grep`/`glob` over IPC.
+/// Parsed daemon response for `catenary glob` over IPC.
 ///
 /// A normal query carries rendered `output`; a `--count` query carries the
-/// totals instead (`matches`/`files` for grep, `paths` for glob) with an
-/// empty `output`. Fields absent from the wire default to empty/`None`, so an
-/// empty response line deserializes to [`SearchResponse::default`].
+/// `paths` total with an empty `output`. Fields absent from the wire default
+/// to empty/`None`, so an empty response line deserializes to
+/// [`SearchResponse::default`]. Grep no longer answers over this envelope —
+/// it streams on the hitstream engine (ws43-02); this stays for glob until
+/// glob's own cutover (ws43-03).
 #[cfg(unix)]
 #[derive(Default, serde::Deserialize)]
 struct SearchResponse {
     /// Rendered tree output (empty for a count response).
     #[serde(default)]
     output: String,
-    /// grep `--count`: matching-line total.
-    #[serde(default)]
-    matches: Option<usize>,
-    /// grep `--count`: distinct-file total.
-    #[serde(default)]
-    files: Option<usize>,
     /// glob `--count`: resolved-path total.
     #[serde(default)]
     paths: Option<usize>,
@@ -2431,35 +2751,11 @@ struct SearchResponse {
     /// moment 3 escaped-spelling note on stderr.
     #[serde(default)]
     metachar_names: Vec<String>,
-    /// grep: files in the search scope skipped instead of searched (misc 135,
-    /// bug 62). Empty for a normal all-searched query.
-    #[serde(default)]
-    skipped: catenary_cli::bridge::GrepSkips,
-    /// A usage error (uncompilable pattern, bug 105) that aborted the search.
+    /// A usage error (invalid pattern/argument) that aborted the search.
     /// `Some` routes the CLI to stderr + exit 2 on both the bare and `--count`
     /// forms; `None` for every successful query.
     #[serde(default)]
     error: Option<String>,
-}
-
-/// Adapts a daemon-less [`GrepResponse`](catenary_cli::router::GrepResponse) into
-/// the CLI's [`SearchResponse`] so the daemon-served and in-process paths render
-/// through the identical code (bug 80, leg 4).
-#[cfg(unix)]
-impl From<catenary_cli::router::GrepResponse> for SearchResponse {
-    fn from(r: catenary_cli::router::GrepResponse) -> Self {
-        Self {
-            output: r.output,
-            matches: r.matches,
-            files: r.files,
-            paths: None,
-            no_match_patterns: Vec::new(),
-            dir_hints: Vec::new(),
-            metachar_names: Vec::new(),
-            skipped: r.skipped,
-            error: r.error,
-        }
-    }
 }
 
 /// Adapts a daemon-less [`GlobResponse`](catenary_cli::router::GlobResponse) into
@@ -2469,13 +2765,10 @@ impl From<catenary_cli::router::GlobResponse> for SearchResponse {
     fn from(r: catenary_cli::router::GlobResponse) -> Self {
         Self {
             output: r.output,
-            matches: None,
-            files: None,
             paths: r.paths,
             no_match_patterns: r.no_match_patterns,
             dir_hints: r.dir_hints,
             metachar_names: r.metachar_names,
-            skipped: catenary_cli::bridge::GrepSkips::default(),
             error: r.error,
         }
     }
@@ -2557,11 +2850,11 @@ fn emit_quarantine_marker(warning: Option<&str>) {
 /// Sends a search request over an already-connected daemon IPC `stream` and
 /// returns the parsed [`SearchResponse`].
 ///
-/// Serializes `request` with `method` injected, reads the response, and
-/// reassembles a chunked [`GrepFrame`] stream (misc 140 phase 2) or parses a
-/// legacy single envelope. Split from [`search_ipc`] so the daemon-down branch
-/// can decide *before* connecting whether to fall back to the in-process
-/// pipeline (bug 80, leg 4).
+/// Serializes `request` with `method` injected, reads the response, and parses
+/// the single envelope. Glob's transport until its own streamed cutover
+/// (ws43-03) — grep left this envelope for the hitstream engine in ws43-02.
+/// Split from the connect step so the daemon-down branch can decide *before*
+/// connecting whether to fall back to the in-process pipeline (bug 80, leg 4).
 ///
 /// # Errors
 ///
@@ -2596,87 +2889,7 @@ async fn search_ipc_on<R: serde::Serialize + Sync>(
     if trimmed.is_empty() {
         return Ok(SearchResponse::default());
     }
-    let first: serde_json::Value =
-        serde_json::from_str(trimmed).context("invalid search response from daemon")?;
-
-    // Version-skew hinge: a framed response tags every line with `"frame"`; a
-    // legacy single envelope never does. The absent tag routes to the
-    // single-envelope parse, so a pre-framing daemon (and every glob response)
-    // still deserializes.
-    if first.get("frame").is_some() {
-        return read_grep_frames(first, &mut buf_reader).await;
-    }
-    serde_json::from_value(first).context("invalid search response from daemon")
-}
-
-/// Reassembles a chunked grep response ([`GrepFrame`] stream) into a
-/// [`SearchResponse`] (misc 140 phase 2).
-///
-/// `first` is the already-parsed first frame; subsequent frames are read from
-/// `reader`. Chunk payloads concatenate into the rendered output — trimmed of
-/// its trailing newline to reproduce the pre-framing render byte-for-byte — and
-/// the terminator supplies the count/skip tallies. An unrecognized frame tag (a
-/// future daemon speaking a newer protocol) fails with a comprehensible error
-/// rather than a silent misparse.
-///
-/// # Errors
-///
-/// Returns an error on a transport failure, a malformed/unrecognized frame, or a
-/// stream that ends before its terminator.
-#[cfg(unix)]
-async fn read_grep_frames<R>(
-    first: serde_json::Value,
-    reader: &mut tokio::io::BufReader<R>,
-) -> Result<SearchResponse>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use catenary_cli::router::GrepFrame;
-    use tokio::io::AsyncBufReadExt;
-
-    let mut response = SearchResponse::default();
-    let mut output = String::new();
-    let mut pending = Some(first);
-
-    loop {
-        let value = if let Some(v) = pending.take() {
-            v
-        } else {
-            let mut line = String::new();
-            let n = reader.read_line(&mut line).await?;
-            if n == 0 {
-                anyhow::bail!("grep response ended before its terminator frame");
-            }
-            let t = line.trim();
-            if t.is_empty() {
-                continue;
-            }
-            serde_json::from_str(t).context("invalid grep frame from daemon")?
-        };
-
-        let frame: GrepFrame = serde_json::from_value(value).context(
-            "unrecognized grep frame from daemon — restart the daemon to match versions",
-        )?;
-        match frame {
-            GrepFrame::Chunk { data } => output.push_str(&data),
-            GrepFrame::End {
-                matches,
-                files,
-                skipped,
-                error,
-            } => {
-                response.matches = matches;
-                response.files = files;
-                response.skipped = skipped;
-                response.error = error;
-                break;
-            }
-        }
-    }
-
-    output.truncate(output.trim_end().len());
-    response.output = output;
-    Ok(response)
+    serde_json::from_str(trimmed).context("invalid search response from daemon")
 }
 
 /// Runs a glob query against the running daemon.

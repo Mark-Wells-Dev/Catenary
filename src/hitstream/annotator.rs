@@ -44,13 +44,40 @@ use super::frame::{AnnotatedBatch, AnnotatedHit, AnnotationFrame, AnnotationVerd
 pub trait BatchEnricher: Send + Sync {
     /// Enriches one batch's hits, returning the annotated hits in the same order.
     ///
-    /// This future is what the budget times out. A pass-through implementation
-    /// returns immediately; a real one awaits enrichment and returns whatever it
+    /// `observed` is the batch's WS31 observation slice — every file the walk
+    /// visited since the previous batch, with walk-time mtimes (ws43-02): the
+    /// production enricher feeds it to the changed-set nudge *before* deriving
+    /// anchors, exactly the executor's nudge-then-anchor order, and falls back
+    /// to nudging the hit paths when it is empty (an old CLI). This future is
+    /// what the budget times out. A pass-through implementation returns
+    /// immediately; a real one awaits enrichment and returns whatever it
     /// resolved within the time it was given (the caller applies the budget).
     fn enrich(
         &self,
         hits: Vec<super::WireHit>,
+        observed: Vec<(std::path::PathBuf, i64)>,
     ) -> impl Future<Output = Result<Vec<AnnotatedHit>>> + Send;
+
+    /// Consumes the walk's WS31 observation set from the [`HitFrame::End`]
+    /// terminator (ws43-02 reap parity): every file the CLI walk visited, plus
+    /// the reap-eligibility scopes of a pathless full walk.
+    ///
+    /// The production enricher feeds these to the root tracker's changed-set
+    /// diff — the same once-per-walk nudge/reap rule the retired grep executor
+    /// ran. The default is a no-op (the pass-through/protocol-test spelling),
+    /// so an enricher that has no tracker degrades to the per-batch
+    /// add/update-only nudge. Infallible by design: a failed nudge must never
+    /// tear down the annotation stream.
+    ///
+    /// [`HitFrame::End`]: super::HitFrame::End
+    fn observe_walk(
+        &self,
+        observed: Vec<(std::path::PathBuf, i64)>,
+        reap_scopes: Option<Vec<std::path::PathBuf>>,
+    ) -> impl Future<Output = ()> + Send {
+        let _ = (observed, reap_scopes);
+        async {}
+    }
 }
 
 /// The pass-through enricher: wraps every hit with no anchor, immediately.
@@ -62,7 +89,11 @@ pub trait BatchEnricher: Send + Sync {
 pub struct PassThroughEnricher;
 
 impl BatchEnricher for PassThroughEnricher {
-    async fn enrich(&self, hits: Vec<super::WireHit>) -> Result<Vec<AnnotatedHit>> {
+    async fn enrich(
+        &self,
+        hits: Vec<super::WireHit>,
+        _observed: Vec<(std::path::PathBuf, i64)>,
+    ) -> Result<Vec<AnnotatedHit>> {
         Ok(hits.into_iter().map(AnnotatedHit::passthrough).collect())
     }
 }
@@ -81,6 +112,7 @@ pub async fn annotate_batch<E: BatchEnricher>(
     enricher: &E,
     seq: u64,
     hits: Vec<super::WireHit>,
+    observed: Vec<(std::path::PathBuf, i64)>,
     budget: Duration,
 ) -> AnnotatedBatch {
     // Keep an unannotated copy so a blown budget or an enrich error still returns
@@ -91,7 +123,7 @@ pub async fn annotate_batch<E: BatchEnricher>(
         .map(AnnotatedHit::passthrough)
         .collect();
 
-    match tokio::time::timeout(budget, enricher.enrich(hits)).await {
+    match tokio::time::timeout(budget, enricher.enrich(hits, observed)).await {
         Ok(Ok(annotated)) => AnnotatedBatch {
             seq,
             hits: annotated,
@@ -158,16 +190,33 @@ where
             return Ok(());
         };
         match frame {
-            HitFrame::Batch { seq, hits } => {
+            HitFrame::Batch {
+                seq,
+                hits,
+                observed,
+            } => {
                 // read → await (budgeted) → write. No lock guard is held across
                 // this await (the skeleton holds none; the ruled law binds the
                 // real enricher too).
-                let batch = annotate_batch(enricher, seq, hits, budget).await;
+                let batch = annotate_batch(enricher, seq, hits, observed, budget).await;
                 super::write_frame(writer, &AnnotationFrame::Batch { batch }).await?;
                 emitted += 1;
             }
-            HitFrame::End { batches } => {
+            HitFrame::End {
+                batches,
+                observed,
+                reap_scopes,
+            } => {
                 debug_assert_eq!(emitted, batches, "annotated every batch the CLI sent");
+                // The walk-level observation nudge (ws43-02 reap parity) runs
+                // BEFORE the terminator is written, so a CLI that has read the
+                // annotation terminator knows the nudge — including any reap —
+                // has already landed (the deterministic ordering the reap pin
+                // relies on). Empty observations (a zero-match walk, or an old
+                // CLI) make this a no-op.
+                if !observed.is_empty() || reap_scopes.is_some() {
+                    enricher.observe_walk(observed, reap_scopes).await;
+                }
                 super::write_frame(writer, &AnnotationFrame::End { batches: emitted })
                     .await
                     .context("write annotation terminator")?;
@@ -231,7 +280,11 @@ mod tests {
     /// prove the budget blows to a pass-through verdict carrying every hit.
     struct SlowEnricher;
     impl BatchEnricher for SlowEnricher {
-        async fn enrich(&self, hits: Vec<WireHit>) -> Result<Vec<AnnotatedHit>> {
+        async fn enrich(
+            &self,
+            hits: Vec<WireHit>,
+            _observed: Vec<(std::path::PathBuf, i64)>,
+        ) -> Result<Vec<AnnotatedHit>> {
             tokio::time::sleep(Duration::from_hours(1)).await;
             Ok(hits.into_iter().map(AnnotatedHit::passthrough).collect())
         }
@@ -240,14 +293,25 @@ mod tests {
     /// An enricher that fails, to prove an enrich error degrades (not aborts).
     struct FailingEnricher;
     impl BatchEnricher for FailingEnricher {
-        async fn enrich(&self, _hits: Vec<WireHit>) -> Result<Vec<AnnotatedHit>> {
+        async fn enrich(
+            &self,
+            _hits: Vec<WireHit>,
+            _observed: Vec<(std::path::PathBuf, i64)>,
+        ) -> Result<Vec<AnnotatedHit>> {
             Err(anyhow::anyhow!("enrichment unavailable"))
         }
     }
 
     #[tokio::test]
     async fn passthrough_batch_is_annotated_verdict_with_no_anchors() {
-        let batch = annotate_batch(&PassThroughEnricher, 0, hits(3), Duration::from_secs(5)).await;
+        let batch = annotate_batch(
+            &PassThroughEnricher,
+            0,
+            hits(3),
+            Vec::new(),
+            Duration::from_secs(5),
+        )
+        .await;
         assert_eq!(batch.seq, 0);
         assert_eq!(batch.hits.len(), 3, "every hit is present");
         assert!(matches!(batch.verdict, AnnotationVerdict::Annotated));
@@ -266,7 +330,14 @@ mod tests {
 
     #[tokio::test]
     async fn blown_budget_passes_through_with_every_hit() {
-        let batch = annotate_batch(&SlowEnricher, 5, hits(4), Duration::from_millis(20)).await;
+        let batch = annotate_batch(
+            &SlowEnricher,
+            5,
+            hits(4),
+            Vec::new(),
+            Duration::from_millis(20),
+        )
+        .await;
         assert_eq!(batch.seq, 5, "seq is preserved through a blown budget");
         assert_eq!(batch.hits.len(), 4, "budget bounds enrichment, never hits");
         assert_eq!(
@@ -278,7 +349,14 @@ mod tests {
 
     #[tokio::test]
     async fn enrich_error_passes_through_with_every_hit() {
-        let batch = annotate_batch(&FailingEnricher, 2, hits(2), Duration::from_secs(5)).await;
+        let batch = annotate_batch(
+            &FailingEnricher,
+            2,
+            hits(2),
+            Vec::new(),
+            Duration::from_secs(5),
+        )
+        .await;
         assert_eq!(
             batch.hits.len(),
             2,

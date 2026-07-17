@@ -334,13 +334,19 @@ fn two_bridges_share_daemon() -> Result<()> {
     bridge_b.initialize()?;
 
     // Both can call grep.
-    let text_a = bridge_a.call_tool_text("grep", &json!({"pattern": "shared_sym"}))?;
+    let text_a = bridge_a.call_tool_text(
+        "grep",
+        &json!({"pattern": "shared_sym", "directory": root_str}),
+    )?;
     assert!(
         text_a.contains("shared_sym"),
         "bridge A grep should find symbol, got:\n{text_a}",
     );
 
-    let text_b = bridge_b.call_tool_text("grep", &json!({"pattern": "shared_sym"}))?;
+    let text_b = bridge_b.call_tool_text(
+        "grep",
+        &json!({"pattern": "shared_sym", "directory": root_str}),
+    )?;
     assert!(
         text_b.contains("shared_sym"),
         "bridge B grep should find symbol, got:\n{text_b}",
@@ -381,7 +387,10 @@ fn bridge_disconnect_preserves_other() -> Result<()> {
     bridge_b.initialize_with_roots(&[root_str])?;
 
     // Bridge A can grep.
-    let text = bridge_a.call_tool_text("grep", &json!({"pattern": "survivor"}))?;
+    let text = bridge_a.call_tool_text(
+        "grep",
+        &json!({"pattern": "survivor", "directory": root_str}),
+    )?;
     assert!(
         text.contains("survivor"),
         "bridge A should work before disconnect"
@@ -393,7 +402,10 @@ fn bridge_disconnect_preserves_other() -> Result<()> {
     std::thread::sleep(Duration::from_millis(500));
 
     // Bridge B still works.
-    let text = bridge_b.call_tool_text("grep", &json!({"pattern": "survivor"}))?;
+    let text = bridge_b.call_tool_text(
+        "grep",
+        &json!({"pattern": "survivor", "directory": root_str}),
+    )?;
     assert!(
         text.contains("survivor"),
         "bridge B should still work after A disconnects, got:\n{text}",
@@ -429,7 +441,10 @@ fn stale_socket_recovery() -> Result<()> {
     bridge.initialize()?;
 
     // Verify the bridge works.
-    let text = bridge.call_tool_text("grep", &json!({"pattern": "recovered"}))?;
+    let text = bridge.call_tool_text(
+        "grep",
+        &json!({"pattern": "recovered", "directory": root_str}),
+    )?;
     assert!(
         text.contains("recovered"),
         "bridge should work after stale socket recovery, got:\n{text}",
@@ -540,7 +555,10 @@ fn editing_guardrail_blocks_cross_session() -> Result<()> {
             "session_id": "session-a"
         }),
     )?;
-    bridge_a.call_tool_text("grep", &json!({"pattern": "guarded_fn"}))?;
+    bridge_a.call_tool_text(
+        "grep",
+        &json!({"pattern": "guarded_fn", "directory": root_str}),
+    )?;
 
     // Correlate session B: PreToolUse(grep) → MCP tools/call.
     hook_roundtrip(
@@ -552,7 +570,10 @@ fn editing_guardrail_blocks_cross_session() -> Result<()> {
             "session_id": "session-b"
         }),
     )?;
-    bridge_b.call_tool_text("grep", &json!({"pattern": "guarded_fn"}))?;
+    bridge_b.call_tool_text(
+        "grep",
+        &json!({"pattern": "guarded_fn", "directory": root_str}),
+    )?;
 
     // Session A: first edit implicitly enters editing mode and acquires
     // the per-root guardrail.
@@ -625,7 +646,10 @@ fn correlation_end_to_end() -> Result<()> {
     )?;
 
     // 2. Send MCP tools/call — this resolves correlation.
-    let text = bridge.call_tool_text("grep", &json!({"pattern": "correlated_fn"}))?;
+    let text = bridge.call_tool_text(
+        "grep",
+        &json!({"pattern": "correlated_fn", "directory": root_str}),
+    )?;
     assert!(
         text.contains("correlated_fn"),
         "grep should work after correlation, got:\n{text}",
@@ -644,7 +668,10 @@ fn correlation_end_to_end() -> Result<()> {
     )?;
 
     // Verify session is still functional — another grep should work.
-    let text = bridge.call_tool_text("grep", &json!({"pattern": "correlated_fn"}))?;
+    let text = bridge.call_tool_text(
+        "grep",
+        &json!({"pattern": "correlated_fn", "directory": root_str}),
+    )?;
     assert!(
         text.contains("correlated_fn"),
         "grep should work after the follow-up hook, got:\n{text}",

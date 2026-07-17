@@ -174,12 +174,12 @@ impl ResolvedGlob {
     /// `.gitignore` rules apply. Results are sorted for deterministic output.
     ///
     /// Only meaningful for absolute patterns — the sole form path-argument
-    /// expansion sees, because the daemon absolutizes every relative path
-    /// argument against the request's `cwd` (in `GrepRequest`/`GlobRequest`
-    /// `to_params`) before dispatch (bugs 31, 69). Relative patterns carry no
-    /// base directory and yield an empty list; the relative form survives only
-    /// for `--glob` scope filters, which match root-relative via
-    /// [`is_match`](Self::is_match).
+    /// expansion sees, because every relative path argument is absolutized
+    /// against the invoking `cwd` first (`GlobRequest::to_params` daemon-side;
+    /// grep's CLI-side `run_grep` since ws43-02) (bugs 31, 69). Relative
+    /// patterns carry no base directory and yield an empty list; the relative
+    /// form survives only for `--glob` scope filters, which match
+    /// root-relative via [`is_match`](Self::is_match).
     #[must_use]
     pub fn expand(&self, include_gitignored: bool, include_hidden: bool) -> Vec<PathBuf> {
         self.expand_cancellable(
@@ -331,15 +331,16 @@ impl ExcludeSet {
 /// repo-scoped (matching ripgrep/editors); outside a git repository nothing is
 /// filtered.
 ///
-/// Paths are expected to be absolute — the daemon absolutizes every relative
-/// path argument against the request's `cwd` (in `GrepRequest`/`GlobRequest`
-/// `to_params`) before dispatch. An empty input yields an empty result; callers
-/// distinguish "no path arguments" (search `cwd`) from "arguments that matched
-/// nothing" (empty result) before calling this.
+/// Paths are expected to be absolute — every relative path argument is
+/// absolutized against the invoking `cwd` first (`GlobRequest::to_params`
+/// daemon-side; grep's CLI-side `run_grep`). An empty input yields an empty
+/// result; callers distinguish "no path arguments" (search `cwd`) from
+/// "arguments that matched nothing" (empty result) before calling this.
 ///
-/// Shared by the grep and glob executors: when grep's streamed-engine cutover
-/// completes (ws43-02 seam) this expansion moves CLI-side for grep, but the
-/// daemon-side copy stays for glob until glob's own cutover (ws43-03).
+/// Shared across the search surfaces: since the ws43-02 cutover `catenary
+/// grep` runs this expansion **CLI-side** (in `run_grep`, before the walk);
+/// the daemon-side caller is the glob executor, which keeps it until glob's
+/// own cutover (ws43-03).
 #[must_use]
 pub fn expand_search_paths(
     paths: &[PathBuf],
@@ -724,31 +725,31 @@ pub struct Session {
     diagnostics_in_flight: std::sync::atomic::AtomicBool,
 }
 
-/// A daemon-less `grep`/`glob` pair, backed by an empty, never-spawned
+/// A daemon-less `glob` executor, backed by an empty, never-spawned
 /// [`LspClientManager`] (bug 80, leg 4).
 ///
-/// Built by [`Session::daemon_less_search`] so the CLI can run the daemon's own
-/// search pipeline in-process when the daemon is down, producing output
-/// byte-identical to a daemon-served answer with no language-server coverage.
+/// Built so the CLI can run the daemon's own glob pipeline in-process when the
+/// daemon is down, producing output byte-identical to a daemon-served answer
+/// with no language-server coverage. Grep no longer needs a daemon-less twin:
+/// since the ws43-02 cutover the CLI owns the grep walk in both modes, and the
+/// daemon-less case is simply the hitstream engine's unannotated sink.
 pub struct DaemonlessSearch {
-    /// The grep server, LSP-manager-empty.
-    pub grep: GrepServer,
     /// The glob server, LSP-manager-empty.
     pub glob: GlobServer,
 }
 
 impl DaemonlessSearch {
-    /// Builds a daemon-less search pair — the `grep` and `glob` servers wired to
-    /// an empty, never-spawned [`LspClientManager`] — for the CLI to run
-    /// in-process when the daemon is down (bug 80, leg 4).
+    /// Builds a daemon-less glob server wired to an empty, never-spawned
+    /// [`LspClientManager`] — for the CLI to run in-process when the daemon is
+    /// down (bug 80, leg 4).
     ///
     /// Catenary is one binary: the search pipeline (walk, gitignore semantics,
     /// pattern compilation, exclude handling, output rendering) is library code.
-    /// This constructs the *exact same* [`GrepServer`]/[`GlobServer`] the daemon
-    /// serves, but with no LSP manager backing — so `execute` takes the
-    /// uncovered-file rendering path the daemon already uses for a tree no
-    /// language server covers, and the stdout is byte-identical to a
-    /// daemon-served answer with no coverage.
+    /// This constructs the *exact same* [`GlobServer`] the daemon serves, but
+    /// with no LSP manager backing — so `execute` takes the uncovered-file
+    /// rendering path the daemon already uses for a tree no language server
+    /// covers, and the stdout is byte-identical to a daemon-served answer with
+    /// no coverage.
     ///
     /// Unlike [`Session::new`], this performs **no** logging activation, opens
     /// **no** JSONL firehose sink, and mirrors **no** snapshot — a throwaway CLI
@@ -764,8 +765,8 @@ impl DaemonlessSearch {
         let fs_manager = Arc::new(FilesystemManager::with_classification(classification));
 
         // No symbol index: without an LSP manager nothing populates it, and a
-        // never-populated index yields no `#scope` anchors and no outlines —
-        // exactly the uncovered render. Skipping it keeps the CLI process lean.
+        // never-populated index yields no outlines — exactly the uncovered
+        // render. Skipping it keeps the CLI process lean.
         let symbol_index = None;
 
         let glob_config = config
@@ -777,11 +778,6 @@ impl DaemonlessSearch {
         let client_manager = Arc::new(LspClientManager::new(config, logging, fs_manager.clone()));
 
         Self {
-            grep: GrepServer {
-                client_manager: client_manager.clone(),
-                fs_manager: fs_manager.clone(),
-                symbol_index: symbol_index.clone(),
-            },
             glob: GlobServer {
                 client_manager,
                 fs_manager,

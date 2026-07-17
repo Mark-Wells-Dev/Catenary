@@ -24,6 +24,7 @@
 //! deterministic global `(file, line)` order the query path renders, which is
 //! what lets the sinks stream without a global sort buffer.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -33,7 +34,9 @@ use grep_searcher::{Searcher, Sink, SinkContext, SinkMatch};
 use ignore::overrides::OverrideBuilder;
 use ignore::types::{Types, TypesBuilder};
 
-use crate::bridge::filesystem_manager::{FilesystemManager, stat_with_retry};
+use crate::bridge::filesystem_manager::{
+    FilesystemManager, OBSERVED_STAT_MISS_MTIME, mtime_nanos, stat_with_retry,
+};
 use crate::bridge::session::ExcludeSet;
 use crate::bridge::{GrepFlags, SkipRecord};
 
@@ -56,6 +59,14 @@ pub struct HitBatch {
     pub seq: u64,
     /// The hits in this batch, in the walk's global order.
     pub hits: Vec<Hit>,
+    /// The WS31 observations recorded since the previous flush: every regular
+    /// file the walk visited (matched or not), `(path, mtime-nanos)`. Riding
+    /// the batch keeps the daemon's observation nudge ordered before the
+    /// batch's anchors — and keeps a cold root's first nudge the cold snapshot
+    /// (first-walk `Changed`), the executor's classification. A visited file
+    /// whose stat misses carries the `OBSERVED_STAT_MISS_MTIME` sentinel,
+    /// never omission (WS31-review H1).
+    pub observed: Vec<(PathBuf, i64)>,
 }
 
 /// The knobs the walk honors — the full `catenary grep` flag surface (ws43-02).
@@ -82,8 +93,11 @@ pub struct WalkOptions {
     pub fs_manager: Option<Arc<FilesystemManager>>,
 }
 
-/// What one walk did: how many ordered batches it emitted, and which files it
-/// skipped instead of searching (misc 135 — a skip is reported, never silent).
+/// What one walk did.
+///
+/// How many ordered batches it emitted, which files it skipped instead of
+/// searching (misc 135 — a skip is reported, never silent), and every regular
+/// file it visited (the WS31 observation set).
 #[derive(Debug, Default)]
 pub struct WalkSummary {
     /// Number of [`HitBatch`]es handed to `on_batch` (0-based `seq`s, gap-free).
@@ -91,6 +105,14 @@ pub struct WalkSummary {
     /// Files skipped instead of searched, with their reasons. Folded into the
     /// wire-ready `GrepSkips` at the CLI cutover seam.
     pub skips: Vec<SkipRecord>,
+    /// The observation **tail**: files visited after the last batch flushed
+    /// (per-batch observations ride each [`HitBatch::observed`]) — the
+    /// trailing files that held no hits, or the entire visited set when the
+    /// walk emitted no batch at all. The daemon-stream sink ships it on the
+    /// `End` terminator (suppressed for a zero-match walk — executor parity: a
+    /// query with no matches never nudged) so the walk-level reap diff still
+    /// covers every visited file.
+    pub observed: Vec<(PathBuf, i64)>,
 }
 
 /// Walks `roots` for `pattern`, emitting each ordered [`HitBatch`] to `on_batch`.
@@ -112,7 +134,19 @@ pub struct WalkSummary {
 /// `-g`/`--type` filters — those govern recursive directory traversal, not a
 /// path the caller named (misc 110, ripgrep parity).
 ///
-/// Returns a [`WalkSummary`]: the emitted batch count plus the skip records.
+/// Multi-root discipline (ws43-02, the executor's sort/dedup preserved): the
+/// roots are walked in sorted, deduplicated order, and a file already searched
+/// under an earlier root is never searched again — so overlapping roots
+/// (`grep pat . src`) emit each hit exactly once, and the emission order is the
+/// same global `(file, line)` order the query executor's sorted merge produced
+/// (nested roots interleave naturally: the ancestor's own sorted walk covers
+/// them in place). The one divergence from the buffered merge is a *named* root
+/// the ancestor's walk filtered out (a gitignored named file): it emits at its
+/// own root's sorted turn rather than interleaved — same hit set, later
+/// position.
+///
+/// Returns a [`WalkSummary`]: the emitted batch count, the skip records, and
+/// the visited-file observation set.
 ///
 /// # Errors
 ///
@@ -133,8 +167,17 @@ where
     let types = build_types(&options.flags)?;
     let mut batcher = Batcher::new(HIT_BATCH_SIZE, &mut on_batch);
     let mut skips: Vec<SkipRecord> = Vec::new();
+    // Canonical paths already searched — the cross-root dedup set. Same memory
+    // order as the observation set (both are O(visited files), the executor's
+    // own accumulation shape); the hit stream itself stays streaming.
+    let mut dedup: HashSet<PathBuf> = HashSet::new();
 
-    for root in roots {
+    // Sorted, deduplicated roots: global emission order by construction.
+    let mut ordered: Vec<&PathBuf> = roots.iter().collect();
+    ordered.sort();
+    ordered.dedup();
+
+    for root in ordered {
         walk_root(
             root,
             &matcher,
@@ -142,14 +185,43 @@ where
             options,
             &mut batcher,
             &mut skips,
+            &mut dedup,
         )?;
     }
 
-    let emitted = batcher.finish()?;
+    let (emitted, observed_tail) = batcher.finish()?;
     Ok(WalkSummary {
         batches: emitted,
         skips,
+        observed: observed_tail,
     })
+}
+
+/// Validates the walk's compilable inputs — the pattern, the `-t`/`--type`
+/// filters, and the `-g`/`--glob` patterns — without walking anything.
+///
+/// The CLI's exit-2 usage gate (bug 105 contract, preserved through the
+/// ws43-02 cutover): an uncompilable input is refused loudly *before* any
+/// stream opens, so a walk that has started can no longer fail on user input.
+/// The error spellings are exactly the walk's own (the same constructors run).
+///
+/// # Errors
+///
+/// Returns the same error [`walk`] would: an invalid regex pattern, `--type`
+/// filter, or `--glob` pattern.
+pub fn validate_inputs(pattern: &str, flags: &GrepFlags) -> Result<()> {
+    crate::bridge::build_matcher(pattern, flags)?;
+    build_types(flags)?;
+    if !flags.globs.is_empty() {
+        let mut ob = OverrideBuilder::new(Path::new("/"));
+        for g in &flags.globs {
+            ob.add(g)
+                .map_err(|e| anyhow!("Invalid --glob pattern '{g}': {e}"))?;
+        }
+        ob.build()
+            .map_err(|e| anyhow!("Invalid --glob filter: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Resolves the `-t`/`--type` filters against ripgrep's built-in type
@@ -169,11 +241,14 @@ fn build_types(flags: &GrepFlags) -> Result<Option<Types>> {
     ))
 }
 
-/// Walks one root, feeding every match into `batcher` in walk order and every
-/// binary skip into `skips`.
+/// Walks one root, feeding every match into `batcher` in walk order, every
+/// binary skip into `skips`, and every visited regular file into the
+/// batcher's pending observation set (the WS31 observations, shipped with the
+/// next batch). `dedup` is the cross-root canonical-path dedup set — a file
+/// already searched under an earlier root is skipped.
 #[allow(
     clippy::too_many_lines,
-    reason = "one linear pass: filter gates, binary skip, then the search"
+    reason = "one linear pass: observation, filter gates, binary skip, then the search"
 )]
 fn walk_root<F>(
     root: &Path,
@@ -182,6 +257,7 @@ fn walk_root<F>(
     options: &WalkOptions,
     batcher: &mut Batcher<'_, F>,
     skips: &mut Vec<SkipRecord>,
+    dedup: &mut HashSet<PathBuf>,
 ) -> Result<()>
 where
     F: FnMut(HitBatch) -> Result<()>,
@@ -234,6 +310,20 @@ where
         }
         let path = entry.path();
 
+        // Record this file's mtime for the WS31 changed-set observation set —
+        // every visited file, before the query-level exclude and binary skips,
+        // exactly as the query executor recorded it. The stat is retried (a
+        // fresh stat can race an atomic rename even when `d_type` already
+        // proved the entry a file) and reused by the binary check below. An
+        // enumerated present file whose stat still misses is recorded with the
+        // `OBSERVED_STAT_MISS_MTIME` sentinel, NOT omitted: omission would let
+        // a full walk false-reap it as `Deleted` (WS31-review H1).
+        let metadata = stat_with_retry(path);
+        let stat_mtime = metadata
+            .as_ref()
+            .map_or(OBSERVED_STAT_MISS_MTIME, mtime_nanos);
+        batcher.observe(path.to_path_buf(), stat_mtime);
+
         // Query-level exclusion (`--exclude-pattern`): matched paths are not
         // searched, exactly as the query engine gates them.
         if options.exclude.is_match(path, root) {
@@ -246,8 +336,8 @@ where
         // live-race rename) searches the file rather than dropping it,
         // mirroring the query engine.
         if let Some(fs) = &options.fs_manager
-            && let Some(md) = stat_with_retry(path)
-            && let Some(reason) = fs.binary_skip_reason(path, &md)
+            && let Some(md) = &metadata
+            && let Some(reason) = fs.binary_skip_reason(path, md)
         {
             skips.push(SkipRecord {
                 path: path.to_path_buf(),
@@ -259,6 +349,14 @@ where
 
         // Canonicalize at the ingestion seam — the hit carries a canonical path.
         let canonical = canonicalize_hit_path(path);
+
+        // Cross-root dedup: overlapping roots (`grep pat . src`) visit a file
+        // more than once; only its first (sorted-order) visit searches it, so
+        // each hit is emitted exactly once (the executor's map-keyed dedup,
+        // preserved).
+        if !dedup.insert(canonical.clone()) {
+            continue;
+        }
 
         let mut sink = HitSink {
             matcher,
@@ -284,10 +382,15 @@ where
 /// Accumulates hits into fixed-size batches, handing each full batch to the
 /// caller's `on_batch` in strict `seq` order. Nothing is buffered beyond one
 /// in-progress batch — the streaming, no-buffered-result-set invariant.
+/// Observations accumulate alongside and drain into each flushed batch, so
+/// they reach the daemon's nudge in walk order, ahead of the batch's anchors.
 struct Batcher<'a, F> {
     cap: usize,
     seq: u64,
     current: Vec<Hit>,
+    /// Observations recorded since the last flush — drained into the next
+    /// batch; whatever remains at `finish` is the walk's observation tail.
+    pending_observed: Vec<(PathBuf, i64)>,
     on_batch: &'a mut F,
 }
 
@@ -300,8 +403,14 @@ where
             cap: cap.max(1),
             seq: 0,
             current: Vec::with_capacity(cap.max(1)),
+            pending_observed: Vec::new(),
             on_batch,
         }
+    }
+
+    /// Records one visited file's observation (shipped with the next batch).
+    fn observe(&mut self, path: PathBuf, mtime: i64) {
+        self.pending_observed.push((path, mtime));
     }
 
     /// Adds one hit, flushing a full batch to `on_batch`.
@@ -322,15 +431,17 @@ where
         let batch = HitBatch {
             seq: self.seq,
             hits,
+            observed: std::mem::take(&mut self.pending_observed),
         };
         self.seq += 1;
         (self.on_batch)(batch)
     }
 
-    /// Flushes any partial final batch and returns the total batch count.
-    fn finish(mut self) -> Result<u64> {
+    /// Flushes any partial final batch and returns the total batch count plus
+    /// the observation tail (files visited after the last flushed batch).
+    fn finish(mut self) -> Result<(u64, Vec<(PathBuf, i64)>)> {
         self.flush()?;
-        Ok(self.seq)
+        Ok((self.seq, self.pending_observed))
     }
 }
 
@@ -783,6 +894,156 @@ mod tests {
             hits.iter().all(|h| !h.path.ends_with("zzz.txt")),
             "the file deleted by the first batch's callback was never searched — \
              emission streams ahead of the walk, nothing buffers the result set"
+        );
+    }
+
+    /// Initializes a git repository so `.gitignore` rules apply (gitignore is
+    /// repo-scoped, matching ripgrep).
+    fn git_init(dir: &Path) {
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .expect("git init");
+    }
+
+    #[test]
+    fn named_gitignored_file_is_searched_but_dir_walk_still_gates() {
+        // misc 110, migrated from the retired executor's pins: a gitignored
+        // file NAMED as a root is searched unconditionally (naming it is a
+        // direct request), while the same file reached by walking a directory
+        // root stays gated behind --include-gitignored.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        git_init(root);
+        std::fs::write(root.join(".gitignore"), "ignored.txt\n").expect("write gitignore");
+        write_file(root, "kept.txt", "needle kept\n");
+        write_file(root, "ignored.txt", "needle ignored\n");
+
+        // Directory walk: the gitignored file is gated.
+        let walked = collect_hits("needle", &[root.to_path_buf()], &WalkOptions::default());
+        assert!(
+            walked.iter().all(|h| !h.path.ends_with("ignored.txt")),
+            "a directory walk gates gitignored contents"
+        );
+        assert!(
+            walked.iter().any(|h| h.path.ends_with("kept.txt")),
+            "the non-ignored file is searched"
+        );
+
+        // Named file root: the gate does not apply.
+        let named = collect_hits(
+            "needle",
+            &[root.join("ignored.txt")],
+            &WalkOptions::default(),
+        );
+        assert_eq!(named.len(), 1, "a named gitignored file is searched");
+
+        // The escape hatch lifts the directory-walk gate.
+        let options = WalkOptions {
+            include_gitignored: true,
+            ..WalkOptions::default()
+        };
+        let with_ignored = collect_hits("needle", &[root.to_path_buf()], &options);
+        assert!(
+            with_ignored.iter().any(|h| h.path.ends_with("ignored.txt")),
+            "--include-gitignored surfaces the gated file"
+        );
+    }
+
+    #[test]
+    fn empty_pattern_matches_every_line() {
+        // bug 83 (ripgrep parity), migrated from the retired executor's pins:
+        // the empty pattern matches every line — a `--count` projection over
+        // this walk is the file's line count, never a silent zero.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_file(
+            tmp.path(),
+            "fixture.txt",
+            "alpha\nbeta\ngamma\ndelta\nepsilon\n",
+        );
+        let hits = collect_hits("", &[tmp.path().to_path_buf()], &WalkOptions::default());
+        assert_eq!(hits.len(), 5, "empty pattern selects every line");
+    }
+
+    #[test]
+    fn overlapping_roots_dedup_and_keep_global_order() {
+        // ws43-02 multi-root discipline: overlapping roots (`grep pat . sub`)
+        // emit each hit exactly once, and sorted-root walking preserves the
+        // global (file, line) order the executor's merged sort produced —
+        // regardless of the argument order.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        write_file(root, "a.txt", "needle a\n");
+        write_file(root, "sub/b.txt", "needle b\n");
+        write_file(root, "z.txt", "needle z\n");
+
+        let roots = vec![
+            root.join("sub"),
+            root.to_path_buf(),
+            root.join("sub"), // exact duplicate root
+        ];
+        let hits = collect_hits("needle", &roots, &WalkOptions::default());
+        let names: Vec<String> = hits
+            .iter()
+            .map(|h| {
+                h.path
+                    .strip_prefix(root.canonicalize().expect("canonical root"))
+                    .expect("hit under root")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "a.txt".to_string(),
+                "sub/b.txt".to_string(),
+                "z.txt".to_string()
+            ],
+            "each hit once, in global path order"
+        );
+    }
+
+    #[test]
+    fn walk_records_visited_files_as_observations() {
+        // ws43-02 reap parity: every visited regular file lands in the
+        // observation stream with a real mtime — matched or not — batched
+        // observations riding each flush and the remainder in the summary
+        // tail, so the daemon's nudges see the same set the executor observed.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_file(tmp.path(), "hit.txt", "needle\n");
+        write_file(tmp.path(), "miss.txt", "nothing here\n");
+
+        let mut observed: Vec<(PathBuf, i64)> = Vec::new();
+        let summary = walk(
+            "needle",
+            &[tmp.path().to_path_buf()],
+            &WalkOptions::default(),
+            |batch| {
+                observed.extend(batch.observed);
+                Ok(())
+            },
+        )
+        .expect("walk");
+        observed.extend(summary.observed);
+        assert_eq!(
+            observed.len(),
+            2,
+            "both visited files are observed: {observed:?}"
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|(p, m)| p.ends_with("miss.txt") && *m != OBSERVED_STAT_MISS_MTIME),
+            "an unmatched file is still observed with its mtime"
+        );
+        // hit.txt matched, so the batch that carries it also carries every
+        // observation recorded up to its flush — the order the cold-snapshot
+        // classification relies on.
+        assert!(
+            observed.iter().any(|(p, _)| p.ends_with("hit.txt")),
+            "the matched file is observed too"
         );
     }
 

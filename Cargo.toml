@@ -159,6 +159,12 @@ brush-parser = "0.4.0"
 # adds only itself.
 filetime = "0.2"
 proptest = "1.11"
+# `test-util` unlocks tokio's paused clock for the hitstream silent-daemon pin
+# (ws43-02): the accepts-then-silent deadline test fires the generous
+# `STREAM_READ_DEADLINE` instantly under `start_paused` instead of stalling the
+# suite for its wall-clock length. Dev-only — the runtime graph keeps the plain
+# `full` feature set; same crate, same version, no new dependency.
+tokio = { version = "1.49.0", features = ["full", "test-util"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

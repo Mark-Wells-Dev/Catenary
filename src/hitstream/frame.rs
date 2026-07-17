@@ -10,11 +10,13 @@
 //! enriched, plus a per-batch **budget verdict**, plus a terminator).
 //!
 //! Both enums are internally tagged on `"frame"` — the same version-skew hinge
-//! the legacy [`crate::router::GrepFrame`] uses. A frame from a peer that speaks
+//! the retired chunked `tool/grep` framing used. A frame from a peer that speaks
 //! a newer protocol carries an unrecognized tag and deserializes to a
 //! comprehensible error rather than a silent misparse; the reader treats that as
-//! the degrade signal (fall back to the unannotated stream), exactly as a
+//! the degrade signal (complete the stream unannotated), exactly as a
 //! daemon-absent connection would.
+
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -37,14 +39,72 @@ pub enum HitFrame {
         /// The hits in this batch, in the walk's global order. Each path is
         /// canonical (canonicalized at the walk seam).
         hits: Vec<WireHit>,
+        /// The WS31 observations recorded since the previous batch flushed:
+        /// every regular file the walk visited (matched or not), with its
+        /// walk-time mtime (ws43-02 reap parity). Riding the batch — not the
+        /// terminator — keeps the daemon's nudge order the executor's: the
+        /// observation nudge lands *before* this batch's anchors are derived,
+        /// and a cold root's first nudge is still the cold snapshot
+        /// (first-walk `Changed`, never a spurious `Created`). Empty from an
+        /// old CLI — the daemon then degrades to nudging the batch's hit
+        /// paths, the previous add/update-only behavior.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        observed: Vec<(PathBuf, i64)>,
     },
     /// The terminator: no more batches follow. Carries the total batch count so
-    /// the daemon and the CLI agree on how many annotation-batches to expect.
+    /// the daemon and the CLI agree on how many annotation-batches to expect,
+    /// plus the walk's WS31 observation set (ws43-02 reap parity).
+    ///
+    /// The observation fields ride the terminator because that is exactly when
+    /// the executor nudged: once, after the whole walk, with every visited
+    /// file. Version skew is field-tolerant in both directions: an old daemon
+    /// ignores the unknown fields (add/update-only via its per-batch hit
+    /// nudge — the current behavior), and an old CLI's field-less `End` parses
+    /// here with an empty set and no scopes (no walk-level nudge, no reap).
     End {
         /// Total number of [`HitFrame::Batch`] frames sent before this
         /// terminator (`0` for an empty walk).
         batches: u64,
+        /// The observation **tail**: files visited after the last
+        /// [`HitFrame::Batch`] flushed (per-batch observations ride the batch
+        /// frames). Usually empty — the final flush drains everything — and
+        /// always empty for a zero-match walk (executor parity: a query with
+        /// no matches never nudged) and for an old CLI.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        observed: Vec<(PathBuf, i64)>,
+        /// The canonicalized scopes a **pathless** full walk covered — reap
+        /// eligibility, exactly the executor's rule: `Some` only when the walk
+        /// had no path arguments (its scope may cover whole registered roots,
+        /// so a baseline entry missing from `observed` is provably gone).
+        /// `None` for a path-scoped walk: add/update only, a subtree walk
+        /// never proves absence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reap_scopes: Option<Vec<PathBuf>>,
     },
+}
+
+impl HitFrame {
+    /// A plain batch with no observations — the shape an old CLI sends (and
+    /// the protocol tests' spelling).
+    #[must_use]
+    pub const fn batch(seq: u64, hits: Vec<WireHit>) -> Self {
+        Self::Batch {
+            seq,
+            hits,
+            observed: Vec::new(),
+        }
+    }
+
+    /// A plain terminator with no observations — the zero-match spelling (and
+    /// the shape an old CLI sends).
+    #[must_use]
+    pub const fn end(batches: u64) -> Self {
+        Self::End {
+            batches,
+            observed: Vec::new(),
+            reap_scopes: None,
+        }
+    }
 }
 
 /// The per-batch budget verdict the daemon stamps on each annotation-batch.
@@ -124,7 +184,8 @@ impl AnnotatedHit {
     /// byte-identical to [`WireHit::render_unannotated`], so a pass-through
     /// batch and a daemon-absent batch print the same bytes (the degrade-only
     /// invariant). The user-visible `catenary grep` shape is
-    /// [`Self::render_grep_line`]; the CLI cutover switches the sinks to it.
+    /// [`Self::render_grep_line`] — what the sinks emit since the ws43-02
+    /// cutover; this spelling remains for protocol debugging.
     #[must_use]
     pub fn render(&self) -> String {
         self.anchor.as_ref().map_or_else(
@@ -220,26 +281,74 @@ mod tests {
 
     #[test]
     fn hit_frame_batch_roundtrips_and_carries_tag() {
-        let frame = HitFrame::Batch {
-            seq: 7,
-            hits: vec![sample_hit()],
-        };
+        let frame = HitFrame::batch(7, vec![sample_hit()]);
         let line = serde_json::to_string(&frame).expect("serialize batch");
         assert!(
             line.contains("\"frame\":\"batch\""),
             "batch carries the frame tag: {line}"
+        );
+        assert!(
+            !line.contains("observed"),
+            "an observation-less batch serializes exactly as before (old-daemon \
+             compatibility): {line}"
         );
         let back: HitFrame = serde_json::from_str(&line).expect("parse batch");
         assert_eq!(back, frame, "hit batch roundtrips");
     }
 
     #[test]
+    fn hit_frame_batch_carries_observations() {
+        let frame = HitFrame::Batch {
+            seq: 1,
+            hits: vec![sample_hit()],
+            observed: vec![(PathBuf::from("/w/src/a.rs"), 7)],
+        };
+        let line = serde_json::to_string(&frame).expect("serialize batch");
+        let back: HitFrame = serde_json::from_str(&line).expect("parse batch");
+        assert_eq!(back, frame, "batch observations roundtrip");
+
+        // An old CLI's field-less batch parses with an empty observation set —
+        // the daemon then degrades to the hit-path nudge.
+        let legacy: HitFrame = serde_json::from_str(
+            r#"{"frame":"batch","seq":1,"hits":[{"path":"/w/src/a.rs","line":3,"column":1,"text":"fn f() {"}]}"#,
+        )
+        .expect("parse legacy batch");
+        assert!(
+            matches!(legacy, HitFrame::Batch { ref observed, .. } if observed.is_empty()),
+            "absent observations read as empty"
+        );
+    }
+
+    #[test]
     fn hit_frame_end_roundtrips() {
-        let frame = HitFrame::End { batches: 3 };
+        let frame = HitFrame::end(3);
         let line = serde_json::to_string(&frame).expect("serialize end");
         assert!(line.contains("\"frame\":\"end\""), "end carries the tag");
+        assert!(
+            !line.contains("observed") && !line.contains("reap_scopes"),
+            "an observation-less end serializes exactly as before (old-daemon \
+             compatibility): {line}"
+        );
         let back: HitFrame = serde_json::from_str(&line).expect("parse end");
         assert_eq!(back, frame, "hit end roundtrips");
+    }
+
+    #[test]
+    fn hit_frame_end_carries_observations_and_reap_scopes() {
+        let frame = HitFrame::End {
+            batches: 2,
+            observed: vec![(PathBuf::from("/w/src/a.rs"), 42)],
+            reap_scopes: Some(vec![PathBuf::from("/w")]),
+        };
+        let line = serde_json::to_string(&frame).expect("serialize end");
+        let back: HitFrame = serde_json::from_str(&line).expect("parse end");
+        assert_eq!(back, frame, "observation fields roundtrip");
+
+        // An old CLI's field-less terminator parses with the honest defaults:
+        // nothing observed, no reap — the add/update-only degrade.
+        let legacy: HitFrame =
+            serde_json::from_str(r#"{"frame":"end","batches":2}"#).expect("parse legacy end");
+        assert_eq!(legacy, HitFrame::end(2));
     }
 
     #[test]

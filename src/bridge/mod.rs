@@ -11,7 +11,8 @@ pub mod editing_manager;
 mod file_tools;
 /// Single authority for file classification (binary, language ID, shebang).
 pub mod filesystem_manager;
-/// Grep tool: ripgrep + workspace/symbol pipeline with LSP enrichment.
+/// Grep's shared machinery: flags, skips, matcher/searcher construction, the
+/// LSP enrichment core, and stdin (stream) mode.
 mod grep_server;
 /// Path utilities shared by bridge components.
 mod handler;
@@ -40,14 +41,11 @@ pub use diagnostics_server::DiagnosticsServer;
 pub use editing_guardrail::EditingGuardrail;
 pub use editing_manager::EditingManager;
 pub use file_tools::GlobOutcome;
-pub use grep_server::{
-    GrepFlags, GrepOutcome, GrepSkips, HunkChunk, HunkSpool, ShapedOutput, SkipRecord,
-    StreamOutcome, grep_stream,
-};
+pub use grep_server::{GrepFlags, GrepSkips, SkipRecord, StreamOutcome, grep_stream};
 pub use handler::expand_tilde;
 pub use hitstream_enricher::GrepHitEnricher;
-// The ws43 hitstream engine builds its CLI-side walk matcher/searcher through
-// the grep executor's constructors so the two walks cannot drift (ws43-02).
+// The ws43 hitstream engine walks with the same matcher/searcher constructors
+// stdin mode uses, so the surfaces' matching semantics cannot drift (ws43-02).
 pub(crate) use grep_server::{build_matcher, build_searcher};
 pub use hook_router::HookRouter;
 pub use hook_router::is_edit_tool;

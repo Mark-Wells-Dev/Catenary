@@ -858,27 +858,147 @@ impl BridgeProcess {
         }
     }
 
-    /// Calls grep via the IPC socket and returns the output text.
+    /// Runs a grep query through the real `catenary grep` CLI (ws43-02: the
+    /// CLI owns the walk; the daemon serves only the `tool/hitstream`
+    /// annotation stream) and returns the results body.
     ///
-    /// `args` should contain the grep parameters (`pattern`, and optionally
-    /// `paths`, `exclude`, `page`, `include_gitignored`, `include_hidden`).
-    /// A `directory` field, if present, is used as the cwd.
+    /// `args` keeps the old IPC-helper shape (`pattern`, and optionally
+    /// `paths`, `exclude`, `count`, `include_gitignored`, `include_hidden`,
+    /// the ripgrep-parity flags, and a `directory` cwd) so the ~130 existing
+    /// call sites migrate without rewriting each one; the helper translates
+    /// them to CLI argv. The returned body matches the retired IPC `output`
+    /// field: results only (the CLI's `cwd:` scope anchor stripped), trailing
+    /// newline trimmed, stderr advisories dropped.
     pub fn call_grep(&self, args: &Value) -> Result<String> {
-        let socket_path = self.wait_for_ipc_socket()?;
-        let mut request = args.clone();
-        let obj = request.as_object_mut().context("args must be an object")?;
-        obj.insert("method".to_string(), json!("tool/grep"));
-        self.resolve_ipc_cwd(obj);
+        // The daemon must be up before the CLI connects, or the query silently
+        // takes the daemon-less (unenriched) path — the old helper waited for
+        // the socket too.
+        let _ = self.wait_for_ipc_socket()?;
+        let out = self.grep_cli_output(args)?;
+        if !out.status.success() {
+            bail!(
+                "catenary grep exited {:?}; stderr:\n{}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(Self::grep_cli_body(&out.stdout))
+    }
 
-        let response =
-            ipc_tool_request(&socket_path, self.daemon_pid(), &Value::Object(obj.clone()))?;
-        let parsed: Value =
-            serde_json::from_str(&response).context("failed to parse grep response")?;
-        let output = parsed
-            .get("output")
-            .and_then(|o| o.as_str())
-            .context("no output in grep response")?;
-        Ok(output.to_string())
+    /// Spawns the `catenary grep` CLI against this test's isolated daemon
+    /// state, translating the old IPC-helper JSON args into argv. The child's
+    /// working directory is the `directory` arg when present, else the spawn
+    /// cwd (`ipc_cwd`/`root_dir`) — the same resolution the IPC helper used.
+    fn grep_cli_output(&self, args: &Value) -> Result<std::process::Output> {
+        let obj = args.as_object().context("grep args must be an object")?;
+        let pattern = obj
+            .get("pattern")
+            .and_then(Value::as_str)
+            .context("grep args need a pattern")?;
+
+        let mut command_line: Vec<String> = vec!["grep".to_string(), pattern.to_string()];
+        if let Some(paths) = obj.get("paths").and_then(Value::as_array) {
+            for p in paths {
+                command_line.push(
+                    p.as_str()
+                        .context("grep `paths` entries must be strings")?
+                        .to_string(),
+                );
+            }
+        }
+        for pat in Self::string_or_seq(obj.get("exclude"))? {
+            command_line.push("--exclude-pattern".to_string());
+            command_line.push(pat);
+        }
+        // Only the `globs` spelling maps to `-g` — wire parity: the retired
+        // IPC request deserialized the flattened `GrepFlags` field `globs` and
+        // silently ignored a singular `glob` key, and at least one call site
+        // relies on that (test_grep_broad_glob_excludes_hidden passes `glob`,
+        // which never reached the old executor either).
+        for g in Self::string_or_seq(obj.get("globs"))? {
+            command_line.push("--glob".to_string());
+            command_line.push(g);
+        }
+        for t in Self::string_or_seq(obj.get("types"))? {
+            command_line.push("--type".to_string());
+            command_line.push(t);
+        }
+        let bool_flags = [
+            ("count", "--count"),
+            ("include_gitignored", "--include-gitignored"),
+            ("include_hidden", "--include-hidden"),
+            ("ignore_case", "--ignore-case"),
+            ("case_sensitive", "--case-sensitive"),
+            ("word", "--word-regexp"),
+            ("fixed_strings", "--fixed-strings"),
+            ("invert", "--invert-match"),
+            ("files_with_matches", "--files-with-matches"),
+        ];
+        for (key, flag) in bool_flags {
+            if obj.get(key).and_then(Value::as_bool) == Some(true) {
+                command_line.push(flag.to_string());
+            }
+        }
+        if let Some(n) = obj.get("before_context").and_then(Value::as_u64) {
+            command_line.push("--before-context".to_string());
+            command_line.push(n.to_string());
+        }
+        if let Some(n) = obj.get("after_context").and_then(Value::as_u64) {
+            command_line.push("--after-context".to_string());
+            command_line.push(n.to_string());
+        }
+
+        let cwd = obj
+            .get("directory")
+            .or_else(|| obj.get("cwd"))
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .or_else(|| self.ipc_cwd.clone())
+            .or_else(|| self.root_dir.as_ref().map(|d| d.path().to_path_buf()))
+            .context("grep CLI helper needs a cwd: pass `directory`, or spawn with a root")?;
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+        isolate_env(&mut cmd, &self.state_home);
+        cmd.args(&command_line)
+            .current_dir(&cwd)
+            // /dev/null stdin: NOT a readable stream, so the CLI takes the
+            // filesystem path, never stdin mode.
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.output().context("run catenary grep CLI")
+    }
+
+    /// Extracts the results body from the CLI's stdout in the retired IPC
+    /// `output` shape: the leading `cwd:` scope anchor (misc 172) stripped,
+    /// trailing newline trimmed.
+    fn grep_cli_body(stdout: &[u8]) -> String {
+        let text = String::from_utf8_lossy(stdout);
+        let body = text.strip_suffix('\n').unwrap_or(&text);
+        if body.starts_with("cwd: ") {
+            return body
+                .split_once('\n')
+                .map_or_else(String::new, |(_, rest)| rest.to_string());
+        }
+        body.to_string()
+    }
+
+    /// A JSON value that is either a string or an array of strings, folded to
+    /// a vector (the old wire's `deserialize_string_or_seq` tolerance).
+    fn string_or_seq(value: Option<&Value>) -> Result<Vec<String>> {
+        match value {
+            None => Ok(Vec::new()),
+            Some(Value::String(s)) => Ok(vec![s.clone()]),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .context("expected a string entry")
+                })
+                .collect(),
+            Some(other) => bail!("expected a string or array, got: {other}"),
+        }
     }
 
     /// Calls glob via the IPC socket and returns the output text.
@@ -904,13 +1024,20 @@ impl BridgeProcess {
         Ok(output.to_string())
     }
 
-    /// Calls grep/glob via IPC and returns the full parsed response object.
+    /// Calls a search and returns the full response object.
     ///
     /// Unlike [`Self::call_grep`]/[`Self::call_glob`] (which extract only
-    /// `output`), this returns the entire response — including the `--count`
-    /// fields (`matches`/`files` for grep, `paths` for glob). `method` is the
-    /// IPC method string (`tool/grep` or `tool/glob`).
+    /// `output`), this returns the whole response — including the `--count`
+    /// fields (`matches`/`files` for grep, `paths` for glob). `method` keeps
+    /// the historical IPC method-string spelling: `tool/glob` still goes over
+    /// IPC (until ws43-03), while `tool/grep` — whose executor retired in
+    /// ws43-02 — drives the real CLI and reassembles the old response shape
+    /// (`output`, `matches`/`files` parsed from the `--count` line, `error`
+    /// from an exit-2 usage refusal) so count/error pins keep their intent.
     pub fn call_search_raw(&self, method: &str, args: &Value) -> Result<Value> {
+        if method == "tool/grep" {
+            return self.grep_raw(args);
+        }
         let socket_path = self.wait_for_ipc_socket()?;
         let mut request = args.clone();
         let obj = request.as_object_mut().context("args must be an object")?;
@@ -920,6 +1047,43 @@ impl BridgeProcess {
         let response =
             ipc_tool_request(&socket_path, self.daemon_pid(), &Value::Object(obj.clone()))?;
         serde_json::from_str(&response).context("failed to parse search response")
+    }
+
+    /// The `tool/grep` leg of [`Self::call_search_raw`]: runs the CLI and
+    /// rebuilds the retired IPC response object.
+    fn grep_raw(&self, args: &Value) -> Result<Value> {
+        let _ = self.wait_for_ipc_socket()?;
+        let out = self.grep_cli_output(args)?;
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        // Exit 2 is the usage-error contract (bug 105): the old wire carried
+        // it as an `error` field.
+        if out.status.code() == Some(2) {
+            return Ok(json!({ "output": "", "error": stderr.trim_end() }));
+        }
+        if !out.status.success() {
+            bail!(
+                "catenary grep exited {:?}; stderr:\n{stderr}",
+                out.status.code()
+            );
+        }
+        let body = Self::grep_cli_body(&out.stdout);
+        let count_requested = args.get("count").and_then(Value::as_bool) == Some(true);
+        if count_requested {
+            // `N matches in M files[ (suffix)]` → the old count fields.
+            let mut words = body.split_whitespace();
+            let matches: u64 = words
+                .next()
+                .context("count line starts with the match tally")?
+                .parse()
+                .with_context(|| format!("parse match tally from: {body}"))?;
+            let files: u64 = words
+                .nth(2)
+                .context("count line carries the file tally")?
+                .parse()
+                .with_context(|| format!("parse file tally from: {body}"))?;
+            return Ok(json!({ "output": "", "matches": matches, "files": files }));
+        }
+        Ok(json!({ "output": body }))
     }
 
     /// Calls a tool via the IPC socket and returns the raw result object.

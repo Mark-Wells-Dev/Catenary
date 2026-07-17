@@ -20,10 +20,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, warn};
 
 use crate::bridge::EditingGuardrail;
+use crate::bridge::GlobOutcome;
 use crate::bridge::HookRouter;
 use crate::bridge::filesystem_manager::Root;
 use crate::bridge::session::Session;
-use crate::bridge::{GlobOutcome, GrepFlags, GrepOutcome, GrepSkips, HunkChunk, ShapedOutput};
 use crate::companions::expand_companions;
 use crate::hook::{HookRequest, HookResponseEnvelope, emit_hook_event, hook_outcome_level};
 use crate::logging::LoggingServer;
@@ -61,9 +61,11 @@ pub fn socket_path() -> PathBuf {
 }
 
 // ── IPC request/response types for CLI tool commands ─────────────
-
-/// IPC method string for grep requests.
-pub const METHOD_GREP: &str = "tool/grep";
+//
+// Grep has no envelope types here anymore: `catenary grep` cut over to the
+// streamed hitstream engine in ws43-02 (`METHOD_HITSTREAM` below), and the
+// `tool/grep` executor arm retired with it. The glob request/response pair
+// stays until glob's own cutover (ws43-03).
 
 /// IPC method string for glob requests.
 pub const METHOD_GLOB: &str = "tool/glob";
@@ -93,229 +95,6 @@ fn search_timestamp() -> String {
 /// caller reported no cwd.
 fn search_cwd(cwd: Option<&Path>) -> String {
     cwd.map(|p| p.display().to_string()).unwrap_or_default()
-}
-
-/// IPC request payload for `catenary grep`.
-///
-/// Sent as a JSON line over the daemon IPC socket with
-/// `"method": "tool/grep"`. [`to_params`](Self::to_params) resolves
-/// relative paths and `exclude` patterns against `cwd` before
-/// dispatching to the grep pipeline.
-///
-/// Wire format:
-/// ```json
-/// {"method": "tool/grep", "cwd": "/path", "pattern": "foo", "paths": ["src/main.rs"]}
-/// ```
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "1:1 with the clap-parsed grep flags plus the transport-only chunked capability"
-)]
-pub struct GrepRequest {
-    /// Working directory from the CLI process.
-    ///
-    /// `None` when the caller has no meaningful cwd (e.g. test fixtures
-    /// using `spawn_in_state`). When absent, the daemon falls back to
-    /// searching all workspace roots.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<PathBuf>,
-    /// Search pattern (regex, supports `|` for alternation).
-    pub pattern: String,
-    /// Literal file/directory paths to scope the search.
-    ///
-    /// All positional arguments are concrete filesystem paths — the
-    /// shell is the only glob engine. These bypass glob matching and
-    /// are used as direct search roots.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub paths: Vec<PathBuf>,
-    /// Glob patterns to exclude from matches (repeatable `--exclude-pattern`).
-    ///
-    /// Empty for a query with no exclusion. Each pattern is resolved against
-    /// `cwd` in [`Self::to_params`] and matched as a union daemon-side. Accepts
-    /// a lone string or an array on the wire (a single-pattern spelling still
-    /// works).
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "deserialize_string_or_seq"
-    )]
-    pub exclude: Vec<String>,
-    /// Include files ignored by `.gitignore`.
-    #[serde(default)]
-    pub include_gitignored: bool,
-    /// Include hidden files and directories.
-    #[serde(default)]
-    pub include_hidden: bool,
-    /// Return a match/file count instead of rendered results (`--count`).
-    #[serde(default)]
-    pub count: bool,
-    /// Protocol capability (misc 140 phase 2): the CLI understands the chunked
-    /// [`GrepFrame`] response stream. A daemon that predates framing ignores this
-    /// unknown field and replies with the single-envelope [`GrepResponse`]; the
-    /// CLI detects that by the absent frame tag and parses the legacy envelope.
-    /// Absent (a legacy CLI) → the daemon replies with the single envelope, which
-    /// the legacy CLI parses. Every version combination degrades honestly. The
-    /// field is transport-only — never forwarded into the grep pipeline params.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub chunked: bool,
-    /// Ripgrep-parity flags (`-i`/`-s`/`-w`/`-F`/`-v`/`-l`, context, `-g`/
-    /// `--type`). Flattened onto the wire so the request stays a flat object and
-    /// a flagless query serializes exactly as before (each inner field carries
-    /// its own `#[serde(default)]`, so a minimal payload still deserializes).
-    #[serde(flatten)]
-    pub flags: GrepFlags,
-}
-
-impl GrepRequest {
-    /// Resolves relative paths against `cwd` and produces a
-    /// `GrepInput`-compatible JSON value for the grep pipeline.
-    ///
-    /// - Paths are resolved against `cwd` (relative → absolute).
-    /// - `exclude` is resolved against `cwd`.
-    /// - `targets_hidden` is checked on paths to auto-enable
-    ///   `include_hidden` for explicit hidden targets like `.gitignore`.
-    fn to_params(&self) -> serde_json::Value {
-        let mut include_hidden = self.include_hidden;
-
-        let mut params = serde_json::json!({
-            "pattern": self.pattern,
-            "include_gitignored": self.include_gitignored,
-            "count": self.count,
-        });
-
-        if self.paths.is_empty() {
-            // No paths — cwd-scoped search. Pass cwd so the daemon
-            // scopes to the agent's working directory.
-            if let Some(ref cwd) = self.cwd {
-                params["cwd"] = serde_json::Value::String(cwd.to_string_lossy().into_owned());
-            }
-        } else {
-            // Literal paths — resolve relative paths against cwd,
-            // check for hidden targeting.
-            for p in &self.paths {
-                let s = p.to_string_lossy();
-                if !p.is_absolute() && crate::bridge::session::ResolvedGlob::targets_hidden(&s) {
-                    include_hidden = true;
-                }
-            }
-            params["paths"] = serde_json::Value::Array(
-                self.paths
-                    .iter()
-                    .map(|p| {
-                        let s = if p.is_absolute() {
-                            p.to_string_lossy().into_owned()
-                        } else {
-                            self.cwd.as_ref().map_or_else(
-                                || p.to_string_lossy().into_owned(),
-                                |cwd| cwd.join(p).to_string_lossy().into_owned(),
-                            )
-                        };
-                        serde_json::Value::String(s)
-                    })
-                    .collect(),
-            );
-        }
-        if !self.exclude.is_empty() {
-            // `--exclude-pattern` is repeatable (bug 89): resolve each pattern
-            // against `cwd` independently and pass the whole set so every
-            // collected pattern reaches the daemon-side matcher (the bug-73
-            // leak class — no pattern silently dropped).
-            params["exclude"] = serde_json::Value::Array(
-                self.exclude
-                    .iter()
-                    .map(|exclude| {
-                        let resolved = self
-                            .cwd
-                            .as_ref()
-                            .map_or_else(|| exclude.clone(), |cwd| resolve_relative(exclude, cwd));
-                        serde_json::Value::String(resolved)
-                    })
-                    .collect(),
-            );
-        }
-        params["include_hidden"] = serde_json::Value::Bool(include_hidden);
-
-        // Merge the ripgrep-parity flags as flat keys so the daemon-side
-        // `GrepInput` (which flattens the same `GrepFlags`) deserializes them.
-        if let (Some(params_obj), Ok(serde_json::Value::Object(flag_obj))) =
-            (params.as_object_mut(), serde_json::to_value(&self.flags))
-        {
-            for (k, v) in flag_obj {
-                params_obj.insert(k, v);
-            }
-        }
-
-        params
-    }
-}
-
-/// IPC response for `catenary grep`.
-///
-/// Returned as a JSON line over the daemon IPC socket.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct GrepResponse {
-    /// Rendered grep output (empty for a `--count` response).
-    pub output: String,
-    /// Matching-line count, present only for a `--count` response.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub matches: Option<usize>,
-    /// Distinct-file count, present only for a `--count` response.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub files: Option<usize>,
-    /// Files in the search scope skipped instead of searched (misc 135, bug 62).
-    /// Empty for the common all-searched query, so a normal response is byte-for-
-    /// byte unchanged on the wire (the field is omitted when empty).
-    #[serde(default, skip_serializing_if = "GrepSkips::is_empty")]
-    pub skipped: GrepSkips,
-    /// A usage error — an uncompilable pattern (bug 105) or invalid argument —
-    /// that the search never ran. `Some` routes the CLI to stderr + exit 2 on
-    /// both the bare and `--count` forms (rg's exit-2 parity), instead of a
-    /// zero indistinguishable from a genuine no-match. Omitted (None) for every
-    /// successful query, so a normal response is byte-for-byte unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// One frame of a chunked `catenary grep` response (misc 140 phase 2).
-///
-/// The framed grep response is a stream of [`GrepFrame::Chunk`] frames — each
-/// carrying one file's rendered hunk, in global (file, line) sort order —
-/// terminated by exactly one [`GrepFrame::End`] frame carrying the tallies the
-/// single-envelope [`GrepResponse`] used to carry (count totals, skip records).
-/// The CLI concatenates the chunk payloads into the rendered output and reads
-/// the terminator for the metadata, reproducing the pre-framing response
-/// byte-for-byte.
-///
-/// Each frame serializes to one JSON line, exactly like the pre-framing envelope,
-/// so the transport is unchanged. The internally-tagged `"frame"` field is the
-/// version-skew hinge: it distinguishes a frame from a legacy single-envelope
-/// response (which has no `"frame"` key), and an unrecognized tag deserializes to
-/// a comprehensible error rather than a silent misparse.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "frame", rename_all = "snake_case")]
-pub enum GrepFrame {
-    /// A slice of the rendered output — one file's hunk — in sort order.
-    Chunk {
-        /// UTF-8 output bytes for this chunk.
-        data: String,
-    },
-    /// The terminator, carrying the same tallies as [`GrepResponse`].
-    End {
-        /// Matching-line count, present only for a `--count` response.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        matches: Option<usize>,
-        /// Distinct-file count, present only for a `--count` response.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        files: Option<usize>,
-        /// Files in the search scope skipped instead of searched.
-        #[serde(default, skip_serializing_if = "GrepSkips::is_empty")]
-        skipped: GrepSkips,
-        /// A usage error (uncompilable pattern, bug 105) that aborted the
-        /// search. `Some` routes the CLI to stderr + exit 2. Omitted for every
-        /// successful query.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
-    },
 }
 
 /// IPC request payload for `catenary glob`.
@@ -3144,9 +2923,18 @@ struct HitstreamGrepAnnotator<'a> {
 
 #[cfg(unix)]
 impl crate::hitstream::BatchEnricher for HitstreamGrepAnnotator<'_> {
+    /// The walk-level observation nudge (ws43-02 reap parity) delegates
+    /// straight to the migrated enricher — no auto-mount here: observations
+    /// are coherence bookkeeping for roots already served, not a query that
+    /// earns a mount, exactly as the executor's nudge never mounted.
+    async fn observe_walk(&self, observed: Vec<(PathBuf, i64)>, reap_scopes: Option<Vec<PathBuf>>) {
+        self.inner.observe_walk(observed, reap_scopes).await;
+    }
+
     async fn enrich(
         &self,
         hits: Vec<crate::hitstream::WireHit>,
+        observed: Vec<(PathBuf, i64)>,
     ) -> Result<Vec<crate::hitstream::frame::AnnotatedHit>> {
         // The batch's distinct files are the touched paths — dedup keeps the
         // mount pass linear in files, not hits.
@@ -3157,7 +2945,7 @@ impl crate::hitstream::BatchEnricher for HitstreamGrepAnnotator<'_> {
             .into_iter()
             .collect();
         ensure_ephemeral_mounts(self.ctx, &touched, Instant::now(), "").await;
-        self.inner.enrich(hits).await
+        self.inner.enrich(hits, observed).await
     }
 }
 
@@ -5218,163 +5006,28 @@ fn merged_nudge_message(merged: &[PathBuf]) -> String {
     }
 }
 
-/// Streams a grep outcome as a chunk-frame sequence (misc 140 phase 2).
-///
-/// One [`GrepFrame::Chunk`] per rendered hunk in global sort order, then one
-/// [`GrepFrame::End`] terminator carrying the count/skip tallies. Chunk payloads
-/// are the raw hunk bytes (trailing newlines intact); the CLI concatenates them
-/// and applies the trailing-whitespace trim, reproducing the pre-framing output
-/// byte-for-byte. Spooled hunks are read one at a time on a blocking task so a
-/// giant hunk never pins the runtime — peak memory is the path index plus one
-/// hunk in flight.
-///
-/// # Errors
-///
-/// Returns an error if a spool read fails or the socket write fails.
-#[cfg(unix)]
-async fn write_grep_frames<W>(writer: &mut W, outcome: Result<GrepOutcome>) -> Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    match outcome {
-        Ok(GrepOutcome::Count {
-            matches,
-            files,
-            skipped,
-        }) => {
-            write_grep_frame(
-                writer,
-                &GrepFrame::End {
-                    matches: Some(matches),
-                    files: Some(files),
-                    skipped,
-                    error: None,
-                },
-            )
-            .await?;
-        }
-        Ok(GrepOutcome::Rendered { output, skipped }) => {
-            let (chunks, spool) = output.into_parts();
-            for chunk in chunks {
-                let data = match chunk {
-                    HunkChunk::InMemory(s) => s,
-                    HunkChunk::Spooled { offset, len } => {
-                        let spool = spool
-                            .clone()
-                            .ok_or_else(|| anyhow!("spooled grep hunk without a spool"))?;
-                        let bytes =
-                            tokio::task::spawn_blocking(move || spool.read_hunk(offset, len))
-                                .await
-                                .map_err(|e| anyhow!("grep spool read task failed: {e}"))??;
-                        String::from_utf8(bytes)
-                            .map_err(|e| anyhow!("grep spool hunk is not utf-8: {e}"))?
-                    }
-                };
-                write_grep_frame(writer, &GrepFrame::Chunk { data }).await?;
-            }
-            write_grep_frame(
-                writer,
-                &GrepFrame::End {
-                    matches: None,
-                    files: None,
-                    skipped,
-                    error: None,
-                },
-            )
-            .await?;
-        }
-        Err(e) => {
-            // A grep error is a usage error (bug 105): no chunk, and the
-            // terminator carries the parse error so the CLI prints it on stderr
-            // and exits 2 — never a zero indistinguishable from a no-match.
-            write_grep_frame(
-                writer,
-                &GrepFrame::End {
-                    matches: None,
-                    files: None,
-                    skipped: GrepSkips::default(),
-                    error: Some(format!("{e:#}")),
-                },
-            )
-            .await?;
-        }
-    }
-    Ok(())
-}
-
-/// Writes one [`GrepFrame`] as a single JSON line.
-///
-/// # Errors
-///
-/// Returns an error if serialization or the socket write fails.
-#[cfg(unix)]
-async fn write_grep_frame<W>(writer: &mut W, frame: &GrepFrame) -> Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::AsyncWriteExt;
-    let mut bytes = serde_json::to_vec(frame)?;
-    bytes.push(b'\n');
-    writer.write_all(&bytes).await?;
-    Ok(())
-}
-
-/// Materializes a [`ShapedOutput`] into the single trimmed output string the
-/// legacy single-envelope [`GrepResponse`] carries — the version-skew compat
-/// path for a CLI that predates chunked framing.
-///
-/// Reads every hunk (including spooled ones) and applies the trailing-whitespace
-/// trim the pre-framing render applied, so the bytes match a pre-framing daemon
-/// exactly. Unbounded in memory, but reached only by a legacy CLI.
-///
-/// # Errors
-///
-/// Returns an error if a spool read fails or a hunk is not valid UTF-8.
-#[cfg(unix)]
-fn shaped_to_string(output: ShapedOutput) -> Result<String> {
-    let (chunks, spool) = output.into_parts();
-    let mut out = String::new();
-    for chunk in chunks {
-        match chunk {
-            HunkChunk::InMemory(s) => out.push_str(&s),
-            HunkChunk::Spooled { offset, len } => {
-                let spool = spool
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("spooled grep hunk without a spool"))?;
-                let bytes = spool.read_hunk(offset, len)?;
-                out.push_str(
-                    &String::from_utf8(bytes)
-                        .map_err(|e| anyhow!("grep spool hunk is not utf-8: {e}"))?,
-                );
-            }
-        }
-    }
-    let trimmed_len = out.trim_end().len();
-    out.truncate(trimmed_len);
-    Ok(out)
-}
-
 // ── Daemon-less in-process search (bug 80, leg 4) ────────────────────
 //
-// When the daemon is down, `catenary grep`/`glob` degrade honestly: they run
-// the daemon's own search pipeline in-process with no LSP manager, so stdout is
+// When the daemon is down, `catenary glob` degrades honestly: it runs the
+// daemon's own search pipeline in-process with no LSP manager, so stdout is
 // byte-identical to a daemon-served answer over a tree with no language-server
-// coverage. These two functions are the in-process twins of the `METHOD_GREP` /
-// `METHOD_GLOB` daemon dispatch arms — same `to_params`, same `execute`, same
-// outcome→response conversion (`shaped_to_string`, the `no_match_indices`
-// remap) — so the two paths cannot drift. The honesty marker (`[no daemon …]`)
-// is the CLI's responsibility and lives on stderr only; these produce the
-// stdout body unchanged.
+// coverage. This is the in-process twin of the `METHOD_GLOB` daemon dispatch
+// arm — same `to_params`, same `execute`, same outcome→response conversion
+// (the `no_match_indices` remap) — so the two paths cannot drift. The honesty
+// marker (`[no daemon …]`) is the CLI's responsibility and lives on stderr
+// only; this produces the stdout body unchanged. Grep's twin retired with the
+// ws43-02 cutover: daemon-less `catenary grep` is now simply the hitstream
+// engine's unannotated sink — the CLI owns the walk in both modes.
 
 /// A daemon-less search result paired with an optional config-degradation
 /// advisory (bug 110).
 ///
-/// `grep`/`glob` never consume the `[commands]` section, so a quarantined
+/// `glob` never consumes the `[commands]` section, so a quarantined
 /// section must only degrade *loudly*, never fatally: the search still runs on
 /// the valid config remainder, and `quarantine_warning` — when present — carries
 /// the single stderr line the CLI prints once per invocation to name the
-/// quarantined section(s). Kept off the wire [`GrepResponse`]/[`GlobResponse`]
-/// types: the advisory is a daemon-less-CLI concern, printed at the `print_stderr`
+/// quarantined section(s). Kept off the wire [`GlobResponse`]
+/// type: the advisory is a daemon-less-CLI concern, printed at the `print_stderr`
 /// boundary in `main.rs`, not part of the daemon protocol.
 #[cfg(unix)]
 pub struct DaemonlessOutcome<T> {
@@ -5383,65 +5036,6 @@ pub struct DaemonlessOutcome<T> {
     /// A single stderr advisory naming any quarantined config section(s), or
     /// `None` on a clean load. Printed once per CLI invocation.
     pub quarantine_warning: Option<String>,
-}
-
-/// Runs a `catenary grep` request in-process, daemon-less (bug 80, leg 4).
-///
-/// Builds a [`DaemonlessSearch`] from the loaded config, resolves the request
-/// with the same [`GrepRequest::to_params`] the daemon uses, and runs the grep
-/// pipeline in-process. Returns the same [`GrepResponse`] the daemon would build
-/// for a tree with no LSP coverage, paired with any config-quarantine advisory
-/// (bug 110) — grep never consumes `[commands]`, so a quarantined section only
-/// degrades loudly. `cancel` never fires (no client-disconnect race — the CLI
-/// awaits its own result).
-///
-/// # Errors
-///
-/// Returns an error if the config cannot be loaded or the grep pipeline faults.
-#[cfg(unix)]
-pub async fn run_grep_daemon_less(req: &GrepRequest) -> Result<DaemonlessOutcome<GrepResponse>> {
-    let config = crate::config::Config::load().context("load config for daemon-less grep")?;
-    let quarantine_warning = config.quarantined.summary();
-    let search = crate::bridge::DaemonlessSearch::from_config(config);
-
-    let params = req.to_params();
-    let cancel = CancellationToken::new();
-    let outcome = search.grep.execute(&params, None, &cancel).await;
-
-    let response = match outcome {
-        Ok(GrepOutcome::Rendered { output, skipped }) => GrepResponse {
-            output: shaped_to_string(output)?,
-            matches: None,
-            files: None,
-            skipped,
-            error: None,
-        },
-        Ok(GrepOutcome::Count {
-            matches,
-            files,
-            skipped,
-        }) => GrepResponse {
-            output: String::new(),
-            matches: Some(matches),
-            files: Some(files),
-            skipped,
-            error: None,
-        },
-        // A usage error (uncompilable pattern, bug 105): stderr + exit 2 at the
-        // CLI, on both bare and `--count`, matching the daemon-served path.
-        Err(e) => GrepResponse {
-            output: String::new(),
-            matches: None,
-            files: None,
-            skipped: GrepSkips::default(),
-            error: Some(format!("{e:#}")),
-        },
-    };
-
-    Ok(DaemonlessOutcome {
-        response,
-        quarantine_warning,
-    })
 }
 
 /// Runs a `catenary glob` request in-process, daemon-less (bug 80, leg 4).
@@ -6210,19 +5804,22 @@ async fn handle_hook_dispatch(
 
     // ── Hit-batch annotation stream (ws43) ──────────────────────
     //
-    // `tool/hitstream` is opened by the CLI-owns-the-walk engine. The method
-    // line has already been read; the CLI now streams `HitFrame` batches on this
-    // same connection. The daemon annotates each batch under budget with the
-    // REAL grep enrichment (ws43-02: the executor's LSP enrichment migrated into
-    // [`crate::bridge::GrepHitEnricher`]) and streams `AnnotationFrame` batches
-    // back, preserving batch order. The WS31 observation nudge and the query
-    // auto-mount (with its ws43-05 sensitive-path gate) ride each annotation
-    // call, keyed on the canonical hit paths the batches carry. A malformed
-    // frame or a socket fault tears the connection down; the CLI, seeing an
-    // incomplete annotation stream, degrades to the unannotated stdout stream —
-    // the same fallback as daemon-absent (degrade-only). This arm is a native
-    // async citizen: read batch → await (budgeted) → write batch, no lock guard
-    // held across an await.
+    // `tool/hitstream` is opened by `catenary grep` — since ws43-02 the ONLY
+    // grep surface the daemon serves (the `tool/grep` executor arm retired).
+    // The method line has already been read; the CLI now streams `HitFrame`
+    // batches on this same connection. The daemon annotates each batch under
+    // budget with the REAL grep enrichment (the executor's LSP enrichment,
+    // migrated into [`crate::bridge::GrepHitEnricher`]) and streams
+    // `AnnotationFrame` batches back, preserving batch order. The per-batch
+    // WS31 hit nudge and the query auto-mount (with its ws43-05 sensitive-path
+    // gate) ride each annotation call, keyed on the canonical hit paths the
+    // batches carry; the walk-level observation set on the `End` terminator
+    // feeds the executor's once-per-walk nudge/reap rule (`observe_walk`). A
+    // malformed frame or a socket fault tears the connection down; the CLI,
+    // seeing an incomplete annotation stream, completes its results
+    // unannotated in place — the same output as daemon-absent (degrade-only).
+    // This arm is a native async citizen: read batch → await (budgeted) →
+    // write batch, no lock guard held across an await.
     if method == METHOD_HITSTREAM {
         let annotator = HitstreamGrepAnnotator {
             ctx: &ctx,
@@ -6235,167 +5832,6 @@ async fn handle_hook_dispatch(
             crate::hitstream::ANNOTATION_BATCH_BUDGET,
         )
         .await?;
-        return Ok(());
-    }
-
-    // ── Grep query ──────────────────────────────────────────────
-    //
-    // `tool/grep` is sent by `catenary grep`. Resolves relative
-    // patterns against `cwd`, dispatches to the grep pipeline, and
-    // returns the rendered output as a `GrepResponse`.
-    if method == METHOD_GREP {
-        let grep_req: GrepRequest = serde_json::from_value(raw.clone())
-            .map_err(|e| anyhow!("invalid grep request: {e}"))?;
-
-        let params = grep_req.to_params();
-        let parent_id = uuid::Uuid::new_v4().to_string();
-        let cancel = CancellationToken::new();
-
-        // Per-invocation search scope: the firehose shards this grep into its
-        // own grep/<ts>_<uuid>.jsonl. The span carries the scope fields onto the
-        // command record and the LSP requests it instruments. (Responses, emitted
-        // on the shared LSP reader loop, fall back to the server file — same as
-        // session-scoped LSP responses.)
-        let search_ts = search_timestamp();
-        let cwd = search_cwd(grep_req.cwd.as_deref());
-        let span = tracing::info_span!(
-            "search",
-            search_id = %parent_id,
-            tool = "grep",
-            search_ts = %search_ts,
-            cwd = %cwd,
-        );
-
-        span.in_scope(|| {
-            emit_hook_event(
-                tracing::Level::INFO,
-                "cli",
-                &method,
-                Some(&parent_id),
-                &raw.to_string(),
-                "incoming hook",
-            );
-        });
-
-        // Ephemeral mount (ticket 02): a searched path outside every mounted
-        // root mounts its enclosing project root so the hits are LSP-enriched
-        // from the fresh server. Refreshes the idle clock of any ephemeral root
-        // the paths fall under. Instrumented with the search span so the mount
-        // event shards into this grep's firehose scope.
-        let grep_touched = resolve_touched_paths(&grep_req.paths, grep_req.cwd.as_deref());
-        ensure_ephemeral_mounts(&ctx, &grep_touched, Instant::now(), "")
-            .instrument(span.clone())
-            .await;
-
-        // Bound concurrent walks so one session's monster search cannot starve
-        // the others (misc 140 phase 2). Held for the walk, released before the
-        // results stream.
-        let search_permit = ctx.search_limiter.acquire().await;
-
-        // Race grep execution against client disconnect so a killed
-        // CLI process doesn't leave the pipeline running indefinitely.
-        let raced = race_against_disconnect(
-            ctx.primary
-                .grep
-                .execute(&params, Some(&parent_id), &cancel)
-                .instrument(span.clone()),
-            &mut buf_reader,
-        )
-        .await;
-        let Some(outcome) = raced else {
-            // The token reaches walk internals that dropping the execute
-            // future alone cannot stop.
-            cancel.cancel();
-            debug!(
-                source = Source::DaemonDispatch.as_str(),
-                "grep client disconnected — query cancelled",
-            );
-            span.in_scope(|| {
-                emit_hook_event(
-                    tracing::Level::INFO,
-                    "cli",
-                    &method,
-                    Some(&parent_id),
-                    "client disconnected",
-                    "outgoing hook response",
-                );
-            });
-            // The dropped `ShapedOutput` (if any) unlinks its spool.
-            return Ok(());
-        };
-
-        // The walk is done — free the permit so a queued search can proceed
-        // while these results stream.
-        drop(search_permit);
-
-        if grep_req.chunked {
-            // Chunked framing (misc 140 phase 2): stream one chunk frame per
-            // hunk in global sort order, then a terminator carrying the tallies.
-            // Peak memory is the path index plus one hunk in flight; the CLI
-            // concatenates the chunk payloads and trims, reproducing the
-            // pre-framing output byte-for-byte.
-            write_grep_frames(&mut writer, outcome).await?;
-            span.in_scope(|| {
-                emit_hook_event(
-                    tracing::Level::INFO,
-                    "cli",
-                    &method,
-                    Some(&parent_id),
-                    "streamed grep frames",
-                    "outgoing hook response",
-                );
-            });
-            writer.shutdown().await?;
-            return Ok(());
-        }
-
-        // Legacy single-envelope response (a CLI that predates framing): build
-        // the whole output into one `GrepResponse`. Unbounded in memory, but
-        // reached only by a pre-framing CLI — a transient version-skew path.
-        let response = match outcome {
-            Ok(GrepOutcome::Rendered { output, skipped }) => GrepResponse {
-                output: shaped_to_string(output)?,
-                matches: None,
-                files: None,
-                skipped,
-                error: None,
-            },
-            Ok(GrepOutcome::Count {
-                matches,
-                files,
-                skipped,
-            }) => GrepResponse {
-                output: String::new(),
-                matches: Some(matches),
-                files: Some(files),
-                skipped,
-                error: None,
-            },
-            Err(e) => GrepResponse {
-                output: String::new(),
-                matches: None,
-                files: None,
-                skipped: GrepSkips::default(),
-                error: Some(format!("{e:#}")),
-            },
-        };
-
-        let mut payload = serde_json::to_vec(&response)?;
-
-        span.in_scope(|| {
-            emit_hook_event(
-                tracing::Level::INFO,
-                "cli",
-                &method,
-                Some(&parent_id),
-                std::str::from_utf8(&payload).unwrap_or_default(),
-                "outgoing hook response",
-            );
-        });
-
-        payload.push(b'\n');
-        writer.write_all(&payload).await?;
-        writer.shutdown().await?;
         return Ok(());
     }
 
@@ -9768,6 +9204,56 @@ mod tests {
         let mut line = String::new();
         buf_reader.read_line(&mut line).await.expect("read");
         line
+    }
+
+    /// Streams one single-hit batch through the `tool/hitstream` arm — the
+    /// grep surface since the ws43-02 cutover — and returns the raw annotation
+    /// frames. The query-side trigger for the mount tests: the annotator's
+    /// auto-mount (and its sensitive-path gate) fires per batch, keyed on the
+    /// batch's hit paths.
+    async fn hitstream_annotate_one(ipc_path: &Path, file: &Path, text: &str) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let stream = tokio::net::UnixStream::connect(ipc_path)
+            .await
+            .expect("connect to IPC socket");
+        let (reader, mut writer) = stream.into_split();
+
+        let hit = crate::hitstream::WireHit {
+            path: file.to_path_buf(),
+            line: 1,
+            column: 1,
+            text: text.to_string(),
+        };
+        let mut payload = serde_json::to_vec(&serde_json::json!({ "method": METHOD_HITSTREAM }))
+            .expect("serialize handshake");
+        payload.push(b'\n');
+        payload.extend(
+            serde_json::to_vec(&crate::hitstream::HitFrame::batch(0, vec![hit]))
+                .expect("serialize batch"),
+        );
+        payload.push(b'\n');
+        payload.extend(
+            serde_json::to_vec(&crate::hitstream::HitFrame::end(1)).expect("serialize end"),
+        );
+        payload.push(b'\n');
+        writer.write_all(&payload).await.expect("write hit frames");
+
+        let mut buf_reader = BufReader::new(reader);
+        let mut out = String::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = buf_reader.read_line(&mut line).await.expect("read frame");
+            if n == 0 {
+                break;
+            }
+            out.push_str(&line);
+            if line.contains("\"frame\":\"end\"") {
+                break;
+            }
+        }
+        out
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13801,16 +13287,9 @@ mod tests {
             let _ = m.accept_loop().await;
         });
 
-        // A grep touching the out-of-root file mounts its enclosing project root.
-        let _ = hook_roundtrip(
-            &ipc_path,
-            &serde_json::json!({
-                "method": "tool/grep",
-                "pattern": "hello",
-                "paths": [file.display().to_string()],
-            }),
-        )
-        .await;
+        // A grep hit-batch touching the out-of-root file mounts its enclosing
+        // project root (the annotator's per-batch auto-mount, ws43-02).
+        let _ = hitstream_annotate_one(&ipc_path, &file, "hello").await;
 
         let classes = roots_ls_classes(&ipc_path).await;
         let entry = classes
@@ -13844,18 +13323,11 @@ mod tests {
             let _ = m.accept_loop().await;
         });
 
-        let resp = hook_roundtrip(
-            &ipc_path,
-            &serde_json::json!({
-                "method": "tool/grep",
-                "pattern": "hello",
-                "paths": [secret.display().to_string()],
-            }),
-        )
-        .await;
-        // The hit still streams — the gate is on mount state, never on results.
+        let resp = hitstream_annotate_one(&ipc_path, &secret, "hello secret").await;
+        // The hit still streams — the gate is on mount state, never on results:
+        // the annotation-batch echoes the hit (unenriched) rather than dropping it.
         assert!(
-            resp.contains("hello"),
+            resp.contains("hello secret"),
             "the sensitive hit is still returned (unenriched): {resp}",
         );
 
@@ -13888,17 +13360,10 @@ mod tests {
             let _ = m.accept_loop().await;
         });
 
-        // Mount the ephemeral root via an out-of-root grep (the one query allowed
-        // — mounting is a query's job; refreshing is the hook seam's).
-        let _ = hook_roundtrip(
-            &ipc_path,
-            &serde_json::json!({
-                "method": "tool/grep",
-                "pattern": "hello",
-                "paths": [file.display().to_string()],
-            }),
-        )
-        .await;
+        // Mount the ephemeral root via an out-of-root grep hit-batch (the one
+        // query allowed — mounting is a query's job; refreshing is the hook
+        // seam's).
+        let _ = hitstream_annotate_one(&ipc_path, &file, "hello").await;
 
         // Age the ephemeral clock deep into the idle window by hand (no wall-clock
         // wait): set its last-activity to a stale instant, so absent a refresh the
@@ -14025,16 +13490,8 @@ mod tests {
             let _ = m.accept_loop().await;
         });
 
-        // Mount ephemerally via an out-of-root grep.
-        let _ = hook_roundtrip(
-            &ipc_path,
-            &serde_json::json!({
-                "method": "tool/grep",
-                "pattern": "hello",
-                "paths": [file.display().to_string()],
-            }),
-        )
-        .await;
+        // Mount ephemerally via an out-of-root grep hit-batch.
+        let _ = hitstream_annotate_one(&ipc_path, &file, "hello").await;
         assert!(
             roots_ls_classes(&ipc_path)
                 .await
@@ -14319,160 +13776,6 @@ mod tests {
 
     // ── IPC request/response type tests ──────────────────────────
 
-    /// `GrepRequest` roundtrips through JSON with all fields.
-    #[test]
-    fn grep_request_roundtrip_full() {
-        let req = GrepRequest {
-            cwd: Some(PathBuf::from("/home/user/project")),
-            pattern: "TODO|FIXME".to_string(),
-            paths: vec![PathBuf::from("src/main.rs"), PathBuf::from("src/lib.rs")],
-            exclude: vec!["tests/**".to_string(), "vendor/**".to_string()],
-            include_gitignored: true,
-            include_hidden: false,
-            count: false,
-            chunked: true,
-            flags: GrepFlags::default(),
-        };
-        let json = serde_json::to_string(&req).expect("serialize");
-        let parsed: GrepRequest = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(parsed.cwd, Some(PathBuf::from("/home/user/project")));
-        assert_eq!(parsed.pattern, "TODO|FIXME");
-        assert_eq!(
-            parsed.paths,
-            vec![PathBuf::from("src/main.rs"), PathBuf::from("src/lib.rs")]
-        );
-        // A repeated `--exclude-pattern` roundtrips as a full set (bug 89).
-        assert_eq!(
-            parsed.exclude,
-            vec!["tests/**".to_string(), "vendor/**".to_string()]
-        );
-        assert!(parsed.include_gitignored);
-        assert!(!parsed.include_hidden);
-    }
-
-    /// `GrepRequest` deserializes with defaults for optional fields.
-    #[test]
-    fn grep_request_minimal() {
-        let json = r#"{"cwd":"/tmp","pattern":"foo"}"#;
-        let req: GrepRequest = serde_json::from_str(json).expect("deserialize");
-        assert_eq!(req.cwd, Some(PathBuf::from("/tmp")));
-        assert_eq!(req.pattern, "foo");
-        assert!(req.exclude.is_empty());
-        assert!(!req.include_gitignored);
-        assert!(!req.include_hidden);
-    }
-
-    /// `GrepRequest` skips empty/`None` fields in serialized output.
-    #[test]
-    fn grep_request_skips_none_fields() {
-        let req = GrepRequest {
-            cwd: Some(PathBuf::from("/tmp")),
-            pattern: "foo".to_string(),
-            paths: vec![],
-            exclude: vec![],
-            include_gitignored: false,
-            include_hidden: false,
-            count: false,
-            chunked: false,
-            flags: GrepFlags::default(),
-        };
-        let json = serde_json::to_string(&req).expect("serialize");
-        assert!(!json.contains("paths"), "empty paths should be skipped");
-        assert!(!json.contains("exclude"), "empty exclude should be skipped");
-        // Default ripgrep-parity flags are skipped too — a flagless query
-        // serializes exactly as before this surface existed.
-        assert!(
-            !json.contains("ignore_case"),
-            "default flags should be skipped"
-        );
-        assert!(!json.contains("globs"), "empty globs should be skipped");
-        assert!(
-            !json.contains("chunked"),
-            "chunked:false should be skipped — a legacy CLI's wire form is unchanged"
-        );
-    }
-
-    /// `GrepResponse` roundtrips through JSON.
-    #[test]
-    fn grep_response_roundtrip() {
-        let resp = GrepResponse {
-            output: "file.rs:10 matched line".to_string(),
-            matches: None,
-            files: None,
-            skipped: GrepSkips::default(),
-            error: None,
-        };
-        let json = serde_json::to_string(&resp).expect("serialize");
-        // An all-searched response omits `skipped` entirely — the wire is byte-
-        // for-byte what it was before misc 135.
-        assert!(!json.contains("skipped"), "empty skips are omitted: {json}");
-        assert!(
-            !json.contains("error"),
-            "a successful response omits the error field: {json}"
-        );
-        let parsed: GrepResponse = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(parsed.output, "file.rs:10 matched line");
-        assert!(parsed.matches.is_none());
-        assert!(parsed.files.is_none());
-        assert!(parsed.skipped.is_empty());
-        assert!(parsed.error.is_none());
-    }
-
-    /// Chunked grep frames (misc 140 phase 2) roundtrip, carry the `"frame"`
-    /// version-skew tag, and reject an unrecognized kind rather than misparse.
-    #[test]
-    fn grep_frame_roundtrips_and_carries_version_tag() {
-        let chunk = GrepFrame::Chunk {
-            data: "src/a.rs:1:hit\n".to_string(),
-        };
-        let line = serde_json::to_string(&chunk).expect("serialize chunk");
-        assert!(
-            line.contains("\"frame\":\"chunk\""),
-            "chunk carries the frame tag: {line}"
-        );
-        assert!(
-            matches!(
-                serde_json::from_str::<GrepFrame>(&line).expect("parse chunk"),
-                GrepFrame::Chunk { data } if data == "src/a.rs:1:hit\n"
-            ),
-            "chunk roundtrips",
-        );
-
-        let end = GrepFrame::End {
-            matches: Some(3),
-            files: Some(2),
-            skipped: GrepSkips::default(),
-            error: None,
-        };
-        let end_line = serde_json::to_string(&end).expect("serialize end");
-        assert!(
-            end_line.contains("\"frame\":\"end\""),
-            "terminator carries the frame tag: {end_line}"
-        );
-
-        // The version-skew hinge: a legacy single envelope never carries the
-        // frame tag, so the CLI routes it to the single-envelope parse.
-        let legacy = GrepResponse {
-            output: "x".to_string(),
-            matches: None,
-            files: None,
-            skipped: GrepSkips::default(),
-            error: None,
-        };
-        let legacy_json = serde_json::to_string(&legacy).expect("serialize legacy");
-        assert!(
-            !legacy_json.contains("\"frame\""),
-            "legacy envelope has no frame tag: {legacy_json}"
-        );
-
-        // A newer daemon's unknown frame kind fails to parse — honest degradation,
-        // never a silent misparse.
-        assert!(
-            serde_json::from_str::<GrepFrame>(r#"{"frame":"future_kind","data":"x"}"#).is_err(),
-            "an unrecognized frame kind is a comprehensible error",
-        );
-    }
-
     /// The fairness guard (misc 140 phase 2): the shared search limiter bounds
     /// concurrent walks. Deterministic — asserts permit accounting, never timing.
     #[test]
@@ -14572,7 +13875,6 @@ mod tests {
     /// IPC method constants match expected wire values.
     #[test]
     fn method_constants() {
-        assert_eq!(METHOD_GREP, "tool/grep");
         assert_eq!(METHOD_GLOB, "tool/glob");
         assert_eq!(METHOD_HITSTREAM, "tool/hitstream");
         // The router constant re-exports the protocol module's owner (ws43), so
@@ -14581,34 +13883,6 @@ mod tests {
     }
 
     // ── repeatable --exclude-pattern to_params (bug 89) ──────────
-
-    /// `GrepRequest::to_params` resolves EVERY collected exclude against `cwd`
-    /// and emits them all as an array — no collected pattern silently dropped
-    /// (bug 89, the bug-73 leak class at the router seam).
-    #[test]
-    fn grep_to_params_resolves_every_exclude() {
-        let req = GrepRequest {
-            cwd: Some(PathBuf::from("/proj")),
-            pattern: "x".to_string(),
-            paths: vec![],
-            exclude: vec!["tests/**".to_string(), "/abs/vendor/**".to_string()],
-            include_gitignored: false,
-            include_hidden: false,
-            count: false,
-            chunked: false,
-            flags: GrepFlags::default(),
-        };
-        let params = req.to_params();
-        let excludes = params["exclude"].as_array().expect("exclude is an array");
-        // Relative resolved against cwd; absolute passed through unchanged.
-        assert_eq!(
-            excludes,
-            &vec![
-                serde_json::Value::String("/proj/tests/**".to_string()),
-                serde_json::Value::String("/abs/vendor/**".to_string()),
-            ]
-        );
-    }
 
     /// `GlobRequest::to_params` resolves EVERY collected exclude with the
     /// per-pattern rule (basename → `**/<name>`, slash-bearing → `cwd`) and
@@ -14636,16 +13910,8 @@ mod tests {
         );
     }
 
-    /// The wire accepts a lone `exclude` string, folding it into a one-element
-    /// set — a single-pattern spelling still works (bug 89).
-    #[test]
-    fn grep_request_accepts_scalar_exclude() {
-        let json = r#"{"cwd":"/tmp","pattern":"foo","exclude":"tests/**"}"#;
-        let req: GrepRequest = serde_json::from_str(json).expect("deserialize");
-        assert_eq!(req.exclude, vec!["tests/**".to_string()]);
-    }
-
-    /// The wire also accepts an `exclude` array (the repeatable form).
+    /// The wire accepts an `exclude` array (the repeatable form) — and a lone
+    /// string still folds into a one-element set (bug 89).
     #[test]
     fn glob_request_accepts_array_exclude() {
         let json = r#"{"cwd":"/tmp","paths":["src/"],"exclude":["a/**","b/**"]}"#;

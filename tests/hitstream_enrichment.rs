@@ -10,13 +10,14 @@
 //! arm serves the REAL grep enrichment.
 //!
 //! These tests speak the raw hit-batch frame protocol to a live daemon over its
-//! IPC socket — exactly what the cut-over `catenary grep` CLI will do — and pin:
+//! IPC socket — exactly what the cut-over `catenary grep` CLI does — and pin:
 //!
 //! - **Enriched parity**: an annotation-batch for a covered-root hit carries the
-//!   same `#scope` anchor the `tool/grep` executor renders, and
-//!   `render_grep_line` reproduces the executor's output line byte-for-byte.
+//!   `#scope` anchor, and `render_grep_line` reproduces the full CLI's grep
+//!   output line byte-for-byte (the pin that once compared against the retired
+//!   `tool/grep` executor now closes the loop against the CLI itself).
 //! - **The WS31 observation nudge fires from the annotation call**: a hit-batch
-//!   alone (no `tool/grep` query) routes `didChangeWatchedFiles` for the batch's
+//!   alone (no grep CLI run) routes `didChangeWatchedFiles` for the batch's
 //!   files.
 //! - **Query auto-mount fires from the annotation call**: a batch whose hits lie
 //!   outside every tracked root mounts the enclosing project root, and the hits
@@ -54,13 +55,10 @@ fn hitstream_exchange(socket: &Path, hits: &[WireHit]) -> Result<Vec<AnnotatedBa
     // The method-line handshake, then the frames — one JSON object per line.
     let mut payload = serde_json::to_vec(&json!({ "method": HITSTREAM_METHOD }))?;
     payload.push(b'\n');
-    let batch = HitFrame::Batch {
-        seq: 0,
-        hits: hits.to_vec(),
-    };
+    let batch = HitFrame::batch(0, hits.to_vec());
     payload.extend(serde_json::to_vec(&batch)?);
     payload.push(b'\n');
-    payload.extend(serde_json::to_vec(&HitFrame::End { batches: 1 })?);
+    payload.extend(serde_json::to_vec(&HitFrame::end(1))?);
     payload.push(b'\n');
     stream.write_all(&payload).context("write hit frames")?;
     stream.flush().context("flush hit frames")?;
@@ -80,8 +78,9 @@ fn hitstream_exchange(socket: &Path, hits: &[WireHit]) -> Result<Vec<AnnotatedBa
 }
 
 /// Enriched parity: the annotation-batch for a covered-root hit carries the
-/// executor's anchor, and the grep-shape rendering matches the `tool/grep`
-/// output byte-for-byte.
+/// containment anchor, and the grep-shape rendering matches the full
+/// `catenary grep` CLI output byte-for-byte (the ws43-02 acceptance byte-parity
+/// pin, end to end).
 #[test]
 fn hitstream_annotation_matches_executor_enrichment() -> Result<()> {
     let dir = common::canonical_tempdir()?;
@@ -93,7 +92,7 @@ fn hitstream_annotation_matches_executor_enrichment() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    // Warm the executor path first: it retries until the `#Outer` anchor
+    // Warm the CLI path first: it retries until the `#Outer` anchor
     // appears, proving the server settled and the symbol index is populated.
     // Its output is the parity target.
     let executor_out = grep_until_enriched(&bridge, &json!({ "pattern": "inner" }))?;

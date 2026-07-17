@@ -85,7 +85,7 @@ fn test_marker_at_workspace_root_eager_spawn() -> Result<()> {
     })?;
     bridge.initialize()?;
 
-    let result = bridge.call_tool("grep", &json!({ "pattern": "echo" }))?;
+    let result = bridge.call_tool("grep", &json!({ "pattern": "echo", "directory": root }))?;
     assert!(
         result["isError"].is_null() || result["isError"] == false,
         "Grep should succeed with marker at workspace root: {result:?}"
@@ -120,7 +120,7 @@ fn test_marker_in_subdir_lazy_spawn_via_grep() -> Result<()> {
     bridge.initialize()?;
 
     // Grep should trigger lazy spawn and find the file.
-    let result = bridge.call_tool("grep", &json!({ "pattern": "subdir" }))?;
+    let result = bridge.call_tool("grep", &json!({ "pattern": "subdir", "directory": root }))?;
     assert!(
         result["isError"].is_null() || result["isError"] == false,
         "Grep should succeed after lazy spawn: {result:?}"
@@ -162,7 +162,7 @@ fn test_two_subroots_separate_instances() -> Result<()> {
     bridge.initialize()?;
 
     // Grep should find files from both sub-roots.
-    let text = bridge.call_tool_text("grep", &json!({ "pattern": "echo" }))?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "echo", "directory": root }))?;
     assert!(
         text.contains("crate_a") && text.contains("crate_b"),
         "Grep should find files in both sub-roots. Got:\n{text}"
@@ -229,7 +229,7 @@ fn test_empty_markers_disables_resolution() -> Result<()> {
     bridge.initialize()?;
 
     // Server should be spawned at workspace root (eager), grep works.
-    let result = bridge.call_tool("grep", &json!({ "pattern": "disabled" }))?;
+    let result = bridge.call_tool("grep", &json!({ "pattern": "disabled", "directory": root }))?;
     assert!(
         result["isError"].is_null() || result["isError"] == false,
         "Grep should succeed with disabled markers: {result:?}"
@@ -272,7 +272,7 @@ fn test_nested_markers_nearest_wins() -> Result<()> {
     bridge.initialize()?;
 
     // Grep should find files from both levels.
-    let text = bridge.call_tool_text("grep", &json!({ "pattern": "echo" }))?;
+    let text = bridge.call_tool_text("grep", &json!({ "pattern": "echo", "directory": root }))?;
     assert!(
         text.contains(&format!("root.{MOCK_LANG}"))
             && text.contains(&format!("nested.{MOCK_LANG}")),
