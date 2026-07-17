@@ -32,7 +32,7 @@ bench-test:
 build-release:
 	@cargo build --release
 
-check: sweep
+check:
 	@PINNED=$$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml); \
 	 LATEST=$$(rustup run stable rustc --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1); \
 	 if [ -n "$$LATEST" ] && [ "$$PINNED" != "$$LATEST" ]; then \
@@ -54,6 +54,7 @@ check: sweep
 	@cargo machete --skip-target-dir
 	@if [ "$(MEMLIMIT_KB)" != unlimited ]; then ulimit -v $(MEMLIMIT_KB); fi; \
 	 cargo nextest run --workspace --features mockls --no-fail-fast --status-level fail --final-status-level fail --cargo-quiet --show-progress only
+	@$(MAKE) --no-print-directory sweep
 
 # Clippy — CI's single source of truth for the lint gate (misc 202).
 #
@@ -464,22 +465,35 @@ rustglob:
 # the NEW build and replay their sessions on their own — the bounce is safe
 # to automate. `--force` skips the TTY confirmation (the bounce is the
 # point here); no daemon running is a clean no-op.
-install: sweep
+install:
 	@cargo install --path . --locked
 	@catenary version
 	@catenary stop --force
+	@$(MAKE) --no-print-directory sweep
 
 # Continuous target-dir garbage collection. Cargo never deletes artifacts, and
-# on a nightly-rebuild machine every toolchain bump orphans the previous
-# vintage wholesale (observed: 500 GB of dead incremental/deps). `cargo sweep
-# --installed` deletes every artifact not produced by a currently-installed
-# toolchain — a no-op scan (seconds) when nothing is stale, a bulk reclaim the
-# morning after a toolchain bump. Riding `check` and `install` makes the GC
-# continuous; absent cargo-sweep it skips with a hint (CI runners and fresh
-# machines never break on it). One-time setup: cargo install cargo-sweep.
+# target/ decays two ways (observed: 500 GB against an 85 MB firehose):
+#
+# 1. Toolchain bumps orphan the previous vintage wholesale — `cargo sweep
+#    --installed` deletes artifacts no currently-installed toolchain produced.
+#    NOTE its blind spot: an old toolchain still installed in rustup keeps its
+#    artifacts alive; prune fossils with `rustup toolchain uninstall <v>`.
+# 2. Same-toolchain drift — daily `cargo update` bumps plus every distinct
+#    profile/feature/flag combination (mutants, flycheck clippy, mockls
+#    combos) and incremental sessions write artifact universes that
+#    `--installed` deliberately keeps: used once, never again, ~10 GB/day.
+#    `cargo sweep --time 7` deletes what no build has USED in 7 days.
+#
+# ORDERING IS LOAD-BEARING: sweep runs AFTER a green build (the last step of
+# `check`/`install`, never a prerequisite), so everything the build just used
+# carries a fresh stamp and eviction can only hit true leftovers — even after
+# a long idle gap, the build reuses-and-restamps before the sweep runs.
+# Absent cargo-sweep it skips with a hint (CI runners and fresh machines never
+# break). Setup: cargo install cargo-sweep.
 sweep:
 	@if command -v cargo-sweep >/dev/null 2>&1; then \
 	   cargo sweep --installed | tail -1; \
+	   cargo sweep --time 7 | tail -1; \
 	 else \
 	   echo "sweep: cargo-sweep not installed — skipping stale-artifact GC (cargo install cargo-sweep)"; \
 	 fi
