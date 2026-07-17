@@ -3203,6 +3203,35 @@ mod tests {
         );
     }
 
+    /// Reproduces the bug-128 incident geometry (daemon `24aafb70`, 19:45:00Z):
+    /// the caller stands in an UNLOCKED root, its own debt lives in a sibling
+    /// kitchen, and an unrelated identity holds debt in a third. The unanchored
+    /// arm's single-owner requirement then classifies attribution as ambiguous
+    /// and drops the caller's OWN kitchen — the bare serve answers
+    /// `[no edited files]` while the caller's booking sits unpaid on the ledger.
+    ///
+    /// This pins the CONVICTED mechanism, not the desired contract: the serve is
+    /// identity-free by ruling, so no path-algebraic fact can attribute here.
+    /// The pending vetted-serve-set ruling (bugs 124/128 — the hook, which has
+    /// the identity, forwards owner-filtered kitchens) will flip this
+    /// expectation to serve `repo-ours`.
+    #[test]
+    fn bare_serve_roots_unanchored_foreign_debt_hides_the_callers_own_kitchen() {
+        let fx = MultiFixture::new(&["repo-cwd", "repo-ours", "repo-theirs"]);
+        let ours = Owner::new("claude", "sess-a", "");
+        let theirs = Owner::new("claude", "sess-a", "agent-b");
+        fx.book("repo-ours", "src/main.rs", &ours);
+        fx.book("repo-theirs", "src/main.rs", &theirs);
+
+        // cwd in the unlocked repo-cwd: two owner tuples hold debt, so the
+        // unanchored arm serves only the cwd root's (empty) ledger — the miss.
+        assert_eq!(
+            bare_serve_roots_in(&fx.locks(), &fx.root("repo-cwd")),
+            vec![fx.root("repo-cwd")],
+            "bug 128: a second identity's debt anywhere hides the caller's own kitchen"
+        );
+    }
+
     #[test]
     fn bare_serve_roots_includes_the_unlocked_cwd_root_first() {
         let fx = MultiFixture::new(&["repo-a", "repo-b"]);
