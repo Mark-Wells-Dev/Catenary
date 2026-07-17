@@ -323,6 +323,14 @@ pub struct Denial {
     /// The construct-naming teaching message for an
     /// [`OpaqueWrite`](DenialReason::OpaqueWrite) denial.
     pub message: Option<String>,
+    /// Resolved write targets of statements *earlier* in the compound than the
+    /// denied one (misc 206, bug 117's mechanism): the denial stops the whole
+    /// command, so these writes never happened — [`format_denial`] names them
+    /// so the agent doesn't read a stale file as fresh output. Empty for a
+    /// single-statement denial, a denial in the first statement, earlier
+    /// statements with no write targets, or earlier writes that don't resolve
+    /// (never invent paths).
+    pub skipped_writes: Vec<std::path::PathBuf>,
 }
 
 /// Check all commands in a shell command string against the allowlist rules.
@@ -376,7 +384,26 @@ pub fn check_and_resolve_command(
         effective_cwd: cwd.map(std::path::PathBuf::from),
         saw_unresolved_cd: false,
     };
-    if let Some(denial) = check_script(&script, rules, &mut cwd_state) {
+    if let Some((denied_stmt, mut denial)) = check_script(&script, rules, &mut cwd_state) {
+        // A denied compound never says the earlier write leg didn't run
+        // (misc 206, bug 117): when statements *before* the denied one carry
+        // write targets, resolve them — the same resolution the gate would
+        // have recorded had the command run — so the denial can name the
+        // writes that never happened. Resolution failure names nothing
+        // (never invent paths); prefix resolution is identical to the full
+        // script's for those statements, since state threads document-order.
+        if denied_stmt > 0 {
+            let toolset = resolver::WriteToolset::from_allowed(|tool| rules.allow.contains(tool));
+            let script_hosts =
+                resolver::ScriptHosts::from_names(rules.script_hosts.iter().cloned());
+            let earlier = parse::ParsedScript {
+                pipelines: script.pipelines[..denied_stmt].to_vec(),
+            };
+            if let Ok(skipped) = resolver::resolve_script_with(&earlier, cwd, toolset, script_hosts)
+            {
+                denial.skipped_writes = skipped.writes.into_iter().collect();
+            }
+        }
         return Err(denial);
     }
 
@@ -408,6 +435,11 @@ pub fn check_and_resolve_command(
             unresolved_cd: cwd_state.saw_unresolved_cd,
             effective_cwd: cwd_state.effective_cwd,
             message: Some(opaque.message),
+            // The resolver's compound teaching already carries the misc-154
+            // "no leg has run" clause; naming the resolved earlier legs would
+            // need the failing leg's statement index, which `OpaqueWrite`
+            // doesn't carry — out of misc 206's scope.
+            skipped_writes: Vec::new(),
         }),
     }
 }
@@ -424,7 +456,10 @@ struct CwdState {
 
 /// Walk a [`ParsedScript`](parse::ParsedScript)'s pipelines and commands in
 /// document order, validating each command position against the allowlist and
-/// returning the first [`Denial`].
+/// returning the first [`Denial`] paired with the index of the pipeline
+/// (list-level statement) it occurred in — a denial inside a substitution
+/// reports the hosting statement's index. The top-level caller uses the index
+/// to resolve the writes of the statements that never ran (misc 206).
 ///
 /// Segmentation is the parse's: a `Pipeline` is one list element (separated by
 /// `;` / `&&` / `||` / newline / `&`); its `commands` are the pipe stages, so
@@ -437,11 +472,11 @@ fn check_script(
     script: &parse::ParsedScript,
     rules: &ResolvedCommands,
     cwd: &mut CwdState,
-) -> Option<Denial> {
-    for pipeline in &script.pipelines {
+) -> Option<(usize, Denial)> {
+    for (stmt_idx, pipeline) in script.pipelines.iter().enumerate() {
         for (pipe_pos, command) in pipeline.commands.iter().enumerate() {
             if let Some(denial) = check_parsed_command(command, pipe_pos, rules, cwd) {
-                return Some(denial);
+                return Some((stmt_idx, denial));
             }
         }
     }
@@ -460,9 +495,12 @@ fn check_parsed_command(
 ) -> Option<Denial> {
     // Recurse substitutions first — a denied command (or a redirect) inside
     // `$()` / `` `…` `` / `<(…)` / `>(…)` is caught regardless of the host
-    // command's own name (including a `catenary` host, skipped below).
+    // command's own name (including a `catenary` host, skipped below). The
+    // sub-script's own statement index is dropped: the hosting statement's
+    // index (the outer walk's) is the one the misc-206 skipped-writes
+    // resolution reads.
     for sub in &command.substitutions {
-        if let Some(denial) = check_script(sub, rules, cwd) {
+        if let Some((_, denial)) = check_script(sub, rules, cwd) {
             return Some(denial);
         }
     }
@@ -492,6 +530,7 @@ fn check_parsed_command(
             unresolved_cd: cwd.saw_unresolved_cd,
             effective_cwd: cwd.effective_cwd.clone(),
             message: Some(git_worktree_teaching()),
+            skipped_writes: Vec::new(),
         });
     }
 
@@ -510,6 +549,7 @@ fn check_parsed_command(
             unresolved_cd: cwd.saw_unresolved_cd,
             effective_cwd: cwd.effective_cwd.clone(),
             message: None,
+            skipped_writes: Vec::new(),
         });
     }
 
@@ -1582,6 +1622,40 @@ fn format_opening_line(denied_cmd: &str, reason: DenialReason) -> String {
 /// whole surface inline (decision 023).
 const SURFACE_POINTER: &str = "Run `catenary commands` for the allowed command surface.";
 
+/// Cap on the skipped-write targets a denial names inline; the remainder is a
+/// count, so a pathological compound can't balloon the teaching (misc 206).
+const SKIPPED_WRITES_CAP: usize = 3;
+
+/// The misc-206 honesty line: a denied compound never ran its earlier write
+/// legs, so name the writes that never happened — otherwise the agent follows
+/// the redirect teaching and reads a stale file as fresh output (bug 117).
+/// `None` when there is nothing to name (single-statement denial, denial in
+/// the first statement, or no resolved earlier writes) — silence is correct
+/// there.
+fn format_skipped_writes_note(skipped: &[std::path::PathBuf]) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let mut list = skipped
+        .iter()
+        .take(SKIPPED_WRITES_CAP)
+        .map(|p| format!("`{}`", p.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = skipped.len().saturating_sub(SKIPPED_WRITES_CAP);
+    if rest > 0 {
+        list = format!("{list}, and {rest} more");
+    }
+    let noun = if skipped.len() == 1 {
+        "the write"
+    } else {
+        "the writes"
+    };
+    Some(format!(
+        "Note: nothing in this command ran, including {noun} to {list}."
+    ))
+}
+
 /// Render the `allow_flags` (form-lever) denial: a config-sourced, misc-119
 /// voice message that names the permitted invocation forms. The forms are
 /// sorted for a deterministic listing.
@@ -1693,6 +1767,18 @@ pub fn format_denial(
     format: Option<super::HostFormat>,
     build_hint: Option<&str>,
 ) -> String {
+    // The misc-206 honesty line, appended to every non-opaque teaching below:
+    // a denied compound's earlier write legs never ran, and the denial says so
+    // by name (bug 117). `None` — silence — for a single-statement denial or a
+    // compound with no resolved earlier writes.
+    let append_skipped = |mut msg: String| {
+        if let Some(note) = format_skipped_writes_note(&denial.skipped_writes) {
+            msg.push('\n');
+            msg.push_str(&note);
+        }
+        msg
+    };
+
     // Opaque-write denial: the resolver's construct-naming teaching message
     // is the whole denial — it already names the resolvable alternative
     // (ws38 ticket 01), independent of guidance entries and build hints.
@@ -1711,7 +1797,7 @@ pub fn format_denial(
     if denial.reason == DenialReason::DeniedSubcommand
         && let Some(msg) = &denial.message
     {
-        return msg.clone();
+        return append_skipped(msg.clone());
     }
 
     // Form-lever denial (`allow_flags`): the config-sourced message naming the
@@ -1719,9 +1805,9 @@ pub fn format_denial(
     if denial.reason == DenialReason::DisallowedForm {
         let lookup_cmd = denied_cmd.split_whitespace().next().unwrap_or(denied_cmd);
         if let Some(forms) = commands.allow_flags.get(lookup_cmd) {
-            return format_disallowed_form_denial(lookup_cmd, forms);
+            return append_skipped(format_disallowed_form_denial(lookup_cmd, forms));
         }
-        return format_opening_line(denied_cmd, denial.reason);
+        return append_skipped(format_opening_line(denied_cmd, denial.reason));
     }
 
     // Guidance hint (static, build-resolved, or redirect).
@@ -1729,13 +1815,16 @@ pub fn format_denial(
     // subcommand part: "git grep" → "git" won't match, but "grep" will).
     let lookup_cmd = denied_cmd.split_whitespace().next().unwrap_or(denied_cmd);
 
-    // Redirect denial: short format with the command's `-h` output.
+    // Redirect denial: short format with the command's `-h` output. The
+    // skipped-writes note rides directly after the redirect teaching — before
+    // the help dump — so the agent reads "never ran" before it follows the
+    // redirect to the named path (bug 117's exact trap).
     if let Some(crate::config::GuidanceEntry::Redirect { command }) =
         commands.guidance_for(lookup_cmd)
     {
-        let opening = format!(
+        let opening = append_skipped(format!(
             "`{denied_cmd}` isn't allowed. Use `catenary {command}` instead. Works on any path (LSP enrichment only within tracked roots)."
-        );
+        ));
         let help = render_subcommand_help(command);
         return if help.is_empty() {
             opening
@@ -1781,7 +1870,7 @@ pub fn format_denial(
         );
     }
 
-    parts.join("\n")
+    append_skipped(parts.join("\n"))
 }
 
 #[cfg(test)]
@@ -3006,6 +3095,7 @@ mod tests {
             reason: DenialReason::NotAllowed,
             unresolved_cd: false,
             message: None,
+            skipped_writes: Vec::new(),
         }
     }
 
@@ -3311,6 +3401,7 @@ mod tests {
             unresolved_cd: true,
             effective_cwd: None,
             message: None,
+            skipped_writes: Vec::new(),
         };
         let msg = format_denial("npm", &rules, &denial, None, None);
         assert!(
@@ -3328,11 +3419,119 @@ mod tests {
             unresolved_cd: false,
             effective_cwd: None,
             message: None,
+            skipped_writes: Vec::new(),
         };
         let msg = format_denial("npm", &rules, &denial, None, None);
         assert!(
             !msg.contains("could not be resolved"),
             "should not include note when resolved: {msg}",
+        );
+    }
+
+    // ── Skipped-writes note (misc 206, bug 117) ───────────────────────
+
+    /// The live-config shape of bug 117: `grep` carries a Redirect guidance
+    /// entry, so the denial teaching is "Use `catenary grep` instead".
+    fn rules_with_grep_redirect() -> ResolvedCommands {
+        let mut rules = basic_rules();
+        rules.guidance.insert(
+            "grep".to_string(),
+            crate::config::GuidanceEntry::Redirect {
+                command: "grep".to_string(),
+            },
+        );
+        rules
+    }
+
+    #[test]
+    fn compound_denial_names_skipped_earlier_write() {
+        // Bug 117's exact shape: the whole compound is denied on the
+        // statement-initial `grep`, so `make check` never ran and `check.log`
+        // was never written — the teaching must say so by name, or the agent
+        // follows the redirect and reads a stale log as fresh output.
+        let rules = rules_with_grep_redirect();
+        let denial = check_command(
+            "make check > check.log 2>&1; grep -n err check.log",
+            &rules,
+            None,
+        )
+        .expect("statement-initial grep denied");
+        assert_eq!(denial.command, "grep");
+        assert_eq!(
+            denial.skipped_writes,
+            vec![std::path::PathBuf::from("check.log")],
+        );
+        let msg = format_denial(&denial.command, &rules, &denial, None, None);
+        assert!(
+            msg.contains("Use `catenary grep` instead"),
+            "redirect teaching kept: {msg}",
+        );
+        assert!(
+            msg.contains("Note: nothing in this command ran, including the write to `check.log`."),
+            "skipped write named with the teaching: {msg}",
+        );
+    }
+
+    #[test]
+    fn single_statement_denial_appends_no_skipped_writes_note() {
+        let rules = rules_with_grep_redirect();
+        let denial =
+            check_command("grep -n err check.log", &rules, None).expect("grep denied at start");
+        assert!(denial.skipped_writes.is_empty());
+        let msg = format_denial(&denial.command, &rules, &denial, None, None);
+        assert!(
+            !msg.contains("nothing in this command ran"),
+            "no note for a single-statement denial: {msg}",
+        );
+    }
+
+    #[test]
+    fn compound_denied_in_first_statement_appends_no_note() {
+        // The denied statement is first — nothing earlier was skipped, so
+        // silence is correct even though a later statement carries a write.
+        let rules = rules_with_grep_redirect();
+        let denial = check_command(
+            "grep -n err check.log; make check > check.log 2>&1",
+            &rules,
+            None,
+        )
+        .expect("grep denied in the first statement");
+        assert!(denial.skipped_writes.is_empty());
+        let msg = format_denial(&denial.command, &rules, &denial, None, None);
+        assert!(
+            !msg.contains("nothing in this command ran"),
+            "no note when the denied statement is first: {msg}",
+        );
+    }
+
+    #[test]
+    fn skipped_writes_note_caps_the_list() {
+        let rules = rules_with_grep_redirect();
+        let denial = check_command(
+            "echo a > f1.log; echo b > f2.log; echo c > f3.log; echo d > f4.log; grep err f1.log",
+            &rules,
+            None,
+        )
+        .expect("grep denied after four writes");
+        let msg = format_denial(&denial.command, &rules, &denial, None, None);
+        assert!(
+            msg.contains("including the writes to `f1.log`, `f2.log`, `f3.log`, and 1 more."),
+            "three named targets plus a count: {msg}",
+        );
+    }
+
+    #[test]
+    fn unresolved_earlier_write_names_no_paths() {
+        // An earlier statement whose write target doesn't resolve (`$VAR`)
+        // must not invent paths — the note stays silent rather than guessing.
+        let rules = rules_with_grep_redirect();
+        let denial =
+            check_command("echo hi > $TARGET; grep err f.log", &rules, None).expect("grep denied");
+        assert!(denial.skipped_writes.is_empty(), "no invented paths");
+        let msg = format_denial(&denial.command, &rules, &denial, None, None);
+        assert!(
+            !msg.contains("nothing in this command ran"),
+            "silence when earlier writes don't resolve: {msg}",
         );
     }
 
@@ -3366,6 +3565,7 @@ mod tests {
             unresolved_cd: false,
             effective_cwd: None,
             message: None,
+            skipped_writes: Vec::new(),
         };
         let msg = format_denial("grep", &rules, &denial, None, None);
         assert!(
@@ -3383,6 +3583,7 @@ mod tests {
             unresolved_cd: false,
             effective_cwd: None,
             message: None,
+            skipped_writes: Vec::new(),
         };
         let msg = format_denial("grep", &rules, &denial, None, None);
         assert!(
@@ -3400,6 +3601,7 @@ mod tests {
             unresolved_cd: false,
             effective_cwd: None,
             message: None,
+            skipped_writes: Vec::new(),
         };
         let msg = format_denial("git grep", &rules, &denial, None, None);
         assert!(
@@ -3596,6 +3798,7 @@ mod tests {
             unresolved_cd: false,
             effective_cwd: None,
             message: None,
+            skipped_writes: Vec::new(),
         };
         let msg = format_denial("make -C", &rules, &denial, None, None);
         assert!(
