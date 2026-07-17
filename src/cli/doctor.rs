@@ -279,11 +279,20 @@ async fn gather_probe_feed(
     config: &crate::config::Config,
     daemon_version: Option<String>,
 ) -> ProbeFeed {
+    // Spawn resolution (lsm 07): probe exactly the binary a spawn would run —
+    // the same `resolve_spawn_program` order the daemon uses (path override →
+    // managed home at the pin when `prefer_managed` → PATH) — so a
+    // managed-only install reads as installed, full stop.
+    let home = crate::managed_home::ManagedHome::resolve();
+    let manifest = crate::recipes::active_manifest();
+    let prefer_managed = config.prefer_managed();
     let mut join_set = tokio::task::JoinSet::new();
     for (name, def) in &config.server {
+        let program =
+            crate::managed_home::resolve_spawn_program(&home, &manifest, name, def, prefer_managed);
         join_set.spawn(crate::health::servers::probe_server(
             name.clone(),
-            def.program(name).to_string(),
+            program,
             def.args.clone(),
             def.initialization_options.clone(),
             def.env.clone(),
@@ -444,9 +453,17 @@ pub async fn run_doctor_single(
     };
 
     // ── 1. Resolved command ─────────────────────────────────────────
-    // The server key IS the executable (misc 162): resolve the `path` override
-    // if set, else spawn the key `server_name` on PATH.
-    let command = server_def.program(server_name);
+    // The server key IS the executable (misc 162), resolved through the same
+    // `resolve_spawn_program` order the daemon spawn uses (lsm 07): the `path`
+    // override if set, else the managed install at the blessed pin (when
+    // `prefer_managed`), else the key `server_name` on PATH.
+    let command = crate::managed_home::resolve_spawn_program(
+        &crate::managed_home::ManagedHome::resolve(),
+        &crate::recipes::active_manifest(),
+        server_name,
+        server_def,
+        merged_config.prefer_managed(),
+    );
     let args_display = if server_def.args.is_empty() {
         String::new()
     } else {
@@ -478,8 +495,8 @@ pub async fn run_doctor_single(
     // shim (misc 162): a bare proxy with no component behind it reads as NOT
     // installed, not a phantom `✓`.
     let _ = out.writeln(format_args!("{}:", out.colors.bold("Binary")));
-    match crate::health::servers::resolve_binary(command) {
-        Some(path) if crate::health::servers::server_binary_installed(server_name, command) => {
+    match crate::health::servers::resolve_binary(&command) {
+        Some(path) if crate::health::servers::server_binary_installed(server_name, &command) => {
             let _ = out.writeln(format_args!(
                 "  {} {}",
                 out.colors.green("✓"),
@@ -512,7 +529,7 @@ pub async fn run_doctor_single(
     let _ = out.writeln(format_args!("{}:", out.colors.bold("Spawn")));
     let args_refs: Vec<&str> = server_def.args.iter().map(String::as_str).collect();
     let spawn_result = lsp::LspClient::spawn_for_doctor(
-        command,
+        &command,
         &args_refs,
         server_name,
         server_name,

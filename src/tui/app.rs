@@ -322,17 +322,21 @@ impl<'a> App<'a> {
     }
 
     /// Recompute the active-language set and all findings from the current
-    /// snapshot + config.
+    /// snapshot + config. Spawn resolution (lsm 07) reads the app's managed
+    /// home and blessed manifest — the same injection seams the guided
+    /// install uses.
     fn recompute_findings(&mut self) {
         let active = self.active_languages();
         let env = self.env_findings;
         let snapshot = &self.snapshot;
         let project_root = &self.project_root;
+        let home = &self.home;
+        let manifest = &self.blessed;
         self.findings = self.config.as_ref().map_or_else(Vec::new, |cfg| {
             if env {
-                findings::gather(snapshot, cfg, project_root, active)
+                findings::gather(snapshot, cfg, project_root, active, home, manifest)
             } else {
-                findings::gather_snapshot(snapshot, cfg, active)
+                findings::gather_snapshot(snapshot, cfg, active, home, manifest)
             }
         });
         self.enrich_blessed_suggestions();
@@ -733,10 +737,21 @@ impl<'a> App<'a> {
     /// The mutation the detail pane offers for a cursored server: set its binary
     /// path when the executable is not installed, else toggle its diagnostics.
     fn mutation_for_server(&self, name: &str) -> Option<Mutation> {
-        let def = self.config.as_ref()?.server.get(name)?;
-        // The server key IS the executable (misc 162); `server_binary_installed`
-        // is honest against the rust-analyzer rustup proxy shim.
-        if server_binary_installed(name, def.program(name)) {
+        let config = self.config.as_ref()?;
+        let def = config.server.get(name)?;
+        // The server key IS the executable (misc 162), resolved through the
+        // same `resolve_spawn_program` order the daemon spawn uses (lsm 07) —
+        // a managed-only install reads as installed, so the action is a
+        // diagnostics toggle, never a set-path offer. `server_binary_installed`
+        // stays honest against the rust-analyzer rustup proxy shim.
+        let program = crate::managed_home::resolve_spawn_program(
+            &self.home,
+            &self.blessed,
+            name,
+            def,
+            config.prefer_managed(),
+        );
+        if server_binary_installed(name, &program) {
             self.toggle_server_mutation(name)
         } else {
             self.set_path_mutation(name)
@@ -1182,6 +1197,47 @@ mod tests {
                 Some(crate::config::Mutation::SetServerPath { server, .. }) if server == "srv0"
             ),
             "a missing-binary server offers a set-path mutation",
+        );
+    }
+
+    #[test]
+    fn cursored_server_with_managed_only_install_offers_toggle_not_set_path() {
+        // lsm 07: nothing on $PATH, but the managed home holds srv0 at its
+        // blessed pin — resolution through `resolve_spawn_program` reads it as
+        // installed, so the action is a diagnostics toggle, never "set path".
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = ManagedHome::at(tmp.path().join("servers"));
+        let bin_dir = home.bin_dir("srv0", "1.0.0").expect("bin dir derives");
+        std::fs::create_dir_all(&bin_dir).expect("mkdir bin");
+        let executable = bin_dir.join("srv0");
+        std::fs::write(&executable, b"#!/bin/sh\n").expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+                .expect("mark executable");
+        }
+        let mut app = app_with(
+            &theme,
+            &icons,
+            snap_with_servers(1),
+            config_with_server("srv0", "rust"),
+        );
+        app.inject_install_env(
+            BTreeMap::new(),
+            blessed_manifest("srv0", "1.0.0"),
+            Box::new(RecordingRunner(Rc::new(RefCell::new(Vec::new())))),
+            Box::new(NoFetch),
+            home,
+        );
+        assert!(
+            matches!(
+                app.mutation_for_server("srv0"),
+                Some(crate::config::Mutation::SetServerEnabled { server, .. }) if server == "srv0"
+            ),
+            "a managed-only install reads as installed — the action toggles diagnostics",
         );
     }
 

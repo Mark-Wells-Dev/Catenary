@@ -5,9 +5,11 @@
 //!
 //! This is the TUI leg of "one health model, two renderers" (DESIGN): doctor
 //! feeds the model with its own one-shot `initialize` probes; the TUI feeds it
-//! with the daemon's **live** server states from `state.json` and a PATH-only
-//! binary check — it **never probes** (a probing TUI would be a second LSP
-//! client fighting the pool) and never opens the firehose.
+//! with the daemon's **live** server states from `state.json` and a binary
+//! check over the spawn-resolved executable
+//! ([`crate::managed_home::resolve_spawn_program`], lsm 07) — it **never
+//! probes** (a probing TUI would be a second LSP client fighting the pool) and
+//! never opens the firehose.
 //!
 //! [`SnapshotFeed`] materializes a [`HealthFeed`] from a [`Snapshot`] plus the
 //! resolved [`Config`]; [`gather`] runs every model check the TUI can know and
@@ -19,6 +21,8 @@ use std::collections::{HashMap, HashSet};
 use crate::config::Config;
 use crate::health::servers::{HealthFeed, Provenance, ServerStatus, server_binary_installed};
 use crate::health::{Finding, FindingCode, Severity};
+use crate::managed_home::{ManagedHome, resolve_spawn_program};
+use crate::recipes::BlessedManifest;
 use crate::state_snapshot::{ServerEntry, Snapshot};
 
 /// The board node a finding belongs to — its inline home and the target a
@@ -72,15 +76,26 @@ pub struct SnapshotFeed {
 impl SnapshotFeed {
     /// Build the feed from the live snapshot, the resolved config, and the set
     /// of active workspace languages (live instances ∪ detected files).
+    /// `home` and `manifest` feed spawn resolution (lsm 07) — production passes
+    /// the app's [`ManagedHome::resolve`] home and its blessed manifest; tests
+    /// inject a tempdir home and a synthetic manifest.
     ///
     /// Aggregation is **broken-anywhere-is-broken**: a server with any failed
     /// or dead instance reports [`ServerStatus::InitializeFailed`] even if
     /// another instance is healthy, so "is rust-analyzer broken anywhere?" is a
-    /// problem (DESIGN). A routed server with no live instance whose binary is
-    /// absent on `$PATH` reports [`ServerStatus::BinaryNotFound`] — the only
-    /// place the feed touches the filesystem, and never the LSP.
+    /// problem (DESIGN). A routed server with no live instance whose
+    /// spawn-resolved binary ([`resolve_spawn_program`] — the `path` override,
+    /// the managed install at the blessed pin, or the key on `$PATH`) is
+    /// absent reports [`ServerStatus::BinaryNotFound`] — the only place the
+    /// feed touches the filesystem, and never the LSP.
     #[must_use]
-    pub fn build(snapshot: &Snapshot, config: &Config, active_languages: HashSet<String>) -> Self {
+    pub fn build(
+        snapshot: &Snapshot,
+        config: &Config,
+        active_languages: HashSet<String>,
+        home: &ManagedHome,
+        manifest: &BlessedManifest,
+    ) -> Self {
         let mut statuses: HashMap<String, ServerStatus> = HashMap::new();
 
         // Aggregate live instances per server name.
@@ -100,22 +115,24 @@ impl SnapshotFeed {
             }
         }
 
-        // Intent-routed servers with no live instance: a PATH check
+        // Intent-routed servers with no live instance: a binary check
         // distinguishes "not installed" (a problem/suggestion) from "installed
         // but idle".
         for (name, def) in &config.server {
             if statuses.contains_key(name) {
                 continue;
             }
-            let routed = crate::health::servers::is_intent_routed(config, name, &active_languages);
-            // The server key IS the executable (misc 162); `server_binary_installed`
-            // is honest about the rust-analyzer rustup proxy shim.
-            let program = def.program(name);
-            if routed && !server_binary_installed(name, program) {
-                statuses.insert(
-                    name.clone(),
-                    ServerStatus::BinaryNotFound(program.to_string()),
-                );
+            if !crate::health::servers::is_intent_routed(config, name, &active_languages) {
+                continue;
+            }
+            // Spawn resolution (lsm 07): check the binary a spawn would
+            // actually run — the same `resolve_spawn_program` order the daemon
+            // uses — so a managed-only install never reads as missing and
+            // never raises an install offer. `server_binary_installed` stays
+            // honest about the rust-analyzer rustup proxy shim (misc 162).
+            let program = resolve_spawn_program(home, manifest, name, def, config.prefer_managed());
+            if !server_binary_installed(name, &program) {
+                statuses.insert(name.clone(), ServerStatus::BinaryNotFound(program));
             }
         }
 
@@ -199,7 +216,8 @@ pub fn live_languages(snapshot: &Snapshot) -> HashSet<String> {
 /// migration/validation/unknown-key/unreferenced/duplicate, server health,
 /// install health, version skew) plus the live-only signals doctor cannot see
 /// (027 coverage degradation, crash-looping). `project_root` scopes the
-/// project-config / antigravity install checks.
+/// project-config / antigravity install checks; `home` and `manifest` feed
+/// spawn resolution (lsm 07).
 #[must_use]
 #[allow(clippy::implicit_hasher, reason = "callers use the default hasher")]
 pub fn gather(
@@ -207,18 +225,22 @@ pub fn gather(
     config: &Config,
     project_root: &std::path::Path,
     active_languages: HashSet<String>,
+    home: &ManagedHome,
+    manifest: &BlessedManifest,
 ) -> Vec<OwnedFinding> {
-    let mut out = gather_snapshot(snapshot, config, active_languages);
+    let mut out = gather_snapshot(snapshot, config, active_languages, home, manifest);
     out.extend(gather_environment(config, project_root));
     out
 }
 
-/// The findings derivable from the snapshot plus the resolved config **alone**.
+/// The findings derivable from the snapshot plus the resolved config and the
+/// injected spawn-resolution inputs (`home` + `manifest`, lsm 07).
 ///
-/// No filesystem or `$PATH` reads — version skew (daemon vs this binary),
-/// config-struct validation (validation / unreferenced / duplicate-extension),
-/// the live server-health aggregation, and the live-only board signals (027
-/// degradation, crash-looping).
+/// No config-file or install-health reads — version skew (daemon vs this
+/// binary), config-struct validation (validation / unreferenced /
+/// duplicate-extension), the live server-health aggregation (whose binary
+/// check resolves through [`resolve_spawn_program`] against the injected
+/// home), and the live-only board signals (027 degradation, crash-looping).
 ///
 /// Hermetic given its inputs, so this is the seam the fleet-scale render tests
 /// drive: a synthetic snapshot + an injected config produce a deterministic
@@ -229,6 +251,8 @@ pub fn gather_snapshot(
     snapshot: &Snapshot,
     config: &Config,
     active_languages: HashSet<String>,
+    home: &ManagedHome,
+    manifest: &BlessedManifest,
 ) -> Vec<OwnedFinding> {
     let mut out: Vec<OwnedFinding> = Vec::new();
 
@@ -273,7 +297,7 @@ pub fn gather_snapshot(
     }
 
     // ── Server-health findings (owner = server) ──────────────────────
-    let feed = SnapshotFeed::build(snapshot, config, active_languages);
+    let feed = SnapshotFeed::build(snapshot, config, active_languages, home, manifest);
     for f in crate::health::servers::server_findings(config, &feed) {
         // Only surface problems/suggestions from the aggregate; Ok/Info stay
         // out of the finding stream (the tree renders healthy state directly).
@@ -463,6 +487,51 @@ mod tests {
     use super::*;
     use crate::config::{LanguageConfig, ServerBinding, ServerDef};
 
+    /// A managed home rooted nowhere — resolution always falls through to
+    /// `$PATH`, matching the pre-lsm-07 behavior these tests were written for.
+    fn no_home() -> ManagedHome {
+        ManagedHome::at(std::path::PathBuf::from("/nonexistent"))
+    }
+
+    /// An empty manifest — no server carries a pin, so the managed home is
+    /// never consulted.
+    fn no_manifest() -> BlessedManifest {
+        BlessedManifest::default()
+    }
+
+    /// A manifest with one blessed row for `server` pinning `version`. The
+    /// row's platform key is a synthetic token no host matches, so the
+    /// preferred-row lookup falls back to it deterministically everywhere.
+    fn pinned_manifest(server: &str, version: &str) -> BlessedManifest {
+        let mut rows = std::collections::BTreeMap::new();
+        rows.insert(
+            "synthetic".to_string(),
+            crate::recipes::BlessedEntry {
+                version: version.to_string(),
+                platform: "synthetic".to_string(),
+                date: "2026-07-17".to_string(),
+                tier: None,
+            },
+        );
+        let mut manifest = BlessedManifest::default();
+        manifest.blessed.insert(server.to_string(), rows);
+        manifest
+    }
+
+    /// Stages an executable at `<home>/<server>/<version>/bin/<server>`.
+    fn stage_managed_executable(home: &ManagedHome, server: &str, version: &str) {
+        let bin_dir = home.bin_dir(server, version).expect("bin dir derives");
+        std::fs::create_dir_all(&bin_dir).expect("mkdir bin");
+        let executable = bin_dir.join(server);
+        std::fs::write(&executable, b"#!/bin/sh\n").expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+                .expect("mark executable");
+        }
+    }
+
     fn routed_config(lang: &str, server: &str) -> Config {
         let mut config = Config::default();
         // The key IS the executable (misc 162): a bare def spawns `server`.
@@ -506,7 +575,13 @@ mod tests {
             },
             ..Snapshot::default()
         };
-        let findings = gather_snapshot(&snap, &Config::default(), HashSet::new());
+        let findings = gather_snapshot(
+            &snap,
+            &Config::default(),
+            HashSet::new(),
+            &no_home(),
+            &no_manifest(),
+        );
         let mismatch = findings
             .iter()
             .find(|f| f.finding.code == crate::health::FindingCode::BridgeVersionMismatch)
@@ -520,7 +595,13 @@ mod tests {
         // A snapshot with no recorded mismatch (versions agree, or a daemon
         // predating the field) produces no bridge-mismatch finding.
         let snap = Snapshot::default();
-        let findings = gather_snapshot(&snap, &Config::default(), HashSet::new());
+        let findings = gather_snapshot(
+            &snap,
+            &Config::default(),
+            HashSet::new(),
+            &no_home(),
+            &no_manifest(),
+        );
         assert!(
             !findings
                 .iter()
@@ -539,7 +620,13 @@ mod tests {
             ],
             ..Snapshot::default()
         };
-        let feed = SnapshotFeed::build(&snap, &config, live_languages(&snap));
+        let feed = SnapshotFeed::build(
+            &snap,
+            &config,
+            live_languages(&snap),
+            &no_home(),
+            &no_manifest(),
+        );
         assert!(
             matches!(
                 feed.server_status("my-ls"),
@@ -555,13 +642,68 @@ mod tests {
         let snap = Snapshot::default();
         // No live instance, but the language is active (detected).
         let active: HashSet<String> = std::iter::once("mylang".to_string()).collect();
-        let feed = SnapshotFeed::build(&snap, &config, active);
+        let feed = SnapshotFeed::build(&snap, &config, active, &no_home(), &no_manifest());
         assert!(
             matches!(
                 feed.server_status("my-ls"),
                 Some(ServerStatus::BinaryNotFound(_))
             ),
             "a routed server with an absent binary is flagged",
+        );
+    }
+
+    #[test]
+    fn managed_only_install_reads_as_installed_and_raises_no_missing_finding() {
+        // lsm 07: nothing on $PATH, but the managed home holds the server at
+        // its blessed pin. The feed resolves through the same
+        // `resolve_spawn_program` order the daemon spawn uses, so the server
+        // reads as installed — no `BinaryNotFound` status, no missing-binary
+        // finding, and (downstream) no TUI install offer.
+        let config = routed_config("mylang", "my-ls");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = ManagedHome::at(tmp.path().join("servers"));
+        stage_managed_executable(&home, "my-ls", "1.0.0");
+        let manifest = pinned_manifest("my-ls", "1.0.0");
+        let active: HashSet<String> = std::iter::once("mylang".to_string()).collect();
+
+        let snap = Snapshot::default();
+        let feed = SnapshotFeed::build(&snap, &config, active.clone(), &home, &manifest);
+        assert!(
+            feed.server_status("my-ls").is_none(),
+            "a managed install at the pin reads as installed, full stop",
+        );
+        let findings = gather_snapshot(&snap, &config, active.clone(), &home, &manifest);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                f.finding.code,
+                FindingCode::ServerRoutedBroken | FindingCode::ServerInstallSuggestion
+            ) && matches!(&f.owner, Owner::Server(s) if s == "my-ls")),
+            "no missing-binary finding — nothing for an install offer to hang on",
+        );
+
+        // The opt-outs read exactly as today: `prefer_managed = false` and an
+        // empty home both fall through to $PATH, where nothing resolves.
+        let mut path_only = routed_config("mylang", "my-ls");
+        path_only.servers = Some(crate::config::ServersConfig {
+            prefer_managed: false,
+            ..Default::default()
+        });
+        let feed = SnapshotFeed::build(&snap, &path_only, active.clone(), &home, &manifest);
+        assert!(
+            matches!(
+                feed.server_status("my-ls"),
+                Some(ServerStatus::BinaryNotFound(_))
+            ),
+            "prefer_managed = false ignores the managed home wholesale",
+        );
+        let empty_home = ManagedHome::at(tmp.path().join("empty"));
+        let feed = SnapshotFeed::build(&snap, &config, active, &empty_home, &manifest);
+        assert!(
+            matches!(
+                feed.server_status("my-ls"),
+                Some(ServerStatus::BinaryNotFound(_))
+            ),
+            "a pinned server with no managed install still reads from $PATH",
         );
     }
 
@@ -606,7 +748,7 @@ mod tests {
             ..Snapshot::default()
         };
 
-        let quiet = gather_snapshot(&snap, &config, HashSet::new());
+        let quiet = gather_snapshot(&snap, &config, HashSet::new(), &no_home(), &no_manifest());
         assert!(
             !quiet
                 .iter()
@@ -625,7 +767,7 @@ mod tests {
                 file_count: 1,
             });
         let active: HashSet<String> = std::iter::once("cmake".to_string()).collect();
-        let loud = gather_snapshot(&touched, &config, active);
+        let loud = gather_snapshot(&touched, &config, active, &no_home(), &no_manifest());
         let cmake = loud
             .iter()
             .find(|f| matches!(&f.owner, Owner::Server(s) if s == "cmake-language-server"))

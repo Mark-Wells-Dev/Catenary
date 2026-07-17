@@ -28,6 +28,11 @@
 //! (`[servers] prefer_managed = false`, or an explicit `[lsp.server.*]`
 //! `path` override), and rust-analyzer is exempt by design
 //! ([`crate::recipes::BlessedManifest::pinned_version`]).
+//! [`resolve_spawn_program`] is the ONE resolution truth (lsm 07): the daemon
+//! spawn, doctor's probe feed and single-server transcript, and the TUI's
+//! snapshot feed and server-action check all resolve through it — no surface
+//! keeps a second list, so a managed-only install can never spawn fine while
+//! a health surface calls it missing.
 //!
 //! **Warranty-renewal GC (lsm 06).** A version bump is a warranty renewal: the
 //! renewal *event* is repo-side (a new blessed pin ships in the manifest), but
@@ -235,6 +240,12 @@ impl ManagedHome {
 }
 
 /// Spawn resolution (lsm 02): the executable a server spawn runs.
+///
+/// Also the single resolution truth for every health surface (lsm 07): the
+/// daemon spawn ([`crate::lsp`] manager), doctor's probe feed and
+/// single-server transcript ([`crate::cli::doctor`]), and the TUI's snapshot
+/// feed and server-action check ([`crate::tui`]) all call this function, so
+/// "what would spawn?" and "is it installed?" can never disagree.
 ///
 /// Resolution order, first hit wins:
 ///

@@ -669,8 +669,11 @@ fn probe_timeout() -> Duration {
 /// This is doctor's own one-shot probe — daemon-down capable, since it spawns
 /// the server directly rather than asking a running daemon.
 ///
-/// `program` is the executable the server key resolves to (misc 162): the
-/// server's own `path` override if set, else the key itself on `PATH`.
+/// `program` is the executable spawn resolution chose for the server key
+/// ([`crate::managed_home::resolve_spawn_program`], lsm 07): the server's own
+/// `path` override if set, else the managed install at the blessed pin (when
+/// `prefer_managed`), else the key itself on `PATH` — so the probe exercises
+/// exactly the binary a spawn would run.
 #[allow(clippy::implicit_hasher, reason = "callers use the default hasher")]
 pub async fn probe_server(
     name: String,
