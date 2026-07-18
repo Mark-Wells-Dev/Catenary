@@ -127,10 +127,8 @@ pub struct PermissionsConfig {
     ///
     /// Each entry joins the answer desk's declared read scope (alongside the
     /// session's workspace roots, the agents-worktree base, and companion
-    /// repos). A read under one of these is a quiet allow, and the FIRST such
-    /// allow promotes the enclosing prefix into the session's working
-    /// directories (session destination only — never persistent client state).
-    /// `~`/`$VAR` expand at the ingestion seam.
+    /// repos). A read under one of these is a quiet allow. `~`/`$VAR` expand at
+    /// the ingestion seam.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub always_read: Vec<String>,
 

@@ -18,16 +18,14 @@
 //!      (a firehose event plus a TUI health finding via `warn!`), never denied.
 //!   4. **Writes: the desk answers nothing** — the human decides.
 //!
-//! - **`always_read` promotion:** the first allow under a declared `always_read`
-//!   prefix additionally emits `updatedPermissions` with `addDirectories`,
-//!   destination **session only** — never a persistent client-state destination.
-//!
 //! This module is the pure policy core: it takes a resolved path plus the
 //! canonicalized scope and denylist and returns a [`Decision`]; the emission of
-//! the wire field names lives in [`Decision::to_hook_json`] alone, so a field
-//! rename is a one-place fix. The transport (`catenary hook permission-request`)
-//! and the daemon method that resolves the scope live elsewhere
-//! (`src/cli/hooks.rs`, `src/router.rs`).
+//! the wire field names lives in [`Decision::to_hook_json`] (the
+//! `PermissionRequest` envelope) and [`Decision::to_pretooluse_json`] (the
+//! `PreToolUse` envelope, the delivery seat as of bug 123), so a field rename is
+//! a one-place fix per seat. The transport (`catenary hook pre-tool` /
+//! `permission-request`) and the daemon method that resolves the scope live
+//! elsewhere (`src/cli/hooks.rs`, `src/router.rs`).
 //!
 //! ## Path-spelling discipline
 //!
@@ -64,6 +62,15 @@ Do not obfuscate a secret into a form that bypasses the secrets sniffer.";
 /// The suffix names WHAT was redacted (e.g. `[REDACTED: private key]`), so the
 /// agent sees a shape, not the bytes, and knows a real value stood there.
 const REDACT_PREFIX: &str = "[REDACTED: ";
+
+/// The `permissionDecisionReason` a quiet (in-scope) allow carries at the
+/// `PreToolUse` seat (bug 123).
+pub const QUIET_ALLOW_REASON: &str = "Catenary read policy: allowed within declared read scope";
+
+/// The `permissionDecisionReason` a loud (out-of-scope, recorded) allow carries
+/// at the `PreToolUse` seat (bug 123).
+pub const LOUD_ALLOW_REASON: &str =
+    "Catenary read policy: allowed outside declared scope (recorded)";
 
 // ── The sensitive-path denylist ──────────────────────────────────────────────
 
@@ -156,7 +163,8 @@ impl SensitiveDenylist {
 /// The declared readable scope (decision 031).
 ///
 /// The union of the session's workspace roots, the agents-class worktree base,
-/// configured companion repos, and the user-config `always_read` path list.
+/// configured companion repos, and the user-config `always_read` path list — the
+/// caller folds all of these into one prefix list.
 ///
 /// Every prefix is canonicalized at construction ([`canonicalize_lenient`]) so a
 /// symlinked-prefix alias gets the same verdict as the canonical spelling. Pins
@@ -164,44 +172,24 @@ impl SensitiveDenylist {
 /// reachable is self-grantable; mount state never converts into a desk answer).
 #[derive(Debug, Clone, Default)]
 pub struct ReadScope {
-    /// Non-`always_read` declared prefixes: workspace roots, the agents-worktree
-    /// base, companion repos. A read under one of these is a QUIET allow.
+    /// Declared prefixes: workspace roots, the agents-worktree base, companion
+    /// repos, and the `always_read` prefixes. A read under one of these is a
+    /// QUIET allow.
     prefixes: Vec<PathBuf>,
-    /// Declared `always_read` prefixes. A read under one of these is a quiet
-    /// allow AND, on the first such allow, promotes the enclosing prefix into the
-    /// session's working directories (session destination only).
-    always_read: Vec<PathBuf>,
 }
 
 impl ReadScope {
     /// Builds a scope, canonicalizing every prefix at ingestion.
     #[must_use]
-    pub fn new(prefixes: &[PathBuf], always_read: &[PathBuf]) -> Self {
+    pub fn new(prefixes: &[PathBuf]) -> Self {
         Self {
             prefixes: prefixes.iter().map(|p| canonicalize_lenient(p)).collect(),
-            always_read: always_read
-                .iter()
-                .map(|p| canonicalize_lenient(p))
-                .collect(),
         }
     }
 
     /// Classifies a canonical `realpath` against the declared scope.
-    ///
-    /// `always_read` wins over the plain prefixes: a path under both is an
-    /// [`ScopeVerdict::AlwaysRead`] carrying the enclosing declared prefix (for
-    /// the promotion), so the first allow there can promote the tree.
     #[must_use]
     pub fn classify(&self, realpath: &Path) -> ScopeVerdict {
-        if let Some(prefix) = self
-            .always_read
-            .iter()
-            .find(|prefix| path_is_within(realpath, prefix))
-        {
-            return ScopeVerdict::AlwaysRead {
-                prefix: prefix.clone(),
-            };
-        }
         if self
             .prefixes
             .iter()
@@ -216,14 +204,9 @@ impl ReadScope {
 /// Where a read's resolved realpath falls relative to the declared scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeVerdict {
-    /// Inside a declared workspace root / companion / agents base — a quiet allow.
+    /// Inside a declared prefix (workspace root / companion / agents base /
+    /// `always_read`) — a quiet allow.
     InScope,
-    /// Inside a declared `always_read` prefix — a quiet allow that also promotes
-    /// the enclosing prefix into the session's working directories.
-    AlwaysRead {
-        /// The enclosing declared `always_read` prefix to promote.
-        prefix: PathBuf,
-    },
     /// Outside every declared prefix — a LOUD allow (allow + record).
     OutOfScope,
 }
@@ -232,10 +215,12 @@ pub enum ScopeVerdict {
 
 /// The answer-desk verdict for one permission prompt.
 ///
-/// [`Decision::to_hook_json`] is the SINGLE place the wire field names
+/// [`Decision::to_hook_json`] (the `PermissionRequest` envelope) and
+/// [`Decision::to_pretooluse_json`] (the `PreToolUse` envelope, the delivery seat
+/// as of bug 123) are the emission sites for the wire field names
 /// (`hookSpecificOutput`, `hookEventName`, `decision`, `behavior`,
-/// `updatedInput`, `updatedPermissions`, `message`) are emitted, so a field
-/// rename is a one-place fix.
+/// `updatedInput`, `message`, `permissionDecision`, `permissionDecisionReason`),
+/// so a field rename is a one-place fix per seat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     /// Deny the read (sensitive file). Carries the teaching message.
@@ -248,18 +233,6 @@ pub enum Decision {
         /// The resolved realpath to pin via `updatedInput` (closes symlink
         /// TOCTOU: the decision and the read are about the same inode-path).
         realpath: PathBuf,
-    },
-    /// Quiet allow inside a declared `always_read` prefix — pin the realpath AND,
-    /// when `promote` is set, emit `updatedPermissions` promoting the enclosing
-    /// prefix into the session's working directories (session destination only).
-    AlwaysReadAllow {
-        /// The resolved realpath to pin via `updatedInput`.
-        realpath: PathBuf,
-        /// The enclosing declared prefix to promote into session directories.
-        prefix: PathBuf,
-        /// Whether this is the FIRST allow under `prefix` — only then is the
-        /// promotion emitted (subsequent reads are prompt-free natively).
-        promote: bool,
     },
     /// Loud allow outside declared scope — pin the realpath; the RECORDING (a
     /// firehose event + a TUI health finding) is the caller's responsibility.
@@ -274,15 +247,18 @@ pub enum Decision {
 }
 
 impl Decision {
-    /// Renders the decision as the hook-response JSON, or `None` for
-    /// [`Decision::NoDecision`] (nothing is printed — the human's prompt stands).
+    /// Renders the decision as the `PermissionRequest` hook-response JSON, or
+    /// `None` for [`Decision::NoDecision`] (nothing is printed — the human's
+    /// prompt stands).
     ///
-    /// This is the ONE emission site for the wire schema. The documented
-    /// `PermissionRequest` envelope (bug 123 — hooks docs, fetched 2026-07-17)
-    /// nests the decision under `hookSpecificOutput`:
+    /// This is the emission site for the `PermissionRequest` wire schema. Since
+    /// bug 123 the DELIVERY seat is [`Decision::to_pretooluse_json`]; this
+    /// envelope remains as the harmless second answerer (the `PermissionRequest`
+    /// hook, when the host does fire it). The documented `PermissionRequest`
+    /// envelope (bug 123 — hooks docs, fetched 2026-07-17) nests the decision
+    /// under `hookSpecificOutput`:
     /// `{"hookSpecificOutput": {"hookEventName": "PermissionRequest",
-    /// "decision": {"behavior": "allow"|"deny", "updatedInput"?,
-    /// "updatedPermissions"?, "message"?}}}`.
+    /// "decision": {"behavior": "allow"|"deny", "updatedInput"?, "message"?}}}`.
     ///
     /// TRANSITIONAL DUAL-SHAPE (bug 123): the same `decision` object is ALSO
     /// emitted at the top level, alongside `hookSpecificOutput`. The host is
@@ -295,11 +271,7 @@ impl Decision {
     ///
     /// The `updatedInput` object pins the resolved realpath under `input_path_key`
     /// (the tool's file-path field name — `file_path` for Read, `path` for the
-    /// host Grep/Glob prompts). A promotion emits `updatedPermissions` with a
-    /// single `addDirectories` rule whose destination is **`session`** — the
-    /// engraved rule (misc 201): the desk NEVER writes persistent client state, so
-    /// `localSettings`/`projectSettings`/`userSettings` destinations never appear.
-    /// `updatedPermissions` and `message` ride inside the `decision` object in
+    /// host Grep/Glob prompts). `message` rides inside the `decision` object in
     /// BOTH copies.
     #[must_use]
     pub fn to_hook_json(&self, input_path_key: &str) -> Option<serde_json::Value> {
@@ -317,28 +289,6 @@ impl Decision {
                     },
                 })
             }
-            Self::AlwaysReadAllow {
-                realpath,
-                prefix,
-                promote,
-            } => {
-                let mut decision = serde_json::json!({
-                    "behavior": "allow",
-                    "updatedInput": {
-                        input_path_key: realpath.to_string_lossy(),
-                    },
-                });
-                if *promote {
-                    decision["updatedPermissions"] = serde_json::json!([
-                        {
-                            "type": "addDirectories",
-                            "directories": [prefix.to_string_lossy()],
-                            "destination": "session",
-                        }
-                    ]);
-                }
-                decision
-            }
         };
         Some(serde_json::json!({
             "hookSpecificOutput": {
@@ -347,6 +297,32 @@ impl Decision {
             },
             // Transitional top-level copy — see the doc comment above.
             "decision": decision,
+        }))
+    }
+
+    /// Render the decision as the `PreToolUse` permission envelope (bug 123 — the
+    /// delivery seat moved here from `PermissionRequest`), or `None` for
+    /// `NoDecision` (absence means the host's normal permission flow proceeds —
+    /// silence is the pass-through; never an "ask"-equivalent).
+    ///
+    /// The shape is the documented `PreToolUse` decision envelope:
+    /// `{"hookSpecificOutput": {"hookEventName": "PreToolUse",
+    /// "permissionDecision": "allow"|"deny", "permissionDecisionReason": "…"}}`.
+    /// Unlike the `PermissionRequest` envelope this carries NO `updatedInput`.
+    #[must_use]
+    pub fn to_pretooluse_json(&self) -> Option<serde_json::Value> {
+        let (decision, reason) = match self {
+            Self::NoDecision => return None,
+            Self::Deny { message } => ("deny", message.as_str()),
+            Self::QuietAllow { .. } => ("allow", QUIET_ALLOW_REASON),
+            Self::LoudAllow { .. } => ("allow", LOUD_ALLOW_REASON),
+        };
+        Some(serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": decision,
+                "permissionDecisionReason": reason,
+            }
         }))
     }
 }
@@ -379,29 +355,17 @@ pub fn classify_tool(tool_name: &str) -> ToolClass {
 /// The read-policy decision for a resolved read prompt (decision 031).
 ///
 /// `realpath` is the CANONICAL target (the caller canonicalizes at ingestion).
-/// `first_always_read` tells whether this is the first allow under the enclosing
-/// `always_read` prefix — the caller owns that ledger; `true` promotes.
 ///
 /// Order is the ruled order: sensitive-deny first (even inside scope — a `.env`
 /// in the workspace is still sensitive), then scope classification.
 #[must_use]
-pub fn decide_read(
-    realpath: &Path,
-    scope: &ReadScope,
-    denylist: &SensitiveDenylist,
-    first_always_read: bool,
-) -> Decision {
+pub fn decide_read(realpath: &Path, scope: &ReadScope, denylist: &SensitiveDenylist) -> Decision {
     if denylist.is_sensitive(realpath) {
         return Decision::Deny {
             message: SENSITIVE_DENY_MESSAGE.to_string(),
         };
     }
     match scope.classify(realpath) {
-        ScopeVerdict::AlwaysRead { prefix } => Decision::AlwaysReadAllow {
-            realpath: realpath.to_path_buf(),
-            prefix,
-            promote: first_always_read,
-        },
         ScopeVerdict::InScope => Decision::QuietAllow {
             realpath: realpath.to_path_buf(),
         },
@@ -724,17 +688,15 @@ mod tests {
     // ── Scope predicate ──────────────────────────────────────────────────
 
     #[test]
-    fn scope_classifies_in_scope_always_read_and_out_of_scope() {
-        let scope = ReadScope::new(&[PathBuf::from("/work/repo")], &[PathBuf::from("/docs")]);
+    fn scope_classifies_in_scope_and_out_of_scope() {
+        let scope = ReadScope::new(&[PathBuf::from("/work/repo"), PathBuf::from("/docs")]);
         assert_eq!(
             scope.classify(Path::new("/work/repo/src/main.rs")),
             ScopeVerdict::InScope
         );
         assert_eq!(
             scope.classify(Path::new("/docs/guide.md")),
-            ScopeVerdict::AlwaysRead {
-                prefix: PathBuf::from("/docs")
-            }
+            ScopeVerdict::InScope
         );
         assert_eq!(
             scope.classify(Path::new("/etc/hosts")),
@@ -756,7 +718,7 @@ mod tests {
 
         // Scope declared with the CANONICAL real root; a read spelled through
         // the symlinked alias must land in-scope after canonicalization.
-        let scope = ReadScope::new(std::slice::from_ref(&real), &[]);
+        let scope = ReadScope::new(std::slice::from_ref(&real));
         let aliased_read = canonicalize_lenient(&link.join("src/main.rs"));
         assert_eq!(scope.classify(&aliased_read), ScopeVerdict::InScope);
     }
@@ -782,10 +744,10 @@ mod tests {
 
     #[test]
     fn decide_read_denies_sensitive_even_inside_scope() {
-        let scope = ReadScope::new(&[PathBuf::from("/work/repo")], &[]);
+        let scope = ReadScope::new(&[PathBuf::from("/work/repo")]);
         let deny = SensitiveDenylist::load(&[]);
         // A `.env` inside the workspace is still sensitive.
-        let d = decide_read(Path::new("/work/repo/.env"), &scope, &deny, false);
+        let d = decide_read(Path::new("/work/repo/.env"), &scope, &deny);
         assert_eq!(
             d,
             Decision::Deny {
@@ -796,9 +758,9 @@ mod tests {
 
     #[test]
     fn decide_read_quiet_allow_in_scope_pins_realpath() {
-        let scope = ReadScope::new(&[PathBuf::from("/work/repo")], &[]);
+        let scope = ReadScope::new(&[PathBuf::from("/work/repo")]);
         let deny = SensitiveDenylist::load(&[]);
-        let d = decide_read(Path::new("/work/repo/src/main.rs"), &scope, &deny, false);
+        let d = decide_read(Path::new("/work/repo/src/main.rs"), &scope, &deny);
         assert_eq!(
             d,
             Decision::QuietAllow {
@@ -809,9 +771,9 @@ mod tests {
 
     #[test]
     fn decide_read_loud_allow_out_of_scope() {
-        let scope = ReadScope::new(&[PathBuf::from("/work/repo")], &[]);
+        let scope = ReadScope::new(&[PathBuf::from("/work/repo")]);
         let deny = SensitiveDenylist::load(&[]);
-        let d = decide_read(Path::new("/etc/hosts"), &scope, &deny, false);
+        let d = decide_read(Path::new("/etc/hosts"), &scope, &deny);
         assert_eq!(
             d,
             Decision::LoudAllow {
@@ -905,66 +867,54 @@ mod tests {
         assert_eq!(json["hookSpecificOutput"]["decision"], json["decision"]);
     }
 
+    // ── The documented PreToolUse envelope (bug 123 — the delivery seat) ──
+
     #[test]
-    fn envelope_promotion_pins_updated_permissions_in_both_copies() {
-        let d = Decision::AlwaysReadAllow {
-            realpath: PathBuf::from("/docs/guide.md"),
-            prefix: PathBuf::from("/docs"),
-            promote: true,
+    fn pretooluse_envelope_allow_pins_documented_shape_verbatim() {
+        let d = Decision::QuietAllow {
+            realpath: PathBuf::from("/work/repo/src/main.rs"),
         };
-        let json = d.to_hook_json("file_path").expect("allow emits json");
+        let json = d.to_pretooluse_json().expect("allow emits json");
         assert_eq!(
-            json["hookSpecificOutput"]["hookEventName"],
-            "PermissionRequest"
-        );
-        assert_eq!(json["hookSpecificOutput"]["decision"]["behavior"], "allow");
-        // `updatedPermissions` rides INSIDE the decision object, in both copies.
-        let nested_perms = &json["hookSpecificOutput"]["decision"]["updatedPermissions"];
-        assert_eq!(nested_perms[0]["type"], "addDirectories");
-        assert_eq!(nested_perms[0]["destination"], "session");
-        assert_eq!(nested_perms[0]["directories"][0], "/docs");
-        assert_eq!(json["hookSpecificOutput"]["decision"], json["decision"]);
-    }
-
-    #[test]
-    fn always_read_first_allow_emits_session_add_directories_and_never_persistent() {
-        let d = Decision::AlwaysReadAllow {
-            realpath: PathBuf::from("/docs/guide.md"),
-            prefix: PathBuf::from("/docs"),
-            promote: true,
-        };
-        let json = d.to_hook_json("file_path").expect("allow emits json");
-        assert_eq!(json["decision"]["behavior"], "allow");
-        let perms = &json["decision"]["updatedPermissions"];
-        assert_eq!(perms[0]["type"], "addDirectories");
-        assert_eq!(perms[0]["destination"], "session");
-        assert_eq!(perms[0]["directories"][0], "/docs");
-
-        // ENGRAVED RULE: no persistent client-state destination, ever.
-        let text = json.to_string();
-        assert!(
-            !text.contains("localSettings"),
-            "persistent dest leaked: {text}"
-        );
-        assert!(
-            !text.contains("projectSettings"),
-            "persistent dest leaked: {text}"
-        );
-        assert!(
-            !text.contains("userSettings"),
-            "persistent dest leaked: {text}"
+            json["hookSpecificOutput"],
+            serde_json::json!({
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": QUIET_ALLOW_REASON,
+            })
         );
     }
 
     #[test]
-    fn always_read_subsequent_allow_does_not_promote() {
-        let d = Decision::AlwaysReadAllow {
-            realpath: PathBuf::from("/docs/guide.md"),
-            prefix: PathBuf::from("/docs"),
-            promote: false,
+    fn pretooluse_envelope_deny_pins_documented_shape() {
+        let d = Decision::Deny {
+            message: SENSITIVE_DENY_MESSAGE.to_string(),
         };
-        let json = d.to_hook_json("file_path").expect("allow emits json");
-        assert!(json["decision"].get("updatedPermissions").is_none());
+        let json = d.to_pretooluse_json().expect("deny emits json");
+        assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecisionReason"],
+            SENSITIVE_DENY_MESSAGE
+        );
+    }
+
+    #[test]
+    fn pretooluse_loud_allow_pins_recorded_reason() {
+        let d = Decision::LoudAllow {
+            realpath: PathBuf::from("/etc/hosts"),
+        };
+        let json = d.to_pretooluse_json().expect("loud allow emits json");
+        assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecisionReason"],
+            LOUD_ALLOW_REASON
+        );
+    }
+
+    #[test]
+    fn pretooluse_no_decision_emits_nothing() {
+        assert!(Decision::NoDecision.to_pretooluse_json().is_none());
     }
 
     // ── Tool classification ──────────────────────────────────────────────

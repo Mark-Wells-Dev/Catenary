@@ -359,33 +359,33 @@ fn build_read_scope(
     // always reachable to it, so reading within the base is declared scope.
     prefixes.push(crate::paths::agents_worktrees_dir());
 
+    // The `always_read` prefixes join the declared scope as plain prefixes (a
+    // read there is a quiet allow, per decision 031); the promotion machinery
+    // retired with bug 123.
     let permissions = config.permissions();
-    let always_read: Vec<PathBuf> = permissions
-        .always_read
-        .iter()
-        .map(|s| PathBuf::from(crate::bridge::expand_tilde(s)))
-        .collect();
+    prefixes.extend(
+        permissions
+            .always_read
+            .iter()
+            .map(|s| PathBuf::from(crate::bridge::expand_tilde(s))),
+    );
 
-    crate::answer_desk::ReadScope::new(&prefixes, &always_read)
+    crate::answer_desk::ReadScope::new(&prefixes)
 }
 
-/// Resolve the answer desk's decision for a forwarded `PermissionRequest` payload
-/// (misc 201, decision 031).
+/// Resolve the answer desk's decision for a forwarded read-class payload (misc
+/// 201, decision 031).
 ///
 /// Returns `(decision, tool_name)`, or `None` when the desk answers nothing (a
 /// write-class tool or an unresolvable read target).
 ///
 /// The target realpath is canonicalized at ingestion ([`canonicalize_lenient`])
 /// so a symlinked-prefix alias gets the same verdict as the canonical spelling.
-/// The `always_read` first-allow promotion is decided here against the per-session
-/// [`PromotedPrefixes`] ledger — only the first allow under a prefix promotes.
 #[cfg(unix)]
 fn resolve_permission_decision(
     hp: &serde_json::Value,
     tracker: Option<&RootTracker>,
     config: &crate::config::Config,
-    promoted: &PromotedPrefixes,
-    session_id: &str,
 ) -> Option<(crate::answer_desk::Decision, String)> {
     let (tool_name, target) = permission_read_target(hp)?;
     let realpath = crate::answer_desk::canonicalize_lenient(&target);
@@ -393,25 +393,7 @@ fn resolve_permission_decision(
     let scope = build_read_scope(tracker, config);
     let denylist = crate::answer_desk::SensitiveDenylist::load(&config.permissions().deny_paths);
 
-    // Two-phase for the `always_read` promotion: first classify with `false`, and
-    // only if it lands `AlwaysReadAllow` do we consult the ledger to set `promote`
-    // — so a sensitive-deny or a non-always-read allow never touches the ledger.
-    let decision = crate::answer_desk::decide_read(&realpath, &scope, &denylist, false);
-    let decision = match decision {
-        crate::answer_desk::Decision::AlwaysReadAllow {
-            realpath,
-            prefix,
-            promote: _,
-        } => {
-            let first = promoted.promote(session_id, &prefix);
-            crate::answer_desk::Decision::AlwaysReadAllow {
-                realpath,
-                prefix,
-                promote: first,
-            }
-        }
-        other => other,
-    };
+    let decision = crate::answer_desk::decide_read(&realpath, &scope, &denylist);
     Some((decision, tool_name))
 }
 
@@ -1004,10 +986,6 @@ struct HookDispatchContext {
     /// `conversationId` the hook has taught, so the persisted `userMessage` is
     /// injected exactly once per conversation.
     first_sightings: FirstSightings,
-    /// Answer-desk `always_read` promotion ledger (misc 201). Records the FIRST
-    /// allow under each declared `always_read` prefix per session, so only that
-    /// prompt emits the session-destination `addDirectories` promotion.
-    promoted_prefixes: PromotedPrefixes,
     /// Per-root ledger for the `SessionStart` project-config setup nudge (misc
     /// 202). Fires the missing-config pointer once per served root per daemon
     /// instance; a repeat `SessionStart` on the same root is silent.
@@ -1942,38 +1920,6 @@ impl FirstSightings {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(conversation_id.to_string())
-    }
-}
-
-/// Answer-desk `always_read` promotion ledger (misc 201).
-///
-/// Keyed on `(session_id, prefix)`: [`promote`](Self::promote) records the pair
-/// and returns `true` iff it was not already present — the FIRST allow under a
-/// declared `always_read` prefix, which emits the session-destination
-/// `addDirectories` promotion so subsequent reads of that tree are prompt-free
-/// natively. Every later allow under the same prefix returns `false` (no
-/// re-promotion). In-memory only — a daemon restart re-promotes on the next read,
-/// which is harmless (session destination re-adds the same working directory).
-#[cfg(unix)]
-#[derive(Clone, Default)]
-struct PromotedPrefixes {
-    inner: Arc<std::sync::Mutex<HashSet<String>>>,
-}
-
-#[cfg(unix)]
-impl PromotedPrefixes {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    /// Records `(session_id, prefix)` and returns `true` iff it was not already
-    /// present — the first allow under this prefix in this session.
-    fn promote(&self, session_id: &str, prefix: &Path) -> bool {
-        let key = format!("{session_id}::{}", prefix.display());
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key)
     }
 }
 
@@ -3533,7 +3479,6 @@ impl SessionManager {
             worktree_watcher,
             ephemeral_mounts,
             first_sightings: FirstSightings::new(),
-            promoted_prefixes: PromotedPrefixes::new(),
             project_config_nudges: ProjectConfigNudges::new(),
             auto_installer,
             worktree_registry,
@@ -5641,28 +5586,23 @@ async fn handle_hook_dispatch(
             "incoming hook",
         );
 
-        // ── The answer desk (misc 201, decision 031) ──────────────────
+        // ── The answer desk: the harmless second answerer (bug 123) ────
         //
         // Compute the read-class permission decision from the forwarded payload:
         // sensitive → deny with teaching; in declared scope → quiet allow (pin
-        // the realpath); `always_read` → quiet allow + first-time session
-        // promotion; out of scope → LOUD allow (allow + record). A write-class
-        // tool or an unresolvable target yields no decision — the human's prompt
-        // stands (fail-PASS). Emitted as the response body so the hook CLI prints
-        // it verbatim; the daemon being unreachable already fails PASS CLI-side.
+        // the realpath); out of scope → allow. A write-class tool or an
+        // unresolvable target yields no decision — the human's prompt stands
+        // (fail-PASS). Emitted as the `PermissionRequest` envelope so the hook CLI
+        // prints it verbatim WHEN the host fires PermissionRequest; the reliable
+        // delivery seat is the PreToolUse leg (bug 123), which is where the
+        // loud-allow recording ([`record_loud_read`]) now fires — EXACTLY ONCE, so
+        // this seat records nothing (both seats firing would double-count).
         let response_body = raw
             .get("host_payload")
             .and_then(|hp| {
-                resolve_permission_decision(
-                    hp,
-                    ctx.root_tracker.as_ref(),
-                    &ctx.primary.config,
-                    &ctx.promoted_prefixes,
-                    &session_id,
-                )
+                resolve_permission_decision(hp, ctx.root_tracker.as_ref(), &ctx.primary.config)
             })
             .map(|(decision, tool_name)| {
-                record_loud_read(&decision, &session_id);
                 decision
                     .to_hook_json(permission_input_key(&tool_name))
                     .map(|v| v.to_string())
@@ -6328,6 +6268,24 @@ async fn handle_hook_dispatch(
 
     let mut result = router.dispatch(request);
 
+    // The answer desk delivers its read policy at the PreToolUse seat (bug 123).
+    // Only when editing-state enforcement ALLOWED (no deny) — enforcement wins,
+    // the desk stays silent. Computed daemon-side so the loud-allow warn! reaches
+    // the firehose (the hook-side subscriber cannot).
+    let read_permission: Option<String> =
+        if method == "pre-tool/editing-state" && result.result.is_none() {
+            raw.get("host_payload")
+                .and_then(|hp| {
+                    resolve_permission_decision(hp, ctx.root_tracker.as_ref(), &ctx.primary.config)
+                })
+                .and_then(|(decision, _tool)| {
+                    record_loud_read(&decision, &session_id);
+                    decision.to_pretooluse_json().map(|v| v.to_string())
+                })
+        } else {
+            None
+        };
+
     // ── Lingering-worktree nag at the parent's Stop (misc 151 D-2) ─────
     //
     // Block-once with the list of the session's worktrees that satisfy ALL of:
@@ -6509,13 +6467,16 @@ async fn handle_hook_dispatch(
     let response = if session_start_nudge.is_some()
         || merged_nudge.is_some()
         || auto_install_announcement.is_some()
+        || read_permission.is_some()
     {
         // A nudge rides alongside any result on its own wire field —
         // `session_start_nudge` (misc 202; the CLI folds it into the
         // SessionStart context), `merged_nudge` (wf-04; the CLI surfaces it
-        // as a Stop-time `systemMessage`, never a gate), or
+        // as a Stop-time `systemMessage`, never a gate),
         // `auto_install_announcement` (lsm 05; a SessionStart-time
-        // `systemMessage`). A hook that never nudges keeps the plain envelope.
+        // `systemMessage`), or `read_permission` (bug 123; the CLI prints the
+        // desk's PreToolUse envelope verbatim). A hook that never nudges keeps
+        // the plain envelope.
         let mut obj = serde_json::to_value(&envelope)
             .ok()
             .and_then(|v| v.as_object().cloned())
@@ -6533,6 +6494,12 @@ async fn handle_hook_dispatch(
             obj.insert(
                 "auto_install_announcement".to_string(),
                 serde_json::Value::String(announcement),
+            );
+        }
+        if let Some(perm) = read_permission {
+            obj.insert(
+                "read_permission".to_string(),
+                serde_json::Value::String(perm),
             );
         }
         serde_json::to_string(&serde_json::Value::Object(obj))?
@@ -10274,7 +10241,6 @@ mod tests {
         let tracker = RootTracker::new();
         tracker.set_roots("mcp:1", vec![root.canonicalize().expect("canon")]);
         let config = crate::config::Config::default();
-        let promoted = PromotedPrefixes::new();
 
         // In-scope file → quiet allow, realpath pinned.
         let read = read_payload(
@@ -10284,8 +10250,7 @@ mod tests {
             tmp.path().to_str().expect("utf8"),
         );
         let (decision, tool) =
-            resolve_permission_decision(&read, Some(&tracker), &config, &promoted, "sess")
-                .expect("read decided");
+            resolve_permission_decision(&read, Some(&tracker), &config).expect("read decided");
         assert_eq!(tool, "Read");
         assert!(matches!(
             decision,
@@ -10300,8 +10265,7 @@ mod tests {
             tmp.path().to_str().expect("utf8"),
         );
         let (decision, _) =
-            resolve_permission_decision(&env, Some(&tracker), &config, &promoted, "sess")
-                .expect("env decided");
+            resolve_permission_decision(&env, Some(&tracker), &config).expect("env decided");
         assert!(matches!(
             decision,
             crate::answer_desk::Decision::Deny { .. }
@@ -10324,7 +10288,6 @@ mod tests {
         let tracker = RootTracker::new();
         tracker.add_roots(&ephemeral_contributor(&root), std::slice::from_ref(&root));
         let config = crate::config::Config::default();
-        let promoted = PromotedPrefixes::new();
 
         let read = read_payload(
             "Read",
@@ -10333,8 +10296,7 @@ mod tests {
             root.to_str().expect("utf8"),
         );
         let (decision, _) =
-            resolve_permission_decision(&read, Some(&tracker), &config, &promoted, "sess")
-                .expect("read decided");
+            resolve_permission_decision(&read, Some(&tracker), &config).expect("read decided");
         assert!(
             matches!(decision, crate::answer_desk::Decision::LoudAllow { .. }),
             "an ephemeral-only root confers no quiet scope, got {decision:?}"
@@ -10343,8 +10305,7 @@ mod tests {
         // A genuine session contribution on the same root flips it to quiet.
         tracker.add_roots("mcp:1", std::slice::from_ref(&root));
         let (decision, _) =
-            resolve_permission_decision(&read, Some(&tracker), &config, &promoted, "sess")
-                .expect("read decided");
+            resolve_permission_decision(&read, Some(&tracker), &config).expect("read decided");
         assert!(
             matches!(decision, crate::answer_desk::Decision::QuietAllow { .. }),
             "a session-contributed root is declared scope, got {decision:?}"
@@ -10360,7 +10321,6 @@ mod tests {
         let tracker = RootTracker::new();
         tracker.set_roots("mcp:1", vec![PathBuf::from("/some/other/root")]);
         let config = crate::config::Config::default();
-        let promoted = PromotedPrefixes::new();
 
         let read = read_payload(
             "Read",
@@ -10369,8 +10329,7 @@ mod tests {
             "/some/other/root",
         );
         let (decision, _) =
-            resolve_permission_decision(&read, Some(&tracker), &config, &promoted, "sess")
-                .expect("read decided");
+            resolve_permission_decision(&read, Some(&tracker), &config).expect("read decided");
         assert!(matches!(
             decision,
             crate::answer_desk::Decision::LoudAllow { .. }
@@ -10381,64 +10340,54 @@ mod tests {
     fn answer_desk_write_class_emits_no_decision() {
         let tracker = RootTracker::new();
         let config = crate::config::Config::default();
-        let promoted = PromotedPrefixes::new();
         let write = read_payload("Write", "file_path", "/work/x.rs", "/work");
-        assert!(
-            resolve_permission_decision(&write, Some(&tracker), &config, &promoted, "sess")
-                .is_none()
-        );
+        assert!(resolve_permission_decision(&write, Some(&tracker), &config).is_none());
     }
 
+    /// Both delivery seats (bug 123) render the SAME policy from one decision: a
+    /// read-class payload yields `Some(decision)` and BOTH the `PreToolUse`
+    /// envelope (`to_pretooluse_json`) and the `PermissionRequest` envelope
+    /// (`to_hook_json`) speak with the same allow/deny sense; a write-class
+    /// payload yields `None`, so neither seat speaks.
     #[test]
-    fn answer_desk_always_read_promotes_only_on_first_allow() {
+    fn answer_desk_both_seats_render_the_same_policy() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let docs = tmp.path().join("docs");
-        std::fs::create_dir_all(&docs).expect("mkdir docs");
-        std::fs::write(docs.join("a.md"), "a").expect("write a");
-        std::fs::write(docs.join("b.md"), "b").expect("write b");
-        let docs_canon = docs.canonicalize().expect("canon");
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).expect("mkdir");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").expect("write");
 
-        // always_read carries the docs prefix; no workspace roots.
-        let mut config = crate::config::Config::default();
-        config.permissions = Some(crate::config::PermissionsConfig {
-            always_read: vec![docs_canon.to_string_lossy().into_owned()],
-            ..Default::default()
-        });
         let tracker = RootTracker::new();
-        let promoted = PromotedPrefixes::new();
+        tracker.set_roots("mcp:1", vec![root.canonicalize().expect("canon")]);
+        let config = crate::config::Config::default();
 
-        let first = read_payload(
+        // A read-class in-scope payload → both seats agree (allow).
+        let read = read_payload(
             "Read",
             "file_path",
-            docs.join("a.md").to_str().expect("utf8"),
+            root.join("src/main.rs").to_str().expect("utf8"),
             tmp.path().to_str().expect("utf8"),
         );
-        let (decision, _) =
-            resolve_permission_decision(&first, Some(&tracker), &config, &promoted, "sess")
-                .expect("first decided");
-        match decision {
-            crate::answer_desk::Decision::AlwaysReadAllow { promote, .. } => {
-                assert!(promote, "first allow under always_read promotes");
-            }
-            other => panic!("expected AlwaysReadAllow, got {other:?}"),
-        }
+        let (decision, tool) =
+            resolve_permission_decision(&read, Some(&tracker), &config).expect("read decided");
 
-        // A second read under the same prefix in the same session does NOT promote.
-        let second = read_payload(
-            "Read",
-            "file_path",
-            docs.join("b.md").to_str().expect("utf8"),
-            tmp.path().to_str().expect("utf8"),
+        let permission_request = decision
+            .to_hook_json(permission_input_key(&tool))
+            .expect("permission-request envelope present");
+        let pretooluse = decision
+            .to_pretooluse_json()
+            .expect("pretooluse envelope present");
+        assert_eq!(
+            permission_request["hookSpecificOutput"]["decision"]["behavior"],
+            "allow"
         );
-        let (decision, _) =
-            resolve_permission_decision(&second, Some(&tracker), &config, &promoted, "sess")
-                .expect("second decided");
-        match decision {
-            crate::answer_desk::Decision::AlwaysReadAllow { promote, .. } => {
-                assert!(!promote, "subsequent allow does not re-promote");
-            }
-            other => panic!("expected AlwaysReadAllow, got {other:?}"),
-        }
+        assert_eq!(
+            pretooluse["hookSpecificOutput"]["permissionDecision"],
+            "allow"
+        );
+
+        // A write-class payload → the desk answers nothing; neither seat speaks.
+        let write = read_payload("Write", "file_path", "/work/x.rs", "/work");
+        assert!(resolve_permission_decision(&write, Some(&tracker), &config).is_none());
     }
 
     #[test]
@@ -10457,7 +10406,6 @@ mod tests {
         let tracker = RootTracker::new();
         tracker.set_roots("mcp:1", vec![canonical_root]);
         let config = crate::config::Config::default();
-        let promoted = PromotedPrefixes::new();
 
         // Read spelled through the ALIAS prefix.
         let read = read_payload(
@@ -10467,8 +10415,7 @@ mod tests {
             tmp.path().to_str().expect("utf8"),
         );
         let (decision, _) =
-            resolve_permission_decision(&read, Some(&tracker), &config, &promoted, "sess")
-                .expect("read decided");
+            resolve_permission_decision(&read, Some(&tracker), &config).expect("read decided");
         assert!(
             matches!(decision, crate::answer_desk::Decision::QuietAllow { .. }),
             "an aliased read lands in-scope after canonicalization",

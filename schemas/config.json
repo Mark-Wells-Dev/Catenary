@@ -561,7 +561,7 @@
       "description": "Answer-desk permission policy (`[permissions]`, misc 201).\n\nUser-level only — homes the answer desk's config levers (decision 031, \"Reads nod through, writes wait\"). A project `.catenary.toml` carrying `[permissions]` is warned-and-ignored (it is not in [`crate::config::parse::PROJECT_CONFIG_ALLOWED_KEYS`]), mirroring the `[roots]` user-config-only precedent so a public repo cannot broaden read scope or the sensitive-path denylist for a private machine.\n\n# Examples\n\n```toml [permissions] always_read = [\"~/notes\", \"/srv/shared-docs\"] deny_paths = [\"**/vault/**\"] deny_host_grep = true deny_host_glob = true ```",
       "properties": {
         "always_read": {
-          "description": "Additional declared-readable prefixes (`[permissions] always_read`).\n\nEach entry joins the answer desk's declared read scope (alongside the session's workspace roots, the agents-worktree base, and companion repos). A read under one of these is a quiet allow, and the FIRST such allow promotes the enclosing prefix into the session's working directories (session destination only — never persistent client state). `~`/`$VAR` expand at the ingestion seam.",
+          "description": "Additional declared-readable prefixes (`[permissions] always_read`).\n\nEach entry joins the answer desk's declared read scope (alongside the session's workspace roots, the agents-worktree base, and companion repos). A read under one of these is a quiet allow. `~`/`$VAR` expand at the ingestion seam.",
           "items": {
             "type": "string"
           },

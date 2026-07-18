@@ -263,8 +263,7 @@ const TEMPLATE: &str = r#"#:schema https://twowells.github.io/catenary/schemas/c
 # for your machine. Everything below is OFF/empty by default.
 #
 # [permissions]
-# always_read = ["~/notes"]      # extra always-readable prefixes (the first read
-#                                #   promotes the tree into the session's dirs)
+# always_read = ["~/notes"]      # extra always-readable prefixes
 # deny_paths  = ["**/vault/**"]  # extend the built-in sensitive-path denylist
 #                                #   (SSH keys, *.pem/*.key, .env*, cloud creds)
 # deny_host_grep = true          # deny the host Grep tool → use `catenary grep`

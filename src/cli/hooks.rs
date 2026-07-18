@@ -1548,16 +1548,32 @@ fn enforce_editing_state(
 
     let lines = ipc_exchange(stream, &request);
 
-    if let Some(line) = lines.first()
-        && let Ok(envelope) = serde_json::from_str::<crate::hook::HookResponseEnvelope>(line)
+    let Some(line) = lines.first() else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+
+    // Enforcement deny wins: the daemon denied this tool on PRE-EXISTING debt.
+    if let Ok(envelope) = serde_json::from_value::<crate::hook::HookResponseEnvelope>(value.clone())
         && let Some(crate::hook::HookResult::Deny(reason)) = &envelope.result
     {
-        // Deny-books-nothing (bug 118): the daemon denied this tool on
-        // PRE-EXISTING debt, so the command never runs — unwind whatever this
-        // call freshly booked into the ledger. The excluded self-booked set is
-        // exactly the debt to remove; pre-existing debt is untouched.
+        // Deny-books-nothing (bug 118): the command never runs — unwind whatever
+        // this call freshly booked into the ledger. The excluded self-booked set
+        // is exactly the debt to remove; pre-existing debt is untouched.
         crate::lock::unlink_delivered_by_root(&self_booked);
         print!("{}", format_deny(reason, format));
+        return;
+    }
+
+    // Otherwise the answer desk's read-policy envelope may ride the response on
+    // the `read_permission` field (bug 123 — the delivery seat moved here from
+    // PermissionRequest). The daemon attaches it ONLY when editing-state
+    // enforcement allowed (`result` absent), so there is never a two-envelope
+    // collision to merge — print it verbatim.
+    if let Some(perm) = value.get("read_permission").and_then(|v| v.as_str()) {
+        print!("{perm}");
     }
 }
 
