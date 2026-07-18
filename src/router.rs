@@ -2721,6 +2721,17 @@ impl crate::hitstream::BatchEnricher for HitstreamAnnotator<'_> {
 #[cfg(unix)]
 const DISCONNECT_GRACE: Duration = Duration::from_mins(1);
 
+/// How often the accept loop verifies that its own socket files still exist
+/// (bug 129 fix C — ghost self-defense tripwire).
+///
+/// If either socket file vanishes the daemon was silently deregistered —
+/// emit one `error!()` interrupt and exit cleanly without re-unlinking, so
+/// a successor daemon's freshly bound files are never disturbed. Tests
+/// inject a shorter interval via
+/// [`SessionManager::tripwire_interval_override`].
+#[cfg(unix)]
+const TRIPWIRE_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Core daemon component that manages MCP and hook socket connections.
 ///
 /// Binds two Unix domain sockets: one for MCP connections from `catenary
@@ -2796,6 +2807,28 @@ pub struct SessionManager {
     /// persistent surfaces (doctor, board, `SessionStart`) carry the reminder
     /// beneath the single interrupt.
     mismatch_interrupts: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Set to `true` by [`Self::remove_sockets`] the first time it unlinks the
+    /// socket files. [`SessionManager::drop`] checks this flag and skips its
+    /// own unlink when it is set.
+    ///
+    /// Unlinking twice is forbidden: a second unlink issued after a successor
+    /// daemon has bound fresh files at the same paths removes THAT daemon's
+    /// files, making it permanently unreachable (bug 129). The first deliberate
+    /// removal — from the accept loop's shutdown arm or the grace-expiry arm —
+    /// is the authoritative one; `Drop` is the backstop for exit paths where
+    /// `remove_sockets` never ran.
+    sockets_removed: AtomicBool,
+    /// Interval at which the accept loop verifies that its own socket files
+    /// still exist (bug 129 fix C — ghost self-defense tripwire). If either
+    /// file disappears, the daemon has been unlinked by an external actor
+    /// (a race in a restart handoff, for instance), emits one `error!()`, and
+    /// exits cleanly without re-unlinking — it sets the `sockets_removed` flag
+    /// WITHOUT unlinking so [`SessionManager::drop`] cannot remove files that
+    /// may now belong to a successor daemon.
+    ///
+    /// Production default: [`TRIPWIRE_INTERVAL`]. Tests inject a smaller
+    /// value via [`Self::tripwire_interval_override`].
+    tripwire_interval: Duration,
 }
 
 #[cfg(unix)]
@@ -2851,6 +2884,8 @@ impl SessionManager {
             config_path_override: None,
             auto_installer_override: None,
             mismatch_interrupts: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            sockets_removed: AtomicBool::new(false),
+            tripwire_interval: TRIPWIRE_INTERVAL,
         }
     }
 
@@ -2903,6 +2938,8 @@ impl SessionManager {
             config_path_override: None,
             auto_installer_override: None,
             mismatch_interrupts: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            sockets_removed: AtomicBool::new(false),
+            tripwire_interval: TRIPWIRE_INTERVAL,
         })
     }
 
@@ -2930,6 +2967,10 @@ impl SessionManager {
     /// # Errors
     ///
     /// Returns an error if either listener encounters a fatal I/O error.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "sequential accept-loop arms; extraction would harm readability"
+    )]
     pub async fn accept_loop(&self) -> Result<()> {
         use std::os::fd::AsRawFd;
 
@@ -2939,6 +2980,15 @@ impl SessionManager {
         // deadline on every select pass, so the loop keeps accepting (and
         // serving IPC) while the window runs.
         let mut grace_deadline: Option<tokio::time::Instant> = None;
+
+        // Ghost self-defense tripwire (bug 129 fix C): periodically verify
+        // that our own socket files still exist. First tick fires after one
+        // full interval so we never trip on files we have not yet had a chance
+        // to bind (interval_at, not interval).
+        let mut tripwire = tokio::time::interval_at(
+            tokio::time::Instant::now() + self.tripwire_interval,
+            self.tripwire_interval,
+        );
 
         loop {
             // Copied into the timer arm so the handler bodies below can
@@ -3024,6 +3074,46 @@ impl SessionManager {
                         return Ok(());
                     }
                 }
+                _ = tripwire.tick() => {
+                    // Ghost self-defense tripwire (bug 129 fix C): verify our
+                    // socket files still exist. If either has been removed by
+                    // an external actor (a restart handoff race, for example),
+                    // we are an unreachable ghost — emit one error interrupt
+                    // and exit cleanly.
+                    //
+                    // IMPORTANT: set `sockets_removed` WITHOUT calling
+                    // `remove_sockets()` — the thief may already have bound a
+                    // successor daemon at these paths, and unlinking would kill
+                    // the successor.  V1 detects file-gone only; a thief who
+                    // unlinks AND re-binds between ticks is out of scope.
+                    //
+                    // This arm cannot fire after the shutdown arm or the
+                    // grace-expiry arm, because both of those arms return
+                    // from the loop — no further select! iterations occur.
+                    let mcp_gone = !self.mcp_socket_path.exists();
+                    let ipc_gone = !self.ipc_socket_path.exists();
+                    if mcp_gone || ipc_gone {
+                        let missing = if mcp_gone && ipc_gone {
+                            "both socket files"
+                        } else if mcp_gone {
+                            "MCP socket"
+                        } else {
+                            "IPC socket"
+                        };
+                        error!(
+                            source = Source::DaemonLifecycle.as_str(),
+                            mcp_path = %self.mcp_socket_path.display(),
+                            ipc_path = %self.ipc_socket_path.display(),
+                            "daemon socket file(s) vanished externally ({missing}): \
+                             this daemon is unreachable — exiting (bug 129 tripwire); \
+                             a successor daemon may already be bound at these paths",
+                        );
+                        // Mark as removed WITHOUT unlinking — a successor may
+                        // own these paths now. Drop must not re-unlink.
+                        self.sockets_removed.store(true, Ordering::Release);
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -3039,9 +3129,19 @@ impl SessionManager {
     }
 
     /// Removes socket files so new bridges start a fresh daemon.
+    ///
+    /// Sets [`Self::sockets_removed`] so [`SessionManager::drop`] skips its
+    /// own unlink. Unlinking twice is forbidden: a second unlink issued after a
+    /// successor daemon has bound fresh files at the same paths silently removes
+    /// THAT daemon's files, making it permanently unreachable (bug 129). This
+    /// call is the deliberate, authoritative removal; `Drop` is the backstop for
+    /// exit paths that never reach here.
     fn remove_sockets(&self) {
         let _ = std::fs::remove_file(&self.mcp_socket_path);
         let _ = std::fs::remove_file(&self.ipc_socket_path);
+        // Mark removed AFTER the unlinks succeed (or fail silently) so `Drop`
+        // never issues a second removal on the same paths.
+        self.sockets_removed.store(true, Ordering::Release);
     }
 
     /// Spawns a per-connection MCP task.
@@ -3275,6 +3375,18 @@ impl SessionManager {
     #[must_use]
     const fn disconnect_grace_override(mut self, grace: Duration) -> Self {
         self.disconnect_grace = grace;
+        self
+    }
+
+    /// Shrinks the ghost self-defense tripwire interval (bug 129, test-only).
+    ///
+    /// Production polls every [`TRIPWIRE_INTERVAL`] (30 s); tests inject a
+    /// small interval so the tripwire arm runs in milliseconds. No production
+    /// caller.
+    #[cfg(test)]
+    #[must_use]
+    const fn tripwire_interval_override(mut self, interval: Duration) -> Self {
+        self.tripwire_interval = interval;
         self
     }
 
@@ -3941,7 +4053,14 @@ async fn handle_hook_connection(
                 connections = connected,
                 "shutdown requested via stop command",
             );
-            let response = serde_json::json!({ "status": "ok", "connections": connected });
+            // Include the daemon's own PID so the CLI can poll `/proc/{pid}`
+            // for process liveness instead of relying on socket-file absence
+            // (bug 129 fix B). Old CLIs ignore the extra field — additive JSON.
+            let response = serde_json::json!({
+                "status": "ok",
+                "connections": connected,
+                "pid": std::process::id(),
+            });
             let mut payload = serde_json::to_vec(&response)?;
             payload.push(b'\n');
             writer.write_all(&payload).await?;
@@ -4932,7 +5051,14 @@ async fn handle_hook_dispatch(
             connections = connected,
             "shutdown requested via stop command",
         );
-        let response = serde_json::json!({ "status": "ok", "connections": connected });
+        // Include the daemon's own PID so the CLI can poll `/proc/{pid}`
+        // for process liveness instead of relying on socket-file absence
+        // (bug 129 fix B). Old CLIs ignore the extra field — additive JSON.
+        let response = serde_json::json!({
+            "status": "ok",
+            "connections": connected,
+            "pid": std::process::id(),
+        });
         let mut payload = serde_json::to_vec(&response)?;
         payload.push(b'\n');
         writer.write_all(&payload).await?;
@@ -6448,7 +6574,18 @@ async fn handle_hook_dispatch(
 
 #[cfg(unix)]
 impl Drop for SessionManager {
+    /// Backstop socket cleanup: removes socket files when the accept loop
+    /// exited via a path that never called [`Self::remove_sockets`].
+    ///
+    /// Skips the unlink when `sockets_removed` is already set — a second
+    /// unlink is forbidden because a successor daemon may have bound fresh
+    /// files at those same paths, and removing them makes the successor
+    /// permanently unreachable (bug 129). [`Self::remove_sockets`] is the
+    /// deliberate, authoritative removal; this is only the backstop.
     fn drop(&mut self) {
+        if self.sockets_removed.load(Ordering::Acquire) {
+            return;
+        }
         let _ = std::fs::remove_file(&self.mcp_socket_path);
         let _ = std::fs::remove_file(&self.ipc_socket_path);
     }
@@ -8377,6 +8514,240 @@ mod tests {
             .expect("accept_loop should exit within 5s")
             .expect("task should not panic");
         assert!(result.is_ok(), "accept_loop should return Ok");
+    }
+
+    // ── Bug 129 fix A: single-unlink ownership flag ────────────────────
+
+    /// After `remove_sockets()` the flag is set; `Drop` must leave decoy files
+    /// at both paths untouched (not unlink them a second time).
+    #[tokio::test]
+    async fn drop_skips_unlink_after_remove_sockets() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let manager = bind_in(dir.path());
+        let mcp_path = manager.mcp_socket_path.clone();
+        let ipc_path = manager.ipc_socket_path.clone();
+
+        // Manually call remove_sockets to simulate the accept_loop shutdown arm.
+        manager.remove_sockets();
+        assert!(
+            manager.sockets_removed.load(Ordering::Acquire),
+            "sockets_removed must be set after remove_sockets()",
+        );
+
+        // Plant decoy files at both paths — a successor daemon's freshly bound
+        // sockets (simulated).
+        std::fs::write(&mcp_path, b"decoy-mcp").expect("plant mcp decoy");
+        std::fs::write(&ipc_path, b"decoy-ipc").expect("plant ipc decoy");
+
+        // Drop must not unlink these — they belong to the successor.
+        drop(manager);
+
+        assert!(
+            mcp_path.exists(),
+            "Drop must NOT unlink the successor's MCP socket file (bug 129)",
+        );
+        assert!(
+            ipc_path.exists(),
+            "Drop must NOT unlink the successor's IPC socket file (bug 129)",
+        );
+    }
+
+    /// Without `remove_sockets()` the `Drop` backstop must still clean up.
+    #[tokio::test]
+    async fn drop_removes_sockets_when_remove_sockets_never_called() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let manager = bind_in(dir.path());
+        let mcp_path = manager.mcp_socket_path.clone();
+        let ipc_path = manager.ipc_socket_path.clone();
+
+        assert!(mcp_path.exists(), "MCP socket should exist before drop");
+        assert!(ipc_path.exists(), "IPC socket should exist before drop");
+
+        drop(manager);
+
+        assert!(
+            !mcp_path.exists(),
+            "Drop must unlink the MCP socket when remove_sockets was never called",
+        );
+        assert!(
+            !ipc_path.exists(),
+            "Drop must unlink the IPC socket when remove_sockets was never called",
+        );
+    }
+
+    // ── Bug 129 fix B: shutdown ack carries pid ────────────────────────
+
+    /// The `tool/shutdown` ack JSON includes a `pid` field containing the
+    /// daemon's own process id. Old CLIs that ignore extra fields are
+    /// unaffected (the existing `connections` field is still present).
+    #[tokio::test]
+    async fn shutdown_ack_carries_pid() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_in(dir.path()));
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move { m.accept_loop().await });
+
+        let stream = tokio::net::UnixStream::connect(&ipc_path)
+            .await
+            .expect("connect to IPC socket");
+        let (reader, mut writer) = stream.into_split();
+
+        let request = serde_json::json!({"method": "tool/shutdown"});
+        let mut payload = serde_json::to_string(&request).expect("serialize");
+        payload.push('\n');
+        writer.write_all(payload.as_bytes()).await.expect("write");
+
+        let mut buf_reader = BufReader::new(reader);
+        let mut line = String::new();
+        buf_reader.read_line(&mut line).await.expect("read");
+
+        let ack: serde_json::Value = serde_json::from_str(line.trim()).expect("parse ack");
+
+        // `connections` field must still be present (backward compatibility).
+        assert!(
+            ack.get("connections").is_some(),
+            "ack must still carry 'connections' field, got: {line}",
+        );
+
+        // `pid` field must be a positive u32.
+        let pid = ack
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .expect("ack must carry 'pid' field as a u64");
+        assert!(pid > 0, "pid must be positive, got: {pid}");
+
+        // The reported pid must match this process's own pid (same process, no
+        // subprocess spawned in this test).
+        assert_eq!(
+            pid,
+            u64::from(std::process::id()),
+            "ack pid must match std::process::id()",
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("accept_loop should exit within 5s")
+            .expect("task should not panic");
+        assert!(result.is_ok(), "accept_loop should return Ok");
+    }
+
+    // ── Bug 129 fix C: ghost self-defense tripwire ─────────────────────
+
+    /// When either socket file is removed externally the tripwire arm fires,
+    /// exits the accept loop cleanly, and the `Drop` backstop does NOT unlink
+    /// files at those paths (because `sockets_removed` is set by the tripwire
+    /// exit path).
+    ///
+    /// The "successor decoy" assertion: after the loop exits, a file planted
+    /// at the MCP path (simulating a successor daemon that has re-bound there)
+    /// must survive the manager's `Drop`.
+    ///
+    /// NOTE: the decoy must be planted AFTER the loop exits — if it is
+    /// planted before the tripwire ticks the file would appear to exist and
+    /// the tripwire would not fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tripwire_exits_when_socket_removed_externally() {
+        // Short interval so the test completes in milliseconds.
+        const INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mcp_path = mcp_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(
+            bind_in(dir.path())
+                .tripwire_interval_override(INTERVAL)
+                // Large grace so the shutdown-on-disconnect arm never races
+                // the tripwire in this test.
+                .disconnect_grace_override(std::time::Duration::from_mins(1)),
+        );
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move { m.accept_loop().await });
+
+        // Let the loop start.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Simulate the race: an external actor removes the MCP socket
+        // (e.g. the old daemon's late remove_sockets in a restart handoff).
+        // Do NOT replant immediately — let the tripwire detect the absence.
+        std::fs::remove_file(&mcp_path).expect("remove mcp socket to trigger tripwire");
+
+        // The tripwire fires within the interval and exits the accept loop.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("accept_loop should exit within 5s after tripwire")
+            .expect("task should not panic");
+        assert!(
+            result.is_ok(),
+            "accept_loop should return Ok on tripwire exit"
+        );
+
+        // The tripwire set sockets_removed = true WITHOUT unlinking — the IPC
+        // socket was never removed externally, so it still exists.
+        assert!(
+            ipc_path.exists(),
+            "IPC socket must survive tripwire exit (only MCP was removed externally)",
+        );
+
+        // Plant a successor-decoy at the MCP path now (simulating a successor
+        // daemon that bound there), then release the manager. Drop must see
+        // sockets_removed = true and NOT unlink the decoy.
+        std::fs::write(&mcp_path, b"successor-mcp").expect("plant successor decoy");
+        drop(manager);
+
+        assert!(
+            mcp_path.exists(),
+            "Drop must NOT unlink a file at the MCP path when sockets_removed is set (bug 129)",
+        );
+        assert!(
+            ipc_path.exists(),
+            "Drop must NOT unlink the IPC socket when sockets_removed is set (bug 129)",
+        );
+    }
+
+    /// The tripwire must not fire after a normal shutdown arm already
+    /// removed the sockets (the `sockets_removed` flag is set).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tripwire_inert_after_normal_shutdown() {
+        // Very short interval — if the tripwire fires spuriously after
+        // shutdown it would race the assertion below.
+        const INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mcp_path = mcp_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_in(dir.path()).tripwire_interval_override(INTERVAL));
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move { m.accept_loop().await });
+
+        // Normal shutdown via token — remove_sockets is called in the
+        // shutdown arm, which sets sockets_removed. The loop then returns
+        // without further iterations.
+        manager.shutdown_token().cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("accept_loop should exit within 5s")
+            .expect("task should not panic");
+        assert!(
+            result.is_ok(),
+            "accept_loop should return Ok on normal shutdown"
+        );
+
+        // Sockets removed by the shutdown arm.
+        assert!(
+            !mcp_path.exists(),
+            "MCP socket removed by normal shutdown arm",
+        );
+        assert!(
+            !ipc_path.exists(),
+            "IPC socket removed by normal shutdown arm",
+        );
     }
 
     #[tokio::test]
