@@ -397,13 +397,16 @@ fn bare_diagnostics_owner_gate_daemon_down() -> Result<()> {
     Ok(())
 }
 
-/// The bug-121 owner gate sweeps every kitchen the bare serve would pull, not
-/// just the cwd's root: with debt booked in a SIBLING root, the owner's bare
-/// run from an unrelated root is allowed (the extra kitchen is their own),
-/// while another identity's bare run from the same cwd is denied naming the
-/// owed sibling — pulling it would pay debt the caller does not own. All
-/// daemon-down: the would-serve enumeration and the owner files are filesystem
-/// facts.
+/// The bare diagnostics gate correctly handles sibling kitchens (bugs 124/128):
+/// the owner's bare run from an unrelated root is allowed (the extra kitchen is
+/// their own), while another identity's bare run from the same cwd is ALSO
+/// allowed and silently excludes the sibling — it was not a deny before the fix,
+/// because the sibling debt is not the caller's to diagnose, but it was
+/// erroneously denied. Now the foreign extra is pruned silently.
+///
+/// Only the CWD's OWN root being held by another identity triggers the hard deny.
+/// All daemon-down: the would-serve enumeration and the owner files are
+/// filesystem facts.
 #[test]
 fn bare_diagnostics_gate_sweeps_sibling_kitchens() -> Result<()> {
     let home = tempfile::tempdir()?;
@@ -435,8 +438,8 @@ fn bare_diagnostics_gate_sweeps_sibling_kitchens() -> Result<()> {
         "the booking edit must be admitted, got: {edit}"
     );
 
-    // The OWNER's bare run from repo A is allowed: the would-serve sweep finds
-    // repo B, but its holder is the caller.
+    // The OWNER's bare run from repo A is allowed: the cwd's own root (repo-a)
+    // is unlocked; the owner's sibling kitchen (repo-b) is included.
     let ours = run_hook(
         home_str,
         &json!({
@@ -451,8 +454,12 @@ fn bare_diagnostics_gate_sweeps_sibling_kitchens() -> Result<()> {
         "the owner's bare diagnostics must be allowed across kitchens, got: {ours}"
     );
 
-    // ANOTHER identity's bare run from the same cwd is denied naming the owed
-    // sibling root — its debt is session A's to diagnose, not session B's.
+    // ANOTHER identity's bare run from the same cwd is ALSO allowed (bugs 124/128
+    // fix): the cwd's own root (repo-a) is unlocked — no foreign holder, no deny.
+    // The foreign extra (repo-b) is pruned silently from the vetted set; the
+    // caller will see `[no edited files]` (they have no debt). The old behavior
+    // was to deny with "root locked: repo-b" and teach `catenary claim`, which
+    // was wrong — the caller is not standing in repo-b's kitchen.
     let theirs = run_hook(
         home_str,
         &json!({
@@ -462,12 +469,39 @@ fn bare_diagnostics_gate_sweeps_sibling_kitchens() -> Result<()> {
             "tool_input": { "command": "catenary diagnostics" },
         }),
     )?;
-    let reason =
-        deny_reason(&theirs).context("a non-owner's cross-kitchen bare pull must be denied")?;
-    let repo_b_str = repo_b.to_str().context("repo b utf-8")?;
     assert!(
-        reason.contains("root locked:") && reason.contains(repo_b_str),
-        "the deny names the owed sibling root, got: {reason}"
+        deny_reason(&theirs).is_none(),
+        "bug 124/128 fix: a non-owner's bare run is allowed when only a sibling is foreign-held, got: {theirs}"
+    );
+
+    Ok(())
+}
+
+/// Acceptance test outcome 3 (bugs 124/128): the hard deny fires ONLY when the
+/// CWD's OWN root is held by another identity — the genuine two-cooks case where
+/// the takeover teaching is honest. A foreign-held SIBLING (outcome 1/2) is never
+/// a deny.
+#[test]
+fn bare_diagnostics_denied_when_callers_own_root_is_foreign_held() -> Result<()> {
+    let repo = Repo::new()?;
+    let root = repo.root_str()?;
+    let file = repo.file("src/main.rs")?;
+
+    // Session A books a covered edit in the repo — taking the lock.
+    let edit = run_edit_hook(root, "session-a", &file)?;
+    assert!(
+        deny_reason(&edit).is_none(),
+        "the booking edit must be admitted, got: {edit}"
+    );
+
+    // Session B tries bare diagnostics from the SAME root (repo). The cwd's
+    // own root is now held by session A — hard deny with the claim teaching.
+    let theirs = run_diagnostics_hook(root, "session-b", "catenary diagnostics")?;
+    let reason = deny_reason(&theirs)
+        .context("bare diagnostics on a foreign-held cwd root must be denied")?;
+    assert!(
+        reason.contains("root locked:"),
+        "the deny names the locked root, got: {reason}"
     );
     assert!(
         reason.contains("catenary claim"),

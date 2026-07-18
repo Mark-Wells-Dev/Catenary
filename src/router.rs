@@ -1022,6 +1022,16 @@ struct HookDispatchContext {
     /// [`crate::paths::config_dir`], which no in-process test can redirect
     /// (`std::env::set_var` is forbidden under Rust 2024).
     user_config_path: PathBuf,
+    /// Hook-deposited owner-vetted serve sets for bare `catenary diagnostics`
+    /// (bugs 124/128). The `pre-tool/editing-stop` IPC (hook process, which
+    /// has identity) deposits the caller-filtered kitchen list keyed by the
+    /// cwd's enclosing lock root. `tool/editing-stop` (CLI process,
+    /// identity-free) consumes it in one shot, bypassing the ambiguous
+    /// `bare_serve_roots` enumeration. Absent entry → today's identity-free
+    /// fallback runs unchanged (hookless / old-hook posture). Shared across
+    /// all clone-of-context connections; per-root serialization is not
+    /// required (the one-cook lock ensures at most one active hook per root).
+    vetted_roots_cache: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<PathBuf>>>>,
 }
 
 /// A staged hook→CLI handoff, deposited under a [`HandoffKey`] by the
@@ -3491,6 +3501,7 @@ impl SessionManager {
                 .config_path_override
                 .clone()
                 .unwrap_or_else(user_config_path),
+            vetted_roots_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
         self
     }
@@ -5673,6 +5684,69 @@ async fn handle_hook_dispatch(
         return Ok(());
     }
 
+    // ── Vetted-serve-set deposit (bugs 124/128) ──────────────────
+    //
+    // `pre-tool/editing-stop` arrives from the `PreToolUse` hook process
+    // BEFORE `catenary diagnostics` runs. The hook is the one seam with
+    // caller identity; it computes the owner-filtered kitchen list and
+    // deposits it here, keyed by the cwd's enclosing lock root. The
+    // identity-free `tool/editing-stop` handler consumes the deposit one-shot
+    // so it can bypass the ambiguous `bare_serve_roots` guess (bugs 124/128).
+    // Old hooks / hookless boxes send no `vetted_roots` field → the deposit is
+    // empty → the fallback enumeration runs unchanged (serde-default = `[]`).
+    if method == "pre-tool/editing-stop" {
+        let scope_id = uuid::Uuid::new_v4().to_string();
+
+        let vetted_roots: Vec<PathBuf> = raw
+            .get("vetted_roots")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(PathBuf::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !vetted_roots.is_empty() {
+            // Key by the cwd's enclosing lock root. The hook sends `cwd` in the
+            // request; fall back to the daemon's cwd on a mis-send. A valid
+            // deposit always carries a non-empty cwd (the hook resolves cwd before
+            // depositing), so the fallback is a safety net, not a live path.
+            let cwd = raw.get("cwd").and_then(|v| v.as_str()).map_or_else(
+                || std::env::current_dir().unwrap_or_default(),
+                PathBuf::from,
+            );
+            if let Some(cwd_root) = crate::lock::resolve_lock_root(&cwd) {
+                ctx.vetted_roots_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(cwd_root, vetted_roots);
+            }
+        }
+
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            Some(&scope_id),
+            &raw.to_string(),
+            "incoming hook",
+        );
+        emit_hook_event(
+            tracing::Level::DEBUG,
+            &session_id,
+            &method,
+            Some(&scope_id),
+            "",
+            "outgoing hook response",
+        );
+
+        // Empty response = allow (the hook still lets the CLI run).
+        writer.write_all(b"\n").await?;
+        writer.shutdown().await?;
+        return Ok(());
+    }
+
     // ── Diagnostics serve: the ledger is the batch ───────────────
     //
     // `tool/editing-stop` is sent by the `catenary diagnostics` CLI command
@@ -5729,10 +5803,22 @@ async fn handle_hook_dispatch(
         // the attribution policy). A scoped run names its own files and needs
         // no root resolution for the diagnose set (delivery groups by each
         // file's root).
+        //
+        // Bugs 124/128: when the hook deposited a vetted serve set via
+        // `pre-tool/editing-stop` (keyed by this cwd's lock root), consume it
+        // one-shot and use it verbatim — the hook already filtered to the
+        // caller's identity. When absent (hookless / old hook), today's
+        // identity-free `bare_serve_roots` enumeration runs unchanged.
         let bare_roots: Vec<PathBuf> = if scoped {
             Vec::new()
         } else {
-            crate::lock::bare_serve_roots(&caller_cwd)
+            let cached = crate::lock::resolve_lock_root(&caller_cwd).and_then(|cwd_root| {
+                ctx.vetted_roots_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&cwd_root)
+            });
+            cached.unwrap_or_else(|| crate::lock::bare_serve_roots(&caller_cwd))
         };
 
         // The diagnose set:

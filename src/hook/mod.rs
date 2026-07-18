@@ -182,18 +182,27 @@ pub(crate) enum HookRequest {
         stop_hook_active: bool,
     },
 
-    /// Prepare handoff for `catenary editing stop` CLI command.
+    /// Prepare handoff for `catenary diagnostics` (bare form) — deposits
+    /// the owner-vetted serve set so the daemon's identity-free
+    /// `tool/editing-stop` handler can use it without guessing (bugs 124/128).
     ///
-    /// Sent by the `PreToolUse` hook when the agent runs
-    /// `catenary editing stop` via the host's shell tool. The daemon
-    /// acquires the handoff lock, drains accumulated files, releases
-    /// the editing guardrail, and deposits the file list in the
-    /// handoff slot for the subsequent `done-editing/run` request.
+    /// Sent by the `PreToolUse` hook when the agent runs bare
+    /// `catenary diagnostics`. The hook is the one seam with identity; it
+    /// computes the vetted set — the caller's cwd root plus every debtor root
+    /// owned by the same `(session_id, agent_id)` tuple — and deposits it
+    /// here before the CLI connects. The daemon stores the set keyed by the
+    /// cwd's enclosing lock root and hands it to `tool/editing-stop` as an
+    /// override of the identity-free `bare_serve_roots` enumeration.
+    ///
+    /// `vetted_roots` is serde-default (`[]`) so old hooks that do not send
+    /// it deserialise without error; an absent set is treated as "no override"
+    /// and today's identity-free path runs unchanged (hookless / old-hook
+    /// posture is byte-identical to pre-fix).
     #[serde(rename = "pre-tool/editing-stop")]
     PreToolDoneEditingPrepare {
         /// Agent ID (empty string for the main agent).
-        /// Deserialized from IPC but not consumed — the daemon
-        /// handles preparation at the dispatch level.
+        /// Deserialized from IPC but not consumed at the hook-router level —
+        /// the daemon handles preparation at the dispatch level.
         #[serde(default)]
         #[allow(
             dead_code,
@@ -207,14 +216,29 @@ pub(crate) enum HookRequest {
             reason = "deserialized from IPC protocol, consumed by serde"
         )]
         session_id: Option<String>,
+        /// Owner-vetted serve set deposited by the hook (bugs 124/128).
+        ///
+        /// The hook computes this as the caller's cwd root plus every debtor
+        /// root whose lock is held by the same `(session_id, agent_id)` tuple.
+        /// Foreign extras are pruned at the hook before deposit — the daemon
+        /// trusts this set without re-vetting. Absent (empty) on old hooks or
+        /// hookless boxes; the daemon falls back to `bare_serve_roots` when
+        /// the cache is empty for the cwd root.
+        #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "deserialized from IPC protocol; consumed by the daemon via raw JSON, not via this enum variant"
+        )]
+        vetted_roots: Vec<std::path::PathBuf>,
     },
 
     /// Execute the `editing stop` pipeline and return diagnostics.
     ///
-    /// Sent by the `catenary editing stop` CLI command after the
-    /// `PreToolUse` hook has prepared the handoff slot. Takes the file
-    /// list from the slot, runs `process_files_batched`, and returns
-    /// formatted diagnostics.
+    /// Sent by the `catenary diagnostics` CLI command. The daemon serves
+    /// diagnoses against the durable on-disk lock ledger, enumerated over the
+    /// kitchens the hook deposited via `pre-tool/editing-stop` (bugs 124/128),
+    /// or — when no deposit is present (hookless / old hook) — over the
+    /// identity-free `bare_serve_roots` set (unchanged posture).
     #[serde(rename = "tool/editing-stop")]
     DoneEditingRun,
 

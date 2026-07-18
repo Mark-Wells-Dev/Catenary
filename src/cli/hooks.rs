@@ -2156,28 +2156,31 @@ fn handle_start_editing_hook(hook_json: &serde_json::Value, format: HostFormat) 
 }
 
 /// Handle `PreToolUse` for `catenary diagnostics` (root-ownership stage 3,
-/// deliverable 4: diagnostics gating moves to the hook).
+/// deliverable 4: diagnostics gating moves to the hook; bugs 124/128: identity-
+/// aware vetted serve set).
 ///
-/// The identity-correlation prepare handoff (`pre-tool/editing-stop`) retired
-/// with stage 3 — the daemon now serves diagnoses against the durable ledger, so
-/// this hook stages nothing. Its sole job is the OWNER GATE: only the lock holder
-/// may pull a locked root's ledger via **bare** `catenary diagnostics`. The hook
-/// is the one seam with identity, so it — not the identity-less serve path —
-/// answers "is this the owner?". Since the bare due set spans kitchens (bug 121),
-/// the gate sweeps every root the serve would pull
-/// ([`crate::lock::bare_serve_roots`] — the hook mirrors the serve's enumeration
-/// exactly). A non-owner is denied naming the owed root and taught
-/// `catenary claim <root>`; the owner (or an unlocked root) is allowed silently
-/// and the CLI runs `tool/editing-stop`.
+/// The hook is the one seam with caller identity. It computes the
+/// **owner-vetted serve set**: the cwd root plus every debtor root whose lock is
+/// held by the same `(session_id, agent_id)` tuple. Foreign-owned EXTRAS in the
+/// would-serve set are **pruned silently** — the hard deny with the `claim`
+/// teaching fires ONLY when the cwd's OWN root is held by another identity (the
+/// genuine two-cooks case where the takeover teaching is honest).
+///
+/// The vetted set is deposited in the daemon via `pre-tool/editing-stop` IPC
+/// (serde-default `vetted_roots` field — absent on old daemons, ignored
+/// harmlessly). The identity-free `tool/editing-stop` handler consumes it
+/// one-shot and skips the ambiguous `bare_serve_roots` enumeration.
 ///
 /// **Scoped** `catenary diagnostics <path…>` names explicit paths and serves them
 /// regardless of ownership or debt — the pull-anything arm (a diagnose of a named
 /// file is a read, not a payment against someone's kitchen). Only the bare form,
 /// which pulls the whole ledger for the cwd's root, is owner-gated.
 ///
-/// No daemon connection is made here — the lock is a filesystem fact
-/// ([`crate::lock`]), so the gate works with the daemon down (the serve itself
-/// then fails at `tool/editing-stop`, but the gate never false-denies).
+/// No daemon connection is made for the gate itself — the lock is a filesystem
+/// fact ([`crate::lock`]), so the gate works with the daemon down (the serve
+/// itself then fails at `tool/editing-stop`, but the gate never false-denies).
+/// The `pre-tool/editing-stop` deposit is best-effort: if the daemon is down,
+/// the deposit is skipped and the serve falls back to the identity-free path.
 fn handle_done_editing_hook(
     hook_json: &serde_json::Value,
     command: Option<&str>,
@@ -2189,14 +2192,9 @@ fn handle_done_editing_hook(
         return;
     }
 
-    // Bare form: resolve every kitchen the serve would pull and gate each on
-    // ownership. The bare due set spans roots (bug 121): the cwd's root plus
-    // every same-owner debtor root (`bare_serve_roots` documents the
-    // attribution policy — the hook mirrors the serve's enumeration exactly, so
-    // whatever the identity-free serve would pull is vetted HERE, the one seam
-    // with identity). An empty would-serve set (unresolvable cwd, no debt
-    // anywhere) gates nothing — allow (the serve then answers
-    // `[no edited files]`).
+    // Bare form: resolve every kitchen the serve would pull. The bare due set
+    // spans roots (bug 121). Compute the CALLER IDENTITY (the one seam with it)
+    // and partition the would-serve set.
     let cwd = extract_cwd_str(hook_json, format).map_or_else(
         || std::env::current_dir().unwrap_or_default(),
         PathBuf::from,
@@ -2208,16 +2206,52 @@ fn handle_done_editing_hook(
         extract_agent_id(hook_json),
     );
 
-    // Only a LOCKED root held by ANOTHER owner is gated. An unlocked root (no
-    // lock dir), or one this caller owns, serves freely. `owner_of` reads the
-    // owner file by pure path algebra — canonical root, matching the ledger seam.
-    for root in crate::lock::bare_serve_roots(&cwd) {
-        if let Some(holder) = crate::lock::owner_of(&root)
-            && holder != owner
-        {
-            print!("{}", format_deny(&diagnostics_locked_deny(&root), format));
-            return;
+    // Gate: hard deny ONLY when the cwd's OWN root is held by another identity
+    // (the genuine two-cooks case; the takeover teaching is honest there).
+    // Foreign extras elsewhere are NOT a denial — they are simply omitted from
+    // the vetted set (bugs 124/128). `owner_of` reads the owner file by pure
+    // path algebra — canonical root, matching the ledger seam.
+    if let Some(cwd_root) = crate::lock::resolve_lock_root(&cwd)
+        && let Some(holder) = crate::lock::owner_of(&cwd_root)
+        && holder != owner
+    {
+        print!(
+            "{}",
+            format_deny(&diagnostics_locked_deny(&cwd_root), format)
+        );
+        return;
+    }
+
+    // Compute the owner-vetted serve set: the caller's cwd root plus every
+    // debtor root whose lock is held by the same identity. Foreign-owned roots
+    // and the unanchored-ambiguous case are handled gracefully — the caller's
+    // own kitchens are always found here because identity IS available.
+    let vetted = crate::lock::vetted_serve_roots(&cwd, &owner);
+
+    // Deposit the vetted set in the daemon so `tool/editing-stop` can bypass
+    // the ambiguous `bare_serve_roots` enumeration (bugs 124/128). Best-effort:
+    // a daemon-down or old-daemon silently skips the deposit; the serve falls
+    // back to identity-free enumeration (hookless posture, unchanged).
+    if let Some(stream) = hook_connect(hook_json) {
+        let cwd_str = cwd.to_string_lossy();
+        let vetted_json: Vec<String> = vetted
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let agent_id = extract_agent_id(hook_json);
+        let session_id = extract_session_id(hook_json, format);
+        let mut request = serde_json::json!({
+            "method": "pre-tool/editing-stop",
+            "cwd": cwd_str.as_ref(),
+            "agent_id": agent_id,
+            "vetted_roots": vetted_json,
+        });
+        if let Some(sid) = session_id {
+            request["session_id"] = serde_json::json!(sid);
         }
+        // Fire-and-forget: the hook allows regardless of the deposit result.
+        // `ipc_exchange` reads and discards the empty response.
+        let _lines = ipc_exchange(stream, &request);
     }
 }
 

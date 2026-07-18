@@ -546,6 +546,45 @@ pub fn bare_serve_roots(cwd: &Path) -> Vec<PathBuf> {
     bare_serve_roots_in(&locks_dir(), cwd)
 }
 
+/// Owner-vetted analogue of [`bare_serve_roots_in`] used by the hook (bugs
+/// 124/128).
+///
+/// The hook is the one seam with caller identity. It calls this function to
+/// compute the **vetted serve set** — the caller's cwd root plus every debtor
+/// root whose lock is held by the same `owner` tuple — and deposits the result
+/// in the daemon before `catenary diagnostics` runs. The identity-free daemon
+/// serve consumes the deposit, bypassing the ambiguous `bare_serve_roots`
+/// enumeration.
+///
+/// Unlike [`bare_serve_roots_in`]:
+/// - The unanchored arm has no single-owner restriction: even when multiple
+///   identities hold debt, the caller's own kitchens are always found (because
+///   identity is available here).
+/// - Foreign-owned extras are **excluded** rather than triggering a deny; the
+///   deny is issued by the hook caller for the cwd's own root only.
+///
+/// The cwd root is always included first (single-root contract), even when
+/// unresolvable (empty ledger → `[no edited files]`).
+#[must_use]
+pub fn vetted_serve_roots_in(locks_base: &Path, cwd: &Path, owner: &Owner) -> Vec<PathBuf> {
+    let cwd_root = resolve_lock_root(cwd);
+    // Collect extras before consuming `cwd_root` in the chain (releasing the
+    // borrow the filter closure holds on `cwd_root.as_ref()`).
+    let extras: Vec<PathBuf> = debtor_roots_in(locks_base)
+        .into_iter()
+        .filter(|r| Some(r) != cwd_root.as_ref())
+        .filter(|root| owner_of_in(locks_base, root).is_some_and(|o| o == *owner))
+        .collect();
+    cwd_root.into_iter().chain(extras).collect()
+}
+
+/// Production wrapper for [`vetted_serve_roots_in`] resolving the base through
+/// [`locks_dir`].
+#[must_use]
+pub fn vetted_serve_roots(cwd: &Path, owner: &Owner) -> Vec<PathBuf> {
+    vetted_serve_roots_in(&locks_dir(), cwd, owner)
+}
+
 /// The subset of `candidates` still DUE (undiagnosed) on their roots' ledgers
 /// under `locks_base` (bug 116).
 ///
@@ -3203,18 +3242,17 @@ mod tests {
         );
     }
 
-    /// Reproduces the bug-128 incident geometry (daemon `24aafb70`, 19:45:00Z):
-    /// the caller stands in an UNLOCKED root, its own debt lives in a sibling
-    /// kitchen, and an unrelated identity holds debt in a third. The unanchored
-    /// arm's single-owner requirement then classifies attribution as ambiguous
-    /// and drops the caller's OWN kitchen — the bare serve answers
-    /// `[no edited files]` while the caller's booking sits unpaid on the ledger.
+    /// Pins the bug-128 fix: with the identity-aware [`vetted_serve_roots_in`]
+    /// the caller's own kitchen is always found, even when an unrelated identity
+    /// holds debt in a sibling root.
     ///
-    /// This pins the CONVICTED mechanism, not the desired contract: the serve is
-    /// identity-free by ruling, so no path-algebraic fact can attribute here.
-    /// The pending vetted-serve-set ruling (bugs 124/128 — the hook, which has
-    /// the identity, forwards owner-filtered kitchens) will flip this
-    /// expectation to serve `repo-ours`.
+    /// Bug 128 geometry (daemon `24aafb70`, 19:45:00Z): caller stands in an
+    /// UNLOCKED root, its own debt lives in `repo-ours`, and an unrelated
+    /// identity (`theirs`) holds debt in `repo-theirs`. The identity-free
+    /// [`bare_serve_roots_in`] could not disambiguate (two owners → ambiguous
+    /// → `[repo-cwd]` only). The hook, which has identity, now calls
+    /// [`vetted_serve_roots_in`] and correctly serves `repo-ours` while silently
+    /// excluding `repo-theirs`.
     #[test]
     fn bare_serve_roots_unanchored_foreign_debt_hides_the_callers_own_kitchen() {
         let fx = MultiFixture::new(&["repo-cwd", "repo-ours", "repo-theirs"]);
@@ -3223,12 +3261,19 @@ mod tests {
         fx.book("repo-ours", "src/main.rs", &ours);
         fx.book("repo-theirs", "src/main.rs", &theirs);
 
-        // cwd in the unlocked repo-cwd: two owner tuples hold debt, so the
-        // unanchored arm serves only the cwd root's (empty) ledger — the miss.
+        // Identity-free path: still ambiguous — unchanged for hookless callers.
         assert_eq!(
             bare_serve_roots_in(&fx.locks(), &fx.root("repo-cwd")),
             vec![fx.root("repo-cwd")],
-            "bug 128: a second identity's debt anywhere hides the caller's own kitchen"
+            "identity-free path: two owners → serves only the cwd root (hookless posture unchanged)"
+        );
+
+        // Identity-aware path (the hook uses this): the caller's own kitchen is
+        // served; the foreign debt in repo-theirs is excluded without a deny.
+        assert_eq!(
+            vetted_serve_roots_in(&fx.locks(), &fx.root("repo-cwd"), &ours),
+            vec![fx.root("repo-cwd"), fx.root("repo-ours")],
+            "bug 128 fix: vetted_serve_roots finds the caller's own kitchen even with foreign debt"
         );
     }
 
@@ -3266,6 +3311,100 @@ mod tests {
             bare_serve_roots_in(&fx.locks(), &fx.root("repo-a")),
             vec![fx.root("repo-a")],
             "ownerless debt is never attributed to the caller"
+        );
+    }
+
+    // ── vetted_serve_roots_in tests (bugs 124/128) ───────────────────────
+
+    /// Bug 124: unanchored caller, sole debtor is a stranger.
+    ///
+    /// Acceptance test outcome 1: the vetted set has no debtor kitchens for
+    /// the caller (the stranger's kitchen is excluded), so the serve honestly
+    /// answers `[no edited files]`. No deny, no claim invitation.
+    #[test]
+    fn vetted_serve_roots_sole_foreign_debtor_yields_empty_extras() {
+        let fx = MultiFixture::new(&["repo-cwd", "repo-stranger"]);
+        let caller = Owner::new("claude", "sess-caller", "");
+        let stranger = Owner::new("claude", "sess-stranger", "");
+        fx.book("repo-stranger", "src/main.rs", &stranger);
+
+        // The caller's vetted set is just the cwd root — no debtor kitchens.
+        assert_eq!(
+            vetted_serve_roots_in(&fx.locks(), &fx.root("repo-cwd"), &caller),
+            vec![fx.root("repo-cwd")],
+            "bug 124: sole foreign debtor is excluded; caller gets only their cwd root"
+        );
+    }
+
+    /// Bug 128: caller owns debt in one root, a stranger in another.
+    ///
+    /// Acceptance test outcome 2: the vetted set includes the caller's own
+    /// kitchen (`repo-ours`) and excludes the stranger's (`repo-theirs`).
+    #[test]
+    fn vetted_serve_roots_includes_callers_own_kitchen_excludes_foreign() {
+        let fx = MultiFixture::new(&["repo-cwd", "repo-ours", "repo-theirs"]);
+        let caller = Owner::new("claude", "sess-a", "");
+        let stranger = Owner::new("claude", "sess-a", "agent-b");
+        fx.book("repo-ours", "src/main.rs", &caller);
+        fx.book("repo-theirs", "src/main.rs", &stranger);
+
+        assert_eq!(
+            vetted_serve_roots_in(&fx.locks(), &fx.root("repo-cwd"), &caller),
+            vec![fx.root("repo-cwd"), fx.root("repo-ours")],
+            "bug 128: caller's own kitchen is served; the stranger's is excluded silently"
+        );
+    }
+
+    /// Acceptance test outcome 4 (hookless / field absent): `bare_serve_roots_in`
+    /// is unchanged. The vetted function is only called from the hook; the
+    /// identity-free path stays byte-identical to the pre-fix posture.
+    #[test]
+    fn vetted_serve_roots_anchored_cwd_matches_bare_serve_for_same_owner() {
+        let fx = MultiFixture::new(&["repo-a", "repo-b"]);
+        let owner = Owner::new("claude", "sess-a", "");
+        fx.book("repo-a", "src/main.rs", &owner);
+        fx.book("repo-b", "src/main.rs", &owner);
+
+        // When the caller owns all the debt and is anchored, both functions
+        // agree — the vetted path is strictly a superset, never narrower.
+        assert_eq!(
+            vetted_serve_roots_in(&fx.locks(), &fx.root("repo-a"), &owner),
+            bare_serve_roots_in(&fx.locks(), &fx.root("repo-a")),
+            "vetted and bare paths agree when the caller owns all debt and is anchored"
+        );
+    }
+
+    /// Acceptance test outcome 5 (wire / serde-default): `vetted_roots` absent
+    /// from a `pre-tool/editing-stop` request deserialises without error and
+    /// yields an empty vec, which the daemon treats as "no override" and falls
+    /// back to `bare_serve_roots`.
+    #[test]
+    fn hook_request_pre_tool_editing_stop_vetted_roots_defaults_to_empty() {
+        use crate::hook::HookRequest;
+        // Old hook: no vetted_roots field.
+        let json = r#"{"method": "pre-tool/editing-stop", "session_id": "sess-x"}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("deserialise");
+        let HookRequest::PreToolDoneEditingPrepare { vetted_roots, .. } = req else {
+            unreachable!("expected PreToolDoneEditingPrepare");
+        };
+        assert!(
+            vetted_roots.is_empty(),
+            "absent vetted_roots field defaults to an empty vec"
+        );
+
+        // New hook: vetted_roots present.
+        let json = r#"{"method": "pre-tool/editing-stop", "vetted_roots": ["/a", "/b"]}"#;
+        let req: HookRequest = serde_json::from_str(json).expect("deserialise with vetted_roots");
+        let HookRequest::PreToolDoneEditingPrepare { vetted_roots, .. } = req else {
+            unreachable!("expected PreToolDoneEditingPrepare");
+        };
+        assert_eq!(
+            vetted_roots,
+            vec![
+                std::path::PathBuf::from("/a"),
+                std::path::PathBuf::from("/b")
+            ],
+            "present vetted_roots round-trips through serde"
         );
     }
 }
