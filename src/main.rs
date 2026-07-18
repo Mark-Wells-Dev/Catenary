@@ -2385,6 +2385,10 @@ async fn wait_daemon_teardown(pid: Option<u32>) {
         // separate bug). Proceed anyway; the new daemon will bind fresh files.
         return;
     }
+    // The pid leg is Linux-only (`/proc`); elsewhere the parameter has no
+    // reader and clippy's -D warnings would reject the build.
+    #[cfg(not(target_os = "linux"))]
+    let _ = pid;
 
     // Fallback for old daemons (no pid in ack) or non-Linux: poll socket-file
     // absence plus a fixed grace sleep so the old daemon has time to fully
