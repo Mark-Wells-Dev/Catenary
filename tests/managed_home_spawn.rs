@@ -43,6 +43,10 @@ const PINNED_VERSION: &str = "mockls-persona";
 /// One test's staged world: an isolated state home whose managed home and
 /// `PATH` directory each carry a marker-writing wrapper around real mockls.
 struct SpawnFixture {
+    /// Panic-safe daemon teardown (bug 131): `spawn_in_state` leaves daemon
+    /// lifecycle to the test. Declared before `state` so it drops first —
+    /// the guard reads the snapshot before the tempdir is wiped.
+    _daemon_guard: common::DaemonGuard,
     /// Owns every path below; the externally-owned state home for
     /// [`BridgeProcess::spawn_in_state`].
     state: tempfile::TempDir,
@@ -116,6 +120,7 @@ fn fixture(user_config_extra: &str, stage_managed: bool) -> Result<SpawnFixture>
     )?;
 
     Ok(SpawnFixture {
+        _daemon_guard: common::DaemonGuard::new(state.path()),
         state,
         root,
         config,

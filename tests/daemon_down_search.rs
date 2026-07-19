@@ -75,6 +75,8 @@ fn run_cli(state_home: &str, root: &Path, subargs: &[&str]) -> Result<(String, S
 fn run_daemon_served(root: &Path, subargs: &[&str]) -> Result<(String, String, bool)> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?.to_string();
+    // Panic-safe daemon teardown (bug 131) for the shared-state spawn below.
+    let _daemon_guard = common::DaemonGuard::new(&state_home);
 
     // A daemon with no roots and no LSP servers — the tree is fully uncovered.
     let mut bridge = BridgeProcess::spawn_in_state(&state_home, |_cmd| {})?;

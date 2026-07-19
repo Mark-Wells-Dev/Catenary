@@ -182,6 +182,11 @@ fn worktree_rm_force_denied_with_lifecycle_teaching_for_claude_format() -> Resul
 fn command_filter_enforces_after_daemon_death() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("tempdir path")?;
+    // Panic-safe daemon teardown (bug 131): `catenary start` below spawns a
+    // detached daemon that never sees an MCP connection — the exact
+    // never-arms-its-exit leak class — so a failed assertion before the
+    // `stop --force` would leak it forever without this guard.
+    let _daemon_guard = common::DaemonGuard::new(root);
 
     // Bring a daemon up, then stop it — the daemon was up and died.
     let start = {

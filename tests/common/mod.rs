@@ -276,6 +276,204 @@ pub fn xdg_runtime_dir(root: impl AsRef<Path>) -> PathBuf {
     root.as_ref().join("runtime")
 }
 
+// ── Daemon teardown guard (bug 131) ──────────────────────────────────
+
+/// How long past `daemon.log`'s mtime a booting daemon gets to publish its
+/// first `state.json` snapshot before the teardown sweep gives up on it.
+///
+/// `spawn_daemon` creates `daemon.log` at spawn time and the daemon writes its
+/// first snapshot within milliseconds of boot, so a log this old with no
+/// snapshot is a failed or long-finished boot — not a daemon mid-boot. Measured
+/// from the log's mtime (not a flat teardown sleep), the sweep costs nothing on
+/// the ordinary teardown path where the log is already seconds old.
+const DAEMON_TEARDOWN_BOOT_WINDOW: Duration = Duration::from_secs(2);
+
+/// Grace between the teardown SIGTERM (the daemon's graceful-shutdown signal —
+/// the same catchable path `catenary stop` rides) and the SIGKILL escalation
+/// that guarantees a wedged daemon still cannot outlive its test.
+const DAEMON_TEARDOWN_TERM_GRACE: Duration = Duration::from_secs(2);
+
+/// Panic-safe teardown for the detached daemon a test's isolated state may
+/// hold (bug 131).
+///
+/// Integration tests hold a `Child` for the CLI/bridge subprocess, never for
+/// the daemon: the subprocess spawns `catenary daemon` detached in its own
+/// process group (deliberate — daemons outlive bridges), which also detaches it
+/// from the test's lifetime. A test that fails an assertion before its cleanup
+/// or simply lacks a stop step leaks that daemon forever — its exit is
+/// disconnect-event-driven, and a daemon that never sees an MCP connection
+/// never arms it (a recovery `ps` found six such daemons, 8–10 days old, bound
+/// at tempdir socket paths from long-gone runs).
+///
+/// This guard closes that hole: created alongside the test's isolated state
+/// root, on `Drop` — **including the panic unwind, which is the point** — it
+/// best-effort terminates the daemon the isolated state names. Discovery goes
+/// through the daemon's own `state.json` snapshot (`daemon.pid` under the
+/// isolated runtime dir, the same source [`BridgeProcess::daemon_pid`] reads),
+/// with a short mtime-bounded sweep for a daemon that wrote `daemon.log` but no
+/// snapshot yet. Every failure is tolerated silently — absent file, malformed
+/// JSON, already-dead pid — and a recycled pid is protected by an identity
+/// check (argv + the isolated `CATENARY_STATE_DIR` in the daemon's environment
+/// where `/proc` exposes it), so the guard never signals a stranger.
+///
+/// [`BridgeProcess`] carries one automatically for the state dirs it owns.
+/// Shared-state tests ([`BridgeProcess::spawn_in_state`], `catenary start`
+/// drivers) create their own, right after the state tempdir, so it drops before
+/// the tempdir does. Where a test already stops its daemon deliberately, the
+/// guard is a harmless no-op (the snapshot's pid is dead, the identity check
+/// fails, nothing is signalled).
+pub struct DaemonGuard {
+    state_home: PathBuf,
+}
+
+impl DaemonGuard {
+    /// Guards the daemon of the isolated state rooted at `state_home` — the
+    /// same root handed to [`isolate_env`].
+    pub fn new(state_home: impl AsRef<Path>) -> Self {
+        Self {
+            state_home: state_home.as_ref().to_path_buf(),
+        }
+    }
+
+    /// The `state.json` snapshot path under this guard's isolated runtime dir.
+    fn snapshot_path(&self) -> PathBuf {
+        xdg_runtime_dir(&self.state_home)
+            .join("catenary")
+            .join("state.json")
+    }
+
+    /// Resolves the guarded daemon's PID from its snapshot, polling on
+    /// [`POLL_SPACING`] up to [`POLL_BACKSTOP`] — the standalone counterpart of
+    /// [`BridgeProcess::daemon_pid`] for tests that start a daemon without a
+    /// bridge (`catenary start`). `None` if no daemon ever published a PID.
+    pub fn daemon_pid(&self) -> Option<u32> {
+        let snapshot = self.snapshot_path();
+        let deadline = std::time::Instant::now() + POLL_BACKSTOP;
+        loop {
+            if let Some(pid) = read_daemon_pid(&snapshot) {
+                return Some(pid);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(POLL_SPACING);
+        }
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let snapshot = self.snapshot_path();
+        let mut pid = read_daemon_pid(&snapshot);
+        if pid.is_none() {
+            // Mid-boot sweep: a `daemon.log` younger than the boot window with
+            // no snapshot yet may be a daemon still booting — poll out the
+            // window's remainder. An older log is a failed or long-finished
+            // boot, so the ordinary teardown pays nothing here. Residual
+            // window, documented honestly: a daemon that takes longer than
+            // [`DAEMON_TEARDOWN_BOOT_WINDOW`] to publish its first snapshot
+            // escapes this sweep (nothing else on disk names its pid).
+            let log = xdg_state_home(&self.state_home)
+                .join("catenary")
+                .join("daemon.log");
+            while pid.is_none()
+                && log_age(&log).is_some_and(|age| age < DAEMON_TEARDOWN_BOOT_WINDOW)
+            {
+                std::thread::sleep(POLL_SPACING);
+                pid = read_daemon_pid(&snapshot);
+            }
+        }
+        let Some(pid) = pid else { return };
+        if !is_isolated_daemon(pid, &self.state_home) {
+            // Already dead, or the pid was recycled — never signal a stranger.
+            return;
+        }
+        // Graceful first: SIGTERM rides the daemon's own catchable shutdown
+        // path (servers stopped, sockets unlinked). SIGKILL only if it does
+        // not die within the grace — a wedged daemon must still not leak.
+        let _ = signal_pid(pid, "-TERM");
+        let deadline = std::time::Instant::now() + DAEMON_TEARDOWN_TERM_GRACE;
+        while pid_alive(pid) {
+            if std::time::Instant::now() >= deadline {
+                let _ = signal_pid(pid, "-KILL");
+                return;
+            }
+            std::thread::sleep(POLL_SPACING);
+        }
+    }
+}
+
+/// Age of the file at `path` per its mtime, or `None` when it does not exist.
+/// A future mtime (clock skew) reads as age zero.
+fn log_age(path: &Path) -> Option<Duration> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(modified.elapsed().unwrap_or(Duration::ZERO))
+}
+
+/// Whether `pid` is alive, probed with the null signal (`kill -0`).
+///
+/// Every daemon the guard watches was spawned detached by an intermediary that
+/// has since exited, so a dead daemon is reaped by init immediately — there is
+/// no zombie window for `kill -0` to misread as alive.
+pub fn pid_alive(pid: u32) -> bool {
+    signal_pid(pid, "-0")
+}
+
+/// Sends `sig` (a `kill(1)` argument, e.g. `"-TERM"`) to `pid` via the system
+/// `kill` binary — no unsafe, no new deps. Returns whether the signal was
+/// delivered; every failure (no such pid, no `kill` on PATH) reads as `false`.
+fn signal_pid(pid: u32, sig: &str) -> bool {
+    Command::new("kill")
+        .args([sig, &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Whether `pid` is the live daemon of the isolated state at `state_home` —
+/// the anti-pid-recycling identity check the teardown kill hides behind.
+///
+/// Where `/proc` exists (Linux) the check is precise on two axes: the argv
+/// names `catenary daemon`, and the process environment carries the isolated
+/// `CATENARY_STATE_DIR` naming **this** test's state home (set by
+/// [`isolate_env`] on the spawning subprocess and inherited by the daemon).
+/// Without `/proc` (macOS) it falls back to a `ps` argv match. Every failure —
+/// dead pid, unreadable `/proc`, no `ps` — reads as "not ours", skipping the
+/// kill: the safe side of every ambiguity.
+fn is_isolated_daemon(pid: u32, state_home: &Path) -> bool {
+    if let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+        if !cmdline_names_catenary_daemon(&bytes) {
+            return false;
+        }
+        let needle = format!(
+            "CATENARY_STATE_DIR={}",
+            xdg_state_home(state_home).display()
+        );
+        return std::fs::read(format!("/proc/{pid}/environ"))
+            .is_ok_and(|env| env.split(|&b| b == 0).any(|kv| kv == needle.as_bytes()));
+    }
+    Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .is_some_and(|out| {
+            let argv = String::from_utf8_lossy(&out.stdout);
+            argv.contains("catenary") && argv.contains(" daemon")
+        })
+}
+
+/// Whether a NUL-separated `/proc/<pid>/cmdline` reads `…catenary daemon …`.
+fn cmdline_names_catenary_daemon(cmdline: &[u8]) -> bool {
+    let mut args = cmdline.split(|&b| b == 0).filter(|arg| !arg.is_empty());
+    args.next()
+        .is_some_and(|argv0| String::from_utf8_lossy(argv0).contains("catenary"))
+        && args.next() == Some(b"daemon")
+}
+
 // ── BridgeProcess ────────────────────────────────────────────────────
 
 /// Spawns the Catenary bridge binary and communicates via MCP over
@@ -291,6 +489,13 @@ pub struct BridgeProcess {
     stdout: Option<BufReader<std::process::ChildStdout>>,
     stderr_log: Option<PathBuf>,
     state_home: String,
+    /// Terminates the detached daemon of this bridge's OWNED state on drop —
+    /// panic unwind included (bug 131). `None` for a shared (externally-owned)
+    /// state dir, where the daemon deliberately outlives individual bridges and
+    /// the test owns teardown via its own [`DaemonGuard`]. Declared before
+    /// `_state_dir` so it drops first: the guard must read the snapshot before
+    /// the tempdir is wiped.
+    daemon_guard: Option<DaemonGuard>,
     /// Internal tempdir for XDG state/config isolation.
     /// `None` when using a shared (externally-owned) state dir. Wrapped in
     /// [`KeepOnPanic`] so a failing test's daemon firehose / `daemon.log` /
@@ -417,6 +622,7 @@ impl BridgeProcess {
             stdout: Some(stdout),
             stderr_log: Some(stderr_path),
             state_home,
+            daemon_guard: None,
             _state_dir: None,
             root_dir: None,
             ipc_cwd: None,
@@ -476,6 +682,7 @@ impl BridgeProcess {
             stdin: Some(stdin),
             stdout: Some(stdout),
             stderr_log: Some(stderr_path),
+            daemon_guard: Some(DaemonGuard::new(&state_home)),
             state_home,
             _state_dir: Some(state_dir),
             root_dir: None,

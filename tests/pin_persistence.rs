@@ -177,6 +177,10 @@ fn read_snapshot(state_home: &str) -> Option<serde_json::Value> {
 fn pin_survives_daemon_restart() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave daemon
+    // lifecycle to the test, so a failed assertion before `stop_daemon` would
+    // leak the daemon without this guard.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     // A base root that holds the first daemon open, distinct from the pin target.
     let base = tempfile::tempdir()?;
@@ -245,6 +249,10 @@ fn pin_survives_daemon_restart() -> Result<()> {
 fn unpin_removes_the_config_entry() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave daemon
+    // lifecycle to the test, so a failed assertion before `stop_daemon` would
+    // leak the daemon without this guard.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let base = tempfile::tempdir()?;
     let base_str = base.path().to_str().context("base path")?;
@@ -292,6 +300,10 @@ fn unpin_removes_the_config_entry() -> Result<()> {
 fn hand_authored_comments_survive_pin_unpin_round_trip() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave daemon
+    // lifecycle to the test, so a failed assertion before `stop_daemon` would
+    // leak the daemon without this guard.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let base = tempfile::tempdir()?;
     let base_str = base.path().to_str().context("base path")?;
@@ -373,6 +385,10 @@ path = \"/usr/bin/rust-analyzer\"   # pinned binary
 fn missing_pin_at_boot_is_kept_and_flagged_by_doctor() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave daemon
+    // lifecycle to the test, so a failed assertion before `stop_daemon` would
+    // leak the daemon without this guard.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let base = tempfile::tempdir()?;
     let base_str = base.path().to_str().context("base path")?;
@@ -428,6 +444,10 @@ fn missing_pin_at_boot_is_kept_and_flagged_by_doctor() -> Result<()> {
 fn boot_restore_spawns_no_servers() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave daemon
+    // lifecycle to the test, so a failed assertion before `stop_daemon` would
+    // leak the daemon without this guard.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let base = tempfile::tempdir()?;
     let base_str = base.path().to_str().context("base path")?;
@@ -501,6 +521,10 @@ fn boot_restore_spawns_no_servers() -> Result<()> {
 fn env_seed_survives_a_pin() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave daemon
+    // lifecycle to the test, so a failed assertion before `stop_daemon` would
+    // leak the daemon without this guard.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     // The env seed — canonical, so it matches the daemon's stored form.
     let seed = common::canonical_tempdir()?;
@@ -552,6 +576,10 @@ fn env_seed_survives_a_pin() -> Result<()> {
 fn env_seed_survives_an_unpin() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave daemon
+    // lifecycle to the test, so a failed assertion before `stop_daemon` would
+    // leak the daemon without this guard.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let seed = common::canonical_tempdir()?;
     let seed_str = seed.path().to_str().context("seed path")?;
@@ -624,6 +652,10 @@ fn subprocess_pin_never_touches_the_real_user_config() -> Result<()> {
 
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave daemon
+    // lifecycle to the test, so a failed assertion before `stop_daemon` would
+    // leak the daemon without this guard.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let base = tempfile::tempdir()?;
     let base_str = base.path().to_str().context("base path")?;

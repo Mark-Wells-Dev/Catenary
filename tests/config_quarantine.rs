@@ -292,6 +292,8 @@ fn ipc_socket(root: &str) -> std::path::PathBuf {
 fn daemon_boots_and_notifies_once_on_quarantine() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_str().context("tempdir path")?;
+    // Panic-safe daemon teardown (bug 131) for the shared-state spawn below.
+    let _daemon_guard = common::DaemonGuard::new(root);
 
     // The config the DAEMON reads is a named file (CATENARY_CONFIG), written into
     // the isolated tree so the daemon subprocess (spawned by the bridge with the

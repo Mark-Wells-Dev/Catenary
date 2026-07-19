@@ -779,6 +779,8 @@ fn test_help_exits_zero_for_agent_subcommands() -> Result<()> {
 fn test_glob_quoted_zero_match_exits_zero_loud() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131) for the shared-state spawn below.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let root = tempfile::tempdir()?;
     let root_str = root.path().to_str().context("root path")?;
@@ -933,6 +935,8 @@ fn test_grep_invalid_regex_is_usage_error_exit_2() -> Result<()> {
 fn test_glob_count_reports_paths() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131) for the shared-state spawn below.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let root = tempfile::tempdir()?;
     let root_str = root.path().to_str().context("root path")?;
@@ -994,6 +998,8 @@ fn test_glob_count_reports_paths() -> Result<()> {
 fn test_glob_pattern_header_matches_count_via_binary() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131) for the shared-state spawn below.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let root = tempfile::tempdir()?;
     let root_str = root.path().to_str().context("root path")?;
@@ -1081,6 +1087,8 @@ fn test_glob_pattern_header_matches_count_via_binary() -> Result<()> {
 fn test_grep_searches_large_utf8_file_uncapped() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131) for the shared-state spawn below.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let root = tempfile::tempdir()?;
     let root_str = root.path().to_str().context("root path")?;
@@ -1291,6 +1299,8 @@ const GLOB_HINT_MARKER: &str = "for its listing:";
 fn test_glob_listing_hint_rides_stderr_only() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131) for the shared-state spawn below.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
     let root = tempfile::tempdir()?;
     let root_str = root.path().to_str().context("root path")?;
     bug112_workspace(root.path())?;
@@ -1379,6 +1389,8 @@ fn test_glob_listing_hint_rides_stderr_only() -> Result<()> {
 fn test_glob_listing_hint_never_fuses_in_merged_stream() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131) for the shared-state spawn below.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
     let root = tempfile::tempdir()?;
     let root_str = root.path().to_str().context("root path")?;
     bug112_workspace(root.path())?;

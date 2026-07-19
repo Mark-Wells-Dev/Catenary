@@ -139,6 +139,8 @@ fn enrichment_evicted_on_root_removal() -> Result<()> {
 fn untracked_root_does_not_serve_cached_enrichment() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131) for the shared-state spawns below.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     // The base root keeps the daemon alive after the warming bridge drops.
     let base = tempfile::tempdir()?;

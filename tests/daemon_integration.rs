@@ -310,6 +310,9 @@ fn hook_roundtrip(ipc_path: &Path, request: &serde_json::Value) -> Result<String
 fn two_bridges_share_daemon() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave the
+    // daemon's lifecycle to the test, so guard it against early exits.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let root = tempfile::tempdir()?;
     let root_str = root.path().to_str().context("root path")?;
@@ -365,6 +368,9 @@ fn two_bridges_share_daemon() -> Result<()> {
 fn bridge_disconnect_preserves_other() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave the
+    // daemon's lifecycle to the test, so guard it against early exits.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let root = tempfile::tempdir()?;
     let root_str = root.path().to_str().context("root path")?;
@@ -419,6 +425,9 @@ fn bridge_disconnect_preserves_other() -> Result<()> {
 fn stale_socket_recovery() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave the
+    // daemon's lifecycle to the test, so guard it against early exits.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let root = tempfile::tempdir()?;
     let root_str = root.path().to_str().context("root path")?;
@@ -458,6 +467,9 @@ fn stale_socket_recovery() -> Result<()> {
 fn stop_command_shuts_down_daemon() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave the
+    // daemon's lifecycle to the test, so guard it against early exits.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let root = tempfile::tempdir()?;
     let root_str = root.path().to_str().context("root path")?;
@@ -521,6 +533,9 @@ fn stop_command_shuts_down_daemon() -> Result<()> {
 fn editing_guardrail_blocks_cross_session() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave the
+    // daemon's lifecycle to the test, so guard it against early exits.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let root = tempfile::tempdir()?;
     let root_str = root.path().to_str().context("root path")?;
@@ -617,6 +632,9 @@ fn editing_guardrail_blocks_cross_session() -> Result<()> {
 fn correlation_end_to_end() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave the
+    // daemon's lifecycle to the test, so guard it against early exits.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let root = tempfile::tempdir()?;
     let root_str = root.path().to_str().context("root path")?;
@@ -692,6 +710,9 @@ fn correlation_end_to_end() -> Result<()> {
 fn permission_request_dispatch_answers_no_decision() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave the
+    // daemon's lifecycle to the test, so guard it against early exits.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let root = tempfile::tempdir()?;
     let root_str = root.path().to_str().context("root path")?;
@@ -767,6 +788,9 @@ fn run_cli(state_home: &str, subargs: &[&str]) -> Result<(String, String, Option
 fn bare_diagnostics_empty_ledger_reports_no_edited_files() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave the
+    // daemon's lifecycle to the test, so guard it against early exits.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let mut bridge = BridgeProcess::spawn_in_state(state_home, |_cmd| {})?;
     bridge.initialize()?;
@@ -794,6 +818,9 @@ fn bare_diagnostics_empty_ledger_reports_no_edited_files() -> Result<()> {
 fn hookless_scoped_diagnostics_cli_serves_receipt() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave the
+    // daemon's lifecycle to the test, so guard it against early exits.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
 
     let root = tempfile::tempdir()?;
     let root_str = root.path().to_str().context("root path")?;

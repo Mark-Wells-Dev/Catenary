@@ -123,6 +123,9 @@ fn sigkill(pid: u32) -> Result<()> {
 fn killed_daemon_reconnects_and_answers_ping() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?.to_string();
+    // Panic-safe daemon teardown (bug 131): these tests bounce/kill daemons
+    // deliberately; the guard covers the assertion-failure exits in between.
+    let _daemon_guard = common::DaemonGuard::new(&state_home);
     let (_ipc_sock, mcp_sock) = socket_paths(&state_home);
 
     // Session up — daemon #1 spawned by the bridge init.
@@ -190,6 +193,9 @@ fn killed_daemon_reconnects_and_answers_ping() -> Result<()> {
 fn search_surface_recovers_after_reconnect() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?.to_string();
+    // Panic-safe daemon teardown (bug 131): these tests bounce/kill daemons
+    // deliberately; the guard covers the assertion-failure exits in between.
+    let _daemon_guard = common::DaemonGuard::new(&state_home);
 
     let tree = tempfile::tempdir()?;
     std::fs::write(tree.path().join("hay.txt"), "a needle in here\n")?;
@@ -234,6 +240,9 @@ fn search_surface_recovers_after_reconnect() -> Result<()> {
 fn catenary_start_brings_daemon_up_idempotently() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?.to_string();
+    // Panic-safe daemon teardown (bug 131): these tests bounce/kill daemons
+    // deliberately; the guard covers the assertion-failure exits in between.
+    let _daemon_guard = common::DaemonGuard::new(&state_home);
     let (ipc_sock, _mcp_sock) = socket_paths(&state_home);
 
     assert!(!ipc_sock.exists(), "no daemon before start");
@@ -275,6 +284,9 @@ fn catenary_start_brings_daemon_up_idempotently() -> Result<()> {
 fn catenary_start_recovers_a_stopped_daemon() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?.to_string();
+    // Panic-safe daemon teardown (bug 131): these tests bounce/kill daemons
+    // deliberately; the guard covers the assertion-failure exits in between.
+    let _daemon_guard = common::DaemonGuard::new(&state_home);
     let (ipc_sock, mcp_sock) = socket_paths(&state_home);
 
     // Bring one up and stop it.
@@ -321,6 +333,9 @@ fn intent_mode(state_home: &str) -> Option<String> {
 fn stop_records_stop_intent_and_start_clears_it() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?.to_string();
+    // Panic-safe daemon teardown (bug 131): these tests bounce/kill daemons
+    // deliberately; the guard covers the assertion-failure exits in between.
+    let _daemon_guard = common::DaemonGuard::new(&state_home);
     let (ipc_sock, mcp_sock) = socket_paths(&state_home);
 
     let up = run_catenary(&state_home, &["start"])?;
@@ -368,6 +383,9 @@ fn stop_records_stop_intent_and_start_clears_it() -> Result<()> {
 fn restart_starts_a_daemon_at_census_zero_and_clears_leftover_marker() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?.to_string();
+    // Panic-safe daemon teardown (bug 131): these tests bounce/kill daemons
+    // deliberately; the guard covers the assertion-failure exits in between.
+    let _daemon_guard = common::DaemonGuard::new(&state_home);
     let (ipc_sock, _mcp_sock) = socket_paths(&state_home);
 
     // Seed a leftover `stop` marker (e.g. a `stop` whose `start` never came).
@@ -408,6 +426,9 @@ fn restart_starts_a_daemon_at_census_zero_and_clears_leftover_marker() -> Result
 fn restart_bounces_a_running_daemon_without_a_marker() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?.to_string();
+    // Panic-safe daemon teardown (bug 131): these tests bounce/kill daemons
+    // deliberately; the guard covers the assertion-failure exits in between.
+    let _daemon_guard = common::DaemonGuard::new(&state_home);
     let (ipc_sock, _mcp_sock) = socket_paths(&state_home);
 
     let up = run_catenary(&state_home, &["start"])?;
@@ -447,6 +468,9 @@ fn restart_bounces_a_running_daemon_without_a_marker() -> Result<()> {
 fn quit_records_quit_intent() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let state_home = state_dir.path().to_str().context("state dir")?.to_string();
+    // Panic-safe daemon teardown (bug 131): these tests bounce/kill daemons
+    // deliberately; the guard covers the assertion-failure exits in between.
+    let _daemon_guard = common::DaemonGuard::new(&state_home);
     let (ipc_sock, mcp_sock) = socket_paths(&state_home);
 
     let up = run_catenary(&state_home, &["start"])?;
