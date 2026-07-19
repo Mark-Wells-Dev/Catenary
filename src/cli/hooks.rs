@@ -959,27 +959,19 @@ pub fn run_worktree_remove(format: HostFormat) {
     let _ = ipc_exchange(stream, &request);
 }
 
-/// Answer a read-class permission prompt so the agent never parks on it
-/// (`PermissionRequest` hook handler — the answer desk, misc 201 / decision 031).
+/// Observe a permission prompt (`PermissionRequest` hook handler — a pure
+/// observer since the answer-desk decision seat retired, 2026-07-19).
 ///
-/// Forwards `session_id` + `agent_id` + the **full** host payload (`tool_name`,
-/// `tool_input`, cwd) to the daemon, which computes the read policy (decision 031,
-/// "Reads nod through, writes wait") and — same round-trip — marks the worktree
-/// root enclosing the prompt's cwd blocked for `catenary worktree ls`. The daemon
-/// returns the decision JSON, which this prints verbatim:
+/// Forwards `session_id` + `agent_id` + the full host payload (`tool_name`,
+/// `tool_input`, cwd) to the daemon, which records the event in the firehose
+/// and marks the worktree root enclosing the prompt's cwd blocked for
+/// `catenary worktree ls`. The daemon answers no decision — this handler
+/// prints NOTHING, so the host always proceeds with its normal permission
+/// dialog. Read-policy delivery lives at the `PreToolUse` seat
+/// (`pre-tool/editing-state` → `read_permission`, bug 123).
 ///
-/// - **Deny** (a sensitive file) with the maintainer's teaching — a deny does not
-///   park the agent; the model gets the reason and continues.
-/// - **Allow** with the resolved realpath pinned via `updatedInput` (quiet inside
-///   declared scope; loud + recorded outside; `always_read` also promotes the
-///   enclosing prefix into the session's working directories on the first allow).
-/// - **Nothing** for a write-class tool — the human decides.
-///
-/// **Fail-PASS** (the load-bearing safety rule): only Claude Code's
-/// `PermissionRequest` is answered, and only when the daemon actually returns a
-/// non-empty decision. An unreachable daemon, a non-Claude host, or an
-/// unresolvable target prints nothing — the human's prompt must stand; the desk
-/// never eats a prompt it cannot answer.
+/// Only Claude Code's `PermissionRequest` is forwarded; any other host, an
+/// unreachable daemon, or malformed stdin is a silent no-op.
 pub fn run_permission_request(format: HostFormat) {
     let Ok(stdin_data) = std::io::read_to_string(std::io::stdin()) else {
         return;
@@ -988,8 +980,8 @@ pub fn run_permission_request(format: HostFormat) {
         return;
     };
 
-    // Only Claude Code carries the answer-desk PermissionRequest surface; any
-    // other host is a no-op (nothing printed — fail PASS).
+    // Only Claude Code carries the PermissionRequest observer surface; any
+    // other host is a no-op (nothing printed).
     if !matches!(format, HostFormat::Claude) {
         return;
     }
@@ -1006,18 +998,13 @@ pub fn run_permission_request(format: HostFormat) {
     if let Some(sid) = extract_session_id(&hook_json, format) {
         request["session_id"] = serde_json::json!(sid);
     }
-    // The desk needs the tool_name + tool_input to classify the read, so forward
-    // the FULL raw payload (not the truncated one — a path could exceed the
-    // capture cap and mis-resolve). The blocked-marking cwd rides along with it.
+    // Forward the FULL raw payload (not the truncated one) so the firehose
+    // record carries the whole prompt. The blocked-marking cwd rides with it.
     request["host_payload"] = hook_json;
 
-    // The daemon returns the decision JSON (or an empty line for "no decision").
-    // Print it verbatim; an empty line prints nothing — the human's prompt stands.
-    for line in ipc_exchange(stream, &request) {
-        if !line.trim().is_empty() {
-            print!("{line}");
-        }
-    }
+    // Fire and forget — the daemon answers the no-decision form (an empty
+    // line); nothing is ever printed, so the human's prompt stands.
+    let _ = ipc_exchange(stream, &request);
 }
 
 /// Reserved no-op shim shared by every hook event registered ahead of its

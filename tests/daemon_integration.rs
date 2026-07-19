@@ -680,6 +680,60 @@ fn correlation_end_to_end() -> Result<()> {
     Ok(())
 }
 
+/// The `permission-request/blocked` dispatch answers NO decision (the answer
+/// desk retired from this seat — maintainer ruling, 2026-07-19). Even a
+/// read-class prompt whose target sits squarely in declared scope — the exact
+/// shape that once drew an allow envelope — gets the neutral, decision-free
+/// response (an empty line), so the host proceeds with its own permission
+/// dialog. The dispatch stays registered purely for the firehose record and
+/// the blocked-root marking; read-policy delivery lives at the `PreToolUse`
+/// seat.
+#[test]
+fn permission_request_dispatch_answers_no_decision() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+
+    let root = tempfile::tempdir()?;
+    let root_str = root.path().to_str().context("root path")?;
+
+    let file = root.path().join(format!("in_scope.{MOCK_LANG}"));
+    std::fs::write(&file, "fn in_scope_fn()\n")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG, "--scan-roots");
+
+    // The bridge starts the daemon and contributes the root, so the read
+    // target below is IN declared scope — the strongest previously-answered
+    // shape.
+    let mut bridge = BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_SERVERS", &lsp);
+        cmd.env("CATENARY_ROOTS", root_str);
+    })?;
+    bridge.initialize()?;
+
+    let ipc_path = wait_for_ipc_socket(state_home);
+
+    let response = hook_roundtrip(
+        &ipc_path,
+        &json!({
+            "method": "permission-request/blocked",
+            "agent_id": "",
+            "session_id": "perm-session",
+            "format": "claude",
+            "host_payload": {
+                "tool_name": "Read",
+                "tool_input": { "file_path": file.to_str().context("file path")? },
+                "cwd": root_str,
+            },
+        }),
+    )?;
+    assert!(
+        response.trim().is_empty(),
+        "permission-request dispatch must answer the no-decision form, got: {response}",
+    );
+
+    Ok(())
+}
+
 // ── Hookless CLI surface (bug 100) ─────────────────────────────────
 //
 // The documented CLI-only story: a live daemon, but no PreToolUse hook ever

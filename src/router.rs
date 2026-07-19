@@ -274,12 +274,13 @@ fn extract_session_roots(raw: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Extract the answer desk's read target from a forwarded `PermissionRequest`
-/// payload (misc 201).
+/// Extract the answer desk's read target from a forwarded host tool payload
+/// (misc 201; since the `PermissionRequest` seat retired, the `PreToolUse`
+/// leg's `host_payload`).
 ///
 /// Returns `(tool_name, target_path)` when the payload names a read-class tool
 /// (`Read`/`Grep`/`Glob`) with a resolvable path field, else `None` (the desk
-/// answers nothing). Claude Code's `PermissionRequest` carries `tool_name` and a
+/// answers nothing). Claude Code's hook payload carries `tool_name` and a
 /// `tool_input` object whose path field is `file_path` (Read) or `path`
 /// (Grep/Glob). A relative path is resolved against the payload's `cwd`.
 #[cfg(unix)]
@@ -305,17 +306,6 @@ fn permission_read_target(hp: &serde_json::Value) -> Option<(String, PathBuf)> {
         cwd.join(path)
     };
     Some((tool_name.to_string(), abs))
-}
-
-/// The tool-input path key the answer desk pins the realpath under, for a given
-/// read-class tool: `file_path` for `Read`, `path` for the host `Grep`/`Glob`
-/// prompts. Defaults to `file_path`.
-#[cfg(unix)]
-fn permission_input_key(tool_name: &str) -> &'static str {
-    match tool_name {
-        "Grep" | "Glob" => "path",
-        _ => "file_path",
-    }
 }
 
 /// Build the answer desk's declared [`ReadScope`](crate::answer_desk::ReadScope)
@@ -5597,40 +5587,22 @@ async fn handle_hook_dispatch(
             "incoming hook",
         );
 
-        // ── The answer desk: the harmless second answerer (bug 123) ────
-        //
-        // Compute the read-class permission decision from the forwarded payload:
-        // sensitive → deny with teaching; in declared scope → quiet allow (pin
-        // the realpath); out of scope → allow. A write-class tool or an
-        // unresolvable target yields no decision — the human's prompt stands
-        // (fail-PASS). Emitted as the `PermissionRequest` envelope so the hook CLI
-        // prints it verbatim WHEN the host fires PermissionRequest; the reliable
-        // delivery seat is the PreToolUse leg (bug 123), which is where the
-        // loud-allow recording ([`record_loud_read`]) now fires — EXACTLY ONCE, so
-        // this seat records nothing (both seats firing would double-count).
-        let response_body = raw
-            .get("host_payload")
-            .and_then(|hp| {
-                resolve_permission_decision(hp, ctx.root_tracker.as_ref(), &ctx.primary.config)
-            })
-            .map(|(decision, tool_name)| {
-                decision
-                    .to_hook_json(permission_input_key(&tool_name))
-                    .map(|v| v.to_string())
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default();
-
+        // The answer desk retired from this seat (maintainer ruling, 2026-07-19):
+        // the seat proved structurally unreliable on the host, and delivery moved
+        // to the PreToolUse leg (`pre-tool/editing-state` → `read_permission`,
+        // bug 123), live-verified attended. This handler answers the no-decision
+        // form — an empty line — so the host proceeds with its normal permission
+        // dialog; the dispatch stays registered purely for the firehose record
+        // and the blocked-root marking above.
         emit_hook_event(
             tracing::Level::DEBUG,
             &session_id,
             &method,
             Some(&scope_id),
-            &response_body,
+            "",
             "outgoing hook response",
         );
 
-        writer.write_all(response_body.as_bytes()).await?;
         writer.write_all(b"\n").await?;
         writer.shutdown().await?;
         return Ok(());
@@ -10426,52 +10398,6 @@ mod tests {
     fn answer_desk_write_class_emits_no_decision() {
         let tracker = RootTracker::new();
         let config = crate::config::Config::default();
-        let write = read_payload("Write", "file_path", "/work/x.rs", "/work");
-        assert!(resolve_permission_decision(&write, Some(&tracker), &config).is_none());
-    }
-
-    /// Both delivery seats (bug 123) render the SAME policy from one decision: a
-    /// read-class payload yields `Some(decision)` and BOTH the `PreToolUse`
-    /// envelope (`to_pretooluse_json`) and the `PermissionRequest` envelope
-    /// (`to_hook_json`) speak with the same allow/deny sense; a write-class
-    /// payload yields `None`, so neither seat speaks.
-    #[test]
-    fn answer_desk_both_seats_render_the_same_policy() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().join("repo");
-        std::fs::create_dir_all(root.join("src")).expect("mkdir");
-        std::fs::write(root.join("src/main.rs"), "fn main() {}").expect("write");
-
-        let tracker = RootTracker::new();
-        tracker.set_roots("mcp:1", vec![root.canonicalize().expect("canon")]);
-        let config = crate::config::Config::default();
-
-        // A read-class in-scope payload → both seats agree (allow).
-        let read = read_payload(
-            "Read",
-            "file_path",
-            root.join("src/main.rs").to_str().expect("utf8"),
-            tmp.path().to_str().expect("utf8"),
-        );
-        let (decision, tool) =
-            resolve_permission_decision(&read, Some(&tracker), &config).expect("read decided");
-
-        let permission_request = decision
-            .to_hook_json(permission_input_key(&tool))
-            .expect("permission-request envelope present");
-        let pretooluse = decision
-            .to_pretooluse_json()
-            .expect("pretooluse envelope present");
-        assert_eq!(
-            permission_request["hookSpecificOutput"]["decision"]["behavior"],
-            "allow"
-        );
-        assert_eq!(
-            pretooluse["hookSpecificOutput"]["permissionDecision"],
-            "allow"
-        );
-
-        // A write-class payload → the desk answers nothing; neither seat speaks.
         let write = read_payload("Write", "file_path", "/work/x.rs", "/work");
         assert!(resolve_permission_decision(&write, Some(&tracker), &config).is_none());
     }

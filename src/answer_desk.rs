@@ -12,20 +12,19 @@
 //!   1. **Deny only sensitive files** — the lean tier-0 [`SensitiveDenylist`]
 //!      (SSH keys, PEM/key material, `.env`-class, cloud credentials). The deny
 //!      carries [`SENSITIVE_DENY_MESSAGE`], a teaching, not a park.
-//!   2. **Quiet allow** inside the declared [`ReadScope`] — the resolved realpath
-//!      is pinned via `updatedInput`.
+//!   2. **Quiet allow** inside the declared [`ReadScope`] — the decision carries
+//!      the resolved realpath.
 //!   3. **Loud allow** outside declared scope — the read is allowed AND recorded
 //!      (a firehose event plus a TUI health finding via `warn!`), never denied.
 //!   4. **Writes: the desk answers nothing** — the human decides.
 //!
 //! This module is the pure policy core: it takes a resolved path plus the
 //! canonicalized scope and denylist and returns a [`Decision`]; the emission of
-//! the wire field names lives in [`Decision::to_hook_json`] (the
-//! `PermissionRequest` envelope) and [`Decision::to_pretooluse_json`] (the
-//! `PreToolUse` envelope, the delivery seat as of bug 123), so a field rename is
-//! a one-place fix per seat. The transport (`catenary hook pre-tool` /
-//! `permission-request`) and the daemon method that resolves the scope live
-//! elsewhere (`src/cli/hooks.rs`, `src/router.rs`).
+//! the wire field names lives in [`Decision::to_pretooluse_json`] (the
+//! `PreToolUse` envelope — the sole delivery seat; the `PermissionRequest`
+//! seat retired 2026-07-19), so a field rename is a one-place fix. The
+//! transport (`catenary hook pre-tool`) and the daemon method that resolves
+//! the scope live elsewhere (`src/cli/hooks.rs`, `src/router.rs`).
 //!
 //! ## Path-spelling discipline
 //!
@@ -215,12 +214,11 @@ pub enum ScopeVerdict {
 
 /// The answer-desk verdict for one permission prompt.
 ///
-/// [`Decision::to_hook_json`] (the `PermissionRequest` envelope) and
-/// [`Decision::to_pretooluse_json`] (the `PreToolUse` envelope, the delivery seat
-/// as of bug 123) are the emission sites for the wire field names
-/// (`hookSpecificOutput`, `hookEventName`, `decision`, `behavior`,
-/// `updatedInput`, `message`, `permissionDecision`, `permissionDecisionReason`),
-/// so a field rename is a one-place fix per seat.
+/// [`Decision::to_pretooluse_json`] (the `PreToolUse` envelope — the sole
+/// delivery seat since the `PermissionRequest` seat retired, 2026-07-19) is the
+/// emission site for the wire field names (`hookSpecificOutput`,
+/// `hookEventName`, `permissionDecision`, `permissionDecisionReason`), so a
+/// field rename is a one-place fix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     /// Deny the read (sensitive file). Carries the teaching message.
@@ -228,16 +226,16 @@ pub enum Decision {
         /// The maintainer-dictated teaching ([`SENSITIVE_DENY_MESSAGE`]).
         message: String,
     },
-    /// Quiet allow inside declared scope — pin the resolved realpath.
+    /// Quiet allow inside declared scope.
     QuietAllow {
-        /// The resolved realpath to pin via `updatedInput` (closes symlink
-        /// TOCTOU: the decision and the read are about the same inode-path).
+        /// The resolved realpath the verdict is about (the canonical spelling
+        /// the scope predicate judged).
         realpath: PathBuf,
     },
-    /// Loud allow outside declared scope — pin the realpath; the RECORDING (a
-    /// firehose event + a TUI health finding) is the caller's responsibility.
+    /// Loud allow outside declared scope — the RECORDING (a firehose event + a
+    /// TUI health finding) is the caller's responsibility.
     LoudAllow {
-        /// The resolved realpath to pin via `updatedInput`.
+        /// The resolved realpath the recording names.
         realpath: PathBuf,
     },
     /// The desk answers nothing — the human's prompt must stand. Emitted for
@@ -247,68 +245,15 @@ pub enum Decision {
 }
 
 impl Decision {
-    /// Renders the decision as the `PermissionRequest` hook-response JSON, or
-    /// `None` for [`Decision::NoDecision`] (nothing is printed — the human's
-    /// prompt stands).
-    ///
-    /// This is the emission site for the `PermissionRequest` wire schema. Since
-    /// bug 123 the DELIVERY seat is [`Decision::to_pretooluse_json`]; this
-    /// envelope remains as the harmless second answerer (the `PermissionRequest`
-    /// hook, when the host does fire it). The documented `PermissionRequest`
-    /// envelope (bug 123 — hooks docs, fetched 2026-07-17) nests the decision
-    /// under `hookSpecificOutput`:
-    /// `{"hookSpecificOutput": {"hookEventName": "PermissionRequest",
-    /// "decision": {"behavior": "allow"|"deny", "updatedInput"?, "message"?}}}`.
-    ///
-    /// TRANSITIONAL DUAL-SHAPE (bug 123): the same `decision` object is ALSO
-    /// emitted at the top level, alongside `hookSpecificOutput`. The host is
-    /// effectively-nightly and the schema paste that drove the original
-    /// implementation showed the fields without an envelope; hosts tolerate
-    /// unknown fields, both shapes carry the identical decision so no conflict is
-    /// possible, and the worst case of an unparsed response is the pre-fix status
-    /// quo (the dialog). The top-level copy is removable after attended live
-    /// verification.
-    ///
-    /// The `updatedInput` object pins the resolved realpath under `input_path_key`
-    /// (the tool's file-path field name — `file_path` for Read, `path` for the
-    /// host Grep/Glob prompts). `message` rides inside the `decision` object in
-    /// BOTH copies.
-    #[must_use]
-    pub fn to_hook_json(&self, input_path_key: &str) -> Option<serde_json::Value> {
-        let decision = match self {
-            Self::NoDecision => return None,
-            Self::Deny { message } => serde_json::json!({
-                "behavior": "deny",
-                "message": message,
-            }),
-            Self::QuietAllow { realpath } | Self::LoudAllow { realpath } => {
-                serde_json::json!({
-                    "behavior": "allow",
-                    "updatedInput": {
-                        input_path_key: realpath.to_string_lossy(),
-                    },
-                })
-            }
-        };
-        Some(serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PermissionRequest",
-                "decision": decision,
-            },
-            // Transitional top-level copy — see the doc comment above.
-            "decision": decision,
-        }))
-    }
-
-    /// Render the decision as the `PreToolUse` permission envelope (bug 123 — the
-    /// delivery seat moved here from `PermissionRequest`), or `None` for
-    /// `NoDecision` (absence means the host's normal permission flow proceeds —
-    /// silence is the pass-through; never an "ask"-equivalent).
+    /// Render the decision as the `PreToolUse` permission envelope (bug 123 —
+    /// the sole delivery seat; the `PermissionRequest` seat retired 2026-07-19),
+    /// or `None` for `NoDecision` (absence means the host's normal permission
+    /// flow proceeds — silence is the pass-through; never an "ask"-equivalent).
     ///
     /// The shape is the documented `PreToolUse` decision envelope:
     /// `{"hookSpecificOutput": {"hookEventName": "PreToolUse",
     /// "permissionDecision": "allow"|"deny", "permissionDecisionReason": "…"}}`.
-    /// Unlike the `PermissionRequest` envelope this carries NO `updatedInput`.
+    /// It carries NO `updatedInput`.
     #[must_use]
     pub fn to_pretooluse_json(&self) -> Option<serde_json::Value> {
         let (decision, reason) = match self {
@@ -780,91 +725,6 @@ mod tests {
                 realpath: PathBuf::from("/etc/hosts")
             }
         );
-    }
-
-    // ── Decision JSON emission ───────────────────────────────────────────
-    //
-    // The wire shape is TRANSITIONALLY dual (bug 123): the documented
-    // `hookSpecificOutput` envelope plus an identical top-level `decision`
-    // copy. The `json["decision"]` assertions below pin the transitional
-    // top-level copy; the `envelope_*` tests pin the documented envelope.
-    // When the top-level copy retires (after attended live verification),
-    // the top-level pins go with it.
-
-    #[test]
-    fn deny_json_carries_behavior_and_message() {
-        let d = Decision::Deny {
-            message: SENSITIVE_DENY_MESSAGE.to_string(),
-        };
-        let json = d.to_hook_json("file_path").expect("deny emits json");
-        assert_eq!(json["decision"]["behavior"], "deny");
-        assert_eq!(json["decision"]["message"], SENSITIVE_DENY_MESSAGE);
-    }
-
-    #[test]
-    fn quiet_allow_json_pins_realpath_under_key() {
-        let d = Decision::QuietAllow {
-            realpath: PathBuf::from("/work/repo/src/main.rs"),
-        };
-        let json = d.to_hook_json("file_path").expect("allow emits json");
-        assert_eq!(json["decision"]["behavior"], "allow");
-        assert_eq!(
-            json["decision"]["updatedInput"]["file_path"],
-            "/work/repo/src/main.rs"
-        );
-        assert!(json["decision"].get("updatedPermissions").is_none());
-    }
-
-    #[test]
-    fn no_decision_emits_nothing() {
-        assert!(Decision::NoDecision.to_hook_json("file_path").is_none());
-    }
-
-    // ── The documented PermissionRequest envelope (bug 123) ─────────────
-
-    #[test]
-    fn envelope_allow_pins_documented_shape_verbatim() {
-        let d = Decision::QuietAllow {
-            realpath: PathBuf::from("/work/repo/src/main.rs"),
-        };
-        let json = d.to_hook_json("file_path").expect("allow emits json");
-        assert_eq!(
-            json["hookSpecificOutput"]["hookEventName"],
-            "PermissionRequest"
-        );
-        assert_eq!(json["hookSpecificOutput"]["decision"]["behavior"], "allow");
-        // The documented envelope, verbatim.
-        assert_eq!(
-            json["hookSpecificOutput"],
-            serde_json::json!({
-                "hookEventName": "PermissionRequest",
-                "decision": {
-                    "behavior": "allow",
-                    "updatedInput": { "file_path": "/work/repo/src/main.rs" },
-                }
-            })
-        );
-        // Both copies carry the identical decision.
-        assert_eq!(json["hookSpecificOutput"]["decision"], json["decision"]);
-    }
-
-    #[test]
-    fn envelope_deny_pins_documented_shape() {
-        let d = Decision::Deny {
-            message: SENSITIVE_DENY_MESSAGE.to_string(),
-        };
-        let json = d.to_hook_json("file_path").expect("deny emits json");
-        assert_eq!(
-            json["hookSpecificOutput"]["hookEventName"],
-            "PermissionRequest"
-        );
-        assert_eq!(json["hookSpecificOutput"]["decision"]["behavior"], "deny");
-        assert_eq!(
-            json["hookSpecificOutput"]["decision"]["message"],
-            SENSITIVE_DENY_MESSAGE
-        );
-        // Both copies carry the identical decision.
-        assert_eq!(json["hookSpecificOutput"]["decision"], json["decision"]);
     }
 
     // ── The documented PreToolUse envelope (bug 123 — the delivery seat) ──
