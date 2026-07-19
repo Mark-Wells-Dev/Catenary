@@ -314,12 +314,18 @@ paid file re-arms it. A named path that was never edited is simply linted
 on demand — it pays nothing, since it owed nothing. Relative paths resolve
 against the shell's current working directory. A named path that does not
 exist, or that resolves **outside every mounted root**, is never dropped in
-silence. When the path has a detectable enclosing project root (walking
+silence — and a named path that exists is **always served**: scoped
+diagnostics is a diagnostics service, and the explicitly named path is the
+intent signal. When the path has a detectable enclosing project root (walking
 `.git` up from it), Catenary **mounts that root ephemerally** and diagnoses
-the file from the freshly-attached server — the mount then expires after a
-few minutes of inactivity (or `catenary pin` pins it). When no
-enclosing root is detectable, the receipt names the path on its own line and
-says why (`path does not exist`, or that it is outside every mounted root).
+the file from the freshly-attached server; when no marker is detectable, the
+named directory itself (a file's containing directory) mounts instead —
+exactly the root `catenary pin` on it would mount. Either way the mount
+expires after a few minutes of inactivity (or `catenary pin` pins it), and a
+file no language server covers still answers `[no LSP coverage]` honestly.
+The receipt names a path on its own line only when it could not be served at
+all: it does not exist (`path does not exist`), or the mount was refused
+because the path is on the sensitive-path denylist.
 
 `catenary diagnostics` is a load-bearing command — run it (bare or scoped)
 as its **own step** (no pipes, no `&&`/`;` chaining), and read the result.

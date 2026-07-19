@@ -93,8 +93,14 @@ the single enclosing root (never a sibling, no companion templating) and
 **expires after a few minutes of inactivity** — every qualifying activity
 refreshes its idle clock, and `catenary pin` on it upgrades it to pinned.
 Bare `catenary roots` and the `state.json` root board distinguish the two classes.
-A file with no detectable enclosing project root still has no owning root; it
-routes only to single-file-capable servers (tier 3).
+The marker walk gates **ambient** touches only (a stray grep hit must not
+mount a root): a file with no detectable enclosing project root stays
+unmounted for grep/glob and routes only to single-file-capable servers
+(tier 3). A path **explicitly named** to `catenary diagnostics`, though, is
+its own intent signal: with no marker detectable, the named directory itself
+(a file's containing directory) mounts ephemerally — the same root
+`catenary pin` on it would mount — so a scoped diagnose always serves the
+named file.
 
 ## Instance keying
 

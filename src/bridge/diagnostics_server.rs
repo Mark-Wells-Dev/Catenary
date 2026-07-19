@@ -204,7 +204,11 @@ enum OutOfScopeKind {
     /// The named path exists but resolves outside every mounted root. Carries
     /// the enclosing project root when one is detectable (walk repository markers up from
     /// the path) — what a `catenary pin` would mount — or `None` when no
-    /// enclosing project root is found.
+    /// enclosing project root is found. Rarely reached for a scoped serve as
+    /// of misc 203: an explicitly named target auto-mounts its enclosing root
+    /// (markerless dirs included) before the pipeline runs, so this arm
+    /// remains for the mounts that could not happen — a sensitive-path
+    /// refusal (ws43-05), or a daemon with no root tracker.
     OutsideRoots { enclosing_root: Option<PathBuf> },
 }
 
