@@ -118,6 +118,7 @@ where
             roots,
             &WalkOptions::default(),
             None,
+            catenary_cli::hitstream::WalkTier::Dig,
             lint,
             cli_reader,
             cli_writes,
@@ -213,6 +214,7 @@ impl BatchEnricher for SlowFirstBatch {
         hits: Vec<WireHit>,
         _observed: Vec<(PathBuf, i64)>,
         _weight: Option<catenary_cli::hitstream::EnrichmentWeight>,
+        _tier: catenary_cli::hitstream::WalkTier,
     ) -> anyhow::Result<Vec<AnnotatedHit>> {
         // Tag each hit's anchor with a fixed trail so the output takes the
         // annotated (`#x`) spelling. A batch's first hit line identifies it.
@@ -324,6 +326,7 @@ async fn daemon_absent_and_unknown_method_degrade_identically() -> Result<()> {
             &roots,
             &WalkOptions::default(),
             None,
+            catenary_cli::hitstream::WalkTier::Dig,
             None,
             cli_reader,
             cli_writes,
@@ -383,6 +386,7 @@ async fn silent_daemon_deadline_completes_unannotated() -> Result<()> {
             &roots,
             &WalkOptions::default(),
             None,
+            catenary_cli::hitstream::WalkTier::Dig,
             None,
             cli_reader,
             cli_writes,
@@ -537,6 +541,7 @@ impl BatchEnricher for RecordingEnricher {
         hits: Vec<WireHit>,
         _observed: Vec<(PathBuf, i64)>,
         _weight: Option<catenary_cli::hitstream::EnrichmentWeight>,
+        _tier: catenary_cli::hitstream::WalkTier,
     ) -> anyhow::Result<Vec<AnnotatedHit>> {
         if let Ok(mut seen) = self.seen.lock() {
             seen.extend(hits.iter().map(|h| h.path.clone()));

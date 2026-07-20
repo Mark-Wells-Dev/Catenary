@@ -1294,10 +1294,203 @@ pub fn canonicalize_pattern_base(pattern: &Path) -> PathBuf {
     }
 }
 
+/// The metachar-free base of one declared anchor argument: the walk's anchor
+/// directory as the command declared it, before any expansion — a plain path is
+/// its own base, a glob pattern's base is its metachar-free prefix (the same
+/// split point [`canonicalize_pattern_base`] and `ResolvedGlob::base_dir` use).
+fn anchor_base(anchor: &Path) -> PathBuf {
+    let mut base = PathBuf::new();
+    for component in anchor.components() {
+        if component_has_metachar(component.as_os_str()) {
+            break;
+        }
+        base.push(component);
+    }
+    if base.as_os_str().is_empty() {
+        anchor.to_path_buf()
+    } else {
+        base
+    }
+}
+
+/// Resolves a walk's declared anchors to its enrichment tier (brackets 04):
+/// *declared by the command, decided by the anchor, never guessed from the
+/// pattern or the hits.*
+///
+/// `anchors` are the command's declared anchor arguments, absolutized and
+/// pre-expansion — the canonical cwd for a pathless `catenary grep`, the path
+/// arguments otherwise, the single positional pattern for `catenary glob`.
+/// Each anchor's metachar-free base (canonicalized when it resolves) is tested
+/// against two enclosing-root legs, either of which decides a dig for that
+/// anchor:
+///
+/// - **a tracked root** (`tracked_roots` — the daemon's served set: session
+///   roots, pins, worktree/ephemeral mounts, all canonical): a served root
+///   needs no repository marker, so a query anchored inside one is
+///   project-grade exactly as today;
+/// - **a repository-marker root**, by the same probe the ambient query
+///   auto-mount uses ([`crate::companions::enclosing_worktree_root`], walking
+///   `.git`-class markers up the ancestors) — the dig path would auto-mount
+///   it, so the anchor is inside a root-to-be.
+///
+/// Every anchor inside a root → [`WalkTier::Dig`]: project-grade enrichment,
+/// exactly the pre-tier behavior (nested roots under the anchor ride along,
+/// as today). Any anchor above every root — a parent-of-projects directory,
+/// or a directory outside any repository and any served root — makes the
+/// whole walk a [`WalkTier::Sweep`], by its own declaration: file-grade
+/// enrichment only.
+///
+/// The decision is made here, at planning time, BEFORE any walk I/O — the
+/// probe stats only the anchor's own ancestor chain. There is no hit counting,
+/// no mid-stream flip, and no pattern inference: the anchor is the entire
+/// decision, and a sweep whose hits all land in one root still gets file-grade
+/// (conscious conservatism — the query asked for a sweep). An empty anchor set
+/// (defensive; every caller declares at least one) is `Dig`, the
+/// today-shaped default: with no anchor declared there is no "anchored above"
+/// declaration to honor.
+#[must_use]
+pub fn resolve_walk_tier(
+    anchors: &[PathBuf],
+    tracked_roots: &[PathBuf],
+) -> crate::hitstream::WalkTier {
+    // `all` on an empty set is `true` — exactly the documented defensive
+    // default: no declared anchor, no sweep declaration, today's behavior.
+    let dig = anchors.iter().all(|anchor| {
+        let base = anchor_base(anchor);
+        // Canonical-to-canonical: tracked roots are stored canonical, and the
+        // marker probe stats the real ancestor chain.
+        let base = base.canonicalize().unwrap_or(base);
+        tracked_roots.iter().any(|root| base.starts_with(root))
+            || crate::companions::enclosing_worktree_root(&base).is_some()
+    });
+    if dig {
+        crate::hitstream::WalkTier::Dig
+    } else {
+        crate::hitstream::WalkTier::Sweep
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use globset::Glob;
+
+    // ─── resolve_walk_tier — the anchor decision (brackets 04) ─────────────
+
+    /// A parent directory holding two markered projects — the sweep fixture.
+    /// Returns `(tempdir, parent, project_a, project_b)`.
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn tier_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let parent = tmp.path().canonicalize().expect("canonicalize parent");
+        let proj_a = parent.join("proj_a");
+        let proj_b = parent.join("proj_b");
+        for proj in [&proj_a, &proj_b] {
+            std::fs::create_dir_all(proj.join(".git")).expect("create project marker");
+            std::fs::create_dir_all(proj.join("src")).expect("create src");
+        }
+        (tmp, parent, proj_a, proj_b)
+    }
+
+    /// An anchor inside a markered project decides a dig — for the project
+    /// root itself, a subdirectory, and a file path alike.
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn walk_tier_anchor_inside_a_root_is_dig() {
+        let (_tmp, _parent, proj_a, _proj_b) = tier_fixture();
+        let file = proj_a.join("src").join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").expect("write file");
+        for anchor in [proj_a.clone(), proj_a.join("src"), file] {
+            assert_eq!(
+                resolve_walk_tier(std::slice::from_ref(&anchor), &[]),
+                crate::hitstream::WalkTier::Dig,
+                "anchored inside a root is a dig: {}",
+                anchor.display(),
+            );
+        }
+    }
+
+    /// A markerless anchor inside a TRACKED root digs: a served root (a pin,
+    /// an env-seeded session root, a worktree mount) needs no repository
+    /// marker — the query is project-grade exactly as today.
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn walk_tier_markerless_anchor_inside_a_tracked_root_is_dig() {
+        let (_tmp, parent, _proj_a, _proj_b) = tier_fixture();
+        let tracked = parent.join("served");
+        std::fs::create_dir_all(tracked.join("src")).expect("create served root");
+        assert_eq!(
+            resolve_walk_tier(&[tracked.join("src")], std::slice::from_ref(&tracked)),
+            crate::hitstream::WalkTier::Dig,
+            "a markerless anchor inside a tracked root digs",
+        );
+        // The same anchor with no tracked coverage sweeps.
+        assert_eq!(
+            resolve_walk_tier(&[tracked.join("src")], &[]),
+            crate::hitstream::WalkTier::Sweep,
+            "without tracked coverage the markerless anchor sweeps",
+        );
+        // An anchor ABOVE the tracked root still sweeps — tracked roots below
+        // the anchor never enter the decision.
+        assert_eq!(
+            resolve_walk_tier(
+                std::slice::from_ref(&parent),
+                std::slice::from_ref(&tracked)
+            ),
+            crate::hitstream::WalkTier::Sweep,
+            "anchored above a tracked root is still a sweep",
+        );
+    }
+
+    /// An anchor above every root — the parent-of-projects directory — decides
+    /// a sweep from the anchor ALONE: the markered projects beneath it never
+    /// enter the decision (no descent, no hit counting).
+    #[test]
+    fn walk_tier_anchor_above_every_root_is_sweep() {
+        let (_tmp, parent, _proj_a, _proj_b) = tier_fixture();
+        assert_eq!(
+            resolve_walk_tier(std::slice::from_ref(&parent), &[]),
+            crate::hitstream::WalkTier::Sweep,
+            "anchored above every root is a sweep, by its own declaration",
+        );
+    }
+
+    /// A glob-pattern anchor decides from its metachar-free base: the pattern's
+    /// declaration, never its expansion.
+    #[test]
+    fn walk_tier_pattern_anchor_decides_from_its_base() {
+        let (_tmp, parent, proj_a, _proj_b) = tier_fixture();
+        assert_eq!(
+            resolve_walk_tier(&[proj_a.join("**").join("*.rs")], &[]),
+            crate::hitstream::WalkTier::Dig,
+            "a pattern based inside a root digs",
+        );
+        assert_eq!(
+            resolve_walk_tier(&[parent.join("**").join("*.rs")], &[]),
+            crate::hitstream::WalkTier::Sweep,
+            "a pattern based above every root sweeps — even though every \
+             expansion hit would land inside a project",
+        );
+    }
+
+    /// Mixed anchors: any anchor above every root makes the whole walk a sweep
+    /// (one decision per walk — no mid-stream flips, no per-anchor tiers).
+    #[test]
+    fn walk_tier_mixed_anchors_sweep_wins() {
+        let (_tmp, parent, proj_a, _proj_b) = tier_fixture();
+        assert_eq!(
+            resolve_walk_tier(&[proj_a.join("src"), parent], &[]),
+            crate::hitstream::WalkTier::Sweep,
+            "one above-roots anchor sweeps the whole walk",
+        );
+    }
+
+    /// The defensive empty set is a dig — with no anchor declared there is no
+    /// "anchored above" declaration to honor, so behavior stays today-shaped.
+    #[test]
+    fn walk_tier_empty_anchor_set_is_dig() {
+        assert_eq!(resolve_walk_tier(&[], &[]), crate::hitstream::WalkTier::Dig);
+    }
 
     // ─── canonicalize_pattern_base — glob's ingestion-seam canonicalization (misc 193) ──
 

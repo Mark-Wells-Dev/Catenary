@@ -73,6 +73,7 @@ fn hitstream_exchange_weighted(
         hits: hits.to_vec(),
         observed: Vec::new(),
         weight,
+        tier: catenary_cli::hitstream::WalkTier::Dig,
     };
     payload.extend(serde_json::to_vec(&batch)?);
     payload.push(b'\n');

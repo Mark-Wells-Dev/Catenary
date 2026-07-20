@@ -35,6 +35,7 @@ use tokio::io::AsyncWriteExt;
 use super::ANNOTATION_BATCH_BUDGET;
 use super::frame::{
     AnnotatedBatch, AnnotatedHit, AnnotationFrame, AnnotationVerdict, EnrichmentWeight, HitFrame,
+    WalkTier,
 };
 
 /// The enrichment step the annotator awaits per batch, under budget.
@@ -62,11 +63,18 @@ pub trait BatchEnricher: Send + Sync {
     /// production enricher then answers each hit's file with an outline body
     /// at that weight instead of a scope anchor. The annotator honors the
     /// requested weight; the same per-batch budget bounds both shapes.
+    ///
+    /// `tier` is the walk's anchor-decided enrichment tier (brackets 04):
+    /// [`WalkTier::Dig`] serves project-grade enrichment from root instances
+    /// (the pre-tier behavior); [`WalkTier::Sweep`] serves file-grade
+    /// enrichment through the rootless single-file singletons only — no
+    /// mounts, no per-hit-root spawns, no root-instance traffic.
     fn enrich(
         &self,
         hits: Vec<super::WireHit>,
         observed: Vec<(std::path::PathBuf, i64)>,
         weight: Option<EnrichmentWeight>,
+        tier: WalkTier,
     ) -> impl Future<Output = Result<Vec<AnnotatedHit>>> + Send;
 
     /// Consumes the walk's WS31 observation set from the [`HitFrame::End`]
@@ -105,6 +113,7 @@ impl BatchEnricher for PassThroughEnricher {
         hits: Vec<super::WireHit>,
         _observed: Vec<(std::path::PathBuf, i64)>,
         _weight: Option<EnrichmentWeight>,
+        _tier: WalkTier,
     ) -> Result<Vec<AnnotatedHit>> {
         Ok(hits.into_iter().map(AnnotatedHit::passthrough).collect())
     }
@@ -126,6 +135,7 @@ pub async fn annotate_batch<E: BatchEnricher>(
     hits: Vec<super::WireHit>,
     observed: Vec<(std::path::PathBuf, i64)>,
     weight: Option<EnrichmentWeight>,
+    tier: WalkTier,
     budget: Duration,
 ) -> AnnotatedBatch {
     // Keep an unannotated copy so a blown budget or an enrich error still returns
@@ -136,7 +146,7 @@ pub async fn annotate_batch<E: BatchEnricher>(
         .map(AnnotatedHit::passthrough)
         .collect();
 
-    match tokio::time::timeout(budget, enricher.enrich(hits, observed, weight)).await {
+    match tokio::time::timeout(budget, enricher.enrich(hits, observed, weight, tier)).await {
         Ok(Ok(annotated)) => AnnotatedBatch {
             seq,
             hits: annotated,
@@ -208,11 +218,13 @@ where
                 hits,
                 observed,
                 weight,
+                tier,
             } => {
                 // read → await (budgeted) → write. No lock guard is held across
                 // this await (the skeleton holds none; the ruled law binds the
                 // real enricher too).
-                let batch = annotate_batch(enricher, seq, hits, observed, weight, budget).await;
+                let batch =
+                    annotate_batch(enricher, seq, hits, observed, weight, tier, budget).await;
                 super::write_frame(writer, &AnnotationFrame::Batch { batch }).await?;
                 emitted += 1;
             }
@@ -299,6 +311,7 @@ mod tests {
             hits: Vec<WireHit>,
             _observed: Vec<(std::path::PathBuf, i64)>,
             _weight: Option<EnrichmentWeight>,
+            _tier: WalkTier,
         ) -> Result<Vec<AnnotatedHit>> {
             tokio::time::sleep(Duration::from_hours(1)).await;
             Ok(hits.into_iter().map(AnnotatedHit::passthrough).collect())
@@ -313,6 +326,7 @@ mod tests {
             _hits: Vec<WireHit>,
             _observed: Vec<(std::path::PathBuf, i64)>,
             _weight: Option<EnrichmentWeight>,
+            _tier: WalkTier,
         ) -> Result<Vec<AnnotatedHit>> {
             Err(anyhow::anyhow!("enrichment unavailable"))
         }
@@ -326,6 +340,7 @@ mod tests {
             hits(3),
             Vec::new(),
             None,
+            WalkTier::Dig,
             Duration::from_secs(5),
         )
         .await;
@@ -353,6 +368,7 @@ mod tests {
             hits(4),
             Vec::new(),
             None,
+            WalkTier::Dig,
             Duration::from_millis(20),
         )
         .await;
@@ -373,6 +389,7 @@ mod tests {
             hits(2),
             Vec::new(),
             None,
+            WalkTier::Dig,
             Duration::from_secs(5),
         )
         .await;

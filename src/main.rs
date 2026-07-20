@@ -2679,6 +2679,20 @@ async fn run_grep(
             }
         })
         .collect();
+    // The anchor-decided enrichment tier (brackets 04), resolved BEFORE any
+    // walk I/O: the declared anchors are the canonical cwd for a pathless
+    // grep, the path arguments (pre-expansion — the command's declaration,
+    // never the hits) otherwise. Anchored inside a root — a repository-marker
+    // root, or a root the daemon already serves (the tracked-set leg, fetched
+    // only when the marker probe finds nothing) → dig (project-grade, today's
+    // behavior); anchored above every root → sweep (file-grade only, through
+    // the rootless singletons).
+    let tier = resolve_tier(if paths.is_empty() {
+        std::slice::from_ref(&canonical_cwd)
+    } else {
+        &abs_forward
+    })
+    .await;
     let search_roots: Vec<PathBuf> = if paths.is_empty() {
         vec![canonical_cwd.clone()]
     } else {
@@ -2813,11 +2827,19 @@ async fn run_grep(
         let reap_scopes = paths.is_empty().then(|| vec![canonical_cwd.clone()]);
         let report = match connection {
             Some((daemon_reader, daemon_writer)) => {
+                // The tier disclosure (brackets 04): a daemon-served sweep is
+                // named on stderr, once, before any result byte — the reader
+                // can tell project-grade from file-grade from raw. Daemon-less
+                // runs are all-raw and already carry the no-daemon marker.
+                if tier.is_sweep() {
+                    emit_sweep_marker();
+                }
                 daemon_stream(
                     &pattern,
                     &search_roots,
                     &options,
                     reap_scopes,
+                    tier,
                     lint_annotator,
                     daemon_reader,
                     daemon_writer,
@@ -3175,6 +3197,36 @@ fn emit_no_daemon_marker() {
     eprintln!("[no daemon \u{2014} results unenriched; start one with catenary start]");
 }
 
+/// Resolves the walk's anchor-decided enrichment tier (brackets 04), both
+/// legs: the CLI-local repository-marker probe first, then — only when it
+/// found nothing — the daemon's tracked-root set (a pin, an env-seeded
+/// session root, or a worktree/ephemeral mount needs no marker). The common
+/// in-repo query pays no daemon round-trip; a daemon-less run resolves from
+/// the marker probe alone (its verdict is moot — nothing enriches anyway).
+#[cfg(unix)]
+async fn resolve_tier(anchors: &[PathBuf]) -> catenary_cli::hitstream::WalkTier {
+    let tier = catenary_cli::bridge::resolve_walk_tier(anchors, &[]);
+    if tier.is_dig() {
+        return tier;
+    }
+    let tracked = catenary_cli::cli::commands::fetch_tracked_roots().await;
+    catenary_cli::bridge::resolve_walk_tier(anchors, &tracked)
+}
+
+/// The sweep-tier disclosure (brackets 04).
+///
+/// A walk whose anchor lies above every project root is a sweep by its own
+/// declaration: enrichment is file-grade only (syntax-level outlines/anchors
+/// from the rootless single-file singletons), never project-grade. Where a
+/// covering singleton exists the hit annotations render normally; where none
+/// does the per-result degrade markers (`#?`, `no outline`) apply as always.
+/// Follows [`emit_no_daemon_marker`]'s contract — stderr only (stdout stays
+/// byte-identical), once per invocation, never a `tracing` event.
+#[cfg(unix)]
+fn emit_sweep_marker() {
+    eprintln!("[sweep \u{2014} anchored above any project root; enrichment is file-grade]");
+}
+
 /// The daemon-less config-quarantine advisory (bug 110).
 ///
 /// `catenary grep`/`glob` never consume the `[commands]` section, so a config
@@ -3295,6 +3347,13 @@ async fn run_glob(
     };
     let abs_pattern = canonicalize_pattern_base(&abs_pattern);
 
+    // The anchor-decided enrichment tier (brackets 04), resolved BEFORE any
+    // walk I/O: glob's declared anchor is the single positional pattern — its
+    // metachar-free base decides. Inside a root (repository-marker or
+    // daemon-tracked) → dig (project-grade, today's behavior); above every
+    // root → sweep (file-grade only, through the rootless singletons).
+    let tier = resolve_tier(std::slice::from_ref(&abs_pattern)).await;
+
     // The listing renders CLI-side, so the CLI needs the daemon's file
     // classification (custom binary/text mappings) — the same config either
     // mode of the retired pipeline read.
@@ -3364,12 +3423,19 @@ async fn run_glob(
 
     let enrichment = match connection {
         Some((reader, writer)) if !plan.enrich_files.is_empty() => {
+            // The tier disclosure (brackets 04): a daemon-served sweep is
+            // named on stderr, once — the reader can tell project-grade from
+            // file-grade from raw.
+            if tier.is_sweep() {
+                emit_sweep_marker();
+            }
             let (hits, degraded) = annotate_paths(
                 reader,
                 writer,
                 &plan.enrich_files,
                 plan.observations.clone(),
                 weight,
+                tier,
             )
             .await;
             if degraded {

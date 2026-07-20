@@ -52,6 +52,59 @@ pub enum EnrichmentWeight {
     Outline,
 }
 
+/// The walk's enrichment tier (brackets 04): declared by the command, decided
+/// by the walk's **anchor** — never guessed from the pattern or the hits.
+///
+/// Computed **CLI-side** at planning time, before any walk I/O
+/// ([`crate::bridge::resolve_walk_tier`]): the walk's anchor directory (the cwd
+/// of a pathless grep, a path argument's metachar-free base, glob's pattern
+/// base) is resolved to its enclosing root — a repository-marker root, or a
+/// root the daemon already serves. Anchored **inside** a root
+/// → [`WalkTier::Dig`]: project-grade enrichment from that root's instances,
+/// exactly the pre-tier behavior (nested roots under the anchor ride along).
+/// Anchored **above** every root → [`WalkTier::Sweep`], by its own
+/// declaration: file-grade enrichment only, served through the rootless
+/// single-file singletons — no project loads, no mounts, no per-hit-root
+/// spawns. One decision per walk; there are no mid-stream flips, and a sweep
+/// whose hits all land in one root still gets file-grade (conscious
+/// conservatism — the query asked for a sweep).
+///
+/// Version skew degrades to the pre-tier behavior in both directions: an old
+/// CLI sends no tier and parses as `Dig` (today's wire, byte-identical), and
+/// an old daemon ignores the field and serves the dig path (project-grade — an
+/// over-enrichment, never fewer results).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WalkTier {
+    /// Anchored inside a project root: project-grade enrichment from the
+    /// root's instances — the pre-tier behavior, and the wire default.
+    #[default]
+    Dig,
+    /// Anchored above every project root: file-grade enrichment only, through
+    /// the rootless single-file singletons.
+    Sweep,
+}
+
+impl WalkTier {
+    /// Whether this is the dig tier (the wire default — used as the
+    /// `skip_serializing_if` predicate so a dig batch serializes byte-identically
+    /// to the pre-tier wire).
+    #[must_use]
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde skip_serializing_if requires a &T predicate"
+    )]
+    pub const fn is_dig(&self) -> bool {
+        matches!(self, Self::Dig)
+    }
+
+    /// Whether this is the sweep tier (file-grade enrichment only).
+    #[must_use]
+    pub const fn is_sweep(self) -> bool {
+        matches!(self, Self::Sweep)
+    }
+}
+
 /// One frame of the CLI → daemon hit stream.
 ///
 /// The CLI emits an ordered sequence of [`HitFrame::Batch`] frames — each a
@@ -88,6 +141,14 @@ pub enum HitFrame {
         /// outline-less), which degrades gracefully.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         weight: Option<EnrichmentWeight>,
+        /// The walk's anchor-decided enrichment tier (brackets 04). `Dig` — the
+        /// default, and what an old CLI's field-less batch parses as —
+        /// serializes byte-identically to the pre-tier wire; `Sweep` selects
+        /// file-grade enrichment through the rootless singletons. Unknown-field
+        /// tolerance carries the skew: an old daemon ignores it and serves the
+        /// dig path (over-enrichment, never fewer results).
+        #[serde(default, skip_serializing_if = "WalkTier::is_dig")]
+        tier: WalkTier,
     },
     /// The terminator: no more batches follow. Carries the total batch count so
     /// the daemon and the CLI agree on how many annotation-batches to expect,
@@ -122,8 +183,8 @@ pub enum HitFrame {
 }
 
 impl HitFrame {
-    /// A plain batch with no observations and no weight — the shape an old
-    /// CLI sends (and the protocol tests' spelling).
+    /// A plain batch with no observations, no weight, and the dig tier — the
+    /// shape an old CLI sends (and the protocol tests' spelling).
     #[must_use]
     pub const fn batch(seq: u64, hits: Vec<WireHit>) -> Self {
         Self::Batch {
@@ -131,6 +192,7 @@ impl HitFrame {
             hits,
             observed: Vec::new(),
             weight: None,
+            tier: WalkTier::Dig,
         }
     }
 
@@ -371,9 +433,9 @@ mod tests {
             "batch carries the frame tag: {line}"
         );
         assert!(
-            !line.contains("observed") && !line.contains("weight"),
-            "an observation-less, weight-less batch serializes exactly as before \
-             (old-daemon compatibility): {line}"
+            !line.contains("observed") && !line.contains("weight") && !line.contains("tier"),
+            "an observation-less, weight-less, dig-tier batch serializes exactly \
+             as before (old-daemon compatibility): {line}"
         );
         let back: HitFrame = serde_json::from_str(&line).expect("parse batch");
         assert_eq!(back, frame, "hit batch roundtrips");
@@ -388,6 +450,7 @@ mod tests {
             hits: vec![sample_hit()],
             observed: Vec::new(),
             weight: Some(EnrichmentWeight::Listing),
+            tier: WalkTier::Dig,
         };
         let line = serde_json::to_string(&frame).expect("serialize batch");
         assert!(
@@ -402,6 +465,7 @@ mod tests {
             hits: Vec::new(),
             observed: Vec::new(),
             weight: Some(EnrichmentWeight::Outline),
+            tier: WalkTier::Dig,
         };
         let line = serde_json::to_string(&full).expect("serialize batch");
         assert!(
@@ -421,12 +485,50 @@ mod tests {
     }
 
     #[test]
+    fn hit_frame_batch_tier_roundtrips_and_defaults_dig() {
+        // The brackets-04 tier lever on the wire: a sweep batch names its tier;
+        // a tier-less (dig / old-CLI) batch parses as `Dig`.
+        let frame = HitFrame::Batch {
+            seq: 0,
+            hits: vec![sample_hit()],
+            observed: Vec::new(),
+            weight: None,
+            tier: WalkTier::Sweep,
+        };
+        let line = serde_json::to_string(&frame).expect("serialize batch");
+        assert!(
+            line.contains("\"tier\":\"sweep\""),
+            "the sweep declaration rides the batch frame: {line}"
+        );
+        let back: HitFrame = serde_json::from_str(&line).expect("parse batch");
+        assert_eq!(back, frame, "sweep batch roundtrips");
+
+        // A field-less batch (old CLI, or an in-root dig) reads as Dig — the
+        // pre-tier behavior, byte-identical.
+        let legacy: HitFrame = serde_json::from_str(
+            r#"{"frame":"batch","seq":1,"hits":[{"path":"/w/src/a.rs","line":3,"column":1,"text":"fn f() {"}]}"#,
+        )
+        .expect("parse legacy batch");
+        assert!(
+            matches!(
+                legacy,
+                HitFrame::Batch {
+                    tier: WalkTier::Dig,
+                    ..
+                }
+            ),
+            "absent tier reads as Dig (project-grade, today's behavior)"
+        );
+    }
+
+    #[test]
     fn hit_frame_batch_carries_observations() {
         let frame = HitFrame::Batch {
             seq: 1,
             hits: vec![sample_hit()],
             observed: vec![(PathBuf::from("/w/src/a.rs"), 7)],
             weight: None,
+            tier: WalkTier::Dig,
         };
         let line = serde_json::to_string(&frame).expect("serialize batch");
         let back: HitFrame = serde_json::from_str(&line).expect("parse batch");

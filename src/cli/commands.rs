@@ -83,6 +83,59 @@ pub async fn run_ls_roots(out: &mut Output) -> Result<()> {
     Ok(())
 }
 
+/// Fetches the daemon's tracked workspace roots (`tool/roots-ls`) for the
+/// anchor-decided walk tier (brackets 04).
+///
+/// The planning leg behind `catenary grep`/`glob`'s tier resolution: a
+/// markerless anchor may still lie inside a **served** root (a pin, an
+/// env-seeded session root, a worktree/ephemeral mount), which the CLI-local
+/// repository-marker probe cannot see — only the daemon's tracked set can.
+/// Called only when the marker probe found nothing, so the common in-repo
+/// query pays no extra round-trip.
+///
+/// Best-effort and bounded: daemon absent, a wedged daemon (the 2-second
+/// ceiling), or a malformed response all yield an empty list — the tier then
+/// resolves from the marker probe alone, and a daemon-less run never enriches
+/// anyway.
+pub async fn fetch_tracked_roots() -> Vec<std::path::PathBuf> {
+    tokio::time::timeout(Duration::from_secs(2), fetch_tracked_roots_inner())
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// The fallible leg of [`fetch_tracked_roots`]: one `tool/roots-ls` round-trip.
+async fn fetch_tracked_roots_inner() -> Option<Vec<std::path::PathBuf>> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let ipc_path = crate::router::socket_path();
+    let stream = tokio::net::UnixStream::connect(&ipc_path).await.ok()?;
+    let (reader, mut writer) = stream.into_split();
+    let mut payload =
+        serde_json::to_string(&serde_json::json!({"method": "tool/roots-ls"})).ok()?;
+    payload.push('\n');
+    writer.write_all(payload.as_bytes()).await.ok()?;
+
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+    buf_reader.read_line(&mut line).await.ok()?;
+    let response: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    Some(
+        response
+            .get("roots")?
+            .as_array()?
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(std::path::PathBuf::from)
+            })
+            .collect(),
+    )
+}
+
 /// Resolve a `pin`/`unpin` path to the form matched against the daemon's
 /// tracked set.
 ///

@@ -1297,6 +1297,43 @@ impl LspClientManager {
         })
     }
 
+    /// Names the candidate single-file server bindings for `lang` and `path`
+    /// — the sweep tier's config-level projection (brackets 04).
+    ///
+    /// Mirrors the tier-3 filters of `get_servers` (single-file servers
+    /// resolve their binding globally — there is no project layer to
+    /// consult): the language's configured bindings, minus method-disabled
+    /// ones for `method`, minus bindings with no user-scope server def, minus
+    /// file-pattern mismatches. Purely config-level by design: the rootless
+    /// spawn gate (manifest capability / config opt-in / negative cache) is
+    /// applied fail-closed inside
+    /// [`Self::with_single_file_bracket`], which answers `None` for an
+    /// unqualified name — so a caller iterates these names and the bracket
+    /// seam decides capability.
+    #[must_use]
+    pub fn single_file_binding_names(
+        &self,
+        lang: &str,
+        path: &Path,
+        method: Option<DispatchMethod>,
+    ) -> Vec<String> {
+        let Some(lang_config) = self.config.resolve_language(lang) else {
+            return Vec::new();
+        };
+        lang_config
+            .servers()
+            .iter()
+            .filter(|binding| !method.is_some_and(|m| binding.is_method_disabled(m)))
+            .filter(|binding| {
+                self.config
+                    .server
+                    .get(&binding.name)
+                    .is_some_and(|def| file_matches_patterns(path, &def.compiled_patterns))
+            })
+            .map(|binding| binding.name.clone())
+            .collect()
+    }
+
     /// Returns whether any **blessed** server is configured for this language in
     /// `root` — the diagnostics coverage gate (diagnostics-debt 04b).
     ///

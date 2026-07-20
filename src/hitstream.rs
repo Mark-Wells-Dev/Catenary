@@ -74,6 +74,7 @@ pub use annotator::{BatchEnricher, PassThroughEnricher, annotate_connection, ser
 pub use engine::{Hit, HitBatch, WalkOptions, WalkSummary, walk};
 pub use frame::{
     AnnotatedBatch, AnnotatedHit, AnnotationFrame, AnnotationVerdict, EnrichmentWeight, HitFrame,
+    WalkTier,
 };
 pub use lint::{LintAnnotator, LintedBatch};
 pub use sink::{

@@ -55,7 +55,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 
-use super::frame::{AnnotatedBatch, AnnotatedHit, AnnotationFrame, EnrichmentWeight, HitFrame};
+use super::frame::{
+    AnnotatedBatch, AnnotatedHit, AnnotationFrame, EnrichmentWeight, HitFrame, WalkTier,
+};
 use super::lint::{LintAnnotator, LintedBatch};
 use super::{HIT_BATCH_SIZE, HitBatch, IN_FLIGHT_WINDOW, STREAM_READ_DEADLINE, WireHit};
 
@@ -281,7 +283,9 @@ pub struct DaemonStreamReport {
 /// duplicated and nothing dropped. `reap_scopes` rides the [`HitFrame::End`]
 /// terminator with the walk's observation set (ws43-02 reap parity); a
 /// zero-match walk ships neither (executor parity — a query with no matches
-/// never nudged).
+/// never nudged). `tier` is the walk's anchor-decided enrichment tier
+/// (brackets 04), computed at planning time and stamped on every batch — a
+/// dig batch serializes byte-identically to the pre-tier wire.
 ///
 /// # Errors
 ///
@@ -304,6 +308,7 @@ pub async fn daemon_stream<R, Wr, Wo>(
     roots: &[std::path::PathBuf],
     options: &super::engine::WalkOptions,
     reap_scopes: Option<Vec<PathBuf>>,
+    tier: WalkTier,
     lint: Option<LintAnnotator>,
     reader: R,
     writer: Wr,
@@ -386,6 +391,11 @@ where
                 // Grep batches are weight-less: anchor enrichment, the
                 // pre-ws43-03 wire, byte-identical.
                 weight: None,
+                // The walk's anchor-decided tier (brackets 04), declared once
+                // at planning time and stamped on every batch — no mid-stream
+                // flips. A dig batch serializes byte-identically to the
+                // pre-tier wire.
+                tier,
             };
             // Retention next: the emitter owns this copy (hits, route mask,
             // and resolved lint annotations) from here on.
@@ -722,11 +732,12 @@ pub async fn lint_stream<Wo: std::io::Write>(
 /// laid out before enrichment (its render interleaves headers and outlines, so
 /// there is no line-at-a-time emission to pipeline into), so this just chunks
 /// the file set into [`HIT_BATCH_SIZE`] batches — each hit a `line 0` marker
-/// for one file — stamps every batch with the CLI-computed `weight`, ships the
-/// scoped-nudge `observations` on the first batch (so the daemon's changed-set
-/// nudge lands before any outline is derived), and terminates with a
-/// reap-scope-less `End` (a scoped walk never proves absence, so glob never
-/// reaps).
+/// for one file — stamps every batch with the CLI-computed `weight` and the
+/// anchor-decided `tier` (brackets 04), ships the scoped-nudge `observations`
+/// on the first batch (so the daemon's changed-set nudge lands before any
+/// outline is derived; a sweep's daemon side skips the nudge), and terminates
+/// with a reap-scope-less `End` (a scoped walk never proves absence, so glob
+/// never reaps).
 ///
 /// The writer runs as its own task so a large listing cannot deadlock against
 /// the daemon's replies; the reader (this task) collects annotation batches
@@ -745,6 +756,7 @@ pub async fn annotate_paths<R, Wr>(
     files: &[PathBuf],
     observations: Vec<(PathBuf, i64)>,
     weight: EnrichmentWeight,
+    tier: WalkTier,
 ) -> (Vec<AnnotatedHit>, bool)
 where
     R: tokio::io::AsyncBufRead + Unpin + Send + 'static,
@@ -783,6 +795,9 @@ where
             hits,
             observed: observations.take().unwrap_or_default(),
             weight: Some(weight),
+            // The walk's anchor-decided tier (brackets 04): the pattern base's
+            // declaration, stamped on every batch.
+            tier,
         })
         .chain(std::iter::once(HitFrame::End {
             batches: total,
@@ -996,6 +1011,7 @@ mod tests {
             &files,
             vec![(PathBuf::from("/w/f0.rs"), 7)],
             crate::hitstream::EnrichmentWeight::Listing,
+            WalkTier::Dig,
         )
         .await;
 
@@ -1026,6 +1042,7 @@ mod tests {
             &files,
             Vec::new(),
             crate::hitstream::EnrichmentWeight::Listing,
+            WalkTier::Dig,
         )
         .await;
 
@@ -1058,6 +1075,7 @@ mod tests {
             &files,
             Vec::new(),
             crate::hitstream::EnrichmentWeight::Outline,
+            WalkTier::Dig,
         )
         .await;
 

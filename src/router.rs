@@ -2749,17 +2749,27 @@ impl crate::hitstream::BatchEnricher for HitstreamAnnotator<'_> {
         hits: Vec<crate::hitstream::WireHit>,
         observed: Vec<(PathBuf, i64)>,
         weight: Option<crate::hitstream::EnrichmentWeight>,
+        tier: crate::hitstream::WalkTier,
     ) -> Result<Vec<crate::hitstream::frame::AnnotatedHit>> {
-        // The batch's distinct files are the touched paths — dedup keeps the
-        // mount pass linear in files, not hits.
-        let touched: Vec<PathBuf> = hits
-            .iter()
-            .map(|h| h.path.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        ensure_ephemeral_mounts(self.ctx, &touched, MountIntent::Ambient, Instant::now(), "").await;
-        self.inner.enrich(hits, observed, weight).await
+        // The query auto-mount serves the DIG tier only (brackets 04): a sweep
+        // batch, by its anchor's own declaration, mounts nothing — no root
+        // registration, no server spawn, no tracker entry — and is enriched
+        // file-grade through the rootless singletons instead. This is the
+        // fan-out kill: a sweep across many projects no longer converts each
+        // hit root into an ephemeral mount + heavyweight spawn.
+        if tier.is_dig() {
+            // The batch's distinct files are the touched paths — dedup keeps
+            // the mount pass linear in files, not hits.
+            let touched: Vec<PathBuf> = hits
+                .iter()
+                .map(|h| h.path.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            ensure_ephemeral_mounts(self.ctx, &touched, MountIntent::Ambient, Instant::now(), "")
+                .await;
+        }
+        self.inner.enrich(hits, observed, weight, tier).await
     }
 }
 

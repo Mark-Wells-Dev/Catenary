@@ -310,13 +310,6 @@ impl SymbolIndex {
         file_path: &Path,
         symbols: &serde_json::Value,
     ) -> Result<()> {
-        let mut flat: Vec<Symbol> = Vec::new();
-        if let Some(arr) = symbols.as_array() {
-            for sym in arr {
-                flatten_document_symbol(sym, None, None, &mut flat);
-            }
-        }
-
         // Stat and hash before storing. Both describe the version the server saw
         // (the caller opened the document from disk before requesting
         // `documentSymbol`), so a write landing after this point either advances
@@ -329,18 +322,10 @@ impl SymbolIndex {
             .ok()
             .map(|bytes| hash_bytes(&bytes));
 
-        // One symbol per start line, kept ascending — the old store keyed rows
-        // on `(file_path, line)` with `INSERT OR IGNORE`, so the first symbol
-        // seen at a line won and rows read back ordered by line.
-        let mut by_line: BTreeMap<u32, Symbol> = BTreeMap::new();
-        for sym in flat {
-            by_line.entry(sym.line).or_insert(sym);
-        }
-
         self.files.borrow_mut().insert(
             file_path.to_path_buf(),
             FileEntry {
-                symbols: by_line.into_values().collect(),
+                symbols: flatten_symbols(symbols),
                 mtime: recorded_mtime,
                 hash: recorded_hash,
             },
@@ -635,6 +620,31 @@ fn scope_matches(scope: &ScopeFilter<'_>, sym: &Symbol) -> bool {
         ScopeFilter::AnyDepth => true,
         ScopeFilter::WithinSpan(lo, hi) => sym.line >= *lo && sym.line <= *hi,
     }
+}
+
+/// Flattens a `documentSymbol` LSP response (the JSON array) into per-file
+/// [`Symbol`] entries: the recursive `DocumentSymbol` hierarchy walked with
+/// parent scopes recorded, then deduplicated to one symbol per start line,
+/// kept ascending — exactly the shape
+/// [`SymbolIndex::populate_from_document_symbols`] stores (which delegates
+/// here). `pub(crate)` so the file-grade sweep tier (brackets 04) parses a
+/// rootless singleton's response through the same flatten the index uses —
+/// the two tiers' symbol semantics cannot drift.
+pub(crate) fn flatten_symbols(symbols: &serde_json::Value) -> Vec<Symbol> {
+    let mut flat: Vec<Symbol> = Vec::new();
+    if let Some(arr) = symbols.as_array() {
+        for sym in arr {
+            flatten_document_symbol(sym, None, None, &mut flat);
+        }
+    }
+    // One symbol per start line, kept ascending — the old store keyed rows
+    // on `(file_path, line)` with `INSERT OR IGNORE`, so the first symbol
+    // seen at a line won and rows read back ordered by line.
+    let mut by_line: BTreeMap<u32, Symbol> = BTreeMap::new();
+    for sym in flat {
+        by_line.entry(sym.line).or_insert(sym);
+    }
+    by_line.into_values().collect()
 }
 
 /// Recursively flattens a `DocumentSymbol` JSON node into [`Symbol`] entries.

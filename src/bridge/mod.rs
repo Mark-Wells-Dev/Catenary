@@ -42,7 +42,7 @@ pub use editing_guardrail::EditingGuardrail;
 pub use editing_manager::EditingManager;
 pub use file_tools::{
     FileEnrichment, GlobPlan, build_glob_plan, canonicalize_pattern_base, count_glob_paths,
-    render_glob_plan,
+    render_glob_plan, resolve_walk_tier,
 };
 pub use grep_server::{GrepFlags, GrepSkips, SkipRecord, StreamOutcome, grep_stream};
 pub use handler::expand_tilde;

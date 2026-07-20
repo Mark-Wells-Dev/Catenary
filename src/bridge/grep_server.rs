@@ -278,6 +278,26 @@ pub(super) struct AnchorContext {
 }
 
 impl AnchorContext {
+    /// Builds the context from file-grade parts — the sweep tier's
+    /// construction (brackets 04).
+    ///
+    /// The sweep path derives `file_symbols` per file from a rootless
+    /// single-file singleton's `documentSymbol` answer (never a root
+    /// instance), and `uncovered` is decided capability-shaped: a file whose
+    /// language has no capable singleton, or whose bracket degraded, renders
+    /// raw (`#?` / `no outline`). The consuming projections
+    /// ([`Self::anchor_for`], [`Self::symbols_for`]) are shared with the dig
+    /// tier, so the two tiers' hit shapes cannot drift.
+    pub(super) const fn from_file_grade(
+        file_symbols: HashMap<PathBuf, Vec<Symbol>>,
+        uncovered: HashSet<PathBuf>,
+    ) -> Self {
+        Self {
+            file_symbols,
+            uncovered,
+        }
+    }
+
     /// Whether `file` could not be enriched at all (no `documentSymbol`
     /// coverage — the `#?` / `no outline` degrade state).
     pub(super) fn is_uncovered(&self, file: &Path) -> bool {
