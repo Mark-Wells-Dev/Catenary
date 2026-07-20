@@ -88,12 +88,17 @@ const TEMPLATE: &str = r#"#:schema https://twowells.github.io/catenary/schemas/c
 # # (`sed -i`, `perl -i -pe`) are script-checked and resolved into the
 # # diagnostics batch, and an unparseable/executing script (`sed -i 'w …'`,
 # # `perl -e system(…)`) is surgically denied by the resolver.
+# # `lattice` is the Lattice markdown tool: `lattice mv` is the link-aware
+# # move — it relocates a markdown file and rewrites inbound links and
+# # backlink frontmatter in one step, where bare `mv` leaves them broken.
+# # Known residual (same class as tar extraction): the rewritten referrer
+# # files aren't argv-visible, so they don't arm the diagnostics gate.
 # allow = ["git", "gh", "cp", "rm", "mkdir", "mv", "touch",
 #          "chmod", "sleep", "cd", "true", "false", "which",
 #          "cat", "head", "tail", "less", "more", "diff",
 #          "echo", "printf", "seq", "sed", "perl", "sqlite3",
 #          "sha256sum", "sha1sum", "md5sum", "b2sum", "cksum",
-#          "tar"]
+#          "tar", "lattice"]
 # pipeline = ["grep", "wc", "jq", "sort", "tr", "cut", "uniq"]
 #
 # [commands.deny]
@@ -743,6 +748,19 @@ mod tests {
                 "recommended allow should contain the digest tool {cmd}",
             );
         }
+    }
+
+    #[test]
+    fn template_allows_lattice() {
+        // `lattice mv` is the link-aware markdown move (rewrites inbound
+        // links and backlink frontmatter); bare `mv` leaves them broken.
+        let allow = test_recommended::config()
+            .allow
+            .expect("recommended config has an allow list");
+        assert!(
+            allow.iter().any(|c| c == "lattice"),
+            "recommended allow should contain lattice",
+        );
     }
 
     #[test]
