@@ -530,6 +530,30 @@ pub fn kill_process(pid: u32) {
 #[cfg(not(any(unix, windows)))]
 pub const fn kill_process(_pid: u32) {}
 
+/// Send `SIGTERM` to a process by PID.
+///
+/// Best-effort: returns silently if the process doesn't exist or the
+/// signal cannot be delivered (e.g., permission denied). The polite rung
+/// before [`kill_process`]'s SIGKILL — gives a straggling child a chance
+/// to run its own signal handlers before the unrefusable kill.
+#[cfg(unix)]
+pub fn terminate_process(pid: u32) {
+    // SAFETY: `kill` is a POSIX function. Sending SIGTERM to a valid
+    // PID is well-defined; sending to a nonexistent PID returns ESRCH
+    // which we ignore.
+    #[allow(unsafe_code, reason = "libc::kill is the POSIX signal API")]
+    #[allow(clippy::cast_possible_wrap, reason = "PID fits in i32")]
+    unsafe {
+        libc::kill(pid.cast_signed(), libc::SIGTERM);
+    }
+}
+
+/// Send `SIGTERM` to a process by PID.
+///
+/// No-op on non-Unix, non-Windows platforms.
+#[cfg(not(any(unix, windows)))]
+pub const fn terminate_process(_pid: u32) {}
+
 // ─── Linux ──────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]

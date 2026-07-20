@@ -337,6 +337,94 @@ const MAX_SERVER_STRIKES: u8 = 3;
 /// wedged one never goes silent.
 pub(crate) const QUERY_ENRICHMENT_BUDGET: Duration = Duration::from_secs(5);
 
+/// Rung 1 of the daemon-teardown ladder (bug 130): upper bound on one child's
+/// graceful leg — acquiring its client (a wedged in-flight request can hold
+/// that mutex forever — the observed field wedge), sending the LSP
+/// `shutdown`/`exit` sequence, and watching the process die.
+///
+/// Deliberately not generous: teardown blocks `catenary restart`, so the
+/// whole ladder must stay seconds-scale.
+const TEARDOWN_GRACEFUL_GRACE: Duration = Duration::from_secs(5);
+
+/// Rung 2 of the ladder: grace after SIGTERM before escalating to SIGKILL.
+const TEARDOWN_SIGTERM_GRACE: Duration = Duration::from_secs(2);
+
+/// Whole-teardown ceiling regardless of fleet size (bug 130). Per-child
+/// ladders run concurrently, so a healthy teardown never approaches this;
+/// it is the hard stop that guarantees teardown ends even if a ladder
+/// wedges. Stragglers still pending at the ceiling are killed (SIGKILL) by
+/// PID.
+const TEARDOWN_CEILING: Duration = Duration::from_secs(20);
+
+/// Poll cadence for the ladder's is-the-child-dead checks.
+const TEARDOWN_POLL: Duration = Duration::from_millis(25);
+
+/// Injectable timings for the bounded teardown ladder (bug 130).
+///
+/// Production uses [`Self::PRODUCTION`] (5 s graceful / 2 s SIGTERM / 20 s
+/// ceiling); tests shrink them via
+/// `LspClientManager::teardown_timings_override` so ladder paths run in
+/// milliseconds.
+#[derive(Debug, Clone, Copy)]
+struct TeardownTimings {
+    /// Rung 1 bound: client acquisition + graceful `shutdown`/`exit` +
+    /// death wait.
+    graceful_grace: Duration,
+    /// Rung 2 bound: SIGTERM-to-SIGKILL escalation grace.
+    sigterm_grace: Duration,
+    /// Whole-fleet hard stop.
+    ceiling: Duration,
+}
+
+impl TeardownTimings {
+    /// The production ladder: 5 s graceful, 2 s SIGTERM, 20 s ceiling.
+    const PRODUCTION: Self = Self {
+        graceful_grace: TEARDOWN_GRACEFUL_GRACE,
+        sigterm_grace: TEARDOWN_SIGTERM_GRACE,
+        ceiling: TEARDOWN_CEILING,
+    };
+}
+
+/// Straggler ledger for the teardown ceiling (bug 130): every child starts
+/// pending with an unknown PID; its ladder records the PID once harvested and
+/// removes the entry when the child is down (or the ladder has done all it
+/// can). Whatever remains when the ceiling expires is killed — and named —
+/// from [`LspClientManager::shutdown_all`].
+type PendingTeardowns = Arc<std::sync::Mutex<HashMap<InstanceKey, Option<u32>>>>;
+
+/// Names one teardown-ladder straggler action in the firehose (bug 130):
+/// the server identity plus the rung that acted. `warn!` — a misbehaving
+/// server is a health finding, never a desktop interrupt.
+fn warn_straggler(key: &InstanceKey, rung: &str, detail: &str) {
+    warn!(
+        source = Source::LspLifecycle.as_str(),
+        language = key.language_id.as_str(),
+        server = key.server.as_str(),
+        scope_root = key.scope.root_path().map(|p| p.display().to_string()),
+        rung = rung,
+        "LSP teardown: {key} {detail}",
+    );
+}
+
+/// Records a harvested PID on the straggler ledger (no-op once settled).
+fn note_teardown_pid(pending: &PendingTeardowns, key: &InstanceKey, pid: u32) {
+    let mut pending = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = pending.get_mut(key) {
+        *entry = Some(pid);
+    }
+}
+
+/// Settles one child on the straggler ledger: its ladder finished (child
+/// down, or nothing left to signal), so the ceiling rung must skip it.
+fn settle_teardown(pending: &PendingTeardowns, key: &InstanceKey) {
+    pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(key);
+}
+
 /// One instance's standing on the strike ledger (misc 167).
 ///
 /// `+1` per failure observation (a crash while up, a revive spawn failure, a
@@ -485,6 +573,11 @@ pub struct LspClientManager {
     /// `state.json` snapshot writer for live server-board mirroring.
     /// `None` in doctor/test contexts.
     snapshot: Option<Arc<crate::state_snapshot::SnapshotWriter>>,
+    /// Bounded-teardown ladder timings (bug 130). Defaults to
+    /// [`TeardownTimings::PRODUCTION`]; tests shrink them via
+    /// [`Self::teardown_timings_override`] so ladder paths run in
+    /// milliseconds.
+    teardown_timings: TeardownTimings,
 }
 
 impl LspClientManager {
@@ -510,7 +603,29 @@ impl LspClientManager {
             logging,
             fs,
             snapshot: None,
+            teardown_timings: TeardownTimings::PRODUCTION,
         }
+    }
+
+    /// Shrinks the bounded-teardown ladder timings (bug 130, test-only).
+    ///
+    /// Production always tears down with [`TeardownTimings::PRODUCTION`];
+    /// tests inject millisecond-scale graces so the ladder's escalation and
+    /// ceiling paths run fast. No production caller.
+    #[cfg(test)]
+    #[must_use]
+    const fn teardown_timings_override(
+        mut self,
+        graceful_grace: Duration,
+        sigterm_grace: Duration,
+        ceiling: Duration,
+    ) -> Self {
+        self.teardown_timings = TeardownTimings {
+            graceful_grace,
+            sigterm_grace,
+            ceiling,
+        };
+        self
     }
 
     /// Sets the `state.json` snapshot writer for live server-board mirroring.
@@ -3728,36 +3843,250 @@ impl LspClientManager {
         }
     }
 
-    /// Shuts down all active clients.
+    /// Shuts down all active clients through the bounded teardown ladder
+    /// (bug 130) — teardown always ends.
     ///
-    /// Each server gets 5 seconds to respond to the graceful
-    /// `shutdown`/`exit` sequence. Servers that don't respond in time
-    /// are dropped, which triggers the `Connection` drop handler to SIGKILL them.
+    /// Per child, concurrently: the graceful LSP `shutdown`/`exit` sequence
+    /// gets [`TEARDOWN_GRACEFUL_GRACE`]; a child still alive past it gets
+    /// SIGTERM and [`TEARDOWN_SIGTERM_GRACE`]; a child still alive past that
+    /// gets SIGKILL. The whole fleet is additionally bounded by
+    /// [`TEARDOWN_CEILING`] regardless of size — stragglers still pending at
+    /// the ceiling are killed (SIGKILL) by PID. Every straggler action is named in
+    /// the firehose (`warn!` with the server identity and the rung that
+    /// acted); a clean graceful exit is `debug!` chatter.
     pub async fn shutdown_all(&self) {
-        let mut clients = self.clients.lock().await;
-        for (key, client_mutex) in clients.drain() {
-            let mut client = client_mutex.lock().await;
-            if client.is_alive() {
-                let result = tokio::time::timeout(Duration::from_secs(5), client.shutdown()).await;
-                drop(client);
-                match result {
-                    Ok(Err(e)) => {
-                        info!("Failed to shutdown LSP server instance {}: {}", key, e);
-                    }
-                    Err(_) => {
-                        info!(
-                            "LSP server instance {} did not respond to shutdown within 5s, killing",
-                            key
-                        );
-                    }
-                    Ok(Ok(())) => {}
+        let timings = self.teardown_timings;
+        let started = std::time::Instant::now();
+
+        // Detach the fleet from the registry. The registry lock is
+        // short-held everywhere, but a wedged holder must not pin teardown —
+        // bound the acquisition by the ceiling and abandon gracefulness past
+        // it (the children die with the process: `Connection::drop` SIGKILLs
+        // by PID at runtime teardown).
+        let Ok(mut clients) = tokio::time::timeout(timings.ceiling, self.clients.lock()).await
+        else {
+            warn!(
+                source = Source::LspLifecycle.as_str(),
+                "LSP teardown: client registry lock not acquired within {:?}; \
+                 abandoning graceful shutdown (children are SIGKILLed by \
+                 connection drop at process exit)",
+                timings.ceiling,
+            );
+            self.clear_all_strikes();
+            return;
+        };
+        let fleet: Vec<(InstanceKey, Arc<Mutex<LspClient>>)> = clients.drain().collect();
+        drop(clients);
+
+        let pending: PendingTeardowns = Arc::new(std::sync::Mutex::new(
+            fleet.iter().map(|(k, _)| (k.clone(), None)).collect(),
+        ));
+
+        let mut ladders = tokio::task::JoinSet::new();
+        for (key, client_mutex) in fleet {
+            ladders.spawn(Self::child_teardown_ladder(
+                key,
+                client_mutex,
+                timings,
+                Arc::clone(&pending),
+            ));
+        }
+
+        // The whole-teardown ceiling: normally the concurrent ladders finish
+        // well inside it (max per-child ≈ graceful + SIGTERM graces). Past it,
+        // stop waiting, kill what the ladders left behind, and name each one.
+        // One budget covers the registry wait above and this drain together.
+        let remaining = timings.ceiling.saturating_sub(started.elapsed());
+        let drained = tokio::time::timeout(remaining, async {
+            while ladders.join_next().await.is_some() {}
+        })
+        .await;
+
+        if drained.is_err() {
+            ladders.abort_all();
+            let stragglers: Vec<(InstanceKey, Option<u32>)> = {
+                let mut pending = pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                pending.drain().collect()
+            };
+            for (key, pid) in stragglers {
+                if let Some(pid) = pid {
+                    catenary_proc::kill_process(pid);
+                    warn_straggler(
+                        &key,
+                        "ceiling",
+                        &format!(
+                            "outlived the whole-teardown ceiling ({:?}); sent SIGKILL",
+                            timings.ceiling
+                        ),
+                    );
+                } else {
+                    warn_straggler(
+                        &key,
+                        "ceiling",
+                        &format!(
+                            "outlived the whole-teardown ceiling ({:?}) with no \
+                             harvestable PID (client wedged); it dies with the process",
+                            timings.ceiling
+                        ),
+                    );
                 }
             }
         }
-        drop(clients);
+
         // Daemon shutdown resets the ledger (misc 167): a restart is the
         // ticket's "restart resets S to 0".
         self.clear_all_strikes();
+    }
+
+    /// One child's teardown ladder (bug 130).
+    ///
+    /// Rung 1 bounds the whole graceful leg — client acquisition, the LSP
+    /// `shutdown`/`exit` sequence, and the wait for process death — under
+    /// `graceful_grace`. A child still alive past it gets SIGTERM and
+    /// `sigterm_grace` (rung 2), then SIGKILL (rung 3). The child's PID is
+    /// recorded on `pending` once harvested and its entry removed when the
+    /// ladder finishes, so the ceiling rung in [`Self::shutdown_all`] only
+    /// sees genuine stragglers.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "sequential ladder rungs; extraction would harm readability"
+    )]
+    async fn child_teardown_ladder(
+        key: InstanceKey,
+        client_mutex: Arc<Mutex<LspClient>>,
+        timings: TeardownTimings,
+        pending: PendingTeardowns,
+    ) {
+        // The server handle is exported through a slot so the later rungs can
+        // reach the PID even when the graceful future is dropped at its
+        // deadline mid-`shutdown`.
+        let server_slot: Arc<std::sync::Mutex<Option<Arc<LspServer>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        // Rung 1 — graceful. One grace bounds the lock acquisition too: a
+        // wedged in-flight request can hold the client mutex forever (the
+        // observed field wedge), and teardown must not inherit that wait.
+        let graceful = tokio::time::timeout(timings.graceful_grace, {
+            let slot = Arc::clone(&server_slot);
+            let pending = Arc::clone(&pending);
+            let key = key.clone();
+            let client_mutex = Arc::clone(&client_mutex);
+            async move {
+                let mut client = client_mutex.lock().await;
+                let server = Arc::clone(client.server());
+                *slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&server));
+                if let Some(pid) = server.pid() {
+                    note_teardown_pid(&pending, &key, pid);
+                }
+                if !server.is_alive() {
+                    return;
+                }
+                if let Err(e) = client.shutdown().await {
+                    // The failure may be the server dying mid-handshake —
+                    // which is success here; the death wait below decides.
+                    debug!(
+                        source = Source::LspLifecycle.as_str(),
+                        server = key.server.as_str(),
+                        "LSP teardown: graceful shutdown of {key} failed: {e}",
+                    );
+                }
+                drop(client);
+                while server.is_alive() {
+                    tokio::time::sleep(TEARDOWN_POLL).await;
+                }
+            }
+        })
+        .await;
+
+        if graceful.is_ok() {
+            debug!(
+                source = Source::LspLifecycle.as_str(),
+                server = key.server.as_str(),
+                "LSP teardown: {key} shut down gracefully",
+            );
+            settle_teardown(&pending, &key);
+            return;
+        }
+
+        // Rung 1 expired. Recover the server handle: the slot when the lock
+        // arrived in time, else one immediate `try_lock` (the holder may have
+        // released since).
+        let server = server_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .or_else(|| {
+                client_mutex
+                    .try_lock()
+                    .ok()
+                    .map(|client| Arc::clone(client.server()))
+            });
+        let Some(server) = server else {
+            // The client mutex never unlocked and there is no path to the
+            // PID. Name it; it dies with the process (`Connection::drop`
+            // SIGKILLs by PID at runtime teardown).
+            warn_straggler(
+                &key,
+                "abandoned",
+                "unreachable (client mutex wedged, no PID); it dies with the process",
+            );
+            settle_teardown(&pending, &key);
+            return;
+        };
+        if !server.is_alive() {
+            // Died at the bell.
+            settle_teardown(&pending, &key);
+            return;
+        }
+        let Some(pid) = server.pid() else {
+            warn_straggler(
+                &key,
+                "abandoned",
+                "still alive past the graceful grace but has no PID to signal; \
+                 it dies with the process",
+            );
+            settle_teardown(&pending, &key);
+            return;
+        };
+        note_teardown_pid(&pending, &key, pid);
+
+        // Rung 2 — SIGTERM.
+        catenary_proc::terminate_process(pid);
+        warn_straggler(
+            &key,
+            "sigterm",
+            &format!(
+                "did not answer graceful shutdown within {:?}; sent SIGTERM",
+                timings.graceful_grace
+            ),
+        );
+        let died = tokio::time::timeout(timings.sigterm_grace, async {
+            while server.is_alive() {
+                tokio::time::sleep(TEARDOWN_POLL).await;
+            }
+        })
+        .await;
+        if died.is_ok() {
+            settle_teardown(&pending, &key);
+            return;
+        }
+
+        // Rung 3 — SIGKILL. Not refusable — nothing left to wait for, and
+        // the ceiling rung has nothing more to offer this child.
+        catenary_proc::kill_process(pid);
+        warn_straggler(
+            &key,
+            "sigkill",
+            &format!(
+                "survived SIGTERM for {:?}; sent SIGKILL",
+                timings.sigterm_grace
+            ),
+        );
+        settle_teardown(&pending, &key);
     }
 
     /// Installs (or replaces) a single root's project config, preserving the
@@ -3883,6 +4212,97 @@ mod tests {
             ServerDef {
                 path: Some(bin.to_string_lossy().to_string()),
                 args: vec![MOCK_LANG_A.to_string()],
+                ..ServerDef::default()
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new(server_name)]),
+                ..LanguageConfig::default()
+            },
+        );
+        Arc::new(Config {
+            language,
+            server,
+            log_retention_days: 7,
+            notifications: None,
+            icons: None,
+            tools: None,
+            resolved_commands: None,
+            observability: None,
+            roots: None,
+            registry: None,
+            permissions: None,
+            servers: None,
+            linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
+        })
+    }
+
+    /// Config whose mockls never answers `shutdown` (`--hang-on shutdown`):
+    /// the bug-130 straggler stand-in for the teardown ladder's SIGTERM rung.
+    fn mockls_hang_shutdown_config() -> Arc<Config> {
+        let bin = mockls_bin();
+        let server_name = format!("mockls-{MOCK_LANG_A}-hang");
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                path: Some(bin.to_string_lossy().to_string()),
+                args: vec![
+                    MOCK_LANG_A.to_string(),
+                    "--hang-on".to_string(),
+                    "shutdown".to_string(),
+                ],
+                ..ServerDef::default()
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new(server_name)]),
+                ..LanguageConfig::default()
+            },
+        );
+        Arc::new(Config {
+            language,
+            server,
+            log_retention_days: 7,
+            notifications: None,
+            icons: None,
+            tools: None,
+            resolved_commands: None,
+            observability: None,
+            roots: None,
+            registry: None,
+            permissions: None,
+            servers: None,
+            linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
+        })
+    }
+
+    /// Config whose mockls both hangs on `shutdown` AND ignores SIGTERM:
+    /// the bug-130 stand-in for the teardown ladder's SIGKILL rung. The
+    /// `trap '' TERM` runs before `exec`, and an ignored signal disposition
+    /// survives exec, so mockls runs with SIGTERM ignored.
+    #[cfg(unix)]
+    fn mockls_term_immune_config() -> Arc<Config> {
+        let bin = mockls_bin();
+        let server_name = format!("mockls-{MOCK_LANG_A}-immune");
+        let script = format!(
+            "trap '' TERM; exec '{}' {MOCK_LANG_A} --hang-on shutdown",
+            bin.to_string_lossy()
+        );
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                path: Some("sh".to_string()),
+                args: vec!["-c".to_string(), script],
                 ..ServerDef::default()
             },
         );
@@ -8808,6 +9228,166 @@ mod tests {
             manager.clients().await.is_empty(),
             "all clients should be removed after shutdown_all"
         );
+        Ok(())
+    }
+
+    /// Polls the reader-loop liveness flag until the child is dead, then
+    /// asserts. The teardown ladder's kills reach the flag via pipe EOF.
+    async fn wait_dead(server: &Arc<LspServer>) {
+        for _ in 0..80 {
+            if !server.is_alive() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            !server.is_alive(),
+            "child should be dead after the teardown ladder"
+        );
+    }
+
+    /// Bug 130 rung 2: a child that never answers `shutdown` gets SIGTERM
+    /// past the graceful grace and teardown stays bounded.
+    #[tokio::test]
+    async fn teardown_ladder_sigterms_hung_shutdown() -> Result<()> {
+        let manager = LspClientManager::new(
+            mockls_hang_shutdown_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        )
+        .teardown_timings_override(
+            Duration::from_millis(200),
+            Duration::from_millis(500),
+            Duration::from_secs(10),
+        );
+
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        let server = Arc::clone(client.lock().await.server());
+        assert!(server.is_alive(), "mockls should be up before teardown");
+
+        let started = std::time::Instant::now();
+        manager.shutdown_all().await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            manager.clients().await.is_empty(),
+            "registry should drain on teardown"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "the graceful grace must elapse before escalation, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "teardown must end inside the ceiling, took {elapsed:?}"
+        );
+        wait_dead(&server).await;
+        Ok(())
+    }
+
+    /// Bug 130 rung 3: a child that hangs on `shutdown` AND ignores SIGTERM
+    /// gets SIGKILL after both graces; teardown still ends.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn teardown_ladder_sigkills_term_immune_child() -> Result<()> {
+        let manager = LspClientManager::new(
+            mockls_term_immune_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        )
+        .teardown_timings_override(
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+            Duration::from_secs(10),
+        );
+
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        let server = Arc::clone(client.lock().await.server());
+        assert!(server.is_alive(), "mockls should be up before teardown");
+
+        let started = std::time::Instant::now();
+        manager.shutdown_all().await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "both graces must elapse before SIGKILL, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "teardown must end inside the ceiling, took {elapsed:?}"
+        );
+        wait_dead(&server).await;
+        Ok(())
+    }
+
+    /// Bug 130 field wedge: a client mutex held by a stuck in-flight request
+    /// cannot pin teardown — the ladder abandons the child within its grace
+    /// and `shutdown_all` returns.
+    #[tokio::test]
+    async fn teardown_bounded_when_client_mutex_wedged() -> Result<()> {
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        )
+        .teardown_timings_override(
+            Duration::from_millis(150),
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+        );
+
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        // Wedge: hold the client mutex across teardown, as a stuck
+        // in-flight request would.
+        let guard = client.lock().await;
+
+        let started = std::time::Instant::now();
+        manager.shutdown_all().await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a wedged client mutex must not pin teardown, took {elapsed:?}"
+        );
+        assert!(
+            manager.clients().await.is_empty(),
+            "registry should drain even when a client is wedged"
+        );
+        drop(guard);
+        Ok(())
+    }
+
+    /// Bug 130 ceiling: a ladder that cannot finish (graces longer than the
+    /// ceiling) is cut off — teardown ends at the ceiling and the straggler
+    /// gets SIGKILL via its harvested PID.
+    #[tokio::test]
+    async fn teardown_ceiling_ends_wedged_ladder() -> Result<()> {
+        let manager = LspClientManager::new(
+            mockls_hang_shutdown_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        )
+        .teardown_timings_override(
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_millis(400),
+        );
+
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        let server = Arc::clone(client.lock().await.server());
+        assert!(server.is_alive(), "mockls should be up before teardown");
+
+        let started = std::time::Instant::now();
+        manager.shutdown_all().await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the ceiling must end teardown regardless of ladder graces, \
+             took {elapsed:?}"
+        );
+        wait_dead(&server).await;
         Ok(())
     }
 
