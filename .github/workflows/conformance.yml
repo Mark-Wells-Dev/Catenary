@@ -519,9 +519,15 @@ jobs:
         # rustup proxy shim (~/.cargo/bin/rust-analyzer, no component behind
         # it) defeats their binary-missing skip — the second dispatch failed
         # all 23 harness jobs on that one poisoned sentinel.
+        #
+        # --nocapture (brackets 06): libtest hides a PASSING test's stderr,
+        # which would swallow the single-file evidence line ("SERVES
+        # DIAGNOSTICS" / "FINDING") the harness now emits per server — the
+        # record a `single_file` manifest-row upgrade cites. One test runs, so
+        # uncaptured output cannot interleave.
         run: |
           mkdir -p "$TMPDIR"
-          ./dist/conformance_harness conformance_selected_server
+          ./dist/conformance_harness conformance_selected_server --nocapture
 
       # The server's own stderr is NOT bridge_stderr.log — it is piped into
       # the daemon and re-emitted as `lsp.stderr` events in the JSONL
@@ -804,9 +810,11 @@ jobs:
           # flags for tempdir-canonicalization bugs.
           TMPDIR: ${{ runner.temp }}/conformance
           CATENARY_CONFORMANCE_KEEP: "1"
+        # --nocapture (brackets 06): same rationale as the Linux leg — the
+        # per-server single-file evidence line must land in the job log.
         run: |
           mkdir -p "$TMPDIR"
-          ./dist/conformance_harness conformance_selected_server
+          ./dist/conformance_harness conformance_selected_server --nocapture
 
       # BSD find/tar accept the same -print0 / --null -T - contract as the
       # GNU pair on the Linux leg; the tarball stays immune to any filename

@@ -378,10 +378,14 @@ forbidden_init_options = ["diagnosticsDelay"]
 [discipline.lattice]
 discipline = "event"
 declares_push = true
-# single_file (brackets 01): markdown is per-file-natured — a stray note or
-# README outside any root. Lattice's publish contract is pinned cross-repo,
-# but its NULL-ROOT behavior specifically is not verified by anything in this
-# repo, so the claim stays at the conservative enrichment-only.
+# single_file (brackets 01; re-verified brackets 06): markdown is
+# per-file-natured — a stray note or README outside any root. The claim STAYS
+# at enrichment-only, now on observed evidence rather than caution: the
+# conformance suite's single-file leg (2026-07-20) opened a lone dirty
+# broken.md under a null-root session and NO publish arrived within 60 s and
+# no on-demand pull was answered — the publish-per-didOpen contract above
+# does not extend to null-root sessions. Never serves-diagnostics without a
+# positive re-probe.
 single_file = "enrichment-only"
 
 # typescript-language-server — DEBOUNCE discipline (diagnostics-debt 05). ts-ls
@@ -430,12 +434,14 @@ debounce_ms = 850
 [discipline.taplo]
 discipline = "event"
 declares_push = true
-# single_file (brackets 01): TOML is overwhelmingly per-file-natured — core
-# stray population. The verified-live probe above ran ROOTED; nothing in this
-# repo verifies taplo's null-root diagnostic behavior, so the claim stays at
-# the conservative enrichment-only (trust-increasing serves-diagnostics only
-# on direct null-root verification — the misc-196 evidence bar).
-single_file = "enrichment-only"
+# single_file (brackets 01; upgraded brackets 06): TOML is overwhelmingly
+# per-file-natured — core stray population. Verified live 2026-07-20 by the
+# conformance suite's single-file leg (`single_file_evidence`): under a
+# genuine null-root session (null rootUri/rootPath, no workspaceFolders) a
+# lone dirty broken.toml drew a settled publish carrying its diagnostic
+# ~0.1 s after didOpen — the direct null-root verification the misc-196
+# evidence bar demands.
+single_file = "serves-diagnostics"
 
 # yaml-language-server — event + DECLARED PUSH (misc 196 verified live 2026-07-14).
 # Direct probe: no `diagnosticProvider`; publishes UNVERSIONED on didOpen — an
@@ -446,10 +452,12 @@ single_file = "enrichment-only"
 [discipline.yaml-language-server]
 discipline = "event"
 declares_push = true
-# single_file (brackets 01): YAML is per-file-natured (a lone config in $HOME
-# is the tier's motivating stray). The live probe above ran rooted; null-root
-# diagnostic behavior is unverified in-repo ⇒ conservative enrichment-only.
-single_file = "enrichment-only"
+# single_file (brackets 01; upgraded brackets 06): YAML is per-file-natured
+# (a lone config in $HOME is the tier's motivating stray). Verified live
+# 2026-07-20 by the conformance suite's single-file leg: under null root a
+# lone dirty broken.yaml drew a settled publish carrying its diagnostic
+# ~0.3 s after didOpen.
+single_file = "serves-diagnostics"
 
 # docker-langserver — event + DECLARED PUSH (misc 196 verified live 2026-07-14).
 # Direct probe: no `diagnosticProvider`; publishes UNVERSIONED on didOpen — an
@@ -479,11 +487,12 @@ discipline = "event"
 # the shellcheck linter feeder, conformance_bash_ls).
 [discipline.bash-language-server]
 discipline = "event"
-# single_file (brackets 01): shell scripts are the archetypal stray (a lone
-# script in $HOME, no project marker). bash-language-server analyzes per-file
-# (shellcheck-fed), but its null-root diagnostic behavior is not verified by
-# anything in this repo — the probe above ran rooted ⇒ enrichment-only.
-single_file = "enrichment-only"
+# single_file (brackets 01; upgraded brackets 06): shell scripts are the
+# archetypal stray (a lone script in $HOME, no project marker). Verified live
+# 2026-07-20 by the conformance suite's single-file leg: under null root a
+# lone flagged broken.sh drew a settled publish carrying 2 shellcheck-fed
+# diagnostics ~0.6 s after didOpen.
+single_file = "serves-diagnostics"
 
 # lua-language-server — event, VERSIONED (misc 196 verified live 2026-07-14 against
 # lua-language-server 3.18.2). Direct probe: no `diagnosticProvider`; publishes
@@ -515,11 +524,13 @@ discipline = "event"
 # directly (DESIGN's pull row); a pull error would leave it unsettled (bug 84).
 [discipline.vscode-json-language-server]
 discipline = "pull"
-# single_file (brackets 01): JSON is per-file-natured (validation needs no
-# project semantics). The pull probe above ran rooted; null-root behavior is
-# unverified in-repo ⇒ conservative enrichment-only, never a guessed
-# serves-diagnostics.
-single_file = "enrichment-only"
+# single_file (brackets 01; upgraded brackets 06): JSON is per-file-natured
+# (validation needs no project semantics). Verified live 2026-07-20 by the
+# conformance suite's single-file leg: under null root the server answered
+# the on-demand `textDocument/diagnostic` pull for a lone dirty broken.json
+# with its full report ~1.0 s after didOpen — the same pull channel its
+# rooted discipline rides.
+single_file = "serves-diagnostics"
 
 # vscode-css-language-server — PULL discipline (misc 196 verified live 2026-07-14).
 # Direct probe: advertises `diagnosticProvider`; publishes nothing on didOpen;

@@ -2389,12 +2389,15 @@ bin = "bin/srv"
     }
 
     #[test]
-    fn seed_manifest_single_file_rows_stay_conservative() {
-        // brackets 01: the stray-population servers (per-file-natured languages)
-        // carry `enrichment-only` — their null-root DIAGNOSTIC behavior is not
-        // verified by anything in this repo, so the trust-increasing
-        // `serves-diagnostics` state is deliberately withheld (the misc-196
-        // evidence bar). The project-semantic class carries no key at all —
+    fn seed_manifest_single_file_rows_match_verified_evidence() {
+        // brackets 01 shipped every stray-population row conservative
+        // (`enrichment-only`) because no probe had run rootless; brackets 06's
+        // conformance single-file leg produced the real evidence, and each row
+        // now pins what was OBSERVED (the misc-196 verify-then-declare bar).
+        // The verified servers drew their fixture's diagnostic under a genuine
+        // null-root session (2026-07-20); lattice demonstrably did NOT (no
+        // publish, no pull answer), so it stays enrichment-only — on evidence
+        // now, not caution. The project-semantic class carries no key at all —
         // `unsupported`, fail closed.
         let manifest = default_blessed_manifest().expect("manifest parses");
         for name in [
@@ -2402,14 +2405,18 @@ bin = "bin/srv"
             "taplo",
             "yaml-language-server",
             "vscode-json-language-server",
-            "lattice",
         ] {
             assert_eq!(
                 manifest.discipline_for(name).single_file,
-                SingleFileSupport::EnrichmentOnly,
-                "{name} is stray-population: enrichment-only until verified",
+                SingleFileSupport::ServesDiagnostics,
+                "{name} verified null-root diagnostics (brackets 06)",
             );
         }
+        assert_eq!(
+            manifest.discipline_for("lattice").single_file,
+            SingleFileSupport::EnrichmentOnly,
+            "lattice verified NOT to publish under null root (brackets 06)",
+        );
         for name in ["rust-analyzer", "gopls", "typescript-language-server"] {
             assert_eq!(
                 manifest.discipline_for(name).single_file,

@@ -5,7 +5,7 @@
 #   make release-major   # 0.5.5 -> 1.0.0
 #   make release V=0.6.0 # explicit version
 
-.PHONY: bench bench-test build-release bump-guard check clippy conformance conformance-matrix deny flake-hunt fuzz install machete mdbook mockgrep mockglob mdgrep mdglob publish-backstop refresh-recipes registry-selftest rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc sweep test test-ignored release release-patch release-minor release-major publish publish-check tag-current
+.PHONY: bench bench-test build-release bump-guard check clippy conformance conformance-evidence conformance-matrix deny flake-hunt fuzz install machete mdbook mockgrep mockglob mdgrep mdglob publish-backstop refresh-recipes registry-selftest rustgrep rustglob mutants mutants-stop mutants-flag-runaways rustdoc sweep test test-ignored release release-patch release-minor release-major publish publish-check tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -289,6 +289,17 @@ conformance:
 	@$(if $(CONFORMANCE),CATENARY_CONFORMANCE=$(CONFORMANCE),) \
 	 cargo nextest run --workspace --features mockls --no-fail-fast --status-level all \
 	   -E 'binary(conformance_harness)'
+
+# Run the conformance harness with output UNCAPTURED so the per-server
+# single-file evidence lines (brackets 06: "SERVES DIAGNOSTICS" / "FINDING")
+# are readable on a green run — nextest hides a passing test's stderr, which
+# is exactly where the harness records its evidence. --no-capture implies a
+# serial run, so scope it with T= when hunting one server's evidence:
+#   make conformance-evidence T=conformance_taplo
+conformance-evidence:
+	@$(if $(CONFORMANCE),CATENARY_CONFORMANCE=$(CONFORMANCE),) \
+	 cargo nextest run --workspace --features mockls --no-fail-fast --no-capture \
+	   -E 'binary(conformance_harness)$(if $(T), and test($(T)),)'
 
 # Print a conformance CI matrix exactly as the discover job generates it
 # (stdout is the JSON; stderr carries the job census and skip annotations) —

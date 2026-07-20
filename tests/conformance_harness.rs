@@ -49,6 +49,21 @@
 //!   then runs exactly that server and **requires** its binary (a missing binary
 //!   is a failed install, not a skip).
 //!
+//! ## Two modes: rooted and single-file (brackets 06)
+//!
+//! Every case runs its diagnostics probe in BOTH modes. The **rooted** leg is
+//! the blessing gate above, unchanged. The **single-file** leg then probes the
+//! SAME server under the rootless tier brackets 01 landed — the genuine LSP
+//! single-file wire shape (null `rootUri`, null `rootPath`, NO
+//! `workspaceFolders` member), produced by the product's own initialize
+//! builder, never a fork — and records whether the server published/answered
+//! trustworthy diagnostics for an opened stray document. A rooted PASS with a
+//! single-file miss is a **finding** (the manifest's `single_file` row stays
+//! `enrichment-only`), never a suite failure: the leg asserts nothing and
+//! renders evidence on stderr ([`single_file_evidence`]). Upgrading a row to
+//! `serves-diagnostics` is a maintainer act on the manifest data, citing a
+//! SERVES line from a real run — the misc-196 verify-then-declare bar.
+//!
 //! `isolate_env` discipline throughout: every daemon subprocess gets its own XDG
 //! bases under a per-test tempdir; only `PATH` is restored so the real pinned
 //! binary resolves.
@@ -83,6 +98,20 @@ const CONFORMANCE_WALL_BOUND_SLOW: Duration = Duration::from_mins(10);
 
 /// Grace for a clean bridge shutdown after stdin close.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// The bounded evidence window for the single-file (null-root) leg
+/// (brackets 06).
+///
+/// Deliberately tighter than [`CONFORMANCE_WALL_BOUND`]: a negative outcome
+/// here is a FINDING (the row stays `enrichment-only`), never a suite
+/// failure, so a shorter window can only under-claim — the conservative,
+/// fail-closed direction — while a served answer stops the wait immediately.
+/// One minute is ~5–45x the fleet's observed publish latencies (1.3–1.9 s for
+/// the event fleet, 6–12 s for ansible-lint's async pass, misc 196), so a
+/// server that cannot answer inside it has no timely stray-file diagnostics
+/// to offer the editing loop anyway. Slow-start cases (jdtls) ride
+/// [`CONFORMANCE_WALL_BOUND`] instead — JVM spin-up dominates their clock.
+const SINGLE_FILE_EVIDENCE_BOUND: Duration = Duration::from_mins(1);
 
 /// Env var the conformance CI matrix sets to select the one server a job runs.
 const CONFORMANCE_ENV: &str = "CATENARY_CONFORMANCE";
@@ -627,7 +656,288 @@ fn run_conformance(case: &Case, require: bool) -> Result<()> {
         .with_context(|| format!("clean shutdown for `{}`", case.server))?;
 
     eprintln!("conformance: `{}` PASSED", case.server);
+
+    // The second mode (brackets 06): the SAME server, probed under the
+    // rootless single-file tier. Evidence only — a miss is a finding, never a
+    // suite failure, so nothing here asserts.
+    eprintln!("{}", single_file_evidence(case).render(case.server));
     Ok(())
+}
+
+// ── Single-file (null-root) evidence leg (brackets 06) ────────────────
+//
+// Brackets 01 landed the rootless tier: a server may spawn in genuine LSP
+// single-file mode — null `rootUri`, null `rootPath`, NO `workspaceFolders`
+// member — and each blessed row carries a `single_file` capability
+// (`unsupported` fail-closed / `enrichment-only` / `serves-diagnostics`).
+// Every row shipped conservative `enrichment-only` because every prior probe
+// ran ROOTED; the maintainer ruling — "the servers that get stray-file
+// diagnostics are the ones that can serve them" — demands REAL observed
+// null-root behavior before a row is upgraded. This leg produces that
+// evidence beside every rooted blessing run.
+//
+// The probe drives the product's own client — `LspClient::spawn` +
+// `initialize(&[], …)`, the exact calls the daemon's `spawn_single_file`
+// makes — so the wire shape IS the landed builder
+// (`src/lsp/params.rs::initialize` with no roots), never a forked second
+// one, and the trust judgment is the product's own settlement consult
+// (`settled_diagnostics`) plus its best-effort on-demand pull. The daemon
+// IPC surface cannot express this probe: since misc 203 a scoped serve
+// auto-mounts the named file's enclosing directory (`ExplicitTarget`), so
+// every `tool/editing-stop` serve is ROOTED by construction.
+
+/// What the single-file (null-root) probe observed for one server.
+///
+/// Rendered as one stderr evidence line ([`Self::render`]) — the suite's
+/// reporting surface. Only [`Self::Serves`] is upgrade evidence; every other
+/// variant is a finding that keeps the row at `enrichment-only`.
+enum SingleFileEvidence {
+    /// Trustworthy diagnostics arrived for the opened stray document: a
+    /// publish that settles for the opened version (the product's own
+    /// settlement judgment), or a non-empty answered pull.
+    Serves {
+        /// Which channel carried the evidence (`settled publish` / `answered
+        /// pull`).
+        channel: &'static str,
+        /// How many diagnostics arrived.
+        count: usize,
+        /// Time from `didOpen` to the evidence.
+        elapsed: Duration,
+    },
+    /// The server rejected the null-root `initialize` — the same class the
+    /// daemon negative-caches (`spawn_single_file`'s "rejected single-file
+    /// mode" arm).
+    RejectedInit(String),
+    /// The probe machinery could not complete (spawn failure, notification
+    /// transport failure, tempdir trouble). Reported honestly, never a suite
+    /// failure.
+    ProbeIncomplete(String),
+    /// The bound expired with no trustworthy diagnostics.
+    NoDiagnostics {
+        /// Final push-cache state for the URI: `None` = never heard,
+        /// `Some(n)` = a publish arrived carrying `n` diagnostics but never
+        /// settled as trustworthy (`Some(0)` = only empty publishes).
+        heard: Option<usize>,
+        /// Whether the best-effort pull answered — with an empty report.
+        empty_pull_answer: bool,
+        /// The evidence window that expired.
+        bound: Duration,
+    },
+}
+
+impl SingleFileEvidence {
+    /// Renders the one-line stderr evidence record for `server`.
+    fn render(&self, server: &str) -> String {
+        match self {
+            Self::Serves {
+                channel,
+                count,
+                elapsed,
+            } => {
+                let secs = elapsed.as_secs_f64();
+                format!(
+                    "conformance single-file: `{server}` SERVES DIAGNOSTICS under null root — \
+                     {count} diagnostic(s) via {channel} in {secs:.1}s; direct evidence for \
+                     upgrading the manifest row to `serves-diagnostics` (misc-196 evidence bar)"
+                )
+            }
+            Self::RejectedInit(err) => format!(
+                "conformance single-file: `{server}` FINDING — rejected null-root initialize \
+                 (the negative-cache class): {err}; row stays `enrichment-only`"
+            ),
+            Self::ProbeIncomplete(err) => format!(
+                "conformance single-file: `{server}` FINDING — probe did not complete ({err}); \
+                 row stays `enrichment-only`"
+            ),
+            Self::NoDiagnostics {
+                heard,
+                empty_pull_answer,
+                bound,
+            } => {
+                let push = match heard {
+                    None => "no publish arrived",
+                    Some(0) => "only empty publishes arrived",
+                    Some(_) => "a publish arrived but never settled for the opened version",
+                };
+                let pull = if *empty_pull_answer {
+                    "; the on-demand pull answered an empty report"
+                } else {
+                    "; no on-demand pull answer carried diagnostics"
+                };
+                format!(
+                    "conformance single-file: `{server}` FINDING — no trustworthy diagnostics \
+                     within {bound:?} under null root ({push}{pull}); row stays `enrichment-only`"
+                )
+            }
+        }
+    }
+}
+
+/// Watches the opened stray document for trustworthy diagnostics under the
+/// null-root session, bounded by `bound`.
+///
+/// The 100 ms cadence is poll only (the harness's wall-bound idiom): each
+/// tick consults the product's own settlement judgment
+/// ([`catenary_cli::lsp::LspClient::settled_diagnostics`] — the consult the
+/// receipt renders from, so a stale or untrusted publish never counts), and
+/// once per second the product's best-effort on-demand pull
+/// ([`catenary_cli::lsp::LspClient::try_pull_diagnostics`]) runs, mirroring
+/// retrieval's pull channel. The bound is a finite ceiling whose expiry is a
+/// FINDING, not a failure.
+async fn observe_null_root_diagnostics(
+    client: &catenary_cli::lsp::LspClient,
+    uri: &str,
+    bound: Duration,
+) -> SingleFileEvidence {
+    let started = Instant::now();
+    let deadline = started + bound;
+    let mut empty_pull_answer = false;
+    let mut next_pull = started + Duration::from_secs(1);
+    loop {
+        if let Some(diags) = client.settled_diagnostics(uri)
+            && !diags.is_empty()
+        {
+            return SingleFileEvidence::Serves {
+                channel: "settled publish",
+                count: diags.len(),
+                elapsed: started.elapsed(),
+            };
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        if now >= next_pull {
+            next_pull = now + Duration::from_secs(1);
+            if let Some(diags) = client.try_pull_diagnostics(uri).await {
+                if diags.is_empty() {
+                    empty_pull_answer = true;
+                } else {
+                    return SingleFileEvidence::Serves {
+                        channel: "answered pull",
+                        count: diags.len(),
+                        elapsed: started.elapsed(),
+                    };
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    SingleFileEvidence::NoDiagnostics {
+        heard: client.get_diagnostics(uri).map(|d| d.len()),
+        empty_pull_answer,
+        bound,
+    }
+}
+
+/// Runs the single-file (null-root) probe for `case` and returns the observed
+/// evidence.
+///
+/// Never panics and never fails the suite — every outcome, machinery trouble
+/// included, renders as an evidence line. The fixture's representative file
+/// is copied ALONE into a bare, markerless tempdir (the stray shape the tier
+/// exists for: a lone script or config outside any project), so a server that
+/// needs its project context to diagnose misses here honestly. The server
+/// definition is the shipped `[lsp.server.*]` default — no user layer — and
+/// the spawn is PATH-resolved exactly like the [`on_path`] gate that admitted
+/// this run (the key IS the executable, misc 162). The spawned child inherits
+/// this process's cwd, the same posture a production rootless spawn has with
+/// the daemon's cwd: unrelated to the stray file, so evidence rides the
+/// opened URI only.
+fn single_file_evidence(case: &Case) -> SingleFileEvidence {
+    use catenary_cli::logging::LoggingServer;
+    use catenary_cli::lsp::{LspClient, Scope};
+
+    // Shipped defaults only: the same definition the daemon's rootless spawn
+    // reads on a stock install.
+    let config = catenary_cli::config::Config::default_with_classification();
+    let Some(def) = config.server.get(case.server) else {
+        return SingleFileEvidence::ProbeIncomplete(format!(
+            "no shipped [lsp.server.{}] definition",
+            case.server
+        ));
+    };
+
+    let dir = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            return SingleFileEvidence::ProbeIncomplete(format!("create stray tempdir: {e}"));
+        }
+    };
+    let src = fixture_dir(case).join(case.file);
+    let Some(file_name) = Path::new(case.file).file_name() else {
+        return SingleFileEvidence::ProbeIncomplete("fixture file has no name".to_string());
+    };
+    let stray = dir.path().join(file_name);
+    if let Err(e) = std::fs::copy(&src, &stray) {
+        return SingleFileEvidence::ProbeIncomplete(format!("copy stray fixture: {e}"));
+    }
+    let text = match std::fs::read_to_string(&stray) {
+        Ok(text) => text,
+        Err(e) => return SingleFileEvidence::ProbeIncomplete(format!("read stray fixture: {e}")),
+    };
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => return SingleFileEvidence::ProbeIncomplete(format!("build tokio runtime: {e}")),
+    };
+    let bound = if case.slow_start {
+        CONFORMANCE_WALL_BOUND
+    } else {
+        SINGLE_FILE_EVIDENCE_BOUND
+    };
+
+    rt.block_on(async {
+        let args: Vec<&str> = def.args.iter().map(String::as_str).collect();
+        let mut client = match LspClient::spawn(
+            def.program(case.server),
+            &args,
+            // The fixture dir name IS the language key throughout CASES
+            // (`rust`, `shellscript`, `dockerfile`, …), so it is the
+            // `languageId` the daemon would open this document with.
+            case.fixture,
+            case.server,
+            LoggingServer::new(),
+            def.settings.clone(),
+            def.env.as_ref(),
+            "",
+        ) {
+            Ok(client) => client,
+            Err(e) => return SingleFileEvidence::ProbeIncomplete(format!("spawn failed: {e:#}")),
+        };
+        client.server().set_scope(Scope::SingleFile);
+
+        // The landed null-root initialize (brackets 01): empty roots make the
+        // product builder emit null `rootUri`, null `rootPath`, and no
+        // `workspaceFolders` member — reused via the product client, never
+        // forked. Rejection here is exactly the class the daemon
+        // negative-caches.
+        if let Err(e) = client
+            .initialize(&[], def.initialization_options.clone())
+            .await
+        {
+            return SingleFileEvidence::RejectedInit(format!("{e:#}"));
+        }
+
+        let uri = format!("file://{}", stray.display());
+        if let Err(e) = client.did_open(&uri, case.fixture, 1, &text).await {
+            return SingleFileEvidence::ProbeIncomplete(format!("didOpen failed: {e:#}"));
+        }
+        // The editing lifecycle always delivers the save event for a changed
+        // file, so deliver it here too — save-triggered publishers (the diff
+        // discipline) get their contractual trigger.
+        if let Err(e) = client.did_save(&uri).await {
+            return SingleFileEvidence::ProbeIncomplete(format!("didSave failed: {e:#}"));
+        }
+
+        let outcome = observe_null_root_diagnostics(&client, &uri, bound).await;
+        // Best-effort teardown; Drop kills the process if shutdown fails.
+        let _ = client.shutdown().await;
+        outcome
+    })
 }
 
 /// Runs a sentinel case by server name — skips if its binary is absent.

@@ -680,28 +680,37 @@ mod tests {
     // ── single-file (rootless) capability projection (brackets 01) ──────
 
     #[test]
-    fn stray_population_servers_project_enrichment_only_single_file() {
-        // The stray-population rows (per-file-natured languages) carry the
-        // conservative `enrichment-only` claim: rootless spawn is allowed, but
-        // the tier must never serve their diagnostics — null-root diagnostic
-        // behavior is unverified in-repo.
+    fn stray_population_servers_project_verified_single_file_claims() {
+        // The stray-population rows pin what the conformance single-file leg
+        // OBSERVED (brackets 06, 2026-07-20): the verified servers drew their
+        // fixture's diagnostic under a genuine null-root session and project
+        // `serves-diagnostics`; lattice demonstrably did not (no publish, no
+        // pull answer within the bound) and stays `enrichment-only` — rootless
+        // spawn allowed, never a diagnostics source.
         use crate::recipes::SingleFileSupport;
         for name in [
             "bash-language-server",
             "taplo",
             "yaml-language-server",
             "vscode-json-language-server",
-            "lattice",
         ] {
             let capability = ServerProfile::for_server(name).single_file();
             assert_eq!(
                 capability,
-                SingleFileSupport::EnrichmentOnly,
-                "{name} projects the conservative enrichment-only claim",
+                SingleFileSupport::ServesDiagnostics,
+                "{name} projects the brackets-06-verified serves-diagnostics claim",
             );
             assert!(capability.may_spawn_rootless());
-            assert!(!capability.serves_diagnostics());
+            assert!(capability.serves_diagnostics());
         }
+        let lattice = ServerProfile::for_server("lattice").single_file();
+        assert_eq!(
+            lattice,
+            SingleFileSupport::EnrichmentOnly,
+            "lattice projects enrichment-only (verified-negative, brackets 06)",
+        );
+        assert!(lattice.may_spawn_rootless());
+        assert!(!lattice.serves_diagnostics());
     }
 
     #[test]
