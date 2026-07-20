@@ -124,8 +124,9 @@ you will not get editing state enforcement or command filtering.
 > **Two installs, two meanings.** `catenary install <host>` installs *host
 > integration* — it writes the host's plugin and hook files and never
 > touches your Catenary config. Language servers have no install command at
-> all: Catenary installs them for you when you opt in below, or you install
-> them system-wide by hand ([Language Servers](lsp/README.md)).
+> all: Catenary installs them for you — via the opt-in below, or the TUI's
+> guided install — or you install them system-wide by hand
+> ([Language Servers](lsp/README.md)).
 
 Catenary can install and manage the language servers it spawns. Opt in
 from your user config (`~/.config/catenary/config.toml`):
@@ -152,6 +153,16 @@ The opt-in is honored from your user config only — a project
 `.catenary.toml` can never switch it on. That is a consent posture: a
 public repository must not be able to opt your machine into installing
 software.
+
+Prefer per-server consent? The TUI offers the same install interactively.
+Run `catenary` to open the dashboard: a missing server one of your active
+languages needs appears in the problems pane as an install suggestion, and
+when the server is in the vetted set, pressing `a` on that row opens a
+consent overlay previewing the resolved install plan — `Enter` runs it,
+`Esc` dismisses. It is the same verified engine as `auto_install`, landing
+the same pinned version in the same managed home. There is no CLI verb for
+either path — installs happen through the opt-in or the overlay, never a
+shell command. See [Guided install](cli.md#guided-install).
 
 > **Migrating from system installs.** If you installed language servers
 > system-wide solely for Catenary's use, you can retire them: remove the

@@ -43,12 +43,29 @@ its owner):
 | `Enter` | Expand/collapse a node, or focus a problem's owner |
 | `p` | Problems-only — collapse both trees to broken things |
 | `d` | Toggle the dormant-server inventory |
+| `a` | Open the cursored row's guided action — on a vetted install suggestion, the [guided-install](#guided-install) consent overlay |
 | `g` / `Home` | Jump to the first entry |
 | `G` / `End` | Jump to the last entry |
 | `PageDown` / `PageUp` | Page down / up |
 | `y` | Yank the selected entry (scope id / text) via OSC 52 |
 | `?` | Toggle the keybinds help panel |
 | `q` | Quit |
+
+### Guided install
+
+A missing server that an active language routes to surfaces in the
+problems pane as an install *suggestion* — advisory, never counted as a
+problem. When the server is in the conformance-vetted set, the
+suggestion's fix-it shows the exact pinned install command, and pressing
+`a` on the row opens a consent overlay previewing the resolved install
+plan — nothing runs until you confirm. `Enter` executes the plan through
+Catenary's verified install engine (the same one `auto_install` uses),
+landing the pinned version in the managed home; the outcome log replaces
+the preview, naming any stale managed versions collected, and on success
+the suggestion clears. `Esc` dismisses at any point. A recipe whose
+artifact cannot be verified (an npm/pip package carrying no hash to check)
+is refused — the overlay says so instead of offering to run it. See
+[Managed Server Installs](configuration.md#managed-server-installs).
 
 ## Protocol Transparency
 

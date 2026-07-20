@@ -365,7 +365,9 @@ install at the pin and nothing on PATH — and installs each one into the
 managed home in the background. Session start never waits: the kick is
 announced, coverage arrives when the install lands, and a landed install
 pre-warms the server for live matching roots. There is no per-server
-install command — enabling the flag *is* the setup.
+install command — enabling the flag *is* the setup. The interactive
+alternative is the TUI's [guided install](cli.md#guided-install): the same
+engine, run per server from a consent overlay instead of the opt-in.
 
 Only blessed servers qualify, at their exact pinned version, through
 Catenary's verified install engine. A server already on PATH, or one with
