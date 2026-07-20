@@ -39,12 +39,25 @@ use common::{
 const MOCK_LANG_A: &str = "mockls-event";
 const MOCK_LANG_B: &str = "mockls-declared";
 
+/// Seeds a probe-bait file for `lang` in `dir` (bug 133 lean 2). The eager
+/// health probe opens the alphabetically-first matching file at spawn and
+/// leaves it HELD OPEN — and an open document routes external changes as the
+/// didChange full-text relay, never as `didChangeWatchedFiles` (the
+/// watch-before-query invariant's two dispatch forms). These tests assert the
+/// watched-files leg, so the bait — sorting before every fixture file — soaks
+/// up the probe and keeps the files under test closed.
+fn seed_probe_bait(dir: &std::path::Path, lang: &str) -> Result<()> {
+    std::fs::write(dir.join(format!("_probe_bait.{lang}")), "bait\n")?;
+    Ok(())
+}
+
 /// Cold baseline ⇒ the first enriched grep sends every registered-glob file
 /// once as `Changed` (`FileChangeType` 2). The first walk *is* the snapshot.
 #[test]
 fn first_walk_sends_full_candidate_set() -> Result<()> {
     let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
+    seed_probe_bait(dir.path(), MOCK_LANG_A)?;
     std::fs::write(dir.path().join(format!("a.{MOCK_LANG_A}")), "needle\n")?;
     std::fs::write(dir.path().join(format!("b.{MOCK_LANG_A}")), "other\n")?;
 
@@ -91,6 +104,7 @@ fn first_walk_sends_full_candidate_set() -> Result<()> {
 fn second_walk_sends_only_delta() -> Result<()> {
     let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
+    seed_probe_bait(dir.path(), MOCK_LANG_A)?;
     std::fs::write(dir.path().join(format!("a.{MOCK_LANG_A}")), "needle\n")?;
 
     let log_arg = log_path.to_str().context("log path")?;
@@ -155,6 +169,8 @@ fn external_change_routed_to_matching_server_only() -> Result<()> {
     let dir = common::canonical_tempdir()?;
     let log_a = dir.path().join("notifications_a.jsonl");
     let log_b = dir.path().join("notifications_b.jsonl");
+    seed_probe_bait(dir.path(), MOCK_LANG_A)?;
+    seed_probe_bait(dir.path(), MOCK_LANG_B)?;
     let changed = dir.path().join(format!("watched.{MOCK_LANG_A}"));
     let b_anchor = dir.path().join(format!("other.{MOCK_LANG_B}"));
     std::fs::write(&changed, "needle\n")?;
@@ -327,6 +343,7 @@ fn changed_file_routed_with_changed_wire_type() -> Result<()> {
     let dir = common::canonical_tempdir()?;
     let log_change = dir.path().join("notifications_change.jsonl");
     let log_create = dir.path().join("notifications_create.jsonl");
+    seed_probe_bait(dir.path(), MOCK_LANG_A)?;
     let existing = dir.path().join(format!("existing.{MOCK_LANG_A}"));
     std::fs::write(&existing, "needle\n")?;
     // A `.MOCK_LANG_B` file so the daemon DETECTS and SPAWNS server B (spawn_all
@@ -472,6 +489,7 @@ fn diagnostics_excludes_edited_set() -> Result<()> {
 fn count_grep_does_no_coherence_walk() -> Result<()> {
     let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
+    seed_probe_bait(dir.path(), MOCK_LANG_A)?;
     let a = dir.path().join(format!("a.{MOCK_LANG_A}"));
     std::fs::write(&a, "needle\n")?;
 
@@ -746,6 +764,7 @@ fn glob_scoped_adds_but_never_reaps() -> Result<()> {
     std::fs::create_dir(&sub)?;
     let inside = sub.join(format!("inside.{MOCK_LANG_A}"));
     let outside = dir.path().join(format!("outside.{MOCK_LANG_A}"));
+    seed_probe_bait(dir.path(), MOCK_LANG_A)?;
     std::fs::write(&inside, "fn a() {}\n")?;
     std::fs::write(&outside, "fn b() {}\n")?;
 
@@ -807,6 +826,7 @@ fn glob_routes_changed_then_queries_outline() -> Result<()> {
     let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
     let file = dir.path().join(format!("outline.{MOCK_LANG_A}"));
+    seed_probe_bait(dir.path(), MOCK_LANG_A)?;
     std::fs::write(&file, "fn original() {}\n")?;
 
     let log_arg = log_path.to_str().context("log path")?;

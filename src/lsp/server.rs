@@ -1115,6 +1115,19 @@ impl LspServer {
             .contains(uri)
     }
 
+    /// Whether the diagnostics cache holds ANY publish entry for `uri`
+    /// (empty or not, any version). The probe-opened re-sync's stand-down
+    /// check (bug 133 lean 2): a heard probe-time publish is evidence the
+    /// serve can consult, so no re-stimulus is owed — forcing one would
+    /// clear the entry and bet on a re-publish that content-hashing servers
+    /// (clangd) never send for identical text.
+    pub(crate) fn has_cached_publish(&self, uri: &str) -> bool {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(uri)
+    }
+
     /// The current stimulus generation for `uri` (`0` before any stimulus).
     fn doc_stimulus_gen(&self, uri: &str) -> u64 {
         self.doc_stimulus
@@ -2827,6 +2840,80 @@ mod tests {
             "a never-opened document's clear caches as before"
         );
         drop(cache);
+    }
+
+    /// Lean 2's churn removal, pinned at this seam (bug 133): the eager
+    /// probe's document is REUSED by the serve — one `didOpen`, no
+    /// `didClose`, no reopen — so the flake's misordered close-clear can no
+    /// longer be produced for the probed file. The full reuse sequence with
+    /// the probe-time publish HEARD (the common case; an unheard probe open
+    /// re-syncs first — the client-seam gate,
+    /// `probe_opened_document_replans_change_only_until_evidence`): probe
+    /// open → dirty publish → `didSave` (the round's only stimulus on an
+    /// unchanged reused document) → post-save dirty re-publish. No close
+    /// ever happens, so no close-clear exists to land after the `didSave`,
+    /// and the dirty verdict settles at every step — the post-didSave
+    /// window the insert-time gate cannot police (the documented residual)
+    /// is simply never entered for a probe-reused file.
+    #[test]
+    fn probe_reused_document_owes_no_clear_and_stays_dirty_through_save() {
+        let server = declared_push_server();
+        let uri = "file:///probe-reused.md";
+        // The probe's open — the ONLY open this document ever gets
+        // (`note_doc_closed` never runs: `run_eager_health_probe` has no
+        // close leg).
+        server.note_doc_version(uri, 1);
+        server.note_doc_opened(uri);
+        // The probe-time publish: the server's real verdict, heard.
+        publish_unversioned_dirty(&server, uri);
+        let settled = server.settled_diagnostics(uri).expect("settles dirty");
+        assert_eq!(settled[0]["message"], "dirty");
+
+        // The serve reuses the open document: unchanged content sends no
+        // sync traffic, so the round's stimulus is the didSave alone — and
+        // an on-save re-check answers it with the same dirty verdict.
+        server.note_doc_saved(uri);
+        publish_unversioned_dirty(&server, uri);
+
+        let settled = server.settled_diagnostics(uri).expect("stays settled");
+        assert_eq!(settled.len(), 1, "the dirty verdict survives the round");
+        assert_eq!(settled[0]["message"], "dirty");
+    }
+
+    /// The residual lean 2 exists to remove, pinned at this seam: under
+    /// close→reopen churn, a misordered clear landing AFTER the round's
+    /// `didSave` is indistinguishable from a legitimate on-save clean
+    /// re-check, and the insert-time gate must let it settle (the ruled
+    /// condition set — `empty_after_save_stimulus_settles_clean` is its
+    /// positive framing). The defense for the file under diagnosis is
+    /// therefore upstream: `run_eager_health_probe` never closes its
+    /// document, so the churn that produces such a clear cannot arise
+    /// there. If this seam ever learns to reject the post-save clear too,
+    /// this test documents what changed.
+    #[test]
+    fn churned_close_clear_after_save_still_settles_at_this_seam() {
+        let server = declared_push_server();
+        let uri = "file:///churned.md";
+        // The churn lean 2 removed: open → close (a clear is now owed) →
+        // reopen.
+        server.note_doc_version(uri, 1);
+        server.note_doc_opened(uri);
+        server.note_doc_closed(uri);
+        server.note_doc_version(uri, 2);
+        server.note_doc_opened(uri);
+
+        publish_unversioned_dirty(&server, uri);
+        server.note_doc_saved(uri);
+        // The owed close-clear, flushed after the didSave: at this seam it
+        // reads exactly like an on-save clean re-check, and it settles.
+        publish_unversioned_empty(&server, uri);
+
+        let settled = server.settled_diagnostics(uri).expect("settled");
+        assert!(
+            settled.is_empty(),
+            "the post-didSave clear settles here — the gate cannot tell it \
+             from an on-save clean; lean 2 removes the churn that makes it"
+        );
     }
 
     /// A never-heard URI is unsettled (`None`) — no publish, no settlement.

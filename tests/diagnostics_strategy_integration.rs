@@ -850,8 +850,9 @@ fn delayed_publish_after_settle_reaches_the_receipt() -> Result<()> {
 /// the held-open lifecycle keeps it as evidence for text the server still
 /// holds — so the never-heard state requires the rewrite. Gating the one
 /// publish on `didSave` keeps it out of the daemon's spawn-time eager health
-/// probe, whose `didOpen`/`didClose` of the same file would otherwise
-/// consume it before the batch's first round.)
+/// probe, whose `didOpen` of the same file (held open since bug 133 lean 2 —
+/// the probe no longer closes) would otherwise consume it before the batch's
+/// first round.)
 #[test]
 fn expired_evidence_renders_unverified_not_clean() -> Result<()> {
     let dir = tempfile::tempdir()?;

@@ -55,17 +55,18 @@ fn count_notification_method(log: &str, method: &str) -> usize {
 /// Polls the (merged) notification log until the per-root server is fully ready
 /// with capabilities set.
 ///
-/// The daemon's eager health probe opens and closes the first covered file
-/// *after* it has read the initialize response and set the server's
-/// capabilities, so the probe's `textDocument/didClose` is a positive signal
-/// that a `workspace/diagnostic`-capable client is live — stronger than the
-/// `__instance_root` init marker, which mockls writes before the daemon has
-/// processed the capabilities (a race the whole-root route would lose by falling
-/// back to fan-out).
+/// The daemon's eager health probe opens the first covered file *after* it has
+/// read the initialize response and set the server's capabilities (and leaves
+/// it held open — bug 133 lean 2: no probe `didClose`, so no close-clear is
+/// ever owed on the probed file), so the probe's `textDocument/didOpen` is a
+/// positive signal that a `workspace/diagnostic`-capable client is live —
+/// stronger than the `__instance_root` init marker, which mockls writes before
+/// the daemon has processed the capabilities (a race the whole-root route
+/// would lose by falling back to fan-out).
 fn wait_for_server_ready(nlog_base: &Path) {
     let deadline = Instant::now() + POLL_BACKSTOP;
     loop {
-        if has_notification_method(&read_merged_log(nlog_base), "textDocument/didClose") {
+        if has_notification_method(&read_merged_log(nlog_base), "textDocument/didOpen") {
             return;
         }
         assert!(

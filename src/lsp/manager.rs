@@ -2463,20 +2463,37 @@ impl LspClientManager {
     /// Runs an eager health probe on a freshly spawned server.
     ///
     /// Finds the first file matching `lang` under `root`, opens it on
-    /// the server, sends `documentSymbol`, and closes it. If no
-    /// matching file exists or the probe fails, the server stays in its
-    /// current state and will transition on the first real request.
+    /// the server, sends `documentSymbol`, and **leaves it held open**
+    /// (bug 133 lean 2). The probe used to close its document — but in a
+    /// minimal fixture the first matching file is the very file a diagnose
+    /// serve is about to open, and the probe's `didClose` owed a clear
+    /// that a starved unversioned-push server (taplo, under peak-parallel
+    /// load) could flush late and OUT OF ORDER: the close-clear landing
+    /// after the serve's real diagnostics and settling dirty→clean. With
+    /// no close leg no clear is ever owed: the serve reuses the still-open
+    /// document through the change gate ([`Self::open_document_on`] —
+    /// `didChange` when disk content moved since the probe, nothing when
+    /// unchanged), so the misordered-clear class cannot arise on the
+    /// probed file. If no matching file exists or the probe fails, the
+    /// server stays in its current state and will transition on the first
+    /// real request.
     async fn run_eager_health_probe(
         &self,
         client_mutex: &Arc<Mutex<LspClient>>,
         lang: &str,
         root: &Path,
     ) {
-        // Walk the root for the first file matching the language.
+        // Walk the root for the first file matching the language. Sorted, so
+        // the pick is deterministic (bug 133 lean 2): the probed file stays
+        // held open for the serve to reuse, and a reproducible pick keeps
+        // that lifecycle observable — test fixtures that need a file to stay
+        // closed (watched-files routing) bait the probe with a
+        // `_probe_bait.<lang>` file that sorts first.
         let probe_path = {
             let walker = ignore::WalkBuilder::new(root)
                 .git_ignore(true)
                 .hidden(true)
+                .sort_by_file_name(std::ffi::OsStr::cmp)
                 .build();
 
             let mut found = None;
@@ -2504,8 +2521,11 @@ impl LspClientManager {
         };
 
         // Query-cycle open through the held-open gate: at spawn time nothing
-        // is held, so this is a plain didOpen; the close below skips a
-        // batch-held document by construction (diagnostics-debt 01).
+        // is held, so this is a plain didOpen. Deliberately NO close leg
+        // (bug 133 lean 2): the document stays held open — query-opened,
+        // unowned — so the diagnose serve reuses it via the change gate
+        // instead of close→reopen, and no didClose-triggered clear can ever
+        // race a later round's fresher verdict.
         let Ok((uri, _)) = self
             .open_document_on(&probe_path, client_mutex, None, None)
             .await
@@ -2515,8 +2535,16 @@ impl LspClientManager {
         };
 
         let mut client = client_mutex.lock().await;
+        // The probe's didOpen races server init (the elm cold-download class:
+        // a still-loading server drops the publish this open should have
+        // provoked, and never re-pushes). Mark the document so a post-probe
+        // demand that finds NO publish heard re-syncs it — a same-text
+        // `didChange` through the change gate
+        // ([`LspClient::plan_document_sync`]) — re-earning the evidence with
+        // a stimulus the serve's settle discipline brackets. A heard publish
+        // stands the re-sync down: the cached entry is the evidence.
+        client.mark_probe_opened(&uri);
         client.run_health_probe(&uri).await;
-        client.close_tracked_document(&uri).await;
         drop(client);
     }
 
@@ -7153,15 +7181,15 @@ mod tests {
         fs.set_roots(vec![dir.path().to_path_buf()]);
         let manager = LspClientManager::new(mockls_config(), test_logging(), fs);
 
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        // Created after spawn, so the eager health probe never saw it — this
+        // test exercises the plain first-open leg (the probe-reuse leg is
+        // `eager_probe_document_stays_open_for_the_serve`).
         let path = dir.path().join(format!("test.{MOCK_LANG_A}"));
         std::fs::write(&path, "content").expect("write");
 
-        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
         let (uri, action) = manager.open_document_on(&path, &client, None, None).await?;
         assert!(uri.starts_with("file://"));
-        // The eager health probe may have opened/closed this same fixture
-        // file at spawn, advancing the version floor — so assert the action
-        // kind, not an absolute version.
         assert!(
             matches!(action, DocSync::Open(_)),
             "first open sends didOpen, got {action:?}"
@@ -7184,10 +7212,12 @@ mod tests {
         fs.set_roots(vec![dir.path().to_path_buf()]);
         let manager = LspClientManager::new(mockls_config(), test_logging(), fs);
 
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        // Created after spawn so the eager health probe never opened it —
+        // the change-gate sequence below starts from a genuinely fresh URI.
         let path = dir.path().join(format!("test.{MOCK_LANG_A}"));
         std::fs::write(&path, "content").expect("write");
 
-        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
         let (uri1, action1) = manager.open_document_on(&path, &client, None, None).await?;
         let DocSync::Open(v1) = action1 else {
             anyhow::bail!("first open must send didOpen, got {action1:?}");
@@ -7212,6 +7242,103 @@ mod tests {
             "moved disk content relays didChange with a bumped real version"
         );
         assert!(client.lock().await.is_document_open(&uri1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn eager_probe_document_stays_open_for_the_serve() -> Result<()> {
+        // Bug 133 lean 2: the eager health probe leaves its document held
+        // open so the diagnose serve REUSES it instead of close→reopen. The
+        // probe picks the first matching file under the root — in a minimal
+        // fixture, the very file under diagnosis — and a didClose there owed
+        // a clear a starved unversioned-push server could flush late and out
+        // of order onto the serve's fresher verdict. Every close path drops
+        // the held-open registry entry together with its didClose, so the
+        // entry's survival after spawn is the proof no didClose was sent.
+        // Default mockls publishes on the probe's didOpen, so the evidence
+        // is HEARD and the serve reuses the document with no sync traffic
+        // at all (the dropped-publish variant is
+        // `eager_probe_unheard_document_resyncs_on_first_demand`).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fs = test_fs_with_roots(&[]);
+        fs.set_roots(vec![dir.path().to_path_buf()]);
+        let manager = LspClientManager::new(mockls_config(), test_logging(), fs);
+
+        // The fixture exists BEFORE spawn, so the eager probe opens it.
+        let path = dir.path().join(format!("probe.{MOCK_LANG_A}"));
+        std::fs::write(&path, "fn probe\n").expect("write");
+
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        let uri = crate::lsp::lang::path_to_uri(&path.canonicalize()?);
+        assert!(
+            client.lock().await.is_document_open(&uri),
+            "the probe leaves its document held open — no didClose was sent"
+        );
+
+        // The serve's open on unchanged content: reuse, no sync traffic —
+        // the probe-time publish (heard before the probe's documentSymbol
+        // response resolved) is the evidence.
+        let (serve_uri, action) = manager.open_document_on(&path, &client, None, None).await?;
+        assert_eq!(serve_uri, uri);
+        assert_eq!(
+            action,
+            DocSync::Unchanged,
+            "the serve reuses the probe's still-open document"
+        );
+
+        // Moved disk content: the honest reuse — didChange on the open
+        // document (version 2 continues the probe's open at 1), never a
+        // close→reopen.
+        std::fs::write(&path, "fn probe changed\n").expect("write");
+        let (_, action) = manager.open_document_on(&path, &client, None, None).await?;
+        assert_eq!(
+            action,
+            DocSync::Change(2),
+            "changed content relays didChange on the open document, not a reopen"
+        );
+        assert!(client.lock().await.is_document_open(&uri));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn eager_probe_unheard_document_resyncs_on_first_demand() -> Result<()> {
+        // Bug 133 lean 2, the dropped-publish leg: a server that never
+        // publishes for the probe's didOpen (here `--no-push-diagnostics`;
+        // in the wild, a still-loading server dropping the publish mid-init)
+        // leaves the probe-opened document with NO heard evidence — so the
+        // first demand re-syncs it with a same-text didChange (version 2
+        // continues the probe's open at 1), re-earning the stimulus. The
+        // committed re-sync clears the mark: the next unchanged demand sends
+        // nothing. Still no didClose anywhere.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fs = test_fs_with_roots(&[]);
+        fs.set_roots(vec![dir.path().to_path_buf()]);
+        let manager = LspClientManager::new(
+            mockls_config_with_args(&["--no-push-diagnostics"]),
+            test_logging(),
+            fs,
+        );
+
+        let path = dir.path().join(format!("probe.{MOCK_LANG_A}"));
+        std::fs::write(&path, "fn probe\n").expect("write");
+
+        let client = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        let uri = crate::lsp::lang::path_to_uri(&path.canonicalize()?);
+        assert!(client.lock().await.is_document_open(&uri));
+
+        let (_, action) = manager.open_document_on(&path, &client, None, None).await?;
+        assert_eq!(
+            action,
+            DocSync::Change(2),
+            "no publish heard: the first demand re-syncs the probe-opened document"
+        );
+        let (_, action) = manager.open_document_on(&path, &client, None, None).await?;
+        assert_eq!(
+            action,
+            DocSync::Unchanged,
+            "the committed re-sync clears the mark"
+        );
+        assert!(client.lock().await.is_document_open(&uri));
         Ok(())
     }
 

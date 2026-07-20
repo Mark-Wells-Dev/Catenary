@@ -253,6 +253,13 @@ fn hitstream_annotation_call_routes_the_observation_nudge() -> Result<()> {
     let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
     let file = dir.path().join(format!("a.{MOCK_LANG}"));
+    // Probe bait (bug 133 lean 2): the eager probe holds the sorted-first
+    // matching file OPEN, and an open document routes external changes as
+    // the didChange relay, never watched-files — keep `a` out of its pick.
+    std::fs::write(
+        dir.path().join(format!("_probe_bait.{MOCK_LANG}")),
+        "bait\n",
+    )?;
     std::fs::write(&file, "needle\n")?;
 
     let log_arg = log_path.to_str().context("log path")?;

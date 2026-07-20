@@ -463,8 +463,9 @@ fn assert_no_unlinked(text: &str) {
 // (mtime fast-path, hash tie-break), saved only when its last-sent content is
 // unsaved, and closed only at the owning agent's Stop/SubagentStop. These
 // tests read mockls's `--notification-log` and assert **deltas** between
-// rounds — the spawn-time eager health probe opens/closes the first matching
-// file in the root, so absolute counts are ambiguous by design.
+// rounds — the spawn-time eager health probe opens the first matching file in
+// the root and leaves it held open (bug 133 lean 2: no probe `didClose`, so
+// no close-clear is ever owed), so absolute counts are ambiguous by design.
 
 /// Counts notification-log entries with `method` addressed to `uri`.
 fn count_doc_notifications(log: &str, method: &str, uri: &str) -> usize {
@@ -595,6 +596,12 @@ fn held_open_changed_round_sends_didchange_and_didsave() -> Result<()> {
     let closes = count_doc_notifications(&log1, "textDocument/didClose", &uri);
     let open_version =
         last_doc_version(&log1, "textDocument/didOpen", &uri).context("didOpen version")?;
+    // Round 1 may itself have didChanged (the eager probe opened this file at
+    // spawn, and the first serve demand re-syncs a probe-opened document —
+    // bug 133 lean 2). The "next real version" baseline is the last version
+    // round 1 sent, whichever leg sent it.
+    let base_version =
+        last_doc_version(&log1, "textDocument/didChange", &uri).unwrap_or(open_version);
 
     // The edit: disk content moves between rounds.
     std::fs::write(&file, "echo changed\necho line2\n")?;
@@ -629,7 +636,7 @@ fn held_open_changed_round_sends_didchange_and_didsave() -> Result<()> {
         last_doc_version(&log2, "textDocument/didChange", &uri).context("didChange version")?;
     assert_eq!(
         change_version,
-        open_version + 1,
+        base_version + 1,
         "the didChange carries the next real document version; log:\n{log2}"
     );
 

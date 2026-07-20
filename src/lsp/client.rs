@@ -51,6 +51,16 @@ struct OpenDocState {
     /// `didOpen`/`didChange` (content the server has not been told is saved —
     /// an on-save analyzer has not re-checked it), `true` after `didSave`.
     saved: bool,
+    /// Whether the eager health probe opened this document and no demand has
+    /// re-synced it since (bug 133 lean 2). The probe's `didOpen` races
+    /// server init — a still-loading server (the elm cold-download class)
+    /// drops the publish that open should have provoked and never re-pushes —
+    /// so a post-probe demand that finds NO cached publish for the URI must
+    /// re-earn the evidence: the change gate
+    /// ([`LspClient::plan_document_sync`]) forces a same-text `didChange`,
+    /// and any committed sync clears the flag. A heard publish stands the
+    /// re-sync down (the entry IS the evidence).
+    probe_opened: bool,
     /// Batch owners holding this document open: `(session, agent)` editing
     /// keys. Empty for query-opened documents, which no Stop owns.
     owners: HashSet<String>,
@@ -1208,12 +1218,27 @@ impl LspClient {
     ///   differing hash is a same-granularity write ([`DocSync::Change`]), an
     ///   equal hash is [`DocSync::Unchanged`] — no sync traffic. A missing
     ///   mtime on either side degrades to the hash leg.
+    ///
+    /// One exception precedes the staleness legs: a **probe-opened** document
+    /// ([`Self::mark_probe_opened`], bug 133 lean 2) whose URI carries **no
+    /// cached publish** plans [`DocSync::Change`] even when the disk is
+    /// unchanged. The probe's `didOpen` raced server init, so the publish it
+    /// should have provoked may have been dropped (a still-loading server —
+    /// the elm cold-download class — drops it and never re-pushes); with
+    /// nothing heard, the first demand re-syncs the same text to re-earn the
+    /// evidence, and the committed sync clears the flag. A publish that WAS
+    /// heard stands the re-sync down: the cached entry is the evidence, and
+    /// re-syncing would clear it while betting on a re-publish that
+    /// content-hashing servers (clangd) never send for identical text.
     #[must_use]
     pub fn plan_document_sync(&self, uri: &str, mtime: Option<i64>, hash: u64) -> DocSync {
         let Some(entry) = self.open_documents.get(uri) else {
             let floor = self.version_floor.get(uri).copied().unwrap_or(0);
             return DocSync::Open(floor.saturating_add(1));
         };
+        if entry.probe_opened && !self.server.has_cached_publish(uri) {
+            return DocSync::Change(entry.version.saturating_add(1));
+        }
         let mtime_unchanged = match (entry.last_sent_mtime, mtime) {
             (Some(recorded), Some(current)) => recorded == current,
             // No stamp to compare — degrade to the hash leg.
@@ -1227,14 +1252,30 @@ impl LspClient {
 
     /// Records a committed `didOpen`/`didChange` in the held-open registry:
     /// the new version, the disk state it carried (the next round's change-gate
-    /// reference), and the not-yet-saved flag.
+    /// reference), and the not-yet-saved flag. A committed sync also clears
+    /// the probe-opened mark (bug 133 lean 2) — the document's evidence is
+    /// re-earned by this send.
     pub fn commit_document_sync(&mut self, uri: &str, version: i32, mtime: Option<i64>, hash: u64) {
         let entry = self.open_documents.entry(uri.to_string()).or_default();
         entry.version = version;
         entry.last_sent_mtime = mtime;
         entry.last_sent_hash = hash;
         entry.saved = false;
+        entry.probe_opened = false;
         self.version_floor.insert(uri.to_string(), version);
+    }
+
+    /// Marks an open document as **probe-opened** (bug 133 lean 2): opened by
+    /// the eager health probe, whose `didOpen` races server init. If no
+    /// publish is ever heard for the URI, the next
+    /// [`Self::plan_document_sync`] plans a same-text `didChange` regardless
+    /// of disk state, re-earning the evidence the racing open may have
+    /// forfeited; a heard publish stands the re-sync down, and the committed
+    /// sync clears the mark.
+    pub fn mark_probe_opened(&mut self, uri: &str) {
+        if let Some(entry) = self.open_documents.get_mut(uri) {
+            entry.probe_opened = true;
+        }
     }
 
     /// Whether the last-sent content of an open document still owes a
@@ -1298,7 +1339,9 @@ impl LspClient {
     }
 
     /// Closes a document while the caller holds the lock — the query-cycle
-    /// close (eager health probe and friends).
+    /// close (the single-file bracket teardown and friends; the eager health
+    /// probe no longer closes — bug 133 lean 2, its document stays held open
+    /// for the diagnose serve to reuse).
     ///
     /// Removes the URI from per-client tracking and sends `didClose`.
     /// Eliminates the lock gap that would exist if the caller dropped
@@ -1743,6 +1786,50 @@ mod tests {
         assert!(
             client.document_needs_save(uri),
             "a didChange re-arms the save debt"
+        );
+
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn probe_opened_document_replans_change_only_until_evidence() -> Result<()> {
+        // Bug 133 lean 2: a probe-opened document with NO publish heard plans
+        // a same-text didChange on the next demand (the probe's didOpen raced
+        // server init and its publish may have been dropped), a HEARD publish
+        // stands the re-sync down (the cached entry is the evidence — a
+        // re-sync would clear it and bet on a re-publish content-hashing
+        // servers never send for identical text), and a committed sync clears
+        // the mark for good.
+        let (mut client, _dir) = spawn_and_init(&[]).await?;
+        let uri = "file:///probe.rs";
+
+        client.commit_document_sync(uri, 1, Some(10), 111);
+        client.mark_probe_opened(uri);
+        assert_eq!(
+            client.plan_document_sync(uri, Some(10), 111),
+            DocSync::Change(2),
+            "no publish heard: a probe-opened document re-syncs even when \
+             disk is unchanged"
+        );
+
+        // The probe-time publish arrives late: evidence heard, re-sync off.
+        client.server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({ "uri": uri, "diagnostics": [{ "message": "dirty" }] }),
+        );
+        assert_eq!(
+            client.plan_document_sync(uri, Some(10), 111),
+            DocSync::Unchanged,
+            "a heard publish is the evidence — no re-sync is owed"
+        );
+
+        // A committed sync (here: the disk actually moved) clears the mark.
+        client.commit_document_sync(uri, 2, Some(11), 222);
+        assert_eq!(
+            client.plan_document_sync(uri, Some(11), 222),
+            DocSync::Unchanged,
+            "the committed sync clears the probe mark"
         );
 
         client.shutdown().await?;

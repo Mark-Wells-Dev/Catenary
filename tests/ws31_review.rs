@@ -78,6 +78,14 @@ fn ws31_review_r1_scoped_grep_no_spurious_delete() -> Result<()> {
     std::fs::create_dir(&b)?;
     let a_match = a.join(format!("match.{MOCK_LANG}"));
     let b_keep = b.join(format!("keep.{MOCK_LANG}"));
+    // Probe bait (bug 133 lean 2): the eager probe holds the sorted-first
+    // matching file OPEN, and an open document routes external changes as
+    // the didChange relay, never watched-files — so keep the files under
+    // test out of the probe's pick.
+    std::fs::write(
+        dir.path().join(format!("_probe_bait.{MOCK_LANG}")),
+        "bait\n",
+    )?;
     std::fs::write(&a_match, "needle\n")?;
     std::fs::write(&b_keep, "needle\n")?;
 
@@ -637,6 +645,13 @@ fn ws31_review_r4_second_walk_emits_empty_changeset() -> Result<()> {
     // daemon's canonical coherence-walk URIs (macOS symlinked-tempdir class).
     let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
+    // Probe bait (bug 133 lean 2): keeps `a` (the sorted-first fixture file)
+    // out of the eager probe's held-open pick, so both a and b route as
+    // watched-files rather than the open-document didChange relay.
+    std::fs::write(
+        dir.path().join(format!("_probe_bait.{MOCK_LANG}")),
+        "bait\n",
+    )?;
     std::fs::write(dir.path().join(format!("a.{MOCK_LANG}")), "needle\n")?;
     std::fs::write(dir.path().join(format!("b.{MOCK_LANG}")), "other\n")?;
 
@@ -1006,6 +1021,9 @@ fn ws31_review_c1_symlink_dir_glob_single_canonical_key() -> Result<()> {
     let realdir = base.join("realdir");
     std::fs::create_dir(&realdir)?;
     let real_file = realdir.join(format!("x.{MOCK_LANG}"));
+    // Probe bait (bug 133 lean 2): keeps `realdir/x` out of the eager
+    // probe's held-open pick, so its baseline events route as watched-files.
+    std::fs::write(base.join(format!("_probe_bait.{MOCK_LANG}")), "bait\n")?;
     std::fs::write(&real_file, "needle\n")?;
 
     let linkdir = base.join("linkdir");
