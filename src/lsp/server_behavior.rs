@@ -686,13 +686,19 @@ mod tests {
         // fixture's diagnostic under a genuine null-root session and project
         // `serves-diagnostics`; lattice demonstrably did not (no publish, no
         // pull answer within the bound) and stays `enrichment-only` — rootless
-        // spawn allowed, never a diagnostics source.
+        // spawn allowed, never a diagnostics source. clangd/gopls/
+        // typescript-language-server joined by maintainer ruling 2026-07-20 on
+        // the brackets-07 probes (true positives + sibling resolution +
+        // genuinely-missing controls under null root).
         use crate::recipes::SingleFileSupport;
         for name in [
             "bash-language-server",
             "taplo",
             "yaml-language-server",
             "vscode-json-language-server",
+            "clangd",
+            "gopls",
+            "typescript-language-server",
         ] {
             let capability = ServerProfile::for_server(name).single_file();
             assert_eq!(
@@ -718,14 +724,10 @@ mod tests {
         // A project-semantic server (no `single_file` key on its row) and an
         // unverified custom def (no row at all) both resolve `unsupported`:
         // the engine never spawns them rootless (fail closed, brackets 01).
+        // rust-analyzer stays keyless deliberately — its rootless probe
+        // answered an EMPTY pull report (brackets 06), no serving evidence.
         use crate::recipes::SingleFileSupport;
-        for name in [
-            "rust-analyzer",
-            "gopls",
-            "typescript-language-server",
-            "some-custom-server",
-            "yX4Za",
-        ] {
+        for name in ["rust-analyzer", "some-custom-server", "yX4Za"] {
             let capability = ServerProfile::for_server(name).single_file();
             assert_eq!(
                 capability,

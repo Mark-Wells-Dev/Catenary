@@ -2397,7 +2397,9 @@ bin = "bin/srv"
         // The verified servers drew their fixture's diagnostic under a genuine
         // null-root session (2026-07-20); lattice demonstrably did NOT (no
         // publish, no pull answer), so it stays enrichment-only — on evidence
-        // now, not caution. The project-semantic class carries no key at all —
+        // now, not caution. clangd/gopls/typescript-language-server joined by
+        // maintainer ruling (brackets 07, 2026-07-20) on their rootless probes;
+        // rust-analyzer remains the keyless project-semantic case —
         // `unsupported`, fail closed.
         let manifest = default_blessed_manifest().expect("manifest parses");
         for name in [
@@ -2405,11 +2407,14 @@ bin = "bin/srv"
             "taplo",
             "yaml-language-server",
             "vscode-json-language-server",
+            "clangd",
+            "gopls",
+            "typescript-language-server",
         ] {
             assert_eq!(
                 manifest.discipline_for(name).single_file,
                 SingleFileSupport::ServesDiagnostics,
-                "{name} verified null-root diagnostics (brackets 06)",
+                "{name} verified null-root diagnostics (brackets 06/07)",
             );
         }
         assert_eq!(
@@ -2417,13 +2422,13 @@ bin = "bin/srv"
             SingleFileSupport::EnrichmentOnly,
             "lattice verified NOT to publish under null root (brackets 06)",
         );
-        for name in ["rust-analyzer", "gopls", "typescript-language-server"] {
-            assert_eq!(
-                manifest.discipline_for(name).single_file,
-                SingleFileSupport::Unsupported,
-                "{name} is project-semantic: never spawned rootless",
-            );
-        }
+        // rust-analyzer stays keyless deliberately: its rootless probe answered
+        // an EMPTY pull report (brackets 06) — no serving evidence, fail closed.
+        assert_eq!(
+            manifest.discipline_for("rust-analyzer").single_file,
+            SingleFileSupport::Unsupported,
+            "rust-analyzer is project-semantic: never spawned rootless",
+        );
     }
 
     #[test]

@@ -370,6 +370,12 @@ contains_any = ["`#[allow(", "`#[warn("]
 [discipline.gopls]
 discipline = "pull"
 forbidden_init_options = ["diagnosticsDelay"]
+# single_file: maintainer-ruled 2026-07-20 on the brackets-07 rootless probes
+# (v0.22.0, matches pin): true positive 0.2 s no go.mod (IncompatibleAssign),
+# explicit [] clean, same-package sibling + stdlib import resolve (no false
+# "undefined"), //go:build ignore does not suppress. Non-sibling module
+# reach-outs stay the rooted tier's job.
+single_file = "serves-diagnostics"
 
 # lattice — declared push (misc 187): the contract, pinned cross-repo in misc
 # 153 / Lattice ticket 16 / its decision 022 and re-verified per re-pin, is a
@@ -401,6 +407,11 @@ single_file = "enrichment-only"
 [discipline.typescript-language-server]
 discipline = "debounce"
 debounce_ms = 850
+# single_file: maintainer-ruled 2026-07-20 on the brackets-07 rootless probes
+# (5.3.0, matches pin): true positive 0.8 s no tsconfig (TS2322), explicit []
+# clean, relative sibling import resolves while a genuinely-missing module
+# correctly errors (TS2307) — tsserver inferred projects per spec.
+single_file = "serves-diagnostics"
 
 # ── The rest of the blessed fleet (misc 196) ─────────────────────────────────
 #
@@ -478,6 +489,14 @@ declares_push = true
 # is the UNVERSIONED lattice contract; clangd's versioned publish settles by echo).
 [discipline.clangd]
 discipline = "event"
+# single_file: maintainer-ruled 2026-07-20 on the brackets-07 rootless probes
+# (host 22.1.6; the CI conformance job's evidence leg carries the pin-grade
+# 18.1.3 SERVES line in every run log): true positive 0.1 s
+# (undeclared_var_use), explicit [] clean, sibling "foo.h" and <stdio.h>
+# resolve under the bare `clang $FILENAME` fallback while a genuinely-missing
+# header correctly errors (pp_file_not_found) — silence is resolution, not
+# suppression. Non-adjacent -I reach-outs stay the rooted tier's job.
+single_file = "serves-diagnostics"
 
 # bash-language-server — event, VERSIONED (misc 196 verified live 2026-07-14).
 # Direct probe: no `diagnosticProvider`; publishes VERSIONED on didOpen — version-1
