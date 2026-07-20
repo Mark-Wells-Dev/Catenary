@@ -172,6 +172,10 @@ struct DiagnosticFile {
     /// All formatted entries, combined across all servers in
     /// server-name order.
     entries: Vec<DiagEntry>,
+    /// Served through the rootless single-file tier (brackets 03) — the
+    /// receipt header line carries the `[single-file]` tag, so the mode is
+    /// named, never silent.
+    single_file: bool,
 }
 
 /// File without LSP server coverage.
@@ -204,12 +208,24 @@ enum OutOfScopeKind {
     /// The named path exists but resolves outside every mounted root. Carries
     /// the enclosing project root when one is detectable (walk repository markers up from
     /// the path) — what a `catenary pin` would mount — or `None` when no
-    /// enclosing project root is found. Rarely reached for a scoped serve as
-    /// of misc 203: an explicitly named target auto-mounts its enclosing root
-    /// (markerless dirs included) before the pipeline runs, so this arm
-    /// remains for the mounts that could not happen — a sensitive-path
-    /// refusal (ws43-05), or a daemon with no root tracker.
+    /// enclosing project root is found. Reached for the mounts that could not
+    /// happen — a marker-rooted path whose mount was refused (a sensitive
+    /// path, ws43-05, or a daemon with no root tracker), or a markerless
+    /// sensitive path the rootless serve declines to open on a server. A
+    /// plain markerless named target no longer lands here: it serves through
+    /// the rootless single-file tier (brackets 03).
     OutsideRoots { enclosing_root: Option<PathBuf> },
+    /// A markerless named file whose language has a bound server, but no
+    /// server that serves single-file diagnostics (brackets 03) — the
+    /// `enrichment-only` / `unsupported` capability classes. The named file
+    /// still gets its answer: an honest disclosure naming the nearest server,
+    /// following the enrichment-only receipt-disclosure precedent
+    /// (diagnostics-debt 04b).
+    NoSingleFileDiagnostics {
+        /// The first server bound to the file's language — named so the
+        /// disclosure says who exists and cannot serve, never a bare shrug.
+        server: String,
+    },
 }
 
 /// A covered file that a feeder verified with no diagnostics.
@@ -223,6 +239,9 @@ struct CleanEntry {
     /// Grouping root: workspace root, or parent directory for
     /// files outside all roots.
     root: PathBuf,
+    /// Served through the rootless single-file tier (brackets 03) — the
+    /// receipt line carries the `[single-file]` tag.
+    single_file: bool,
 }
 
 /// A covered file whose server produced no result — the server died mid-pipeline
@@ -250,6 +269,9 @@ struct UnverifiedEntry {
     /// render's honesty, not a semantic change — every cause returns the
     /// receipt and pays the debt ("paying is diagnosing").
     cause: UnverifiedCause,
+    /// Served through the rootless single-file tier (brackets 03) — the
+    /// receipt line carries the `[single-file]` tag.
+    single_file: bool,
 }
 
 /// The typed cause behind an unverified receipt line, softest first.
@@ -470,10 +492,18 @@ impl DiagnosticsServer {
         // Fan-out engine (ticket 02's path): explicit files plus sub-root /
         // no-capability directories expanded to their covered files. Also yields
         // the per-file server assignment, so a file that dies before producing a
-        // result can name the server(s) that owed it one (bug 56).
-        let (mut canonical_paths, uncovered, out_of_scope, mut path_servers, mut stuck_servers) =
-            self.fan_out(&plan.fan_out, parent_id, owner, &mut feeds)
-                .await;
+        // result can name the server(s) that owed it one (bug 56), and the
+        // rootless-serve set (brackets 03) so the receipt tags the mode.
+        let (
+            mut canonical_paths,
+            uncovered,
+            out_of_scope,
+            mut path_servers,
+            mut stuck_servers,
+            single_file_paths,
+        ) = self
+            .fan_out(&plan.fan_out, parent_id, owner, &mut feeds)
+            .await;
 
         // Whole-root + capable scopes: one workspace/diagnostic request each,
         // merged into the same per-file map the fan-out populated. A scan server
@@ -499,7 +529,12 @@ impl DiagnosticsServer {
         // server that owed a file a result and produced none has degraded, one
         // that produced has recovered. Today this state lives only in the
         // receipt banner; record it where the health surface reads it too.
-        self.record_diag_degradation(&canonical_paths, &file_results, &path_servers);
+        self.record_diag_degradation(
+            &canonical_paths,
+            &file_results,
+            &path_servers,
+            &single_file_paths,
+        );
 
         // ── Phase 3: classify and format ─────────────────────────
         let outcome = self.format_output(
@@ -510,6 +545,7 @@ impl DiagnosticsServer {
             &path_servers,
             &stuck_servers,
             plan.directory_scoped,
+            &single_file_paths,
         );
 
         // ── Phase 4: invalidate caches ────────────────────────────
@@ -527,11 +563,13 @@ impl DiagnosticsServer {
     /// open — diagnostics-debt 01) → linter feeders. Populates `feeds` with each file's raw feeder
     /// diagnostics and returns the covered `canonical_paths`, the uncovered list,
     /// the out-of-scope list (named paths that do not exist or resolve outside
-    /// every mounted root — bug 58 / ephemeral-roots ticket 01), and a per-file
+    /// every mounted root — bug 58 / ephemeral-roots ticket 01), a per-file
     /// map of the diagnostic server(s) assigned to each covered file (keyed by
-    /// canonical-path string). The last is how a file that never produced a
+    /// canonical-path string) — how a file that never produced a
     /// result — because its server died mid-pipeline — can still name the server
-    /// that owed it one in the unverified receipt line (bug 56).
+    /// that owed it one in the unverified receipt line (bug 56) — and the set of
+    /// files served through the rootless single-file tier (brackets 03), so the
+    /// receipt tags the mode.
     ///
     /// Cross-file diagnostics (e.g., a renamed type that breaks importers) are
     /// correct because every server sees the complete final state before
@@ -553,6 +591,7 @@ impl DiagnosticsServer {
         Vec<OutOfScopeEntry>,
         BTreeMap<String, BTreeSet<String>>,
         BTreeMap<String, UnverifiedCause>,
+        BTreeSet<PathBuf>,
     ) {
         if files.is_empty() {
             return (
@@ -561,6 +600,7 @@ impl DiagnosticsServer {
                 Vec::new(),
                 BTreeMap::new(),
                 BTreeMap::new(),
+                BTreeSet::new(),
             );
         }
 
@@ -576,6 +616,17 @@ impl DiagnosticsServer {
         // mounted root. Kept explicit so a scoped pull never renders empty
         // stdout for a named path (bug 58 / ephemeral-roots ticket 01).
         let mut out_of_scope: Vec<OutOfScopeEntry> = Vec::new();
+        // Markerless named targets: served through the rootless single-file
+        // tier (brackets 03) after the resolve loop, replacing the retired
+        // misc-203 fallback mount.
+        let mut single_file_candidates: Vec<PathBuf> = Vec::new();
+        // The sensitive-path gate at the serve seam (ws43-05's invariant,
+        // carried over from the retired mount conversion): a sensitive
+        // markerless path is never opened on a server. Same compiled source
+        // the answer desk and the mount gate load.
+        let sensitive = crate::answer_desk::SensitiveDenylist::load(
+            &self.client_manager.config().permissions().deny_paths,
+        );
         // The lint-covered subset, fanned out to standalone linters in Phase 2b
         // (workstream 34 ticket 01). A file can be both LSP- and lint-covered.
         let mut lint_candidates: Vec<PathBuf> = Vec::new();
@@ -618,11 +669,26 @@ impl DiagnosticsServer {
             };
 
             // The LSP-awareness gate declined the path: it is either nonexistent
-            // or outside every mounted root. Classify it so the receipt says
-            // which — instead of the silent drop that rendered empty stdout for
-            // a named out-of-root/nonexistent path (bug 58 / ticket 01).
+            // or outside every mounted root. A MARKERLESS existing file routes
+            // to the rootless single-file serve (brackets 03 — the misc-203
+            // "always serves" ruling with zero root collateral); everything
+            // else classifies so the receipt says why — instead of the silent
+            // drop that rendered empty stdout for a named path (bug 58 /
+            // ticket 01). A marker-rooted-but-unmounted path keeps its
+            // out-of-scope line (its mount was refused: sensitive, or no
+            // tracker), and a sensitive markerless path is never opened on a
+            // server (ws43-05's invariant at the serve seam).
             let Ok(canonical) = validator.validate_read(&path) else {
-                out_of_scope.push(classify_out_of_scope(&path));
+                let markerless = path.canonicalize().ok().filter(|c| {
+                    c.is_file()
+                        && crate::companions::enclosing_worktree_root(c).is_none()
+                        && !sensitive.is_sensitive(c)
+                });
+                if let Some(canonical) = markerless {
+                    single_file_candidates.push(canonical);
+                } else {
+                    out_of_scope.push(classify_out_of_scope(&path));
+                }
                 continue;
             };
 
@@ -709,6 +775,136 @@ impl DiagnosticsServer {
             }
         }
         drop(validator);
+
+        // ── Phase 1a-bis: the rootless single-file serve (brackets 03) ──
+        // Each markerless named target rides one transaction bracket on the
+        // DebtPayment lane against its language's singleton: didOpen →
+        // settle → collect in the body, didClose as the teardown leg — a
+        // budget-expired body still closes the document. A qualifying
+        // (`serves-diagnostics` / config-opt-in) server serves real
+        // diagnostics; a language whose only servers are enrichment-only or
+        // unsupported still ANSWERS with the honest disclosure line; a type
+        // with no bound server keeps the `[no LSP coverage]` reading. Every
+        // serve is recorded in `single_file_paths` so the receipt tags the
+        // mode.
+        let mut single_file_paths: BTreeSet<PathBuf> = BTreeSet::new();
+        for canonical in single_file_candidates {
+            let lang = self.fs.language_id(&canonical).or_else(|| {
+                canonical
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(str::to_string)
+            });
+            let Some(lang) = lang else {
+                let display = self.display_rel(&canonical.to_string_lossy());
+                let root = self.resolve_root_or_parent(&canonical);
+                uncovered.push(UncoveredEntry { display, root });
+                continue;
+            };
+            let Some(server) = self
+                .client_manager
+                .single_file_diagnostics_server(&lang, &canonical)
+            else {
+                if let Some(named) = self.client_manager.first_bound_server(&lang) {
+                    // A server exists but cannot serve single-file
+                    // diagnostics — the honest disclosure, named (brackets 03
+                    // ruling 1: the command answers for every named file,
+                    // never refuses).
+                    out_of_scope.push(OutOfScopeEntry {
+                        display: super::compress_home(&canonical),
+                        kind: OutOfScopeKind::NoSingleFileDiagnostics { server: named },
+                    });
+                } else {
+                    // No server bound at all: genuinely uncovered.
+                    let display = self.display_rel(&canonical.to_string_lossy());
+                    let root = self.resolve_root_or_parent(&canonical);
+                    uncovered.push(UncoveredEntry { display, root });
+                }
+                continue;
+            };
+
+            let key = canonical.to_string_lossy().to_string();
+            path_servers
+                .entry(key.clone())
+                .or_default()
+                .insert(server.clone());
+            canonical_paths.push(canonical.clone());
+            single_file_paths.insert(canonical.clone());
+
+            let manager = Arc::clone(&self.client_manager);
+            let body_path = canonical.clone();
+            let close_path = canonical.clone();
+            let outcome = self
+                .client_manager
+                .with_single_file_bracket(
+                    &lang,
+                    &server,
+                    crate::lsp::Lane::DebtPayment,
+                    move |client| single_file_round(manager, client, body_path),
+                    move |client| async move {
+                        // The teardown leg: the round's document never
+                        // outlives its bracket, budget expiry included.
+                        let uri = crate::lsp::lang::path_to_uri(&close_path);
+                        let mut client = client.lock().await;
+                        if client.is_document_open(&uri) {
+                            client.close_tracked_document(&uri).await;
+                        }
+                        drop(client);
+                    },
+                )
+                .await;
+            let round = match outcome {
+                Some(crate::lsp::BracketOutcome::Completed(round)) => round,
+                // No capable singleton (gate refused / negative-cached /
+                // dead), or the budget backstop cut the body: the file stays
+                // unrecorded → `NoResults` → the honest `[unverified — …]`
+                // line naming the server.
+                Some(crate::lsp::BracketOutcome::Degraded) | None => None,
+            };
+            let Some((feeder_ctx, diagnostics)) = round else {
+                continue;
+            };
+
+            // The per-server min_severity filter, mirroring the batch
+            // retrieval path.
+            let min_severity = self
+                .client_manager
+                .config()
+                .server
+                .get(&server)
+                .and_then(|sd| sd.min_severity.as_deref())
+                .and_then(crate::filter::parse_severity);
+            let diagnostics: Vec<Value> = match min_severity {
+                Some(threshold) => diagnostics
+                    .into_iter()
+                    .filter(|d| {
+                        crate::lsp::extract::diagnostic_severity(d)
+                            .is_none_or(|sev| crate::filter::severity_passes(sev, threshold))
+                    })
+                    .collect(),
+                None => diagnostics,
+            };
+
+            // Record even with zero diagnostics so the file classifies Clean,
+            // not NoResults — the singleton reached a verdict for it.
+            let display = self.display_rel(&key);
+            let file_feed = feeds.entry(key).or_insert_with(|| FileFeed {
+                display,
+                entries: Vec::new(),
+            });
+            let feeder_ctx = Arc::new(feeder_ctx);
+            for value in diagnostics {
+                file_feed.entries.push(FeederEntry {
+                    value,
+                    // Quick fixes and enclosing symbols need a held-open
+                    // document; the bracket closed it (the workspace-pull
+                    // precedent).
+                    fixes: Vec::new(),
+                    enclosing: None,
+                    ctx: Arc::clone(&feeder_ctx),
+                });
+            }
+        }
 
         // ── Phase 1b: route the changed-set nudge (WS31 Consumer A) ──
         // Pull diagnostics read the server's index, so an external change the
@@ -852,6 +1048,7 @@ impl DiagnosticsServer {
             out_of_scope,
             path_servers,
             stuck_servers,
+            single_file_paths,
         )
     }
 
@@ -1213,6 +1410,7 @@ impl DiagnosticsServer {
         path_servers: &BTreeMap<String, BTreeSet<String>>,
         stuck_servers: &BTreeMap<String, UnverifiedCause>,
         collapse_clean: bool,
+        single_file_paths: &BTreeSet<PathBuf>,
     ) -> DiagnosticsOutcome {
         let mut diag_files: Vec<DiagnosticFile> = Vec::new();
         let mut clean_files: Vec<CleanEntry> = Vec::new();
@@ -1225,6 +1423,9 @@ impl DiagnosticsServer {
                 .get(&key)
                 .map_or_else(|| self.display_rel(&key), |(d, _)| d.clone());
             let root = self.resolve_root_or_parent(cp);
+            // The mode tag (brackets 03): a rootless single-file serve is
+            // named on its receipt line, never silent.
+            let single_file = single_file_paths.contains(cp);
 
             match classify_file(entries) {
                 FileOutcome::HasDiagnostics(entries) => {
@@ -1232,13 +1433,18 @@ impl DiagnosticsServer {
                         display,
                         root,
                         entries,
+                        single_file,
                     });
                 }
                 // A feeder reached retrieval and reported no diagnostics: the
                 // file is verified clean, so it earns an explicit `[clean]`
                 // line in the receipt (no longer silent).
                 FileOutcome::Clean => {
-                    clean_files.push(CleanEntry { display, root });
+                    clean_files.push(CleanEntry {
+                        display,
+                        root,
+                        single_file,
+                    });
                 }
                 // No feeder produced a result (the server died mid-pipeline or
                 // never answered): the file was NOT verified, so it earns neither
@@ -1279,6 +1485,7 @@ impl DiagnosticsServer {
                             root,
                             server,
                             cause,
+                            single_file,
                         });
                     }
                 }
@@ -1992,6 +2199,7 @@ impl DiagnosticsServer {
         canonical_paths: &[PathBuf],
         file_results: &BTreeMap<String, (String, Vec<DiagEntry>)>,
         path_servers: &BTreeMap<String, BTreeSet<String>>,
+        single_file_paths: &BTreeSet<PathBuf>,
     ) {
         let Some(writer) = self.client_manager.snapshot() else {
             return;
@@ -2001,6 +2209,11 @@ impl DiagnosticsServer {
         let mut degraded: BTreeSet<String> = BTreeSet::new();
         let mut recovered: BTreeSet<String> = BTreeSet::new();
         for cp in canonical_paths {
+            // Rootless serves (brackets 03) key no per-root instance — a
+            // `server@parent-dir` id would invent a board row no root owns.
+            if single_file_paths.contains(cp) {
+                continue;
+            }
             let key = cp.to_string_lossy().to_string();
             let Some(servers) = path_servers.get(&key) else {
                 continue;
@@ -2024,6 +2237,149 @@ impl DiagnosticsServer {
             writer.clear_degraded(id);
         }
     }
+}
+
+/// One rootless single-file diagnostics round, run INSIDE the singleton's
+/// transaction bracket body (brackets 03): open → settle → save → collect.
+/// The bracket's close leg sends the `didClose`, so a budget-expired body
+/// still tears its document down.
+///
+/// A faithful miniature of the per-server batch round
+/// ([`DiagnosticsServer::run_server_batch`]) against exactly one file,
+/// reusing the same settle / pipe-drain / evidence-bar / pull-settlement
+/// helpers so a `serves-diagnostics` singleton is held to the same
+/// settlement discipline a root instance is. Quick-fix collection and
+/// enclosing-symbol labels are deliberately skipped — both need a held-open
+/// document, and the bracket closes it (the workspace-pull precedent).
+///
+/// Returns `None` when the round could not produce a verdict — dead server,
+/// failed open, root death mid-settle, an unsettled pull, or expired publish
+/// evidence — so the caller renders the honest `[unverified — …]` line
+/// instead of a fabricated `[clean]`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear round: pre-settle / open / settle+save / evidence / collect, top-to-bottom like the batch pipeline it mirrors"
+)]
+async fn single_file_round(
+    manager: Arc<LspClientManager>,
+    client_mutex: Arc<Mutex<LspClient>>,
+    path: PathBuf,
+) -> Option<(FeederContext, Vec<Value>)> {
+    // Pre-open settle: a fresh singleton may still be settling its
+    // null-workspace init; a dead one serves nothing.
+    let (server, server_name) = {
+        let client = client_mutex.lock().await;
+        if matches!(
+            client.lifecycle(),
+            ServerLifecycle::Failed | ServerLifecycle::Dead
+        ) {
+            return None;
+        }
+        (client.server().clone(), client.server_name().to_string())
+    };
+    let detector = IdleDetector::unconditional();
+    if await_idle(&server, detector, CancellationToken::new(), &server_name).await
+        == SettleResult::RootDied
+    {
+        return None;
+    }
+    let baseline = sample_baseline(&server).await;
+
+    let (uri, action) = manager
+        .open_document_on(&path, &client_mutex, None, None)
+        .await
+        .ok()?;
+    let synced = action.sends();
+
+    // Settle + didSave under the client lock, so no interleaved traffic
+    // restarts activity mid-settle (the `settle_and_save` discipline).
+    let mut saved = false;
+    {
+        let mut client = client_mutex.lock().await;
+        let cancel = CancellationToken::new();
+        if synced
+            && !settle_after(
+                &server,
+                baseline,
+                cancel.clone(),
+                &server_name,
+                "single-file post-open",
+            )
+            .await
+        {
+            return None;
+        }
+        if client.wants_did_save() && client.document_needs_save(&uri) {
+            let save_baseline = sample_baseline(&server).await;
+            client.did_save(&uri).await.ok()?;
+            client.mark_document_saved(&uri);
+            saved = true;
+            if !settle_after(
+                &server,
+                save_baseline,
+                cancel,
+                &server_name,
+                "single-file post-didSave",
+            )
+            .await
+            {
+                return None;
+            }
+        }
+        if matches!(
+            client.lifecycle(),
+            ServerLifecycle::Failed | ServerLifecycle::Dead
+        ) {
+            return None;
+        }
+    }
+
+    // Drain any publish still in the pipe buffer, then hold retrieval for
+    // the evidence bar exactly as the batch round does (bug 99 / misc 156).
+    drain_pipe(&server).await;
+    let docs = vec![RoundDoc {
+        path,
+        uri: uri.clone(),
+        synced,
+    }];
+    let stimulus = RoundStimulus {
+        stimulated: synced || saved,
+        saved,
+    };
+    let evidence_expired = await_publish_evidence(&client_mutex, &docs, stimulus).await;
+
+    // Collect through the same settlement decision tree as
+    // [`DiagnosticsServer::retrieve_diagnostics`].
+    let client = client_mutex.lock().await;
+    let diagnostics = match client.settled_diagnostics(&uri) {
+        Some(diags) => diags,
+        None if client.supports_pull_diagnostics() => match pull_settling(&client, &uri).await {
+            PullSettlement::Settled(diags) => diags,
+            PullSettlement::Unsettled => return None,
+        },
+        None if client.server().pull_suppressed() => Vec::new(),
+        None => match client.try_pull_diagnostics(&uri).await {
+            Some(pulled) => reconsult_push_after_empty_pull(&client, &uri, pulled),
+            None => match client.settled_diagnostics(&uri) {
+                Some(published) => published,
+                None if evidence_expired.contains(&uri) => return None,
+                None => Vec::new(),
+            },
+        },
+    };
+    let feeder_ctx = FeederContext {
+        command: client.server_command().to_string(),
+        version: client.server_version().map(str::to_string),
+        language_id: client.language().to_string(),
+    };
+    let served_key = client.server().key();
+    drop(client);
+    // Served work pays the strike counter down (misc 167): one delivered
+    // per-file verdict is one completed request, rootless tier included.
+    if let Some(key) = served_key {
+        manager.record_server_service(&key);
+    }
+    Some((feeder_ctx, diagnostics))
 }
 
 /// Samples cumulative ticks for use as an [`IdleDetector::after_activity`]
@@ -2935,7 +3291,10 @@ fn classify_out_of_scope(resolved: &std::path::Path) -> OutOfScopeEntry {
 ///   language servers running for <root> — not a mounted root; see `catenary
 ///   roots -h`]`;
 /// - outside every root, no enclosing project root → `<path> [outside every
-///   mounted root; see `catenary roots -h`]`.
+///   mounted root; see `catenary roots -h`]`;
+/// - markerless, no single-file-diagnostics server (brackets 03) → `<path>
+///   [single-file] [no server serves single-file diagnostics — <server> covers
+///   this type inside a project root only]`.
 ///
 /// Returns the empty string when there is nothing out of scope, so the caller
 /// appends it unconditionally without a trailing blank line.
@@ -2964,6 +3323,18 @@ fn render_out_of_scope(entries: &[OutOfScopeEntry]) -> String {
                 _ = writeln!(
                     out,
                     "{} [outside every mounted root; see `catenary roots -h`]",
+                    entry.display,
+                );
+            }
+            OutOfScopeKind::NoSingleFileDiagnostics { server } => {
+                // The rootless serve's honest disclosure (brackets 03): the
+                // named file is ANSWERED — the mode tag names the tier, the
+                // label names the server that exists and cannot serve
+                // single-file diagnostics (enrichment-only / unsupported).
+                _ = writeln!(
+                    out,
+                    "{} [single-file] [no server serves single-file diagnostics \u{2014} {server} \
+                     covers this type inside a project root only]",
                     entry.display,
                 );
             }
@@ -3006,6 +3377,14 @@ fn unverified_label(server: &str, cause: UnverifiedCause) -> String {
     }
 }
 
+/// Per-root dirty rows for the receipt render: `(display, entries,
+/// single_file)`.
+type DiagByRoot<'a> = BTreeMap<&'a PathBuf, Vec<(&'a str, &'a [DiagEntry], bool)>>;
+
+/// Per-root unverified rows for the receipt render: `(display, server, cause,
+/// single_file)`.
+type UnverifiedByRoot<'a> = BTreeMap<&'a PathBuf, Vec<(&'a str, &'a str, UnverifiedCause, bool)>>;
+
 /// Formats the per-file receipt.
 ///
 /// Bare root-path section headers. Every diagnosed file is listed: dirty files
@@ -3046,26 +3425,34 @@ fn format_diagnostics(
 ) -> String {
     use std::fmt::Write;
 
-    let mut root_diag: BTreeMap<&PathBuf, Vec<(&str, &[DiagEntry])>> = BTreeMap::new();
-    let mut root_clean: BTreeMap<&PathBuf, Vec<&str>> = BTreeMap::new();
-    let mut root_unverified: BTreeMap<&PathBuf, Vec<(&str, &str, UnverifiedCause)>> =
-        BTreeMap::new();
+    // The `[single-file]` mode tag (brackets 03) rides each entry's flag:
+    // rendered on the receipt header line so a rootless serve is named.
+    let sf_tag = |single_file: bool| if single_file { " [single-file]" } else { "" };
+
+    let mut root_diag: DiagByRoot<'_> = BTreeMap::new();
+    let mut root_clean: BTreeMap<&PathBuf, Vec<(&str, bool)>> = BTreeMap::new();
+    let mut root_unverified: UnverifiedByRoot<'_> = BTreeMap::new();
     let mut root_uncovered: BTreeMap<&PathBuf, Vec<&str>> = BTreeMap::new();
 
     for df in diag_files {
         root_diag
             .entry(&df.root)
             .or_default()
-            .push((&df.display, &df.entries));
+            .push((&df.display, &df.entries, df.single_file));
     }
     for ce in clean {
-        root_clean.entry(&ce.root).or_default().push(&ce.display);
+        root_clean
+            .entry(&ce.root)
+            .or_default()
+            .push((&ce.display, ce.single_file));
     }
     for ue in unverified {
-        root_unverified
-            .entry(&ue.root)
-            .or_default()
-            .push((&ue.display, &ue.server, ue.cause));
+        root_unverified.entry(&ue.root).or_default().push((
+            &ue.display,
+            &ue.server,
+            ue.cause,
+            ue.single_file,
+        ));
     }
     for ue in uncovered {
         root_uncovered
@@ -3097,8 +3484,13 @@ fn format_diagnostics(
         if collapsed {
             // Single file: merge root and filename into one path.
             if let Some(files) = root_diag.get(root) {
-                for (display, entries) in files {
-                    _ = writeln!(output, "{}:", root.join(display).display());
+                for (display, entries, single_file) in files {
+                    _ = writeln!(
+                        output,
+                        "{}{}:",
+                        root.join(display).display(),
+                        sf_tag(*single_file),
+                    );
                     for entry in *entries {
                         for line in entry.text.lines() {
                             _ = writeln!(output, "\t{line}");
@@ -3107,16 +3499,22 @@ fn format_diagnostics(
                 }
             }
             if let Some(clean_files) = root_clean.get(root) {
-                for f in clean_files {
-                    _ = writeln!(output, "{} [clean]", root.join(f).display());
+                for (f, single_file) in clean_files {
+                    _ = writeln!(
+                        output,
+                        "{}{} [clean]",
+                        root.join(f).display(),
+                        sf_tag(*single_file),
+                    );
                 }
             }
             if let Some(unv_files) = root_unverified.get(root) {
-                for (display, server, cause) in unv_files {
+                for (display, server, cause, single_file) in unv_files {
                     _ = writeln!(
                         output,
-                        "{} [{}]",
+                        "{}{} [{}]",
                         root.join(display).display(),
+                        sf_tag(*single_file),
                         unverified_label(server, *cause),
                     );
                 }
@@ -3131,8 +3529,8 @@ fn format_diagnostics(
             // Multiple files: directory header with indented entries.
             _ = writeln!(output, "{}", root.display());
             if let Some(files) = root_diag.get(root) {
-                for (display, entries) in files {
-                    _ = writeln!(output, "\t{display}:");
+                for (display, entries, single_file) in files {
+                    _ = writeln!(output, "\t{display}{}:", sf_tag(*single_file));
                     for entry in *entries {
                         for line in entry.text.lines() {
                             _ = writeln!(output, "\t\t{line}");
@@ -3147,8 +3545,8 @@ fn format_diagnostics(
                     let plural = if n == 1 { "" } else { "s" };
                     _ = writeln!(output, "\t{n} file{plural} clean");
                 } else {
-                    for f in clean_files {
-                        _ = writeln!(output, "\t{f} [clean]");
+                    for (f, single_file) in clean_files {
+                        _ = writeln!(output, "\t{f}{} [clean]", sf_tag(*single_file));
                     }
                 }
             }
@@ -3160,8 +3558,13 @@ fn format_diagnostics(
                     let plural = if n == 1 { "" } else { "s" };
                     _ = writeln!(output, "\t{n} file{plural} unverified");
                 } else {
-                    for (display, server, cause) in unv_files {
-                        _ = writeln!(output, "\t{display} [{}]", unverified_label(server, *cause));
+                    for (display, server, cause, single_file) in unv_files {
+                        _ = writeln!(
+                            output,
+                            "\t{display}{} [{}]",
+                            sf_tag(*single_file),
+                            unverified_label(server, *cause),
+                        );
                     }
                 }
             }
@@ -3316,6 +3719,7 @@ mod tests {
             display: "file.rs".to_string(),
             root: PathBuf::from("/test"),
             entries: vec![de(1, ":1:1 [error] test: msg")],
+            single_file: false,
         }];
         let output = format_diagnostics(&diag_files, &[], &[], &[], false);
         assert!(!output.contains("[LSP available]"), "output: {output}");
@@ -3333,6 +3737,7 @@ mod tests {
             display: "file.rs".to_string(),
             root: PathBuf::from("/test"),
             entries,
+            single_file: false,
         }];
         let output = format_diagnostics(&diag_files, &[], &[], &[], false);
         // All entries should be present (no paging).
@@ -3357,6 +3762,7 @@ mod tests {
         let clean = vec![CleanEntry {
             display: "file.rs".to_string(),
             root: PathBuf::from("/test"),
+            single_file: false,
         }];
         let output = format_diagnostics(&[], &[], &clean, &[], false);
         // Single file under root → collapsed path with `[clean]` beside it.
@@ -3370,16 +3776,19 @@ mod tests {
                 display: "src/lib.rs".to_string(),
                 root: PathBuf::from("/alpha"),
                 entries: vec![de(1, ":1:1 [error] test: alpha error")],
+                single_file: false,
             },
             DiagnosticFile {
                 display: "src/util.rs".to_string(),
                 root: PathBuf::from("/alpha"),
                 entries: vec![de(2, ":3:1 [warning] test: alpha warning")],
+                single_file: false,
             },
             DiagnosticFile {
                 display: "src/lib.rs".to_string(),
                 root: PathBuf::from("/beta"),
                 entries: vec![de(2, ":5:1 [warning] test: beta warning")],
+                single_file: false,
             },
         ];
         let output = format_diagnostics(&diag_files, &[], &[], &[], false);
@@ -3407,10 +3816,12 @@ mod tests {
             display: "src/lib.rs".to_string(),
             root: PathBuf::from("/alpha"),
             entries: vec![de(1, ":1:1 [error] test: alpha error")],
+            single_file: false,
         }];
         let clean = vec![CleanEntry {
             display: "src/main.rs".to_string(),
             root: PathBuf::from("/alpha"),
+            single_file: false,
         }];
         let output = format_diagnostics(&diag_files, &[], &clean, &[], false);
         // Two printed files under /alpha → directory header, indented entries.
@@ -3426,6 +3837,7 @@ mod tests {
             display: "scratch.sh".to_string(),
             root: PathBuf::from("/tmp"),
             entries: vec![de(2, ":3:1 [warning] test: standalone warning")],
+            single_file: false,
         }];
         let output = format_diagnostics(&diag_files, &[], &[], &[], false);
         // Single file → collapsed path.
@@ -3443,6 +3855,7 @@ mod tests {
             display: "file.rs".to_string(),
             root: PathBuf::from("/test"),
             entries: vec![de(1, ":1:1 [error] test: msg")],
+            single_file: false,
         }];
         let output = format_diagnostics(&diag_files, &[], &[], &[], false);
         // No status header — output starts directly with file content.
@@ -3473,6 +3886,7 @@ mod tests {
         let clean = vec![CleanEntry {
             display: "lib.rs".to_string(),
             root: PathBuf::from("/project"),
+            single_file: false,
         }];
         let uncovered = vec![UncoveredEntry {
             display: "data.csv".to_string(),
@@ -3497,6 +3911,7 @@ mod tests {
             .map(|f| CleanEntry {
                 display: (*f).to_string(),
                 root: PathBuf::from("/project"),
+                single_file: false,
             })
             .collect();
         let output = format_diagnostics(&[], &[], &clean, &[], true);
@@ -3517,11 +3932,13 @@ mod tests {
             display: "broken.rs".to_string(),
             root: PathBuf::from("/project"),
             entries: vec![de(1, ":1:1 [error] test: boom")],
+            single_file: false,
         }];
         let clean: Vec<CleanEntry> = (0..5)
             .map(|i| CleanEntry {
                 display: format!("ok{i}.rs"),
                 root: PathBuf::from("/project"),
+                single_file: false,
             })
             .collect();
         let output = format_diagnostics(&diag_files, &[], &clean, &[], true);
@@ -3542,10 +3959,12 @@ mod tests {
             display: "broken.rs".to_string(),
             root: PathBuf::from("/project"),
             entries: vec![de(1, ":1:1 [error] test: boom")],
+            single_file: false,
         }];
         let clean = vec![CleanEntry {
             display: "ok.rs".to_string(),
             root: PathBuf::from("/project"),
+            single_file: false,
         }];
         let output = format_diagnostics(&diag_files, &[], &clean, &[], true);
         assert!(output.contains("\t1 file clean"), "output: {output}");
@@ -3578,6 +3997,7 @@ mod tests {
             root: PathBuf::from(root),
             server: server.to_string(),
             cause,
+            single_file: false,
         }
     }
 
@@ -3812,10 +4232,12 @@ mod tests {
             display: "src/lib.rs".to_string(),
             root: PathBuf::from("/alpha"),
             entries: vec![de(1, ":1:1 [error] test: alpha error")],
+            single_file: false,
         }];
         let clean = vec![CleanEntry {
             display: "src/main.rs".to_string(),
             root: PathBuf::from("/alpha"),
+            single_file: false,
         }];
         let unverified = vec![ue("src/dead.rs", "/alpha", "rust-analyzer")];
         let output = format_diagnostics(&diag_files, &[], &clean, &unverified, false);
@@ -3840,6 +4262,7 @@ mod tests {
             .map(|f| CleanEntry {
                 display: (*f).to_string(),
                 root: PathBuf::from("/project"),
+                single_file: false,
             })
             .collect();
         let unverified = vec![
@@ -3869,6 +4292,7 @@ mod tests {
             display: "broken.rs".to_string(),
             root: PathBuf::from("/project"),
             entries: vec![de(1, ":1:1 [error] test: boom")],
+            single_file: false,
         }];
         let unverified = vec![ue("dead.rs", "/project", "rust-analyzer")];
         let output = format_diagnostics(&diag_files, &[], &[], &unverified, true);
@@ -3910,10 +4334,12 @@ mod tests {
             display: "file.rs".to_string(),
             root: PathBuf::from("/test"),
             entries: vec![de(1, ":1:1 [error] test: boom")],
+            single_file: false,
         }];
         let clean = vec![CleanEntry {
             display: "ok.rs".to_string(),
             root: PathBuf::from("/test"),
+            single_file: false,
         }];
         let output = format_diagnostics(&diag_files, &[], &clean, &[], false);
         assert!(
@@ -4097,7 +4523,7 @@ mod tests {
 
         let detected = match classify_out_of_scope(&file).kind {
             OutOfScopeKind::OutsideRoots { enclosing_root } => enclosing_root,
-            OutOfScopeKind::Missing => None,
+            OutOfScopeKind::Missing | OutOfScopeKind::NoSingleFileDiagnostics { .. } => None,
         };
         assert_eq!(
             detected.as_deref(),
@@ -4382,6 +4808,7 @@ mod tests {
                 de(1, ":2:1 [error] e: err-b"),
                 de(2, ":3:1 [warning] w: warn-c"),
             ],
+            single_file: false,
         }];
         let out = format_diagnostics(&diag_files, &[], &[], &[], false);
         assert!(

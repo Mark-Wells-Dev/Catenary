@@ -1032,9 +1032,29 @@ struct HookDispatchContext {
     vetted_roots_cache: Arc<std::sync::Mutex<VettedDepositCache>>,
 }
 
-/// Hook-deposited vetted serve sets keyed by lock root, each stamped with
-/// its deposit instant (bugs 124/128 + the TTL ruling).
-type VettedDepositCache = HashMap<PathBuf, (std::time::Instant, Vec<PathBuf>)>;
+/// One hook-deposited vetted serve set: the caller's root kitchens plus its
+/// markerless FILE scopes (bugs 124/128; the files leg is brackets 03).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct VettedDeposit {
+    /// The caller's cwd root plus every same-owner debtor root.
+    roots: Vec<PathBuf>,
+    /// Every markerless file whose file-scope lock the caller holds.
+    files: Vec<PathBuf>,
+}
+
+/// Hook-deposited vetted serve sets keyed by [`vetted_deposit_key`], each
+/// stamped with its deposit instant (bugs 124/128 + the TTL ruling).
+type VettedDepositCache = HashMap<PathBuf, (std::time::Instant, VettedDeposit)>;
+
+/// The cache key for a vetted-set deposit: the cwd's enclosing lock root, or
+/// the canonical cwd itself when no repository marker encloses it
+/// (brackets 03 — a caller working from a markerless directory can hold
+/// file-scope debt, and its deposit needs a key both the hook side and the
+/// consume side derive identically).
+fn vetted_deposit_key(cwd: &Path) -> PathBuf {
+    crate::lock::resolve_lock_root(cwd)
+        .unwrap_or_else(|| cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()))
+}
 
 /// Age bound on a `pre-tool/editing-stop` vetted-set deposit. `catenary
 /// diagnostics` is bare-only (the command filter denies compounds), so the
@@ -1051,8 +1071,8 @@ const VETTED_DEPOSIT_TTL: std::time::Duration = std::time::Duration::from_mins(1
 fn consume_vetted_deposit(
     cache: &std::sync::Mutex<VettedDepositCache>,
     cwd_root: &Path,
-) -> Option<Vec<PathBuf>> {
-    let (deposited, roots) = cache
+) -> Option<VettedDeposit> {
+    let (deposited, deposit) = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(cwd_root)?;
@@ -1064,7 +1084,7 @@ fn consume_vetted_deposit(
         );
         return None;
     }
-    Some(roots)
+    Some(deposit)
 }
 
 /// A staged hook→CLI handoff, deposited under a [`HandoffKey`] by the
@@ -2016,53 +2036,6 @@ enum EphemeralMountVerdict {
     NoMount,
 }
 
-/// The intent class behind a touched path, gating the markerless fallback
-/// (misc 203).
-///
-/// The repository-marker probe exists to stop **ambient** mounting — a stray
-/// grep hit must never mount a root. An **explicitly named** serve target is
-/// not ambient: the path IS the intent signal, so refusing it because its
-/// directory carries no project marker serves nobody. The intent travels with
-/// the decision ([`ephemeral_root_to_mount`]), not a caller, so every future
-/// caller states which class it is.
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MountIntent {
-    /// The path arrived ambiently — a grep/glob hit batch, a bare drain, or
-    /// the edit preheat. The marker probe gates the mount: no repository
-    /// marker, no mount.
-    Ambient,
-    /// The path was explicitly named as a serve target (a scoped
-    /// `catenary diagnostics <path>`). Serving the named path is the point
-    /// (misc 203): when the marker probe finds nothing, the mount falls
-    /// through to the pin-shaped enclosing directory
-    /// ([`explicit_target_fallback_root`]) instead of refusing.
-    ExplicitTarget,
-}
-
-/// The markerless fallback root for an explicitly named serve target
-/// (misc 203).
-///
-/// Shapes the root exactly as the manual escape did — `catenary pin
-/// ~/.config/catenary` mounts the named directory itself, no marker walk — by
-/// reusing the pin machinery's own resolution
-/// ([`crate::cli::commands::resolve_root_path`]) on the named directory: the
-/// path itself when it is a directory, its containing directory when it is a
-/// file. Returns `None` when the path does not exist on disk (a nonexistent
-/// named path keeps its `[path does not exist]` receipt line — the fallback
-/// mounts roots for real files, never for typos).
-#[cfg(unix)]
-fn explicit_target_fallback_root(canonical_touched: &Path) -> Option<PathBuf> {
-    let dir = if canonical_touched.is_dir() {
-        canonical_touched
-    } else if canonical_touched.is_file() {
-        canonical_touched.parent()?
-    } else {
-        return None;
-    };
-    Some(crate::cli::commands::resolve_root_path(dir))
-}
-
 /// Decides whether a touched path warrants mounting an enclosing ephemeral root.
 ///
 /// Returns [`EphemeralMountVerdict::Mount`] with the canonical enclosing project
@@ -2073,11 +2046,12 @@ fn explicit_target_fallback_root(canonical_touched: &Path) -> Option<PathBuf> {
 ///   path under a mounted sub-root), and
 /// - an enclosing project root is detectable by walking repository markers
 ///   (`.git`/`.svn`/`.hg`/`.jj`) up from the path
-///   ([`crate::companions::enclosing_worktree_root`]) — or, for an
-///   [`MountIntent::ExplicitTarget`] touch whose probe finds nothing, the
-///   pin-shaped enclosing directory stands in
-///   ([`explicit_target_fallback_root`], misc 203: an explicitly named
-///   diagnose target is served, never refused for lacking a marker), and
+///   ([`crate::companions::enclosing_worktree_root`]) — the marker probe is
+///   the gate for EVERY touch class now: the misc-203 explicit-target
+///   fallback mount (the pin-shaped enclosing directory, and its `$HOME`
+///   wide-root edge) retired with brackets 03 — a markerless explicitly
+///   named diagnose target serves through the rootless single-file tier
+///   instead of manufacturing an ephemeral root — and
 /// - that root is not itself already tracked, and
 /// - the touched path does **not** match the sensitive-path denylist (ws43-05):
 ///   a sensitive path NEVER converts into a mount — no root registration, no
@@ -2102,23 +2076,16 @@ fn ephemeral_root_to_mount(
     canonical_touched: &Path,
     tracked: &HashSet<PathBuf>,
     denylist: &crate::answer_desk::SensitiveDenylist,
-    intent: MountIntent,
 ) -> EphemeralMountVerdict {
     // Already inside a tracked root → covered, no ephemeral mount. The
     // sensitive gate never fires here — it governs mount conversion only.
     if tracked.iter().any(|r| canonical_touched.starts_with(r)) {
         return EphemeralMountVerdict::NoMount;
     }
-    let probed = crate::companions::enclosing_worktree_root(canonical_touched).or_else(|| {
-        // Markerless: an ambient touch stops here (the probe is the ambient
-        // gate), while an explicitly named target falls through to the
-        // pin-shaped enclosing directory (misc 203).
-        match intent {
-            MountIntent::Ambient => None,
-            MountIntent::ExplicitTarget => explicit_target_fallback_root(canonical_touched),
-        }
-    });
-    let Some(root) = probed else {
+    // Markerless stops here for every touch class: the probe is the gate.
+    // (The misc-203 explicit-target fallback retired with brackets 03 — a
+    // markerless named target serves through the rootless single-file tier.)
+    let Some(root) = crate::companions::enclosing_worktree_root(canonical_touched) else {
         return EphemeralMountVerdict::NoMount;
     };
     let root = root.canonicalize().unwrap_or(root);
@@ -2613,13 +2580,11 @@ fn resolve_touched_paths(paths: &[PathBuf], cwd: Option<&Path>) -> Vec<PathBuf> 
 ///
 /// Called by the `grep` / `glob` / `diagnostics` handlers before they execute,
 /// so the enriched/diagnosed result is served from the freshly-attached
-/// server(s). `intent` states the touch class (misc 203): an
-/// [`MountIntent::Ambient`] touch mounts only when the repository-marker probe
-/// finds an enclosing project root, while an [`MountIntent::ExplicitTarget`]
-/// touch (a scoped `catenary diagnostics <path>`) falls through to the
-/// pin-shaped enclosing directory when the probe finds nothing — the named
-/// path is the intent signal, so a markerless root mounts rather than the
-/// serve refusing. A new mount adds an `ephemeral:{path}` contributor and re-syncs
+/// server(s). A touch mounts only when the repository-marker probe finds an
+/// enclosing project root — the marker gate holds for every touch class
+/// (brackets 03 retired the misc-203 explicit-target fallback: a markerless
+/// named diagnose target serves through the rootless single-file tier, never a
+/// manufactured mount). A new mount adds an `ephemeral:{path}` contributor and re-syncs
 /// the union (the same `sync_roots` path root removal rides, so the fresh server
 /// spawns exactly as a pinned root's would); the sync happens once, after all
 /// paths are processed. Idempotent per path: an already-mounted root only has
@@ -2642,7 +2607,6 @@ fn resolve_touched_paths(paths: &[PathBuf], cwd: Option<&Path>) -> Vec<PathBuf> 
 async fn ensure_ephemeral_mounts(
     ctx: &HookDispatchContext,
     touched: &[PathBuf],
-    intent: MountIntent,
     now: Instant,
     session_id: &str,
 ) {
@@ -2664,7 +2628,7 @@ async fn ensure_ephemeral_mounts(
         mounts.touch_covering(&canonical, now);
         ctx.worktree_mounts.touch_covering(&canonical, now);
         let existing: HashSet<PathBuf> = tracker.global_roots().into_iter().collect();
-        match ephemeral_root_to_mount(&canonical, &existing, &denylist, intent) {
+        match ephemeral_root_to_mount(&canonical, &existing, &denylist) {
             EphemeralMountVerdict::Mount(root) => {
                 let contributor = ephemeral_contributor(&root);
                 tracker.set_roots(&contributor, vec![root.clone()]);
@@ -2766,8 +2730,7 @@ impl crate::hitstream::BatchEnricher for HitstreamAnnotator<'_> {
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect();
-            ensure_ephemeral_mounts(self.ctx, &touched, MountIntent::Ambient, Instant::now(), "")
-                .await;
+            ensure_ephemeral_mounts(self.ctx, &touched, Instant::now(), "").await;
         }
         self.inner.enrich(hits, observed, weight, tier).await
     }
@@ -5963,31 +5926,48 @@ async fn handle_hook_dispatch(
     if method == "pre-tool/editing-stop" {
         let scope_id = uuid::Uuid::new_v4().to_string();
 
-        let vetted_roots: Vec<PathBuf> = raw
-            .get("vetted_roots")
-            .and_then(serde_json::Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(PathBuf::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let path_list = |key: &str| -> Vec<PathBuf> {
+            raw.get(key)
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(PathBuf::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let vetted_roots = path_list("vetted_roots");
+        // The files leg (brackets 03): the caller's owned markerless file
+        // scopes, deposited alongside the root kitchens. Serde-default at the
+        // hook, absent on old hooks — an empty leg costs nothing.
+        let vetted_files = path_list("vetted_files");
 
-        if !vetted_roots.is_empty() {
-            // Key by the cwd's enclosing lock root. The hook sends `cwd` in the
+        if !vetted_roots.is_empty() || !vetted_files.is_empty() {
+            // Key by the cwd's enclosing lock root — or the canonical cwd
+            // itself when no marker encloses it ([`vetted_deposit_key`],
+            // brackets 03: a caller standing in a markerless directory can
+            // still hold file-scope debt). The hook sends `cwd` in the
             // request; fall back to the daemon's cwd on a mis-send. A valid
-            // deposit always carries a non-empty cwd (the hook resolves cwd before
-            // depositing), so the fallback is a safety net, not a live path.
+            // deposit always carries a non-empty cwd (the hook resolves cwd
+            // before depositing), so the fallback is a safety net, not a live
+            // path.
             let cwd = raw.get("cwd").and_then(|v| v.as_str()).map_or_else(
                 || std::env::current_dir().unwrap_or_default(),
                 PathBuf::from,
             );
-            if let Some(cwd_root) = crate::lock::resolve_lock_root(&cwd) {
-                ctx.vetted_roots_cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(cwd_root, (std::time::Instant::now(), vetted_roots));
-            }
+            ctx.vetted_roots_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    vetted_deposit_key(&cwd),
+                    (
+                        std::time::Instant::now(),
+                        VettedDeposit {
+                            roots: vetted_roots,
+                            files: vetted_files,
+                        },
+                    ),
+                );
         }
 
         emit_hook_event(
@@ -6071,31 +6051,43 @@ async fn handle_hook_dispatch(
         // file's root).
         //
         // Bugs 124/128: when the hook deposited a vetted serve set via
-        // `pre-tool/editing-stop` (keyed by this cwd's lock root), consume it
+        // `pre-tool/editing-stop` (keyed by this cwd's deposit key), consume it
         // one-shot and use it verbatim — the hook already filtered to the
         // caller's identity. When absent (hookless / old hook), today's
-        // identity-free `bare_serve_roots` enumeration runs unchanged.
-        let bare_roots: Vec<PathBuf> = if scoped {
-            Vec::new()
+        // identity-free `bare_serve_roots` enumeration runs unchanged (with no
+        // files leg: file-scope attribution needs identity, so hookless boxes
+        // pay stray files through the scoped form).
+        let (bare_roots, bare_files): (Vec<PathBuf>, Vec<PathBuf>) = if scoped {
+            (Vec::new(), Vec::new())
         } else {
-            let cached = crate::lock::resolve_lock_root(&caller_cwd)
-                .and_then(|cwd_root| consume_vetted_deposit(&ctx.vetted_roots_cache, &cwd_root));
-            cached.unwrap_or_else(|| crate::lock::bare_serve_roots(&caller_cwd))
+            consume_vetted_deposit(&ctx.vetted_roots_cache, &vetted_deposit_key(&caller_cwd))
+                .map_or_else(
+                    || (crate::lock::bare_serve_roots(&caller_cwd), Vec::new()),
+                    |deposit| (deposit.roots, deposit.files),
+                )
         };
 
         // The diagnose set:
         // - scoped: exactly the named paths (served regardless of debt);
         // - bare:   the union of the served roots' ledger due sets
         //           (`crate::lock::due_files`), the single source of truth — no
-        //           in-memory mirror. Ledgers are disjoint (a file books into
-        //           its innermost root), and the receipt groups per root, so
-        //           the concatenation renders one section per kitchen.
+        //           in-memory mirror — plus every deposited FILE scope whose
+        //           own ledger still holds debt (brackets 03). Ledgers are
+        //           disjoint (a file books into its innermost root; a
+        //           markerless file into its own file scope), and the receipt
+        //           groups per root, so the concatenation renders one section
+        //           per kitchen.
         let diag_files: Vec<PathBuf> = if scoped {
             scoped_files.clone()
         } else {
             bare_roots
                 .iter()
                 .flat_map(|root| crate::lock::due_files(root))
+                .chain(
+                    bare_files
+                        .into_iter()
+                        .filter(|file| crate::lock::file_has_debt(file)),
+                )
                 .collect()
         };
 
@@ -6187,19 +6179,14 @@ async fn handle_hook_dispatch(
                 // on an out-of-root file, and a bare drain whose debt lives
                 // under a since-expired ephemeral root (re-mount = activity,
                 // refreshing its clock). Runs before the pipeline so
-                // `process_files_batched` sees the file as covered. A scoped
-                // run's files are explicitly named targets (misc 203): a
-                // markerless path still mounts its pin-shaped enclosing
-                // directory instead of the serve refusing — scoped
-                // diagnostics is a diagnostics SERVICE, and the named path is
-                // the intent signal the ambient marker gate exists to demand.
-                let intent = if scoped {
-                    MountIntent::ExplicitTarget
-                } else {
-                    MountIntent::Ambient
-                };
-                ensure_ephemeral_mounts(&ctx, &diag_files, intent, Instant::now(), &session_id)
-                    .await;
+                // `process_files_batched` sees the file as covered. The
+                // marker probe gates every class now: a MARKERLESS named
+                // target no longer manufactures a mount (the misc-203
+                // fallback retired, brackets 03) — the pipeline serves it
+                // through the rootless single-file tier instead, so the
+                // misc-203 "always serves" ruling holds with zero root
+                // collateral.
+                ensure_ephemeral_mounts(&ctx, &diag_files, Instant::now(), &session_id).await;
                 // Reflect the run on the session board: status → diagnostics
                 // for its duration, then record the result as last_action
                 // (observability ticket 05). Clone the session Arc and drop the
@@ -6787,14 +6774,7 @@ async fn handle_hook_dispatch(
     if let Some(file_path) = raw.get("file_path").and_then(|v| v.as_str()) {
         let touched =
             resolve_touched_paths(&[PathBuf::from(file_path)], hook_cwd(&raw).map(Path::new));
-        ensure_ephemeral_mounts(
-            &ctx,
-            &touched,
-            MountIntent::Ambient,
-            Instant::now(),
-            &session_id,
-        )
-        .await;
+        ensure_ephemeral_mounts(&ctx, &touched, Instant::now(), &session_id).await;
     }
 
     // ── SessionStart project-config setup nudge (misc 202) ──────────────
@@ -13532,7 +13512,7 @@ mod tests {
         // Outside every tracked root, enclosing `.git` detectable → mount it.
         let empty = HashSet::new();
         assert_eq!(
-            ephemeral_root_to_mount(&file, &empty, &deny, MountIntent::Ambient),
+            ephemeral_root_to_mount(&file, &empty, &deny),
             EphemeralMountVerdict::Mount(project.clone()),
             "an out-of-root file mounts its enclosing project root",
         );
@@ -13540,28 +13520,29 @@ mod tests {
         // Already inside a tracked root → covered, no mount.
         let tracked: HashSet<PathBuf> = std::iter::once(project).collect();
         assert_eq!(
-            ephemeral_root_to_mount(&file, &tracked, &deny, MountIntent::Ambient),
+            ephemeral_root_to_mount(&file, &tracked, &deny),
             EphemeralMountVerdict::NoMount,
             "a file under a tracked root is already covered",
         );
 
-        // No enclosing `.git`, ambient touch → no mount (the marker probe is
-        // the ambient gate; the ticket-01 fallback still answers).
+        // No enclosing `.git` → no mount (the marker probe is the gate).
         let orphan = base.join("loose.txt");
         std::fs::write(&orphan, "x").expect("write");
         let orphan = orphan.canonicalize().expect("canon");
         assert_eq!(
-            ephemeral_root_to_mount(&orphan, &empty, &deny, MountIntent::Ambient),
+            ephemeral_root_to_mount(&orphan, &empty, &deny),
             EphemeralMountVerdict::NoMount,
         );
     }
 
     #[test]
-    fn explicit_target_mounts_markerless_enclosing_dir() {
-        // misc 203: an explicitly named diagnose target in a markerless
-        // directory mounts the pin-shaped enclosing dir — the manual
-        // `catenary pin <dir>` escape, automated — while the ambient class
-        // keeps refusing (the marker probe stays the ambient gate).
+    fn markerless_target_never_mounts() {
+        // Brackets 03: the misc-203 explicit-target fallback mount is RETIRED.
+        // A markerless named diagnose target no longer manufactures an
+        // ephemeral root (the pin-shaped enclosing dir, and with it the
+        // `$HOME` wide-root edge) — the marker probe is the gate for every
+        // touch class, and the markerless serve rides the rootless
+        // single-file tier instead.
         let dir = tempfile::tempdir().expect("tempdir");
         let base = dir.path().canonicalize().expect("canonicalize");
         let deny = crate::answer_desk::SensitiveDenylist::load(&[]);
@@ -13575,56 +13556,28 @@ mod tests {
         std::fs::write(&file, "x = 1\n").expect("write");
         let file = file.canonicalize().expect("canon");
 
-        // Named file → its containing directory mounts.
+        // Named markerless file → NO mount (the retired fallback used to
+        // mount `config_dir` here).
         assert_eq!(
-            ephemeral_root_to_mount(&file, &empty, &deny, MountIntent::ExplicitTarget),
-            EphemeralMountVerdict::Mount(config_dir.clone()),
-            "an explicitly named markerless file mounts its containing dir",
-        );
-        // Same touch, ambient class → still refused (regression pin on the
-        // ambient gate).
-        assert_eq!(
-            ephemeral_root_to_mount(&file, &empty, &deny, MountIntent::Ambient),
+            ephemeral_root_to_mount(&file, &empty, &deny),
             EphemeralMountVerdict::NoMount,
-            "the ambient marker gate is untouched",
+            "a markerless named file manufactures no ephemeral root",
         );
 
-        // Named directory → the directory itself mounts (pin parity).
+        // Named markerless directory → NO mount either (pin parity retired).
         assert_eq!(
-            ephemeral_root_to_mount(&config_dir, &empty, &deny, MountIntent::ExplicitTarget),
-            EphemeralMountVerdict::Mount(config_dir.clone()),
-            "an explicitly named markerless directory mounts itself",
-        );
-
-        // A covered explicit target changes nothing — the tracked-root test
-        // short-circuits before any shaping.
-        let tracked: HashSet<PathBuf> = std::iter::once(config_dir).collect();
-        assert_eq!(
-            ephemeral_root_to_mount(&file, &tracked, &deny, MountIntent::ExplicitTarget),
+            ephemeral_root_to_mount(&config_dir, &empty, &deny),
             EphemeralMountVerdict::NoMount,
-            "an in-root explicit target is already covered — no re-mount",
+            "a markerless named directory manufactures no ephemeral root",
         );
 
-        // A nonexistent explicit target never mounts — it keeps its
+        // A nonexistent target still mounts nothing — it keeps its
         // `[path does not exist]` receipt line.
         let missing = base.join("gone").join("nope.toml");
         assert_eq!(
-            ephemeral_root_to_mount(&missing, &empty, &deny, MountIntent::ExplicitTarget),
+            ephemeral_root_to_mount(&missing, &empty, &deny),
             EphemeralMountVerdict::NoMount,
             "a typo mounts nothing",
-        );
-
-        // A sensitive explicit target is still refused (ws43-05 unweakened):
-        // the fallback root is shaped, then the denylist vetoes the conversion.
-        let secret = base.join("keys");
-        std::fs::create_dir_all(&secret).expect("mkdir keys");
-        let key = secret.join("server.pem");
-        std::fs::write(&key, "shh\n").expect("write key");
-        let key = key.canonicalize().expect("canon key");
-        assert_eq!(
-            ephemeral_root_to_mount(&key, &empty, &deny, MountIntent::ExplicitTarget),
-            EphemeralMountVerdict::RefusedSensitive(secret.canonicalize().expect("canon keys dir")),
-            "the sensitive-path gate outranks the explicit-target fallback",
         );
     }
 
@@ -13652,14 +13605,14 @@ mod tests {
         // is REFUSED (never a mount), carrying the root it would have mounted.
         let empty = HashSet::new();
         assert_eq!(
-            ephemeral_root_to_mount(&secret, &empty, &deny, MountIntent::Ambient),
+            ephemeral_root_to_mount(&secret, &empty, &deny),
             EphemeralMountVerdict::RefusedSensitive(project.clone()),
             "a sensitive out-of-root path never converts into a mount",
         );
 
         // Non-sensitive path in the same project mounts exactly as today.
         assert_eq!(
-            ephemeral_root_to_mount(&plain, &empty, &deny, MountIntent::Ambient),
+            ephemeral_root_to_mount(&plain, &empty, &deny),
             EphemeralMountVerdict::Mount(project.clone()),
             "a non-sensitive out-of-root path still mounts",
         );
@@ -13668,7 +13621,7 @@ mod tests {
         // refusal: the gate governs mount conversion only.
         let tracked: HashSet<PathBuf> = std::iter::once(project.clone()).collect();
         assert_eq!(
-            ephemeral_root_to_mount(&secret, &tracked, &deny, MountIntent::Ambient),
+            ephemeral_root_to_mount(&secret, &tracked, &deny),
             EphemeralMountVerdict::NoMount,
             "an in-root sensitive path changes nothing — no spurious refusal",
         );
@@ -13682,7 +13635,7 @@ mod tests {
         std::fs::write(&vaulted, "q3\n").expect("write vaulted");
         let vaulted = vaulted.canonicalize().expect("canonicalize vaulted");
         assert_eq!(
-            ephemeral_root_to_mount(&vaulted, &empty, &user_deny, MountIntent::Ambient),
+            ephemeral_root_to_mount(&vaulted, &empty, &user_deny),
             EphemeralMountVerdict::RefusedSensitive(project),
             "user deny_paths extensions refuse conversion too",
         );
@@ -14881,7 +14834,10 @@ mod tests {
     fn vetted_deposit_ttl_gates_consume() {
         let cache = std::sync::Mutex::new(VettedDepositCache::new());
         let root = PathBuf::from("/ws/root");
-        let serve = vec![PathBuf::from("/ws/root"), PathBuf::from("/ws/other")];
+        let serve = VettedDeposit {
+            roots: vec![PathBuf::from("/ws/root"), PathBuf::from("/ws/other")],
+            files: vec![PathBuf::from("/home/user/notes.toml")],
+        };
 
         // Fresh deposit: consumed verbatim, one-shot.
         cache

@@ -181,6 +181,32 @@ pub fn root_lock_dir(root: &Path) -> PathBuf {
     root_lock_dir_in(&locks_dir(), root)
 }
 
+/// The lock directory for a single **markerless file** under `locks_base`:
+/// `<locks_base>/<encoded-file>/` (brackets 03).
+///
+/// The per-file analogue of [`root_lock_dir_in`]: a covered edit to a file
+/// outside every repository root has no kitchen to book into, so the FILE
+/// itself is the mutual-exclusion unit — two agents editing the same stray
+/// file collide on exactly that file, and sibling files in the same directory
+/// never contend (zero root collateral). Same encoding, same anatomy (owner
+/// file, `dir/` ledger with one leaf, `.root` record — here recording the
+/// file's own path), so the claim / paid-idle-reap / facts machinery reads a
+/// file-scope dir unchanged. The two scopes are told apart by the record:
+/// a root record names a directory, a file record names a file, so the root
+/// enumeration ([`debtor_roots_in`]) and the file enumeration
+/// ([`debtor_files_in`]) never cross.
+#[must_use]
+pub fn file_lock_dir_in(locks_base: &Path, file: &Path) -> PathBuf {
+    locks_base.join(crate::paths::encode_cwd(file))
+}
+
+/// Production wrapper for [`file_lock_dir_in`] resolving the base through
+/// [`locks_dir`].
+#[must_use]
+pub fn file_lock_dir(file: &Path) -> PathBuf {
+    file_lock_dir_in(&locks_dir(), file)
+}
+
 /// The `dir/` touch-tree base inside a root's lock directory.
 fn ledger_dir(lock_dir: &Path) -> PathBuf {
     lock_dir.join("dir")
@@ -345,6 +371,147 @@ fn book_file(lock_dir: &Path, root: &Path, file: &Path) {
         .write(true)
         .truncate(false)
         .open(&touch);
+}
+
+/// The single ledger leaf inside a file-scope lock dir: `dir/<name>.lock`
+/// (brackets 03).
+///
+/// Mirrors [`touch_file`]'s shape at file granularity: the leaf keeps the
+/// file's own name (plus the ledger-safe `.lock` suffix), so [`due_count`]
+/// counts it like any root-scope leaf. A file with no name (defensive — the
+/// caller books canonical file paths) flattens via
+/// [`crate::paths::encode_cwd`].
+fn file_touch_path(lock_dir: &Path, file: &Path) -> PathBuf {
+    let mut name = file.file_name().map_or_else(
+        || std::ffi::OsString::from(crate::paths::encode_cwd(file)),
+        std::ffi::OsStr::to_os_string,
+    );
+    name.push(".lock");
+    ledger_dir(lock_dir).join(name)
+}
+
+/// Books the file-scope ledger: the `.root` record naming the FILE plus the
+/// single `dir/<name>.lock` leaf (brackets 03).
+///
+/// Idempotent and best-effort like [`book_file`]. The record names the file
+/// itself so [`debtor_files_in`] can recover the absolute path from the lossy
+/// dir-name encoding — and so the scope is self-describing (a file record ⇒
+/// file scope).
+fn book_file_scope(lock_dir: &Path, file: &Path) {
+    record_root(lock_dir, file);
+    let touch = file_touch_path(lock_dir, file);
+    if let Some(parent) = touch.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&touch);
+}
+
+/// Whether a markerless file's OWN ledger holds unpaid debt (brackets 03).
+///
+/// The per-file analogue of [`has_debt_in`]: a booked, undiagnosed file-scope
+/// leaf reports `true`; a paid (unlinked) or never-booked file reports
+/// `false`. Best-effort: an unreadable ledger reports `false`.
+#[must_use]
+pub fn file_has_debt_in(locks_base: &Path, file: &Path) -> bool {
+    due_count(&file_lock_dir_in(locks_base, file)) > 0
+}
+
+/// Production wrapper for [`file_has_debt_in`] resolving the base through
+/// [`locks_dir`].
+#[must_use]
+pub fn file_has_debt(file: &Path) -> bool {
+    file_has_debt_in(&locks_dir(), file)
+}
+
+/// Every markerless FILE whose file-scope ledger holds unpaid debt under
+/// `locks_base` (brackets 03).
+///
+/// The per-file analogue of [`debtor_roots_in`], recovered from each lock
+/// dir's record with the same self-checks: the recorded path must reproduce
+/// the dir's own encoded name, and it must still exist **as a file** — the
+/// disjointness leg that keeps root scopes (`is_dir`) and file scopes
+/// (`is_file`) out of each other's enumerations. Sorted for stable output.
+#[must_use]
+pub fn debtor_files_in(locks_base: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(locks_base) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let lock_dir = entry.path();
+        if !lock_dir.is_dir() || due_count(&lock_dir) == 0 {
+            continue;
+        }
+        let Some(file) = read_root_record(&lock_dir) else {
+            continue;
+        };
+        let record_matches_dir = lock_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name == crate::paths::encode_cwd(&file));
+        if record_matches_dir && file.is_file() {
+            out.push(file);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Production wrapper for [`debtor_files_in`] resolving the base through
+/// [`locks_dir`].
+#[must_use]
+pub fn debtor_files() -> Vec<PathBuf> {
+    debtor_files_in(&locks_dir())
+}
+
+/// The owner-vetted FILE scopes for the hook's serve-set deposit — every
+/// debtor file whose lock is held by `owner` (brackets 03, the files leg of
+/// the bugs-124/128 deposit).
+///
+/// The file-scope sibling of [`vetted_serve_roots_in`]: the hook (the one seam
+/// with identity) computes this and deposits it alongside the root kitchens,
+/// so a bare `catenary diagnostics` pays the caller's stray-file debt too.
+/// Foreign-owned and ownerless file scopes are silently excluded — another
+/// agent's stray file is never pulled.
+#[must_use]
+pub fn vetted_serve_files_in(locks_base: &Path, owner: &Owner) -> Vec<PathBuf> {
+    debtor_files_in(locks_base)
+        .into_iter()
+        .filter(|file| owner_of_in(locks_base, file).is_some_and(|o| o == *owner))
+        .collect()
+}
+
+/// Production wrapper for [`vetted_serve_files_in`] resolving the base through
+/// [`locks_dir`].
+#[must_use]
+pub fn vetted_serve_files(owner: &Owner) -> Vec<PathBuf> {
+    vetted_serve_files_in(&locks_dir(), owner)
+}
+
+/// Unlinks a delivered markerless file's ledger leaf from its file-scope lock
+/// dir (brackets 03).
+///
+/// The file-scope delivery leg of [`unlink_delivered_in`]: canonicalizes at
+/// the seam (misc 193 — the booking canonicalized, so the encoding must match),
+/// then removes `dir/<name>.lock`. A file that was never file-scope-booked
+/// (no lock dir) reports [`UnlinkOutcome::NoLedger`]; payment is parole here
+/// too — the lock dir survives for the paid-idle reaper.
+fn unlink_delivered_file_in(locks_base: &Path, file: &Path) -> UnlinkOutcome {
+    let file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    let lock_dir = file_lock_dir_in(locks_base, &file);
+    if !lock_dir.exists() {
+        return UnlinkOutcome::NoLedger;
+    }
+    let touch = file_touch_path(&lock_dir, &file);
+    match std::fs::remove_file(&touch) {
+        Ok(()) => UnlinkOutcome::Unlinked,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => UnlinkOutcome::NoEntry,
+        Err(e) => UnlinkOutcome::Failed(e.kind()),
+    }
 }
 
 /// The number of files awaiting diagnosis in a lock's ledger (touch-tree leaf
@@ -596,8 +763,10 @@ pub fn vetted_serve_roots(cwd: &Path, owner: &Owner) -> Vec<PathBuf> {
 /// diagnose serve landed, root-ownership stage 3). This re-keys the gate to the
 /// single source of truth: for each candidate, resolve its root
 /// ([`resolve_lock_root`]) and test membership in that root's due set
-/// ([`due_files_in`]). A candidate still on the touch-tree is unpaid → returned;
-/// a paid (unlinked), never-booked, or foreign-territory candidate is not.
+/// ([`due_files_in`]); a markerless candidate is tested against its own
+/// file-scope ledger instead ([`file_has_debt_in`], brackets 03). A candidate
+/// still on a touch-tree is unpaid → returned; a paid (unlinked), never-booked,
+/// or genuinely-foreign candidate is not.
 ///
 /// **Path-spelling discipline (load-bearing):** every candidate is canonicalized
 /// at this ingestion seam so its spelling matches the canonical `.lock` leaves the
@@ -624,7 +793,12 @@ pub fn due_candidates_in(locks_base: &Path, candidates: &[PathBuf]) -> Vec<PathB
             .canonicalize()
             .unwrap_or_else(|_| candidate.clone());
         let Some(root) = resolve_lock_root(&file) else {
-            // Foreign territory (/tmp, scratch) — never booked, never due.
+            // Markerless: the per-file ledger answers (brackets 03). A stray
+            // file the edit seam file-scope-booked is due until diagnosed; a
+            // genuinely-foreign candidate (never booked) is not.
+            if file_has_debt_in(locks_base, &file) {
+                out.push(file);
+            }
             continue;
         };
         let due = due_by_root
@@ -1017,7 +1191,14 @@ pub fn acquire_in(
     let file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
     let file = file.as_path();
     let Some(root) = resolve_lock_root(file) else {
-        // Foreign territory (/tmp, scratch) — never tracked, no lock.
+        // Markerless (brackets 03): a type the rootless single-file tier
+        // serves books against the FILE — per-file lock, per-file ledger, so
+        // roots track debt via a root and single files track debt on single
+        // files. Anything else is genuinely-foreign territory (no lock,
+        // unchanged).
+        if booking.books_single_file(file) {
+            return acquire_file_scope_in(locks_base, file, owner, now);
+        }
         return Acquired::Ours;
     };
     let books = booking.books(file);
@@ -1090,6 +1271,96 @@ pub fn acquire_in(
 #[must_use]
 pub fn acquire(file: &Path, owner: &Owner, booking: &Booking, now: SystemTime) -> Acquired {
     acquire_in(&locks_dir(), file, owner, booking, now)
+}
+
+/// Acquires (or re-affirms) the per-FILE lock for a covered markerless edit
+/// (brackets 03).
+///
+/// The file-scope arm of [`acquire_in`], reached when [`resolve_lock_root`]
+/// finds no repository marker and the static single-file booking gate
+/// ([`Booking::books_single_file`]) covers the type. Same mkdir/EEXIST
+/// protocol, same fail-open posture — the mutual-exclusion unit is just the
+/// FILE's own lock dir, so two agents editing the same stray file collide on
+/// exactly that file and nothing else. `file` arrives canonicalized (the
+/// [`acquire_in`] ingestion seam).
+fn acquire_file_scope_in(
+    locks_base: &Path,
+    file: &Path,
+    owner: &Owner,
+    now: SystemTime,
+) -> Acquired {
+    let lock_dir = file_lock_dir_in(locks_base, file);
+    match std::fs::create_dir_all(locks_base).and_then(|()| std::fs::create_dir(&lock_dir)) {
+        Ok(()) => {
+            // First cook on this stray file.
+            let _ = write_owner_atomic(&lock_dir, owner);
+            book_file_scope(&lock_dir, file);
+            Acquired::Ours
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            match read_owner_name(&lock_dir) {
+                Ok(Some(name)) if name == owner.file_name() => {
+                    book_file_scope(&lock_dir, file);
+                    touch_owner(&lock_dir, &name);
+                    Acquired::Ours
+                }
+                Ok(Some(_)) => {
+                    let age = last_activity_age(&lock_dir, now);
+                    let due = due_count(&lock_dir);
+                    let paid_and_idle = is_paid_and_idle(&lock_dir, now, PAID_IDLE_TIMEOUT);
+                    Acquired::Denied(file_deny_briefing(file, age, due, paid_and_idle))
+                }
+                Ok(None) => {
+                    // Ownerless: mid-swing inside the grace, an interrupted
+                    // acquisition past it — the same two truths the root arm
+                    // tells apart ([`acquire_in`]).
+                    let age = last_activity_age(&lock_dir, now);
+                    if age.is_some_and(|a| a > OWNERLESS_GRACE) {
+                        Acquired::Denied(ownerless_briefing(file, age))
+                    } else {
+                        Acquired::Denied(file_deny_briefing(file, Some(Duration::ZERO), 0, false))
+                    }
+                }
+                Err(_) => Acquired::Ours,
+            }
+        }
+        Err(_) => Acquired::Ours,
+    }
+}
+
+/// Formats the deny briefing for a stray FILE held by another identity
+/// (brackets 03).
+///
+/// The file-scope sibling of [`deny_briefing`]: names the file (not a root) so
+/// the copy tells the truth about the collision's granularity, and points at
+/// the same `catenary claim` rescue — [`claim_in`] keys by encoded path, so a
+/// claim on the file transfers exactly this one lock.
+#[must_use]
+pub fn file_deny_briefing(
+    file: &Path,
+    age: Option<Duration>,
+    due: usize,
+    paid_and_idle: bool,
+) -> String {
+    let file = file.display();
+    let ago = age.map_or_else(|| "just now".to_string(), format_age);
+    if paid_and_idle || due == 0 {
+        format!(
+            "file locked: {file}\n\
+             held by another agent — last activity {ago}; no unpaid debt; lock expires shortly.\n\
+             If the previous agent is not coming back, take over with:\n\
+             \x20 catenary claim {file}\n\
+             Claiming transfers this file and its diagnostic debt to you."
+        )
+    } else {
+        format!(
+            "file locked: {file}\n\
+             held by another agent — last activity {ago}; awaiting diagnosis.\n\
+             If the previous agent is not coming back, take over with:\n\
+             \x20 catenary claim {file}\n\
+             Claiming transfers this file and its diagnostic debt to you."
+        )
+    }
 }
 
 /// Claims a root's lock for `claimant` under `locks_base` — the agent-invocable
@@ -1482,8 +1753,10 @@ pub fn merge_transfer(
 /// holds a flat file list rather than a per-root grouping (the diagnostics
 /// delivery seam). Each file is canonicalized
 /// inside [`unlink_delivered_in`] so a symlinked-prefix alias pays the canonical
-/// ledger it booked against (misc 193). Best-effort: a file that resolves to no
-/// root unlinks nothing and reports [`UnlinkOutcome::NoRoot`]. Returns every
+/// ledger it booked against (misc 193). A markerless file pays its own
+/// file-scope ledger instead ([`unlink_delivered_file_in`], brackets 03); a
+/// genuinely-foreign file — no root AND no file-scope lock dir — unlinks
+/// nothing and reports [`UnlinkOutcome::NoRoot`]. Returns every
 /// entry's [`UnlinkOutcome`] so the delivery seam can trace the payment
 /// per file (bug 120); callers with no forensic seam ignore the receipt.
 #[allow(
@@ -1491,6 +1764,18 @@ pub fn merge_transfer(
     reason = "called for the unlink side effect; the outcome receipt is optional forensics (bug 120)"
 )]
 pub fn unlink_delivered_by_root(files: &[PathBuf]) -> Vec<(PathBuf, UnlinkOutcome)> {
+    unlink_delivered_by_root_in(&locks_dir(), files)
+}
+
+/// Testable base-injected form of [`unlink_delivered_by_root`].
+#[allow(
+    clippy::must_use_candidate,
+    reason = "called for the unlink side effect; the outcome receipt is optional forensics (bug 120)"
+)]
+pub fn unlink_delivered_by_root_in(
+    locks_base: &Path,
+    files: &[PathBuf],
+) -> Vec<(PathBuf, UnlinkOutcome)> {
     use std::collections::HashMap;
     let mut by_root: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
     let mut outcomes = Vec::with_capacity(files.len());
@@ -1498,11 +1783,18 @@ pub fn unlink_delivered_by_root(files: &[PathBuf]) -> Vec<(PathBuf, UnlinkOutcom
         if let Some(root) = resolve_lock_root(file) {
             by_root.entry(root).or_default().push(file.clone());
         } else {
-            outcomes.push((file.clone(), UnlinkOutcome::NoRoot));
+            // Markerless: the file-scope ledger is the payee (brackets 03).
+            // A file that was never file-scope-booked reports the honest
+            // no-ledger reading — `NoRoot` when no lock dir exists at all.
+            let outcome = match unlink_delivered_file_in(locks_base, file) {
+                UnlinkOutcome::NoLedger => UnlinkOutcome::NoRoot,
+                paid => paid,
+            };
+            outcomes.push((file.clone(), outcome));
         }
     }
     for (root, served) in &by_root {
-        outcomes.extend(unlink_delivered(root, served));
+        outcomes.extend(unlink_delivered_in(locks_base, root, served));
     }
     outcomes
 }
@@ -1604,6 +1896,12 @@ pub struct Booking {
     /// Linter path-glob matchers — a file whose root-relative path matches any
     /// of these books even without a language-server binding.
     linters: Vec<crate::config::LinterConfig>,
+    /// File extension (no dot) → a bound server serves single-file
+    /// **diagnostics** (brackets 03) — the static approximation of the
+    /// daemon's `has_single_file_coverage` gate.
+    single_file_extensions: std::collections::HashMap<String, bool>,
+    /// Exact filename → single-file diagnostics coverage.
+    single_file_filenames: std::collections::HashMap<String, bool>,
 }
 
 impl Booking {
@@ -1617,23 +1915,59 @@ impl Booking {
     pub fn from_config(config: &crate::config::Config) -> Self {
         let mut extensions = std::collections::HashMap::new();
         let mut filenames = std::collections::HashMap::new();
+        let mut single_file_extensions = std::collections::HashMap::new();
+        let mut single_file_filenames = std::collections::HashMap::new();
 
-        for lc in config.language.values() {
+        for (lang_key, lc) in &config.language {
             let books = !lc.servers().is_empty();
+            // The single-file leg (brackets 03): a language's markerless files
+            // book iff some bound, BLESSED server serves single-file
+            // diagnostics — the manifest's verified `serves-diagnostics`
+            // capability, or the user-scope `single_file = true` opt-in. The
+            // static mirror of the daemon's `has_single_file_coverage` gate
+            // (minus the runtime negative cache — over-booking a server that
+            // then rejects null-workspace init is safe: the serve renders
+            // honestly and the debt retires on delivery).
+            let books_single_file = lc.servers().iter().any(|binding| {
+                let def_opt_in = config
+                    .server
+                    .get(&binding.name)
+                    .is_some_and(|def| def.single_file);
+                let manifest =
+                    crate::lsp::server_behavior::ServerProfile::for_server(&binding.name)
+                        .single_file()
+                        .serves_diagnostics();
+                (def_opt_in || manifest) && crate::recipes::is_server_blessed(&binding.name)
+            });
             if let Some(ref exts) = lc.extensions {
                 for ext in exts {
                     // A booking language upgrades a non-booking prior claim on
                     // the same extension (`or` accumulation).
                     let entry = extensions.entry(ext.clone()).or_insert(false);
                     *entry = *entry || books;
+                    let sf = single_file_extensions.entry(ext.clone()).or_insert(false);
+                    *sf = *sf || books_single_file;
                 }
             }
             if let Some(ref fnames) = lc.filenames {
                 for fname in fnames {
                     let entry = filenames.entry(fname.clone()).or_insert(false);
                     *entry = *entry || books;
+                    let sf = single_file_filenames.entry(fname.clone()).or_insert(false);
+                    *sf = *sf || books_single_file;
                 }
             }
+            // Raw-extension fallback parity (brackets 03): the daemon resolves
+            // an unclassified extension AS a language id
+            // (`resolve_language(ext)` — the tier-3 dispatch and the coverage
+            // gate both fall back this way), so the language KEY itself is a
+            // bookable extension. This is the leg an extensionless binding
+            // (`CATENARY_SERVERS`-derived, no `extensions` list) routes
+            // through.
+            let sf = single_file_extensions
+                .entry(lang_key.clone())
+                .or_insert(false);
+            *sf = *sf || books_single_file;
         }
 
         let linters = config.linter.values().cloned().collect();
@@ -1642,6 +1976,8 @@ impl Booking {
             extensions,
             filenames,
             linters,
+            single_file_extensions,
+            single_file_filenames,
         }
     }
 
@@ -1676,6 +2012,36 @@ impl Booking {
             })
             .unwrap_or_else(|| PathBuf::from(file.file_name().unwrap_or(file.as_os_str())));
         self.linters.iter().any(|l| l.matches(&rel))
+    }
+
+    /// Whether a **markerless** edited `file` books against its own file-scope
+    /// ledger (brackets 03) — its type maps to a blessed server that serves
+    /// single-file diagnostics.
+    ///
+    /// The static mirror of the daemon's edit-gate coverage for out-of-root
+    /// files (`has_single_file_coverage`): the gate arms only for types the
+    /// rootless singleton can actually diagnose, so the ledger must book
+    /// exactly those (booking honesty). Linters are deliberately absent — the
+    /// rootless serve is LSP-only, so a linter glob never books a stray file.
+    #[must_use]
+    pub fn books_single_file(&self, file: &Path) -> bool {
+        if let Some(name) = file.file_name().and_then(|n| n.to_str())
+            && self
+                .single_file_filenames
+                .get(name)
+                .copied()
+                .unwrap_or(false)
+        {
+            return true;
+        }
+        file.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| {
+                self.single_file_extensions
+                    .get(ext)
+                    .copied()
+                    .unwrap_or(false)
+            })
     }
 }
 
@@ -1992,6 +2358,194 @@ mod tests {
         assert!(
             resolve_lock_root(&file).is_none(),
             "scratch path resolves to no lock root"
+        );
+    }
+
+    // ── per-file scope (brackets 03) ─────────────────────────────────
+
+    /// A markerless scratch dir plus a stray file of the given name.
+    fn stray_file(scratch: &tempfile::TempDir, name: &str) -> PathBuf {
+        let file = scratch.path().join(name);
+        std::fs::write(&file, b"x = 1\n").expect("write stray");
+        file.canonicalize().expect("canon stray")
+    }
+
+    #[test]
+    fn stray_covered_edit_books_per_file_scope() {
+        // Brackets 03: a covered edit to a markerless file books against the
+        // FILE — per-file lock dir, per-file ledger leaf — and the Stop
+        // gate's candidate scan sees it as due. TOML is the covered stray
+        // type (taplo's verified `serves-diagnostics` manifest row).
+        let fx = Fixture::new();
+        let scratch = tempfile::tempdir().expect("scratch");
+        let file = stray_file(&scratch, "notes.toml");
+        let owner = Owner::new("claude", "sess-a", "");
+
+        let got = acquire_in(
+            &fx.locks(),
+            &file,
+            &owner,
+            &rust_booking(),
+            SystemTime::now(),
+        );
+        assert!(matches!(got, Acquired::Ours), "stray covered edit admitted");
+
+        let lock_dir = file_lock_dir_in(&fx.locks(), &file);
+        assert!(lock_dir.is_dir(), "the FILE's own lock dir exists");
+        assert!(
+            file_has_debt_in(&fx.locks(), &file),
+            "the file-scope ledger holds the booked debt"
+        );
+        assert_eq!(
+            due_candidates_in(&fx.locks(), std::slice::from_ref(&file)),
+            vec![file.clone()],
+            "the Stop gate's candidate scan names the unpaid stray file"
+        );
+        assert_eq!(
+            debtor_files_in(&fx.locks()),
+            vec![file],
+            "the file enumeration recovers the stray from its record"
+        );
+        assert!(
+            debtor_roots_in(&fx.locks()).is_empty(),
+            "a file scope never leaks into the ROOT enumeration"
+        );
+    }
+
+    #[test]
+    fn stray_file_collision_is_per_file_zero_root_collateral() {
+        // Two agents editing the SAME stray file collide on exactly that
+        // file; a sibling file in the same directory is free — zero root
+        // collateral (brackets 03).
+        let fx = Fixture::new();
+        let scratch = tempfile::tempdir().expect("scratch");
+        let shared = stray_file(&scratch, "shared.toml");
+        let sibling = stray_file(&scratch, "sibling.toml");
+        let ours = Owner::new("claude", "sess-a", "");
+        let theirs = Owner::new("claude", "sess-b", "");
+        let booking = rust_booking();
+        let now = SystemTime::now();
+
+        assert!(matches!(
+            acquire_in(&fx.locks(), &shared, &ours, &booking, now),
+            Acquired::Ours
+        ));
+        let denied = acquire_in(&fx.locks(), &shared, &theirs, &booking, now);
+        let Acquired::Denied(briefing) = denied else {
+            panic!("second cook on the same stray file must be denied");
+        };
+        assert!(
+            briefing.contains("file locked:") && briefing.contains("shared.toml"),
+            "the briefing names the FILE, not a root: {briefing}"
+        );
+        assert!(
+            briefing.contains("catenary claim"),
+            "the briefing teaches the takeover: {briefing}"
+        );
+        assert!(
+            matches!(
+                acquire_in(&fx.locks(), &sibling, &theirs, &booking, now),
+                Acquired::Ours
+            ),
+            "a sibling stray file in the same directory never contends"
+        );
+    }
+
+    #[test]
+    fn stray_delivery_pays_the_file_scope_ledger() {
+        // Delivery pays per-file debt exactly like root debt: the leaf
+        // unlinks, the debt clears, and a repeat unlink reports the honest
+        // no-entry reading. A genuinely-foreign (never-booked) file reports
+        // `NoRoot`.
+        let fx = Fixture::new();
+        let scratch = tempfile::tempdir().expect("scratch");
+        let file = stray_file(&scratch, "paid.toml");
+        let never_booked = stray_file(&scratch, "never.toml");
+        let owner = Owner::new("claude", "sess-a", "");
+
+        let _ = acquire_in(
+            &fx.locks(),
+            &file,
+            &owner,
+            &rust_booking(),
+            SystemTime::now(),
+        );
+        assert!(file_has_debt_in(&fx.locks(), &file), "debt booked");
+
+        let outcomes = unlink_delivered_by_root_in(&fx.locks(), std::slice::from_ref(&file));
+        assert_eq!(
+            outcomes,
+            vec![(file.clone(), UnlinkOutcome::Unlinked)],
+            "delivery unlinks the file-scope leaf"
+        );
+        assert!(
+            !file_has_debt_in(&fx.locks(), &file),
+            "the stray file's debt is paid"
+        );
+        assert!(
+            file_lock_dir_in(&fx.locks(), &file).is_dir(),
+            "payment is parole — the lock dir survives for the reaper"
+        );
+        assert_eq!(
+            unlink_delivered_by_root_in(&fx.locks(), std::slice::from_ref(&file)),
+            vec![(file, UnlinkOutcome::NoEntry)],
+            "a repeat delivery reports no standing entry"
+        );
+        assert_eq!(
+            unlink_delivered_by_root_in(&fx.locks(), std::slice::from_ref(&never_booked)),
+            vec![(never_booked, UnlinkOutcome::NoRoot)],
+            "a never-booked markerless file has no ledger to pay"
+        );
+    }
+
+    #[test]
+    fn vetted_serve_files_filters_by_owner() {
+        // The deposit's files leg (brackets 03): only the caller's OWN file
+        // scopes ride the vetted set — a foreign agent's stray file is never
+        // pulled.
+        let fx = Fixture::new();
+        let scratch = tempfile::tempdir().expect("scratch");
+        let mine = stray_file(&scratch, "mine.toml");
+        let foreign = stray_file(&scratch, "foreign.toml");
+        let me = Owner::new("claude", "sess-a", "");
+        let other = Owner::new("claude", "sess-b", "");
+        let booking = rust_booking();
+        let now = SystemTime::now();
+
+        let _ = acquire_in(&fx.locks(), &mine, &me, &booking, now);
+        let _ = acquire_in(&fx.locks(), &foreign, &other, &booking, now);
+
+        assert_eq!(
+            vetted_serve_files_in(&fx.locks(), &me),
+            vec![mine],
+            "the vetted files leg carries exactly the caller's own strays"
+        );
+    }
+
+    #[test]
+    fn booking_single_file_gate_matches_capability() {
+        // The static single-file booking gate mirrors the daemon's
+        // `has_single_file_coverage` shape: taplo's verified
+        // `serves-diagnostics` row books TOML strays; rust-analyzer is
+        // `unsupported` (fail-closed) so a stray .rs never books; lattice is
+        // verified-negative (`enrichment-only`, brackets 06) so a stray .md
+        // never books; an unserved type (.txt) books nothing.
+        let booking = rust_booking();
+        assert!(
+            booking.books_single_file(Path::new("/scratch/notes.toml")),
+            "toml books single-file (taplo serves-diagnostics)"
+        );
+        assert!(
+            !booking.books_single_file(Path::new("/scratch/main.rs")),
+            "rust is unsupported rootless — never books single-file"
+        );
+        assert!(
+            !booking.books_single_file(Path::new("/scratch/notes.md")),
+            "markdown is enrichment-only — never books single-file"
+        );
+        assert!(
+            !booking.books_single_file(Path::new("/scratch/notes.txt")),
+            "an unserved type books nothing"
         );
     }
 

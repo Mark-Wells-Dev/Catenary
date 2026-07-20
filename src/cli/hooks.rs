@@ -2155,7 +2155,9 @@ fn handle_start_editing_hook(hook_json: &serde_json::Value, format: HostFormat) 
 ///
 /// The vetted set is deposited in the daemon via `pre-tool/editing-stop` IPC
 /// (serde-default `vetted_roots` field — absent on old daemons, ignored
-/// harmlessly). The identity-free `tool/editing-stop` handler consumes it
+/// harmlessly), together with the caller's owned FILE scopes (`vetted_files`,
+/// brackets 03) so a bare serve pays stray-file debt too. The identity-free
+/// `tool/editing-stop` handler consumes it
 /// one-shot and skips the ambiguous `bare_serve_roots` enumeration.
 ///
 /// **Scoped** `catenary diagnostics <path…>` names explicit paths and serves them
@@ -2214,6 +2216,10 @@ fn handle_done_editing_hook(
     // and the unanchored-ambiguous case are handled gracefully — the caller's
     // own kitchens are always found here because identity IS available.
     let vetted = crate::lock::vetted_serve_roots(&cwd, &owner);
+    // The files leg (brackets 03): every markerless file whose file-scope lock
+    // this identity holds rides the same deposit, so the bare serve pays
+    // stray-file debt alongside the root kitchens.
+    let vetted_files = crate::lock::vetted_serve_files(&owner);
 
     // Deposit the vetted set in the daemon so `tool/editing-stop` can bypass
     // the ambiguous `bare_serve_roots` enumeration (bugs 124/128). Best-effort:
@@ -2225,6 +2231,10 @@ fn handle_done_editing_hook(
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
+        let vetted_files_json: Vec<String> = vetted_files
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         let agent_id = extract_agent_id(hook_json);
         let session_id = extract_session_id(hook_json, format);
         let mut request = serde_json::json!({
@@ -2232,6 +2242,7 @@ fn handle_done_editing_hook(
             "cwd": cwd_str.as_ref(),
             "agent_id": agent_id,
             "vetted_roots": vetted_json,
+            "vetted_files": vetted_files_json,
         });
         if let Some(sid) = session_id {
             request["session_id"] = serde_json::json!(sid);

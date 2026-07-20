@@ -230,6 +230,19 @@ pub(crate) enum HookRequest {
             reason = "deserialized from IPC protocol; consumed by the daemon via raw JSON, not via this enum variant"
         )]
         vetted_roots: Vec<std::path::PathBuf>,
+
+        /// Owner-vetted FILE scopes deposited alongside the root kitchens
+        /// (brackets 03): every markerless file whose file-scope lock the
+        /// caller's identity holds, so a bare `catenary diagnostics` pays
+        /// stray-file debt too. Additive and serde-default — an old hook that
+        /// does not send it deserialises to `[]` and the bare serve simply
+        /// pays root kitchens only (old-hook posture unchanged).
+        #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "deserialized from IPC protocol; consumed by the daemon via raw JSON, not via this enum variant"
+        )]
+        vetted_files: Vec<std::path::PathBuf>,
     },
 
     /// Execute the `editing stop` pipeline and return diagnostics.

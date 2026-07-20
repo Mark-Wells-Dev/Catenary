@@ -1334,6 +1334,59 @@ impl LspClientManager {
             .collect()
     }
 
+    /// Resolves the server binding the rootless single-file DIAGNOSTICS serve
+    /// uses for a markerless `path` of language `lang` (brackets 03).
+    ///
+    /// The per-binding form of [`Self::has_single_file_coverage`] — the same
+    /// qualification legs (verified `serves-diagnostics` capability or the
+    /// user-scope `single_file = true` opt-in, blessed, not negative-cached),
+    /// plus the binding's file-pattern gate the tier-3 dispatch applies
+    /// ([`get_servers`]'s `compiled_patterns` check) — returning the first
+    /// qualifying binding's `(language, server)` pair for
+    /// [`Self::with_single_file_bracket`]. `None` means no server serves
+    /// single-file diagnostics for this language: the serve then answers with
+    /// the honest disclosure instead of a mount or a refusal.
+    #[must_use]
+    pub fn single_file_diagnostics_server(&self, lang: &str, path: &Path) -> Option<String> {
+        let lang_config = self.config.resolve_language(lang)?;
+        let failures = self
+            .single_file_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lang_config
+            .servers()
+            .iter()
+            .find(|binding| {
+                let Some(def) = self.config.server.get(&binding.name) else {
+                    return false;
+                };
+                if !file_matches_patterns(path, &def.compiled_patterns) {
+                    return false;
+                }
+                (def.single_file
+                    || crate::lsp::server_behavior::ServerProfile::for_server(&binding.name)
+                        .single_file()
+                        .serves_diagnostics())
+                    && server_is_blessed(&binding.name)
+                    && !failures.contains(&(lang.to_string(), binding.name.clone()))
+            })
+            .map(|binding| binding.name.clone())
+    }
+
+    /// The first server binding configured for `lang` regardless of
+    /// single-file capability — the name the rootless serve's disclosure line
+    /// carries when [`Self::single_file_diagnostics_server`] finds no
+    /// qualifying binding (brackets 03: an `enrichment-only` / `unsupported`
+    /// server still gets named in the honest answer).
+    #[must_use]
+    pub fn first_bound_server(&self, lang: &str) -> Option<String> {
+        self.config
+            .resolve_language(lang)?
+            .servers()
+            .first()
+            .map(|binding| binding.name.clone())
+    }
+
     /// Returns whether any **blessed** server is configured for this language in
     /// `root` — the diagnostics coverage gate (diagnostics-debt 04b).
     ///
