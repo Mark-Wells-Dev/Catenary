@@ -340,6 +340,13 @@ impl Connection {
                     }
                     () = kill.cancelled() => {
                         let _ = child.start_kill();
+                        // Reap the killed child (bug 135): `start_kill` only
+                        // delivers the signal. Without this wait the child is
+                        // left to tokio's global orphan queue, which only
+                        // reaps on later SIGCHLD processing — a wedged or
+                        // shut-down driver never runs it, and the killed
+                        // child lingers as a zombie until the daemon exits.
+                        let _ = child.wait().await;
                     }
                 }
             });
@@ -1294,6 +1301,63 @@ mod tests {
         assert!(
             !alive.load(Ordering::SeqCst),
             "child should be dead after Connection drop"
+        );
+    }
+
+    /// The kill path must reap (bug 135): the child-exit task's kill arm
+    /// `wait()`s after `start_kill()`, so the killed child never lingers as
+    /// a zombie (state Z). Pins the property rather than the omission: in a
+    /// healthy runtime tokio's global orphan queue also reaps dropped
+    /// children on later SIGCHLD processing, so this test cannot go red on
+    /// the wait-less shape here — the leak fires when that machinery is
+    /// wedged (the bug's nine-zombie census, parented by stuck daemons),
+    /// which only the arm's own `wait()` covers.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn drop_killed_child_is_reaped_not_left_a_zombie() {
+        let server = std::sync::Arc::new(super::super::server::LspServer::new(
+            "test".to_string(),
+            "test-server".to_string(),
+            None,
+        ));
+        let logging = LoggingServer::new();
+        let bin = crate::lsp::test_support::mockls_bin();
+        let (conn, _stderr) = Connection::new(
+            bin.to_str().expect("mockls path is UTF-8"),
+            &["test"],
+            std::process::Stdio::null(),
+            None,
+            &server,
+            "test".to_string(),
+            logging,
+            "test-server",
+            "",
+        )
+        .expect("mockls should spawn");
+        let pid = conn.pid().expect("spawned child has a pid");
+
+        // Fire the kill token directly (not via Drop): the child is still
+        // alive when the child-exit task polls, so the select
+        // deterministically takes the kill arm — the leak path. Drop would
+        // also SIGKILL by PID first, racing the `child.wait()` arm into
+        // reaping and masking the omission under test.
+        conn.kill_token.cancel();
+
+        // A reaped child's /proc entry disappears. An unreaped one persists
+        // in state Z for the life of this process — poll attempt-bounded,
+        // then name the leftover state in the assertion.
+        let stat_path = format!("/proc/{pid}/stat");
+        for _ in 0..120 {
+            if std::fs::read_to_string(&stat_path).is_err() {
+                return; // reaped
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let stat = std::fs::read_to_string(&stat_path).ok();
+        drop(conn);
+        assert!(
+            stat.is_none(),
+            "killed child {pid} was never reaped (still present: {stat:?})"
         );
     }
 }

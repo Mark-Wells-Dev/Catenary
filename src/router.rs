@@ -2821,6 +2821,12 @@ pub struct SessionManager {
     /// once per accepted connection; never decremented. Used as the
     /// session key (`mcp:{n}`) to avoid fd-reuse collisions.
     next_connection_id: Arc<AtomicUsize>,
+    /// Accepted MCP connection sockets (bug 134). The accept loop's shutdown
+    /// arm sweeps this registry with `shutdown(Shutdown::Both)` so every
+    /// blocking MCP read returns EOF immediately and the stopped daemon's
+    /// runtime has no parked `spawn_blocking` task left to join — the close
+    /// the stop contract promises each attached bridge's reader.
+    mcp_conns: Arc<McpConnRegistry>,
     /// Session-aware hook dispatch context. `None` in tests that don't
     /// exercise hook routing (passthrough mode).
     hook_ctx: Option<HookDispatchContext>,
@@ -2961,6 +2967,7 @@ impl SessionManager {
             logging,
             connection_count: Arc::new(AtomicUsize::new(0)),
             next_connection_id: Arc::new(AtomicUsize::new(0)),
+            mcp_conns: Arc::new(McpConnRegistry::default()),
             hook_ctx: None,
             lsp: None,
             root_tracker: None,
@@ -3018,6 +3025,7 @@ impl SessionManager {
             logging,
             connection_count: Arc::new(AtomicUsize::new(0)),
             next_connection_id: Arc::new(AtomicUsize::new(0)),
+            mcp_conns: Arc::new(McpConnRegistry::default()),
             hook_ctx: None,
             lsp: None,
             root_tracker: None,
@@ -3163,6 +3171,21 @@ impl SessionManager {
                 }
                 () = self.shutdown.cancelled() => {
                     self.remove_sockets();
+                    // Force-close accepted MCP connections (bug 134): closing
+                    // the listeners never touches them, and their blocking
+                    // reads only end when the peer hangs up — the mutual
+                    // EOF-wait that pinned a stopped daemon in Runtime::drop
+                    // while its bridge waited for the close. The sweep makes
+                    // the stop contract true: each bridge's reader sees the
+                    // socket close now.
+                    let closed = self.mcp_conns.shutdown_all();
+                    if closed > 0 {
+                        info!(
+                            source = Source::DaemonLifecycle.as_str(),
+                            "shutdown: force-closed {closed} accepted MCP \
+                             connection(s)",
+                        );
+                    }
                     return Ok(());
                 }
                 () = self.disconnect.notified() => {
@@ -3323,6 +3346,7 @@ impl SessionManager {
         // `mcp:` prefix tags the tracing span for log correlation.
         let conn_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let session_key = format!("mcp:{conn_id}");
+        let conn_registry = Arc::clone(&self.mcp_conns);
 
         count.fetch_add(1, Ordering::Relaxed);
         // Census flush (pulse-05): the snapshot reads the shared counter at
@@ -3346,6 +3370,8 @@ impl SessionManager {
                     count,
                     disconnect,
                     census_snapshot,
+                    conn_registry: Arc::clone(&conn_registry),
+                    conn_id,
                 };
 
                 info!(
@@ -3385,6 +3411,23 @@ impl SessionManager {
                         return;
                     }
                 };
+                // Registry clone (bug 134): daemon teardown force-closes this
+                // socket so the blocking MCP read below can never pin
+                // Runtime::drop. A failed clone leaves the connection usable
+                // but unprotected — name it, since a stop with this
+                // connection attached would then wedge on the runtime
+                // backstop instead of closing cleanly.
+                match std_stream.try_clone() {
+                    Ok(clone) => conn_registry.register(conn_id, clone),
+                    Err(e) => {
+                        warn!(
+                            source = Source::DaemonDispatch.as_str(),
+                            "failed to clone MCP socket for the shutdown \
+                             registry — this connection cannot be force-closed \
+                             at daemon teardown: {e}",
+                        );
+                    }
+                }
                 let writer = std_stream;
 
                 // Clone shared state for post-disconnect cleanup
@@ -4066,6 +4109,85 @@ impl SessionManager {
     }
 }
 
+/// Registry of accepted MCP connection sockets (bug 134).
+///
+/// Each entry is a `try_clone` of an accepted connection's std socket,
+/// registered by the per-connection task once the tokio stream is converted
+/// for the blocking MCP loop, and removed by that task's [`ConnectionGuard`]
+/// when the connection ends. Daemon teardown sweeps the registry with
+/// `shutdown(Shutdown::Both)` so every blocking `read()` parked in
+/// `spawn_blocking` returns 0 immediately — without the sweep, runtime
+/// teardown joins a read only the PEER can end (the stop-loss wedge: the
+/// stopped daemon pins in `Runtime::drop` while the bridge waits for an EOF
+/// that never comes).
+#[cfg(unix)]
+#[derive(Default)]
+struct McpConnRegistry {
+    inner: std::sync::Mutex<McpConnRegistryInner>,
+}
+
+/// Lock-guarded interior of [`McpConnRegistry`].
+#[cfg(unix)]
+#[derive(Default)]
+struct McpConnRegistryInner {
+    /// Live accepted sockets, keyed by the connection's monotonic id.
+    conns: HashMap<usize, std::os::unix::net::UnixStream>,
+    /// Set by [`McpConnRegistry::shutdown_all`]. A connection accepted just
+    /// before the shutdown token fired can reach its registration after the
+    /// sweep; it must be shut down on arrival, not parked to re-arm the wedge.
+    closed: bool,
+}
+
+#[cfg(unix)]
+impl McpConnRegistry {
+    /// Registers a live connection's socket clone; if the teardown sweep has
+    /// already run, force-closes it immediately instead.
+    fn register(&self, conn_id: usize, sock: std::os::unix::net::UnixStream) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.closed {
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        } else {
+            inner.conns.insert(conn_id, sock);
+        }
+    }
+
+    /// Drops a connection's entry when it ends normally. A miss is fine —
+    /// registration may never have happened (stream conversion failed) or the
+    /// sweep already drained it.
+    fn deregister(&self, conn_id: usize) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.conns.remove(&conn_id);
+    }
+
+    /// Force-closes every registered socket and marks the registry closed.
+    ///
+    /// Returns how many sockets were shut down. `shutdown(Shutdown::Both)` on
+    /// each clone makes the blocking `read()` in the connection's MCP loop
+    /// return 0 (EOF) at once; the loop exits, its `ConnectionGuard` drops,
+    /// and the runtime has no parked blocking task left to join.
+    fn shutdown_all(&self) -> usize {
+        let drained: Vec<(usize, std::os::unix::net::UnixStream)> = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.closed = true;
+            inner.conns.drain().collect()
+        };
+        let count = drained.len();
+        for (_, sock) in drained {
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        }
+        count
+    }
+}
+
 /// RAII guard that decrements the connection count on drop.
 ///
 /// Always notifies the accept loop after decrementing. The accept loop
@@ -4081,11 +4203,17 @@ struct ConnectionGuard {
     /// bridge census (`daemon.mcp_connections`, pulse-05) reflects the
     /// disconnect promptly. `None` outside daemon mode.
     census_snapshot: Option<Arc<crate::state_snapshot::SnapshotWriter>>,
+    /// Accepted-socket registry (bug 134): the guard's drop retires this
+    /// connection's entry so the teardown sweep only touches live sockets.
+    conn_registry: Arc<McpConnRegistry>,
+    /// This connection's key in the registry.
+    conn_id: usize,
 }
 
 #[cfg(unix)]
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
+        self.conn_registry.deregister(self.conn_id);
         self.count.fetch_sub(1, Ordering::AcqRel);
         self.disconnect.notify_one();
         if let Some(writer) = &self.census_snapshot {
@@ -7283,7 +7411,7 @@ fn spawn_daemon() -> Result<()> {
     let stderr_file = std::fs::File::create(&log_path)
         .with_context(|| format!("create daemon log: {}", log_path.display()))?;
 
-    Command::new(exe)
+    let mut child = Command::new(exe)
         .arg("daemon")
         .env("_CATENARY_BRIDGE", "1")
         .stdin(Stdio::null())
@@ -7292,6 +7420,27 @@ fn spawn_daemon() -> Result<()> {
         .process_group(0)
         .spawn()
         .context("spawn daemon process")?;
+
+    // Reap the detached daemon when it dies (bug 134; the bug-135 shape on
+    // the spawn side). The daemon outlives this process by design, but when
+    // it exits first — `catenary stop`, a crash — it must not linger as this
+    // process's zombie child: `kill(pid, 0)` liveness probes and process
+    // censuses would read the corpse as a live daemon. One thread per spawn,
+    // parked in `wait()` until that daemon generation ends; a short-lived
+    // CLI (`catenary start`) exits without joining it, and the daemon then
+    // reparents to init, which reaps instead.
+    let reaper = std::thread::Builder::new()
+        .name("daemon-reaper".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    if let Err(e) = reaper {
+        debug!(
+            source = Source::DaemonLifecycle.as_str(),
+            "daemon reaper thread failed to spawn (daemon exits will not be \
+             reaped by this process): {e}",
+        );
+    }
 
     Ok(())
 }

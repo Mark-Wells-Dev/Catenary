@@ -14,6 +14,8 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
+#[cfg(unix)]
+use tracing::warn;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -1736,13 +1738,13 @@ fn run_daemon() -> Result<()> {
 fn run_daemon_main() -> Result<()> {
     // Build runtime first — bind_daemon_sockets needs the tokio
     // reactor for UnixListener::bind. The enter guard stays alive across the
-    // whole boot (bind, `serve_daemon`), and `rt` is dropped last — after
+    // whole boot (bind, `serve_daemon`), and `rt` is shut down last — after
     // `serve_daemon` returns — so background tasks shut down on the way out.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("build daemon runtime")?;
-    let _rt_guard = rt.enter();
+    let rt_guard = rt.enter();
 
     // Bind sockets immediately so bridge proxies can connect while
     // heavy initialization (config, DB, LSP servers) proceeds.
@@ -1781,8 +1783,38 @@ fn run_daemon_main() -> Result<()> {
     if let Err(e) = &outcome {
         notify_boot_refusal(e);
     }
+
+    // Bounded runtime teardown (bug 134, lean 2): `Runtime::drop` joins
+    // in-flight blocking tasks with no bound — a single blocking read that
+    // only a peer can end pins the exiting process forever (the stop-loss
+    // wedge). The bug-130 ladder discipline, applied to the runtime itself:
+    // every deliberate teardown step has already run by this point, so
+    // anything still parked is a straggler and the process must not outlive
+    // the backstop. The enter guard borrows `rt`; end it before the
+    // consuming shutdown.
+    drop(rt_guard);
+    let teardown_started = std::time::Instant::now();
+    rt.shutdown_timeout(RUNTIME_TEARDOWN_BACKSTOP);
+    if teardown_started.elapsed() >= RUNTIME_TEARDOWN_BACKSTOP {
+        warn!(
+            source = Source::DaemonLifecycle.as_str(),
+            "runtime teardown hit the {RUNTIME_TEARDOWN_BACKSTOP:?} backstop \
+             — a straggler task was abandoned to process exit",
+        );
+    }
+
     outcome
 }
+
+/// Bound on joining the daemon runtime's remaining tasks at exit (bug 134,
+/// lean 2). By the time it applies, deliberate teardown has already run: the
+/// accept loop returned, LSP shutdown finished under its own bug-130 ceiling,
+/// and accepted MCP connections were force-closed — so anything still parked
+/// is a straggler. A pathology backstop, not a scheduling budget: generous
+/// enough that genuine task cleanup never trips it, small enough that a
+/// stopped daemon can never linger as a connection-holding zombie.
+#[cfg(unix)]
+const RUNTIME_TEARDOWN_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Fire the single desktop interrupt a boot refusal earns (bug 111).
 ///

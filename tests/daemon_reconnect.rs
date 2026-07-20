@@ -503,3 +503,82 @@ fn quit_records_quit_intent() -> Result<()> {
     let _ = run_catenary(&state_home, &["stop", "--force"]);
     Ok(())
 }
+
+/// Whether process `pid` is still alive (`kill -0`, no signal delivered).
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Waits (attempt-bounded backstop) for process `pid` to exit; returns whether
+/// it did.
+fn wait_pid_gone(pid: u32) -> bool {
+    let backstop = Instant::now() + Duration::from_secs(15);
+    while pid_alive(pid) {
+        if Instant::now() >= backstop {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    true
+}
+
+/// Stop-loss (the 2026-07-20 sighting): a graceful `catenary stop` issued while
+/// a bridge session is attached must end the daemon *process* — its exit is
+/// what closes the accepted MCP connection, and that close is the only signal
+/// the bridge's reader reacts to (`proxy_with_reconnect` triggers on EOF/error
+/// alone). The wedge under test: `handle_mcp_connection` runs the MCP loop as a
+/// blocking `read` inside `spawn_blocking`; after the accept loop returns,
+/// `serve_daemon` drops the runtime, and `Runtime::drop` joins in-flight
+/// blocking tasks — so the daemon waits on the bridge to hang up while the
+/// bridge waits on the daemon's EOF. Neither ever fires; the daemon lingers as
+/// a zombie holding the connection, and the bridge never reattaches (the board
+/// shows `mcp_connections: 0` forever). SIGKILL coverage above never catches
+/// this: the kernel closes a killed daemon's fds for free.
+#[test]
+fn stopped_daemon_exits_while_bridge_attached() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?.to_string();
+    // Panic-safe daemon teardown (bug 131): the guard reaps the lingering
+    // daemon this test exists to expose, once the assertion has fired.
+    let _daemon_guard = common::DaemonGuard::new(&state_home);
+
+    // Session up — daemon spawned by the bridge init, connection held.
+    let mut bridge = BridgeProcess::spawn_in_state(&state_home, |_cmd| {})?;
+    bridge.initialize()?;
+    bridge.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))?;
+    let answered = bridge.recv()?;
+    assert!(
+        answered.get("result").is_some(),
+        "ping before the stop should be answered, got: {answered:?}",
+    );
+    let pid = bridge.daemon_pid().context("daemon pid before stop")?;
+
+    // Graceful stop with the bridge still attached — the make-install shape.
+    let stop = run_catenary(&state_home, &["stop", "--force"])?;
+    assert!(
+        stop.status.success(),
+        "stop must exit 0, stderr:\n{}",
+        String::from_utf8_lossy(&stop.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&stop.stdout);
+    assert!(
+        stdout.contains("Daemon stopped"),
+        "stop must report the daemon stopped, got:\n{stdout}",
+    );
+
+    // The daemon process must actually exit: its exit closes the accepted MCP
+    // socket, which is the bridge's ONLY daemon-loss signal. A daemon that
+    // lingers here strands the session permanently (stop-loss wedge).
+    assert!(
+        wait_pid_gone(pid),
+        "stopped daemon (pid {pid}) still alive with a bridge attached — the \
+         blocking MCP read pins Runtime::drop, the accepted connection never \
+         closes, and the bridge's EOF-triggered reconnect can never fire",
+    );
+
+    drop(bridge);
+    Ok(())
+}
