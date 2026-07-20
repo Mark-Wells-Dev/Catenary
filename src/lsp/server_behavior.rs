@@ -39,7 +39,7 @@
 //! publishes ignored, no batch sync lifecycle — while grep/glob queries and
 //! watched-files delivery are untouched.
 //!
-//! Three conformance invariants are cased today:
+//! Four conformance invariants are cased today:
 //!
 //! - **rust-analyzer** — [`ServerProfile::suppresses_pull_diagnostics`]. Catenary
 //!   is push-first for the Rust family: RA suppressing native pushes when the
@@ -80,6 +80,14 @@
 //!   declaration even before the connection's first publish, closing the
 //!   first-run false-`[clean]` window that per-connection demonstration
 //!   (`has_ever_published`) reopens on every respawn and daemon bounce.
+//! - **tombi** — the pull-lane selector (misc 207). tombi's diagnostic lane is
+//!   CLIENT-SELECTED: it runs `DiagnosticMode::Pull` iff the client advertises
+//!   `textDocument.diagnostic.dynamicRegistration`, versioned push otherwise.
+//!   The maintainer ruled the PULL lane, so tombi's manifest row carries
+//!   `advertise_pull_dynamic_registration = true` and the capability shaping
+//!   flips exactly that server's `dynamicRegistration` to `true` — every other
+//!   server keeps today's `false`, so no other lane moves. Inert while tombi is
+//!   unblessed (enrichment-only removes the `diagnostic` block entirely).
 
 use serde_json::Value;
 
@@ -93,6 +101,11 @@ use crate::config::merge::deep_merge;
 /// per-server knowledge stays in the manifest and the seams stay
 /// server-name-blind.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "orthogonal per-server casing flags, projected 1:1 from the \
+              manifest's DisciplineRecord"
+)]
 pub struct ServerProfile {
     /// When set, the server is **unverified** — a custom `[lsp.server.*]` def
     /// absent from the blessed manifest — so it is **enrichment-only**
@@ -107,6 +120,13 @@ pub struct ServerProfile {
     /// (advertised pull *or* best-effort probe) — its native pushes are the sole
     /// diagnostic channel.
     suppress_pull_diagnostics: bool,
+    /// When set, the server receives `textDocument.diagnostic.dynamicRegistration:
+    /// true` — the pull-lane selector for a client-selected dual-lane publisher
+    /// (tombi: `DiagnosticMode::Pull` iff the client advertises it; misc 207).
+    /// Projected from the manifest's `advertise_pull_dynamic_registration`.
+    /// Inert for a pull-suppressed or enrichment-only server, whose `diagnostic`
+    /// capability is removed entirely.
+    advertise_pull_dynamic_registration: bool,
     /// Conformance `initializationOptions` overlaid onto (and winning over) the
     /// user-supplied options at initialize time. `None` when the server has no
     /// forced options. Projected from the manifest's `forced_init_options` (a
@@ -191,6 +211,7 @@ impl ServerProfile {
         Self {
             enrichment_only: false,
             suppress_pull_diagnostics: record.suppress_pull,
+            advertise_pull_dynamic_registration: record.advertise_pull_dynamic_registration,
             forced_initialization_options: record.forced_init_options.as_ref().map(toml_to_json),
             forbidden_initialization_options: record.forbidden_init_options.clone(),
             declares_push: record.declares_push,
@@ -358,8 +379,9 @@ impl ServerProfile {
     /// Applies the profile's client-capability shaping to a built `capabilities`
     /// object in place — the capability-construction seam.
     ///
-    /// Two shapings, both by key removal so the capability shape stays
-    /// byte-for-byte identical for every un-profiled (blessed, uncased) server:
+    /// Three shapings; the first two are by key removal so the capability shape
+    /// stays byte-for-byte identical for every un-profiled (blessed, uncased)
+    /// server:
     ///
     /// - a **pull-suppressed** server (rust-analyzer) loses `textDocument.diagnostic`
     ///   — it is never asked to serve pull diagnostics;
@@ -369,23 +391,41 @@ impl ServerProfile {
     ///   diagnostics capability at all, so the server has no signal to publish
     ///   into and its diagnostics listening is withheld. Every other advertised
     ///   capability (definition, references, symbols, …) survives, so grep/glob
-    ///   enrichment and watched-files continue unchanged.
+    ///   enrichment and watched-files continue unchanged;
+    /// - a **pull-lane-selected** server (tombi, misc 207) — blessed, not
+    ///   pull-suppressed — gets `textDocument.diagnostic.dynamicRegistration`
+    ///   flipped to `true`: the lane selector a client-selected dual-lane
+    ///   publisher keys on (`DiagnosticMode::Pull` iff advertised). Per-server
+    ///   by construction: every profile without the manifest flag keeps today's
+    ///   `false`, so no other server's lane flips.
     pub fn shape_client_capabilities(&self, capabilities: &mut Value) {
-        if !(self.suppress_pull_diagnostics || self.enrichment_only) {
+        if self.suppress_pull_diagnostics || self.enrichment_only {
+            let Some(text_document) = capabilities
+                .get_mut("textDocument")
+                .and_then(Value::as_object_mut)
+            else {
+                return;
+            };
+            // A pull-suppressed OR enrichment-only server loses the pull
+            // capability.
+            text_document.remove("diagnostic");
+            // An enrichment-only server additionally loses the push capability —
+            // no diagnostics advertisement whatsoever.
+            if self.enrichment_only {
+                text_document.remove("publishDiagnostics");
+            }
             return;
         }
-        let Some(text_document) = capabilities
-            .get_mut("textDocument")
-            .and_then(Value::as_object_mut)
-        else {
-            return;
-        };
-        // A pull-suppressed OR enrichment-only server loses the pull capability.
-        text_document.remove("diagnostic");
-        // An enrichment-only server additionally loses the push capability — no
-        // diagnostics advertisement whatsoever.
-        if self.enrichment_only {
-            text_document.remove("publishDiagnostics");
+        // The pull-lane selector (misc 207): only a blessed, unsuppressed
+        // profile carrying the manifest flag reaches this arm, and only the
+        // existing `diagnostic` block is edited — nothing is inserted for a
+        // capability set that carries none.
+        if self.advertise_pull_dynamic_registration
+            && let Some(diagnostic) = capabilities
+                .get_mut("textDocument")
+                .and_then(|td| td.get_mut("diagnostic"))
+        {
+            diagnostic["dynamicRegistration"] = Value::Bool(true);
         }
     }
 
@@ -791,6 +831,145 @@ mod tests {
         let mut caps = original.clone();
         ServerProfile::for_server("clangd").shape_client_capabilities(&mut caps);
         assert_eq!(caps, original);
+    }
+
+    // ── tombi pull-lane selector (misc 207) ─────────────────────────────
+    //
+    // The manifest invariants make a `[discipline.tombi]` row atomic with the
+    // `[blessed.tombi.*]` rows (blessed ⊆ rowed AND rowed ⊆ blessed), so the
+    // row rides the human bless commit and these pins exercise the MECHANICS
+    // against a constructed record — the exact record the staged row (commented
+    // in defaults/blessed-manifest.toml) parses to.
+
+    /// The staged tombi discipline record: `discipline = "pull"` (the
+    /// vscode-json shape) plus the pull-lane selector.
+    fn tombi_staged_record() -> crate::recipes::DisciplineRecord {
+        crate::recipes::DisciplineRecord {
+            discipline: Some(crate::recipes::Discipline::Pull),
+            advertise_pull_dynamic_registration: true,
+            ..crate::recipes::DisciplineRecord::default()
+        }
+    }
+
+    #[test]
+    fn pull_lane_selector_flips_only_the_dynamic_registration_leaf() {
+        // The blessed-shaped projection (`from_record` — what `for_server`
+        // resolves the day the bless commit lands the row) flips EXACTLY the
+        // `dynamicRegistration` leaf of the `diagnostic` block to `true`;
+        // siblings and the block itself are untouched. tombi keys on this leaf
+        // to select `DiagnosticMode::Pull` — the ruled lane.
+        let profile = ServerProfile::from_record(&tombi_staged_record());
+        let mut caps = json!({
+            "textDocument": {
+                "diagnostic": { "dynamicRegistration": false },
+                "publishDiagnostics": { "versionSupport": true },
+                "definition": { "linkSupport": true }
+            }
+        });
+        profile.shape_client_capabilities(&mut caps);
+        assert_eq!(
+            caps["textDocument"]["diagnostic"]["dynamicRegistration"],
+            json!(true),
+            "the pull-selecting capability must be advertised"
+        );
+        assert_eq!(
+            caps["textDocument"]["publishDiagnostics"],
+            json!({ "versionSupport": true }),
+            "the push capability is untouched"
+        );
+        assert_eq!(
+            caps["textDocument"]["definition"],
+            json!({ "linkSupport": true }),
+            "sibling capabilities are untouched"
+        );
+        // The staged row makes no single-file claim (verify-then-declare).
+        assert_eq!(
+            profile.single_file(),
+            crate::recipes::SingleFileSupport::Unsupported,
+            "no single_file claim until the conformance single-file leg's evidence"
+        );
+    }
+
+    #[test]
+    fn pull_lane_selector_parses_from_the_staged_row_toml() {
+        // The staged row's TOML (the commented block in
+        // defaults/blessed-manifest.toml the bless commit uncomments) parses to
+        // exactly the constructed record the mechanics pins use — so
+        // uncommenting it at bless time changes nothing but classification.
+        let doc: crate::recipes::BlessedManifest = toml::from_str(
+            "[discipline.tombi]\ndiscipline = \"pull\"\nadvertise_pull_dynamic_registration = true\n",
+        )
+        .expect("staged tombi row parses");
+        assert_eq!(
+            doc.discipline.get("tombi"),
+            Some(&tombi_staged_record()),
+            "the staged TOML and the mechanics pin must agree"
+        );
+    }
+
+    #[test]
+    fn tombi_unblessed_stays_enrichment_only_with_no_diagnostic_block() {
+        // Until the human bless lands the blessed + discipline rows,
+        // `for_server` classifies tombi enrichment-only (no row, no blessing)
+        // and the removal arm wins: no `diagnostic` block survives for the
+        // selector to ride — the staged lane mechanics cannot make an
+        // unverified server a diagnostics source. This pin FLIPS at bless
+        // time: replace it with a `for_server`-based twin of the projection
+        // test above.
+        let profile = ServerProfile::for_server("tombi");
+        assert!(
+            profile.is_enrichment_only(),
+            "tombi is unblessed until the human bless — enrichment-only"
+        );
+        let mut caps = json!({
+            "textDocument": {
+                "diagnostic": { "dynamicRegistration": false },
+                "publishDiagnostics": { "versionSupport": true }
+            }
+        });
+        profile.shape_client_capabilities(&mut caps);
+        assert!(
+            caps["textDocument"].get("diagnostic").is_none(),
+            "enrichment-only removal wins over the lane selector"
+        );
+        assert!(
+            caps["textDocument"].get("publishDiagnostics").is_none(),
+            "an unblessed server advertises no diagnostics capability at all"
+        );
+    }
+
+    #[test]
+    fn no_other_server_advertises_the_pull_lane_selector() {
+        // The per-server-safe guarantee (misc 207): no shipped discipline row
+        // other than tombi's (once the bless commit lands it) may carry the
+        // selector, so no other server's lane flips — pinned over the whole
+        // shipped discipline table, not a sample.
+        let manifest = crate::recipes::seed_manifest();
+        for (name, record) in &manifest.discipline {
+            if name == "tombi" {
+                continue;
+            }
+            assert!(
+                !record.advertise_pull_dynamic_registration,
+                "{name} must not advertise the pull-lane selector",
+            );
+        }
+        // And the wire-shape consequence, sampled on the pull-family neighbors
+        // a lane flip would most plausibly disturb.
+        for name in [
+            "vscode-json-language-server",
+            "gopls",
+            "pyright-langserver",
+            "taplo",
+            "yaml-language-server",
+        ] {
+            let original = json!({
+                "textDocument": { "diagnostic": { "dynamicRegistration": false } }
+            });
+            let mut caps = original.clone();
+            ServerProfile::for_server(name).shape_client_capabilities(&mut caps);
+            assert_eq!(caps, original, "{name}'s capability shape must not move");
+        }
     }
 
     // ── blessed / unverified classification (diagnostics-debt 04b) ───────

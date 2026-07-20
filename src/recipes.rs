@@ -1131,6 +1131,11 @@ pub struct ProjectConfigConvention {
 /// which cannot implement `Eq` (it may hold a float). `PartialEq` suffices for
 /// the round-trip and projection tests; nothing keys a `DisciplineRecord`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "orthogonal capability-casing flags, 1:1 with the manifest's \
+              [discipline.<server>] TOML keys"
+)]
 pub struct DisciplineRecord {
     /// The server's publisher discipline. `None` ⇒ the record carries only
     /// casing/compression (the common case is a discipline is always stated for a
@@ -1149,6 +1154,17 @@ pub struct DisciplineRecord {
     /// diagnostic channel (rust-analyzer, RA #18709). Defaults to `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub suppress_pull: bool,
+    /// Capability casing: advertise `textDocument.diagnostic.dynamicRegistration:
+    /// true` to this server — the pull-lane selector for a CLIENT-SELECTED
+    /// dual-lane publisher (tombi selects `DiagnosticMode::Pull` iff the client
+    /// advertises it, versioned push otherwise; misc 207). Applied per-server
+    /// through the profile's capability shaping so no other server's lane flips;
+    /// defaults to `false` (today's shape — the capability rides with
+    /// `dynamicRegistration: false`). Mutually inert with [`Self::suppress_pull`]
+    /// and with the enrichment-only classification: a server whose pull
+    /// capability is withheld entirely never sees the selector.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub advertise_pull_dynamic_registration: bool,
     /// Capability casing: the server contractually publishes for every opened
     /// document, an explicit `[]` for clean (lattice, misc 187). Arms the
     /// retrieval evidence bar by declaration. Defaults to `false`.

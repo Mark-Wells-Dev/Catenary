@@ -48,6 +48,11 @@ args = ["--stdio"]
 [lsp.server.taplo]
 args = ["lsp", "stdio"]
 
+# tombi's LSP verb is `tombi lsp` — no `--stdio`, no `serve` (misc 207, the
+# TOML succession candidate riding dual-bless-and-watch beside taplo).
+[lsp.server.tombi]
+args = ["lsp"]
+
 [lsp.server.lattice]
 args = ["serve"]
 

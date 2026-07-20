@@ -379,6 +379,15 @@ const CASES: &[Case] = &[
         binding: None,
         slow_start: false,
     },
+    // ── misc 207: TOML succession (dual-bless-and-watch, PULL lane) ────
+    // tombi's Case rides the BLESS BRANCH, not main: its recipe ships
+    // `conformance = false` in the interim (an unblessed server's diagnostics
+    // are withheld by classification, so the job would be guaranteed-red —
+    // the tui-rework-13 idiom). The bless branch restores the Case with a
+    // routing `CaseBinding { language: "toml", server: "tombi" }` — the
+    // shipped TOML row is dual (taplo primary), and without the reroute an
+    // ambient taplo would satisfy the intentional-diagnostic assertion on
+    // taplo's work, laundering the exact evidence the job exists to produce.
 ];
 
 /// Finds `case` by server name.

@@ -911,6 +911,7 @@ mod tests {
             "zls",
             "pyright-langserver",
             "taplo",
+            "tombi",
             "lattice",
             "marksman",
             "jdtls",

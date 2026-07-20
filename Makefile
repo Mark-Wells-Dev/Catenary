@@ -316,8 +316,11 @@ conformance-matrix:
 # for review; it never merges — the merge policy (mechanical gates, auto-merge on
 # green) is tui-rework 08's concern. Offline-tolerant: a per-server resolve
 # failure keeps that pin and is reported; the file is never partially rewritten.
+# ONLY=<name …> scopes the resolve to the named recipe(s) (the script's --only),
+# so adding one recipe does not bump every other pin:
+#   make refresh-recipes ONLY=tombi
 refresh-recipes:
-	@python3 tools/refresh_recipes.py
+	@python3 tools/refresh_recipes.py $(if $(ONLY),--only $(ONLY),)
 	@git --no-pager diff -- defaults/recipes.toml || true
 
 # Exercise the STAGED external-registry pipeline scripts (tui-rework 08). These

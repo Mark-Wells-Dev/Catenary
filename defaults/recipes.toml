@@ -211,6 +211,32 @@ draft = true
 hash = "sha512-DPTmckrnNCf8KdeSu9pE/mjnovSL28InnQhDS2lsuDrLI8obapMxAU0KLDYnC++aTjCK8bZhhkR5HFh3lDddqw=="
 note = "diagnostics depend on ansible-lint being present; a conformance job provisions it (pip) as well."
 
+# tombi — the TOML succession candidate (misc 207, dual-bless-and-watch; taplo
+# stays primary until tombi graduates on watched conformance evidence). npm, NOT
+# cargo: crates.io `tombi-cli` is a 0.0.1 placeholder with no binary, while the
+# npm `tombi` package ships prebuilt binaries via platform optionalDependencies
+# covering both pinned platforms (glibc linux-x64 + darwin-arm64) — fetch-class.
+# binary-SRI was considered and rejected: upstream's Linux release tarballs are
+# musl-only. The pin + integrity below were resolved mechanically via
+# `make refresh-recipes ONLY=tombi` (the registry dist.integrity, never
+# hand-computed). Its matrix job cannot go green until the human bless lands
+# `[blessed.tombi.*]` rows (an unblessed server is enrichment-only, so its
+# diagnostics are withheld by classification) — so per the no-guaranteed-red
+# idiom (tui-rework 13, the eslint/cmake-ls precedent) it ships
+# `conformance = false` in the interim. The misc-207 bless branch flips it:
+# conformance on, the harness Case restored, `[discipline.tombi]` uncommented
+# (blessed-manifest), `[blessed.tombi.*]` rows added, conformance workflow
+# dispatched on the branch, human merges on green = the bless.
+[recipe.tombi]
+ecosystem = "npm"
+package = "tombi"
+version = "1.2.4"
+hash = "sha512-Kquct5cmTCZWFmrXOE0fu8PMV1foDKHoCjxqVe1E17YgDueJmBkibGYlsGGb23Fc4hRHJ7tCRXTfbMAsxtjzCg=="
+tier = "npm-tarball-sha512"
+draft = true
+conformance = false
+note = "resolves its platform binary via optionalDependencies at install time within the pinned version; the engine's --ignore-scripts install caps the residual to non-executing dep code. conformance = false is INTERIM (misc 207): an unblessed server's diagnostics are withheld by classification, so its matrix job would be guaranteed-red until the bless — the bless branch re-enables it (see the stanza comment)."
+
 # ── cargo tranche ────────────────────────────────────────────────────
 # cargo is the implied host toolchain; `--locked` + index checksums verify.
 

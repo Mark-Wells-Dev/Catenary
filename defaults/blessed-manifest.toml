@@ -445,6 +445,31 @@ single_file = "serves-diagnostics"
 [discipline.taplo]
 discipline = "event"
 declares_push = true
+
+# tombi — STAGED, NOT YET A ROW (misc 207, dual-bless-and-watch: the taplo
+# succession, PULL lane by maintainer ruling 2026-07-20). The manifest's two
+# invariants make a discipline row and its blessed rows ATOMIC —
+# `blessed_servers_all_rowed` (blessed ⊆ rowed) and
+# `every_discipline_row_is_a_blessed_server` (rowed ⊆ blessed) — so the
+# `[discipline.tombi]` row below rides the SAME human-merge commit as the
+# `[blessed.tombi.*]` rows, and is staged here as the exact TOML that commit
+# uncomments. Until then tombi classifies enrichment-only (queries only,
+# diagnostics withheld) and the lane selector is inert.
+#
+# The lane: tombi's discipline is CLIENT-SELECTED (source-level read of
+# tombi-lsp at v1.2.4) — `DiagnosticMode::Pull` iff the client advertises
+# `textDocument.diagnostic.dynamicRegistration`, versioned push otherwise. The
+# ruled PULL lane is selected by `advertise_pull_dynamic_registration = true`:
+# the capability casing that flips ONLY tombi's initialize to
+# `dynamicRegistration: true` (every other server keeps today's `false`; the
+# mechanics and the per-server-safety are pinned in
+# src/lsp/server_behavior.rs). NO `single_file` key (verify-then-declare):
+# the conformance single-file leg's SERVES line is what could earn one;
+# keyless fails closed (never spawned rootless).
+#
+# [discipline.tombi]
+# discipline = "pull"
+# advertise_pull_dynamic_registration = true
 # single_file (brackets 01; upgraded brackets 06): TOML is overwhelmingly
 # per-file-natured — core stray population. Verified live 2026-07-20 by the
 # conformance suite's single-file leg (`single_file_evidence`): under a
