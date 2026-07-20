@@ -3354,6 +3354,11 @@ fn render_out_of_scope(entries: &[OutOfScopeEntry]) -> String {
 /// (diagnostics-debt 05 / DESIGN §"The floor is fault attribution"): a blessed
 /// server whose discipline owed a response this round and gave none is a fault,
 /// attributed to the server, not a Catenary shrug.
+///
+/// Coupling: the `did not answer for this round` head is the stable substring
+/// the conformance harness matches (`receipt_names_round_fault`,
+/// `tests/conformance_harness.rs` — a fault note must fail the blessing
+/// probe); reword both ends together.
 fn unverified_label(server: &str, cause: UnverifiedCause) -> String {
     match cause {
         UnverifiedCause::Silent => {

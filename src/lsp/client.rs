@@ -17,12 +17,17 @@ use super::server::LspServer;
 use super::state::{ServerLifecycle, ServerStatus};
 use crate::logging::LoggingServer;
 
-/// Cached diagnostics for a file: `(version, diagnostics)`.
+/// Cached diagnostics for a file: `(version, diagnostics, stimulus)`.
 ///
 /// `version` is the document version from `publishDiagnostics`, if the
-/// server includes it.
+/// server includes it. `stimulus` is the URI's stimulus generation
+/// (didOpen/didChange/didSave counter, [`LspServer::note_doc_version`] /
+/// [`LspServer::note_doc_saved`]) when the entry landed — the misordered
+/// close-clear gate's reference point: an unversioned empty publish arriving
+/// at the same generation as a cached non-empty verdict followed no new
+/// stimulus and cannot be a re-analysis.
 pub type DiagnosticsCache =
-    Arc<std::sync::Mutex<std::collections::HashMap<String, (Option<i32>, Vec<Value>)>>>;
+    Arc<std::sync::Mutex<std::collections::HashMap<String, (Option<i32>, Vec<Value>, u64)>>>;
 
 /// Held-open document state on one server connection (diagnostics-debt 01).
 ///
@@ -596,6 +601,10 @@ impl LspClient {
         // Arm the publish staleness gate before the notification can produce
         // a publish (bug 101, heard-stale leg).
         self.server.note_doc_version(uri, version);
+        // Mark the document open before the notification too, so the
+        // misordered close-clear gate sees the open the instant a publish
+        // for it can exist.
+        self.server.note_doc_opened(uri);
         self.notify(
             "textDocument/didOpen",
             params::did_open(uri, language_id, version, text),
@@ -628,6 +637,11 @@ impl LspClient {
     ///
     /// Returns an error if the notification fails.
     pub async fn did_save(&self, uri: &str) -> Result<()> {
+        // Record the save stimulus before the notification can produce a
+        // publish (the note_doc_version discipline): an on-save analyzer's
+        // clean verdict must land at the post-save generation, or the
+        // misordered close-clear gate would distrust it.
+        self.server.note_doc_saved(uri);
         self.notify("textDocument/didSave", params::did_save(uri))
             .await
     }
@@ -638,6 +652,9 @@ impl LspClient {
     ///
     /// Returns an error if the notification fails.
     pub async fn did_close(&self, uri: &str) -> Result<()> {
+        // Stand the misordered close-clear gate down before the close goes
+        // out: the clear this didClose triggers is ordinary close semantics.
+        self.server.note_doc_closed(uri);
         self.notify("textDocument/didClose", params::did_close(uri))
             .await
     }
@@ -1081,7 +1098,7 @@ impl LspClient {
             .diagnostics
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.get(uri).map(|(_, diags)| diags.clone())
+        cache.get(uri).map(|(_, diags, _)| diags.clone())
     }
 
     /// The **settlement** consult: the cached diagnostics for a URI only when a

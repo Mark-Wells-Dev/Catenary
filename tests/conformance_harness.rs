@@ -640,6 +640,13 @@ fn run_conformance(case: &Case, require: bool) -> Result<()> {
         case.server
     );
     assert!(
+        !receipt_names_round_fault(&receipt),
+        "`{}` was attributed a round fault instead of publishing its intentional \
+         diagnostic — a fault note names the fixture file without diagnosing it, \
+         so it must fail the probe explicitly:\n{receipt}",
+        case.server
+    );
+    assert!(
         !receipt.contains("[no LSP coverage]"),
         "no server covered the `{}` fixture — check the language binding:\n{receipt}",
         case.server
@@ -662,6 +669,46 @@ fn run_conformance(case: &Case, require: bool) -> Result<()> {
     // suite failure, so nothing here asserts.
     eprintln!("{}", single_file_evidence(case).render(case.server));
     Ok(())
+}
+
+/// Whether the receipt carries a verified-contract-violation fault note
+/// (`<path> [<server> did not answer for this round — … re-run to retry]`).
+///
+/// Such a receipt names the fixture file but renders no `[clean]`, no
+/// `[unverified`, and no `[no LSP coverage]`, so without this check it slips
+/// every conformance assertion while delivering zero diagnostics — the probe
+/// demands the intentional diagnostic itself, not a fault attribution. The
+/// matched substring is the stable head of the wording pinned product-side by
+/// `unverified_label` (`src/bridge/diagnostics_server.rs`) and its
+/// `format_contract_violation_renders_the_designs_exact_wording` test.
+fn receipt_names_round_fault(receipt: &str) -> bool {
+    receipt.contains("did not answer for this round")
+}
+
+/// A synthetic fault-note receipt proves the blind spot and its closure: it
+/// passes all four pre-existing conformance rejections (names the fixture,
+/// no `[clean]` / `[unverified` / `[no LSP coverage]`) yet delivers no
+/// diagnostic, and [`receipt_names_round_fault`] is what catches it. A dirty
+/// receipt stays unflagged.
+#[test]
+fn fault_note_receipt_is_rejected() {
+    let fault = "/root/broken.toml [taplo did not answer for this round \u{2014} its \
+                 verified behavior requires a response; treating as a server fault, \
+                 re-run to retry]\n";
+    assert!(fault.contains("broken.toml"));
+    assert!(!fault.contains("[clean]"));
+    assert!(!fault.contains("[unverified"));
+    assert!(!fault.contains("[no LSP coverage]"));
+    assert!(
+        receipt_names_round_fault(fault),
+        "a fault note is not a diagnosis — the probe must reject it"
+    );
+
+    let dirty = "/root/broken.toml\n  1:1 error: invalid TOML [taplo]\n";
+    assert!(
+        !receipt_names_round_fault(dirty),
+        "a receipt carrying real diagnostics must not be flagged"
+    );
 }
 
 // ── Single-file (null-root) evidence leg (brackets 06) ────────────────

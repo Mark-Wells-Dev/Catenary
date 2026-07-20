@@ -239,6 +239,24 @@ pub struct LspServer {
     /// older version than the one last sent is a straggler from a previous
     /// round, and caching it would overwrite fresher evidence.
     doc_versions: Mutex<HashMap<String, i32>>,
+    /// Per-URI **stimulus generation**: bumped on every analysis stimulus
+    /// this side sends — `didOpen`/`didChange` ([`Self::note_doc_version`])
+    /// and `didSave` ([`Self::note_doc_saved`]). Each cache entry records
+    /// the generation current when it landed ([`DiagnosticsCache`]'s third
+    /// field), the reference point for the misordered close-clear gate in
+    /// [`Self::on_notification`]: an unversioned empty publish arriving at
+    /// the same generation as a cached non-empty verdict followed no new
+    /// stimulus, so it cannot be a re-analysis of anything.
+    doc_stimulus: Mutex<HashMap<String, u64>>,
+    /// URIs currently open on this connection (`didOpen` sent, no
+    /// `didClose` yet) — the reader-thread-visible mirror of the client's
+    /// held-open registry, maintained by [`Self::note_doc_opened`] /
+    /// [`Self::note_doc_closed`]. Read by the misordered close-clear gate,
+    /// which only distrusts an empty publish for a document we currently
+    /// hold open: a clear for a closed document is ordinary close
+    /// semantics, and a publish for a never-opened document is
+    /// watcher-induced territory the gate must not touch.
+    open_doc_uris: Mutex<HashSet<String>>,
 
     // ── Capability discovery ──────────────────────────────────────
     pub(crate) capability_notify: Arc<Notify>,
@@ -354,6 +372,8 @@ impl LspServer {
             diagnostics_generation: Arc::new(Mutex::new(HashMap::new())),
             diagnostics_notify: Arc::new(Notify::new()),
             doc_versions: Mutex::new(HashMap::new()),
+            doc_stimulus: Mutex::new(HashMap::new()),
+            open_doc_uris: Mutex::new(HashSet::new()),
             capability_notify: Arc::new(Notify::new()),
             progress: Arc::new(Mutex::new(ProgressTracker::new())),
             progress_notify: Arc::new(Notify::new()),
@@ -1038,11 +1058,16 @@ impl LspServer {
     /// monotonically per URI across close/reopen
     /// ([`super::client::LspClient::open_document`]), so "older than this"
     /// identifies a straggler from a previous round.
+    ///
+    /// Also bumps the URI's stimulus generation: a `didOpen`/`didChange` is
+    /// new input the server may legitimately answer with a changed verdict
+    /// (the misordered close-clear gate's reference point).
     pub(crate) fn note_doc_version(&self, uri: &str, version: i32) {
         self.doc_versions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(uri.to_string(), version);
+        self.bump_doc_stimulus(uri);
     }
 
     /// The latest document version sent for `uri`, if any.
@@ -1052,6 +1077,62 @@ impl LspServer {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(uri)
             .copied()
+    }
+
+    /// Records a `didSave` sent for `uri` as a stimulus. A save may
+    /// legitimately trigger a re-analysis (an on-save analyzer's flycheck
+    /// pass), so an empty publish that follows one is a credible clean
+    /// verdict — the misordered close-clear gate must let it through.
+    /// Called before the notification goes out, so the publish it produces
+    /// can never race the bump.
+    pub(crate) fn note_doc_saved(&self, uri: &str) {
+        self.bump_doc_stimulus(uri);
+    }
+
+    /// Marks `uri` as currently open on this connection (`didOpen` sent).
+    pub(crate) fn note_doc_opened(&self, uri: &str) {
+        self.open_doc_uris
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(uri.to_string());
+    }
+
+    /// Marks `uri` as closed on this connection (`didClose` sent). A clear
+    /// publish arriving after this is ordinary close semantics, not a
+    /// misordered straggler — the close-clear gate stands down.
+    pub(crate) fn note_doc_closed(&self, uri: &str) {
+        self.open_doc_uris
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(uri);
+    }
+
+    /// Whether `uri` is currently open on this connection.
+    fn doc_is_open(&self, uri: &str) -> bool {
+        self.open_doc_uris
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(uri)
+    }
+
+    /// The current stimulus generation for `uri` (`0` before any stimulus).
+    fn doc_stimulus_gen(&self, uri: &str) -> u64 {
+        self.doc_stimulus
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(uri)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Advances the stimulus generation for `uri`.
+    fn bump_doc_stimulus(&self, uri: &str) {
+        *self
+            .doc_stimulus
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(uri.to_string())
+            .or_insert(0) += 1;
     }
 
     /// The cached diagnostics for `uri` **only when a publish settles the
@@ -1100,7 +1181,7 @@ impl LspServer {
         let current = self.doc_version(uri);
         // Take a copy of the cached entry and release the cache lock before the
         // settlement branch (no work held under the lock).
-        let (published_version, diags) = {
+        let (published_version, diags, _) = {
             let cache = self
                 .diagnostics
                 .lock()
@@ -1112,7 +1193,11 @@ impl LspServer {
             Some(pv) => (current == Some(pv)).then_some(diags),
             // Unversioned non-empty: a hint carrying real content — settle with
             // it. Unversioned empty: authoritative only under the declared-push
-            // contract, else a non-settling hint.
+            // contract, else a non-settling hint. The declared-push trust
+            // presumes the empty survived the misordered close-clear gate in
+            // `on_notification`: a clear that could not be a re-analysis (no
+            // stimulus since a cached non-empty verdict on an open document)
+            // never reaches this cache.
             None if !diags.is_empty() || self.declares_push => Some(diags),
             None => None,
         }
@@ -1170,11 +1255,42 @@ impl LspServer {
                     return;
                 }
 
+                // Misordered close-clear gate (the unversioned-empty leg of
+                // the staleness gate above): an unversioned EMPTY publish for
+                // a document currently held open, arriving while the cache
+                // holds a non-empty verdict from the SAME stimulus generation
+                // — no didOpen/didChange/didSave since that verdict landed —
+                // cannot be a re-analysis: the server was given nothing new
+                // to analyze. It is a didClose-triggered clear flushed out of
+                // order under load (a starved server can land the previous
+                // open's clear AFTER the reopen's real diagnostics), and
+                // caching it would flip the settled verdict dirty→clean over
+                // the fresher evidence. Dropped before the cache, like the
+                // versioned straggler. Untouched: versioned empties (the
+                // echo check above judges those), an empty after any
+                // stimulus (a fixing didChange/didSave), a round's first
+                // publish, and clears for closed or never-opened documents.
+                let stimulus = self.doc_stimulus_gen(uri);
+                let doc_open = self.doc_is_open(uri);
                 let mut cache = self
                     .diagnostics
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                cache.insert(uri.to_string(), (version, diagnostics));
+                if version.is_none()
+                    && diagnostics.is_empty()
+                    && doc_open
+                    && cache
+                        .get(uri)
+                        .is_some_and(|(_, cached, stamp)| !cached.is_empty() && *stamp == stimulus)
+                {
+                    drop(cache);
+                    debug!(
+                        "Dropping misordered close-clear for {uri}: empty publish \
+                         with no stimulus since the cached non-empty verdict",
+                    );
+                    return;
+                }
+                cache.insert(uri.to_string(), (version, diagnostics, stimulus));
                 drop(cache);
 
                 // Bump generation counter and wake waiters
@@ -2230,7 +2346,7 @@ mod tests {
 
         let cache = server.diagnostics.lock().expect("lock");
         assert!(cache.contains_key("file:///test.rs"));
-        let (version, diags) = cache.get("file:///test.rs").expect("entry");
+        let (version, diags, _) = cache.get("file:///test.rs").expect("entry");
         assert!(version.is_none());
         assert_eq!(diags.len(), 1);
         drop(cache);
@@ -2276,7 +2392,7 @@ mod tests {
         );
 
         let cache = server.diagnostics.lock().expect("lock");
-        let (version, diags) = cache.get(uri).expect("fresh entry survives");
+        let (version, diags, _) = cache.get(uri).expect("fresh entry survives");
         assert_eq!(*version, Some(2), "the fresh publish's version is kept");
         assert_eq!(diags.len(), 1);
         assert_eq!(
@@ -2507,6 +2623,210 @@ mod tests {
         let settled = server.settled_diagnostics(uri).expect("dirty settles");
         assert_eq!(settled.len(), 1);
         assert_eq!(settled[0]["message"], "real error");
+    }
+
+    // ── misordered close-clear gate (the unversioned-empty leg) ─────────
+
+    /// Helper: a declared-push server (lattice's manifest row) — the shape
+    /// whose unversioned empty settles as the contractual clean, so the
+    /// strongest case for the close-clear gate.
+    fn declared_push_server() -> LspServer {
+        LspServer::new("markdown".to_string(), "lattice".to_string(), None)
+    }
+
+    /// Helper: one unversioned non-empty publish for `uri`.
+    fn publish_unversioned_dirty(server: &LspServer, uri: &str) {
+        server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({
+                "uri": uri,
+                "diagnostics": [{"message": "dirty", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}}]
+            }),
+        );
+    }
+
+    /// Helper: one unversioned empty publish for `uri`.
+    fn publish_unversioned_empty(server: &LspServer, uri: &str) {
+        server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({ "uri": uri, "diagnostics": [] }),
+        );
+    }
+
+    /// The poisoned order: a non-empty verdict lands for an open document,
+    /// then an unversioned EMPTY arrives with NO stimulus in between. A
+    /// starved server can flush a didClose-triggered clear AFTER the
+    /// reopen's real diagnostics; with no new input a clean verdict for the
+    /// same content is impossible, so the clear is dropped before the cache
+    /// and the dirty verdict keeps settling — never dirty→clean.
+    #[test]
+    fn stale_close_clear_never_flips_settled_dirty_to_clean() {
+        let server = declared_push_server();
+        assert!(server.declares_push());
+        let uri = "file:///poisoned.md";
+        // The reopen: didOpen (version + stimulus + open mark).
+        server.note_doc_version(uri, 2);
+        server.note_doc_opened(uri);
+
+        publish_unversioned_dirty(&server, uri);
+        // The previous open's close-clear, flushed out of order.
+        publish_unversioned_empty(&server, uri);
+
+        let settled = server.settled_diagnostics(uri).expect("stays settled");
+        assert_eq!(
+            settled.len(),
+            1,
+            "the fresher non-empty verdict survives the misordered clear"
+        );
+        assert_eq!(settled[0]["message"], "dirty");
+    }
+
+    /// The same order on an UNDECLARED server: without the gate the empty
+    /// would overwrite the cache and the debt would fall unsettled (an
+    /// undeclared unversioned empty settles nothing) — the real findings
+    /// lost either way. The gate keeps them settling.
+    #[test]
+    fn stale_close_clear_keeps_undeclared_dirty_settled() {
+        let server = test_server();
+        assert!(!server.declares_push());
+        let uri = "file:///poisoned.rs";
+        server.note_doc_version(uri, 1);
+        server.note_doc_opened(uri);
+
+        publish_unversioned_dirty(&server, uri);
+        publish_unversioned_empty(&server, uri);
+
+        let settled = server.settled_diagnostics(uri).expect("stays settled");
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0]["message"], "dirty");
+    }
+
+    /// An empty AFTER a `didSave` stimulus settles clean: the save may have
+    /// triggered a re-analysis (an on-save analyzer's flycheck pass), so
+    /// the clean verdict is credible and must keep settling.
+    #[test]
+    fn empty_after_save_stimulus_settles_clean() {
+        let server = declared_push_server();
+        let uri = "file:///fixed-on-save.md";
+        server.note_doc_version(uri, 1);
+        server.note_doc_opened(uri);
+
+        publish_unversioned_dirty(&server, uri);
+        server.note_doc_saved(uri);
+        publish_unversioned_empty(&server, uri);
+
+        let settled = server.settled_diagnostics(uri);
+        assert!(
+            matches!(settled, Some(ref d) if d.is_empty()),
+            "an empty following a save stimulus is a credible clean and \
+             settles, got: {settled:?}"
+        );
+    }
+
+    /// An empty AFTER a `didChange`/reopen stimulus settles clean — the fix
+    /// reached the server and the clean verdict answers it.
+    #[test]
+    fn empty_after_change_stimulus_settles_clean() {
+        let server = declared_push_server();
+        let uri = "file:///fixed-on-change.md";
+        server.note_doc_version(uri, 1);
+        server.note_doc_opened(uri);
+
+        publish_unversioned_dirty(&server, uri);
+        // The fixing didChange (or a reopen with new content).
+        server.note_doc_version(uri, 2);
+        publish_unversioned_empty(&server, uri);
+
+        let settled = server.settled_diagnostics(uri);
+        assert!(
+            matches!(settled, Some(ref d) if d.is_empty()),
+            "an empty following a change stimulus settles clean, got: {settled:?}"
+        );
+    }
+
+    /// An empty as the round's FIRST publish for an open document settles
+    /// clean (the declared-push contractual clean, misc 187): the gate only
+    /// distrusts an empty that would overwrite a same-generation non-empty.
+    #[test]
+    fn first_publish_empty_on_open_document_settles_clean() {
+        let server = declared_push_server();
+        let uri = "file:///genuinely-clean.md";
+        server.note_doc_version(uri, 1);
+        server.note_doc_opened(uri);
+
+        publish_unversioned_empty(&server, uri);
+
+        let settled = server.settled_diagnostics(uri);
+        assert!(
+            matches!(settled, Some(ref d) if d.is_empty()),
+            "a round's first empty on a clean file settles, got: {settled:?}"
+        );
+    }
+
+    /// A VERSIONED empty is judged by the version echo alone — the
+    /// close-clear gate never touches versioned publishes, so a
+    /// current-version empty still supersedes a same-generation non-empty
+    /// (the server provably analyzed the current content and said clean).
+    #[test]
+    fn versioned_empty_bypasses_the_close_clear_gate() {
+        let server = test_server();
+        let uri = "file:///versioned.rs";
+        server.note_doc_version(uri, 3);
+        server.note_doc_opened(uri);
+
+        publish_unversioned_dirty(&server, uri);
+        server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({ "uri": uri, "version": 3, "diagnostics": [] }),
+        );
+
+        let settled = server.settled_diagnostics(uri);
+        assert!(
+            matches!(settled, Some(ref d) if d.is_empty()),
+            "a current-version empty is the authoritative clean and is never \
+             gated, got: {settled:?}"
+        );
+    }
+
+    /// A clear for a document we CLOSED is ordinary close semantics — the
+    /// gate stands down and the clear caches as before.
+    #[test]
+    fn close_clear_for_closed_document_caches() {
+        let server = declared_push_server();
+        let uri = "file:///closed.md";
+        server.note_doc_version(uri, 1);
+        server.note_doc_opened(uri);
+
+        publish_unversioned_dirty(&server, uri);
+        server.note_doc_closed(uri);
+        publish_unversioned_empty(&server, uri);
+
+        let cache = server.diagnostics.lock().expect("lock");
+        let (_, diags, _) = cache.get(uri).expect("clear cached");
+        assert!(
+            diags.is_empty(),
+            "an in-order close-clear for a closed document reaches the cache"
+        );
+        drop(cache);
+    }
+
+    /// A publish pair for a NEVER-opened document (watcher-induced) is
+    /// untouched — the gate only guards documents this side holds open.
+    #[test]
+    fn clear_for_never_opened_document_is_untouched() {
+        let server = test_server();
+        let uri = "file:///never-opened.rs";
+
+        publish_unversioned_dirty(&server, uri);
+        publish_unversioned_empty(&server, uri);
+
+        let cache = server.diagnostics.lock().expect("lock");
+        let (_, diags, _) = cache.get(uri).expect("clear cached");
+        assert!(
+            diags.is_empty(),
+            "a never-opened document's clear caches as before"
+        );
+        drop(cache);
     }
 
     /// A never-heard URI is unsettled (`None`) — no publish, no settlement.
