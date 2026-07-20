@@ -1,6 +1,38 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
+//! LSP client lifecycle: spawn, registry, dispatch, teardown.
+//!
+//! ## Registry isolation: no instance blocks what doesn't depend on it
+//!
+//! The standing doctrine (maintainer ruling, misc 208): **an instance's
+//! slowness may only affect operations that depend on that instance
+//! specifically.** The `clients` registry mutex is a lookup index, never a
+//! wait point, enforced by three constructions:
+//!
+//! - **Snapshot, drop, then await** (bug 104): every lookup snapshots `Arc`
+//!   handles under the registry guard and awaits client locks only after the
+//!   guard is gone. A client mutex can be held for a full diagnose batch
+//!   (settle included); awaiting one under the registry guard convoyed every
+//!   manager lookup daemon-wide behind a single busy server.
+//! - **Cold spawns hold a marker, not the registry** (misc 191, shared across
+//!   the per-root and single-file paths by misc 208):
+//!   [`LspClientManager::claim_spawn`] holds the registry lock only for the
+//!   found-check and the marker lookup/insert; the process spawn and the
+//!   `initialize` handshake run fully unlocked. Duplicate requesters of the
+//!   same key await the marker's `Notify` and re-check — never a second
+//!   spawn, never a daemon-wide stall.
+//! - **Teardowns detach first** (bug 104 / misc 209): detach under the
+//!   registry lock, run the shutdown round-trip after, and drop the board
+//!   entry with the instance ([`LspClientManager::teardown_matching`]) so
+//!   the snapshot keeps no ghost (bug 72).
+//!
+//! Lock order is strictly `clients` → `spawning`, and neither guard is ever
+//! held across a client-lock await. The same principle governs the
+//! transaction-bracket layer (ws48 ruling): a bracket serializes consumers of
+//! ONE instance's document state — a bracket in root A must never block
+//! file B or root C.
+
 use anyhow::{Result, anyhow};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -175,6 +207,25 @@ impl Drop for SpawnMarkerGuard<'_> {
             .remove(&self.key);
         self.notify.notify_waiters();
     }
+}
+
+/// The outcome of [`LspClientManager::claim_spawn`] — the shared
+/// spawn-or-await gate for every cold-spawn path (misc 191, extracted as a
+/// shared helper by misc 208).
+///
+/// `Found` hands back the registry's existing entry (live or tombstone) for
+/// the key, snapshotted under the registry guard; the guard is gone by the
+/// time the caller sees it, so a liveness check (which awaits the client's
+/// own mutex) blocks only callers of THAT instance — never the registry
+/// (bug 104). `Owner` means the caller won the cold spawn: the marker guard
+/// clears the key and wakes waiters on every exit (RAII, misc 191), and the
+/// spawn+`initialize` handshake runs with no registry involvement at all.
+enum SpawnClaim<'a> {
+    /// The registry already holds an entry (live or tombstone) for the key.
+    Found(Arc<Mutex<LspClient>>),
+    /// The caller owns this key's cold spawn; hold the guard across the
+    /// handshake.
+    Owner(SpawnMarkerGuard<'a>),
 }
 
 /// One alive rooted server covering a walked root, with its registered file
@@ -2031,6 +2082,106 @@ impl LspClientManager {
         self.spawn_inner(server_name, lang, root, true).await
     }
 
+    /// Spawn-or-await for `key` — the shared cold-spawn gate (misc 191,
+    /// extracted per misc 208): loops until the registry holds an entry the
+    /// caller can use ([`SpawnClaim::Found`]) or this task claims the
+    /// in-flight marker and owns the cold spawn ([`SpawnClaim::Owner`]).
+    ///
+    /// The registry lock is held only for the found-check (`find`, a pure
+    /// lookup over the guarded map — it must not await) and the marker
+    /// lookup/insert — never across a process spawn or `initialize`
+    /// handshake, so a cold spawn stalls nothing that doesn't depend on this
+    /// key specifically. Three outcomes per iteration:
+    ///
+    ///   found      → return the entry (the caller checks liveness AFTER
+    ///                this returns — no registry guard is held by then),
+    ///   marker set → another task owns this key's spawn; wait its Notify,
+    ///                then loop to re-check (never a duplicate spawn),
+    ///   no marker  → claim the marker and return as the owner.
+    ///
+    /// The wait's wake-safety: `enable()` arms the `Notified` future
+    /// (registers as a waiter) without awaiting, and the owner's guard-drop
+    /// removes the marker and calls `notify_waiters` under the SAME std lock.
+    /// Doing the presence-check AND the `enable()` under one lock hold means:
+    /// if the marker is still present, the owner has not notified yet (notify
+    /// follows remove, both under the lock we hold), so our registration is
+    /// guaranteed to catch the coming wake; if the marker is gone, the owner
+    /// already finished and we drop straight through to re-check the
+    /// registry. Either way there is no missed-wake hang. Lock order stays
+    /// strictly `clients` → `spawning`.
+    async fn claim_spawn<F>(&self, key: &InstanceKey, find: F) -> SpawnClaim<'_>
+    where
+        F: Fn(&HashMap<InstanceKey, Arc<Mutex<LspClient>>>) -> Option<Arc<Mutex<LspClient>>>,
+    {
+        loop {
+            let clients = self.clients.lock().await;
+
+            if let Some(found) = find(&clients) {
+                drop(clients);
+                return SpawnClaim::Found(found);
+            }
+
+            // Marker decision, atomic with the found-check above (both under
+            // the registry guard). Either claim the key and spawn as its
+            // owner, or wait on the marker another task already holds — never
+            // a second spawn of the same key.
+            let notify = self
+                .spawning
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(key)
+                .cloned();
+
+            if let Some(notify) = notify {
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                let still_pending = {
+                    let spawning = self
+                        .spawning
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if spawning.contains_key(key) {
+                        // Register under the lock — the owner cannot notify
+                        // until we release it.
+                        notified.as_mut().enable();
+                        true
+                    } else {
+                        // Owner finished between our clone and this recheck.
+                        false
+                    }
+                };
+                drop(clients);
+                if still_pending {
+                    notified.await;
+                }
+                // Loop: re-check the registry (fresh instance, tombstone, or
+                // a cleared key to claim).
+                continue;
+            }
+
+            // No marker: claim the key. Concurrent claimants serialize on the
+            // std lock, so exactly one wins the insert; a loser gets back the
+            // winner's marker and waits on it next iteration.
+            let ours = Arc::new(tokio::sync::Notify::new());
+            let claimed = self
+                .spawning
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(key.clone())
+                .or_insert_with(|| ours.clone())
+                .clone();
+            drop(clients);
+            if Arc::ptr_eq(&claimed, &ours) {
+                return SpawnClaim::Owner(SpawnMarkerGuard {
+                    spawning: &self.spawning,
+                    key: key.clone(),
+                    notify: ours,
+                });
+            }
+            // Lost the claim race — loop and wait on the winner's marker.
+        }
+    }
+
     /// Shared spawn implementation.
     ///
     /// Every instance gets `Scope::Root(root)`. `project_scoped`
@@ -2104,24 +2255,20 @@ impl LspClientManager {
                 .clone()
         };
 
-        // Double-check under the registry lock, then decide the cold-spawn
-        // marker (misc 191). The registry lock is held only for the found-check
-        // and the marker lookup/insert — never across the spawn+`initialize`
-        // handshake below, so a cold spawn no longer stalls unrelated manager
-        // lookups daemon-wide (the pre-191 hold was a self-inflicted mini-104).
-        // Three outcomes per iteration:
-        //   found      → return the live instance (or bail on a tombstone),
-        //   marker set → another task owns this key's spawn; wait its Notify,
-        //                then loop to re-check (never a duplicate spawn),
-        //   no marker  → claim the marker and break out to spawn as the owner.
-        // The `_marker` guard clears the key on every exit of the owner path.
-        let _marker = loop {
-            let clients = self.clients.lock().await;
-
-            // Both arms diverge, so the registry guard is dropped before any
-            // client lock is awaited (bug 104).
-            if let Some(found) = find_instance(&clients, lang, server_name, root) {
-                drop(clients);
+        // Spawn-or-await through the shared gate (misc 191 / misc 208): the
+        // registry lock is held only for the found-check and the marker
+        // lookup/insert — never across the spawn+`initialize` handshake
+        // below, so a cold spawn stalls no unrelated manager lookup. The
+        // `_marker` guard clears the key on every exit of the owner path.
+        let _marker = match self
+            .claim_spawn(&ledger_key, |clients| {
+                find_instance(clients, lang, server_name, root)
+            })
+            .await
+        {
+            SpawnClaim::Found(found) => {
+                // Liveness is checked with no registry guard held (bug 104):
+                // a busy existing instance blocks only this caller.
                 let key = {
                     let locked = found.lock().await;
                     if !locked.is_alive() {
@@ -2134,76 +2281,7 @@ impl LspClientManager {
                 };
                 return Ok((key, found));
             }
-
-            // Marker decision, atomic with the found-check above (both under
-            // the registry guard). Either claim the key and spawn as its owner,
-            // or wait on the marker another task already holds — never a second
-            // spawn of the same key.
-            //
-            // The subtle leg is the wait's wake-safety. `enable()` arms the
-            // `Notified` future (registers as a waiter) without awaiting, and
-            // the owner's guard-drop removes the marker and calls
-            // `notify_waiters` under the SAME std lock. Doing the presence-check
-            // AND the `enable()` under one lock hold means: if the marker is
-            // still present, the owner has not notified yet (notify follows
-            // remove, both under the lock we hold), so our registration is
-            // guaranteed to catch the coming wake; if the marker is gone, the
-            // owner already finished and we drop straight through to re-check
-            // the registry. Either way there is no missed-wake hang.
-            let notify = self
-                .spawning
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&ledger_key)
-                .cloned();
-
-            if let Some(notify) = notify {
-                let notified = notify.notified();
-                tokio::pin!(notified);
-                let still_pending = {
-                    let spawning = self
-                        .spawning
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if spawning.contains_key(&ledger_key) {
-                        // Register under the lock — the owner cannot notify
-                        // until we release it.
-                        notified.as_mut().enable();
-                        true
-                    } else {
-                        // Owner finished between our clone and this recheck.
-                        false
-                    }
-                };
-                drop(clients);
-                if still_pending {
-                    notified.await;
-                }
-                // Loop: re-check the registry (fresh instance, tombstone, or a
-                // cleared key to claim).
-                continue;
-            }
-
-            // No marker: claim the key. Concurrent claimants serialize on the
-            // std lock, so exactly one wins the insert; a loser gets back the
-            // winner's marker and waits on it next iteration.
-            let ours = Arc::new(tokio::sync::Notify::new());
-            let claimed = self
-                .spawning
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(ledger_key.clone())
-                .or_insert_with(|| ours.clone())
-                .clone();
-            drop(clients);
-            if Arc::ptr_eq(&claimed, &ours) {
-                break SpawnMarkerGuard {
-                    spawning: &self.spawning,
-                    key: ledger_key.clone(),
-                    notify: ours,
-                };
-            }
-            // Lost the claim race — loop and wait on the winner's marker.
+            SpawnClaim::Owner(marker) => marker,
         };
 
         // Spawn resolution (lsm 02): a pinned blessed server prefers its
@@ -2467,15 +2545,45 @@ impl LspClientManager {
             .ok_or_else(|| anyhow!("Server '{server_name}' not found in [lsp.server.*] config"))?
             .clone();
 
-        let mut clients = self.clients.lock().await;
-
-        // Double-check: another task may have spawned while we waited.
         let sf_key = InstanceKey::new(lang.to_string(), server_name.to_string(), Scope::SingleFile);
-        if let Some(existing) = clients.get(&sf_key) {
-            if existing.lock().await.is_alive() {
-                return Ok(existing.clone());
+
+        // Spawn-or-await through the shared gate (misc 208): the registry
+        // lock is held only for the found-check and the marker lookup/insert
+        // — program resolution, the process spawn, and the `initialize`
+        // handshake below all run unlocked, so a cold singleton spawn stalls
+        // nothing that doesn't depend on this key. (Pre-208 this path held
+        // the registry lock across the whole handshake: a daemon-wide lookup
+        // stall on every singleton cold spawn.)
+        let _marker = match self
+            .claim_spawn(&sf_key, |clients| clients.get(&sf_key).cloned())
+            .await
+        {
+            SpawnClaim::Found(existing) => {
+                // Liveness is checked with no registry guard held (bug 104 —
+                // pre-208 this await ran UNDER the registry lock).
+                if existing.lock().await.is_alive() {
+                    return Ok(existing);
+                }
+                anyhow::bail!("Single-file LSP server '{server_name}' ({lang}) is dead");
             }
-            anyhow::bail!("Single-file LSP server '{server_name}' ({lang}) is dead");
+            SpawnClaim::Owner(marker) => marker,
+        };
+
+        // The owner path can be reached by a waiter whose owner just FAILED:
+        // a failed singleton init leaves no tombstone (the negative cache,
+        // not the registry, is the single-file failure memory), so a woken
+        // waiter finds an empty registry and re-claims. Honor the cache here
+        // so a failed init fans out as one handshake, not one per waiter.
+        if self
+            .single_file_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&(lang.to_string(), server_name.to_string()))
+        {
+            anyhow::bail!(
+                "Single-file LSP server '{server_name}' ({lang}) rejected \
+                 null-workspace initialization (negative-cached)"
+            );
         }
 
         // Spawn resolution (lsm 02): same order as the per-root spawn — the
@@ -2509,6 +2617,17 @@ impl LspClientManager {
         // all protocol messages, including the init exchange itself.
         client.server().set_scope(Scope::SingleFile);
 
+        // Wire the snapshot and register the board entry *before* initialize —
+        // same discipline as the per-root spawn — so the singleton is visible
+        // as `initializing` during the handshake and its lifecycle transitions
+        // mirror to the board thereafter (misc 209: singletons previously
+        // never registered, so the board could not show them and the teardown
+        // paths' entry removal had nothing to remove).
+        if let Some(writer) = &self.snapshot {
+            client.server().set_snapshot(writer.clone());
+            writer.register_server(&sf_key, &crate::state_snapshot::now_iso());
+        }
+
         // Initialize with null workspace (single-file mode per LSP spec).
         if let Err(e) = client
             .initialize(&[], server_def.initialization_options.clone())
@@ -2524,12 +2643,27 @@ impl LspClientManager {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert((lang.to_string(), server_name.to_string()));
+            // No instance remains (the negative cache, not a tombstone, is
+            // the single-file failure memory) — a lingering board entry would
+            // be exactly the ghost class, so drop it (bug 72 / misc 209).
+            if let Some(writer) = &self.snapshot {
+                writer.remove_server(&sf_key);
+            }
+            // Dropping `_marker` on return wakes waiters; each re-claims in
+            // turn and bails on the negative cache above — one failed
+            // handshake total.
             return Err(e);
         }
 
         let client_mutex = Arc::new(Mutex::new(client));
-        clients.insert(sf_key.clone(), client_mutex.clone());
-        drop(clients);
+        // Re-acquire the registry only to publish the live instance (the
+        // marker, not the registry lock, held the claim across the
+        // handshake — misc 191/208). No client mutex is awaited under this
+        // guard (bug 104).
+        self.clients
+            .lock()
+            .await
+            .insert(sf_key.clone(), client_mutex.clone());
 
         // A fresh singleton starts its idle clock now (brackets 01).
         self.touch_single_file(&sf_key);
@@ -2563,6 +2697,67 @@ impl LspClientManager {
     /// expiry deterministically (a stale `Instant::now() - Duration`), the
     /// same seam [`crate::router`]'s ephemeral mounts use.
     ///
+    /// Detaches every instance matching `filter` under the registry lock,
+    /// then — registry free — shuts each down and drops its board entry,
+    /// returning the torn-down keys.
+    ///
+    /// The one teardown chokepoint (misc 209, generalized across scopes by
+    /// misc 208): every teardown path — the single-instance restart
+    /// ([`Self::shutdown_instance`]), the root retirement
+    /// ([`Self::shutdown_root_instances`]), the roots-change singleton sweep
+    /// ([`Self::shutdown_single_file_instances`]), and the idle reap
+    /// ([`Self::reap_idle_single_file_instances`]) — routes through here, so
+    /// a detach is structurally paired with its board-entry removal (the
+    /// snapshot keeps no ghost, bug 72) and the shutdown round-trip never
+    /// runs under the registry guard (bug 104). Removal-first preserves the
+    /// invariant: a detached instance is unreachable by lookup before its
+    /// process goes.
+    async fn teardown_matching(
+        &self,
+        mut filter: impl FnMut(&InstanceKey) -> bool,
+        reason: &'static str,
+    ) -> Vec<InstanceKey> {
+        // Detach under the registry lock, shut down after (bug 104).
+        let detached: Vec<(InstanceKey, Arc<Mutex<LspClient>>)> = {
+            let mut clients = self.clients.lock().await;
+            clients.extract_if(|k, _| filter(k)).collect()
+        };
+        let mut torn_down = Vec::with_capacity(detached.len());
+        for (key, client_mutex) in detached {
+            let sr = key.scope.root_path().map(|p| p.display().to_string());
+            info!(
+                source = Source::LspLifecycle.as_str(),
+                server = key.server.as_str(),
+                scope_root = sr.as_deref(),
+                reason,
+                "Shutting down LSP server instance {key}",
+            );
+            let mut client = client_mutex.lock().await;
+            if client.is_alive()
+                && let Err(e) = client.shutdown().await
+            {
+                info!(
+                    source = Source::LspLifecycle.as_str(),
+                    server = key.server.as_str(),
+                    scope_root = sr.as_deref(),
+                    "Failed to shutdown LSP server instance {key}: {e}",
+                );
+            }
+            drop(client);
+            drop(client_mutex);
+            // The instance is gone — drop its board entry so the snapshot
+            // does not keep a stale ghost (bug 72). Ordered after the client
+            // drops so the reader loop's `on_shutdown` (which cannot upgrade
+            // its `Weak` once the last `LspServer` ref is gone) never
+            // re-creates one behind us.
+            if let Some(writer) = &self.snapshot {
+                writer.remove_server(&key);
+            }
+            torn_down.push(key);
+        }
+        torn_down
+    }
+
     /// Same teardown discipline as [`Self::shutdown_single_file_instances`]:
     /// detach under the registry lock, shut down after (bug 104). Board
     /// entries are dropped so the snapshot keeps no ghost (bug 72).
@@ -2594,40 +2789,15 @@ impl LspClientManager {
             return expired;
         }
 
-        // Phase 2 — detach under the registry lock, shut down after (bug 104).
-        let detached: Vec<(InstanceKey, Arc<Mutex<LspClient>>)> = {
-            let mut clients = self.clients.lock().await;
-            expired
-                .iter()
-                .filter_map(|k| clients.remove(k).map(|c| (k.clone(), c)))
-                .collect()
-        };
-        let mut reaped = Vec::with_capacity(detached.len());
-        for (key, client_mutex) in detached {
-            info!(
-                source = Source::LspLifecycle.as_str(),
-                server = key.server.as_str(),
-                "Idle-expiring single-file instance {key}",
-            );
-            let mut client = client_mutex.lock().await;
-            if client.is_alive()
-                && let Err(e) = client.shutdown().await
-            {
-                info!(
-                    source = Source::LspLifecycle.as_str(),
-                    server = key.server.as_str(),
-                    "Failed to shutdown single-file instance {key}: {e}",
-                );
-            }
-            drop(client);
-            drop(client_mutex);
-            // The instance is gone — drop its board entry so the snapshot does
-            // not keep a stale ghost (bug 72).
-            if let Some(writer) = &self.snapshot {
-                writer.remove_server(&key);
-            }
-            reaped.push(key);
-        }
+        // Phase 2 — the shared teardown chokepoint (misc 209): detach under
+        // the registry lock, shut down after (bug 104), board entry dropped
+        // with the instance (bug 72).
+        let reaped = self
+            .teardown_matching(
+                |k| k.scope == Scope::SingleFile && expired.contains(k),
+                "idle-expired",
+            )
+            .await;
 
         // Drop the reaped clocks so a later respawn starts a fresh window.
         {
@@ -2683,20 +2853,22 @@ impl LspClientManager {
             }
         }
 
-        // Check for existing instance.
-        {
+        // Check for existing instance. Snapshot the handle under the
+        // registry lock, check liveness after the guard drops (bug 104 /
+        // misc 208 — this await previously ran UNDER the registry lock).
+        let sf_key = InstanceKey::new(lang.to_string(), server_name.to_string(), Scope::SingleFile);
+        let existing = {
             let clients = self.clients.lock().await;
-            let sf_key =
-                InstanceKey::new(lang.to_string(), server_name.to_string(), Scope::SingleFile);
-            if let Some(existing) = clients.get(&sf_key) {
-                if existing.lock().await.is_alive() {
-                    // Demand refreshes the singleton's idle clock (brackets 01).
-                    self.touch_single_file(&sf_key);
-                    return Some(existing.clone());
-                }
-                // Dead — don't retry.
-                return None;
+            clients.get(&sf_key).cloned()
+        };
+        if let Some(existing) = existing {
+            if existing.lock().await.is_alive() {
+                // Demand refreshes the singleton's idle clock (brackets 01).
+                self.touch_single_file(&sf_key);
+                return Some(existing);
             }
+            // Dead — don't retry.
+            return None;
         }
 
         // No failure and no existing instance — try to spawn.
@@ -3025,24 +3197,37 @@ impl LspClientManager {
         };
         let resolved = self.resolve_server_root(path, &lang_id, &root);
 
-        let clients = self.clients.lock().await;
+        // Phase 1 — registry snapshot: resolve each qualifying binding to its
+        // candidate instance (or `None` for the spawn-fail class) under the
+        // registry lock, awaiting no client lock (bug 104 / misc 208 — the
+        // liveness probe below previously ran under the guard).
+        let candidates: Vec<(String, Option<Arc<Mutex<LspClient>>>)> = {
+            let clients = self.clients.lock().await;
+            lang_config
+                .servers()
+                .iter()
+                .filter(|binding| lang_config.diagnostics_enabled(&binding.name))
+                .filter(|binding| {
+                    self.effective_server_def(&binding.name, &root)
+                        .is_some_and(|def| file_matches_patterns(path, &def.compiled_patterns))
+                })
+                .map(|binding| {
+                    let mut instance = find_instance(&clients, &lang_id, &binding.name, &resolved);
+                    if instance.is_none() && resolved != root {
+                        // No instance at the marker root — fall back to a
+                        // workspace-root instance (mirrors `get_servers`).
+                        instance = find_instance(&clients, &lang_id, &binding.name, &root);
+                    }
+                    (binding.name.clone(), instance)
+                })
+                .collect()
+        };
+
+        // Phase 2 — per-client checks with the registry guard dropped:
+        // waiting on a busy candidate stalls only this lookup, never the
+        // registry.
         let mut names = Vec::new();
-        for binding in lang_config.servers() {
-            if !lang_config.diagnostics_enabled(&binding.name) {
-                continue;
-            }
-            let Some(server_def) = self.effective_server_def(&binding.name, &root) else {
-                continue;
-            };
-            if !file_matches_patterns(path, &server_def.compiled_patterns) {
-                continue;
-            }
-            let mut instance = find_instance(&clients, &lang_id, &binding.name, &resolved);
-            if instance.is_none() && resolved != root {
-                // No instance at the marker root — fall back to a
-                // workspace-root instance (mirrors `get_servers`).
-                instance = find_instance(&clients, &lang_id, &binding.name, &root);
-            }
+        for (name, instance) in candidates {
             let Some(client) = instance else {
                 // No tombstone survives a spawn failure; the ledger still
                 // remembers (misc 167), so the receipt stays honest. Mirror
@@ -3053,13 +3238,13 @@ impl LspClientManager {
                     .map(|r| {
                         InstanceKey::new(
                             lang_id.clone(),
-                            binding.name.clone(),
+                            name.clone(),
                             Scope::Root(r.to_path_buf()),
                         )
                     })
                     .find(|k| self.strikes_recorded(k));
                 if let Some(key) = ledger_key {
-                    names.push((binding.name.clone(), self.revive_verdict(&key)));
+                    names.push((name, self.revive_verdict(&key)));
                 }
                 continue;
             };
@@ -3069,10 +3254,9 @@ impl LspClientManager {
             drop(locked);
             if dead {
                 let verdict = key.map_or(ReviveVerdict::Revivable, |k| self.revive_verdict(&k));
-                names.push((binding.name.clone(), verdict));
+                names.push((name, verdict));
             }
         }
-        drop(clients);
         names
     }
 
@@ -3182,26 +3366,35 @@ impl LspClientManager {
     /// An empty result routes the scope back to the fan-out fallback — so a
     /// not-yet-spawned or incapable server degrades gracefully.
     pub async fn workspace_diagnostic_clients(&self, root: &Path) -> Vec<Arc<Mutex<LspClient>>> {
-        let clients = self.clients.lock().await;
+        // Phase 1 — registry snapshot: root-scoped, diagnostics-enabled
+        // candidates under the registry lock, awaiting no client lock (bug
+        // 104 / misc 208 — the capability probe below previously ran under
+        // the guard).
+        let candidates: Vec<Arc<Mutex<LspClient>>> = {
+            let clients = self.clients.lock().await;
+            clients
+                .iter()
+                .filter(|(key, _)| key.scope.root_path() == Some(root))
+                .filter(|(key, _)| {
+                    self.effective_language(root, &key.language_id)
+                        .is_some_and(|lc| lc.diagnostics_enabled(&key.server))
+                })
+                .map(|(_, client)| client.clone())
+                .collect()
+        };
+
+        // Phase 2 — the liveness/capability probe with the registry guard
+        // dropped: a busy candidate stalls only this lookup, never the
+        // registry.
         let mut result = Vec::new();
-        for (key, client) in clients.iter() {
-            if key.scope.root_path() != Some(root) {
-                continue;
-            }
-            let diag_enabled = self
-                .effective_language(root, &key.language_id)
-                .is_some_and(|lc| lc.diagnostics_enabled(&key.server));
-            if !diag_enabled {
-                continue;
-            }
+        for client in candidates {
             let locked = client.lock().await;
             let capable = locked.is_alive() && locked.server().supports_workspace_diagnostics();
             drop(locked);
             if capable {
-                result.push(client.clone());
+                result.push(client);
             }
         }
-        drop(clients);
         result
     }
 
@@ -3701,36 +3894,18 @@ impl LspClientManager {
     }
 
     /// Shuts down a specific server instance if it exists.
+    ///
+    /// Routes through [`Self::teardown_matching`] (misc 208 — this path
+    /// previously held the registry guard across the client-lock await AND
+    /// the shutdown round-trip, convoying every manager lookup behind one
+    /// instance's teardown).
     pub async fn shutdown_instance(&self, key: &InstanceKey) {
-        let sr = key.scope.root_path().map(|p| p.display().to_string());
-        let mut clients = self.clients.lock().await;
-        if let Some(client_mutex) = clients.remove(key) {
-            info!(
-                source = Source::LspLifecycle.as_str(),
-                server = key.server.as_str(),
-                scope_root = sr.as_deref(),
-                "Shutting down LSP server instance {key}",
-            );
-            let mut client = client_mutex.lock().await;
-            if client.is_alive()
-                && let Err(e) = client.shutdown().await
-            {
-                info!(
-                    source = Source::LspLifecycle.as_str(),
-                    server = key.server.as_str(),
-                    scope_root = sr.as_deref(),
-                    "Failed to shutdown LSP server instance {key}: {e}",
-                );
-            }
-            drop(client);
-            drop(client_mutex);
-            // The instance is gone — drop its board entry so the snapshot does
-            // not keep a stale ghost (bug 72). See `shutdown_root_instances`.
-            if let Some(writer) = &self.snapshot {
-                writer.remove_server(key);
-            }
-            // An intentional shutdown is not failure history (misc 167): a
-            // deliberate restart starts with a clean strike slate.
+        let removed = self
+            .teardown_matching(|k| k == key, "instance shutdown")
+            .await;
+        // An intentional shutdown is not failure history (misc 167): a
+        // deliberate restart starts with a clean strike slate.
+        if !removed.is_empty() {
             self.clear_strikes(key);
         }
     }
@@ -3738,50 +3913,15 @@ impl LspClientManager {
     /// Shuts down all instances bound to a specific root.
     ///
     /// Only affects `Scope::Root(path)` instances where the path matches.
-    /// Workspace-scoped and other instances are untouched.
+    /// Workspace-scoped and other instances are untouched. Teardown
+    /// discipline (detach → shutdown → board-entry drop) lives in
+    /// [`Self::teardown_matching`].
     async fn shutdown_root_instances(&self, root: &Path) {
-        let sr = root.display().to_string();
-        // Detach under the registry lock, shut down after: `shutdown()`
-        // round-trips the server, and a client mutex can be held for a full
-        // diagnose batch (settle included) — awaiting either under the
-        // registry guard convoyed every manager lookup daemon-wide behind one
-        // root's teardown (bug 104). Removal-first preserves the invariant: a
-        // detached instance is unreachable by lookup before its processes go.
-        let detached: Vec<(InstanceKey, Arc<Mutex<LspClient>>)> = {
-            let mut clients = self.clients.lock().await;
-            clients
-                .extract_if(|k, _| matches!(&k.scope, Scope::Root(r) if r.as_path() == root))
-                .collect()
-        };
-        for (key, client_mutex) in detached {
-            info!(
-                source = Source::LspLifecycle.as_str(),
-                server = key.server.as_str(),
-                scope_root = sr.as_str(),
-                "Shutting down per-root instance {key}",
-            );
-            let mut client = client_mutex.lock().await;
-            if client.is_alive()
-                && let Err(e) = client.shutdown().await
-            {
-                info!(
-                    source = Source::LspLifecycle.as_str(),
-                    server = key.server.as_str(),
-                    scope_root = sr.as_str(),
-                    "Failed to shutdown per-root instance {key}: {e}",
-                );
-            }
-            drop(client);
-            drop(client_mutex);
-            // Drop the board entry: the instance is gone, so the snapshot
-            // must not keep rendering it healthy (bug 72). Ordered after the
-            // client drops so the reader loop's `on_shutdown` (which cannot
-            // upgrade its `Weak` once the last `LspServer` ref is gone)
-            // never re-creates a ghost behind us.
-            if let Some(writer) = &self.snapshot {
-                writer.remove_server(&key);
-            }
-        }
+        self.teardown_matching(
+            |k| matches!(&k.scope, Scope::Root(r) if r.as_path() == root),
+            "root retired",
+        )
+        .await;
         // Retirement resets the strike ledger for the root (misc 167 / bug
         // 93): the retired root's servers must not revive — their instances
         // just left the map, so no demand can find them — and a later remount
@@ -3796,31 +3936,13 @@ impl LspClientManager {
     /// now be covered by workspace or per-root instances. Single-file
     /// servers are lazily re-spawned on the next request if still needed.
     async fn shutdown_single_file_instances(&self) {
-        // Detach under the registry lock, shut down after (bug 104) — same
-        // discipline as [`Self::shutdown_root_instances`].
-        let detached: Vec<(InstanceKey, Arc<Mutex<LspClient>>)> = {
-            let mut clients = self.clients.lock().await;
-            clients
-                .extract_if(|k, _| k.scope == Scope::SingleFile)
-                .collect()
-        };
-        for (key, client_mutex) in detached {
-            info!(
-                source = Source::LspLifecycle.as_str(),
-                server = key.server.as_str(),
-                "Shutting down single-file instance {key}",
-            );
-            let mut client = client_mutex.lock().await;
-            if client.is_alive()
-                && let Err(e) = client.shutdown().await
-            {
-                info!(
-                    source = Source::LspLifecycle.as_str(),
-                    server = key.server.as_str(),
-                    "Failed to shutdown single-file instance {key}: {e}",
-                );
-            }
-        }
+        // The shared teardown chokepoint (misc 209): detach under the
+        // registry lock, shut down after (bug 104), board entry dropped with
+        // the instance (bug 72) — this path previously skipped the board
+        // removal, leaving singleton ghosts on the state.json board after
+        // every roots change.
+        self.teardown_matching(|k| k.scope == Scope::SingleFile, "roots changed")
+            .await;
 
         self.single_file_failures
             .lock()
@@ -8438,6 +8560,110 @@ mod tests {
         Ok(())
     }
 
+    /// A flush-fast `state.json` writer rooted in `dir` for board assertions.
+    fn test_snapshot_writer(dir: &Path) -> Arc<crate::state_snapshot::SnapshotWriter> {
+        crate::state_snapshot::SnapshotWriter::with_coalesce(
+            &tokio::runtime::Handle::current(),
+            dir,
+            crate::state_snapshot::DaemonInfo {
+                instance_id: "daemon:test".to_string(),
+                pid: 1,
+                version: "test".to_string(),
+                started_at: "t0".to_string(),
+            },
+            Duration::from_millis(10),
+        )
+    }
+
+    /// Flushes and parses the board's `servers` array from the snapshot file.
+    fn board_servers(writer: &crate::state_snapshot::SnapshotWriter) -> Vec<serde_json::Value> {
+        writer.flush_now();
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(writer.path()).expect("read snapshot"))
+                .expect("parse snapshot");
+        json["servers"].as_array().expect("servers array").clone()
+    }
+
+    /// misc 209: a `sync_roots`-triggered singleton teardown must drop the
+    /// board entry — the same discipline the idle reap and the per-root
+    /// teardown already follow (bug 72). Registration at spawn is asserted
+    /// first so the removal check cannot pass vacuously.
+    #[tokio::test]
+    async fn sync_roots_teardown_drops_singleton_board_entry() -> Result<()> {
+        let config = mockls_single_file_config();
+        let server_name = config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers()[0]
+            .name
+            .clone();
+        let mut manager = LspClientManager::new(config, test_logging(), test_fs());
+        let dir = tempfile::tempdir()?;
+        let writer = test_snapshot_writer(dir.path());
+        manager.set_snapshot(writer.clone());
+
+        let _ = manager.spawn_single_file(&server_name, MOCK_LANG_A).await?;
+        let servers = board_servers(&writer);
+        assert!(
+            servers.iter().any(|s| s["scope_kind"] == "single_file"),
+            "a live singleton registers a board entry: {servers:?}"
+        );
+
+        // A roots change tears down every rootless singleton (`sync_roots` →
+        // `shutdown_single_file_instances`); the board entry goes with it.
+        let root = tempfile::tempdir()?;
+        manager
+            .sync_roots(rich_bufs(vec![root.path().to_path_buf()]))
+            .await?;
+        assert!(
+            manager.clients().await.is_empty(),
+            "the roots change tears the singleton down"
+        );
+        let servers = board_servers(&writer);
+        assert!(
+            servers.iter().all(|s| s["scope_kind"] != "single_file"),
+            "the singleton teardown must leave no board ghost: {servers:?}"
+        );
+        Ok(())
+    }
+
+    /// The idle reap's board discipline, proven non-vacuously: the registered
+    /// singleton entry leaves the board when the reap tears the instance down
+    /// (previously `remove_server` here removed nothing — singletons never
+    /// registered).
+    #[tokio::test]
+    async fn reap_idle_drops_singleton_board_entry() -> Result<()> {
+        let config = mockls_single_file_config();
+        let server_name = config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers()[0]
+            .name
+            .clone();
+        let mut manager = LspClientManager::new(config, test_logging(), test_fs());
+        let dir = tempfile::tempdir()?;
+        let writer = test_snapshot_writer(dir.path());
+        manager.set_snapshot(writer.clone());
+
+        let _ = manager.spawn_single_file(&server_name, MOCK_LANG_A).await?;
+        let servers = board_servers(&writer);
+        assert!(
+            servers.iter().any(|s| s["scope_kind"] == "single_file"),
+            "a live singleton registers a board entry: {servers:?}"
+        );
+
+        let reaped = manager
+            .reap_idle_single_file_instances(Instant::now(), Duration::ZERO)
+            .await;
+        assert_eq!(reaped.len(), 1, "the idle singleton is reaped");
+        let servers = board_servers(&writer);
+        assert!(
+            servers.iter().all(|s| s["scope_kind"] != "single_file"),
+            "the reap must leave no board ghost: {servers:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_get_servers_falls_through_to_single_file() -> Result<()> {
         // File outside all roots → tier 3 single-file server spawned.
@@ -10640,6 +10866,248 @@ mod tests {
         );
         assert_eq!(manager.spawning_len(), 0, "marker cleared after the retry");
 
+        Ok(())
+    }
+
+    // ---- misc 208: the shared spawn-or-await gate covers the rootless tier ----
+
+    /// Single-file variant of [`mockls_config_with_args`]: the one server for
+    /// `MOCK_LANG_A` carries `single_file = true` plus the given extra CLI
+    /// args.
+    fn mockls_single_file_config_with_args(extra_args: &[&str]) -> Arc<Config> {
+        let bin = mockls_bin();
+        let server_name = mockls_server_name();
+        let mut args = vec![MOCK_LANG_A.to_string()];
+        args.extend(extra_args.iter().map(ToString::to_string));
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                path: Some(bin.to_string_lossy().to_string()),
+                args,
+                single_file: true,
+                ..ServerDef::default()
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new(server_name)]),
+                ..LanguageConfig::default()
+            },
+        );
+        Arc::new(Config {
+            language,
+            server,
+            ..test_config_raw()
+        })
+    }
+
+    /// The rootless singleton key for the one mockls server.
+    fn sf_key() -> InstanceKey {
+        InstanceKey::new(
+            MOCK_LANG_A.to_string(),
+            mockls_server_name(),
+            Scope::SingleFile,
+        )
+    }
+
+    /// Concurrent requests for the SAME cold singleton key spawn exactly one
+    /// process — misc 191's anti-duplicate property, carried to the rootless
+    /// tier by the shared gate (misc 208). `--request-log --log-pid-suffix`
+    /// makes each mockls process write its own file, so the file count is the
+    /// process count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_single_file_spawns_exactly_once() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let log = dir.path().join("requests.jsonl");
+        // A slow init widens the concurrent window so every requester arrives
+        // while the owner's handshake is still in flight.
+        let config = mockls_single_file_config_with_args(&[
+            "--response-delay",
+            "200",
+            "--request-log",
+            log.to_str().expect("log path"),
+            "--log-pid-suffix",
+        ]);
+        let manager = Arc::new(LspClientManager::new(config, test_logging(), test_fs()));
+
+        let server = mockls_server_name();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let manager = Arc::clone(&manager);
+            let server = server.clone();
+            handles.push(tokio::spawn(async move {
+                manager.spawn_single_file(&server, MOCK_LANG_A).await
+            }));
+        }
+
+        let mut clients = Vec::new();
+        for handle in handles {
+            clients.push(
+                handle
+                    .await
+                    .expect("spawn task panicked")
+                    .expect("spawn succeeded"),
+            );
+        }
+
+        // Every requester got the SAME instance.
+        let first = &clients[0];
+        for client in &clients[1..] {
+            assert!(
+                Arc::ptr_eq(first, client),
+                "all concurrent requesters must share one singleton"
+            );
+        }
+        assert_eq!(
+            manager.clients().await.len(),
+            1,
+            "the registry holds exactly one singleton for the key"
+        );
+        // Exactly one process handled a request ⇒ exactly one spawn.
+        let log_files: Vec<_> = std::fs::read_dir(dir.path())?
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("requests.jsonl.")
+            })
+            .collect();
+        assert_eq!(
+            log_files.len(),
+            1,
+            "exactly one mockls process spawned (anti-duplicate); found {} request-log files",
+            log_files.len()
+        );
+        assert_eq!(manager.spawning_len(), 0, "marker cleared after spawn");
+
+        manager.shutdown_all().await;
+        Ok(())
+    }
+
+    /// A cold singleton spawn must not stall a DIFFERENT key — the misc-208
+    /// regression proof, state-based like misc 191's. Pre-208
+    /// `spawn_single_file` held the clients registry lock across its whole
+    /// spawn+`initialize` handshake: no marker ever existed for a singleton
+    /// key, and a per-root cold spawn could not even reach its own marker
+    /// insert while a singleton handshake was in flight. Both markers being
+    /// live at once is therefore unreachable pre-208 and decisive here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn single_file_cold_spawn_does_not_stall_a_different_key() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_path_buf();
+        // Slow init on both spawns so each dwells in its handshake window.
+        let config = mockls_single_file_config_with_args(&["--response-delay", "400"]);
+        let manager = Arc::new(LspClientManager::new(
+            config,
+            test_logging(),
+            test_fs_with_roots(&[root.to_str().expect("root")]),
+        ));
+        let server = mockls_server_name();
+        let key_sf = sf_key();
+        let key_root = root_key(&root);
+
+        // Owner A: the singleton's cold spawn, in flight in the background.
+        let spawn_sf = {
+            let manager = Arc::clone(&manager);
+            let server = server.clone();
+            tokio::spawn(async move { manager.spawn_single_file(&server, MOCK_LANG_A).await })
+        };
+        // Wait — by state, not by clock — until the singleton spawn is
+        // provably mid-handshake (marker present, registry lock dropped).
+        poll_until(|| manager.is_spawning(&key_sf)).await?;
+
+        // Owner B: a per-root cold spawn, started while A is still in flight.
+        let spawn_root = {
+            let manager = Arc::clone(&manager);
+            let server = server.clone();
+            let root = root.clone();
+            tokio::spawn(async move { manager.spawn(&server, MOCK_LANG_A, &root).await })
+        };
+        // B reaches its own marker while A's is still live: two cold spawns
+        // in flight at once across the rooted and rootless tiers.
+        poll_until(|| manager.is_spawning(&key_root) && manager.is_spawning(&key_sf)).await?;
+
+        // Both complete; both land distinct live instances.
+        let sf_client = spawn_sf.await.expect("singleton task").expect("sf spawned");
+        let (_k, root_client) = spawn_root.await.expect("root task").expect("root spawned");
+        assert!(!Arc::ptr_eq(&sf_client, &root_client), "distinct instances");
+        assert_eq!(
+            manager.clients().await.len(),
+            2,
+            "one singleton, one per-root instance"
+        );
+        assert_eq!(manager.spawning_len(), 0, "both markers cleared");
+
+        manager.shutdown_all().await;
+        Ok(())
+    }
+
+    /// A failed singleton init fans out as ONE handshake across concurrent
+    /// requesters: the owner negative-caches before its marker drops, and
+    /// every woken waiter (or late arrival) honors the cache instead of
+    /// retrying the spawn — the process count stays 1, the marker clears,
+    /// and no tombstone is left behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_single_file_init_is_one_attempt_across_waiters() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let log = dir.path().join("requests.jsonl");
+        let config = mockls_single_file_config_with_args(&[
+            "--reject-null-workspace",
+            "--response-delay",
+            "200",
+            "--request-log",
+            log.to_str().expect("log path"),
+            "--log-pid-suffix",
+        ]);
+        let manager = Arc::new(LspClientManager::new(config, test_logging(), test_fs()));
+
+        let server = mockls_server_name();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let manager = Arc::clone(&manager);
+            let server = server.clone();
+            handles.push(tokio::spawn(async move {
+                manager.spawn_single_file(&server, MOCK_LANG_A).await
+            }));
+        }
+        for handle in handles {
+            assert!(
+                handle.await.expect("spawn task panicked").is_err(),
+                "every requester fails — the server rejects null-workspace init"
+            );
+        }
+
+        assert!(
+            manager.clients().await.is_empty(),
+            "a failed singleton leaves no tombstone (the negative cache is the memory)"
+        );
+        assert_eq!(manager.spawning_len(), 0, "marker cleared on failure");
+        assert!(
+            manager
+                .single_file_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&(MOCK_LANG_A.to_string(), mockls_server_name())),
+            "the failure is negative-cached"
+        );
+        // Exactly one process received the (rejected) initialize — the owner's.
+        let log_files: Vec<_> = std::fs::read_dir(dir.path())?
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("requests.jsonl.")
+            })
+            .collect();
+        assert_eq!(
+            log_files.len(),
+            1,
+            "one failed handshake total, not one per waiter; found {} request-log files",
+            log_files.len()
+        );
         Ok(())
     }
 
