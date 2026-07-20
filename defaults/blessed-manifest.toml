@@ -296,6 +296,11 @@ tier = "verified-on-macos"
 #   debounce_ms = 300                     # declared window for a debounce server
 #   suppress_pull = true                  # withhold textDocument.diagnostic
 #   declares_push = true                  # contractual publish per didOpen
+#   single_file = "enrichment-only"       # rootless (null-rootUri) capability:
+#                                         # unsupported (absent — fail closed,
+#                                         # never spawned rootless) |
+#                                         # enrichment-only | serves-diagnostics
+#                                         # (brackets 01)
 #   forbidden_init_options = ["..."]      # keys enforced absent post-merge
 #   forced_init_options = { key = false } # options overlaid, winning over user
 #   compress_versions = ["1."]            # version prefixes the strip rules pin
@@ -373,6 +378,11 @@ forbidden_init_options = ["diagnosticsDelay"]
 [discipline.lattice]
 discipline = "event"
 declares_push = true
+# single_file (brackets 01): markdown is per-file-natured — a stray note or
+# README outside any root. Lattice's publish contract is pinned cross-repo,
+# but its NULL-ROOT behavior specifically is not verified by anything in this
+# repo, so the claim stays at the conservative enrichment-only.
+single_file = "enrichment-only"
 
 # typescript-language-server — DEBOUNCE discipline (diagnostics-debt 05). ts-ls
 # is a push-only publisher (no textDocument/diagnostic pull) whose first
@@ -420,6 +430,12 @@ debounce_ms = 850
 [discipline.taplo]
 discipline = "event"
 declares_push = true
+# single_file (brackets 01): TOML is overwhelmingly per-file-natured — core
+# stray population. The verified-live probe above ran ROOTED; nothing in this
+# repo verifies taplo's null-root diagnostic behavior, so the claim stays at
+# the conservative enrichment-only (trust-increasing serves-diagnostics only
+# on direct null-root verification — the misc-196 evidence bar).
+single_file = "enrichment-only"
 
 # yaml-language-server — event + DECLARED PUSH (misc 196 verified live 2026-07-14).
 # Direct probe: no `diagnosticProvider`; publishes UNVERSIONED on didOpen — an
@@ -430,6 +446,10 @@ declares_push = true
 [discipline.yaml-language-server]
 discipline = "event"
 declares_push = true
+# single_file (brackets 01): YAML is per-file-natured (a lone config in $HOME
+# is the tier's motivating stray). The live probe above ran rooted; null-root
+# diagnostic behavior is unverified in-repo ⇒ conservative enrichment-only.
+single_file = "enrichment-only"
 
 # docker-langserver — event + DECLARED PUSH (misc 196 verified live 2026-07-14).
 # Direct probe: no `diagnosticProvider`; publishes UNVERSIONED on didOpen — an
@@ -459,6 +479,11 @@ discipline = "event"
 # the shellcheck linter feeder, conformance_bash_ls).
 [discipline.bash-language-server]
 discipline = "event"
+# single_file (brackets 01): shell scripts are the archetypal stray (a lone
+# script in $HOME, no project marker). bash-language-server analyzes per-file
+# (shellcheck-fed), but its null-root diagnostic behavior is not verified by
+# anything in this repo — the probe above ran rooted ⇒ enrichment-only.
+single_file = "enrichment-only"
 
 # lua-language-server — event, VERSIONED (misc 196 verified live 2026-07-14 against
 # lua-language-server 3.18.2). Direct probe: no `diagnosticProvider`; publishes
@@ -490,6 +515,11 @@ discipline = "event"
 # directly (DESIGN's pull row); a pull error would leave it unsettled (bug 84).
 [discipline.vscode-json-language-server]
 discipline = "pull"
+# single_file (brackets 01): JSON is per-file-natured (validation needs no
+# project semantics). The pull probe above ran rooted; null-root behavior is
+# unverified in-repo ⇒ conservative enrichment-only, never a guessed
+# serves-diagnostics.
+single_file = "enrichment-only"
 
 # vscode-css-language-server — PULL discipline (misc 196 verified live 2026-07-14).
 # Direct probe: advertises `diagnosticProvider`; publishes nothing on didOpen;

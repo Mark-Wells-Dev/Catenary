@@ -14,13 +14,21 @@ use std::path::{Path, PathBuf};
 ///
 /// Determines how the instance is bound to workspace roots.
 /// `Root` is the primary variant — every workspace root gets its
-/// own server instance. `SingleFile` in misc 28b (tier 3).
+/// own server instance. `SingleFile` is the rootless tier (misc 28b tier 3;
+/// foundation completed in brackets 01).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Scope {
     /// One instance per root. Unrelated projects never share
     /// an LSP server — each root is an isolated fault domain.
     Root(PathBuf),
-    /// Tier 3 — single-file mode (misc 28b).
+    /// The rootless single-file tier (brackets 01): a singleton per server
+    /// binding, spawned in genuine LSP single-file mode (null `rootUri`, null
+    /// `rootPath`, no `workspaceFolders`) for files in markerless locations.
+    /// The scope carries no root — the surrounding [`InstanceKey`]'s
+    /// language/server identify the singleton; it is never keyed per file
+    /// (LSP multiplexes documents over the one session). Spawning is gated by
+    /// the manifest's `single_file` capability, fail closed
+    /// ([`crate::recipes::SingleFileSupport`]).
     SingleFile,
 }
 

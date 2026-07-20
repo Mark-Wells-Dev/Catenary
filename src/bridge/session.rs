@@ -1374,6 +1374,25 @@ impl Session {
         self.sync_roots_inner(roots, true).await
     }
 
+    /// Sweeps rootless single-file singletons idle past `idle`, returning the
+    /// reaped instance keys (brackets 01).
+    ///
+    /// The daemon's idle-expiry reaper
+    /// ([`crate::router::SessionManager::spawn_ephemeral_root_reaper`]) calls
+    /// this on the ephemeral-root sweep cadence — the rootless tier's lifetime
+    /// leg, same idle rules as root instances with no root-tracker or
+    /// ownership involvement. Delegates to
+    /// [`crate::lsp::LspClientManager::reap_idle_single_file_instances`].
+    pub async fn reap_idle_single_file_instances(
+        &self,
+        now: std::time::Instant,
+        idle: std::time::Duration,
+    ) -> Vec<crate::lsp::instance_key::InstanceKey> {
+        self.client_manager
+            .reap_idle_single_file_instances(now, idle)
+            .await
+    }
+
     /// Like [`sync_roots`](Self::sync_roots) but **without** the eager `spawn_all`
     /// pre-warm — the boot-restore path for persisted pins (misc 175).
     ///

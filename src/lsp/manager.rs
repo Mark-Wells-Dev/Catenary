@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -467,6 +467,14 @@ pub struct LspClientManager {
     /// initialization at runtime. Uses `std::sync::Mutex` — reads are
     /// fast and non-contended.
     pub(crate) single_file_failures: std::sync::Mutex<HashSet<(String, String)>>,
+    /// Last-demand clocks for rootless single-file singletons (brackets 01).
+    /// Stamped by every [`Self::ensure_single_file_server`] hit and every
+    /// successful [`Self::spawn_single_file`]; swept by
+    /// [`Self::reap_idle_single_file_instances`] on the daemon's idle-expiry
+    /// cadence — same lifetime rules as root instances, minus any
+    /// root-tracker/ownership involvement. `std::sync::Mutex`: tiny critical
+    /// sections, never held across `await`.
+    single_file_last_use: std::sync::Mutex<HashMap<InstanceKey, Instant>>,
     /// Cache for root marker resolution results.
     /// Key: `(directory, server_name)` → resolved root path.
     /// Avoids re-walking the directory tree for files in the same
@@ -497,6 +505,7 @@ impl LspClientManager {
             spawning: std::sync::Mutex::new(HashMap::new()),
             strikes: std::sync::Mutex::new(HashMap::new()),
             single_file_failures: std::sync::Mutex::new(HashSet::new()),
+            single_file_last_use: std::sync::Mutex::new(HashMap::new()),
             marker_cache: std::sync::Mutex::new(HashMap::new()),
             logging,
             fs,
@@ -1110,12 +1119,21 @@ impl LspClientManager {
         }
     }
 
-    /// Returns whether any server for this language is configured for
-    /// single-file mode (`single_file = true` in `[lsp.server.*]`).
+    /// Returns whether any server for this language is single-file
+    /// **diagnostics** coverage for out-of-root files.
     ///
     /// Used by the hook layer to decide whether out-of-root edits
     /// should be gated by `start_editing`. Servers that failed at
     /// runtime (negative cache) are excluded.
+    ///
+    /// Two legs count (brackets 01):
+    /// - the manifest's verified `single_file = "serves-diagnostics"` claim
+    ///   ([`crate::recipes::SingleFileSupport::serves_diagnostics`]) — the
+    ///   maintainer ruling: the servers that get stray-file diagnostics are
+    ///   the ones that can serve them. An `enrichment-only` server may spawn
+    ///   rootless but must never arm this gate;
+    /// - the pre-existing user-scope `single_file = true` config opt-in
+    ///   (`[lsp.server.*]`), unchanged.
     #[must_use]
     pub fn has_single_file_coverage(&self, lang: &str) -> bool {
         let Some(lang_config) = self.config.resolve_language(lang) else {
@@ -1132,7 +1150,10 @@ impl LspClientManager {
             // Only a BLESSED single-file server is diagnostics coverage
             // (diagnostics-debt 04b): an unverified server is enrichment-only and
             // never a diagnostics source, so it must not arm the gate.
-            def.single_file
+            (def.single_file
+                || crate::lsp::server_behavior::ServerProfile::for_server(&binding.name)
+                    .single_file()
+                    .serves_diagnostics())
                 && server_is_blessed(&binding.name)
                 && !failures.contains(&(lang.to_string(), binding.name.clone()))
         })
@@ -2282,24 +2303,144 @@ impl LspClientManager {
         clients.insert(sf_key.clone(), client_mutex.clone());
         drop(clients);
 
+        // A fresh singleton starts its idle clock now (brackets 01).
+        self.touch_single_file(&sf_key);
+
         Ok(client_mutex)
+    }
+
+    /// Stamps a rootless singleton's idle clock at now (brackets 01).
+    ///
+    /// Called on every [`Self::ensure_single_file_server`] hit and every
+    /// successful [`Self::spawn_single_file`], so an actively-demanded
+    /// singleton never idle-expires.
+    fn touch_single_file(&self, key: &InstanceKey) {
+        self.single_file_last_use
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.clone(), Instant::now());
+    }
+
+    /// Sweeps rootless single-file singletons idle past `idle`, returning the
+    /// reaped keys (brackets 01).
+    ///
+    /// The rootless tier's lifetime leg: singletons spawn on demand
+    /// ([`Self::ensure_single_file_server`]) and idle-expire under the same
+    /// lifetime rules as root instances — the daemon's reaper drives this on
+    /// the ephemeral-root sweep cadence with the ephemeral-root idle window —
+    /// minus any root-tracker/ownership involvement (no pinning, no
+    /// pre-warm). Every qualifying demand refreshes the clock, so a singleton
+    /// under active use never expires; a genuinely idle one shuts down and
+    /// the next demand respawns it fresh. `now` is injected so tests drive
+    /// expiry deterministically (a stale `Instant::now() - Duration`), the
+    /// same seam [`crate::router`]'s ephemeral mounts use.
+    ///
+    /// Same teardown discipline as [`Self::shutdown_single_file_instances`]:
+    /// detach under the registry lock, shut down after (bug 104). Board
+    /// entries are dropped so the snapshot keeps no ghost (bug 72).
+    pub async fn reap_idle_single_file_instances(
+        &self,
+        now: Instant,
+        idle: Duration,
+    ) -> Vec<InstanceKey> {
+        // Phase 1 — pick the expired singletons under the registry lock. A
+        // clock-less instance (defensive; spawn always stamps one) adopts
+        // `now`, earning a full idle window rather than expiring on sight.
+        let expired: Vec<InstanceKey> = {
+            let clients = self.clients.lock().await;
+            let mut clocks = self
+                .single_file_last_use
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            clients
+                .keys()
+                .filter(|k| k.scope == Scope::SingleFile)
+                .filter(|k| {
+                    let last = *clocks.entry((*k).clone()).or_insert(now);
+                    now.saturating_duration_since(last) >= idle
+                })
+                .cloned()
+                .collect()
+        };
+        if expired.is_empty() {
+            return expired;
+        }
+
+        // Phase 2 — detach under the registry lock, shut down after (bug 104).
+        let detached: Vec<(InstanceKey, Arc<Mutex<LspClient>>)> = {
+            let mut clients = self.clients.lock().await;
+            expired
+                .iter()
+                .filter_map(|k| clients.remove(k).map(|c| (k.clone(), c)))
+                .collect()
+        };
+        let mut reaped = Vec::with_capacity(detached.len());
+        for (key, client_mutex) in detached {
+            info!(
+                source = Source::LspLifecycle.as_str(),
+                server = key.server.as_str(),
+                "Idle-expiring single-file instance {key}",
+            );
+            let mut client = client_mutex.lock().await;
+            if client.is_alive()
+                && let Err(e) = client.shutdown().await
+            {
+                info!(
+                    source = Source::LspLifecycle.as_str(),
+                    server = key.server.as_str(),
+                    "Failed to shutdown single-file instance {key}: {e}",
+                );
+            }
+            drop(client);
+            drop(client_mutex);
+            // The instance is gone — drop its board entry so the snapshot does
+            // not keep a stale ghost (bug 72).
+            if let Some(writer) = &self.snapshot {
+                writer.remove_server(&key);
+            }
+            reaped.push(key);
+        }
+
+        // Drop the reaped clocks so a later respawn starts a fresh window.
+        {
+            let mut clocks = self
+                .single_file_last_use
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for key in &reaped {
+                clocks.remove(key);
+            }
+        }
+        reaped
     }
 
     /// Returns a single-file server for the given language and server,
     /// spawning one if needed.
     ///
-    /// Only considers servers with `single_file = true` in config.
+    /// The rootless spawn gate (brackets 01): a server qualifies through the
+    /// manifest's verified `single_file` capability
+    /// ([`crate::recipes::SingleFileSupport::may_spawn_rootless`] —
+    /// `enrichment-only` or `serves-diagnostics`; the fail-closed default for a
+    /// server without a claim is `unsupported`, never spawned rootless), or
+    /// through the pre-existing user-scope `single_file = true` config opt-in.
     /// Checks the negative cache first — if the server previously
     /// rejected null-workspace initialization, returns `None` without
     /// a spawn attempt. Returns `None` for dead servers (tombstones).
+    /// Every hit refreshes the singleton's idle clock
+    /// ([`Self::reap_idle_single_file_instances`]).
     async fn ensure_single_file_server(
         &self,
         lang: &str,
         server_name: &str,
     ) -> Option<Arc<Mutex<LspClient>>> {
-        // Config gate: only servers with single_file = true.
+        // Rootless spawn gate: the manifest capability (fail closed), or the
+        // user-scope config opt-in.
         let def = self.config.server.get(server_name)?;
-        if !def.single_file {
+        if !(def.single_file
+            || crate::lsp::server_behavior::ServerProfile::for_server(server_name)
+                .single_file()
+                .may_spawn_rootless())
+        {
             return None;
         }
 
@@ -2321,6 +2462,8 @@ impl LspClientManager {
                 InstanceKey::new(lang.to_string(), server_name.to_string(), Scope::SingleFile);
             if let Some(existing) = clients.get(&sf_key) {
                 if existing.lock().await.is_alive() {
+                    // Demand refreshes the singleton's idle clock (brackets 01).
+                    self.touch_single_file(&sf_key);
                     return Some(existing.clone());
                 }
                 // Dead — don't retry.
@@ -3402,6 +3545,11 @@ impl LspClientManager {
         }
 
         self.single_file_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        // The singletons are gone — drop their idle clocks too (brackets 01).
+        self.single_file_last_use
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
@@ -7541,6 +7689,169 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second), "Should be the same handle");
         assert_eq!(manager.clients().await.len(), 1);
 
+        Ok(())
+    }
+
+    /// Config binding `MOCK_LANG_A` to a server NAMED after the blessed
+    /// `mockls-event` persona, with NO `single_file` config opt-in — the
+    /// manifest's `single_file` capability is the only thing that can open
+    /// the rootless gate (brackets 01).
+    fn mockls_persona_named_config() -> Arc<Config> {
+        let bin = mockls_bin();
+        let server_name = "mockls-event".to_string();
+        let mut server = HashMap::new();
+        server.insert(
+            server_name.clone(),
+            ServerDef {
+                path: Some(bin.to_string_lossy().to_string()),
+                args: vec![MOCK_LANG_A.to_string()],
+                ..ServerDef::default()
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new(server_name)]),
+                ..LanguageConfig::default()
+            },
+        );
+        Arc::new(Config {
+            language,
+            server,
+            log_retention_days: 7,
+            notifications: None,
+            icons: None,
+            tools: None,
+            resolved_commands: None,
+            observability: None,
+            roots: None,
+            registry: None,
+            permissions: None,
+            servers: None,
+            linter: HashMap::new(),
+            quarantined: crate::config::Quarantine::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_registry_capability_opens_the_rootless_gate() -> Result<()> {
+        // brackets 01: the manifest's `single_file` capability alone — no
+        // `single_file = true` config opt-in — admits a rootless spawn. The
+        // `mockls-event` persona row carries `serves-diagnostics`
+        // (may-spawn-rootless), so the null-root spawn + handshake completes
+        // against the real mockls binary.
+        let manager =
+            LspClientManager::new(mockls_persona_named_config(), test_logging(), test_fs());
+
+        let client = manager
+            .ensure_single_file_server(MOCK_LANG_A, "mockls-event")
+            .await
+            .expect("the registry capability admits the rootless spawn");
+        assert!(client.lock().await.is_alive());
+
+        let clients = manager.clients().await;
+        assert_eq!(clients.len(), 1);
+        let key = clients.keys().next().expect("one singleton");
+        assert_eq!(key.scope, Scope::SingleFile);
+        assert_eq!(key.server, "mockls-event");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_capability_fails_closed_on_the_rootless_gate() {
+        // A server with NO manifest claim and NO config opt-in must never
+        // spawn rootless (fail closed, brackets 01): no client appears, and
+        // no spawn was even attempted — the negative cache stays empty
+        // because the gate refused before any process launch.
+        let manager = LspClientManager::new(mockls_config(), test_logging(), test_fs());
+        let server_name = format!("mockls-{MOCK_LANG_A}");
+
+        let result = manager
+            .ensure_single_file_server(MOCK_LANG_A, &server_name)
+            .await;
+        assert!(result.is_none(), "unsupported must never spawn rootless");
+        assert!(manager.clients().await.is_empty());
+        assert!(
+            manager
+                .single_file_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "the gate refuses before any spawn attempt",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reap_idle_single_file_expires_and_respawns() -> Result<()> {
+        // brackets 01 lifecycle: a rootless singleton idle past the window is
+        // reaped (shut down, unregistered); a fresh or actively-demanded one
+        // is kept; the next demand after expiry respawns on demand. Driven
+        // with explicit windows — no wall-clock waits.
+        let config = mockls_single_file_config();
+        let server_name = config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers()[0]
+            .name
+            .clone();
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+
+        let _ = manager
+            .ensure_single_file_server(MOCK_LANG_A, &server_name)
+            .await
+            .expect("spawn");
+        assert_eq!(manager.clients().await.len(), 1);
+
+        // Inside the idle window nothing is reaped.
+        let kept = manager
+            .reap_idle_single_file_instances(Instant::now(), Duration::from_hours(1))
+            .await;
+        assert!(kept.is_empty(), "a freshly-demanded singleton is not idle");
+        assert_eq!(manager.clients().await.len(), 1);
+
+        // Past the window (a zero idle bound expires any stamped clock) it is
+        // reaped and shut down.
+        let reaped = manager
+            .reap_idle_single_file_instances(Instant::now(), Duration::ZERO)
+            .await;
+        assert_eq!(reaped.len(), 1, "the idle singleton is reaped");
+        assert_eq!(reaped[0].scope, Scope::SingleFile);
+        assert!(
+            manager.clients().await.is_empty(),
+            "the reaped singleton left the registry"
+        );
+
+        // On demand after expiry: the next demand respawns fresh.
+        let respawned = manager
+            .ensure_single_file_server(MOCK_LANG_A, &server_name)
+            .await;
+        assert!(
+            respawned.is_some(),
+            "the next demand respawns the expired singleton"
+        );
+        assert_eq!(manager.clients().await.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reap_idle_single_file_skips_rooted_instances() -> Result<()> {
+        // The sweep is scope-narrow: per-root instances are governed by root
+        // lifetime (sync_roots / root expiry), never by the rootless idle
+        // clock — even a zero idle bound touches nothing rooted.
+        let manager = LspClientManager::new(
+            mockls_config(),
+            test_logging(),
+            test_fs_with_roots(&["/tmp"]),
+        );
+        let _ = ensure_first_server(&manager, MOCK_LANG_A).await?;
+        assert_eq!(manager.clients().await.len(), 1);
+
+        let reaped = manager
+            .reap_idle_single_file_instances(Instant::now(), Duration::ZERO)
+            .await;
+        assert!(reaped.is_empty(), "a rooted instance is never reaped here");
+        assert_eq!(manager.clients().await.len(), 1);
         Ok(())
     }
 

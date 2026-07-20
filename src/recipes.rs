@@ -963,6 +963,79 @@ impl Discipline {
     }
 }
 
+/// A blessed server's verified **single-file (rootless) capability** — what the
+/// server actually does when initialized with a null `rootUri` (brackets 01).
+///
+/// The rootless single-file tier serves files in markerless locations (a stray
+/// shell script, a lone config in `$HOME`) through one rootless singleton
+/// instance per server, initialized in genuine LSP single-file mode. Whether a
+/// server may participate — and how far its rootless answers can be trusted —
+/// is a behavioral fact judged against real null-root behavior, never policy
+/// (maintainer ruling, 2026-07-19: "the servers that get stray-file diagnostics
+/// are the ones that can serve them"). Like every discipline leg it rides the
+/// manifest per-pin.
+///
+/// A server without a discipline row — or a row without the `single_file` key —
+/// is [`Self::Unsupported`]: fail closed, the engine never spawns it rootless.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SingleFileSupport {
+    /// The server needs a workspace root; it is never spawned rootless. The
+    /// fail-closed default for every server without a verified claim — the
+    /// project-semantic class (rust-analyzer, gopls, …) and anything
+    /// unverified.
+    #[default]
+    Unsupported,
+    /// The server operates under a null root well enough that rootless answers
+    /// may enrich queries, but its single-file diagnostics are **not** verified
+    /// trustworthy — the rootless tier must never serve diagnostics from it.
+    EnrichmentOnly,
+    /// Single-file analysis is verified trustworthy end to end: the rootless
+    /// tier may serve this server's diagnostics for stray files.
+    ServesDiagnostics,
+}
+
+impl SingleFileSupport {
+    /// The kebab-case token used in the manifest TOML and in tracing.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::EnrichmentOnly => "enrichment-only",
+            Self::ServesDiagnostics => "serves-diagnostics",
+        }
+    }
+
+    /// Whether the engine may spawn this server rootless at all
+    /// (`enrichment-only` or `serves-diagnostics`).
+    ///
+    /// [`Self::Unsupported`] never spawns — the fail-closed default for a
+    /// server carrying no verified claim.
+    #[must_use]
+    pub const fn may_spawn_rootless(self) -> bool {
+        !matches!(self, Self::Unsupported)
+    }
+
+    /// Whether the server's single-file diagnostics are verified trustworthy —
+    /// the only state that lets the rootless tier serve diagnostics
+    /// (maintainer ruling, brackets 01).
+    #[must_use]
+    pub const fn serves_diagnostics(self) -> bool {
+        matches!(self, Self::ServesDiagnostics)
+    }
+}
+
+/// serde `skip_serializing_if` for the fail-closed default — an `unsupported`
+/// single-file capability is omitted from TOML so a row without the claim stays
+/// terse on round-trip.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires an fn(&T) -> bool"
+)]
+const fn single_file_is_unsupported(s: &SingleFileSupport) -> bool {
+    matches!(s, SingleFileSupport::Unsupported)
+}
+
 /// One line-strip rule for the message compressor (diagnostics-debt 04 / misc
 /// 165's rider / DESIGN §"The manifest").
 ///
@@ -1093,6 +1166,12 @@ pub struct DisciplineRecord {
     /// leg. Defaults to `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub declares_progress: bool,
+    /// The server's verified single-file (rootless) capability (brackets 01):
+    /// what it actually does when initialized under a null `rootUri`. Absent ⇒
+    /// [`SingleFileSupport::Unsupported`] — fail closed, never spawned
+    /// rootless by the engine.
+    #[serde(default, skip_serializing_if = "single_file_is_unsupported")]
+    pub single_file: SingleFileSupport,
     /// Forced `initializationOptions` overlaid onto — and winning over — the
     /// user's options at initialize time. A raw TOML value serialized as an inline
     /// table / sub-table. Absent ⇒ no forced options. (gopls's `pullDiagnostics:
@@ -2259,6 +2338,85 @@ bin = "bin/srv"
             pending.declares_progress,
             "`mockls-pending` declares the created-token-pending progress shape"
         );
+    }
+
+    #[test]
+    fn single_file_capability_parses_and_fails_closed() {
+        // brackets 01: the three-state `single_file` capability parses from a
+        // discipline row; a row without the key — and a server without a row —
+        // resolves `unsupported` (fail closed: never spawned rootless).
+        let doc = "\
+            [discipline.enricher]\n\
+            discipline = \"event\"\n\
+            single_file = \"enrichment-only\"\n\n\
+            [discipline.trusted]\n\
+            discipline = \"event\"\n\
+            single_file = \"serves-diagnostics\"\n\n\
+            [discipline.rooted]\n\
+            discipline = \"event\"\n";
+        let manifest = parse_blessed_manifest(doc).expect("capability doc parses");
+        assert_eq!(
+            manifest.discipline_for("enricher").single_file,
+            SingleFileSupport::EnrichmentOnly
+        );
+        assert_eq!(
+            manifest.discipline_for("trusted").single_file,
+            SingleFileSupport::ServesDiagnostics
+        );
+        // Key absent on the row ⇒ unsupported.
+        assert_eq!(
+            manifest.discipline_for("rooted").single_file,
+            SingleFileSupport::Unsupported
+        );
+        // Row absent entirely ⇒ the default record ⇒ unsupported.
+        assert_eq!(
+            manifest.discipline_for("absent-server").single_file,
+            SingleFileSupport::Unsupported
+        );
+        assert_eq!(
+            DisciplineRecord::default().single_file,
+            SingleFileSupport::Unsupported,
+            "the fail-closed default is unsupported",
+        );
+
+        // The predicate pair the gates consult.
+        assert!(!SingleFileSupport::Unsupported.may_spawn_rootless());
+        assert!(SingleFileSupport::EnrichmentOnly.may_spawn_rootless());
+        assert!(SingleFileSupport::ServesDiagnostics.may_spawn_rootless());
+        assert!(!SingleFileSupport::Unsupported.serves_diagnostics());
+        assert!(!SingleFileSupport::EnrichmentOnly.serves_diagnostics());
+        assert!(SingleFileSupport::ServesDiagnostics.serves_diagnostics());
+    }
+
+    #[test]
+    fn seed_manifest_single_file_rows_stay_conservative() {
+        // brackets 01: the stray-population servers (per-file-natured languages)
+        // carry `enrichment-only` — their null-root DIAGNOSTIC behavior is not
+        // verified by anything in this repo, so the trust-increasing
+        // `serves-diagnostics` state is deliberately withheld (the misc-196
+        // evidence bar). The project-semantic class carries no key at all —
+        // `unsupported`, fail closed.
+        let manifest = default_blessed_manifest().expect("manifest parses");
+        for name in [
+            "bash-language-server",
+            "taplo",
+            "yaml-language-server",
+            "vscode-json-language-server",
+            "lattice",
+        ] {
+            assert_eq!(
+                manifest.discipline_for(name).single_file,
+                SingleFileSupport::EnrichmentOnly,
+                "{name} is stray-population: enrichment-only until verified",
+            );
+        }
+        for name in ["rust-analyzer", "gopls", "typescript-language-server"] {
+            assert_eq!(
+                manifest.discipline_for(name).single_file,
+                SingleFileSupport::Unsupported,
+                "{name} is project-semantic: never spawned rootless",
+            );
+        }
     }
 
     #[test]

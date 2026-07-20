@@ -151,6 +151,12 @@ pub struct ServerProfile {
     /// convention. Read only by the `SessionStart` setup nudge — advisory
     /// metadata that no diagnostics seam consults.
     project_config: Option<crate::recipes::ProjectConfigConvention>,
+    /// The server's verified single-file (rootless) capability (brackets 01),
+    /// projected verbatim from the manifest's
+    /// [`crate::recipes::DisciplineRecord::single_file`]. Defaults to
+    /// [`crate::recipes::SingleFileSupport::Unsupported`] — fail closed, the
+    /// engine never spawns a server rootless without a verified claim.
+    single_file: crate::recipes::SingleFileSupport,
 }
 
 impl ServerProfile {
@@ -201,6 +207,7 @@ impl ServerProfile {
             .flatten(),
             discipline: record.discipline,
             project_config: record.project_config.clone(),
+            single_file: record.single_file,
         }
     }
 
@@ -273,6 +280,22 @@ impl ServerProfile {
     #[must_use]
     pub const fn project_config(&self) -> Option<&crate::recipes::ProjectConfigConvention> {
         self.project_config.as_ref()
+    }
+
+    /// The server's verified single-file (rootless) capability (brackets 01).
+    ///
+    /// The rootless-spawn gate consults
+    /// [`crate::recipes::SingleFileSupport::may_spawn_rootless`] (an
+    /// `unsupported` server is never spawned rootless — the fail-closed
+    /// default for a server carrying no verified claim), and the stray-file
+    /// diagnostics-coverage gate consults
+    /// [`crate::recipes::SingleFileSupport::serves_diagnostics`] (only the
+    /// verified-trustworthy state ever serves diagnostics from the rootless
+    /// tier — the maintainer ruling: "the servers that get stray-file
+    /// diagnostics are the ones that can serve them").
+    #[must_use]
+    pub const fn single_file(&self) -> crate::recipes::SingleFileSupport {
+        self.single_file
     }
 
     /// Whether the server's **verified discipline STATICALLY owes an answer** for
@@ -652,6 +675,69 @@ mod tests {
             None,
             "a debounce_ms on a non-debounce row must not project a bound",
         );
+    }
+
+    // ── single-file (rootless) capability projection (brackets 01) ──────
+
+    #[test]
+    fn stray_population_servers_project_enrichment_only_single_file() {
+        // The stray-population rows (per-file-natured languages) carry the
+        // conservative `enrichment-only` claim: rootless spawn is allowed, but
+        // the tier must never serve their diagnostics — null-root diagnostic
+        // behavior is unverified in-repo.
+        use crate::recipes::SingleFileSupport;
+        for name in [
+            "bash-language-server",
+            "taplo",
+            "yaml-language-server",
+            "vscode-json-language-server",
+            "lattice",
+        ] {
+            let capability = ServerProfile::for_server(name).single_file();
+            assert_eq!(
+                capability,
+                SingleFileSupport::EnrichmentOnly,
+                "{name} projects the conservative enrichment-only claim",
+            );
+            assert!(capability.may_spawn_rootless());
+            assert!(!capability.serves_diagnostics());
+        }
+    }
+
+    #[test]
+    fn single_file_capability_fails_closed_without_a_claim() {
+        // A project-semantic server (no `single_file` key on its row) and an
+        // unverified custom def (no row at all) both resolve `unsupported`:
+        // the engine never spawns them rootless (fail closed, brackets 01).
+        use crate::recipes::SingleFileSupport;
+        for name in [
+            "rust-analyzer",
+            "gopls",
+            "typescript-language-server",
+            "some-custom-server",
+            "yX4Za",
+        ] {
+            let capability = ServerProfile::for_server(name).single_file();
+            assert_eq!(
+                capability,
+                SingleFileSupport::Unsupported,
+                "{name} must fail closed on the rootless tier",
+            );
+            assert!(!capability.may_spawn_rootless());
+            assert!(!capability.serves_diagnostics());
+        }
+    }
+
+    #[test]
+    fn mockls_event_persona_projects_serves_diagnostics() {
+        // The rootless tier's synthetic stand-in: the `mockls-event` persona
+        // carries `serves-diagnostics` (the mock demonstrably accepts null-root
+        // initialization — rejection is an explicit opt-in flag), so the
+        // harness can exercise the trusted end of the capability without a
+        // real server.
+        let capability = ServerProfile::for_server("mockls-event").single_file();
+        assert!(capability.may_spawn_rootless());
+        assert!(capability.serves_diagnostics());
     }
 
     #[test]

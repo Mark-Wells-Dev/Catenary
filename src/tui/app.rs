@@ -853,7 +853,8 @@ impl<'a> App<'a> {
 
     /// Run the pending install through the injected seams, store its outcome on
     /// the overlay, and — on success — re-derive health so the suggestion
-    /// vanishes once the probe (a `$PATH` check) sees the now-installed binary.
+    /// vanishes once the probe (spawn-order resolution: managed home, then
+    /// `$PATH`) sees the now-installed binary.
     /// A first Enter runs it; once run, Enter is a no-op (the escape key
     /// dismisses). On failure the overlay carries the error.
     pub fn confirm_install(&mut self) {

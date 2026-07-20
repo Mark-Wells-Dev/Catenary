@@ -44,6 +44,13 @@ tier = "synthetic-persona"
 
 [discipline.mockls-event]
 discipline = "event"
+# single_file (brackets 01): the rootless tier's synthetic stand-in. mockls
+# demonstrably ACCEPTS null-rootUri initialization — rejection is an explicit
+# opt-in flag (`--reject-null-workspace`), and the manager's null-workspace
+# tests exercise the accepting handshake directly — so the trusted
+# `serves-diagnostics` end of the capability is verified for this binary the
+# same way every persona claim is: the row says X, the binary does X.
+single_file = "serves-diagnostics"
 
 # ── event discipline, unversioned publishes + declared push (lattice shape) ───
 # The contractual empty-is-clean: a publish on every didOpen, explicit `[]` for

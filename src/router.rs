@@ -3748,6 +3748,28 @@ impl SessionManager {
                     // expired mount leaves `state.json` promptly.
                     session.touch_snapshot();
                 }
+                // Rootless single-file singletons (brackets 01) ride this same
+                // sweep: the same cadence and the same idle window as the
+                // ephemeral roots — the "same lifetime rules as root
+                // instances" leg — with no root-tracker or ownership
+                // involvement (no pinning, no pre-warm). Demand refreshes the
+                // clock inside the manager; a genuinely idle singleton shuts
+                // down here and the next demand respawns it fresh.
+                let reaped_singletons = session
+                    .reap_idle_single_file_instances(Instant::now(), EPHEMERAL_ROOT_IDLE_TIMEOUT)
+                    .await;
+                if !reaped_singletons.is_empty() {
+                    for key in &reaped_singletons {
+                        info!(
+                            source = Source::DaemonDispatch.as_str(),
+                            server = key.server.as_str(),
+                            "expired idle single-file instance {key}",
+                        );
+                    }
+                    // The server board changed — flush the snapshot so the
+                    // expired singleton leaves `state.json` promptly.
+                    session.touch_snapshot();
+                }
             }
         });
     }

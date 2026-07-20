@@ -48,14 +48,6 @@ pub fn initialize(
     server_name: &str,
     initialization_options: Option<&Value>,
 ) -> Value {
-    // Per the LSP spec: null workspaceFolders means "single file open,
-    // no workspace." An empty array means "workspace open, no folders
-    // configured." Use null for single-file mode.
-    let workspace_folders: Value = if roots.is_empty() {
-        Value::Null
-    } else {
-        json!(folder_array(roots))
-    };
     let root_uri = roots.first().map_or(Value::Null, |(uri, _)| json!(uri));
 
     let mut params = json!({
@@ -130,9 +122,19 @@ pub fn initialize(
             "window": {
                 "workDoneProgress": true
             }
-        },
-        "workspaceFolders": workspace_folders
+        }
     });
+
+    // Per the LSP spec: with no roots this is genuine single-file mode
+    // (brackets 01) — null `rootUri`, null `rootPath` (the deprecated sibling
+    // some older servers still read), and NO `workspaceFolders` member at all;
+    // a rootless instance manufactures no root. With roots, the folder array
+    // rides `workspaceFolders` as before.
+    if roots.is_empty() {
+        params["rootPath"] = Value::Null;
+    } else {
+        params["workspaceFolders"] = json!(folder_array(roots));
+    }
 
     // Resolve the server's conformance profile once; both seams below consult it,
     // so this builder never tests a server name itself (misc 157).
@@ -445,6 +447,30 @@ mod tests {
         });
 
         assert_eq!(ours, expected);
+    }
+
+    #[test]
+    fn initialize_empty_roots_is_genuine_single_file_mode() {
+        // brackets 01: a rootless spawn initializes in genuine LSP single-file
+        // mode — null `rootUri`, null `rootPath`, and NO `workspaceFolders`
+        // member at all (not a manufactured root, not an empty folder array).
+        let ours = initialize(42, &[], "clangd", None);
+        assert_eq!(ours["rootUri"], Value::Null, "rootUri must be null");
+        assert_eq!(ours["rootPath"], Value::Null, "rootPath must be null");
+        assert!(
+            ours.get("workspaceFolders").is_none(),
+            "no workspaceFolders member in single-file mode: {ours}",
+        );
+        // A rooted spawn still carries the folder array and no rootPath.
+        let rooted = initialize(42, &[("file:///ws", "ws")], "clangd", None);
+        assert_eq!(
+            rooted["workspaceFolders"],
+            json!([{ "uri": "file:///ws", "name": "ws" }])
+        );
+        assert!(
+            rooted.get("rootPath").is_none(),
+            "a rooted spawn sends no rootPath member: {rooted}",
+        );
     }
 
     #[test]
