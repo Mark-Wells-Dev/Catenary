@@ -135,7 +135,8 @@ pub struct App<'a> {
     /// guided-install action reads these only through the blessing gate.
     recipes: BTreeMap<String, InstallRecipe>,
     /// The blessed-manifest: the only recipe-derived data a user surface may
-    /// consult. Empty in production until CI conformance blesses a server.
+    /// consult. Production loads the embedded seed — the committed record of
+    /// servers that passed CI conformance; tests inject their own.
     blessed: BlessedManifest,
     /// The command runner the guided install spawns argv through.
     runner: Box<dyn CommandRunner>,

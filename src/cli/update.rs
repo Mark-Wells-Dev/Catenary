@@ -292,7 +292,7 @@ pub fn run_update(out: &mut Output, check: bool, force: bool) -> Result<()> {
         let _ = out.writeln(format_args!(
             "\n{}",
             out.colors
-                .yellow("old daemon running, exit all sessions to use the new version."),
+                .yellow("old daemon running, run `catenary restart` to use the new version."),
         ));
     }
 

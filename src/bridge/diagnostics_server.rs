@@ -1481,10 +1481,12 @@ impl DiagnosticsServer {
     /// ([`LspClientManager::close_agent_docs`]); daemon death closes
     /// implicitly (bug 79, unchanged).
     ///
-    /// Blessed/unverified classification is ticket 04 of the
-    /// diagnostics-debt wave; until it lands, every configured server gets
-    /// this held-open batch lifecycle uniformly — this is where 04 will
-    /// branch.
+    /// Only blessed (diagnostics-eligible) servers reach this batch: an
+    /// enrichment-only (unverified custom) server never serves diagnostics —
+    /// [`LspServer::supports_diagnostics`] is always `false` for it, so
+    /// server selection ([`LspClientManager::diagnostic_servers`]) filters it
+    /// out upstream. Every server here gets this held-open batch lifecycle
+    /// uniformly.
     ///
     /// Returns whether a `didSave` was delivered to the server this round — the
     /// diff floor arm's trigger signal (misc 196). `false` on any early bail
