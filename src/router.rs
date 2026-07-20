@@ -1021,7 +1021,50 @@ struct HookDispatchContext {
     /// fallback runs unchanged (hookless / old-hook posture). Shared across
     /// all clone-of-context connections; per-root serialization is not
     /// required (the one-cook lock ensures at most one active hook per root).
-    vetted_roots_cache: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<PathBuf>>>>,
+    ///
+    /// Each deposit carries its birth instant: a deposit older than
+    /// [`VETTED_DEPOSIT_TTL`] at consume time is discarded (maintainer
+    /// ruling, 2026-07-19). The hazard is cross-caller staleness — a hook
+    /// fires but its CLI run never happens, and a later hookless bare run
+    /// from the same cwd root would inherit a serve set vetted for a dead
+    /// caller. Expiry is benign: the consumer falls back to the plain
+    /// cwd-kitchen serve, and a retry's own hook lays a fresh deposit.
+    vetted_roots_cache: Arc<std::sync::Mutex<VettedDepositCache>>,
+}
+
+/// Hook-deposited vetted serve sets keyed by lock root, each stamped with
+/// its deposit instant (bugs 124/128 + the TTL ruling).
+type VettedDepositCache = HashMap<PathBuf, (std::time::Instant, Vec<PathBuf>)>;
+
+/// Age bound on a `pre-tool/editing-stop` vetted-set deposit. `catenary
+/// diagnostics` is bare-only (the command filter denies compounds), so the
+/// legitimate hook→CLI gap is process-spawn latency — milliseconds, seconds
+/// under brutal load. Sixty seconds is generous by orders of magnitude while
+/// bounding how long a dead caller's deposit can wait to mis-serve a
+/// hookless bare run.
+const VETTED_DEPOSIT_TTL: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// One-shot consume of a vetted-set deposit: removes the entry for
+/// `cwd_root` and returns its serve set only while the deposit is younger
+/// than [`VETTED_DEPOSIT_TTL`]. An expired deposit is dropped silently to
+/// the identity-free fallback (benign: narrower, never wrong).
+fn consume_vetted_deposit(
+    cache: &std::sync::Mutex<VettedDepositCache>,
+    cwd_root: &Path,
+) -> Option<Vec<PathBuf>> {
+    let (deposited, roots) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(cwd_root)?;
+    if deposited.elapsed() > VETTED_DEPOSIT_TTL {
+        tracing::debug!(
+            root = %cwd_root.display(),
+            "vetted-set deposit expired ({}s TTL); bare serve falls back to the cwd kitchen",
+            VETTED_DEPOSIT_TTL.as_secs()
+        );
+        return None;
+    }
+    Some(roots)
 }
 
 /// A staged hook→CLI handoff, deposited under a [`HandoffKey`] by the
@@ -5933,7 +5976,7 @@ async fn handle_hook_dispatch(
                 ctx.vetted_roots_cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(cwd_root, vetted_roots);
+                    .insert(cwd_root, (std::time::Instant::now(), vetted_roots));
             }
         }
 
@@ -6025,12 +6068,8 @@ async fn handle_hook_dispatch(
         let bare_roots: Vec<PathBuf> = if scoped {
             Vec::new()
         } else {
-            let cached = crate::lock::resolve_lock_root(&caller_cwd).and_then(|cwd_root| {
-                ctx.vetted_roots_cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&cwd_root)
-            });
+            let cached = crate::lock::resolve_lock_root(&caller_cwd)
+                .and_then(|cwd_root| consume_vetted_deposit(&ctx.vetted_roots_cache, &cwd_root));
             cached.unwrap_or_else(|| crate::lock::bare_serve_roots(&caller_cwd))
         };
 
@@ -14822,6 +14861,52 @@ mod tests {
             spawns.get(),
             3,
             "a spawn that launched nothing is retried every tick",
+        );
+    }
+
+    /// The vetted-set deposit TTL (bugs 124/128, maintainer ruling 60 s): a
+    /// fresh deposit is consumed one-shot; a stale one is discarded to the
+    /// identity-free fallback; either way the entry is gone afterward.
+    #[test]
+    fn vetted_deposit_ttl_gates_consume() {
+        let cache = std::sync::Mutex::new(VettedDepositCache::new());
+        let root = PathBuf::from("/ws/root");
+        let serve = vec![PathBuf::from("/ws/root"), PathBuf::from("/ws/other")];
+
+        // Fresh deposit: consumed verbatim, one-shot.
+        cache
+            .lock()
+            .expect("fresh cache lock")
+            .insert(root.clone(), (std::time::Instant::now(), serve.clone()));
+        assert_eq!(
+            consume_vetted_deposit(&cache, &root),
+            Some(serve.clone()),
+            "a fresh deposit serves verbatim",
+        );
+        assert_eq!(
+            consume_vetted_deposit(&cache, &root),
+            None,
+            "consume is one-shot",
+        );
+
+        // Stale deposit: discarded, and discarded means GONE.
+        let Some(stale) = std::time::Instant::now().checked_sub(VETTED_DEPOSIT_TTL * 2) else {
+            // A platform whose clock cannot represent the past instant cannot
+            // exercise staleness; the fresh legs above still ran.
+            return;
+        };
+        cache
+            .lock()
+            .expect("stale cache lock")
+            .insert(root.clone(), (stale, serve));
+        assert_eq!(
+            consume_vetted_deposit(&cache, &root),
+            None,
+            "an expired deposit falls back to the identity-free serve",
+        );
+        assert!(
+            cache.lock().expect("post cache lock").is_empty(),
+            "an expired deposit is removed, not retried",
         );
     }
 }
