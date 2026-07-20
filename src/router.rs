@@ -2746,6 +2746,44 @@ const DISCONNECT_GRACE: Duration = Duration::from_mins(1);
 #[cfg(unix)]
 const TRIPWIRE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Idle window between a daemon's birth and its "never served a client"
+/// exit (bug 131).
+///
+/// The daemon's exit lifecycle is disconnect-event-driven: a
+/// last-bridge-disconnect arms [`DISCONNECT_GRACE`]. A daemon born into
+/// silence — spawned by a restart race, an accidental `catenary start`, a
+/// test that never connected — therefore never armed anything and lived
+/// forever. Birth grace bounds that: a daemon that has **never** been
+/// served exits cleanly when this window expires.
+///
+/// "Served" means real service — an accepted MCP (bridge) connection, or a
+/// hook/CLI request that actually parsed off the IPC socket. The spawn
+/// ceremony's bare connect-probes ([`ensure_daemon_running`], the bridge's
+/// [`connect_with_tenacity`] tick) never count, so a daemon cannot disarm
+/// its own birth grace at birth. A deliberate hookful-but-bridgeless daemon
+/// (`catenary start` + hook dispatches, zero MCP bridges) survives — its
+/// dispatches are service. One-shot: once served, the window retires
+/// permanently and the disconnect-driven lifecycle owns the daemon; it is
+/// never re-armed.
+///
+/// Tests inject a smaller window via `CATENARY_BIRTH_GRACE_SECS`
+/// (subprocess daemons, read by [`birth_grace_window`]) or
+/// [`SessionManager::birth_grace_override`] (in-process).
+#[cfg(unix)]
+const BIRTH_GRACE: Duration = Duration::from_mins(10);
+
+/// Resolves the birth-grace window: `CATENARY_BIRTH_GRACE_SECS` when set to
+/// a parseable seconds value (integration tests inject a tiny window across
+/// the process boundary; [`spawn_daemon`] children inherit it), otherwise
+/// [`BIRTH_GRACE`].
+#[cfg(unix)]
+fn birth_grace_window() -> Duration {
+    std::env::var("CATENARY_BIRTH_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(BIRTH_GRACE, Duration::from_secs)
+}
+
 /// Core daemon component that manages MCP and hook socket connections.
 ///
 /// Binds two Unix domain sockets: one for MCP connections from `catenary
@@ -2843,6 +2881,26 @@ pub struct SessionManager {
     /// Production default: [`TRIPWIRE_INTERVAL`]. Tests inject a smaller
     /// value via [`Self::tripwire_interval_override`].
     tripwire_interval: Duration,
+    /// Birth-grace window (bug 131): how long a daemon that has never been
+    /// served waits before concluding it was born into silence and exiting.
+    /// Resolved by [`birth_grace_window`] ([`BIRTH_GRACE`], overridable via
+    /// `CATENARY_BIRTH_GRACE_SECS`); in-process tests shrink it via
+    /// [`Self::birth_grace_override`].
+    birth_grace: Duration,
+    /// Set once, on the first real service — an accepted MCP (bridge)
+    /// connection, or an IPC request that actually parsed (bug 131). Never
+    /// cleared. Read by the accept loop's birth-grace expiry arm. Bare
+    /// socket connects — the spawn ceremony's liveness probes — never set
+    /// it: they close without sending a request line, so the IPC handlers'
+    /// parse step (the marking site) is never reached. `Arc` because the
+    /// IPC handlers run in spawned tasks.
+    service_seen: Arc<AtomicBool>,
+    /// Observability seam for birth grace (bug 131): `true` once the window
+    /// expired on a served daemon and retired permanently. Written only by
+    /// [`Self::accept_loop`]; read by tests to sequence deterministically
+    /// against the expiry pass instead of racing the clock (the
+    /// [`Self::grace_armed`] pattern).
+    birth_grace_retired: AtomicBool,
 }
 
 #[cfg(unix)]
@@ -2900,6 +2958,9 @@ impl SessionManager {
             mismatch_interrupts: Arc::new(std::sync::Mutex::new(HashSet::new())),
             sockets_removed: AtomicBool::new(false),
             tripwire_interval: TRIPWIRE_INTERVAL,
+            birth_grace: birth_grace_window(),
+            service_seen: Arc::new(AtomicBool::new(false)),
+            birth_grace_retired: AtomicBool::new(false),
         }
     }
 
@@ -2954,6 +3015,9 @@ impl SessionManager {
             mismatch_interrupts: Arc::new(std::sync::Mutex::new(HashSet::new())),
             sockets_removed: AtomicBool::new(false),
             tripwire_interval: TRIPWIRE_INTERVAL,
+            birth_grace: birth_grace_window(),
+            service_seen: Arc::new(AtomicBool::new(false)),
+            birth_grace_retired: AtomicBool::new(false),
         })
     }
 
@@ -2965,12 +3029,17 @@ impl SessionManager {
     /// are short-lived and handled in spawned tasks with passthrough
     /// responses.
     ///
-    /// Returns `Ok(())` when the daemon should shut down. Three triggers:
+    /// Returns `Ok(())` when the daemon should shut down. Exit triggers:
     /// - Last MCP client disconnected (disconnect notify, count == 0) and the
     ///   count is still zero when the grace window expires (pulse-03): bridge
     ///   churn at session transitions is normal host behavior, so the exit is
     ///   debounced by [`DISCONNECT_GRACE`] — a connection arriving during the
     ///   window disarms it and the warm LSP fleet survives.
+    /// - Never served (bug 131): the [`BIRTH_GRACE`] window expired and no
+    ///   client was ever served — no MCP connection accepted, no IPC request
+    ///   parsed. One-shot: a served daemon retires the window permanently on
+    ///   its single expiry pass and the disconnect-driven exits above own the
+    ///   lifecycle from there.
     /// - `catenary stop` received on the IPC socket (shutdown token) —
     ///   deliberate stops do not debounce.
     /// - External signal cancelled the shutdown token
@@ -2995,6 +3064,16 @@ impl SessionManager {
         // serving IPC) while the window runs.
         let mut grace_deadline: Option<tokio::time::Instant> = None;
 
+        // Birth grace (bug 131): a daemon that has NEVER been served exits
+        // when this deadline expires. Armed exactly once, at birth; the
+        // expiry arm below either exits (still unserved) or retires the
+        // timer permanently (served — the disconnect-driven lifecycle owns
+        // the daemon from there). Never re-armed. Service is recorded by
+        // the MCP accept arm and by the IPC handlers once a request parses;
+        // the spawn ceremony's bare connect-probes never record it.
+        let mut birth_deadline: Option<tokio::time::Instant> =
+            Some(tokio::time::Instant::now() + self.birth_grace);
+
         // Ghost self-defense tripwire (bug 129 fix C): periodically verify
         // that our own socket files still exist. First tick fires after one
         // full interval so we never trip on files we have not yet had a chance
@@ -3005,12 +3084,18 @@ impl SessionManager {
         );
 
         loop {
-            // Copied into the timer arm so the handler bodies below can
-            // mutate the original without borrowing against its future.
+            // Copied into the timer arms so the handler bodies below can
+            // mutate the originals without borrowing against their futures.
             let deadline = grace_deadline;
+            let birth = birth_deadline;
             tokio::select! {
                 result = self.mcp_listener.accept() => {
                     let (stream, _addr) = result.context("accept MCP connection")?;
+                    // First service (bug 131): an accepted MCP connection IS a
+                    // bridge — nothing bare-probes the MCP socket (the spawn
+                    // ceremony probes IPC precisely so an MCP connect-and-drop
+                    // never registers a connection here).
+                    self.service_seen.store(true, Ordering::Release);
                     if grace_deadline.take().is_some() {
                         self.grace_armed.store(false, Ordering::Release);
                         info!(
@@ -3025,11 +3110,19 @@ impl SessionManager {
                     let (stream, _addr) = result.context("accept IPC connection")?;
                     let shutdown = self.shutdown.clone();
                     let connections = Arc::clone(&self.connection_count);
+                    // Handed to the handlers, which mark it only once a
+                    // request actually parses — an accepted IPC connection is
+                    // NOT yet service (bug 131): the spawn ceremony's
+                    // liveness probes are bare connects that close without
+                    // sending a request line.
+                    let service_seen = Arc::clone(&self.service_seen);
                     if let Some(ctx) = &self.hook_ctx {
                         let ctx = ctx.clone();
                         tokio::spawn(async move {
                             if let Err(e) =
-                                handle_hook_dispatch(stream, ctx, shutdown, connections).await
+                                handle_hook_dispatch(
+                                    stream, ctx, shutdown, connections, service_seen,
+                                ).await
                             {
                                 debug!(
                                     source = Source::DaemonDispatch.as_str(),
@@ -3040,7 +3133,9 @@ impl SessionManager {
                     } else {
                         tokio::spawn(async move {
                             if let Err(e) =
-                                handle_hook_connection(stream, shutdown, connections).await
+                                handle_hook_connection(
+                                    stream, shutdown, connections, service_seen,
+                                ).await
                             {
                                 debug!(
                                     source = Source::DaemonDispatch.as_str(),
@@ -3083,6 +3178,33 @@ impl SessionManager {
                         info!(
                             source = Source::DaemonLifecycle.as_str(),
                             "last client disconnected",
+                        );
+                        self.remove_sockets();
+                        return Ok(());
+                    }
+                }
+                () = async move {
+                    match birth {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    // Birth grace expiry (bug 131) — fires at most once per
+                    // daemon lifetime. Check the flag at expiry — the
+                    // authoritative test: any real service inside the window
+                    // spares the daemon, and the window then retires
+                    // permanently (one-shot, never re-armed).
+                    birth_deadline = None;
+                    if self.service_seen.load(Ordering::Acquire) {
+                        self.birth_grace_retired.store(true, Ordering::Release);
+                    } else {
+                        // Routine housekeeping, never an interrupt: a daemon
+                        // born into silence (a restart race's orphan, an
+                        // accidental spawn, a test leak) exits cleanly.
+                        info!(
+                            source = Source::DaemonLifecycle.as_str(),
+                            birth_grace_secs = self.birth_grace.as_secs(),
+                            "never served a client within the birth grace — exiting (bug 131)",
                         );
                         self.remove_sockets();
                         return Ok(());
@@ -3401,6 +3523,19 @@ impl SessionManager {
     #[must_use]
     const fn tripwire_interval_override(mut self, interval: Duration) -> Self {
         self.tripwire_interval = interval;
+        self
+    }
+
+    /// Shrinks the birth-grace window (bug 131, test-only).
+    ///
+    /// Production waits [`BIRTH_GRACE`] (10 min) before a never-served
+    /// daemon exits; tests inject a small window so the expiry arm runs in
+    /// milliseconds. No production caller (subprocess daemons inject via
+    /// `CATENARY_BIRTH_GRACE_SECS` instead).
+    #[cfg(test)]
+    #[must_use]
+    const fn birth_grace_override(mut self, window: Duration) -> Self {
+        self.birth_grace = window;
         self
     }
 
@@ -4060,11 +4195,17 @@ fn companion_expanded_roots(
 /// shutdown token. The shutdown ack reports the live MCP connection count so
 /// `catenary stop` can warn about sessions that will lose tooling. Used when
 /// no shared session is configured (test mode).
+///
+/// Marks `service_seen` once a request line parses (bug 131): a parsed
+/// request is real service and retires the birth grace; a bare
+/// connect-and-drop (the spawn ceremony's liveness probe) sends no line, so
+/// it never reaches the mark.
 #[cfg(unix)]
 async fn handle_hook_connection(
     stream: tokio::net::UnixStream,
     shutdown: CancellationToken,
     connections: Arc<AtomicUsize>,
+    service_seen: Arc<AtomicBool>,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -4077,6 +4218,8 @@ async fn handle_hook_connection(
         .context("read hook request")?;
 
     if let Ok(raw) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+        // First service (bug 131): a request actually arrived and parsed.
+        service_seen.store(true, Ordering::Release);
         let method = raw
             .get("method")
             .and_then(|v| v.as_str())
@@ -5051,6 +5194,11 @@ async fn race_against_disconnect<T>(
 /// Reads the JSON request, extracts `session_id` for routing, looks up
 /// (or creates) the per-session [`HookRouter`], dispatches the request,
 /// logs the protocol pair, and writes the response.
+///
+/// Marks `service_seen` once the request line parses (bug 131): a parsed
+/// request is real service and retires the birth grace; a bare
+/// connect-and-drop (the spawn ceremony's liveness probe) sends no line,
+/// fails the parse, and never reaches the mark.
 #[cfg(unix)]
 #[allow(clippy::too_many_lines, reason = "sequential protocol steps")]
 async fn handle_hook_dispatch(
@@ -5058,6 +5206,7 @@ async fn handle_hook_dispatch(
     ctx: HookDispatchContext,
     shutdown: CancellationToken,
     connections: Arc<AtomicUsize>,
+    service_seen: Arc<AtomicBool>,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -5071,6 +5220,8 @@ async fn handle_hook_dispatch(
 
     let raw: serde_json::Value =
         serde_json::from_str(line.trim()).map_err(|e| anyhow!("Invalid hook request: {e}"))?;
+    // First service (bug 131): a request actually arrived and parsed.
+    service_seen.store(true, Ordering::Release);
     let method = raw
         .get("method")
         .and_then(|v| v.as_str())
@@ -8881,6 +9032,168 @@ mod tests {
             !ipc_path.exists(),
             "IPC socket removed by normal shutdown arm",
         );
+    }
+
+    // ── Birth grace (bug 131) ───────────────────────────────────────
+
+    /// A daemon that is never served exits when the birth grace expires —
+    /// the immortal-orphan class (census zero from birth, so the
+    /// disconnect-driven exit never arms) is bounded. The exit waits out
+    /// the full window and removes the socket files like every deliberate
+    /// exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn birth_grace_exits_a_never_served_daemon() {
+        const WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mcp_path = mcp_socket_in(dir.path());
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_in(dir.path()).birth_grace_override(WINDOW));
+        let started = std::time::Instant::now();
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move { m.accept_loop().await });
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("a never-served daemon must exit within 5s")
+            .expect("task should not panic");
+        assert!(result.is_ok(), "birth-grace exit should return Ok");
+        assert!(
+            started.elapsed() >= WINDOW,
+            "exit must wait out the birth grace, not fire at birth",
+        );
+
+        // A deliberate exit — sockets removed so successors bind fresh.
+        assert!(
+            !mcp_path.exists(),
+            "MCP socket removed by the birth-grace exit",
+        );
+        assert!(
+            !ipc_path.exists(),
+            "IPC socket removed by the birth-grace exit",
+        );
+    }
+
+    /// The spawn ceremony must not count as service: a bare IPC
+    /// connect-and-drop — exactly what `ensure_daemon_running`'s liveness
+    /// probe and the bridge's connect tick do — sends no request line, so
+    /// the daemon still concludes it was never served and exits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bare_ipc_connect_does_not_disarm_birth_grace() {
+        const WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_in(dir.path()).birth_grace_override(WINDOW));
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move { m.accept_loop().await });
+
+        // The ceremony: connect, confirm liveness by the connect alone, drop.
+        let stream = tokio::net::UnixStream::connect(&ipc_path)
+            .await
+            .expect("ceremony connect");
+        drop(stream);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("a probed-but-never-served daemon must still exit within 5s")
+            .expect("task should not panic");
+        assert!(result.is_ok(), "birth-grace exit should return Ok");
+        assert!(
+            !manager.service_seen.load(Ordering::Acquire),
+            "a bare connect must never register as service",
+        );
+    }
+
+    /// One parsed IPC request inside the window is real service: the window
+    /// retires permanently at its single expiry pass and the daemon
+    /// survives. Sequenced on the `birth_grace_retired` seam, not the
+    /// clock. Exercises the passthrough (`handle_hook_connection`) marking
+    /// site; the dispatch-mode site is pinned end-to-end by the
+    /// `birth_grace` integration tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ipc_request_disarms_birth_grace() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        const WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+
+        let manager = Arc::new(bind_in(dir.path()).birth_grace_override(WINDOW));
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move { m.accept_loop().await });
+
+        // One real request, completed well inside the window. The full
+        // roundtrip proves the request parsed (the response is written only
+        // after the parse), which is the service mark.
+        let stream = tokio::net::UnixStream::connect(&ipc_path)
+            .await
+            .expect("connect to IPC socket");
+        let (reader, mut writer) = stream.into_split();
+        let mut payload =
+            serde_json::to_string(&serde_json::json!({"method": "tool/version"})).expect("json");
+        payload.push('\n');
+        writer.write_all(payload.as_bytes()).await.expect("write");
+        let mut line = String::new();
+        BufReader::new(reader)
+            .read_line(&mut line)
+            .await
+            .expect("read");
+        assert!(
+            line.contains("version"),
+            "the request must be served, got: {line}",
+        );
+
+        // The expiry pass must spare the daemon and retire the window.
+        wait_until("birth grace retired", || {
+            manager.birth_grace_retired.load(Ordering::Acquire)
+        })
+        .await;
+        assert!(
+            !handle.is_finished(),
+            "a served daemon must survive birth-grace expiry",
+        );
+
+        manager.shutdown_token().cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
+    /// An MCP (bridge) connection is service the moment it is accepted:
+    /// the daemon survives birth-grace expiry, and the normal
+    /// disconnect-driven lifecycle owns it from there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_connection_disarms_birth_grace() {
+        const WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mcp_path = mcp_socket_in(dir.path());
+
+        // Default (60 s) disconnect grace: the later disconnect must not
+        // race an exit into this test's observations.
+        let manager = Arc::new(bind_in(dir.path()).birth_grace_override(WINDOW));
+        let m = Arc::clone(&manager);
+        let handle = tokio::spawn(async move { m.accept_loop().await });
+
+        let stream = tokio::net::UnixStream::connect(&mcp_path)
+            .await
+            .expect("connect");
+        wait_until("one connection counted", || manager.connection_count() == 1).await;
+
+        wait_until("birth grace retired", || {
+            manager.birth_grace_retired.load(Ordering::Acquire)
+        })
+        .await;
+        assert!(
+            !handle.is_finished(),
+            "a bridged daemon must survive birth-grace expiry",
+        );
+
+        drop(stream);
+        manager.shutdown_token().cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
 
     #[tokio::test]
