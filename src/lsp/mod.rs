@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
+/// Transaction brackets: serialized, run-to-completion instance access (brackets 02).
+pub mod bracket;
 /// Low-level LSP client for communicating with a server process.
 pub mod client;
 /// Transport layer: process lifecycle, reader loop, request/response correlation.
@@ -71,6 +73,7 @@ pub mod test_support {
     }
 }
 
+pub use bracket::{BracketOutcome, BracketQueues, Lane};
 pub use client::{DocSync, LspClient};
 pub use instance_key::{InstanceKey, Scope};
 pub use manager::LspClientManager;

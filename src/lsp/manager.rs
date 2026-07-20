@@ -15,6 +15,7 @@ use crate::bridge::filesystem_manager::{Change, ChangeKind, FilesystemManager, R
 use crate::config::{Config, DispatchMethod, LanguageConfig, ServerDef};
 use crate::logging::LoggingServer;
 use crate::lsp::LspClient;
+use crate::lsp::bracket::{BracketOutcome, BracketQueues, Lane};
 use crate::lsp::client::DocSync;
 use crate::lsp::glob::{self, LspGlob};
 use crate::lsp::instance_key::{InstanceKey, Scope};
@@ -563,6 +564,14 @@ pub struct LspClientManager {
     /// root-tracker/ownership involvement. `std::sync::Mutex`: tiny critical
     /// sections, never held across `await`.
     single_file_last_use: std::sync::Mutex<HashMap<InstanceKey, Instant>>,
+    /// Per-instance transaction-bracket queues (brackets 02). Serialized,
+    /// run-to-completion access to an instance's document state: consumers
+    /// of the rootless singletons go through
+    /// [`Self::with_single_file_bracket`] rather than interleaving raw
+    /// `didOpen`/request/`didClose` traffic. One queue per [`InstanceKey`],
+    /// never global — the registry's own lock is lookup-scoped, and no
+    /// manager lock is held across a bracket (bug 104).
+    brackets: BracketQueues,
     /// Cache for root marker resolution results.
     /// Key: `(directory, server_name)` → resolved root path.
     /// Avoids re-walking the directory tree for files in the same
@@ -599,6 +608,7 @@ impl LspClientManager {
             strikes: std::sync::Mutex::new(HashMap::new()),
             single_file_failures: std::sync::Mutex::new(HashSet::new()),
             single_file_last_use: std::sync::Mutex::new(HashMap::new()),
+            brackets: BracketQueues::new(),
             marker_cache: std::sync::Mutex::new(HashMap::new()),
             logging,
             fs,
@@ -625,6 +635,19 @@ impl LspClientManager {
             sigterm_grace,
             ceiling,
         };
+        self
+    }
+
+    /// Shrinks the per-bracket service budget (brackets 02, test-only).
+    ///
+    /// Production always serves with the constant
+    /// [`crate::lsp::bracket::BRACKET_SERVICE_BUDGET`]; tests inject a
+    /// millisecond budget so the completed-degraded backstop runs fast.
+    /// No production caller.
+    #[cfg(test)]
+    #[must_use]
+    fn bracket_budget_override(mut self, budget: Duration) -> Self {
+        self.brackets = BracketQueues::with_budget(budget);
         self
     }
 
@@ -2588,6 +2611,56 @@ impl LspClientManager {
 
         // No failure and no existing instance — try to spawn.
         self.spawn_single_file(server_name, lang).await.ok()
+    }
+
+    /// Runs one transaction bracket against the rootless singleton for
+    /// `(lang, server_name)` — the single-file access path (brackets 02).
+    ///
+    /// Ensures the singleton through the brackets-01 gate
+    /// ([`Self::ensure_single_file_server`]), then serves `body` (open →
+    /// request(s) → answer) and `close` (the teardown leg) as one bracket
+    /// on the instance's own queue: concurrent consumers serialize at
+    /// transaction boundaries, debt-payment ahead of enrichment, and the
+    /// bracket runs to completion — a budget-expired body still gets its
+    /// close, degrading the answer to raw
+    /// ([`BracketOutcome::Degraded`]).
+    ///
+    /// Returns `None` when no capable singleton exists — the gate refused,
+    /// the server negative-cached, or the instance is dead. That is the
+    /// capability-shaped degrade: whether a query enriches is decided by
+    /// "does a capable server exist", never by racing a clock; the budget
+    /// inside the bracket is only the pathology backstop.
+    ///
+    /// Registry locks stay lookup-scoped throughout: the ensure path drops
+    /// the client-map guard before returning, and the bracket queue holds
+    /// nothing above the instance's own queue (bug 104).
+    #[allow(
+        clippy::similar_names,
+        reason = "`lang` and `lane` are both established domain vocabulary"
+    )]
+    pub async fn with_single_file_bracket<T, B, BFut, C, CFut>(
+        &self,
+        lang: &str,
+        server_name: &str,
+        lane: Lane,
+        body: B,
+        close: C,
+    ) -> Option<BracketOutcome<T>>
+    where
+        T: Send + 'static,
+        B: FnOnce(Arc<Mutex<LspClient>>) -> BFut + Send + 'static,
+        BFut: std::future::Future<Output = T> + Send + 'static,
+        C: FnOnce(Arc<Mutex<LspClient>>) -> CFut + Send + 'static,
+        CFut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let client = self.ensure_single_file_server(lang, server_name).await?;
+        let key = InstanceKey::new(lang.to_string(), server_name.to_string(), Scope::SingleFile);
+        let opened = Arc::clone(&client);
+        Some(
+            self.brackets
+                .run(&key, lane, move || body(opened), move || close(client))
+                .await,
+        )
     }
 
     /// Get-then-spawn composition.
@@ -8462,6 +8535,160 @@ mod tests {
                 .is_empty(),
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_file_bracket_serializes_concurrent_consumers() -> Result<()> {
+        // brackets 02: the rootless access path serves consumers as whole
+        // transactions. Two concurrent brackets against the one live
+        // singleton never interleave their open→answer→close legs — the
+        // bodies deliberately release the client lock across their yield
+        // point, so only the bracket queue can be doing the serializing.
+        let config = mockls_single_file_config();
+        let server_name = config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers()[0]
+            .name
+            .clone();
+        let manager = LspClientManager::new(config, test_logging(), test_fs());
+
+        let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let bracket = |tag: &'static str| {
+            let body_log = log.clone();
+            let close_log = log.clone();
+            (
+                move |client: Arc<Mutex<LspClient>>| async move {
+                    // Touch the live session, then release the client lock
+                    // before yielding — an unserialized peer WOULD
+                    // interleave across this sleep.
+                    assert!(client.lock().await.is_alive());
+                    body_log.lock().expect("log").push(format!("{tag}:open"));
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    body_log.lock().expect("log").push(format!("{tag}:answer"));
+                },
+                move |_client: Arc<Mutex<LspClient>>| async move {
+                    close_log.lock().expect("log").push(format!("{tag}:close"));
+                },
+            )
+        };
+
+        let (body_a, close_a) = bracket("a");
+        let (body_b, close_b) = bracket("b");
+        let (out_a, out_b) = tokio::join!(
+            manager.with_single_file_bracket(
+                MOCK_LANG_A,
+                &server_name,
+                Lane::Enrichment,
+                body_a,
+                close_a,
+            ),
+            manager.with_single_file_bracket(
+                MOCK_LANG_A,
+                &server_name,
+                Lane::Enrichment,
+                body_b,
+                close_b,
+            ),
+        );
+        assert_eq!(out_a, Some(BracketOutcome::Completed(())));
+        assert_eq!(out_b, Some(BracketOutcome::Completed(())));
+        assert_eq!(
+            manager.clients().await.len(),
+            1,
+            "one singleton serves both"
+        );
+
+        let events = log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(events.len(), 6, "two full brackets: {events:?}");
+        for chunk in events.chunks(3) {
+            let tag = chunk[0].split(':').next().expect("tag");
+            let expected: Vec<String> = ["open", "answer", "close"]
+                .iter()
+                .map(|leg| format!("{tag}:{leg}"))
+                .collect();
+            assert_eq!(chunk, expected, "bracket interleaved: {events:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_file_bracket_is_capability_shaped() {
+        // brackets 02: whether the access path enriches at all is decided
+        // by "does a capable server exist" — no manifest claim and no
+        // config opt-in means the gate refuses and the bracket path answers
+        // `None` (serve raw), with no spawn and no queueing.
+        let manager = LspClientManager::new(mockls_config(), test_logging(), test_fs());
+        let server_name = format!("mockls-{MOCK_LANG_A}");
+
+        let out = manager
+            .with_single_file_bracket(
+                MOCK_LANG_A,
+                &server_name,
+                Lane::Enrichment,
+                |_client| async { 1 },
+                |_client| async {},
+            )
+            .await;
+        assert!(
+            out.is_none(),
+            "capability-shaped degrade: no capable server"
+        );
+        assert!(manager.clients().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn single_file_bracket_budget_expiry_completes_degraded() -> Result<()> {
+        // brackets 02 backstop at the seam: an injected tiny budget cuts a
+        // wedged body, but the transaction completes degraded — the close
+        // leg runs, the singleton survives, and its queue serves the next
+        // bracket normally.
+        let config = mockls_single_file_config();
+        let server_name = config
+            .resolve_language(MOCK_LANG_A)
+            .expect("lang config")
+            .servers()[0]
+            .name
+            .clone();
+        let manager = LspClientManager::new(config, test_logging(), test_fs())
+            .bracket_budget_override(Duration::from_millis(50));
+
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed_tx = closed.clone();
+        let out = manager
+            .with_single_file_bracket(
+                MOCK_LANG_A,
+                &server_name,
+                Lane::Enrichment,
+                |_client| std::future::pending::<()>(),
+                move |_client| async move {
+                    closed_tx.store(true, std::sync::atomic::Ordering::SeqCst);
+                },
+            )
+            .await
+            .expect("a capable singleton exists");
+        assert!(out.is_degraded(), "budget expiry degrades the answer");
+        assert!(
+            closed.load(std::sync::atomic::Ordering::SeqCst),
+            "the close leg still ran",
+        );
+
+        // The singleton survived the degraded bracket and serves fresh.
+        let next = manager
+            .with_single_file_bracket(
+                MOCK_LANG_A,
+                &server_name,
+                Lane::DebtPayment,
+                |client| async move { client.lock().await.is_alive() },
+                |_client| async {},
+            )
+            .await
+            .expect("the singleton is still capable");
+        assert_eq!(next.completed(), Some(true));
         Ok(())
     }
 
