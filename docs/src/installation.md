@@ -3,7 +3,9 @@
 ## Prerequisites
 
 - [Rust toolchain](https://rustup.rs/)
-- Language servers for the languages you want to use (see [Language Servers](lsp/README.md))
+- Language servers for the languages you want to use — Catenary can install
+  these itself (see [Managed language servers](#managed-language-servers))
+  or you can install them system-wide (see [Language Servers](lsp/README.md))
 
 ## Platforms
 
@@ -117,6 +119,51 @@ For other clients, or if you prefer manual setup:
 This registers the MCP connection only. Without the plugin/extension,
 you will not get editing state enforcement or command filtering.
 
+## Managed Language Servers
+
+> **Two installs, two meanings.** `catenary install <host>` installs *host
+> integration* — it writes the host's plugin and hook files and never
+> touches your Catenary config. Language servers have no install command at
+> all: Catenary installs them for you when you opt in below, or you install
+> them system-wide by hand ([Language Servers](lsp/README.md)).
+
+Catenary can install and manage the language servers it spawns. Opt in
+from your user config (`~/.config/catenary/config.toml`):
+
+```toml
+[servers]
+auto_install = true
+```
+
+With the opt-in set, each session start detects configured servers your
+workspace roots need that cannot spawn — nothing on PATH, no managed
+install yet — and installs each one in the background, at the exact
+version that passed Catenary's CI conformance gate, into a
+Catenary-owned directory (`~/.local/share/catenary/servers/` on Linux).
+Session start never waits: the kick is announced, and coverage arrives
+when the install lands. There is no per-server install step — the config
+edit is the setup. Managed installs are preferred at spawn, so a system
+package upgrade can never change the binary Catenary runs; servers you
+already have on PATH, and servers with an explicit `path` override, are
+left alone. See [Managed Server
+Installs](configuration.md#managed-server-installs) for the full contract.
+
+The opt-in is honored from your user config only — a project
+`.catenary.toml` can never switch it on. That is a consent posture: a
+public repository must not be able to opt your machine into installing
+software.
+
+> **Migrating from system installs.** If you installed language servers
+> system-wide solely for Catenary's use, you can retire them: remove the
+> system install, and (with `auto_install` on) the next session start
+> detects the server as missing and installs the vetted version into the
+> managed home. A server still on PATH is never replaced, so removing it
+> is what hands it over. `catenary doctor` is the residue list: a
+> system-installed server whose running version differs from the vetted
+> pin draws an advisory drift finding naming both versions (e.g. `taplo:
+> running version 0.8.0 differs from the blessed 0.10.0`), so every
+> leftover still being consulted is named.
+
 ## Disabling Catenary per project
 
 Catenary runs one daemon per host, shared across every project you open. If you
@@ -205,6 +252,13 @@ For each configured server, `doctor` reports:
 | `spawn failed` | Binary found but process failed to start |
 | `initialize failed` | Process started but LSP handshake failed |
 
+`doctor` resolves each server exactly as a spawn would, so a managed
+install counts as installed even when nothing is on `$PATH`. It also
+reports background auto-installs (running, landed, or failed), and adds
+an advisory drift finding when a running server's version differs from
+its vetted pin — informational only, nothing is refused (see
+[Managed language servers](#managed-language-servers)).
+
 Use `--root` to check a different workspace:
 
 ```bash
@@ -221,4 +275,6 @@ catenary doctor rust-analyzer
 ## Next Steps
 
 1. [Configure](configuration.md) your language servers
-2. [Install language servers](lsp/README.md) for your languages
+2. Install language servers — opt in to
+   [managed installs](#managed-language-servers), or follow the
+   per-language [setup guides](lsp/README.md)

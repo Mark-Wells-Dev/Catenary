@@ -173,6 +173,21 @@ servers = ["rust-analyzer"]
 servers = ["pyright-langserver"]
 ```
 
+Catenary can install the servers itself. Opt in with:
+
+```toml
+[servers]
+auto_install = true
+```
+
+Any configured server that has passed Catenary's conformance gate is then
+installed at its vetted, pinned version into a Catenary-owned directory —
+in the background, at session start, with no per-server install step.
+Servers already on `PATH` are left alone. The opt-in is honored from your
+user config only; a project `.catenary.toml` can never switch it on.
+(`catenary install` is unrelated: it installs host plugins, not language
+servers.)
+
 ### 3. Connect your agent
 
 **Claude Code**
@@ -192,8 +207,10 @@ catenary doctor
 
 `doctor` reports each configured server's status (`ready`, `command not
 found`, `spawn failed`, `initialize failed`) and whether the host's hooks
-are installed and current. Pass a server name (`catenary doctor
-rust-analyzer`) for verbose single-server diagnostics.
+are installed and current. Managed installs count as installed, and a
+system-installed server whose version drifts from the vetted pin draws an
+advisory finding naming both versions. Pass a server name (`catenary
+doctor rust-analyzer`) for verbose single-server diagnostics.
 
 ## Observability
 

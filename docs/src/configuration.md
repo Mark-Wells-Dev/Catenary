@@ -331,6 +331,66 @@ clears the default.
 
 Classification precedence (highest first): shebang > filename > extension.
 
+## Managed Server Installs
+
+The `[servers]` table controls where server binaries come from. Catenary
+keeps its own installs of the servers that have passed its CI conformance
+gate (the *blessed* set — version-pinned per platform) in a managed home it
+owns: `<data-dir>/catenary/servers/<name>/<version>/` — on Linux,
+`~/.local/share/catenary/servers/…`. A system package upgrade can never
+change the binary a managed spawn runs.
+
+```toml
+[servers]
+prefer_managed = true   # default: spawn the managed install at the vetted pin when one exists
+auto_install = false    # default: nothing is ever installed without this opt-in
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `prefer_managed` | `true` | Spawn a blessed server from the managed home at its pinned version when that install exists; PATH remains the fallback. Set `false` to always resolve on PATH. |
+| `auto_install` | `false` | Opt in to background installs of missing blessed servers at session start. |
+
+Spawn resolution order, first hit wins: an explicit `path` on
+`[lsp.server.*]` (your own resolution — the managed home is never
+consulted), then the managed install at the blessed pin (when
+`prefer_managed` is on), then PATH. rust-analyzer is deliberately exempt:
+it tracks your Rust toolchain and is never version-pinned or managed.
+
+### `auto_install`
+
+With the opt-in set, each session start detects configured servers your
+workspace roots need (by root markers) that cannot spawn — no managed
+install at the pin and nothing on PATH — and installs each one into the
+managed home in the background. Session start never waits: the kick is
+announced, coverage arrives when the install lands, and a landed install
+pre-warms the server for live matching roots. There is no per-server
+install command — enabling the flag *is* the setup.
+
+Only blessed servers qualify, at their exact pinned version, through
+Catenary's verified install engine. A server already on PATH, or one with
+a `path` override, is never touched. A failed install is recorded —
+visible in `catenary doctor` and the TUI — and retried at the next session
+start. The opt-in is meaningful only with `prefer_managed` on (its
+default): with the managed home opted out of spawn resolution, a completed
+install would never be consulted, so detection is skipped.
+
+The managed home keeps two versions per server — the current pin plus the
+previously installed one, the trivial rollback target. Older version
+directories are collected on a successful install, each deletion named in
+the install's outcome record.
+
+**User config only, deliberately.** `[servers]` is read only from
+`~/.config/catenary/config.toml`, never from a project `.catenary.toml` —
+a project `[servers]` table is warned about and ignored. This is a consent
+posture, not a limitation: which binary a spawn executes, and whether
+software gets installed on your machine, are decisions only you make — a
+public repository can never opt your machine into either.
+
+> `catenary install` is unrelated to any of this: it installs *host
+> integration* (plugin and hook files for Claude Code, OpenCode,
+> Antigravity) and never touches language servers or your Catenary config.
+
 ## Project Configuration
 
 Place a `.catenary.toml` in a workspace root to override language and

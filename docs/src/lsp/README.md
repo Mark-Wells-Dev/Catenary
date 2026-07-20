@@ -3,6 +3,13 @@
 Setup guides for individual language servers. Each page covers installation and
 Catenary configuration.
 
+Manual installs are one of two paths. With `[servers] auto_install = true` in
+your user config, Catenary installs conformance-vetted servers itself, into a
+directory it owns — see
+[Managed language servers](../installation.md#managed-language-servers). The
+pages here cover the manual system install: use them for servers outside the
+vetted set, or when you prefer to manage server binaries yourself.
+
 ## Languages
 
 | Language(s)        | Page                               | Server                       |
