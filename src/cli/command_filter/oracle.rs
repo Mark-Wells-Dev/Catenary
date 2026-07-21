@@ -1998,4 +1998,41 @@ mod tests {
         // the final `paren_depth == 0` against `!= 0` / a constant `true`).
         assert!(!is_balanced("(a)("));
     }
+
+    // ── bug 137: `case … esac` differential agreement ──────────────────────────
+
+    /// A `case` with *parenthesized* patterns is balanced (each `(pat)` pairs its
+    /// parens), so it is exercised by the differential rather than pruned. Both
+    /// parsers must agree that the scrutinee is not a command and each arm body's
+    /// command list is surfaced — the bug-137 fix's projection matching brush's
+    /// `CaseClause` walk. (The bare `pat)` spelling stays in the pruned tail: its
+    /// unbalanced `)` trips `is_balanced`, the pathological-tail cutout.)
+    #[test]
+    fn bug137_case_projection_agrees_with_brush() {
+        // Parenthesized-pattern form is balanced and not pruned.
+        assert!(!should_skip(
+            "case $x in (a) echo hi;; (b) make test;; esac"
+        ));
+        check("case $x in (a) echo hi;; (b) make test;; esac");
+        // The scrutinee's substitution runs during expansion on both sides.
+        check("case $(git status) in (a) echo hi;; esac");
+        // A nested case inside an arm body, still balanced.
+        check("case $x in (a) case $y in (b) make test;; esac;; esac");
+        // A body glued to a parenthesized pattern's `)` (`(a)make`) is balanced,
+        // so the differential exercises the glued-tail split — both parsers must
+        // still surface the body command (bug 137 review; the glued-tail-dropped
+        // fail-open regression).
+        assert!(!should_skip("case $x in (a)make test;; esac"));
+        check("case $x in (a)make test;; esac");
+        // A glued `$(…)` body head after a parenthesized pattern.
+        check("case $x in (a)$(git status);; esac");
+        // The brush reference projects the scrutinee as a non-command and the arm
+        // body's `make` as the sole command position — glued or spaced.
+        let spaced = brush_projection("case $x in (a) make test;; esac")
+            .expect("brush parses a parenthesized-pattern case");
+        assert_eq!(spaced.command_positions, vec!["make"]);
+        let glued = brush_projection("case $x in (a)make test;; esac")
+            .expect("brush parses a glued-body parenthesized-pattern case");
+        assert_eq!(glued.command_positions, vec!["make"]);
+    }
 }

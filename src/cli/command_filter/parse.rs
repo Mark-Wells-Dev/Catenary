@@ -999,8 +999,47 @@ fn heredoc_command_subs(body: &str) -> String {
 /// command (name, argv, redirects, substitutions, compound flag). The list
 /// operator that *terminates* each pipeline is otherwise discarded, except a
 /// bare `&` sets [`Pipeline::backgrounded`].
+///
+/// A `case … esac` compound is carved out *before* the list-operator split: its
+/// internal `;;` / `;&` / `;;&` arm terminators (and any `;`/`&&`/`||`/newline
+/// inside an arm body) are structure, not top-level list separators, so the span
+/// must not be shredded by [`split_on_list_ops`]. Each such span becomes one
+/// compound [`SimpleCommand`] (bug 137) — the scrutinee word is never a command
+/// position, each arm body filters like any other command list.
 fn segment(tokens: &[Token]) -> ParsedScript {
     let mut pipelines = Vec::new();
+    // Walk the token stream, splitting off each top-level `case … esac` span
+    // (nesting-aware) so its internal separators are never read as list
+    // operators. The plain token runs between spans route through the ordinary
+    // list-operator segmentation; each case span becomes a single compound
+    // pipeline.
+    let mut idx = 0;
+    let mut plain_start = 0;
+    while idx < tokens.len() {
+        if matches!(tokens[idx], Token::Reserved("case")) {
+            segment_plain(&tokens[plain_start..idx], &mut pipelines);
+            let end = case_span_end(tokens, idx);
+            pipelines.push(Pipeline {
+                commands: vec![build_case(&tokens[idx..end])],
+                backgrounded: false,
+                terminator: None,
+            });
+            idx = end;
+            plain_start = end;
+        } else {
+            idx += 1;
+        }
+    }
+    segment_plain(&tokens[plain_start..], &mut pipelines);
+    ParsedScript { pipelines }
+}
+
+/// Segment a `case`-free token run into pipelines, appending them to `out`.
+///
+/// The ordinary path: split on list operators into pipelines, each split on `|`
+/// into simple commands. The terminating list operator is discarded except a
+/// bare `&`, which marks the preceding pipeline backgrounded.
+fn segment_plain(tokens: &[Token], out: &mut Vec<Pipeline>) {
     for (pipe_tokens, sep) in split_on_list_ops(tokens) {
         if pipe_tokens.is_empty() {
             continue;
@@ -1017,9 +1056,275 @@ fn segment(tokens: &[Token]) -> ParsedScript {
             // split); folded into the unconditional arm for totality.
             Control::Semi | Control::Amp | Control::Newline | Control::Pipe => ListOp::Seq,
         });
-        pipelines.push(pipeline);
+        out.push(pipeline);
     }
-    ParsedScript { pipelines }
+}
+
+/// Index just past the `esac` that closes the `case` beginning at `case_idx`
+/// (nesting-aware: an inner `case … esac` in an arm body is matched to its own
+/// `esac`). Returns `tokens.len()` for an unterminated `case` — the safe
+/// (over-swept) direction; a malformed compound is a fail-closed deny anyway.
+fn case_span_end(tokens: &[Token], case_idx: usize) -> usize {
+    let mut depth = 0usize;
+    let mut idx = case_idx;
+    while idx < tokens.len() {
+        match tokens[idx] {
+            Token::Reserved("case") => depth += 1,
+            Token::Reserved("esac") => {
+                depth -= 1;
+                if depth == 0 {
+                    return idx + 1;
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    tokens.len()
+}
+
+/// Build the compound [`SimpleCommand`] for a `case … esac` span (bug 137).
+///
+/// The span runs from the leading `Token::Reserved("case")` through its matching
+/// `esac` (inclusive). The scrutinee word — everything between `case` and the
+/// first `in` — is **never** a command position; only its substitutions are
+/// swept (`case $(cmd) in …` still runs `cmd` during expansion). Each arm body
+/// (the command list after a pattern's `)` and before its `;;` / `;&` / `;;&`
+/// terminator or the closing `esac`) is parsed as its own script and carried on
+/// [`SimpleCommand::substitutions`], so its command positions and writes are
+/// surfaced and filtered like any other command list. Arm *patterns* are never
+/// commands; their `)` and `|` alternation are structure.
+fn build_case(tokens: &[Token]) -> SimpleCommand {
+    let mut cmd = SimpleCommand {
+        is_compound: true,
+        ..SimpleCommand::default()
+    };
+
+    // The scrutinee: tokens after `case` up to the first `in`. Its words are not
+    // command positions, but their substitutions run during expansion.
+    let scrutinee_end = tokens
+        .iter()
+        .position(|t| matches!(t, Token::Reserved("in")))
+        .unwrap_or(tokens.len());
+    for tok in &tokens[1..scrutinee_end] {
+        if let Token::Word(w) = tok {
+            collect_subs(w, &mut cmd);
+        }
+    }
+
+    // The arm region: tokens after `in`, up to the closing `esac`. Nesting-aware
+    // arm splitting keeps an inner `case`'s arm terminators from ending an outer
+    // arm early.
+    let arm_region = arm_region_tokens(tokens, scrutinee_end);
+    for arm in split_case_arms(arm_region) {
+        // Split the arm at the pattern's closing `)` into its pattern tokens and
+        // its body command list (`arm_body` reunites a body word glued onto the
+        // close, e.g. `x)rm`, so the body head still reaches command position —
+        // fail-closed, since a dropped body would falsely *allow* a denied
+        // command; bug 137 review).
+        let (pattern, body) = arm_body(arm);
+        // A pattern may carry a substitution (`case x in $(cmd)) …`) whose
+        // command runs during pattern expansion — sweep those onto the compound.
+        for tok in &pattern {
+            if let Token::Word(w) = tok {
+                collect_subs(w, &mut cmd);
+            }
+        }
+        if body.is_empty() {
+            continue;
+        }
+        let body_script = segment(&body);
+        if !body_script.pipelines.is_empty() {
+            cmd.substitutions.push(body_script);
+        }
+    }
+
+    cmd
+}
+
+/// The arm-region token slice: everything after the scrutinee's `in` up to (but
+/// not including) the `case`'s own closing `esac`. `scrutinee_end` is the index
+/// of the `in` within `tokens` (or `tokens.len()` for a malformed `case` with no
+/// `in`, yielding an empty region).
+fn arm_region_tokens(tokens: &[Token], scrutinee_end: usize) -> &[Token] {
+    if scrutinee_end >= tokens.len() {
+        return &[];
+    }
+    // Skip the `in`. The final token is this `case`'s matching `esac` (or, for an
+    // unterminated span, one past the end already trimmed by `case_span_end`).
+    let start = scrutinee_end + 1;
+    let end = if matches!(tokens.last(), Some(Token::Reserved("esac"))) {
+        tokens.len() - 1
+    } else {
+        tokens.len()
+    };
+    if start >= end {
+        &[]
+    } else {
+        &tokens[start..end]
+    }
+}
+
+/// Split an arm region into per-arm token slices on the arm terminators `;;`
+/// (two `Control::Semi`), `;&` (`Semi` then `Amp`), and `;;&` (`Semi Semi Amp`),
+/// nesting-aware so a nested `case`'s terminators do not split the outer arm. The
+/// terminator tokens are dropped; each returned slice is one arm's
+/// `pattern ) body`.
+fn split_case_arms(region: &[Token]) -> Vec<&[Token]> {
+    let mut arms = Vec::new();
+    let mut depth = 0usize;
+    let mut last = 0;
+    let mut idx = 0;
+    while idx < region.len() {
+        match region[idx] {
+            Token::Reserved("case") => {
+                depth += 1;
+                idx += 1;
+            }
+            Token::Reserved("esac") => {
+                depth = depth.saturating_sub(1);
+                idx += 1;
+            }
+            // An arm terminator only at the outer nesting level. `;;` and the
+            // fallthrough variants `;&` / `;;&` all begin with two adjacent
+            // `Control` tokens whose first is a `Semi`; a lone `;` inside a body
+            // is an ordinary sequence separator kept in the arm.
+            Token::Control(Control::Semi) if depth == 0 => {
+                let term = case_terminator_len(&region[idx..]);
+                if term > 1 {
+                    arms.push(&region[last..idx]);
+                    idx += term;
+                    last = idx;
+                } else {
+                    idx += 1;
+                }
+            }
+            _ => idx += 1,
+        }
+    }
+    if last < region.len() {
+        arms.push(&region[last..]);
+    }
+    arms
+}
+
+/// The length of a case arm terminator starting at `tokens[0]` (a
+/// `Control::Semi`): `;;` → 2, `;&` → 2, `;;&` → 3. A lone `;` (the following
+/// token is neither a second `Semi` nor an `Amp`) is not a terminator → 1.
+fn case_terminator_len(tokens: &[Token]) -> usize {
+    match tokens.get(1) {
+        // `;;` or `;;&`
+        Some(Token::Control(Control::Semi)) => {
+            if matches!(tokens.get(2), Some(Token::Control(Control::Amp))) {
+                3
+            } else {
+                2
+            }
+        }
+        // `;&`
+        Some(Token::Control(Control::Amp)) => 2,
+        // Lone `;` — an ordinary in-body sequence separator.
+        _ => 1,
+    }
+}
+
+/// Split one arm into its `(pattern, body)` tokens at the pattern's closing `)`.
+///
+/// The pattern is `[(] PATTERN [| PATTERN]…)`; an optional leading `(` and the
+/// alternation `|`s are structure. The body is the command list that follows.
+/// When the arm has no closing `)` (malformed), the whole arm is treated as body
+/// — the safe direction: its words route through ordinary segmentation and reach
+/// the gate rather than silently vanishing.
+///
+/// The lexer treats `)` as a metacharacter only at a word boundary, so a
+/// space-separated close (`hello )`) surfaces as a [`Token::Paren`], while a
+/// glued one (`hello)`, `*)`, `b)`) rides on the tail of the preceding
+/// [`Token::Word`]. Both spellings close the pattern here. Critically, a *body*
+/// word glued onto the close (`x)rm`, `a|b)cargo`) is **not** swallowed with the
+/// pattern: the close word is split at its first `)` into a pattern remnant and a
+/// synthesized body-head word, so the smuggled command still reaches command
+/// position (bug 137 review — dropping it would fail *open*, falsely allowing a
+/// denied command the shell would run).
+fn arm_body(arm: &[Token]) -> (Vec<Token>, Vec<Token>) {
+    for (idx, tok) in arm.iter().enumerate() {
+        match tok {
+            // Space-separated close: the body is exactly the following tokens.
+            Token::Paren(')') => {
+                return (arm[..idx].to_vec(), arm[idx + 1..].to_vec());
+            }
+            // Glued close: split the word at its first `)`. The prefix (through
+            // the `)`) is the pattern remnant; a non-empty suffix is the body
+            // head and must reach command position.
+            Token::Word(w) if w.text.contains(')') => {
+                let mut pattern = arm[..idx].to_vec();
+                let mut body = Vec::new();
+                let (pat_word, tail) = split_word_at_close(w);
+                pattern.push(Token::Word(pat_word));
+                if let Some(tail) = tail {
+                    body.push(Token::Word(tail));
+                }
+                body.extend_from_slice(&arm[idx + 1..]);
+                return (pattern, body);
+            }
+            _ => {}
+        }
+    }
+    // No `)` at all (malformed arm): fail closed by routing the whole arm through
+    // the body path so any command in it is still gated.
+    (Vec::new(), arm.to_vec())
+}
+
+/// Split a glued case-pattern close word (`x)rm`, `*)true`) at its first `)` into
+/// the pattern remnant word (text through the `)`) and an optional body-head word
+/// (the text after it). A close with no trailing content (`hello)`, `*)`) yields
+/// `None` for the tail.
+///
+/// The word's cooked `text` is split; its flat [`WordTok::subs`] carry no
+/// per-character position, so every substitution is preserved on the synthesized
+/// tail word — the fail-closed direction: a `$(…)` anywhere in the close word
+/// reaches command position through the body rather than being dropped (an
+/// over-count is a false *deny* at worst; an under-count would hide a command).
+/// The tail is conservatively marked `had_quote`/`first_quote_at` from the parent
+/// so it is never mistaken for a reserved word or an assignment prefix.
+fn split_word_at_close(w: &WordTok) -> (WordTok, Option<WordTok>) {
+    // The caller reaches here only for a word whose `text` contains `)`, so the
+    // split point exists; `len()` is an unreachable fallback kept for totality.
+    let close = w.text.find(')').unwrap_or(w.text.len());
+    let pattern_text = w.text.get(..=close).unwrap_or(&w.text).to_string();
+    let tail_text = w.text.get(close + 1..).unwrap_or("").to_string();
+
+    let pattern_word = WordTok {
+        text: pattern_text,
+        // The pattern side keeps the parent's substitutions/meta only for the
+        // sweep; command-position reasoning never reads the pattern word.
+        subs: Vec::new(),
+        had_quote: w.had_quote,
+        first_quote_at: None,
+        meta: WordMeta::default(),
+    };
+
+    if tail_text.is_empty() {
+        // A bare close (`hello)`, `*)`): its substitutions still ran in the
+        // pattern, so keep them on the pattern word for the compound sweep.
+        return (
+            WordTok {
+                subs: w.subs.clone(),
+                ..pattern_word
+            },
+            None,
+        );
+    }
+
+    let tail_word = WordTok {
+        text: tail_text,
+        // Preserve every substitution on the body head (fail-closed): they surface
+        // as command positions through the body script.
+        subs: w.subs.clone(),
+        had_quote: w.had_quote,
+        first_quote_at: None,
+        meta: w.meta,
+    };
+    (pattern_word, Some(tail_word))
 }
 
 /// Split a token slice on the list operators `;` `&` `&&` `||` newline,
@@ -1534,6 +1839,188 @@ mod tests {
         // command position is still surfaced.
         let input = "for f in $(rm x); do echo hi; done";
         assert_eq!(parse(input).command_positions(), vec!["rm", "echo"]);
+    }
+
+    // ── `case … esac` compound (bug 137) ─────────────────────────────────────
+
+    #[test]
+    fn case_scrutinee_is_not_a_command() {
+        // Bug 137: the ticket repro. The scrutinee `"$c"` must never resolve into
+        // command position — only the arm bodies (`true`, `false`) are commands.
+        let input = r#"case "$c" in hello) true;; *) false;; esac"#;
+        let positions = parse(input).command_positions();
+        assert_eq!(
+            positions,
+            vec!["true", "false"],
+            "scrutinee/patterns must not be commands; got {positions:?}"
+        );
+        assert!(
+            !positions.iter().any(|n| n == "$c" || n == "c"),
+            "the scrutinee variable leaked into command position: {positions:?}"
+        );
+        // `case`/`in`/`esac` are structure, never commands.
+        for kw in ["case", "in", "esac"] {
+            assert!(
+                !positions.contains(&kw.to_string()),
+                "{kw} leaked: {positions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn case_span_is_a_single_compound_pipeline() {
+        // The whole `case … esac` collapses to one compound segment, its internal
+        // `;;` never shredding the span into stray top-level pipelines.
+        let input = r#"case "$c" in hello) true;; *) false;; esac"#;
+        let script = parse(input);
+        assert_eq!(
+            script.pipelines.len(),
+            1,
+            "expected one pipeline: {script:#?}"
+        );
+        assert_eq!(script.pipelines[0].commands.len(), 1);
+        assert!(script.pipelines[0].commands[0].is_compound);
+    }
+
+    #[test]
+    fn case_arm_body_command_is_surfaced() {
+        // A denied command in an arm body must reach command position so the gate
+        // names it (not the scrutinee).
+        let input = "case $x in a) rm -rf /;; esac";
+        assert_eq!(parse(input).command_positions(), vec!["rm"]);
+    }
+
+    #[test]
+    fn case_scrutinee_substitution_still_runs() {
+        // The scrutinee word is not a command, but a substitution inside it runs
+        // during expansion, so its command position is surfaced.
+        let input = "case $(rm x) in a) echo hi;; esac";
+        assert_eq!(parse(input).command_positions(), vec!["rm", "echo"]);
+    }
+
+    #[test]
+    fn case_pattern_alternation_and_leading_paren() {
+        // `a|b)` alternation and an optional leading `(` are pattern structure,
+        // never commands; only the arm body surfaces.
+        let input = "case $x in (a|b) make test;; esac";
+        assert_eq!(parse(input).command_positions(), vec!["make"]);
+    }
+
+    #[test]
+    fn case_multiple_arms_all_bodies_surface() {
+        // Every arm body is filtered; command positions appear in arm order.
+        let input = "case $x in a) echo one;; b) echo two;; *) echo other;; esac";
+        assert_eq!(
+            parse(input).command_positions(),
+            vec!["echo", "echo", "echo"]
+        );
+    }
+
+    #[test]
+    fn case_fallthrough_terminators() {
+        // `;&` (fall through) and `;;&` (test next) terminate arms just like `;;`.
+        let input = "case $x in a) echo a;& b) echo b;;& c) echo c;; esac";
+        assert_eq!(
+            parse(input).command_positions(),
+            vec!["echo", "echo", "echo"]
+        );
+    }
+
+    #[test]
+    fn case_arm_body_with_pipe_and_sequence() {
+        // An arm body is a full command list: pipes and `;`-sequences inside it
+        // segment normally (the in-body `;` is not an arm terminator).
+        let input = "case $x in a) cat f | grep p; make test;; esac";
+        assert_eq!(
+            parse(input).command_positions(),
+            vec!["cat", "grep", "make"]
+        );
+    }
+
+    #[test]
+    fn case_last_arm_without_terminator() {
+        // A final arm may omit its `;;` before `esac`; its body still surfaces.
+        let input = "case $x in a) make test; esac";
+        assert_eq!(parse(input).command_positions(), vec!["make"]);
+    }
+
+    #[test]
+    fn nested_case_arms_are_parsed() {
+        // A `case` inside an arm body is matched to its own `esac`; the inner
+        // arm's `;;` does not terminate the outer arm early.
+        let input = "case $x in a) case $y in b) rm z;; esac;; c) echo hi;; esac";
+        assert_eq!(parse(input).command_positions(), vec!["rm", "echo"]);
+    }
+
+    #[test]
+    fn case_inside_for_loop_body() {
+        // A `case` nested in a `for … do … done` body still surfaces only its arm
+        // bodies, never the scrutinee.
+        let input = "for f in *.rs; do case $f in *.rs) git add $f;; esac; done";
+        assert_eq!(parse(input).command_positions(), vec!["git"]);
+    }
+
+    #[test]
+    fn case_surrounded_by_other_statements() {
+        // Statements before and after a `case` span segment normally; the case
+        // span is a single compound between them.
+        let input = "echo start; case $x in a) make test;; esac; echo end";
+        assert_eq!(
+            parse(input).command_positions(),
+            vec!["echo", "make", "echo"]
+        );
+    }
+
+    #[test]
+    fn case_followed_by_and_list() {
+        // A list operator after `esac` splits the following statement normally.
+        let input = "case $x in a) true;; esac && echo ok";
+        assert_eq!(parse(input).command_positions(), vec!["true", "echo"]);
+    }
+
+    #[test]
+    fn case_glued_body_head_reaches_command_position() {
+        // Bug 137 review: a body command glued to the pattern's `)` (no space,
+        // `a)rm`) must still reach command position. Dropping it fails *open* —
+        // the shell runs `rm` on a match while the filter sees no command and
+        // allows the construct.
+        let input = "case $x in a)rm -rf /;; esac";
+        assert_eq!(parse(input).command_positions(), vec!["rm"]);
+    }
+
+    #[test]
+    fn case_glued_repro_still_surfaces_bodies() {
+        // The fully-glued ticket-shaped repro: every arm body is glued to its
+        // pattern `)`. All bodies surface; the scrutinee never does.
+        let input = r#"case "$c" in hello)true;; *)false;; esac"#;
+        let positions = parse(input).command_positions();
+        assert_eq!(positions, vec!["true", "false"], "got {positions:?}");
+        assert!(!positions.iter().any(|n| n == "$c" || n == "c"));
+    }
+
+    #[test]
+    fn case_glued_body_head_with_alternation() {
+        // A glued body after an alternation pattern (`a|b)cargo`) still reaches
+        // command position — the `|` is pattern structure, `cargo` is the body.
+        let input = "case $x in a|b)cargo build;; esac";
+        assert_eq!(parse(input).command_positions(), vec!["cargo"]);
+    }
+
+    #[test]
+    fn case_glued_body_head_substitution_survives() {
+        // The split preserves the close word's substitutions on the synthesized
+        // body head: a `$(git status)` glued to the pattern `)` still surfaces
+        // `git` (fail-closed — a dropped substitution would hide a command).
+        let input = "case $x in a)$(git status);; esac";
+        assert_eq!(parse(input).command_positions(), vec!["git"]);
+    }
+
+    #[test]
+    fn case_glued_body_head_then_more_commands() {
+        // The glued head is the *head* of the arm's command list; commands after
+        // it in the same body still segment normally.
+        let input = "case $x in a)rm x; make test;; esac";
+        assert_eq!(parse(input).command_positions(), vec!["rm", "make"]);
     }
 
     #[test]

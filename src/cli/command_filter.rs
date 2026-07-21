@@ -5845,6 +5845,91 @@ mod tests {
     }
 
     #[test]
+    fn bug137_case_scrutinee_not_named_as_command() {
+        // The ticket repro: a `case` over an allowlisted arm-body command surface
+        // must be allowed, and the scrutinee variable `$c` must never be resolved
+        // into command position (the misparse it fixes).
+        let rules = recommended_rules();
+        let repro = r#"c=hello; case "$c" in hello) true;; *) false;; esac"#;
+        assert!(
+            check_command(repro, &rules, None).is_none(),
+            "a `case` of allowlisted arm bodies must be allowed (bug 137)",
+        );
+        assert_eq!(outcome(repro, &rules), Outcome::Allow);
+    }
+
+    #[test]
+    fn bug137_case_denied_arm_names_the_offending_command() {
+        // A denied command in an arm body denies with *that* command named — not
+        // the scrutinee, not `case`.
+        let rules = recommended_rules();
+        let denial = check_command("case $x in a) cargo build;; esac", &rules, None)
+            .expect("cargo inside a case arm must be denied");
+        assert_eq!(denial.command, "cargo");
+        assert_eq!(denial.reason, DenialReason::NotAllowed);
+    }
+
+    #[test]
+    fn bug137_case_nested_denied_arm_names_offending_command() {
+        // A denied command in a *nested* case arm is still surfaced and named.
+        let rules = recommended_rules();
+        let denial = check_command(
+            "case $x in a) case $y in b) cargo test;; esac;; esac",
+            &rules,
+            None,
+        )
+        .expect("cargo inside a nested case arm must be denied");
+        assert_eq!(denial.command, "cargo");
+        assert_eq!(denial.reason, DenialReason::NotAllowed);
+    }
+
+    #[test]
+    fn bug137_case_fallthrough_terminator_arm_denied() {
+        // The fallthrough terminators (`;&`, `;;&`) still delimit arms whose
+        // bodies filter — a denied command after one is caught.
+        let rules = recommended_rules();
+        let denial = check_command("case $x in a) echo a;& b) cargo build;; esac", &rules, None)
+            .expect("cargo after a `;&` fallthrough arm must be denied");
+        assert_eq!(denial.command, "cargo");
+    }
+
+    #[test]
+    fn bug137_case_glued_body_denied_arm_names_offending_command() {
+        // Bug 137 review: a body command glued to the pattern's `)` (no space)
+        // must still deny naming it — the earlier fix dropped the glued tail,
+        // failing *open* on a denied command the shell would run on a match.
+        let rules = recommended_rules();
+        let denial = check_command("case $x in a)cargo build;; esac", &rules, None)
+            .expect("glued `cargo` inside a case arm must be denied");
+        assert_eq!(denial.command, "cargo");
+        assert_eq!(denial.reason, DenialReason::NotAllowed);
+    }
+
+    #[test]
+    fn bug137_case_glued_body_all_allowed_still_allows() {
+        // The glued-close ticket-shaped repro of *allowed* arm bodies stays
+        // allowed — the split surfaces the bodies without inventing a denial.
+        let rules = recommended_rules();
+        let repro = r#"case "$c" in hello)true;; *)false;; esac"#;
+        assert!(
+            check_command(repro, &rules, None).is_none(),
+            "a glued `case` of allowlisted arm bodies must be allowed (bug 137)",
+        );
+        assert_eq!(outcome(repro, &rules), Outcome::Allow);
+    }
+
+    #[test]
+    fn bug137_case_glued_body_with_alternation_denied() {
+        // A glued body after an alternation pattern (`a|b)cargo`) denies naming
+        // the offending body command — the `|` is pattern structure.
+        let rules = recommended_rules();
+        let denial = check_command("case $x in a|b)cargo build;; esac", &rules, None)
+            .expect("glued `cargo` after an alternation pattern must be denied");
+        assert_eq!(denial.command, "cargo");
+        assert_eq!(denial.reason, DenialReason::NotAllowed);
+    }
+
+    #[test]
     fn ticket04_isolation_gate_is_structural_not_substring() {
         // The hazard guard: a correlated command quoted inside an argument is
         // *not* a command position, so it never trips the isolation gate (it is
