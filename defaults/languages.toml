@@ -266,18 +266,15 @@ servers = ["vscode-json-language-server"]
 extensions = ["yaml", "yml"]
 servers = ["yaml-language-server"]
 
-# TOML's misc-207 dual-bless-and-watch row (`servers = ["taplo", "tombi"]`)
-# rides the bless branch, not this staging. Binding order is dispatch priority
-# and bindings FAN OUT for diagnostics (every bound, blessed, spawned server
-# feeds), so taplo listed first keeps taplo primary — but binding also SPAWNS
-# regardless of blessing, so an unprovisioned tombi burns its spawn strikes
-# and benches with a TUI finding on every host (the 2026-07-21 strike-out).
-# The dual row therefore lands atomically with provisioning + bless; the
+# TOML dual-bless-and-watch row (misc 207, 2026-07-21). Binding order is
+# dispatch priority: taplo listed first stays the primary TOML query source.
+# Bindings FAN OUT for diagnostics — every bound, blessed, spawned server
+# feeds — so both taplo and tombi serve diagnostics once blessed. The
 # tombi-primary flip is the later watch graduation, on conformance evidence.
 [lsp.language.toml]
 extensions = ["toml"]
 filenames = ["Cargo.toml", "Cargo.lock"]
-servers = ["taplo"]
+servers = ["taplo", "tombi"]
 
 [lsp.language.xml]
 extensions = ["xml", "xsl", "xslt", "xsd"]

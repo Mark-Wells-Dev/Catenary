@@ -137,6 +137,12 @@ platform = "linux-x86_64"
 date = "2026-07-09"
 tier = "verified-on-linux"
 
+[blessed.tombi.linux-x86_64]
+version = "1.2.4"
+platform = "linux-x86_64"
+date = "2026-07-21"
+tier = "verified-on-linux"
+
 [blessed.vscode-css-language-server.linux-x86_64]
 version = "4.10.0"
 platform = "linux-x86_64"
@@ -249,6 +255,12 @@ tier = "verified-on-macos"
 version = "0.10.0"
 platform = "macos-arm64"
 date = "2026-07-10"
+tier = "verified-on-macos"
+
+[blessed.tombi.macos-arm64]
+version = "1.2.4"
+platform = "macos-arm64"
+date = "2026-07-21"
 tier = "verified-on-macos"
 
 [blessed.typescript-language-server.macos-arm64]
@@ -442,20 +454,15 @@ single_file = "serves-diagnostics"
 # closes misc 194's double-miss window structurally (the late unversioned publish
 # no longer races a `[clean]` residual). This is exactly the sharpened candidate
 # misc 194 named, now verified.
+# taplo — verified single-file (brackets 06): TOML is per-file-natured
+# (a lone Cargo.toml or project config in a stray path). Verified live
+# 2026-07-20 by the conformance suite's single-file leg.
 [discipline.taplo]
 discipline = "event"
 declares_push = true
+single_file = "serves-diagnostics"
 
-# tombi — STAGED, NOT YET A ROW (misc 207, dual-bless-and-watch: the taplo
-# succession, PULL lane by maintainer ruling 2026-07-20). The manifest's two
-# invariants make a discipline row and its blessed rows ATOMIC —
-# `blessed_servers_all_rowed` (blessed ⊆ rowed) and
-# `every_discipline_row_is_a_blessed_server` (rowed ⊆ blessed) — so the
-# `[discipline.tombi]` row below rides the SAME human-merge commit as the
-# `[blessed.tombi.*]` rows, and is staged here as the exact TOML that commit
-# uncomments. Until then tombi classifies enrichment-only (queries only,
-# diagnostics withheld) and the lane selector is inert.
-#
+# tombi — BLESSED (misc 207, dual-bless-and-watch, PULL lane; 2026-07-21).
 # The lane: tombi's discipline is CLIENT-SELECTED (source-level read of
 # tombi-lsp at v1.2.4) — `DiagnosticMode::Pull` iff the client advertises
 # `textDocument.diagnostic.dynamicRegistration`, versioned push otherwise. The
@@ -463,13 +470,10 @@ declares_push = true
 # the capability casing that flips ONLY tombi's initialize to
 # `dynamicRegistration: true` (every other server keeps today's `false`; the
 # mechanics and the per-server-safety are pinned in
-# src/lsp/server_behavior.rs). NO `single_file` key (verify-then-declare):
-# the conformance single-file leg's SERVES line is what could earn one;
-# keyless fails closed (never spawned rootless).
-#
-# [discipline.tombi]
-# discipline = "pull"
-# advertise_pull_dynamic_registration = true
+# src/lsp/server_behavior.rs).
+[discipline.tombi]
+discipline = "pull"
+advertise_pull_dynamic_registration = true
 # single_file (brackets 01; upgraded brackets 06): TOML is overwhelmingly
 # per-file-natured — core stray population. Verified live 2026-07-20 by the
 # conformance suite's single-file leg (`single_file_evidence`): under a

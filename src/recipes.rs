@@ -2421,6 +2421,7 @@ bin = "bin/srv"
         for name in [
             "bash-language-server",
             "taplo",
+            "tombi",
             "yaml-language-server",
             "vscode-json-language-server",
             "clangd",
