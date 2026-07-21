@@ -734,6 +734,7 @@ mod tests {
         for name in [
             "bash-language-server",
             "taplo",
+            "tombi",
             "yaml-language-server",
             "vscode-json-language-server",
             "clangd",
@@ -836,17 +837,18 @@ mod tests {
     // ── tombi pull-lane selector (misc 207) ─────────────────────────────
     //
     // The manifest invariants make a `[discipline.tombi]` row atomic with the
-    // `[blessed.tombi.*]` rows (blessed ⊆ rowed AND rowed ⊆ blessed), so the
-    // row rides the human bless commit and these pins exercise the MECHANICS
-    // against a constructed record — the exact record the staged row (commented
-    // in defaults/blessed-manifest.toml) parses to.
+    // `[blessed.tombi.*]` rows (blessed ⊆ rowed AND rowed ⊆ blessed). Both
+    // rows landed in the bless commit; these pins exercise the MECHANICS
+    // against a constructed record that matches the live manifest row.
 
-    /// The staged tombi discipline record: `discipline = "pull"` (the
-    /// vscode-json shape) plus the pull-lane selector.
+    /// The blessed tombi discipline record: `discipline = "pull"` (the
+    /// vscode-json shape) plus the pull-lane selector and verified single-file
+    /// claim (brackets 06 null-root probe, 2026-07-20).
     fn tombi_staged_record() -> crate::recipes::DisciplineRecord {
         crate::recipes::DisciplineRecord {
             discipline: Some(crate::recipes::Discipline::Pull),
             advertise_pull_dynamic_registration: true,
+            single_file: crate::recipes::SingleFileSupport::ServesDiagnostics,
             ..crate::recipes::DisciplineRecord::default()
         }
     }
@@ -882,59 +884,71 @@ mod tests {
             json!({ "linkSupport": true }),
             "sibling capabilities are untouched"
         );
-        // The staged row makes no single-file claim (verify-then-declare).
+        // The blessed row carries the verified single-file claim (brackets 06,
+        // null-root probe 2026-07-20: broken.toml drew a settled publish ~0.1 s).
         assert_eq!(
             profile.single_file(),
-            crate::recipes::SingleFileSupport::Unsupported,
-            "no single_file claim until the conformance single-file leg's evidence"
+            crate::recipes::SingleFileSupport::ServesDiagnostics,
+            "tombi verified null-root diagnostics (brackets 06)"
         );
     }
 
     #[test]
     fn pull_lane_selector_parses_from_the_staged_row_toml() {
-        // The staged row's TOML (the commented block in
-        // defaults/blessed-manifest.toml the bless commit uncomments) parses to
-        // exactly the constructed record the mechanics pins use — so
-        // uncommenting it at bless time changes nothing but classification.
+        // The blessed row's TOML (now active in defaults/blessed-manifest.toml)
+        // parses to exactly the constructed record the mechanics pins use — so
+        // the row and the construction agree on all fields, including the
+        // verified single-file claim (brackets 06).
         let doc: crate::recipes::BlessedManifest = toml::from_str(
-            "[discipline.tombi]\ndiscipline = \"pull\"\nadvertise_pull_dynamic_registration = true\n",
+            "[discipline.tombi]\ndiscipline = \"pull\"\nadvertise_pull_dynamic_registration = true\nsingle_file = \"serves-diagnostics\"\n",
         )
-        .expect("staged tombi row parses");
+        .expect("blessed tombi row parses");
         assert_eq!(
             doc.discipline.get("tombi"),
             Some(&tombi_staged_record()),
-            "the staged TOML and the mechanics pin must agree"
+            "the blessed TOML and the mechanics pin must agree"
         );
     }
 
     #[test]
-    fn tombi_unblessed_stays_enrichment_only_with_no_diagnostic_block() {
-        // Until the human bless lands the blessed + discipline rows,
-        // `for_server` classifies tombi enrichment-only (no row, no blessing)
-        // and the removal arm wins: no `diagnostic` block survives for the
-        // selector to ride — the staged lane mechanics cannot make an
-        // unverified server a diagnostics source. This pin FLIPS at bless
-        // time: replace it with a `for_server`-based twin of the projection
-        // test above.
+    fn tombi_blessed_projects_pull_lane_and_serves_diagnostics() {
+        // The bless commit landed the `[discipline.tombi]` row: `for_server`
+        // now resolves tombi as a full diagnostics source (not enrichment-only)
+        // with the pull-lane selector active and `single_file = "serves-diagnostics"`.
         let profile = ServerProfile::for_server("tombi");
         assert!(
-            profile.is_enrichment_only(),
-            "tombi is unblessed until the human bless — enrichment-only"
+            !profile.is_enrichment_only(),
+            "tombi is blessed — must not be enrichment-only"
         );
+        // The pull-lane selector flips exactly the dynamicRegistration leaf.
         let mut caps = json!({
             "textDocument": {
                 "diagnostic": { "dynamicRegistration": false },
-                "publishDiagnostics": { "versionSupport": true }
+                "publishDiagnostics": { "versionSupport": true },
+                "definition": { "linkSupport": true }
             }
         });
         profile.shape_client_capabilities(&mut caps);
-        assert!(
-            caps["textDocument"].get("diagnostic").is_none(),
-            "enrichment-only removal wins over the lane selector"
+        assert_eq!(
+            caps["textDocument"]["diagnostic"]["dynamicRegistration"],
+            json!(true),
+            "the pull-selecting capability must be advertised"
         );
-        assert!(
-            caps["textDocument"].get("publishDiagnostics").is_none(),
-            "an unblessed server advertises no diagnostics capability at all"
+        assert_eq!(
+            caps["textDocument"]["publishDiagnostics"],
+            json!({ "versionSupport": true }),
+            "the push capability is untouched"
+        );
+        assert_eq!(
+            caps["textDocument"]["definition"],
+            json!({ "linkSupport": true }),
+            "sibling capabilities are untouched"
+        );
+        // single_file verified live 2026-07-20 (brackets 06 null-root probe).
+        assert_eq!(
+            profile.single_file(),
+            crate::recipes::SingleFileSupport::ServesDiagnostics,
+            "tombi verified null-root diagnostics (brackets 06)"
         );
     }
 
@@ -978,7 +992,14 @@ mod tests {
     fn blessed_servers_are_not_enrichment_only() {
         // Every blessed server (whether pull-suppressed, declared-push, or uncased)
         // is a diagnostics source — never enrichment-only.
-        for name in ["rust-analyzer", "gopls", "lattice", "clangd", "taplo"] {
+        for name in [
+            "rust-analyzer",
+            "gopls",
+            "lattice",
+            "clangd",
+            "taplo",
+            "tombi",
+        ] {
             assert!(
                 !ServerProfile::for_server(name).is_enrichment_only(),
                 "{name} is blessed and must not be enrichment-only",

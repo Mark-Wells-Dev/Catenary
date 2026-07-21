@@ -137,14 +137,14 @@ formula = "dockerfile-language-server"
 kind = "linux-recipe"
 note = "no homebrew-core formula; reuses the Linux npm recipe. Diagnostics need ansible-lint, provisioned via brew."
 
-# tombi's stanza rides the misc-207 BLESS BRANCH with its Case (its recipe
-# ships `conformance = false` in the interim, so the partition guard correctly
-# rejects a stanza here for a server the Linux matrix does not conform). The
-# bless-branch shape, decided: no CONFIRMED homebrew-core formula (a `tombi`
-# formula exists upstream-side but is unconfirmed against the `Validate
-# formula` step), so `[provision.tombi] kind = "linux-recipe"` — the npm
-# package's platform optionalDependencies ship a darwin-arm64 binary, matching
-# the typescript-language-server/intelephense/svelteserver/elm rulings.
+# No confirmed homebrew-core formula for tombi (a `tombi` formula exists
+# upstream-side but is unconfirmed against the `Validate formula` step);
+# provisioned via its Linux npm recipe, reused unchanged — the npm package's
+# platform optionalDependencies ship a darwin-arm64 binary, matching the
+# typescript-language-server/intelephense/svelteserver/elm rulings (misc 207).
+[provision.tombi]
+kind = "linux-recipe"
+note = "no confirmed homebrew-core formula; reuses the Linux npm recipe (defaults/recipes.toml). The npm package's platform optionalDependencies ship a darwin-arm64 binary."
 
 # ── Linux cargo / go tranches → homebrew-core formulae ───────────────
 
