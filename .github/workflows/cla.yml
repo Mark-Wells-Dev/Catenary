@@ -21,14 +21,22 @@ jobs:
         uses: contributor-assistant/github-action@v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # The action reads its configuration from `with:` inputs, not env vars
+        # (PR #33: the config lived under `env:`, the action ignored it and ran
+        # on its defaults — signatures on the nonexistent `master` branch at the
+        # `./`-prefixed path the contents API rejects as a malformed path
+        # component). Only the token belongs in `env:`.
+        with:
           # The URL to the CLA document
-          CLA_DOCUMENT_URL: 'https://github.com/TwoWells/Catenary/blob/main/.github/CLA.md'
-          # The path to the file where signatures will be stored (relative to repository root)
-          # We store it in .github to keep the root clean
-          PATH_TO_SIGNATURES: '.github/cla-signatures.json'
+          path-to-document: 'https://github.com/TwoWells/Catenary/blob/main/.github/CLA.md'
+          # The path to the file where signatures will be stored (relative
+          # to repository root). We store it in .github to keep the root clean
+          path-to-signatures: '.github/cla-signatures.json'
+          # The branch where signatures are committed
+          branch: 'main'
           # Message that appears in the PR comment
-          CUSTOM_PR_SIGN_COMMENT: 'I have read the CLA Document and I hereby sign the CLA'
+          custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
           # List of users to ignore: bots, plus the repository owner — a CLA
           # licenses inbound third-party contributions to the owner; the owner
           # signing their own CLA is vacuous (ruled 2026-07-21, PR #33).
-          ALLOWLIST: 'dependabot[bot],renovate[bot],m-wells'
+          allowlist: 'dependabot[bot],renovate[bot],m-wells'
