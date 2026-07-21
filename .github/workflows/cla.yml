@@ -28,5 +28,7 @@ jobs:
           PATH_TO_SIGNATURES: '.github/cla-signatures.json'
           # Message that appears in the PR comment
           CUSTOM_PR_SIGN_COMMENT: 'I have read the CLA Document and I hereby sign the CLA'
-          # List of users to ignore (e.g. bots)
-          ALLOWLIST: 'dependabot[bot],renovate[bot]'
+          # List of users to ignore: bots, plus the repository owner — a CLA
+          # licenses inbound third-party contributions to the owner; the owner
+          # signing their own CLA is vacuous (ruled 2026-07-21, PR #33).
+          ALLOWLIST: 'dependabot[bot],renovate[bot],m-wells'
