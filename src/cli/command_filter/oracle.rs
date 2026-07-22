@@ -1000,6 +1000,15 @@ const SEED_CORPUS: &[&str] = &[
     r#"for f in *.rs; do git add "$f"; done"#,
     "for f in a b c; do echo x; done",
     "for f in $(rm x); do echo hi; done",
+    // ── Bug 139 — loop constructs in subshell position ────────────────────────
+    // The leading `(` must not name the loop variable as a command, and the
+    // `done)` closer glued to the subshell close is structure. brush wraps the
+    // loop in a `Subshell` and projects only the body command, so ours == brush.
+    "(for f in *; do echo $f; done)",
+    r#"(for f in *.rs; do git add "$f"; done)"#,
+    "(for f in $(rm x); do echo hi; done)",
+    "(while true; do echo x; done)",
+    "(until cat f | grep -q x; do sleep 5; done)",
     // ── Bug 45 — redirect trailing a subshell binds to the subshell ───────────
     // The compound-sweep used to drop these; the brace-group reference form is
     // pinned alongside so the two stay agreeing.
@@ -2034,5 +2043,31 @@ mod tests {
         let glued = brush_projection("case $x in (a)make test;; esac")
             .expect("brush parses a glued-body parenthesized-pattern case");
         assert_eq!(glued.command_positions, vec!["make"]);
+    }
+
+    #[test]
+    fn bug139_subshell_loop_projection_agrees_with_brush() {
+        // The subshell-wrapped loop forms are balanced and not pruned — the
+        // differential asserts our fixed projection matches brush's `Subshell`
+        // walk (loop variable + iteration list are structure, only the body
+        // surfaces; the `done)` close carries no command).
+        for input in [
+            "(for f in *; do echo $f; done)",
+            "(for f in $(rm x); do echo hi; done)",
+            "(while true; do echo x; done)",
+            "(until cat f | grep -q x; do sleep 5; done)",
+        ] {
+            assert!(!should_skip(input), "should not be pruned: {input:?}");
+            check(input);
+        }
+        // brush projects the sighting's subshell `for` as a single body command,
+        // never the loop variable `f`.
+        let proj = brush_projection("(for f in *; do echo $f; done)")
+            .expect("brush parses a subshell for-loop");
+        assert_eq!(proj.command_positions, vec!["echo"]);
+        // The blessed wait idiom's condition and body surface; `done)` does not.
+        let wait = brush_projection("(until cat f | grep -q x; do sleep 5; done)")
+            .expect("brush parses a subshell until-loop");
+        assert_eq!(wait.command_positions, vec!["cat", "grep", "sleep"]);
     }
 }

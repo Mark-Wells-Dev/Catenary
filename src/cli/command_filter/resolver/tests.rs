@@ -1526,6 +1526,39 @@ fn loop_with_literal_target_resolves() {
     );
 }
 
+#[test]
+fn subshell_loop_variable_target_is_opaque() {
+    // Bug 139: the write-to-loop-variable deny must hold in subshell position
+    // too. Wrapping the loop in `( … )` must not silently allow a write whose
+    // target rides the per-iteration `$f` — it engages the hard path and fails
+    // toward the resolver's `tainted-variable` deny, exactly as the bare form.
+    let op = err("(for f in a.rs b.rs; do echo x > $f; done)", None);
+    assert_eq!(op.construct, "tainted-variable");
+}
+
+#[test]
+fn subshell_loop_non_editing_body_resolves_clean() {
+    // The allowance shortcut: a non-editing subshell for-loop (no writes) needs
+    // no iteration-list resolution — it records no writes and is allowed. The
+    // leading `(` no longer names the loop variable as an opaque write.
+    let t = tmp();
+    assert_eq!(
+        ok("(for f in *; do echo $f; done)", t.path()),
+        BTreeSet::new(),
+    );
+}
+
+#[test]
+fn subshell_loop_literal_target_still_resolves() {
+    // A subshell loop with a *literal* (non-`$f`) write target resolves to that
+    // target — the subshell wrapper doesn't poison a resolvable write.
+    let t = tmp();
+    assert_eq!(
+        ok("(for f in a b; do echo $f >> log.txt; done)", t.path()),
+        paths(t.path(), &["log.txt"]),
+    );
+}
+
 // ── Composition (union across segments) ──────────────────────────────────────
 
 #[test]

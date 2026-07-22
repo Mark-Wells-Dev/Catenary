@@ -5712,6 +5712,57 @@ mod tests {
         }
     }
 
+    // ── Loop constructs in subshell position (bug 139) ──────────────────────
+
+    #[test]
+    fn bug139_subshell_loops_end_to_end() {
+        use DenialReason::OpaqueWrite;
+        use Outcome::{Allow, DenyForeign};
+        let rules = recommended_rules();
+        let cases: &[(&str, Outcome)] = &[
+            // The sighting: a subshell `for` of an allowed command (`echo`) must
+            // be ALLOWED — the leading `(` no longer names the loop variable `f`
+            // as the denied command.
+            (r#"(for f in *; do echo "== $f"; done)"#, Allow),
+            // The whole sighting line, `cd`-prefixed and `&&`-chained.
+            (
+                r#"cd src 2>/dev/null && (for f in *; do echo "== $f"; done)"#,
+                Allow,
+            ),
+            // The blessed polling-wait idiom, subshelled: `cat`/`grep`/`sleep` are
+            // all permitted, and `done)` is no longer read as a command.
+            ("(until cat f | grep -q x; do sleep 5; done)", Allow),
+            ("(while true; do sleep 1; done)", Allow),
+            // The allowance shortcut only skips the iteration list when the body
+            // is non-editing: a write whose target rides the loop variable engages
+            // the hard path and fails toward the resolver's deny — never silently
+            // allowed.
+            (
+                "(for f in *; do echo x > $f; done)",
+                DenyForeign(OpaqueWrite),
+            ),
+            // A denied command in the body denies on *that* command, not the loop
+            // variable (`cargo` is not allowlisted).
+            (
+                "(for f in *; do cargo build; done)",
+                DenyForeign(DenialReason::NotAllowed),
+            ),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(&outcome(cmd, &rules), want, "outcome for {cmd:?}");
+        }
+    }
+
+    #[test]
+    fn bug139_write_to_loop_var_names_the_tainted_variable() {
+        // The hard-path denial carries the resolver's construct-naming teaching
+        // message — it names the per-iteration variable, not `f` as a command.
+        let rules = recommended_rules();
+        let denial = check_command("(for f in *; do echo x > $f; done)", &rules, None)
+            .expect("a write riding the loop variable must deny");
+        assert_eq!(denial.reason, DenialReason::OpaqueWrite);
+    }
+
     // ── Background `&` fix (ticket 14): smuggle closed, care preserved ──
 
     #[test]

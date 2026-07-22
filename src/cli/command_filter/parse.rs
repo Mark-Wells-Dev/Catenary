@@ -811,6 +811,21 @@ fn reserved_word(text: &str) -> Option<&'static str> {
     WORDS.iter().copied().find(|&w| w == text)
 }
 
+/// Whether `text` is a compound-*closer* reserved word (`done`/`fi`/`esac`)
+/// glued onto one or more subshell-close `)` — the `done)` / `fi)` / `esac)`
+/// shape a lexer produces when a loop/conditional close abuts the subshell close
+/// without an intervening space. The `)` is a word metacharacter only at a word
+/// boundary (`!in_word`), so it rides on the tail of the reserved word here; this
+/// recognizes the glued form so the closer is treated as structure, never as a
+/// command position (bug 139). Only the *closers* are matched — an opener glued
+/// to `)` (`for)`) is not a real shell construct, and matching an in-body
+/// reserved word here would misread ordinary text.
+fn is_reserved_closer_glued_close(text: &str) -> bool {
+    let stem = text.trim_end_matches(')');
+    // A non-empty `)` run was trimmed, and the stem is exactly a closer word.
+    stem.len() < text.len() && matches!(stem, "done" | "fi" | "esac")
+}
+
 // ── Heredoc stripping ─────────────────────────────────────────────────────────
 
 /// The closing delimiter the body-strip is scanning for, plus whether the
@@ -1372,7 +1387,37 @@ fn build_command(tokens: &[Token]) -> Option<SimpleCommand> {
     let mut cmd = SimpleCommand::default();
     let mut words: Vec<&WordTok> = Vec::new();
 
+    // A leading subshell opener `(` must not defeat reserved-construct
+    // recognition (bug 139): `(for f in *; do … done)` splits into segments whose
+    // *first* one begins `( for f in *`. Dispatching on the `(` would sweep the
+    // whole header — the loop variable `f` and the iteration words — into command
+    // position, naming the loop variable as the command. Skip the opener(s)
+    // (recording the compound) so the `for`/`select`/`while`/`until` head that
+    // follows reaches its own arm below, exactly as in bare (segment-start)
+    // position.
     let mut idx = 0;
+    while matches!(tokens.get(idx), Some(Token::Paren('('))) {
+        cmd.is_compound = true;
+        idx += 1;
+    }
+    // A compound *closer* reserved word glued onto the subshell close (`done)`,
+    // `fi)`, `esac)`) lexes as one `Token::Word` — the `)` abuts the word, so it
+    // is not a `Token::Paren`, and the whole `done)` is not a reserved word. In
+    // command position that word would name `done)` as the command (bug 139, the
+    // `done)` half of the sighting). Recognize the reserved-closer-plus-`)`-run
+    // shape and treat it as pure structure: a compound close carrying no command.
+    if let Some(w) = tokens.get(idx).and_then(token_word)
+        && is_reserved_closer_glued_close(&w.text)
+    {
+        cmd.is_compound = true;
+        // Its substitutions still ran during expansion (a closer word carrying a
+        // `$(…)` is pathological but swept for safety, mirroring the case close).
+        collect_subs(w, &mut cmd);
+        idx += 1;
+        // Any tokens after the close (a trailing redirect on the subshell) still
+        // route through the ordinary loop below.
+    }
+
     while idx < tokens.len() {
         match &tokens[idx] {
             // `for VAR in LIST` / `select VAR in LIST`: the loop variable and the
@@ -1942,6 +1987,129 @@ mod tests {
         // command position is still surfaced.
         let input = "for f in $(rm x); do echo hi; done";
         assert_eq!(parse(input).command_positions(), vec!["rm", "echo"]);
+    }
+
+    // ── Loop constructs in subshell position (bug 139) ───────────────────────
+
+    #[test]
+    fn subshell_for_loop_variable_is_not_a_command() {
+        // The sighting: `(for f in *; do echo "== $f"; done)`. The leading `(`
+        // must not defeat `for`-construct recognition — the loop variable `f`
+        // never reaches command position, only the body `echo`. The trailing
+        // `done)` (closer glued to the subshell close) is structure, not a
+        // command.
+        let input = r#"(for f in *; do echo "== $f"; done)"#;
+        assert_eq!(parse(input).command_positions(), vec!["echo"]);
+    }
+
+    #[test]
+    fn subshell_for_matches_bare_for() {
+        // The subshell wrapper must not change the command-position projection —
+        // it agrees with the bare form (only the body command surfaces).
+        let bare = parse("for f in *; do echo $f; done").command_positions();
+        let subshelled = parse("(for f in *; do echo $f; done)").command_positions();
+        assert_eq!(bare, vec!["echo"]);
+        assert_eq!(subshelled, bare);
+    }
+
+    #[test]
+    fn subshell_for_iteration_list_substitution_still_runs() {
+        // The allowance shortcut never suppresses a substitution that runs during
+        // list expansion — even wrapped in a subshell, `$(rm x)` surfaces `rm`.
+        let input = "(for f in $(rm x); do echo hi; done)";
+        assert_eq!(parse(input).command_positions(), vec!["rm", "echo"]);
+    }
+
+    #[test]
+    fn subshell_for_body_denied_command_surfaces() {
+        // A denied command in the body must reach command position so the gate
+        // names *it*, not the loop variable — even in subshell position.
+        let input = "(for f in *; do rm -rf $f; done)";
+        assert_eq!(parse(input).command_positions(), vec!["rm"]);
+    }
+
+    #[test]
+    fn subshell_while_loop_done_close_is_not_a_command() {
+        // The `while` condition (`true`) is a genuine command position, but the
+        // glued `done)` close is structure, never a command (bug 139).
+        let input = "(while true; do echo x; done)";
+        assert_eq!(parse(input).command_positions(), vec!["true", "echo"]);
+    }
+
+    #[test]
+    fn subshell_until_wait_idiom_parses() {
+        // The blessed polling-wait idiom, subshelled: the `until` condition
+        // (`cat | grep`) and the `sleep` body surface; `done)` does not.
+        let input = "(until cat f | grep -q x; do sleep 5; done)";
+        assert_eq!(
+            parse(input).command_positions(),
+            vec!["cat", "grep", "sleep"]
+        );
+    }
+
+    #[test]
+    fn subshell_for_write_to_loop_var_taints_the_target() {
+        // A write whose target rides the loop variable (`echo x > $f`) must NOT be
+        // silently allowed: the parser records the redirect and the `loop_var` so
+        // the write resolver taints `$f` and denies. Here the parser layer proves
+        // the redirect target and loop variable survive to the resolver.
+        let script = parse("(for f in *; do echo x > $f; done)");
+        assert_eq!(script.command_positions(), vec!["echo"]);
+        // The loop variable is captured on the header segment for tainting.
+        assert!(
+            script
+                .pipelines
+                .iter()
+                .flat_map(|p| &p.commands)
+                .any(|c| c.loop_var.as_deref() == Some("f")),
+            "expected the header segment to carry loop_var=f: {script:#?}"
+        );
+        // The `> $f` redirect survives on the body segment.
+        assert!(
+            script.pipelines.iter().flat_map(|p| &p.commands).any(|c| c
+                .redirects
+                .iter()
+                .any(|r| r.op == RedirectOp::Write && r.target == "$f")),
+            "expected a `> $f` redirect to survive: {script:#?}"
+        );
+    }
+
+    #[test]
+    fn subshell_for_inside_and_list_leg() {
+        // The `cd … && (for …)` shape from the sighting: the `cd` leg and the
+        // loop body surface; the loop variable and `done)` do not.
+        let input = r#"cd src 2>/dev/null && (for f in *; do echo "== $f"; done)"#;
+        assert_eq!(parse(input).command_positions(), vec!["cd", "echo"]);
+    }
+
+    #[test]
+    fn for_glued_done_close_only_on_closer_words() {
+        // The glued-close recognizer fires only on the compound *closers* — an
+        // ordinary word that merely ends in `)` (a stray arg) is untouched. Here
+        // `done)` is the closer; a hypothetical `notdone)` would not be.
+        assert!(super::is_reserved_closer_glued_close("done)"));
+        assert!(super::is_reserved_closer_glued_close("fi))"));
+        assert!(super::is_reserved_closer_glued_close("esac)"));
+        assert!(!super::is_reserved_closer_glued_close("done"));
+        assert!(!super::is_reserved_closer_glued_close("notdone)"));
+        assert!(!super::is_reserved_closer_glued_close("for)"));
+        assert!(!super::is_reserved_closer_glued_close(")"));
+    }
+
+    #[test]
+    fn subshell_for_with_nested_case_body() {
+        // `case` nested inside a subshell `for` body still surfaces only its arm
+        // body command, never the loop variable or the scrutinee.
+        let input = "(for f in *.rs; do case $f in *.rs) git add $f;; esac; done)";
+        assert_eq!(parse(input).command_positions(), vec!["git"]);
+    }
+
+    #[test]
+    fn subshell_case_with_nested_for_arm_body() {
+        // A `for` loop nested inside a subshell `case` arm body: only the loop
+        // body command surfaces; the loop variable is structure.
+        let input = "(case $x in a) for f in *; do rm $f; done;; esac)";
+        assert_eq!(parse(input).command_positions(), vec!["rm"]);
     }
 
     // ── `case … esac` compound (bug 137) ─────────────────────────────────────
