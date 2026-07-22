@@ -38,6 +38,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -494,10 +495,19 @@ struct StrikeEntry {
     ever_served: bool,
 }
 
-/// How a dead server instance will behave on future demand (misc 167).
+/// How a dead — or never-installed — server will behave on future demand
+/// (misc 167 / misc 210).
 ///
-/// Derived from the strike ledger; drives both the revive gate and the
-/// honest receipt wording for files the instance owed a result.
+/// The three strike-ledger arms ([`Revivable`](Self::Revivable) /
+/// [`BenchedNeverStarted`](Self::BenchedNeverStarted) /
+/// [`BenchedUnstable`](Self::BenchedUnstable)) are derived from the ledger by
+/// [`verdict_of`]; they drive the revive gate and the receipt wording for files
+/// a dead instance owed a result. The fourth arm,
+/// [`NotInstalled`](Self::NotInstalled), is **not** ledger-derived — it is
+/// produced only by [`LspClientManager::unavailable_diagnostic_servers`] for a
+/// configured server whose binary never resolved pre-spawn (misc 210), so the
+/// receipt can distinguish "not installed" from "keeps dying". It never comes
+/// out of [`verdict_of`] and never rides the strike-count mirror.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviveVerdict {
     /// Below the strike cap: the next demand that routes here attempts a
@@ -510,6 +520,12 @@ pub enum ReviveVerdict {
     /// Struck out after previously serving — repeated crashes exhausted the
     /// strikes. No revives until the daemon restarts or the root remounts.
     BenchedUnstable,
+    /// Configured but its binary never resolved pre-spawn (misc 210): a static
+    /// condition, not a crash. No strike ledger entry and no bench — a later
+    /// spawn demand re-resolves and heals coverage the moment the binary
+    /// appears. Distinct from the benched arms so the receipt teaches "install
+    /// it" rather than "it keeps dying".
+    NotInstalled,
 }
 
 /// Derives a ledger entry's verdict: benched at the strike cap, with the
@@ -549,6 +565,76 @@ fn warn_bench_once(key: &InstanceKey, verdict: ReviveVerdict) {
     );
 }
 
+/// Whether a **blessed recipe** exists for `server` — the axis that picks the
+/// not-installed teaching variant (misc 210 / the maintainer addendum).
+///
+/// A blessed recipe is one auto-install could actually act on: the active
+/// manifest pins the server, a shipped recipe carries that exact pinned
+/// version, and the blessing gate resolves ([`crate::install::BlessedRecipe::resolve`]).
+/// This mirrors the recipe gate in [`crate::auto_install::detect_missing`], so
+/// "the finding suggests auto-install" and "auto-install would act" never
+/// disagree. When it returns `false` there is nothing for auto-install to
+/// fetch, so the finding offers only the honest half — never a suggestion
+/// auto-install cannot fulfill.
+fn has_blessed_recipe(server: &str) -> bool {
+    let Ok(recipes) = crate::recipes::default_recipes() else {
+        return false;
+    };
+    let Some(recipe) = recipes.get(server) else {
+        return false;
+    };
+    let manifest = crate::recipes::active_manifest();
+    let Some(version) = manifest.pinned_version(server) else {
+        return false; // unpinned (or the rust-analyzer exemption)
+    };
+    if recipe.version != version {
+        return false; // a recipe/manifest skew auto-install would refuse to kick
+    }
+    crate::install::BlessedRecipe::resolve(server, recipe, &manifest).is_some()
+}
+
+/// The not-installed finding text (misc 210), split from the `warn!` so the two
+/// teaching variants are unit-testable.
+///
+/// Honest first — "configured for `<language>` but not installed". When a
+/// blessed recipe exists (`recipe_teaching = true`), it carries **both** auto-heal
+/// exits: the one-shot `catenary install <server>` and the standing
+/// `[servers] auto_install = true` opt-in (background installs of missing blessed
+/// servers at session start). A server with no blessed recipe gets only the
+/// honest half — suggesting auto-install there would point at something it can
+/// never fetch.
+fn not_installed_message(server: &str, language: &str, recipe_teaching: bool) -> String {
+    if recipe_teaching {
+        format!(
+            "{server} is configured for {language} but not installed. Install it \
+             with `catenary install {server}`, or set `[servers] auto_install = true` \
+             to install missing blessed servers automatically at session start."
+        )
+    } else {
+        format!(
+            "{server} is configured for {language} but not installed. Install the \
+             binary and place it on PATH — coverage heals on the next demand, no \
+             daemon restart needed."
+        )
+    }
+}
+
+/// Emits the single not-installed health finding (`warn!` — a TUI health
+/// finding, not a desktop interrupt: a missing binary is actionable but never
+/// urgent, the same posture as a strike-out).
+///
+/// One calm finding per server (deduped by the caller); the wording — and its
+/// blessed-recipe teaching variant — comes from [`not_installed_message`].
+fn warn_not_installed(server: &str, language: &str) {
+    let message = not_installed_message(server, language, has_blessed_recipe(server));
+    warn!(
+        source = Source::LspLifecycle.as_str(),
+        language = language,
+        server = server,
+        "{message}",
+    );
+}
+
 impl ReviveVerdict {
     /// Whether the verdict permits a demand-driven revive.
     #[must_use]
@@ -557,15 +643,45 @@ impl ReviveVerdict {
     }
 
     /// The short benched-cause label mirrored to the `state.json` board
-    /// (`None` while revivable).
+    /// (`None` while revivable, and `None` for `NotInstalled` — a missing binary
+    /// is never a bench, it carries the dedicated `not-installed` board state
+    /// instead, misc 210).
     #[must_use]
     pub const fn bench_label(self) -> Option<&'static str> {
         match self {
-            Self::Revivable => None,
+            Self::Revivable | Self::NotInstalled => None,
             Self::BenchedNeverStarted => Some("never started"),
             Self::BenchedUnstable => Some("unstable"),
         }
     }
+}
+
+/// A configured server whose binary does not resolve pre-spawn (misc 210).
+///
+/// A missing binary is a **static** condition, knowable before the first spawn
+/// attempt — not a crash. So [`LspClientManager::spawn_inner`] classifies it
+/// pre-spawn as *not installed* and bails with this error rather than feeding
+/// the strike ledger (no strikes, no bench) or leaving a dead tombstone.
+/// Callers that would otherwise emit a generic `warn!` on any spawn failure
+/// (`spawn_all`, `ensure_clients_for_paths`) downcast to this and stay quiet —
+/// the one calm not-installed finding has already been surfaced (once per
+/// server), so a second per-root/per-attempt line would just fight it.
+#[derive(Debug, Error)]
+#[error(
+    "{server} ({language}) is configured but not installed — no binary resolved pre-spawn (misc 210)"
+)]
+pub struct NotInstalled {
+    /// The configured server key whose binary is missing.
+    pub server: String,
+    /// The language the missing server was routed for.
+    pub language: String,
+}
+
+/// Whether `err` (an `anyhow` chain) is the [`NotInstalled`] classification —
+/// the signal a spawn-failure caller uses to suppress its generic `warn!`
+/// (misc 210): the calm not-installed finding is already surfaced.
+fn is_not_installed(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<NotInstalled>().is_some()
 }
 
 /// Manages the lifecycle of LSP clients, document state, and language detection.
@@ -601,6 +717,14 @@ pub struct LspClientManager {
     /// restart. `std::sync::Mutex`: tiny critical sections, never held
     /// across `await`.
     strikes: std::sync::Mutex<HashMap<InstanceKey, StrikeEntry>>,
+    /// Servers whose not-installed finding has already fired this daemon
+    /// lifetime (misc 210): one calm `warn!` **per server**, not per root and
+    /// not per spawn attempt. Keyed by server name (a server missing from PATH
+    /// is missing for every root, so the finding is a per-server truth), and
+    /// cleared for a server the moment a later spawn demand finds its binary —
+    /// so a re-removal can warn again. `std::sync::Mutex`: tiny critical
+    /// sections, never held across `await`.
+    not_installed_warned: std::sync::Mutex<HashSet<String>>,
     /// Negative cache for single-file server initialization failures.
     /// Contains `(language_id, server_name)` pairs where the server is
     /// configured with `single_file = true` but rejected null-workspace
@@ -657,6 +781,7 @@ impl LspClientManager {
             clients: Mutex::new(HashMap::new()),
             spawning: std::sync::Mutex::new(HashMap::new()),
             strikes: std::sync::Mutex::new(HashMap::new()),
+            not_installed_warned: std::sync::Mutex::new(HashSet::new()),
             single_file_failures: std::sync::Mutex::new(HashSet::new()),
             single_file_last_use: std::sync::Mutex::new(HashMap::new()),
             brackets: BracketQueues::new(),
@@ -895,6 +1020,114 @@ impl LspClientManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+    }
+
+    // ── Not-installed classification (misc 210) ──────────────────────────
+
+    /// Classifies a configured-but-uninstalled server (misc 210): a static
+    /// pre-spawn condition, **not** a strike-ledger failure.
+    ///
+    /// Surfaces exactly one calm `warn!` per server per daemon lifetime (the
+    /// dedupe below) and mirrors the honest `not-installed` state onto the
+    /// `state.json` board — never `initializing`, never a bench. The finding
+    /// carries both auto-heal exits when a blessed recipe exists (the
+    /// one-shot `catenary install`, and the standing `[servers] auto_install`
+    /// opt-in); a server with no blessed recipe gets only the honest half,
+    /// because there is nothing for auto-install to fetch.
+    fn classify_not_installed(&self, key: &InstanceKey, program: &str) {
+        if let Some(writer) = &self.snapshot {
+            writer.mark_not_installed(key);
+        }
+        let first = self
+            .not_installed_warned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.server.clone());
+        if !first {
+            // Already warned once this daemon lifetime — a second root or a
+            // repeat spawn demand does not re-fire the finding.
+            debug!(
+                source = Source::LspLifecycle.as_str(),
+                server = key.server.as_str(),
+                scope_root = key.scope.root_path().map(|p| p.display().to_string()),
+                "not installed (already surfaced): {} resolves to `{program}` which is not on PATH",
+                key.server,
+            );
+            return;
+        }
+        warn_not_installed(&key.server, &key.language_id);
+    }
+
+    /// Clears a server's not-installed dedupe and its `not-installed` board
+    /// entry when a later spawn demand finds the binary (misc 210).
+    ///
+    /// Installing the binary heals coverage without a daemon restart: the next
+    /// spawn demand re-resolves, and — the binary now present — the spawn
+    /// proceeds normally. This clears the stale classification so the fresh
+    /// spawn registers clean, and re-arms the finding for a future removal.
+    fn clear_not_installed(&self, key: &InstanceKey) {
+        let cleared = self
+            .not_installed_warned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key.server);
+        if let Some(writer) = &self.snapshot {
+            writer.clear_not_installed(key);
+        }
+        if cleared {
+            debug!(
+                source = Source::LspLifecycle.as_str(),
+                server = key.server.as_str(),
+                scope_root = key.scope.root_path().map(|p| p.display().to_string()),
+                "not-installed cleared: {} resolved and will spawn (misc 210)",
+                key.server,
+            );
+        }
+    }
+
+    /// Whether server `name`'s not-installed finding has fired this daemon
+    /// lifetime (misc 210). Test hook for the once-per-server dedupe.
+    #[cfg(test)]
+    fn not_installed_was_warned(&self, name: &str) -> bool {
+        self.not_installed_warned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(name)
+    }
+
+    /// Whether `server_name`, resolved for `root`, is configured but **not
+    /// installed** (misc 210) — the same pre-spawn resolution `spawn_inner`
+    /// runs, without spawning.
+    ///
+    /// Resolves the spawn program exactly as the spawn path does (managed-home
+    /// pin first, then PATH) and asks whether that binary is present
+    /// ([`crate::health::servers::server_binary_installed`], shim-aware for the
+    /// rust-analyzer rustup proxy). Used by
+    /// [`Self::unavailable_diagnostic_servers`] so a missing-binary server
+    /// degrades a file with a `not-installed` cause instead of a bare
+    /// `[no LSP coverage]`. `None` server def (a binding with no resolvable
+    /// def) reads as not not-installed here — there is nothing to spawn.
+    fn is_server_not_installed(&self, server_name: &str, root: &Path) -> bool {
+        let Some(server_def) = self.effective_server_def(server_name, root) else {
+            return false;
+        };
+        let program = crate::managed_home::resolve_spawn_program(
+            &crate::managed_home::ManagedHome::resolve(),
+            &crate::recipes::active_manifest(),
+            server_name,
+            &server_def,
+            self.config.prefer_managed(),
+        );
+        // Mirror the spawn-path exemption: a rust-toolchain wrap (rustup present
+        // and a toolchain resolves for this root) delegates rust-analyzer
+        // resolution to `rustup run`, so a bare PATH lookup is the wrong
+        // question — the server is not not-installed here.
+        if rust_toolchain::should_wrap(server_name, &program)
+            && rust_toolchain::resolve_active_toolchain(root).is_some()
+        {
+            return false;
+        }
+        !crate::health::servers::server_binary_installed(server_name, &program)
     }
 
     /// Extracts `CommandsConfig` from each tracked root's project config.
@@ -1294,6 +1527,12 @@ impl LspClientManager {
 
                 for binding in lang_config.servers() {
                     if let Err(e) = self.ensure_server(lang, &binding.name, root).await {
+                        // A not-installed server already surfaced its one calm
+                        // finding in `spawn_inner` (misc 210); a second generic
+                        // spawn-fail warn here would just fight it.
+                        if is_not_installed(&e) {
+                            continue;
+                        }
                         warn!(
                             source = Source::LspLifecycle.as_str(),
                             language = lang.as_str(),
@@ -2295,14 +2534,6 @@ impl LspClientManager {
             self.config.prefer_managed(),
         );
         let program = program.as_str();
-        info!(
-            source = Source::LspLifecycle.as_str(),
-            server = server_name,
-            scope_root = %root.display(),
-            "Spawning LSP server for {lang}: {} {}",
-            program,
-            server_def.args.join(" ")
-        );
 
         let args: Vec<&str> = server_def
             .args
@@ -2318,13 +2549,59 @@ impl LspClientManager {
         // the flycheck `cargo`/`rustc` it spawns honor the project pin on every
         // layout (proxied or not). Resolution failure, no rustup on PATH, or a
         // `path` override all fall through to the unchanged spawn below.
-        // Owned buffers here outlive the borrowed `spawn` arguments.
+        // Owned buffers here outlive the borrowed `spawn` arguments. Resolved
+        // *before* the not-installed check (misc 210): a resolved wrap means
+        // rustup itself execs rust-analyzer, so the installed-binary question is
+        // rustup's to answer at exec time, not a bare-`rust-analyzer` PATH lookup.
         let wrap = if rust_toolchain::should_wrap(server_name, program) {
             rust_toolchain::resolve_active_toolchain(root)
                 .map(|toolchain| rust_toolchain::wrap_spawn(program, &args, &toolchain))
         } else {
             None
         };
+
+        // Pre-spawn resolution (misc 210): a missing binary is a static
+        // condition, knowable before the first spawn attempt — not a crash. The
+        // resolver above already prefers the managed-home install and falls back
+        // to PATH, so `program` is the exact command we would exec; if it does
+        // not resolve to an installed binary, classify **not installed** — no
+        // strike-ledger entry, no bench, no dead tombstone. One calm finding per
+        // server and an honest `not-installed` board state, then bail with the
+        // typed error `spawn_all`/`ensure_clients_for_paths` recognize so they
+        // do not pile a second per-root warning on top. A later spawn demand
+        // re-resolves; if the binary appeared (a `catenary install`, an
+        // auto-install pre-warm), the classification clears and the spawn
+        // proceeds normally — coverage heals without a daemon restart. The
+        // strike ledger keeps its real job: servers that exist and fail (a
+        // mid-flight ENOENT — binary deleted between here and exec — still falls
+        // through to the strike path in `LspClient::spawn`'s `Err` arm below).
+        //
+        // A resolved rust-toolchain wrap is exempt: rustup resolved a toolchain
+        // and will exec rust-analyzer through `rustup run`, so a bare
+        // `rust-analyzer` PATH lookup is the wrong installation question — the
+        // component (or its absence) surfaces through the spawn/init path as
+        // before (misc 162's rust-analyzer exemption).
+        if wrap.is_none() && !crate::health::servers::server_binary_installed(server_name, program)
+        {
+            self.classify_not_installed(&ledger_key, program);
+            return Err(anyhow::Error::new(NotInstalled {
+                server: server_name.to_string(),
+                language: lang.to_string(),
+            }));
+        }
+        // The binary resolved (or the wrap delegates resolution to rustup):
+        // clear any stale not-installed classification so a heal-on-install
+        // registers clean and re-arms the finding for a future removal (misc 210).
+        self.clear_not_installed(&ledger_key);
+
+        info!(
+            source = Source::LspLifecycle.as_str(),
+            server = server_name,
+            scope_root = %root.display(),
+            "Spawning LSP server for {lang}: {} {}",
+            program,
+            server_def.args.join(" ")
+        );
         let (spawn_program, spawn_args, spawn_env): (&str, Vec<&str>, Option<HashMap<_, _>>) =
             if let Some(wrap) = &wrap {
                 info!(
@@ -3273,6 +3550,13 @@ impl LspClientManager {
                     .find(|k| self.strikes_recorded(k));
                 if let Some(key) = ledger_key {
                     names.push((name, self.revive_verdict(&key)));
+                } else if self.is_server_not_installed(&name, &root) {
+                    // No instance and no strikes, but the binary never resolved
+                    // pre-spawn (misc 210): a configured-but-uninstalled server
+                    // is a coverage degradation, not a bare `[no LSP coverage]`.
+                    // Name it with the dedicated `NotInstalled` cause so the
+                    // receipt teaches "install it", never "keeps dying".
+                    names.push((name, ReviveVerdict::NotInstalled));
                 }
                 continue;
             };
@@ -3542,6 +3826,11 @@ impl LspClientManager {
 
         for (lang, server_name, root) in &to_spawn {
             if let Err(e) = self.ensure_server(lang, server_name, root).await {
+                // A not-installed server already surfaced its one calm finding
+                // in `spawn_inner` (misc 210); suppress the generic warn here.
+                if is_not_installed(&e) {
+                    continue;
+                }
                 warn!(
                     source = Source::LspLifecycle.as_str(),
                     language = lang.as_str(),
@@ -6649,6 +6938,376 @@ mod tests {
             !manager.revive_verdict(&key_b).is_revivable(),
             "the other root keeps its bench"
         );
+    }
+
+    // ── Not-installed classification (misc 210) ──────────────────────────
+
+    /// A config whose `MOCK_LANG_A` binds a diagnostics server pointing at
+    /// `program` — used with a bogus key or a nonexistent `path` to exercise the
+    /// not-installed pre-spawn classification (misc 210). When `path_override` is
+    /// set, the binary resolves through that concrete path (so a test can create
+    /// it mid-flight to heal); otherwise `program` is the server key resolved on
+    /// PATH.
+    fn not_installed_config(program: &str, path_override: Option<&str>) -> Arc<Config> {
+        let mut server = HashMap::new();
+        server.insert(
+            program.to_string(),
+            ServerDef {
+                path: path_override.map(str::to_string),
+                args: vec![MOCK_LANG_A.to_string()],
+                ..ServerDef::default()
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new(program)]),
+                ..LanguageConfig::default()
+            },
+        );
+        Arc::new(Config {
+            language,
+            server,
+            ..test_config_raw()
+        })
+    }
+
+    #[test]
+    fn not_installed_message_teaches_both_exits_only_with_a_recipe() {
+        // The maintainer addendum: a blessed-recipe server names both auto-heal
+        // exits (the one-shot install and the standing auto_install opt-in); a
+        // recipe-less server gets only the honest half — never a suggestion
+        // auto_install cannot fulfill.
+        let with_recipe = not_installed_message("tombi", "toml", true);
+        assert!(
+            with_recipe.contains("catenary install tombi"),
+            "recipe variant names the one-shot install: {with_recipe}"
+        );
+        assert!(
+            with_recipe.contains("auto_install = true"),
+            "recipe variant names the standing opt-in: {with_recipe}"
+        );
+        assert!(
+            with_recipe.contains("configured for toml but not installed"),
+            "recipe variant keeps the honest half: {with_recipe}"
+        );
+
+        let no_recipe = not_installed_message("mycustomls", "toml", false);
+        assert!(
+            no_recipe.contains("configured for toml but not installed"),
+            "recipe-less variant is honest: {no_recipe}"
+        );
+        assert!(
+            !no_recipe.contains("auto_install"),
+            "recipe-less variant must not suggest auto_install: {no_recipe}"
+        );
+        assert!(
+            !no_recipe.contains("catenary install"),
+            "recipe-less variant must not suggest an install it cannot fulfill: {no_recipe}"
+        );
+    }
+
+    #[test]
+    fn has_blessed_recipe_matches_the_auto_install_gate() {
+        // taplo is blessed and shipped with a version-matched recipe (the
+        // recipe-teaching axis is true); a bare mock name has neither.
+        assert!(
+            has_blessed_recipe("taplo"),
+            "taplo is a blessed, recipe-backed server"
+        );
+        assert!(
+            !has_blessed_recipe("mockls-not-a-real-server"),
+            "an unknown server has no blessed recipe"
+        );
+    }
+
+    #[tokio::test]
+    async fn not_installed_burns_no_strikes_and_no_bench() -> Result<()> {
+        // misc 210: a configured-but-uninstalled server (bogus PATH key, no
+        // `path` override) is classified pre-spawn — the spawn bails with the
+        // typed NotInstalled error, records ZERO strikes, and leaves the ledger
+        // untouched (never a bench).
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_string_lossy().to_string();
+        let program = "definitely-not-on-path-mockls-xyz";
+        let manager = LspClientManager::new(
+            not_installed_config(program, None),
+            test_logging(),
+            test_fs_with_roots(&[&root]),
+        );
+
+        // The Ok variant (`LspClient`) is not `Debug`, so take the error via
+        // `.err()` rather than `expect_err`.
+        let err = ensure_first_server(&manager, MOCK_LANG_A)
+            .await
+            .err()
+            .expect("a missing binary must not spawn");
+        assert!(
+            is_not_installed(&err),
+            "the bail is the typed NotInstalled classification, got: {err}"
+        );
+
+        // No strike ledger entry — a missing binary is static, not a failure.
+        let key = InstanceKey::new(
+            MOCK_LANG_A.to_string(),
+            program.to_string(),
+            Scope::Root(dir.path().to_path_buf()),
+        );
+        assert!(
+            !manager.strikes_recorded(&key),
+            "not-installed records no strike"
+        );
+        assert!(
+            manager.revive_verdict(&key).is_revivable(),
+            "not-installed never benches the ledger"
+        );
+        // No tombstone: the client map stays empty (a not-installed server never
+        // spawned a process to leave behind).
+        assert!(
+            manager.clients().await.is_empty(),
+            "not-installed leaves no dead tombstone"
+        );
+        // The finding fired exactly once (the per-server dedupe is armed).
+        assert!(
+            manager.not_installed_was_warned(program),
+            "the calm finding fired for the server"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn not_installed_finding_is_one_per_server_not_per_root() -> Result<()> {
+        // misc 210: one calm finding per server, not per root or per attempt. A
+        // second root and a repeat demand both find the dedupe already armed.
+        let dir_a = tempfile::tempdir()?;
+        let dir_b = tempfile::tempdir()?;
+        let root_a = dir_a.path().to_string_lossy().to_string();
+        let root_b = dir_b.path().to_string_lossy().to_string();
+        let program = "definitely-not-on-path-mockls-multi";
+        let manager = LspClientManager::new(
+            not_installed_config(program, None),
+            test_logging(),
+            test_fs_with_roots(&[&root_a, &root_b]),
+        );
+
+        // Two roots, two spawn demands, plus a repeat against the first root.
+        // The Ok variant (`LspClient`) is not `Debug`, so take the error via
+        // `.err()`.
+        for root in [dir_a.path(), dir_b.path(), dir_a.path()] {
+            let err = manager
+                .spawn(program, MOCK_LANG_A, root)
+                .await
+                .err()
+                .expect("missing binary never spawns");
+            assert!(
+                is_not_installed(&err),
+                "each attempt classifies not-installed"
+            );
+        }
+        // The dedupe holds a single server-name entry regardless of root/attempt.
+        assert!(manager.not_installed_was_warned(program));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn not_installed_heals_on_install_without_a_restart() -> Result<()> {
+        // misc 210: installing the binary heals coverage without a daemon
+        // restart — a later spawn demand re-resolves, and with the binary now
+        // present the spawn proceeds normally (the opposite of the strike
+        // bench's "until restart or remount"). Simulated by a `path` override
+        // that starts missing and is created (a real mockls) mid-flight.
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_string_lossy().to_string();
+        let program = format!("mockls-{MOCK_LANG_A}-heal");
+        let binary = dir.path().join("not-yet-installed");
+        let manager = LspClientManager::new(
+            not_installed_config(&program, Some(&binary.to_string_lossy())),
+            test_logging(),
+            test_fs_with_roots(&[&root]),
+        );
+
+        // Before install: the override points at a nonexistent file → not
+        // installed, no strikes, no tombstone. The Ok variant (`LspClient`) is
+        // not `Debug`, so take the error via `.err()`.
+        let err = manager
+            .spawn(&program, MOCK_LANG_A, dir.path())
+            .await
+            .err()
+            .expect("missing binary never spawns");
+        assert!(is_not_installed(&err));
+        let key = InstanceKey::new(
+            MOCK_LANG_A.to_string(),
+            program.clone(),
+            Scope::Root(dir.path().to_path_buf()),
+        );
+        assert!(!manager.strikes_recorded(&key), "no strike before install");
+        assert!(manager.not_installed_was_warned(&program));
+
+        // The install lands: copy the real mockls to the override path.
+        std::fs::copy(mockls_bin(), &binary).expect("stage the installed binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&binary).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&binary, perms).expect("chmod +x");
+        }
+
+        // The next spawn demand re-resolves and now spawns normally — no daemon
+        // restart, and the not-installed dedupe clears (re-arming a future
+        // removal). `?` propagates any spawn failure (the Ok tuple holds a
+        // non-`Debug` client, so no `expect` on it).
+        let (_key, client) = manager.spawn(&program, MOCK_LANG_A, dir.path()).await?;
+        assert!(client.lock().await.is_alive(), "the healed server is live");
+        assert!(
+            !manager.not_installed_was_warned(&program),
+            "the classification clears on heal — a future removal can warn again"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn not_installed_snapshot_state_is_honest_not_initializing() -> Result<()> {
+        // misc 210: the board entry for a not-installed server reads
+        // "not-installed" — never the old "initializing" + benched
+        // contradiction, and never a bench label.
+        let dir = tempfile::tempdir()?;
+        let snap_dir = tempfile::tempdir()?;
+        let root = dir.path().to_string_lossy().to_string();
+        let program = "definitely-not-on-path-mockls-snap";
+        let mut manager = LspClientManager::new(
+            not_installed_config(program, None),
+            test_logging(),
+            test_fs_with_roots(&[&root]),
+        );
+        let writer = crate::state_snapshot::SnapshotWriter::with_coalesce(
+            &tokio::runtime::Handle::current(),
+            snap_dir.path(),
+            crate::state_snapshot::DaemonInfo {
+                instance_id: "daemon:test".to_string(),
+                pid: 1,
+                version: "test".to_string(),
+                started_at: "t0".to_string(),
+            },
+            Duration::from_millis(10),
+        );
+        manager.set_snapshot(writer.clone());
+
+        // The Ok variant (`LspClient`) is not `Debug`, so take the error via
+        // `.err()`.
+        let err = manager
+            .spawn(program, MOCK_LANG_A, dir.path())
+            .await
+            .err()
+            .expect("missing binary never spawns");
+        assert!(is_not_installed(&err));
+        writer.flush_now();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(writer.path()).expect("read snapshot"))
+                .expect("parse snapshot");
+        let servers = json["servers"].as_array().expect("servers array");
+        let entry = servers
+            .iter()
+            .find(|s| s["server"] == program)
+            .expect("the not-installed server has a board entry");
+        assert_eq!(
+            entry["state"], "not-installed",
+            "the board reads not-installed, never initializing: {entry}"
+        );
+        assert!(
+            entry.get("benched").is_none() || entry["benched"].is_null(),
+            "not-installed is never a bench: {entry}"
+        );
+        assert!(
+            entry.get("strikes").is_none() || entry["strikes"] == 0,
+            "not-installed records no strikes: {entry}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn not_installed_surfaces_on_the_unavailable_receipt() -> Result<()> {
+        // misc 210 / decision 027: a configured-but-uninstalled diagnostics
+        // server is a coverage degradation, not a bare `[no LSP coverage]`. The
+        // unavailable surface names it with the dedicated NotInstalled cause so
+        // the receipt teaches "install it", not "keeps dying".
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_string_lossy().to_string();
+        let program = "definitely-not-on-path-mockls-receipt";
+        let manager = LspClientManager::new(
+            not_installed_config(program, None),
+            test_logging(),
+            test_fs_with_roots(&[&root]),
+        );
+        let path = dir.path().join(format!("test.{MOCK_LANG_A}"));
+        std::fs::write(&path, "x").expect("write a covered file");
+
+        let unavailable = manager.unavailable_diagnostic_servers(&path).await;
+        assert_eq!(unavailable.len(), 1, "the not-installed server is named");
+        assert_eq!(unavailable[0].0, program);
+        assert_eq!(
+            unavailable[0].1,
+            ReviveVerdict::NotInstalled,
+            "typed with the not-installed cause, distinct from the benched arms"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn not_installed_clears_when_auto_install_prewarms() -> Result<()> {
+        // misc 210 interaction: when auto_install lands the binary, the router
+        // runs `spawn_all` as the pre-warm. That re-probe re-resolves the now-
+        // present binary and heals coverage — the not-installed classification
+        // clears naturally, no fight with the install announcement, no restart.
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_string_lossy().to_string();
+        let program = format!("mockls-{MOCK_LANG_A}-prewarm");
+        let binary = dir.path().join("landed-by-auto-install");
+        // A real file of the language so `spawn_all`'s detection fires.
+        std::fs::write(dir.path().join(format!("a.{MOCK_LANG_A}")), "x").expect("write lang file");
+        let manager = LspClientManager::new(
+            not_installed_config(&program, Some(&binary.to_string_lossy())),
+            test_logging(),
+            test_fs_with_roots(&[&root]),
+        );
+
+        // Boot pre-warm: the binary is absent → not-installed, no spawn.
+        manager.spawn_all().await;
+        assert!(
+            manager.clients().await.is_empty(),
+            "no server spawns while the binary is missing"
+        );
+        assert!(
+            manager.not_installed_was_warned(&program),
+            "the not-installed finding fired once at boot"
+        );
+
+        // Auto-install lands the binary (its managed home would resolve the
+        // same way; here the concrete override path is created).
+        std::fs::copy(mockls_bin(), &binary).expect("stage the landed binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&binary).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&binary, perms).expect("chmod +x");
+        }
+
+        // The router's post-install pre-warm: the same `spawn_all` the pin path
+        // runs. The re-probe finds the binary and spawns it.
+        manager.spawn_all().await;
+        assert_eq!(
+            manager.clients().await.len(),
+            1,
+            "the landed install's pre-warm spawns the healed server"
+        );
+        assert!(
+            !manager.not_installed_was_warned(&program),
+            "the pre-warm cleared the not-installed classification"
+        );
+        Ok(())
     }
 
     #[tokio::test]

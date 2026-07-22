@@ -65,6 +65,16 @@ use crate::lsp::{InstanceKey, ServerLifecycle};
 ///   absent ⇒ unknown on older snapshots.
 const SCHEMA: u32 = 3;
 
+/// The board `state` for a configured-but-uninstalled server (misc 210).
+///
+/// A server whose binary does not resolve pre-spawn never enters
+/// `initializing` — it was never spawned. Its board entry carries this state
+/// (never a lifecycle string) so the snapshot reads honestly instead of the
+/// old "initializing + benched" contradiction. Not one of the
+/// [`ServerLifecycle`] variants (there is no process behind it), so it lives as
+/// a plain constant rather than a lifecycle string.
+const NOT_INSTALLED_STATE: &str = "not-installed";
+
 /// Default coalescing window for non-urgent flushes.
 ///
 /// A change marks the snapshot dirty and the flush task waits this long before
@@ -805,6 +815,67 @@ impl SnapshotState {
         self.servers.remove(&server_id(key)).is_some()
     }
 
+    /// Marks a configured server as **not installed** (misc 210): the pre-spawn
+    /// resolution found no binary, so the server was never spawned. The board
+    /// entry carries [`NOT_INSTALLED_STATE`] — never `initializing` — with no
+    /// strikes and no bench, because a missing binary is a static condition, not
+    /// a failure the strike ledger owns. Returns whether anything changed, so a
+    /// re-probe on the same missing binary never churns the snapshot.
+    fn mark_not_installed(&mut self, key: &InstanceKey) -> bool {
+        let id = server_id(key);
+        if self
+            .servers
+            .get(&id)
+            .is_some_and(|e| e.state == NOT_INSTALLED_STATE)
+        {
+            return false;
+        }
+        let now = now_iso();
+        let entry = ServerEntry {
+            id: id.clone(),
+            language: key.language_id.clone(),
+            server: key.server.clone(),
+            scope_kind: key.scope.kind_str().to_string(),
+            scope_root: key
+                .scope
+                .root_path()
+                .map_or_else(String::new, |p| p.display().to_string()),
+            state: NOT_INSTALLED_STATE.to_string(),
+            state_since: now.clone(),
+            busy_count: None,
+            started_at: now,
+            progress: None,
+            last_message: None,
+            died_at: None,
+            respawns: 0,
+            last_died_at: None,
+            degraded_since: None,
+            degraded_reason: None,
+            strikes: 0,
+            benched: None,
+        };
+        self.servers.insert(id, entry);
+        true
+    }
+
+    /// Clears a `not-installed` board entry when the binary later resolves
+    /// (misc 210): a landed install heals coverage without a daemon restart, so
+    /// the honest entry must vanish before the fresh spawn registers. Only ever
+    /// removes an entry still in [`NOT_INSTALLED_STATE`] — a live server's entry
+    /// is never clobbered. Returns whether an entry was removed.
+    fn clear_not_installed(&mut self, key: &InstanceKey) -> bool {
+        let id = server_id(key);
+        if self
+            .servers
+            .get(&id)
+            .is_some_and(|e| e.state == NOT_INSTALLED_STATE)
+        {
+            self.servers.remove(&id);
+            return true;
+        }
+        false
+    }
+
     /// Marks a server's coverage degraded (decision 027). `degraded_since` is
     /// stamped once (idempotent — a repeat does not move it) and `reason`
     /// refreshes. Returns whether a matching entry existed.
@@ -1286,6 +1357,37 @@ impl SnapshotWriter {
         {
             let mut state = self.inner.lock_state();
             if state.remove_server(key) {
+                state.dirty = true;
+                state.urgent = true;
+            }
+        }
+        self.inner.notify.notify_one();
+    }
+
+    /// Marks a configured server as **not installed** on the board (misc 210):
+    /// the pre-spawn resolution found no binary. Flushes promptly (urgent) —
+    /// like a lifecycle change — so the honest `not-installed` state reaches the
+    /// TUI/doctor at once. No-op when the entry already reads `not-installed`,
+    /// so a re-probe on the same missing binary never churns the snapshot.
+    pub fn mark_not_installed(&self, key: &InstanceKey) {
+        {
+            let mut state = self.inner.lock_state();
+            if state.mark_not_installed(key) {
+                state.dirty = true;
+                state.urgent = true;
+            }
+        }
+        self.inner.notify.notify_one();
+    }
+
+    /// Clears a `not-installed` board entry when the binary later resolves
+    /// (misc 210, prompt flush): a landed install heals coverage without a
+    /// daemon restart. No-op unless the entry is still `not-installed`, so a
+    /// live server's entry is never clobbered.
+    pub fn clear_not_installed(&self, key: &InstanceKey) {
+        {
+            let mut state = self.inner.lock_state();
+            if state.clear_not_installed(key) {
                 state.dirty = true;
                 state.urgent = true;
             }
@@ -1824,6 +1926,45 @@ mod tests {
 
         // Idempotent write: nothing changed, nothing reported.
         assert!(!state.update_strikes(&key, 3, Some("unstable")));
+    }
+
+    #[test]
+    fn not_installed_entry_is_honest_and_heals_on_clear() {
+        // misc 210: a not-installed server's board entry reads "not-installed"
+        // (never initializing), carries no strikes and no bench, is idempotent
+        // on a repeat probe, and its clear removes only a not-installed entry —
+        // a live server's entry is never clobbered.
+        let mut state = fresh_state();
+        let key = root_key("tombi", "/p");
+
+        assert!(
+            state.mark_not_installed(&key),
+            "first mark changes the board"
+        );
+        let entry = &state.servers[&server_id(&key)];
+        assert_eq!(entry.state, NOT_INSTALLED_STATE);
+        assert_eq!(entry.strikes, 0);
+        assert!(entry.benched.is_none());
+        assert!(entry.died_at.is_none());
+
+        // Idempotent: a re-probe on the same missing binary reports no change.
+        assert!(!state.mark_not_installed(&key), "repeat mark is a no-op");
+
+        // The heal clears the not-installed entry.
+        assert!(state.clear_not_installed(&key), "clear removes the entry");
+        assert!(!state.servers.contains_key(&server_id(&key)));
+        assert!(
+            !state.clear_not_installed(&key),
+            "clear on absent is a no-op"
+        );
+
+        // A live entry is never clobbered by a not-installed clear.
+        state.register_server(&key, "t0");
+        assert!(
+            !state.clear_not_installed(&key),
+            "a live (initializing) entry is not a not-installed clear target"
+        );
+        assert!(state.servers.contains_key(&server_id(&key)));
     }
 
     #[test]

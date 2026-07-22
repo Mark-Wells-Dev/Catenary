@@ -309,18 +309,26 @@ enum UnverifiedCause {
     /// Struck out after previously serving (misc 167):
     /// `[unstable — <server> gave up after repeated crashes]`.
     BenchedUnstable,
+    /// Configured but its binary never resolved pre-spawn (misc 210):
+    /// `[not installed — <server> is configured but not installed]`. A static
+    /// condition, not a crash — the hardest, most concrete claim, so it is the
+    /// last variant: a genuinely softer co-owner (a live server that merely went
+    /// silent) still wins the `min`, but with no such co-owner the receipt says
+    /// "not installed", never "keeps dying".
+    NotInstalled,
 }
 
 impl UnverifiedCause {
-    /// Maps the manager's strike-ledger verdict onto the receipt cause for a
-    /// server whose unavailability is already established (dead tombstone or
-    /// respawn-dead) — never `Silent`.
+    /// Maps the manager's revive verdict onto the receipt cause for a server
+    /// whose unavailability is already established (dead tombstone, respawn-dead,
+    /// or configured-but-uninstalled) — never `Silent`.
     const fn from_verdict(verdict: crate::lsp::manager::ReviveVerdict) -> Self {
         use crate::lsp::manager::ReviveVerdict;
         match verdict {
             ReviveVerdict::Revivable => Self::Stuck,
             ReviveVerdict::BenchedNeverStarted => Self::BenchedBroken,
             ReviveVerdict::BenchedUnstable => Self::BenchedUnstable,
+            ReviveVerdict::NotInstalled => Self::NotInstalled,
         }
     }
 }
@@ -3379,6 +3387,9 @@ fn unverified_label(server: &str, cause: UnverifiedCause) -> String {
         UnverifiedCause::BenchedUnstable => {
             format!("unstable \u{2014} {server} gave up after repeated crashes")
         }
+        UnverifiedCause::NotInstalled => {
+            format!("not installed \u{2014} {server} is configured but not installed")
+        }
     }
 }
 
@@ -4193,6 +4204,37 @@ mod tests {
     }
 
     #[test]
+    fn format_not_installed_renders_ticket_label() {
+        // misc 210 / decision 027: a configured-but-uninstalled server degrades
+        // the file with its own honest cause — "not installed", distinct from
+        // the benched "never started" / "keeps dying" arms. The banner still
+        // opens the receipt and the gate is still paid.
+        let unverified = vec![ue_cause(
+            "Cargo.toml",
+            "/test",
+            "tombi",
+            UnverifiedCause::NotInstalled,
+        )];
+        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        assert_eq!(
+            output.trim(),
+            "unavailable: tombi\n\
+             /test/Cargo.toml [not installed \u{2014} tombi is configured but not installed]",
+            "output: {output}"
+        );
+    }
+
+    #[test]
+    fn not_installed_cause_maps_from_the_verdict() {
+        // The manager's NotInstalled verdict maps onto the receipt's
+        // NotInstalled cause (misc 210) — never a benched arm.
+        assert_eq!(
+            UnverifiedCause::from_verdict(crate::lsp::manager::ReviveVerdict::NotInstalled),
+            UnverifiedCause::NotInstalled,
+        );
+    }
+
+    #[test]
     fn unverified_cause_min_keeps_the_softest_claim() {
         // A file owed by several servers renders the softest cause among them:
         // one alive-but-silent owner keeps the `Silent` wording even when the
@@ -4200,7 +4242,11 @@ mod tests {
         assert!(UnverifiedCause::Silent < UnverifiedCause::Stuck);
         assert!(UnverifiedCause::Stuck < UnverifiedCause::BenchedBroken);
         assert!(UnverifiedCause::BenchedBroken < UnverifiedCause::BenchedUnstable);
-        let softest = [UnverifiedCause::BenchedUnstable, UnverifiedCause::Silent]
+        // NotInstalled is the hardest (last) claim: a genuinely softer co-owner
+        // still wins the `min`, so it shows only when it is the sole cause
+        // (misc 210).
+        assert!(UnverifiedCause::BenchedUnstable < UnverifiedCause::NotInstalled);
+        let softest = [UnverifiedCause::NotInstalled, UnverifiedCause::Silent]
             .into_iter()
             .min();
         assert_eq!(softest, Some(UnverifiedCause::Silent));
