@@ -166,11 +166,13 @@ fn check_against_allowlist(
     // Check if command is in the unconditional allow list.
     if rules.allow.contains(name) {
         // Check subcommand deny: e.g., git is allowed but `git grep` is denied.
-        // The subcommand is the first argument after the command word.
-        // Returns the full denied form (e.g., "git grep") for clear denial messages.
-        if let Some(sub) = argv.first()
-            && let Some(denied_subs) = rules.deny.get(name)
-            && denied_subs.contains(sub)
+        // The subcommand is the first positional past the command's global
+        // options, resolved flag-aware so a value-carrying global (`git -C
+        // <path> grep`, `sqlite3 -readonly -cmd …`) cannot shuffle the real
+        // subcommand out of the matched position (bug 140). Returns the full
+        // denied form (e.g., "git grep") for clear denial messages.
+        if let Some(denied_subs) = rules.deny.get(name)
+            && let Some(sub) = cmd.denied_subcommand(denied_subs)
         {
             return Some((format!("{name} {sub}"), DenialReason::DeniedSubcommand));
         }
@@ -2527,11 +2529,230 @@ mod tests {
         assert!(check_command("git ls-files", &rules, None).is_some());
     }
 
+    // ── Subcommand deny survives global-option shuffle (bug 140) ─────
+    //
+    // A denied subcommand is the first *positional* past the command's global
+    // options — so a value-carrying global (`-C <path>`, `-c key=val`,
+    // `--git-dir …`) can never shift the real subcommand out of the matched
+    // position. Each of these forms was allowed pre-fix (the naive check read
+    // only `argv.first()`).
+
+    #[test]
+    fn git_grep_denied_behind_capital_c_option() {
+        // The lead's first-hand repro: `git -C <path> grep …` slipped through.
+        let rules = basic_rules();
+        assert!(
+            check_command("git -C /some/path grep -c pattern -- src", &rules, None).is_some(),
+            "`git -C <path> grep` must still resolve to the denied `git grep`",
+        );
+    }
+
+    #[test]
+    fn git_grep_denied_behind_config_option() {
+        let rules = basic_rules();
+        assert!(
+            check_command("git -c core.pager=cat grep pattern", &rules, None).is_some(),
+            "`git -c key=val grep` must resolve to the denied `git grep`",
+        );
+    }
+
+    #[test]
+    fn git_grep_denied_behind_git_dir_glued() {
+        let rules = basic_rules();
+        assert!(
+            check_command("git --git-dir=/repo/.git grep pattern", &rules, None).is_some(),
+            "`git --git-dir=… grep` must resolve to the denied `git grep`",
+        );
+    }
+
+    #[test]
+    fn git_grep_denied_behind_git_dir_separated() {
+        let rules = basic_rules();
+        assert!(
+            check_command("git --git-dir /repo/.git grep pattern", &rules, None).is_some(),
+            "`git --git-dir … grep` (separated value) must resolve to `git grep`",
+        );
+    }
+
+    #[test]
+    fn git_grep_denied_behind_work_tree_separated() {
+        let rules = basic_rules();
+        assert!(
+            check_command("git --work-tree /repo grep pattern", &rules, None).is_some(),
+            "`git --work-tree … grep` must resolve to `git grep`",
+        );
+    }
+
+    #[test]
+    fn git_grep_denied_behind_paginate_boolean() {
+        // `-p` / `--paginate` are boolean globals — they take no value, so the
+        // very next token is the subcommand.
+        let rules = basic_rules();
+        assert!(
+            check_command("git -p grep pattern", &rules, None).is_some(),
+            "`git -p grep` (boolean global) must resolve to `git grep`",
+        );
+        assert!(
+            check_command("git --paginate grep pattern", &rules, None).is_some(),
+            "`git --paginate grep` must resolve to `git grep`",
+        );
+    }
+
+    #[test]
+    fn git_grep_denied_behind_stacked_globals() {
+        // `git -C x -c a=b grep …` — the ruling's stacked-combination case.
+        let rules = basic_rules();
+        assert!(
+            check_command("git -C x -c a=b grep pattern", &rules, None).is_some(),
+            "stacked globals before `grep` must still resolve to `git grep`",
+        );
+        assert!(
+            check_command(
+                "git --git-dir=/r/.git -c a=b -C x grep pattern",
+                &rules,
+                None
+            )
+            .is_some(),
+            "deeply stacked globals before `grep` must resolve to `git grep`",
+        );
+    }
+
+    #[test]
+    fn git_ls_files_denied_behind_globals() {
+        // The whole denied surface, not just `grep`.
+        let rules = basic_rules();
+        assert!(
+            check_command("git -C /some/path ls-files", &rules, None).is_some(),
+            "`git -C <path> ls-files` must resolve to `git ls-files`",
+        );
+        assert!(
+            check_command("git -c a=b ls-tree HEAD", &rules, None).is_some(),
+            "`git -c key=val ls-tree` must resolve to `git ls-tree`",
+        );
+    }
+
+    #[test]
+    fn git_commit_still_allowed_behind_globals() {
+        // The fix must not over-deny: a *non-denied* subcommand behind the same
+        // globals is still allowed.
+        let rules = basic_rules();
+        assert!(
+            check_command("git -C /some/path status", &rules, None).is_none(),
+            "`git -C <path> status` is not denied",
+        );
+        assert!(
+            check_command("git -c core.editor=vim commit -m x", &rules, None).is_none(),
+            "`git -c key=val commit` is not denied",
+        );
+    }
+
+    #[test]
+    fn git_ambiguous_leading_long_option_fails_closed() {
+        // A leading long option we can't prove is boolean *could* be consuming
+        // the token that would otherwise be the subcommand: if the ambiguity
+        // could hide a denied subcommand, deny (fail closed). Here the token
+        // after an unknown-arity option is `grep`, a denied subcommand — under
+        // the boolean reading it IS the subcommand, so we must deny.
+        let rules = basic_rules();
+        assert!(
+            check_command("git --unknown-opt grep pattern", &rules, None).is_some(),
+            "an unknown-arity leading option before `grep` must fail closed",
+        );
+    }
+
+    #[test]
+    fn git_ambiguous_short_cluster_fails_closed() {
+        // A short cluster of unknown arity before a denied subcommand: the
+        // boolean reading places `grep` in subcommand position, so fail closed.
+        let rules = basic_rules();
+        assert!(
+            check_command("git -q grep pattern", &rules, None).is_some(),
+            "an unknown-arity short flag before `grep` must fail closed",
+        );
+    }
+
+    // ── sqlite3 `-cmd` is a flag-shaped denied subcommand (bug 140) ──
+    //
+    // The denied token itself is a flag (`sqlite3 -cmd`), not a positional. It
+    // must be caught wherever it sits in the leading option run, not only at
+    // `argv[0]`.
+
+    fn sqlite_rules() -> ResolvedCommands {
+        ResolvedCommands {
+            allow: HashSet::from(["sqlite3".into()]),
+            deny: HashMap::from([("sqlite3".into(), HashSet::from(["-cmd".into()]))]),
+            ..ResolvedCommands::default()
+        }
+    }
+
+    #[test]
+    fn sqlite_cmd_denied_at_front() {
+        let rules = sqlite_rules();
+        assert!(
+            check_command("sqlite3 -cmd \".mode csv\" db.sqlite", &rules, None).is_some(),
+            "`sqlite3 -cmd …` must be denied",
+        );
+    }
+
+    #[test]
+    fn sqlite_cmd_denied_after_other_flags() {
+        // `-cmd` shuffled behind other options must still be caught.
+        let rules = sqlite_rules();
+        assert!(
+            check_command(
+                "sqlite3 -readonly -cmd \".mode csv\" db.sqlite",
+                &rules,
+                None
+            )
+            .is_some(),
+            "`sqlite3 -readonly -cmd …` must be denied",
+        );
+        assert!(
+            check_command("sqlite3 -batch -header -cmd \".dump\" db", &rules, None).is_some(),
+            "`-cmd` behind several boolean flags must be denied",
+        );
+    }
+
+    #[test]
+    fn sqlite_without_cmd_allowed() {
+        let rules = sqlite_rules();
+        assert!(
+            check_command("sqlite3 -readonly db.sqlite \"select 1\"", &rules, None).is_none(),
+            "a `sqlite3` invocation with no `-cmd` is allowed",
+        );
+    }
+
     #[test]
     fn cargo_not_allowed() {
         let rules = basic_rules();
         assert!(check_command("cargo test", &rules, None).is_some());
         assert!(check_command("cargo clippy", &rules, None).is_some());
+    }
+
+    #[test]
+    fn recommended_config_denies_shuffled_subcommands() {
+        // End-to-end against the *shipped* recommendation (bug 140): the
+        // global-option shuffle is closed on the real surface, not just the
+        // hand-built fixtures. `git`'s value-carrying globals and `sqlite3`'s
+        // flag-shuffle both resolve to the denied token.
+        let rules = recommended_rules();
+        assert!(
+            check_command("git -C /repo grep pattern", &rules, None).is_some(),
+            "`git -C <path> grep` denied on the shipped surface",
+        );
+        assert!(
+            check_command("git -c a=b ls-files", &rules, None).is_some(),
+            "`git -c key=val ls-files` denied on the shipped surface",
+        );
+        assert!(
+            check_command("sqlite3 -readonly -cmd \".dump\" db", &rules, None).is_some(),
+            "`sqlite3 -readonly -cmd …` denied on the shipped surface",
+        );
+        // And a plain read past the same globals is still allowed.
+        assert!(
+            check_command("git -C /repo log --oneline", &rules, None).is_none(),
+            "`git -C <path> log` remains allowed",
+        );
     }
 
     // ── Env var prefix ───────────────────────────────────────────────

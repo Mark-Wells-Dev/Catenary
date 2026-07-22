@@ -1701,6 +1701,109 @@ fn skip_double_quote(bytes: &[u8], start: usize) -> usize {
 
 // ── Projection helpers (the gate / oracle view) ──────────────────────────────
 
+impl SimpleCommand {
+    /// Resolve the command's **subcommand candidates** against a denylist,
+    /// returning the first denied token found — the flag-aware replacement for
+    /// the naive "is `argv[0]` denied?" check (bug 140).
+    ///
+    /// A tool's denied subcommand (`git grep`, `git ls-files`) is the first
+    /// *positional* operand past the command's global options — but the option
+    /// run can carry values (`git -C <path> grep`, `git -c key=val grep`,
+    /// `git --git-dir … grep`) that shift the real subcommand out of `argv[0]`.
+    /// Resolving against the structured record — options that take values
+    /// stepped over, the subcommand read as the first positional — is immune to
+    /// that shuffle by construction, and takes no per-tool flag table (no git
+    /// special-casing).
+    ///
+    /// Two token shapes can be denied, and both are honored:
+    ///
+    /// - **Positional-shaped** denials (`grep`, `ls-files`): matched against the
+    ///   first positional, resolved past the leading option run.
+    /// - **Flag-shaped** denials (`sqlite3 -cmd`): the denied token is itself a
+    ///   flag, so every flag in the leading run is matched directly — a `-cmd`
+    ///   shuffled behind other switches (`sqlite3 -readonly -cmd …`) is still
+    ///   caught.
+    ///
+    /// **Arity is unknown per tool, so ambiguity fails closed.** A bare long
+    /// option (`--flag`) or a short cluster (`-x`, `-xyz`) could be a boolean
+    /// switch *or* an option consuming the following token as its value — the
+    /// filter cannot tell which. Under the boolean reading the following token
+    /// sits in subcommand position; under the value reading it is consumed and
+    /// the scan continues. Both readings' subcommand candidates are collected,
+    /// so if *any* plausible reading places a denied subcommand in position, the
+    /// command is denied. Only `--flag=value` (self-contained) and a plain
+    /// positional (unambiguously ends the option run) are read without
+    /// branching. Over-collecting candidates can only *add* denials, never drop
+    /// one — the fail-closed direction the ruling requires.
+    ///
+    /// Returns the matched denied token (for the `"{name} {token}"` denial
+    /// form), or `None` when no candidate is denied.
+    pub(crate) fn denied_subcommand(
+        &self,
+        denied: &std::collections::HashSet<String>,
+    ) -> Option<String> {
+        let argv = &self.argv;
+        // `reachable[i]` marks index `i` as a possible *start of the option run*
+        // — the position where, under some arity reading of the flags before it,
+        // the next token would be read as the subcommand. Index 0 is always a
+        // start. A flag propagates reachability forward per its arity reading;
+        // ambiguous flags propagate to *both* the boolean (i+1) and the value
+        // (i+2) continuations, so every token a plausible reading could place in
+        // subcommand position is visited. Over-approximating reachability can
+        // only surface more candidate subcommands, never fewer — fail closed.
+        let mut reachable = vec![false; argv.len()];
+        if let Some(first) = reachable.first_mut() {
+            *first = true;
+        }
+        for i in 0..argv.len() {
+            if !reachable[i] {
+                continue;
+            }
+            let token = argv[i].as_str();
+            // A plain positional (or bare `-` stdin marker) is a subcommand
+            // candidate reached here — it ends this reading's option run.
+            if !token.starts_with('-') || token == "-" {
+                if denied.contains(token) {
+                    return Some(token.to_string());
+                }
+                continue;
+            }
+            // A flag reached here. Flag-shaped denials (`sqlite3 -cmd`) match the
+            // flag token itself, wherever in the run it sits.
+            if denied.contains(token) {
+                return Some(token.to_string());
+            }
+            // End-of-options: the next token is unambiguously the subcommand,
+            // and nothing after it competes.
+            if token == "--" {
+                if let Some(next) = reachable.get_mut(i + 1) {
+                    *next = true;
+                }
+                continue;
+            }
+            // `--flag=value` carries its own value — self-contained. The run
+            // continues at the next token with no arity ambiguity.
+            if token.starts_with("--") && token.contains('=') {
+                if let Some(next) = reachable.get_mut(i + 1) {
+                    *next = true;
+                }
+                continue;
+            }
+            // Unknown arity (bare `--flag`, or short `-x`/`-xyz`): the boolean
+            // reading continues the run at i+1 (that token could be the
+            // subcommand); the value reading consumes i+1 and continues at i+2.
+            // Mark both so a denied subcommand under either reading is caught.
+            if let Some(next) = reachable.get_mut(i + 1) {
+                *next = true;
+            }
+            if let Some(after) = reachable.get_mut(i + 2) {
+                *after = true;
+            }
+        }
+        None
+    }
+}
+
 impl ParsedScript {
     /// The ordered list of command-position names across every pipeline and
     /// every recursed substitution. This is the projection the allowlist gate
@@ -3113,5 +3216,144 @@ mod tests {
         assert_eq!(cmd.redirects.len(), 1);
         assert_eq!(cmd.redirects[0].op, RedirectOp::HereString);
         assert_eq!(cmd.redirects[0].target, "x");
+    }
+
+    // ── denied_subcommand: flag-aware subcommand resolution (bug 140) ─────────
+
+    /// Build a deny-set from string literals for the resolver tests.
+    fn deny(subs: &[&str]) -> std::collections::HashSet<String> {
+        subs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn denied_subcommand_bare_positional() {
+        let cmd = sole("git grep pattern");
+        assert_eq!(
+            cmd.denied_subcommand(&deny(&["grep"])).as_deref(),
+            Some("grep")
+        );
+    }
+
+    #[test]
+    fn denied_subcommand_allowed_positional_is_none() {
+        let cmd = sole("git status");
+        assert_eq!(cmd.denied_subcommand(&deny(&["grep"])), None);
+    }
+
+    #[test]
+    fn denied_subcommand_past_value_option_capital_c() {
+        // `git -C <path> grep` — `-C` takes a value; `grep` is still the
+        // subcommand. The naive `argv[0]` read saw `-C` and missed it.
+        let cmd = sole("git -C /some/path grep pattern");
+        assert_eq!(
+            cmd.denied_subcommand(&deny(&["grep"])).as_deref(),
+            Some("grep")
+        );
+    }
+
+    #[test]
+    fn denied_subcommand_past_config_option() {
+        let cmd = sole("git -c core.pager=cat grep pattern");
+        assert_eq!(
+            cmd.denied_subcommand(&deny(&["grep"])).as_deref(),
+            Some("grep")
+        );
+    }
+
+    #[test]
+    fn denied_subcommand_past_glued_long_option() {
+        let cmd = sole("git --git-dir=/repo/.git grep pattern");
+        assert_eq!(
+            cmd.denied_subcommand(&deny(&["grep"])).as_deref(),
+            Some("grep")
+        );
+    }
+
+    #[test]
+    fn denied_subcommand_past_separated_long_option() {
+        let cmd = sole("git --git-dir /repo/.git grep pattern");
+        assert_eq!(
+            cmd.denied_subcommand(&deny(&["grep"])).as_deref(),
+            Some("grep")
+        );
+    }
+
+    #[test]
+    fn denied_subcommand_past_stacked_globals() {
+        let cmd = sole("git --git-dir=/r/.git -c a=b -C x grep pattern");
+        assert_eq!(
+            cmd.denied_subcommand(&deny(&["grep"])).as_deref(),
+            Some("grep")
+        );
+    }
+
+    #[test]
+    fn denied_subcommand_allowed_past_config_not_denied() {
+        // The value of `-c` (`core.editor=vim`) must not be mistaken for the
+        // subcommand, and `commit` is not denied.
+        let cmd = sole("git -c core.editor=vim commit -m x");
+        assert_eq!(cmd.denied_subcommand(&deny(&["grep"])), None);
+    }
+
+    #[test]
+    fn denied_subcommand_double_dash_ends_options() {
+        // After `--`, the next token is unambiguously the subcommand.
+        let cmd = sole("git -- grep");
+        assert_eq!(
+            cmd.denied_subcommand(&deny(&["grep"])).as_deref(),
+            Some("grep")
+        );
+    }
+
+    #[test]
+    fn denied_subcommand_ambiguous_long_option_fails_closed() {
+        // `--unknown-opt` — arity unknown. Under the boolean reading `grep` is
+        // the subcommand, so a denied `grep` after it fails closed.
+        let cmd = sole("git --unknown-opt grep pattern");
+        assert_eq!(
+            cmd.denied_subcommand(&deny(&["grep"])).as_deref(),
+            Some("grep")
+        );
+    }
+
+    #[test]
+    fn denied_subcommand_ambiguous_short_flag_fails_closed() {
+        let cmd = sole("git -q grep pattern");
+        assert_eq!(
+            cmd.denied_subcommand(&deny(&["grep"])).as_deref(),
+            Some("grep")
+        );
+    }
+
+    #[test]
+    fn denied_subcommand_flag_shaped_deny_at_front() {
+        // `sqlite3 -cmd …` — the denied token is a flag, not a positional.
+        let cmd = sole("sqlite3 -cmd \".mode csv\" db");
+        assert_eq!(
+            cmd.denied_subcommand(&deny(&["-cmd"])).as_deref(),
+            Some("-cmd")
+        );
+    }
+
+    #[test]
+    fn denied_subcommand_flag_shaped_deny_behind_flags() {
+        // `-cmd` shuffled behind other switches is still caught.
+        let cmd = sole("sqlite3 -readonly -cmd \".mode csv\" db");
+        assert_eq!(
+            cmd.denied_subcommand(&deny(&["-cmd"])).as_deref(),
+            Some("-cmd")
+        );
+    }
+
+    #[test]
+    fn denied_subcommand_flag_shaped_absent_is_none() {
+        let cmd = sole("sqlite3 -readonly db \"select 1\"");
+        assert_eq!(cmd.denied_subcommand(&deny(&["-cmd"])), None);
+    }
+
+    #[test]
+    fn denied_subcommand_empty_argv_is_none() {
+        let cmd = sole("git");
+        assert_eq!(cmd.denied_subcommand(&deny(&["grep"])), None);
     }
 }
