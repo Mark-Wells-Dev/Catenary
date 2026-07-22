@@ -33,6 +33,7 @@
 //!   (never a false teardown). The macOS leg is a flagged follow-up (see the
 //!   module's `probe` on non-Linux and ticket 01's report).
 
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
 /// A declared host-process handle: the pid the hook walked its ancestry to, plus
@@ -59,15 +60,27 @@ impl HostHandle {
     /// Builds a handle for an explicit pid, reading its start-time on the current
     /// platform.
     ///
-    /// A start-time of `0` means "unread" (non-Linux, or a `/proc` race) — the
-    /// handle is still valid for a bare pid-presence probe, just without the
-    /// pid-reuse guard.
+    /// A start-time of `0` means "unread" (a `/proc` race) — the handle is
+    /// still valid for a bare pid-presence probe, just without the pid-reuse
+    /// guard.
+    #[cfg(target_os = "linux")]
     #[must_use]
     pub fn for_pid(pid: u32) -> Self {
         Self {
             pid,
             start_time: read_start_time(pid),
         }
+    }
+
+    /// Builds a handle for an explicit pid.
+    ///
+    /// Non-Linux: the start-time is always `0` ("unread") — the sysctl read
+    /// needs `libc` FFI this crate forbids, so the handle carries no pid-reuse
+    /// guard (and [`probe`] answers [`Liveness::Unknown`] regardless).
+    #[cfg(not(target_os = "linux"))]
+    #[must_use]
+    pub const fn for_pid(pid: u32) -> Self {
+        Self { pid, start_time: 0 }
     }
 }
 
@@ -85,69 +98,70 @@ pub enum Liveness {
     Unknown,
 }
 
-/// Probes a declared [`HostHandle`] for liveness on the current platform.
+/// Probes a declared [`HostHandle`] for liveness.
 ///
-/// Linux: the pid is present iff `/proc/<pid>` exists; when the declaration
-/// carries a non-zero `start_time`, the live process's start-time must match, or
-/// the pid was recycled ([`Liveness::Vanished`]). Non-Linux: [`Liveness::Unknown`]
-/// — the macOS `kill(0)` + sysctl leg needs `libc` FFI this crate forbids.
+/// The pid is present iff `/proc/<pid>` exists; when the declaration carries a
+/// non-zero `start_time`, the live process's start-time must match, or the pid
+/// was recycled ([`Liveness::Vanished`]).
+#[cfg(target_os = "linux")]
 #[must_use]
 pub fn probe(handle: HostHandle) -> Liveness {
     probe_in(handle, &proc_root())
+}
+
+/// Probes a declared [`HostHandle`] for liveness.
+///
+/// Non-Linux: always [`Liveness::Unknown`] — the macOS `kill(0)` + sysctl leg
+/// needs `libc` FFI this crate forbids without a safe wrapper crate (the flagged
+/// Darwin subset; ticket 01's follow-up). The watch treats Unknown as present,
+/// never a false teardown.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub const fn probe(_handle: HostHandle) -> Liveness {
+    Liveness::Unknown
 }
 
 /// The `/proc` mount the Linux probe reads. Split out so a unit test can point it
 /// at a fixture tree (a tempdir with hand-written `<pid>/stat` files) and exercise
 /// the presence / start-time-mismatch / recycled-pid legs without spawning real
 /// processes.
+#[cfg(target_os = "linux")]
 fn proc_root() -> PathBuf {
     PathBuf::from("/proc")
 }
 
-/// The platform- and root-injectable core of [`probe`].
-///
-/// On Linux, `proc_root` is `/proc` in production and a fixture tree in tests. On
-/// non-Linux the parameter is unused and the answer is always
-/// [`Liveness::Unknown`].
+/// The root-injectable core of [`probe`]: `proc_root` is `/proc` in production
+/// and a fixture tree in tests.
+#[cfg(target_os = "linux")]
 #[must_use]
-#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn probe_in(handle: HostHandle, proc_root: &std::path::Path) -> Liveness {
-    #[cfg(target_os = "linux")]
-    {
-        let proc_dir = proc_root.join(handle.pid.to_string());
-        if !proc_dir.exists() {
-            return Liveness::Vanished;
-        }
-        // The pid is present. With no declared start-time (unread at declaration
-        // time) we can only assert presence — Alive. With one, the live
-        // start-time must match, or the pid was recycled by an unrelated process
-        // (Vanished).
-        if handle.start_time == 0 {
-            return Liveness::Alive;
-        }
-        match read_start_time_in(handle.pid, proc_root) {
-            0 => Liveness::Alive, // could not re-read; presence stands
-            live if live == handle.start_time => Liveness::Alive,
-            _ => Liveness::Vanished,
-        }
+    let proc_dir = proc_root.join(handle.pid.to_string());
+    if !proc_dir.exists() {
+        return Liveness::Vanished;
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = handle;
-        Liveness::Unknown
+    // The pid is present. With no declared start-time (unread at declaration
+    // time) we can only assert presence — Alive. With one, the live
+    // start-time must match, or the pid was recycled by an unrelated process
+    // (Vanished).
+    if handle.start_time == 0 {
+        return Liveness::Alive;
+    }
+    match read_start_time_in(handle.pid, proc_root) {
+        0 => Liveness::Alive, // could not re-read; presence stands
+        live if live == handle.start_time => Liveness::Alive,
+        _ => Liveness::Vanished,
     }
 }
 
-/// Reads a process's start-time on the current platform, or `0` when unavailable.
-///
-/// Linux: field 22 of `/proc/<pid>/stat`. Non-Linux: `0` (the sysctl leg needs
-/// `libc` FFI this crate forbids).
+/// Reads a process's start-time (field 22 of `/proc/<pid>/stat`), or `0` when
+/// unavailable.
+#[cfg(target_os = "linux")]
 #[must_use]
 fn read_start_time(pid: u32) -> u64 {
     read_start_time_in(pid, &proc_root())
 }
 
-/// The root-injectable core of [`read_start_time`] (Linux only; `0` elsewhere).
+/// The root-injectable core of [`read_start_time`].
 ///
 /// Parses field 22 (`starttime`) of `/proc/<pid>/stat`. The stat line's second
 /// field is the comm name wrapped in parentheses and may itself contain spaces
@@ -155,22 +169,14 @@ fn read_start_time(pid: u32) -> u64 {
 /// last `)`** — the kernel guarantees the parenthesized comm is the only place a
 /// `)` appears before the numeric fields. From that point, `starttime` is the
 /// 20th whitespace-separated token (fields 3..=22).
+#[cfg(target_os = "linux")]
 #[must_use]
-#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn read_start_time_in(pid: u32, proc_root: &std::path::Path) -> u64 {
-    #[cfg(target_os = "linux")]
-    {
-        let stat_path = proc_root.join(pid.to_string()).join("stat");
-        let Ok(contents) = std::fs::read_to_string(&stat_path) else {
-            return 0;
-        };
-        parse_starttime(&contents).unwrap_or(0)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (pid, proc_root);
-        0
-    }
+    let stat_path = proc_root.join(pid.to_string()).join("stat");
+    let Ok(contents) = std::fs::read_to_string(&stat_path) else {
+        return 0;
+    };
+    parse_starttime(&contents).unwrap_or(0)
 }
 
 /// Parses the `starttime` field (field 22) from a `/proc/<pid>/stat` line.
@@ -179,6 +185,7 @@ fn read_start_time_in(pid: u32, proc_root: &std::path::Path) -> u64 {
 /// the space-separated numeric run `state ppid ... starttime ...`, in which
 /// `starttime` is the 20th token (stat fields 3 through 22 inclusive). Returns
 /// `None` if the line is malformed.
+#[cfg(target_os = "linux")]
 fn parse_starttime(stat: &str) -> Option<u64> {
     let after_comm = stat.rsplit_once(')')?.1;
     // Fields after comm: index 0 == field 3 (state). starttime is field 22,
@@ -193,9 +200,11 @@ fn parse_starttime(stat: &str) -> Option<u64> {
 /// and NOT at an interposed `sh -c` wrapper in the hook chain (bug 96's lesson:
 /// on Darwin ancestry is the coarse leg). A truncated Linux comm (16 bytes) still
 /// matches these short names exactly.
+#[cfg(target_os = "linux")]
 const HOST_PROCESS_NAMES: &[&str] = &["claude", "agy"];
 
 /// Whether a process comm names a known host session process.
+#[cfg(target_os = "linux")]
 #[must_use]
 fn is_host_process(comm: &str) -> bool {
     HOST_PROCESS_NAMES.contains(&comm)
@@ -210,15 +219,24 @@ fn is_host_process(comm: &str) -> bool {
 /// `sh -c` wrapper. Returns `None` when the walk reaches pid 1 (or a broken link)
 /// without finding a host: better to declare nothing than to declare a wrong pid
 /// whose later reuse would tear a live session down.
-///
-/// **Linux only.** On non-Linux the walk needs a `libc`/sysctl ppid read this
-/// crate forbids, so it returns `None` — no handle is declared, the daemon keeps
-/// no registry entry for the session, and the vanish watch never fires for it
-/// (today's behavior for a hookless session). This is the flagged Darwin subset:
-/// the mechanism is honest where it can walk, silent where it cannot.
+#[cfg(target_os = "linux")]
 #[must_use]
 pub fn resolve_host_handle() -> Option<HostHandle> {
     resolve_host_handle_from(std::process::id(), &proc_root())
+}
+
+/// Walks the current process's ancestry to the host session process.
+///
+/// Non-Linux: always `None` — the walk needs a `libc`/sysctl ppid read this
+/// crate forbids without a safe wrapper crate, so no handle is declared, the
+/// daemon keeps no registry entry for the session, and the vanish watch never
+/// fires for it (today's behavior for a hookless session). This is the flagged
+/// Darwin subset: the mechanism is honest where it can walk, silent where it
+/// cannot (ticket 01's follow-up).
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub const fn resolve_host_handle() -> Option<HostHandle> {
+    None
 }
 
 /// The pid- and root-injectable core of [`resolve_host_handle`].
@@ -227,33 +245,25 @@ pub fn resolve_host_handle() -> Option<HostHandle> {
 /// `proc_root` is `/proc` in production and a fixture tree in tests. Bounded to
 /// [`MAX_ANCESTRY_DEPTH`] hops so a pathological ppid cycle (a fixture, or a
 /// kernel oddity) can never spin.
+#[cfg(target_os = "linux")]
 #[must_use]
-#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn resolve_host_handle_from(start: u32, proc_root: &std::path::Path) -> Option<HostHandle> {
-    #[cfg(target_os = "linux")]
-    {
-        let mut pid = read_ppid_in(start, proc_root)?;
-        for _ in 0..MAX_ANCESTRY_DEPTH {
-            if pid <= 1 {
-                // Reached init without a host ancestor — do not guess.
-                return None;
-            }
-            let comm = read_comm_in(pid, proc_root)?;
-            if is_host_process(&comm) {
-                return Some(HostHandle {
-                    pid,
-                    start_time: read_start_time_in(pid, proc_root),
-                });
-            }
-            pid = read_ppid_in(pid, proc_root)?;
+    let mut pid = read_ppid_in(start, proc_root)?;
+    for _ in 0..MAX_ANCESTRY_DEPTH {
+        if pid <= 1 {
+            // Reached init without a host ancestor — do not guess.
+            return None;
         }
-        None
+        let comm = read_comm_in(pid, proc_root)?;
+        if is_host_process(&comm) {
+            return Some(HostHandle {
+                pid,
+                start_time: read_start_time_in(pid, proc_root),
+            });
+        }
+        pid = read_ppid_in(pid, proc_root)?;
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (start, proc_root);
-        None
-    }
+    None
 }
 
 /// Maximum ancestry hops the walk climbs before giving up — a cycle guard.
@@ -286,7 +296,25 @@ fn read_comm_in(pid: u32, proc_root: &std::path::Path) -> Option<String> {
     Some(contents.trim_end().to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "linux")))]
+mod non_linux_tests {
+    use super::{HostHandle, Liveness, probe, resolve_host_handle};
+
+    #[test]
+    fn probe_is_unknown_and_resolve_declares_nothing() {
+        // The honest non-Linux subset: no walk, no probe — never a false
+        // teardown (the watch treats Unknown as present).
+        let handle = HostHandle {
+            pid: 1,
+            start_time: 0,
+        };
+        assert_eq!(probe(handle), Liveness::Unknown);
+        assert!(resolve_host_handle().is_none());
+        assert_eq!(HostHandle::for_pid(7).start_time, 0);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
 #[allow(
     clippy::expect_used,
     reason = "tests use expect for readable assertions"
