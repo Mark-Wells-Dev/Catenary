@@ -32,6 +32,52 @@ struct PendingRequest {
     sender: oneshot::Sender<ResponseMessage>,
 }
 
+/// Observability cap for a protocol-tap payload, in bytes (256 KiB).
+///
+/// Above this the firehose copy is truncated (see [`truncate_payload`]); the
+/// actual protocol delivery to/from the server is untouched. Bug 136: an 82 MB
+/// `documentSymbol` response was copied verbatim into the tap's `to_string()`,
+/// re-parsed by the sink, and re-serialized into an 82 MB single-line firehose
+/// segment — permanent allocator churn on the daemon's own data path. A few
+/// hundred KB is ample forensic context for any realistic protocol message
+/// while bounding the worst case.
+const MAX_PROTOCOL_PAYLOAD_BYTES: usize = 256 * 1024;
+
+/// Marker key on a truncated payload record, so firehose readers can tell a
+/// truncated copy from a genuine wire message.
+const TRUNCATION_MARKER: &str = "__truncated";
+
+/// Cap a protocol-tap payload for the firehose, char-boundary-safe.
+///
+/// Returns the payload unchanged (borrowed) when it is within
+/// [`MAX_PROTOCOL_PAYLOAD_BYTES`]. Above the cap, returns an owned JSON *record*
+/// carrying the full `byte_len`, the [`TRUNCATION_MARKER`] flag, and a
+/// `payload_prefix` (the leading bytes, cut on a UTF-8 char boundary so the
+/// record stays valid UTF-8 and never panics). This is the observability copy
+/// only — the caller's real protocol delivery uses the untruncated bytes.
+fn truncate_payload(payload: &str) -> std::borrow::Cow<'_, str> {
+    let byte_len = payload.len();
+    if byte_len <= MAX_PROTOCOL_PAYLOAD_BYTES {
+        return std::borrow::Cow::Borrowed(payload);
+    }
+    // Walk back to the nearest char boundary at or below the cap — a stable
+    // stand-in for the nightly `str::floor_char_boundary`. `is_char_boundary(0)`
+    // is always true, so this terminates without an unwrap.
+    let mut cut = MAX_PROTOCOL_PAYLOAD_BYTES.min(byte_len);
+    while cut > 0 && !payload.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let prefix = &payload[..cut];
+    // Build the record with serde_json so the prefix is escaped correctly and
+    // the line nests as real JSON in the firehose (parse_payload round-trips it).
+    let record = serde_json::json!({
+        TRUNCATION_MARKER: true,
+        "byte_len": byte_len,
+        "payload_prefix": prefix,
+    });
+    std::borrow::Cow::Owned(record.to_string())
+}
+
 /// Emit an LSP protocol event at the given tracing level.
 ///
 /// Protocol routing is by `kind` field, not by level — the JSONL firehose
@@ -40,6 +86,11 @@ struct PendingRequest {
 ///
 /// `source` is an optional subsystem tag (e.g., `lsp.logging`). Most
 /// callers pass `None`; `window/logMessage` passes its source tag.
+///
+/// The `payload` is truncated at the single choke point here (see
+/// [`truncate_payload`], bug 136 lean 2) before it reaches the firehose — a
+/// large protocol message is capped in the observability copy only, with a
+/// truncation record marking the full byte length.
 #[allow(clippy::too_many_arguments, reason = "protocol event boundary")]
 fn emit_lsp_event(
     level: tracing::Level,
@@ -51,6 +102,8 @@ fn emit_lsp_event(
     payload: &str,
     msg: &str,
 ) {
+    let payload = truncate_payload(payload);
+    let payload = payload.as_ref();
     if level == tracing::Level::ERROR {
         crate::emit_protocol_event!(
             error,
@@ -1359,5 +1412,130 @@ mod tests {
             stat.is_none(),
             "killed child {pid} was never reaped (still present: {stat:?})"
         );
+    }
+
+    // ── truncate_payload: firehose payload cap (bug 136 lean 2) ────────────
+
+    #[test]
+    fn truncate_payload_passes_small_payload_through_unchanged() {
+        // At or below the cap the payload is borrowed verbatim — no marker,
+        // no re-allocation.
+        let small = r#"{"jsonrpc":"2.0","method":"textDocument/hover"}"#;
+        let out = truncate_payload(small);
+        assert!(
+            matches!(out, std::borrow::Cow::Borrowed(_)),
+            "small payload should borrow, not allocate"
+        );
+        assert_eq!(out.as_ref(), small);
+    }
+
+    #[test]
+    fn truncate_payload_boundary_at_exactly_the_cap_is_untouched() {
+        // Exactly MAX bytes is within the cap (`<=`), so it passes through.
+        let at_cap = "a".repeat(MAX_PROTOCOL_PAYLOAD_BYTES);
+        let out = truncate_payload(&at_cap);
+        assert!(
+            matches!(out, std::borrow::Cow::Borrowed(_)),
+            "a payload of exactly the cap is not truncated"
+        );
+        assert_eq!(out.len(), MAX_PROTOCOL_PAYLOAD_BYTES);
+
+        // One byte over the cap truncates.
+        let over_cap = "a".repeat(MAX_PROTOCOL_PAYLOAD_BYTES + 1);
+        let out = truncate_payload(&over_cap);
+        assert!(
+            matches!(out, std::borrow::Cow::Owned(_)),
+            "one byte over the cap is truncated"
+        );
+    }
+
+    #[test]
+    fn truncate_payload_record_carries_full_byte_len_and_marker() {
+        let byte_len = MAX_PROTOCOL_PAYLOAD_BYTES * 4;
+        let big = "z".repeat(byte_len);
+        let out = truncate_payload(&big);
+        // The truncated record nests as real JSON (parse_payload round-trips it).
+        let record: serde_json::Value =
+            serde_json::from_str(out.as_ref()).expect("truncation record is valid JSON");
+        assert_eq!(
+            record[TRUNCATION_MARKER],
+            serde_json::Value::Bool(true),
+            "record carries the truncation marker"
+        );
+        assert_eq!(
+            record["byte_len"],
+            serde_json::json!(byte_len),
+            "record reports the FULL byte length, not the truncated prefix length"
+        );
+        let prefix = record["payload_prefix"]
+            .as_str()
+            .expect("prefix is a string");
+        assert!(
+            prefix.len() <= MAX_PROTOCOL_PAYLOAD_BYTES,
+            "prefix is bounded by the cap"
+        );
+        assert!(
+            prefix.bytes().all(|b| b == b'z'),
+            "prefix is the leading bytes of the original payload"
+        );
+    }
+
+    #[test]
+    fn truncate_payload_cuts_on_a_char_boundary_without_panicking() {
+        // Build a payload that pushes a multi-byte char across the cap so the
+        // naive byte cut would land mid-UTF-8. The char-boundary walk-back must
+        // produce a valid &str and never panic.
+        // '€' is 3 bytes; place a run of them straddling the cap.
+        let filler = "a".repeat(MAX_PROTOCOL_PAYLOAD_BYTES - 1);
+        let payload = format!("{filler}€€€€"); // cap lands inside the first '€'
+        assert!(payload.len() > MAX_PROTOCOL_PAYLOAD_BYTES);
+        let out = truncate_payload(&payload);
+        let record: serde_json::Value =
+            serde_json::from_str(out.as_ref()).expect("record is valid JSON after char-safe cut");
+        let prefix = record["payload_prefix"]
+            .as_str()
+            .expect("prefix is a string");
+        // The cut fell back below the cap to the last char boundary — the euro
+        // sign that straddled the cap is excluded whole, never split.
+        assert!(
+            prefix.len() < MAX_PROTOCOL_PAYLOAD_BYTES,
+            "walk-back cut below the cap to the char boundary (len {})",
+            prefix.len()
+        );
+        assert!(
+            prefix.is_char_boundary(prefix.len()),
+            "prefix ends on a char boundary"
+        );
+        // And the whole prefix is the `a` run — the multi-byte char was dropped.
+        assert!(prefix.bytes().all(|b| b == b'a'));
+    }
+
+    #[test]
+    fn emit_lsp_event_truncates_oversize_payload_at_the_choke_point() {
+        // The single choke point in emit_lsp_event truncates every call site's
+        // payload — the firehose never sees the raw megabytes.
+        let (_logging, db, _guard) = setup_logging();
+        let big = "q".repeat(MAX_PROTOCOL_PAYLOAD_BYTES * 3);
+        emit_lsp_event(
+            tracing::Level::DEBUG,
+            "test-server",
+            "textDocument/documentSymbol",
+            None,
+            None,
+            None,
+            &big,
+            "incoming response",
+        );
+        let msgs = query_all_messages(&db);
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            msgs[0].payload.len() < MAX_PROTOCOL_PAYLOAD_BYTES + 1024,
+            "emitted payload is capped, not the raw {} bytes",
+            big.len()
+        );
+        let record: serde_json::Value =
+            serde_json::from_str(&msgs[0].payload).expect("emitted payload is the JSON record");
+        assert_eq!(record[TRUNCATION_MARKER], serde_json::Value::Bool(true));
+        assert_eq!(record["byte_len"], serde_json::json!(big.len()));
     }
 }

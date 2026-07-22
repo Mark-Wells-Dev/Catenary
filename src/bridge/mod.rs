@@ -31,6 +31,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use tracing::debug;
+
 use crate::bridge::filesystem_manager::{FilesystemManager, mtime_nanos};
 use crate::config::DispatchMethod;
 use crate::lsp::LspClientManager;
@@ -130,6 +132,32 @@ impl SourceLines {
     }
 }
 
+/// File-size ceiling for outline enrichment, in bytes (2 MiB).
+///
+/// Above this, `ensure_symbols` skips the `documentSymbol` round-trip for the
+/// file: it renders raw (grep/glob still return their matches, just without
+/// enclosing labels or an outline) rather than round-tripping symbols.
+///
+/// Rationale (bug 136): a `documentSymbol` response is copied ~6× per round on
+/// the daemon's data path (String → `Value` → the protocol tap's `to_string()` →
+/// sink re-parse → record serialize), and glibc's per-thread arenas retain
+/// those transient pages permanently. The dig's worst driver was a 7.66 MB JSON
+/// data file whose response measured 82 MB — copied to ~490 MB of churn per
+/// round. Useful outlines come from *source* files, which are orders of
+/// magnitude smaller: a 2 MiB source file is already enormous by hand-authored
+/// standards, so the gate spares the pathological data-file case while leaving
+/// every realistic source file enriched.
+const MAX_OUTLINE_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Whether a file of `file_bytes` is within the outline-enrichment size gate.
+///
+/// `true` up to and including [`MAX_OUTLINE_FILE_BYTES`]; `false` above it, in
+/// which case `ensure_symbols` skips the `documentSymbol` round-trip and the
+/// file renders raw. The boundary is inclusive at the ceiling.
+const fn outline_gate_permits(file_bytes: u64) -> bool {
+    file_bytes <= MAX_OUTLINE_FILE_BYTES
+}
+
 /// Ensures the symbol index is populated — and fresh — for the given files.
 ///
 /// For each file, opens the document on the server, requests `documentSymbol`,
@@ -177,6 +205,20 @@ pub(super) async fn ensure_symbols(
                 continue;
             };
             if !meta.is_file() {
+                continue;
+            }
+            // Size-gate the outline round-trip (bug 136 lean 1): a file above
+            // the ceiling renders raw — no symbol enrichment — rather than
+            // round-tripping a `documentSymbol` response that the allocator
+            // retains as churn. Honest skip: grep/glob still return the file's
+            // matches, just without enclosing labels or an outline.
+            if !outline_gate_permits(meta.len()) {
+                debug!(
+                    path = %path.display(),
+                    file_bytes = meta.len(),
+                    max_bytes = MAX_OUTLINE_FILE_BYTES,
+                    "skipping outline enrichment: file exceeds outline size gate"
+                );
                 continue;
             }
             if idx.needs_population(path) {
@@ -230,5 +272,41 @@ pub(super) async fn ensure_symbols(
         if let Ok(idx) = idx_arc.lock() {
             let _ = idx.populate_from_document_symbols(path, &response);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_OUTLINE_FILE_BYTES, outline_gate_permits};
+
+    #[test]
+    fn outline_gate_ceiling_is_two_mib() {
+        assert_eq!(MAX_OUTLINE_FILE_BYTES, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn outline_gate_boundary_is_inclusive_at_the_ceiling() {
+        // Well under the gate: enriched.
+        assert!(outline_gate_permits(0));
+        assert!(outline_gate_permits(64 * 1024));
+        assert!(outline_gate_permits(MAX_OUTLINE_FILE_BYTES - 1));
+
+        // Exactly the ceiling: still permitted (inclusive boundary).
+        assert!(
+            outline_gate_permits(MAX_OUTLINE_FILE_BYTES),
+            "a file of exactly the ceiling is enriched"
+        );
+
+        // One byte over: gated (skipped, renders raw).
+        assert!(
+            !outline_gate_permits(MAX_OUTLINE_FILE_BYTES + 1),
+            "one byte over the ceiling is gated"
+        );
+
+        // The dig's specimen (7.66 MB) is firmly gated.
+        assert!(
+            !outline_gate_permits(7_660_000),
+            "the 7.66 MB data-file specimen is gated (bug 136)"
+        );
     }
 }

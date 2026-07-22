@@ -1100,8 +1100,42 @@ impl LspServer {
     /// Marks `uri` as closed on this connection (`didClose` sent). A clear
     /// publish arriving after this is ordinary close semantics, not a
     /// misordered straggler — the close-clear gate stands down.
+    ///
+    /// Also evicts the closed URI's per-URI entries from the `diagnostics` and
+    /// `doc_stimulus` maps (bug 136 lean 4, the hygiene leg). Both are provably
+    /// dead at close on every serve path:
+    ///
+    /// - The serve is `didOpen → settle → collect → didClose` (the diagnostics
+    ///   fan-out teardown, the hitstream/single-file brackets): the settle has
+    ///   already read the `diagnostics` entry before this close runs, so the
+    ///   cached verdict has done its job.
+    /// - Post-close, the `diagnostics` entry's remaining readers
+    ///   ([`Self::has_cached_publish`], the misordered close-clear gate in
+    ///   [`Self::on_notification`]) all key on held-open state and stand down
+    ///   for a closed document; `doc_stimulus`'s sole reader
+    ///   ([`Self::doc_stimulus_gen`]) is consulted by that gate only when the
+    ///   document is still open, so a closed URI's stimulus generation is
+    ///   unreachable.
+    /// - The held-open probe document (bug 133 lean 2) never reaches here —
+    ///   `run_eager_health_probe` sends no `didClose` — so this eviction cannot
+    ///   fight its cached-publish survival: the two act on disjoint URIs.
+    ///
+    /// `doc_versions` is deliberately **kept**: it is the monotonic version
+    /// floor the publish staleness gate ([`Self::on_notification`]) reads to
+    /// reject a versioned straggler that lands *after* the close. Evicting it
+    /// would let such a straggler resurrect a `diagnostics` entry for the closed
+    /// URI — re-opening the very leak this closes — and its footprint is a
+    /// single `i32` per URI. Left in place as the not-provably-dead entry.
     pub(crate) fn note_doc_closed(&self, uri: &str) {
         self.open_doc_uris
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(uri);
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(uri);
+        self.doc_stimulus
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(uri);
@@ -2802,7 +2836,10 @@ mod tests {
     }
 
     /// A clear for a document we CLOSED is ordinary close semantics — the
-    /// gate stands down and the clear caches as before.
+    /// gate stands down and the clear caches as before. (Since bug 136 lean 4,
+    /// close evicts the prior diagnostics entry, so the post-close clear
+    /// RE-populates an evicted slot rather than overwriting the dirty one —
+    /// the observable result, an empty cached verdict, is identical.)
     #[test]
     fn close_clear_for_closed_document_caches() {
         let server = declared_push_server();
@@ -2914,6 +2951,120 @@ mod tests {
             "the post-didSave clear settles here — the gate cannot tell it \
              from an on-save clean; lean 2 removes the churn that makes it"
         );
+    }
+
+    // ── note_doc_closed: per-URI eviction (bug 136 lean 4) ────────────────
+
+    /// Closing a document evicts its `diagnostics` and `doc_stimulus` entries —
+    /// the hygiene leg — but keeps `doc_versions` (the straggler-rejection
+    /// floor, flagged not-provably-dead).
+    #[test]
+    fn note_doc_closed_evicts_diagnostics_and_stimulus_keeps_version() {
+        let server = test_server();
+        let uri = "file:///evict.rs";
+
+        // Open, stimulate, and land a verdict — all three maps now hold `uri`.
+        server.note_doc_version(uri, 4); // seeds doc_versions AND bumps doc_stimulus
+        server.note_doc_opened(uri);
+        publish_unversioned_dirty(&server, uri);
+
+        assert!(
+            server.has_cached_publish(uri),
+            "a verdict is cached pre-close"
+        );
+        assert_eq!(
+            server.doc_version(uri),
+            Some(4),
+            "version recorded pre-close"
+        );
+        assert!(
+            server.doc_stimulus_gen(uri) > 0,
+            "stimulus recorded pre-close"
+        );
+
+        // The settle already consumed the cached verdict; the close evicts it.
+        server.note_doc_closed(uri);
+
+        assert!(
+            !server.has_cached_publish(uri),
+            "the diagnostics entry is evicted on close"
+        );
+        assert_eq!(
+            server.doc_stimulus_gen(uri),
+            0,
+            "the stimulus entry is evicted on close (back to the zero default)"
+        );
+        assert_eq!(
+            server.doc_version(uri),
+            Some(4),
+            "doc_versions is KEPT — the straggler-rejection floor survives close"
+        );
+    }
+
+    /// The kept `doc_versions` floor still gates a versioned straggler that
+    /// lands *after* the close: with the floor intact, a `< current` publish
+    /// for the closed URI is dropped and cannot resurrect a diagnostics entry.
+    #[test]
+    fn kept_version_floor_gates_post_close_straggler() {
+        let server = test_server();
+        let uri = "file:///straggler.rs";
+
+        server.note_doc_version(uri, 7);
+        server.note_doc_opened(uri);
+        publish_unversioned_dirty(&server, uri);
+        server.note_doc_closed(uri);
+        assert!(!server.has_cached_publish(uri), "evicted on close");
+
+        // A versioned straggler from an earlier round lands after the close.
+        server.on_notification(
+            "textDocument/publishDiagnostics",
+            &json!({
+                "uri": uri,
+                "version": 6,
+                "diagnostics": [{"message": "stale straggler", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}}]
+            }),
+        );
+
+        assert!(
+            !server.has_cached_publish(uri),
+            "the kept version floor (7) drops the stale straggler (6) — no \
+             resurrection of a diagnostics entry for the closed URI"
+        );
+    }
+
+    /// The held-open probe interaction (bug 133 lean 2): a document that is
+    /// never closed — `run_eager_health_probe` sends no `didClose` — keeps its
+    /// cached publish. Close-eviction cannot fight the probe's survival because
+    /// it never runs for the held-open URI.
+    #[test]
+    fn eviction_does_not_touch_a_held_open_probe_document() {
+        let server = test_server();
+        let uri = "file:///probe-held.rs";
+
+        // The probe's open and heard publish — no close ever follows.
+        server.note_doc_version(uri, 1);
+        server.note_doc_opened(uri);
+        publish_unversioned_dirty(&server, uri);
+
+        // A DIFFERENT document is opened and closed alongside it.
+        let other = "file:///other.rs";
+        server.note_doc_version(other, 1);
+        server.note_doc_opened(other);
+        publish_unversioned_dirty(&server, other);
+        server.note_doc_closed(other);
+
+        assert!(
+            !server.has_cached_publish(other),
+            "the closed document's entry is evicted"
+        );
+        assert!(
+            server.has_cached_publish(uri),
+            "the never-closed probe document keeps its cached publish — \
+             eviction acts only on the closed URI"
+        );
+        // And it still settles the same dirty verdict.
+        let settled = server.settled_diagnostics(uri).expect("probe doc settles");
+        assert_eq!(settled[0]["message"], "dirty");
     }
 
     /// A never-heard URI is unsettled (`None`) — no publish, no settlement.
