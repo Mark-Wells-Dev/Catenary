@@ -117,13 +117,17 @@ note = "no homebrew-core formula; reuses the Linux npm recipe (defaults/recipes.
 
 # CONFIRMED ABSENT (run 29067405830): elm-language-server has no homebrew-core
 # formula. Provisioned via its Linux npm recipe, reused unchanged (maintainer
-# ruling 2026-07-10). The elm compiler it shells out to is provisioned via the
-# brew `elm` formula by the workflow's diagnostic-dependencies step (the Linux
-# leg's pinned GitHub release binary ships no arm64 macOS asset). Cold-ELM_HOME
-# bootstrap inherits the same no-pre-warm ruling as Linux (misc 156).
+# ruling 2026-07-10). The elm COMPILER it shells out to is pinned + hash-verified
+# off the GitHub release by the workflow's diagnostic-dependencies step, to the
+# SAME 0.19.1 the Linux leg pins — NOT `brew install elm`, whose floating formula
+# poured 0.19.2 against the fixture's `elm-version: "0.19.1"` pin and produced a
+# deterministic silent-clean (bug 138). The 0.19.1 release DOES ship an arm64 mac
+# asset (`binary-for-mac-64-bit-ARM.gz`), so the pin is native (no Rosetta) and
+# the earlier "no arm64 asset" note was wrong. Cold-ELM_HOME bootstrap inherits
+# the same no-pre-warm ruling as Linux (misc 156).
 [provision.elm-language-server]
 kind = "linux-recipe"
-note = "no homebrew-core formula; reuses the Linux npm recipe. The elm compiler is provisioned via the brew `elm` formula (no arm64 GitHub-release asset)."
+note = "no homebrew-core formula; reuses the Linux npm recipe. The elm compiler is pinned + hash-verified off the GitHub release (0.19.1 arm64 mac asset), identical to the Linux leg — not the floating brew `elm` formula (bug 138)."
 
 [provision.docker-langserver]
 kind = "homebrew"

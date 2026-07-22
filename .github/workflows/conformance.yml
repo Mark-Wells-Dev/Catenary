@@ -278,6 +278,19 @@ jobs:
             *) echo "no extra diagnostic dependency for ${{ matrix.server }}" ;;
           esac
 
+      # Log the elm toolchain identity BEFORE the conformance test (bug 138),
+      # the Linux twin of the macOS step: an explicit `elm --version` on the
+      # pinned compiler the previous step placed on PATH, so both platforms'
+      # elm identity lands in the job log with no reconstruction. The two legs
+      # pin the identical 0.19.1, so these two lines are the in-job proof they
+      # verify the same toolchain.
+      - name: Log elm toolchain identity
+        if: matrix.server == 'elm-language-server'
+        run: |
+          set -euo pipefail
+          echo "elm compiler on PATH: $(command -v elm)"
+          echo "elm --version: $(elm --version)"
+
       - name: Install pinned server (${{ matrix.server }})
         if: matrix.source == 'recipe'
         run: |
@@ -531,27 +544,83 @@ jobs:
 
       # The server's own stderr is NOT bridge_stderr.log — it is piped into
       # the daemon and re-emitted as `lsp.stderr` events in the JSONL
-      # firehose (under the tempdir's cache base); the daemon's stderr goes
-      # to state/catenary/daemon.log. Bundle all three log families into ONE
-      # tarball first: run 7's direct upload got to "7 files" and then
-      # upload-artifact v4 hard-errored on the firehose instance dir
-      # `daemon:<uuid>` (colon is NTFS-invalid; bug 86) and aborted the
-      # whole artifact. A tarball is immune to any filename characters.
-      - name: Bundle triage logs (failure only)
+      # firehose (under the tempdir's cache base, in the per-server
+      # `servers/<server>@<root>.jsonl` shard); the daemon's stderr goes to
+      # state/catenary/daemon.log. Collect all three log families as LOOSE
+      # FILES into one triage dir (misc 213): GitHub already zips every
+      # artifact and `gh run download` transparently extracts that layer, so
+      # tar'ing first (the retired `triage.tgz`) was a second, redundant
+      # packing that only demanded `tar` on the reader — which the agent
+      # triage surface lacks. We mirror the relative subtree (no name
+      # collisions across bridges) and rewrite the one NTFS-invalid path
+      # component: the firehose instance dir `daemon:<uuid>` (colon is
+      # NTFS-invalid; bug 86) is copied to `daemon-<uuid>`, so the loose
+      # upload is portable without a tarball.
+      - name: Collect triage logs (failure only)
         if: failure()
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP/conformance" 2>/dev/null || exit 0
+          src="$RUNNER_TEMP/conformance"
+          dst="$RUNNER_TEMP/triage"
+          [ -d "$src" ] || exit 0
+          rm -rf "$dst"; mkdir -p "$dst"
+          cd "$src"
           find . \( -name 'daemon.log' -o -name '*.jsonl' \
             -o -name 'bridge_stderr*.log' \) -print0 \
-            | tar -czf "$RUNNER_TEMP/triage.tgz" --null -T -
+            | while IFS= read -r -d '' f; do
+                rel="${f#./}"
+                safe="$dst/${rel//:/-}"
+                mkdir -p "$(dirname "$safe")"
+                cp "$f" "$safe"
+              done
+
+      # Name the cause in the job log (bug 138): the LS's own stderr rides the
+      # firehose as `lsp.stderr` events (source="lsp.stderr", method="stderr",
+      # payload=<the line>), so on failure we pull the last ~50 of them from
+      # the collected JSONL and print them into the step output. The elm
+      # incident's signatures — "Cannot find executable", "ELM VERSION
+      # MISMATCH", non-JSON stderr, wasm path errors — then appear here
+      # directly, so the log itself names the cause without downloading the
+      # bundle. `jq` reads the `payload` field of each stderr record; a
+      # non-JSON stderr line was preserved verbatim as a JSON string payload
+      # (jsonl_sink parse_payload fallback), so it still prints.
+      - name: Summarize LS stderr (failure only)
+        if: failure()
+        run: |
+          set -euo pipefail
+          dst="$RUNNER_TEMP/triage"
+          [ -d "$dst" ] || { echo "no triage dir to summarize"; exit 0; }
+          # source == "lsp.stderr" selects the stderr events across every
+          # collected firehose shard; print each event's raw payload line.
+          # Tolerate a torn final line (a crash can leave the firehose tail
+          # unterminated) with `jq -R 'fromjson? // empty'`. Collect into one
+          # file first so the found-count survives the pipeline (a piped
+          # while-loop runs in a subshell).
+          all="$RUNNER_TEMP/lsp_stderr_all.txt"
+          : > "$all"
+          find "$dst" -name '*.jsonl' -print0 \
+            | while IFS= read -r -d '' log; do
+                jq -R 'fromjson? // empty
+                  | select(.source == "lsp.stderr")
+                  | .payload' -r "$log" 2>/dev/null >> "$all" || true
+              done
+          echo "── last 50 lsp.stderr lines (the LS's own stderr) ──"
+          if [ -s "$all" ]; then
+            tail -n 50 "$all"
+          else
+            echo "(no lsp.stderr events in the firehose — the server emitted"
+            echo " nothing on stderr, or died before the reader attached)"
+          fi
 
       - name: Upload triage logs (failure only)
         if: failure()
         uses: actions/upload-artifact@v7
         with:
+          # Loose files (misc 213): the artifact is the triage DIRECTORY, so
+          # `gh run download` yields directly readable daemon.log / *.jsonl /
+          # bridge_stderr*.log with no tar step on the reader.
           name: triage-${{ matrix.server }}
-          path: ${{ runner.temp }}/triage.tgz
+          path: ${{ runner.temp }}/triage
           if-no-files-found: ignore
           retention-days: 7
 
@@ -669,9 +738,20 @@ jobs:
 
       # Same contract as the Linux leg: a server whose diagnostics come from
       # an external tool gets it provisioned so the intentional diagnostic
-      # can publish — via brew, the macOS provisioning surface throughout
-      # (elm-language-server and ansible-language-server ride their Linux npm
-      # recipe, but their linter/compiler deps still come from brew).
+      # can publish. shellcheck / ansible-lint ride brew (the macOS
+      # provisioning surface), but the elm COMPILER is pinned + hash-verified
+      # off the GitHub release, NOT `brew install elm` (bug 138): brew's
+      # `elm` formula floats with homebrew-core HEAD, and the 07-15 runner
+      # image poured elm 0.19.2 against the fixture's `elm-version: "0.19.1"`
+      # pin — which elm-language-server silently publishes CLEAN on, sinking
+      # the intentional diagnostic. So we pin the compiler exactly as the
+      # Linux leg does, to the SAME 0.19.1, off the SAME release: fetch the
+      # arm64 mac asset, verify OUR pinned sha256 BEFORE unpacking, place the
+      # launcher on PATH. The pin is cross-verified against cashapp/
+      # hermit-packages (elm.hcl) — the same public-pinner discipline the
+      # Linux leg records — and 0.19.1 DOES ship an arm64 mac asset
+      # (`binary-for-mac-64-bit-ARM.gz`), so no Rosetta and no fixture bump:
+      # both legs verify the identical 0.19.1 compiler.
       # NO ELM_HOME pre-warm, same maintainer ruling as the Linux leg
       # (misc 156): the cold-bootstrap behavior is conformance's to see.
       - name: Provision diagnostic dependencies
@@ -679,10 +759,45 @@ jobs:
           set -euo pipefail
           case "${{ matrix.server }}" in
             bash-language-server)     brew install shellcheck ;;
-            elm-language-server)      brew install elm ;;
             ansible-language-server)  brew install ansible-lint ;;
+            elm-language-server)
+              # Pinned elm 0.19.1 arm64 mac compiler (bug 138). Same posture
+              # as the Linux leg's elm branch above: fetch, verify OUR pinned
+              # sha256, gunzip, place on PATH. The GitHub release ships no
+              # per-asset digest, so the hash is OURS, cross-verified against
+              # cashapp/hermit-packages elm.hcl.
+              rel="releases/download/0.19.1/binary-for-mac-64-bit-ARM.gz"
+              curl -sSL "https://github.com/elm/compiler/$rel" -o elm.gz
+              want="552c8300b55dafdf52073b095e7bc6afc1b2ea2"
+              want="${want}a600fbc7654bca8a241e38689"
+              actual="$(shasum -a 256 elm.gz | cut -d' ' -f1)"
+              if [ "$actual" != "$want" ]; then
+                echo "sha256 mismatch for elm compiler (macOS arm64)"
+                echo "  expected $want"
+                echo "  actual   $actual"
+                exit 1
+              fi
+              gunzip elm.gz
+              chmod +x elm
+              bindir="$HOME/.local/bin"; mkdir -p "$bindir"
+              mv elm "$bindir/elm"
+              echo "$bindir" >> "$GITHUB_PATH"
+              ;;
             *) echo "no extra diagnostic dependency for ${{ matrix.server }}" ;;
           esac
+
+      # Log the elm toolchain identity BEFORE the conformance test (bug 138):
+      # an explicit `elm --version` on the version the previous step just
+      # pinned onto PATH, so the next incident reads the compiler identity off
+      # the job log directly instead of reconstructing it from install lines.
+      # elm-language-server only — every other server's compiler/runtime
+      # identity is echoed by the `Echo provisioned binary` step below.
+      - name: Log elm toolchain identity
+        if: matrix.server == 'elm-language-server'
+        run: |
+          set -euo pipefail
+          echo "elm compiler on PATH: $(command -v elm)"
+          echo "elm --version: $(elm --version)"
 
       - name: Install server via Homebrew (${{ matrix.formula }})
         if: matrix.kind == 'homebrew'
@@ -816,24 +931,65 @@ jobs:
           mkdir -p "$TMPDIR"
           ./dist/conformance_harness conformance_selected_server --nocapture
 
-      # BSD find/tar accept the same -print0 / --null -T - contract as the
-      # GNU pair on the Linux leg; the tarball stays immune to any filename
-      # characters (the `daemon:<uuid>` colon, bug 86).
-      - name: Bundle triage logs (failure only)
+      # Loose-file triage collection (misc 213), the macOS twin of the Linux
+      # step: same three log families, same colon-sanitized subtree mirror
+      # (the `daemon:<uuid>` firehose dir, bug 86), uploaded as LOOSE FILES so
+      # `gh run download` yields directly readable logs with no tar step on
+      # the reader. BSD find accepts the same -print0 contract as the GNU pair;
+      # the `run:` shell is bash on the macos runner, so the read -d '' /
+      # ${rel//:/-} builtins hold.
+      - name: Collect triage logs (failure only)
         if: failure()
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP/conformance" 2>/dev/null || exit 0
+          src="$RUNNER_TEMP/conformance"
+          dst="$RUNNER_TEMP/triage"
+          [ -d "$src" ] || exit 0
+          rm -rf "$dst"; mkdir -p "$dst"
+          cd "$src"
           find . \( -name 'daemon.log' -o -name '*.jsonl' \
             -o -name 'bridge_stderr*.log' \) -print0 \
-            | tar -czf "$RUNNER_TEMP/triage.tgz" --null -T -
+            | while IFS= read -r -d '' f; do
+                rel="${f#./}"
+                safe="$dst/${rel//:/-}"
+                mkdir -p "$(dirname "$safe")"
+                cp "$f" "$safe"
+              done
+
+      # Name the cause in the job log (bug 138), the macOS twin of the Linux
+      # summarize step: pull the last ~50 `lsp.stderr` payload lines from the
+      # collected firehose JSONL so the elm signatures ("Cannot find
+      # executable", "ELM VERSION MISMATCH", non-JSON stderr, wasm path
+      # errors) surface directly in the step output.
+      - name: Summarize LS stderr (failure only)
+        if: failure()
+        run: |
+          set -euo pipefail
+          dst="$RUNNER_TEMP/triage"
+          [ -d "$dst" ] || { echo "no triage dir to summarize"; exit 0; }
+          all="$RUNNER_TEMP/lsp_stderr_all.txt"
+          : > "$all"
+          find "$dst" -name '*.jsonl' -print0 \
+            | while IFS= read -r -d '' log; do
+                jq -R 'fromjson? // empty
+                  | select(.source == "lsp.stderr")
+                  | .payload' -r "$log" 2>/dev/null >> "$all" || true
+              done
+          echo "── last 50 lsp.stderr lines (the LS's own stderr) ──"
+          if [ -s "$all" ]; then
+            tail -n 50 "$all"
+          else
+            echo "(no lsp.stderr events in the firehose — the server emitted"
+            echo " nothing on stderr, or died before the reader attached)"
+          fi
 
       - name: Upload triage logs (failure only)
         if: failure()
         uses: actions/upload-artifact@v7
         with:
+          # Loose files (misc 213): upload the triage DIRECTORY, not a tgz.
           name: triage-macos-${{ matrix.server }}
-          path: ${{ runner.temp }}/triage.tgz
+          path: ${{ runner.temp }}/triage
           if-no-files-found: ignore
           retention-days: 7
 
