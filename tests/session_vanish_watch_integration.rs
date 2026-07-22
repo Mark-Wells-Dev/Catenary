@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
-#![deny(clippy::unwrap_used, clippy::panic)]
-#![allow(
-    clippy::expect_used,
-    reason = "tests use expect for readable assertions"
-)]
-// The vanish watch's liveness probe reads `/proc/<pid>`, which exists only on
-// Linux (the macOS `kill(0)` + sysctl leg is a flagged follow-up — ticket 01
-// forbids `unsafe`/`libc` here). This whole test binary therefore compiles to
-// nothing off Linux, where it could prove nothing.
-#![cfg(target_os = "linux")]
 //! Integration test for the session vanish watch (ws49-01).
 //!
 //! MCP's connection lifecycle used to be the daemon's session handle: disconnect
@@ -28,6 +18,19 @@
 //! child process, declares that child as the session's host via a `pre-tool`
 //! hook, then KILLS the host — and asserts the session's worktree root is released
 //! on the next watch tick while the project root survives.
+
+#![deny(clippy::unwrap_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
+// The vanish watch's liveness probe reads `/proc/<pid>`, which exists only on
+// Linux (the macOS `kill(0)` + sysctl leg is a flagged follow-up — ticket 01
+// forbids `unsafe`/`libc` here). This whole test binary therefore compiles to
+// nothing off Linux, where it could prove nothing — but the crate doc above
+// stays ATTACHED even when this cfg elides the contents (doc-before-cfg,
+// probe-verified), so the macOS clippy leg's `missing_docs` stays satisfied.
+#![cfg(target_os = "linux")]
 
 mod common;
 
