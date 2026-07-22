@@ -32,6 +32,8 @@ pub mod health;
 pub mod hitstream;
 /// IPC server for host CLI hook integration (diagnostics and root sync).
 pub mod hook;
+/// Host-pid capture and the vanish watch (ws49-01).
+pub mod host_handle;
 /// Guided-install engine: consented, verified per-ecosystem installs (tui-rework 06).
 pub mod install;
 /// Shared standalone-linter core: spawn, parse, severity, routing (ws43-04).

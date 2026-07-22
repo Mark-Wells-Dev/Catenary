@@ -251,6 +251,90 @@ struct SessionMeta {
     roots: Vec<String>,
 }
 
+/// The session-handle registry: maps each `session_id` to its host's
+/// `(pid, start-time)` handle (ws49-01).
+///
+/// The replacement for MCP's connection lifecycle as the daemon's session handle.
+/// The hook CLI walks its ancestry to the host process (`claude` / `agy`) and
+/// declares that process's handle here on each hook payload; the daemon's vanish
+/// watch ([`SessionManager::spawn_ephemeral_root_reaper`]) probes each entry on
+/// the reaper cadence and tears down any session whose host has vanished
+/// ([`crate::host_handle::probe`]). Re-declarations refresh the entry — a resumed
+/// or restarted host overwrites its own stale handle.
+///
+/// Arc-backed so the vanish watch (a detached background task) and the dispatch
+/// path share one live map under a single mutex; cloning shares the state.
+#[cfg(unix)]
+#[derive(Clone, Default)]
+struct SessionHandles {
+    inner: Arc<std::sync::Mutex<HashMap<String, crate::host_handle::HostHandle>>>,
+}
+
+#[cfg(unix)]
+impl SessionHandles {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records (or refreshes) the host handle a session declared.
+    fn declare(&self, session_id: &str, handle: crate::host_handle::HostHandle) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_string(), handle);
+    }
+
+    /// Drops a session's handle (its `SessionEnd` / vanish-teardown edge).
+    /// Idempotent — removing an absent session is a no-op.
+    fn forget(&self, session_id: &str) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+    }
+
+    /// Snapshots every declared `(session_id, handle)` for the watch to probe.
+    ///
+    /// Returns an owned copy so the probe loop never holds the registry lock
+    /// across a filesystem read.
+    fn snapshot(&self) -> Vec<(String, crate::host_handle::HostHandle)> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(id, h)| (id.clone(), *h))
+            .collect()
+    }
+
+    /// The declared handle for one session, if any (snapshot/query surface).
+    #[cfg(test)]
+    fn get(&self, session_id: &str) -> Option<crate::host_handle::HostHandle> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .copied()
+    }
+}
+
+/// Reads a declared host handle out of a hook payload, if the hook carried one.
+///
+/// The hook CLI writes `host_pid` (and `host_start_time`, the pid-reuse guard)
+/// onto every session-bound request when its ancestry walk found the host
+/// ([`crate::host_handle::resolve_host_handle`]). An absent `host_pid` — an old
+/// hook, a hookless box, or a walk that could not name the host (the flagged
+/// Darwin subset) — yields `None`, and the session simply carries no handle
+/// (today's posture: no vanish watch for it).
+#[cfg(unix)]
+fn extract_host_handle(raw: &serde_json::Value) -> Option<crate::host_handle::HostHandle> {
+    let pid = u32::try_from(raw.get("host_pid")?.as_u64()?).ok()?;
+    let start_time = raw
+        .get("host_start_time")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    Some(crate::host_handle::HostHandle { pid, start_time })
+}
+
 /// Extracts a session's workspace roots from its hook payload.
 ///
 /// Host-agnostic: Antigravity sends `workspacePaths` (array), Claude Code sends
@@ -938,6 +1022,13 @@ struct HookDispatchContext {
     /// `Session` (per-session state) and `HookRouter` (turn counter,
     /// debounce).
     sessions: Arc<std::sync::Mutex<HashMap<String, SessionEntry>>>,
+    /// Session-handle registry keyed by `session_id`, each holding its host's
+    /// `(pid, start-time)` (ws49-01). The hook CLI declares the host it descends
+    /// from on every session-bound payload; the vanish watch on the reaper
+    /// cadence probes each entry and tears down a session whose host has
+    /// vanished. Replaces MCP's connection lifecycle as the daemon's session
+    /// handle.
+    session_handles: SessionHandles,
     /// Daemon's primary session — used as the template for creating
     /// per-session sessions via [`Session::new_for_daemon`].
     primary: Arc<Session>,
@@ -1640,9 +1731,28 @@ const EPHEMERAL_CONTRIBUTOR_PREFIX: &str = "ephemeral:";
 #[cfg(unix)]
 const EPHEMERAL_ROOT_IDLE_TIMEOUT: Duration = Duration::from_mins(7);
 
-/// How often the idle-expiry reaper wakes to sweep inactive ephemeral roots.
+/// How often the idle-expiry reaper wakes to sweep inactive ephemeral roots —
+/// and, riding the same tick, run the session vanish watch (ws49-01).
+///
+/// Tests inject a smaller interval via `CATENARY_SWEEP_INTERVAL_MS` (subprocess
+/// daemons, read by [`sweep_interval`]) so the vanish watch's kill→teardown edge
+/// fires in milliseconds instead of the production minute — the same
+/// across-the-process-boundary shrink `CATENARY_BIRTH_GRACE_SECS` uses.
 #[cfg(unix)]
 const EPHEMERAL_ROOT_SWEEP_INTERVAL: Duration = Duration::from_mins(1);
+
+/// Resolves the reaper sweep interval: `CATENARY_SWEEP_INTERVAL_MS` when set to a
+/// parseable, non-zero milliseconds value (integration tests inject a tiny
+/// interval across the process boundary; [`spawn_daemon`] children inherit it),
+/// otherwise [`EPHEMERAL_ROOT_SWEEP_INTERVAL`].
+#[cfg(unix)]
+fn sweep_interval() -> Duration {
+    std::env::var("CATENARY_SWEEP_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map_or(EPHEMERAL_ROOT_SWEEP_INTERVAL, Duration::from_millis)
+}
 
 /// Builds the `ephemeral:{canonical root path}` contributor key for a root.
 #[cfg(unix)]
@@ -3666,6 +3776,10 @@ impl SessionManager {
         restore_pinned_roots(&root_tracker, &session);
 
         let sessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        // The session-handle registry (ws49-01): shared between the dispatch path
+        // (which records declarations) and the vanish watch (which probes them);
+        // both hold the same Arc-backed map.
+        let session_handles = SessionHandles::new();
         // Shared with the root board so `state.json` can surface each ephemeral
         // root's idle-remaining figure; the hook context holds the same handle.
         let ephemeral_mounts = EphemeralMounts::new();
@@ -3732,6 +3846,7 @@ impl SessionManager {
 
         self.hook_ctx = Some(HookDispatchContext {
             sessions,
+            session_handles,
             primary: session,
             _logging: self.logging.clone(),
             root_tracker: Some(root_tracker),
@@ -3865,10 +3980,18 @@ impl SessionManager {
         // context to run `retire_root` (the MOUNT-only teardown discipline).
         let ctx = ctx.clone();
         rt.spawn(async move {
-            let mut ticker = tokio::time::interval(EPHEMERAL_ROOT_SWEEP_INTERVAL);
+            let mut ticker = tokio::time::interval(sweep_interval());
             ticker.tick().await; // consume the immediate first tick
             loop {
                 ticker.tick().await;
+
+                // Session vanish watch (ws49-01): probe every declared host handle
+                // and release the session of any host that died without SessionEnd
+                // (crash, kill, OOM). Rides this existing reaper cadence — no new
+                // timer (tuning delegated to measurement). Routes through the normal
+                // per-session release path (`release_session`), the same teardown a
+                // graceful SessionEnd runs.
+                watch_vanished_sessions(&ctx).await;
 
                 // Worktree kept countdown (root-ownership 04, the mount lifetime
                 // for KEPT worktrees): retire every worktree MOUNT whose countdown
@@ -4817,6 +4940,136 @@ async fn retire_root(ctx: &HookDispatchContext, tracker: &RootTracker, worktree:
     );
 }
 
+/// The normal per-session release path: drop every scrap of a session's daemon
+/// state and sync the reduced root set (ws49-01).
+///
+/// The single teardown the `session-end/cleanup` hook runs on a graceful end AND
+/// the vanish watch runs when a host dies without one — factored out so the two
+/// edges share one release path rather than a parallel teardown (the ticket's
+/// "tear its roots down through the NORMAL release path" ruling). It releases the
+/// editing guardrail, removes the session from the registry and the session-handle
+/// registry, sweeps this session's worktree roots (the leak backstop — the only
+/// session-keyed root contributor class), drops its in-memory watches / idle
+/// clocks / subagent board rows, and syncs the reduced union once. Disposing this
+/// session's CLEAN agent worktrees stays at the `SessionEnd` caller (a
+/// graceful-end concern — a vanished host's dirty worktrees are cross-session
+/// orphans surfaced at the next `SessionStart`, not disposed here).
+///
+/// Idempotent: every step no-ops on absent state, so it composes with a
+/// `SessionEnd` that already ran (or a double vanish tick). Routine lifecycle, so
+/// `debug!`/`info!` — never `warn!`/`error!` (a released session is expected
+/// convergence, not an actionable condition — `docs/src/tracing-conventions`).
+/// `trigger` names the firing edge (`"session ended"`, `"host vanished"`) for the
+/// teardown log.
+#[cfg(unix)]
+async fn release_session(ctx: &HookDispatchContext, session_id: &str, trigger: &str) {
+    // Release editing guardrail locks (idempotent if MCP disconnect already ran).
+    ctx.editing_guardrail.release_all(session_id);
+
+    // Remove the session from the session registry and the session-handle
+    // registry. Not a tombstone: a Claude resume re-creates the session entry via
+    // `get_or_create_router` and re-declares its handle on the next hook.
+    ctx.sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(session_id);
+    ctx.session_handles.forget(session_id);
+
+    // Best-effort removal from the board — mark the snapshot dirty so the next
+    // flush drops it. `last_seen` is the authoritative liveness signal (ticket
+    // 05a). The disconnect milestone records the end on the activity ring.
+    ctx.primary.record_milestone(
+        crate::state_snapshot::MilestoneKind::SessionDisconnect,
+        "session disconnected",
+        Some(session_id.to_string()),
+    );
+    ctx.primary.touch_snapshot();
+
+    if let Some(ref tracker) = ctx.root_tracker {
+        // Leak backstop (workstream 30, ticket 03): reclaim any of THIS session's
+        // worktree roots whose `WorktreeRemove` was missed. The `session_id` baked
+        // into the contributor key finds them without enumerating paths.
+        let prefix = format!("worktree:{session_id}:");
+        let removed = tracker.remove_contributors_with_prefix(&prefix);
+        // Drop this session's in-memory deletion watches too so they never outlive
+        // the roots; idempotent vs the reaper and the GC.
+        if let Some(ref watcher) = ctx.worktree_watcher {
+            watcher.unregister_with_prefix(&prefix);
+        }
+        // Drop this session's worktree idle clocks (misc 150) and subagent board
+        // entries (tui-rework 03).
+        ctx.worktree_mounts.remove_prefix(&prefix);
+        ctx.subagents.clear_session(session_id);
+        if removed > 0 {
+            info!(
+                source = Source::DaemonDispatch.as_str(),
+                session_id = %session_id,
+                count = removed,
+                trigger = trigger,
+                "released session: swept leaked worktree roots",
+            );
+        } else {
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                session_id = %session_id,
+                trigger = trigger,
+                "released session: no worktree roots to sweep",
+            );
+        }
+
+        // Sync the reduced root set — shuts down the released roots' per-root
+        // servers.
+        let global = tracker.global_roots_rich();
+        if let Err(e) = ctx.primary.sync_roots(global).await {
+            debug!(
+                source = Source::DaemonDispatch.as_str(),
+                "root sync after {trigger} release failed: {e}",
+            );
+        }
+
+        info!(
+            source = Source::DaemonDispatch.as_str(),
+            session_id = %session_id,
+            trigger = trigger,
+            "released session: roots cleaned up",
+        );
+    }
+}
+
+/// One vanish-watch pass: probe every declared host handle and release the
+/// session of any host that has vanished (ws49-01).
+///
+/// The daemon's replacement for MCP's disconnect edge. Runs on the reaper cadence
+/// ([`SessionManager::spawn_ephemeral_root_reaper`]). Snapshots the session-handle
+/// registry (so no filesystem probe holds its lock), then for each handle probes
+/// liveness via [`crate::host_handle::probe`]:
+///
+/// - [`crate::host_handle::Liveness::Alive`] — the host is present with the
+///   declared start-time; leave the session be.
+/// - [`crate::host_handle::Liveness::Vanished`] — the pid is gone, or alive with a
+///   *different* start-time (recycled). Release the session through the normal
+///   path ([`release_session`]) and record one `info!` firehose event — a
+///   vanished host is routine, NOT `warn!`/`error!` (the severity ruling).
+/// - [`crate::host_handle::Liveness::Unknown`] — no probe on this platform (the
+///   flagged Darwin subset); treat as present, never a false teardown.
+///
+/// Idempotent: a session already released (`SessionEnd` raced the watch) has no
+/// handle to probe, and `release_session` no-ops on absent state.
+#[cfg(unix)]
+async fn watch_vanished_sessions(ctx: &HookDispatchContext) {
+    for (session_id, handle) in ctx.session_handles.snapshot() {
+        if crate::host_handle::probe(handle) == crate::host_handle::Liveness::Vanished {
+            info!(
+                source = Source::DaemonDispatch.as_str(),
+                session_id = %session_id,
+                host_pid = handle.pid,
+                "host session vanished without SessionEnd — releasing its roots",
+            );
+            release_session(ctx, &session_id, "host vanished").await;
+        }
+    }
+}
+
 /// Build one `catenary worktree ls` row (misc 151) from a sidecar meta and the
 /// live mount/blocked map.
 ///
@@ -5501,6 +5754,24 @@ async fn handle_hook_dispatch(
         .unwrap_or("default")
         .to_string();
 
+    // ── Session handle declaration (ws49-01) ────────────────────────────
+    //
+    // The hook CLI walked its ancestry to the host process (`claude` / `agy`)
+    // and declared that process's `(pid, start-time)` on this payload. Record
+    // (or refresh) it in the session-handle registry so the vanish watch on the
+    // reaper cadence can detect a host that dies without SessionEnd (crash, kill,
+    // OOM) and tear its session down. Runs before every method short-circuit so
+    // every session-bound hook refreshes the handle; the `"default"` fallback (a
+    // hook with no session_id) carries no per-session identity to key on, so it
+    // is skipped. An absent `host_pid` (old hook, hookless box, or a walk that
+    // could not name the host — the flagged Darwin subset) declares nothing, and
+    // the session simply carries no handle (today's no-vanish-watch posture).
+    if session_id != "default"
+        && let Some(handle) = extract_host_handle(&raw)
+    {
+        ctx.session_handles.declare(&session_id, handle);
+    }
+
     // ── The one hook seam: cwd-activity resets every mount lifetime (root-ownership 04) ──
     //
     // Every hook carries cwd, so ANY hook resolving into a mounted root is
@@ -5573,76 +5844,11 @@ async fn handle_hook_dispatch(
     if method == "session-end/cleanup" {
         let scope_id = uuid::Uuid::new_v4().to_string();
 
-        // Release editing guardrail locks (idempotent if MCP
-        // disconnect already ran).
-        ctx.editing_guardrail.release_all(&session_id);
-
-        // Remove the session from the registry.
-        ctx.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&session_id);
-
-        // Best-effort removal from the board — mark the snapshot dirty so the
-        // next flush drops it. Not a tombstone: a Claude resume re-creates the
-        // entry via `get_or_create_router`, and Antigravity sends no
-        // `session-end` at all. `last_seen` is the authoritative liveness signal
-        // (ticket 05a). The disconnect milestone records the (best-effort) end on
-        // the activity ring (ticket 08).
-        ctx.primary.record_milestone(
-            crate::state_snapshot::MilestoneKind::SessionDisconnect,
-            "session disconnected",
-            Some(session_id.clone()),
-        );
-        ctx.primary.touch_snapshot();
-
-        if let Some(ref tracker) = ctx.root_tracker {
-            // Leak backstop (workstream 30, ticket 03): reclaim any of THIS
-            // session's worktree roots whose `WorktreeRemove` was missed at a
-            // graceful end. The `session_id` baked into the contributor key lets
-            // the sweep find them without enumerating paths. Routine cleanup, so
-            // debug/info — never warn (which reaches the user notification queue).
-            let prefix = format!("worktree:{session_id}:");
-            let removed = tracker.remove_contributors_with_prefix(&prefix);
-            // Drop this session's in-memory deletion watches too (ticket 05) so
-            // they never outlive the roots; idempotent vs the reaper and the GC.
-            if let Some(ref watcher) = ctx.worktree_watcher {
-                watcher.unregister_with_prefix(&prefix);
-            }
-            // Drop this session's worktree idle clocks too (misc 150).
-            ctx.worktree_mounts.remove_prefix(&prefix);
-            // Drop this session's subagent board entries too (tui-rework 03).
-            ctx.subagents.clear_session(&session_id);
-            if removed > 0 {
-                info!(
-                    source = Source::DaemonDispatch.as_str(),
-                    session_id = %session_id,
-                    count = removed,
-                    "session ended: swept leaked worktree roots",
-                );
-            } else {
-                debug!(
-                    source = Source::DaemonDispatch.as_str(),
-                    session_id = %session_id,
-                    "session ended: no worktree roots to sweep",
-                );
-            }
-
-            // Sync the reduced root set.
-            let global = tracker.global_roots_rich();
-            if let Err(e) = ctx.primary.sync_roots(global).await {
-                debug!(
-                    source = Source::DaemonDispatch.as_str(),
-                    "root sync after session end failed: {e}",
-                );
-            }
-
-            info!(
-                source = Source::DaemonDispatch.as_str(),
-                session_id = %session_id,
-                "session ended: roots cleaned up",
-            );
-        }
+        // The normal per-session release path (ws49-01): guardrail release,
+        // session + handle registry removal, worktree-root sweep, and the reduced
+        // root-set sync — shared with the vanish watch so a graceful end and a
+        // dead host converge through one teardown, never two.
+        release_session(&ctx, &session_id, "session ended").await;
 
         // misc 151 trigger 2: dispose this session's CLEAN agent worktrees — the
         // resume window is over. Dirty ones are kept (they become cross-session
@@ -11187,6 +11393,115 @@ mod tests {
         tracker.remove_contributor("mcp:20");
         assert_eq!(tracker.refcount(Path::new("/foo")), 0);
         assert!(tracker.global_roots().is_empty());
+    }
+
+    // ── Session-handle registry (ws49-01) ───────────────────────────────
+
+    #[test]
+    fn session_handles_declare_then_get() {
+        let handles = SessionHandles::new();
+        let handle = crate::host_handle::HostHandle {
+            pid: 4242,
+            start_time: 999,
+        };
+        handles.declare("sess-a", handle);
+        assert_eq!(handles.get("sess-a"), Some(handle));
+        assert_eq!(handles.get("sess-b"), None);
+    }
+
+    #[test]
+    fn session_handles_redeclaration_refreshes_the_entry() {
+        // A resumed/restarted host overwrites its own stale handle — the last
+        // declaration wins (a new pid AND a new start-time).
+        let handles = SessionHandles::new();
+        handles.declare(
+            "sess-a",
+            crate::host_handle::HostHandle {
+                pid: 100,
+                start_time: 1,
+            },
+        );
+        let refreshed = crate::host_handle::HostHandle {
+            pid: 200,
+            start_time: 2,
+        };
+        handles.declare("sess-a", refreshed);
+        assert_eq!(handles.get("sess-a"), Some(refreshed));
+    }
+
+    #[test]
+    fn session_handles_forget_is_idempotent() {
+        let handles = SessionHandles::new();
+        handles.declare(
+            "sess-a",
+            crate::host_handle::HostHandle {
+                pid: 7,
+                start_time: 7,
+            },
+        );
+        handles.forget("sess-a");
+        assert_eq!(handles.get("sess-a"), None);
+        // A second forget of an absent session is a no-op, never a panic.
+        handles.forget("sess-a");
+        assert_eq!(handles.get("sess-a"), None);
+    }
+
+    #[test]
+    fn session_handles_snapshot_carries_every_entry() {
+        let handles = SessionHandles::new();
+        handles.declare(
+            "sess-a",
+            crate::host_handle::HostHandle {
+                pid: 1,
+                start_time: 10,
+            },
+        );
+        handles.declare(
+            "sess-b",
+            crate::host_handle::HostHandle {
+                pid: 2,
+                start_time: 20,
+            },
+        );
+        let mut snap = handles.snapshot();
+        snap.sort_by(|(a, _), (b, _)| a.cmp(b));
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].0, "sess-a");
+        assert_eq!(snap[0].1.pid, 1);
+        assert_eq!(snap[0].1.start_time, 10);
+        assert_eq!(snap[1].0, "sess-b");
+        assert_eq!(snap[1].1.pid, 2);
+        assert_eq!(snap[1].1.start_time, 20);
+    }
+
+    #[test]
+    fn extract_host_handle_reads_pid_and_start_time() {
+        let raw = serde_json::json!({
+            "session_id": "sess-a",
+            "host_pid": 4242,
+            "host_start_time": 987_654_u64,
+        });
+        let handle = extract_host_handle(&raw).expect("handle present");
+        assert_eq!(handle.pid, 4242);
+        assert_eq!(handle.start_time, 987_654);
+    }
+
+    #[test]
+    fn extract_host_handle_absent_pid_is_none() {
+        // An old hook / hookless box / a walk that could not name the host sends
+        // no `host_pid` — no handle, no vanish watch (today's posture).
+        let raw = serde_json::json!({ "session_id": "sess-a" });
+        assert!(extract_host_handle(&raw).is_none());
+    }
+
+    #[test]
+    fn extract_host_handle_defaults_missing_start_time_to_zero() {
+        // A `host_pid` without a `host_start_time` still yields a handle — the
+        // probe falls back to bare pid presence (start_time 0 == unread).
+        let raw = serde_json::json!({ "host_pid": 4242 });
+        let handle = extract_host_handle(&raw).expect("handle present");
+        assert_eq!(handle.pid, 4242);
+        assert_eq!(handle.start_time, 0);
     }
 
     #[test]

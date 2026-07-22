@@ -402,6 +402,25 @@ fn format_stop_output(
     }
 }
 
+/// Declares this session's host handle onto a hook request, if the ancestry walk
+/// found the host (ws49-01).
+///
+/// The hook CLI runs as a descendant of the host session process (`claude` /
+/// `agy`); [`crate::host_handle::resolve_host_handle`] walks its ancestry to that
+/// process and returns its `(pid, start-time)`. When found, both are written onto
+/// the request so the daemon can record the session handle and run its vanish
+/// watch. When the walk cannot name the host (a non-Linux box — the flagged Darwin
+/// subset — or a chain with no `claude`/`agy` ancestor), nothing is added and the
+/// session simply carries no handle (today's no-vanish-watch posture). Rides the
+/// session-bound requests (`session-start/clear-editing`, `pre-tool/editing-state`)
+/// so the handle is declared at session start and refreshed on every tool call.
+fn declare_host_handle(request: &mut serde_json::Value) {
+    if let Some(handle) = crate::host_handle::resolve_host_handle() {
+        request["host_pid"] = serde_json::json!(handle.pid);
+        request["host_start_time"] = serde_json::json!(handle.start_time);
+    }
+}
+
 /// Extract session ID from hook payload.
 ///
 /// Each host uses a different field name for the session identifier.
@@ -645,6 +664,10 @@ pub fn run_session_start(format: HostFormat) {
     if let Some(sid) = session_id {
         request["session_id"] = serde_json::json!(sid);
     }
+    // Declare the host handle at session start (ws49-01) so the daemon records
+    // the session's `(pid, start-time)` from the first hook and can vanish-watch
+    // it even if no tool call ever follows.
+    declare_host_handle(&mut request);
     request["host_payload"] = prepare_host_payload(&hook_json);
 
     // Fire the clear-editing request for its daemon-side effect (resetting stale
@@ -1531,6 +1554,11 @@ fn enforce_editing_state(
     if !self_booked.is_empty() {
         request["self_booked"] = serde_json::json!(self_booked);
     }
+    // Refresh the host handle on every tool call (ws49-01): a re-declaration
+    // keeps the registry entry current (a resumed/restarted host overwrites its
+    // own stale handle), and the frequent PreToolUse cadence makes this the
+    // primary declaration path.
+    declare_host_handle(&mut request);
     request["host_payload"] = prepare_host_payload(hook_json);
 
     let lines = ipc_exchange(stream, &request);
