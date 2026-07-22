@@ -64,6 +64,16 @@
 //! `serves-diagnostics` is a maintainer act on the manifest data, citing a
 //! SERVES line from a real run — the misc-196 verify-then-declare bar.
 //!
+//! The single-file leg resolves its spawn program the way the daemon does —
+//! through [`catenary_cli::managed_home::resolve_spawn_program`] (override →
+//! managed home → PATH), never raw PATH (misc 216 ruling b; bug 138's
+//! verify-conditions-are-run-conditions). An auto-install row (tombi) whose
+//! binary lives only in a managed home drives its OWN install into its OWN
+//! isolated home first ([`provision_evidence_home`]), so it can produce
+//! single-file evidence instead of a "spawn failed" finding; a
+//! CI-provisioned-on-PATH row provisions nothing and rides the same call's PATH
+//! fallback.
+//!
 //! `isolate_env` discipline throughout: every daemon subprocess gets its own XDG
 //! bases under a per-test tempdir; only `PATH` is restored so the real pinned
 //! binary resolves.
@@ -585,6 +595,69 @@ fn read_editing_stop_wall_bounded(socket: &Path, file: &str, wall: Duration) -> 
     String::from_utf8(buf).context("diagnostics response was not UTF-8")
 }
 
+/// Builds the throwaway **user** config (`CATENARY_CONFIG`) a `case` needs, or
+/// `None` for a case that routes purely through the shipped defaults.
+///
+/// A non-default server (e.g. marksman, where lattice is the shipped markdown
+/// default) needs a one-line routing opt-in. It is written as a **user** config
+/// layered over the shipped defaults, NOT a project `.catenary.toml`: a project
+/// config's `[lsp.language.*]` `servers` list drives classification only, not
+/// server dispatch, so it never reroutes the language (tui-rework 13 class E —
+/// the marksman fixture routed to the shipped default `lattice` locally, which
+/// merely *masked* the miss because lattice was present; in CI, where only
+/// marksman is provisioned, the same non-reroute surfaced as `[no LSP
+/// coverage]`). The user layer's array-replace merge swaps the binding to
+/// `[server]` deterministically in both environments while leaving every shipped
+/// server *definition* (its command/args) intact.
+///
+/// An `auto-install` row (misc 212) additionally carries a `root_markers` for
+/// the bound language so `SessionStart` auto-install detection nominates its
+/// blessed server for the marker-bearing fixture root (the shipped binding
+/// carries none), and the `[servers] auto_install = true` opt-in itself —
+/// user-config only, exactly the layer a real user enables it in. `prefer_managed`
+/// stays at its `true` default so the landed managed install resolves for spawn.
+///
+/// Shared by the rooted leg (`run_conformance`) and the single-file evidence
+/// leg's own auto-install kick (misc 216 ruling b), so the two legs can never
+/// drift on the config that drives detection.
+fn build_conformance_user_config(case: &Case) -> Option<String> {
+    let binding = case.binding?;
+    let auto_install = matches!(case.provision, ConformanceProvision::AutoInstall);
+    let mut config = format!(
+        "# Conformance routing opt-in (tui-rework 13): `{server}` is defined in\n\
+         # the shipped config but the shipped defaults do not route to it. A\n\
+         # user writes this binding in their user config to opt in; the shipped\n\
+         # server definition (command/args) is unchanged.\n\
+         [lsp.language.{language}]\nservers = [\"{server}\"]\n",
+        server = binding.server,
+        language = binding.language,
+    );
+    // A language absent from the shipped defaults also needs its classification
+    // defined, exactly as a user of that server would.
+    if let Some(classify) = binding.classify {
+        use std::fmt::Write as _;
+        if !classify.extensions.is_empty() {
+            let exts = toml_string_array(classify.extensions);
+            let _ = writeln!(config, "extensions = {exts}");
+        }
+        if !classify.filenames.is_empty() {
+            let names = toml_string_array(classify.filenames);
+            let _ = writeln!(config, "filenames = {names}");
+        }
+    }
+    if auto_install {
+        use std::fmt::Write as _;
+        let marker = toml_string_array(&[AUTO_INSTALL_MARKER]);
+        let _ = writeln!(config, "root_markers = {marker}");
+        let _ = writeln!(
+            config,
+            "\n# misc 212: dogfood the daemon's auto-install loop.\n\
+             [servers]\nauto_install = true"
+        );
+    }
+    Some(config)
+}
+
 /// Runs the full conformance lifecycle for `case`.
 ///
 /// `require` distinguishes the two gating modes: `false` (local sentinel) skips
@@ -636,61 +709,12 @@ fn run_conformance(case: &Case, require: bool) -> Result<()> {
     }
     copy_dir(&src, root.path())?;
 
-    // A non-default server (e.g. marksman, where lattice is the shipped markdown
-    // default) needs a one-line routing opt-in. It is written as a **user** config
-    // (`CATENARY_CONFIG`) layered over the shipped defaults, NOT a project
-    // `.catenary.toml`: a project config's `[lsp.language.*]` `servers` list drives
-    // classification only, not server dispatch, so it never reroutes the language
-    // (tui-rework 13 class E — the marksman fixture routed to the shipped default
-    // `lattice` locally, which merely *masked* the miss because lattice was present;
-    // in CI, where only marksman is provisioned, the same non-reroute surfaced as
-    // `[no LSP coverage]`). The user layer's array-replace merge swaps the binding
-    // to `[server]` deterministically in both environments while leaving every
-    // shipped server *definition* (its command/args) intact. The file lives only in
-    // this throwaway tempdir, so the shipped default every real root gets is
+    // The throwaway user config a non-default / auto-install case needs
+    // (`build_conformance_user_config` carries the full rationale). Written only
+    // into this throwaway tempdir, so the shipped default every real root gets is
     // untouched.
-    let user_config = match case.binding {
-        Some(binding) => {
-            let mut config = format!(
-                "# Conformance routing opt-in (tui-rework 13): `{server}` is defined in\n\
-                 # the shipped config but the shipped defaults do not route to it. A\n\
-                 # user writes this binding in their user config to opt in; the shipped\n\
-                 # server definition (command/args) is unchanged.\n\
-                 [lsp.language.{language}]\nservers = [\"{server}\"]\n",
-                server = binding.server,
-                language = binding.language,
-            );
-            // A language absent from the shipped defaults also needs its
-            // classification defined, exactly as a user of that server would.
-            if let Some(classify) = binding.classify {
-                use std::fmt::Write as _;
-                if !classify.extensions.is_empty() {
-                    let exts = toml_string_array(classify.extensions);
-                    let _ = writeln!(config, "extensions = {exts}");
-                }
-                if !classify.filenames.is_empty() {
-                    let names = toml_string_array(classify.filenames);
-                    let _ = writeln!(config, "filenames = {names}");
-                }
-            }
-            // An `auto-install` row (misc 212) needs two more things in this
-            // throwaway USER config: a `root_markers` for the bound language so
-            // SessionStart auto-install detection nominates its blessed server
-            // for the fixture root (the shipped binding carries none), and the
-            // `[servers] auto_install = true` opt-in itself — user-config only,
-            // exactly the layer a real user enables it in. `prefer_managed`
-            // stays at its `true` default so the landed managed install resolves
-            // for spawn.
-            if auto_install {
-                use std::fmt::Write as _;
-                let marker = toml_string_array(&[AUTO_INSTALL_MARKER]);
-                let _ = writeln!(config, "root_markers = {marker}");
-                let _ = writeln!(
-                    config,
-                    "\n# misc 212: dogfood the daemon's auto-install loop.\n\
-                     [servers]\nauto_install = true"
-                );
-            }
+    let user_config = match build_conformance_user_config(case) {
+        Some(config) => {
             let config_path = root.path().join("conformance-user-config.toml");
             std::fs::write(&config_path, config).context("write conformance routing override")?;
             Some(config_path)
@@ -813,7 +837,10 @@ fn run_conformance(case: &Case, require: bool) -> Result<()> {
     // The second mode (brackets 06): the SAME server, probed under the
     // rootless single-file tier. Evidence only — a miss is a finding, never a
     // suite failure, so nothing here asserts.
-    eprintln!("{}", single_file_evidence(case).render(case.server));
+    eprintln!(
+        "{}",
+        single_file_evidence(case, require).render(case.server)
+    );
     Ok(())
 }
 
@@ -931,6 +958,105 @@ fn run_auto_install_provision(bridge: &BridgeProcess, root: &Path, server: &str)
         }
         std::thread::sleep(AUTO_INSTALL_POLL);
     }
+}
+
+/// The managed home the single-file evidence leg resolves its spawn against,
+/// plus whatever must outlive that resolution (misc 216 ruling b).
+///
+/// For an auto-install row the install lands under a daemon's own isolated,
+/// `TempDir`-backed state home; that `BridgeProcess` is held here so the
+/// installed binary is not torn down before the probe spawns it. For every
+/// other row the home is a bare, empty isolated tempdir (no bridge), so
+/// resolution falls through to PATH — the CI-provisioned binary — exactly as the
+/// daemon's own PATH fallback would.
+struct EvidenceHome {
+    home: catenary_cli::managed_home::ManagedHome,
+    /// The daemon whose isolated state home holds the auto-installed binary;
+    /// `None` for a PATH-resolved row. Held only for its `Drop` lifetime — the
+    /// `TempDir` inside it owns the managed binary the probe spawns.
+    _bridge: Option<BridgeProcess>,
+    /// The isolated fixture root the auto-install kick detected (auto-install
+    /// row), or the empty tempdir backing a PATH-resolved home. Held so the
+    /// home's backing directory outlives the probe; kept on panic for triage.
+    _dir: common::KeepOnPanic,
+}
+
+/// Provisions the managed home the single-file evidence leg resolves its spawn
+/// against, driving its OWN auto-install kick into its OWN isolated home for an
+/// auto-install row (misc 216 ruling b).
+///
+/// The evidence probe must spawn the way the daemon spawns (bug 138's
+/// verify-conditions-are-run-conditions principle): the daemon's
+/// `spawn_single_file` resolves through `resolve_spawn_program` (override →
+/// managed home → PATH), so a server provisioned only into a managed home
+/// (auto-install rows — tombi today) is served in production but was reported
+/// "spawn failed" by the old PATH-naive probe.
+///
+/// Ruling (b) keeps the legs independent: rather than reuse the rooted case's
+/// managed home (torn down after its settle), the evidence leg drives a second,
+/// self-contained install into its own isolated home — a fresh fixture root with
+/// the marker + `auto_install` user config, a fresh daemon, and the same real
+/// `catenary hook session-start` dogfood (`run_auto_install_provision`). It pays
+/// a second install; in exchange the probe universe is wholly its own.
+///
+/// A non-auto-install row provisions nothing: its binary is CI-provisioned on
+/// PATH, and an empty isolated home makes `resolve_spawn_program` fall through to
+/// that PATH exactly as the daemon does.
+fn provision_evidence_home(case: &Case, require: bool) -> Result<EvidenceHome> {
+    let auto_install = matches!(case.provision, ConformanceProvision::AutoInstall);
+    // Only an auto-install row needs (and can drive) a managed install. A local
+    // sentinel run (`!require`) never provisions — an auto-install row has no
+    // binary locally, so the rooted leg would already have failed before here;
+    // guarding on `require` keeps the second install a CI-only cost.
+    let dir = common::KeepOnPanic::new(tempfile::tempdir().context("create evidence root")?);
+    if !auto_install || !require {
+        return Ok(EvidenceHome {
+            home: catenary_cli::managed_home::ManagedHome::at(
+                dir.path().join("catenary").join("servers"),
+            ),
+            _bridge: None,
+            _dir: dir,
+        });
+    }
+
+    // Independent isolated fixture root for the evidence leg's own kick: copy the
+    // fixture, drop the auto-install detection marker, and write the same
+    // throwaway user config the rooted leg uses so detection nominates the
+    // blessed server (`build_conformance_user_config`, shared to prevent drift).
+    let src = fixture_dir(case);
+    if !src.is_dir() {
+        bail!("fixture `{}` missing at {}", case.fixture, src.display());
+    }
+    copy_dir(&src, dir.path())?;
+    std::fs::write(dir.path().join(AUTO_INSTALL_MARKER), b"")
+        .context("write evidence auto-install detection marker")?;
+    let user_config = match build_conformance_user_config(case) {
+        Some(config) => {
+            let config_path = dir.path().join("conformance-user-config.toml");
+            std::fs::write(&config_path, config).context("write evidence routing override")?;
+            Some(config_path)
+        }
+        None => None,
+    };
+
+    let mut bridge =
+        BridgeProcess::spawn_conformance_with_config(dir.path(), user_config.as_deref())?;
+    bridge.initialize()?;
+    // The same dogfooded self-healing path the rooted leg drives — detect →
+    // guided-install engine → managed home — but into THIS leg's own isolated
+    // state home, torn down only when `bridge` drops at the end of the probe.
+    run_auto_install_provision(&bridge, dir.path(), case.server)?;
+
+    let home = catenary_cli::managed_home::ManagedHome::at(
+        common::xdg_data_home(bridge.state_home())
+            .join("catenary")
+            .join("servers"),
+    );
+    Ok(EvidenceHome {
+        home,
+        _bridge: Some(bridge),
+        _dir: dir,
+    })
 }
 
 /// One auto-install record read from a daemon `state.json` snapshot — the fields
@@ -1187,13 +1313,25 @@ async fn observe_null_root_diagnostics(
 /// is copied ALONE into a bare, markerless tempdir (the stray shape the tier
 /// exists for: a lone script or config outside any project), so a server that
 /// needs its project context to diagnose misses here honestly. The server
-/// definition is the shipped `[lsp.server.*]` default — no user layer — and
-/// the spawn is PATH-resolved exactly like the [`on_path`] gate that admitted
-/// this run (the key IS the executable, misc 162). The spawned child inherits
-/// this process's cwd, the same posture a production rootless spawn has with
-/// the daemon's cwd: unrelated to the stray file, so evidence rides the
-/// opened URI only.
-fn single_file_evidence(case: &Case) -> SingleFileEvidence {
+/// definition is the shipped `[lsp.server.*]` default — no user layer.
+///
+/// The spawn program is resolved the way the daemon resolves it (misc 216
+/// ruling b, bug 138's verify-conditions-are-run-conditions): through
+/// [`catenary_cli::managed_home::resolve_spawn_program`] (override → managed
+/// home → PATH), the exact call `spawn_single_file` makes. For an auto-install
+/// row this leg first drives its OWN install into its OWN isolated managed home
+/// (`provision_evidence_home`), so a server provisioned only into a managed home
+/// (tombi today) resolves to that binary instead of failing "spawn failed: No
+/// such file or directory." A CI-provisioned-on-PATH row provisions nothing and
+/// resolves through the same call's PATH fallback. The spawned child inherits
+/// this process's cwd, the same posture a production rootless spawn has with the
+/// daemon's cwd: unrelated to the stray file, so evidence rides the opened URI
+/// only.
+///
+/// `require` mirrors [`run_conformance`]'s gating: only a CI selection
+/// (`require`) of an auto-install row pays the leg's second install; a local
+/// sentinel resolves through PATH.
+fn single_file_evidence(case: &Case, require: bool) -> SingleFileEvidence {
     use catenary_cli::logging::LoggingServer;
     use catenary_cli::lsp::{LspClient, Scope};
 
@@ -1206,6 +1344,27 @@ fn single_file_evidence(case: &Case) -> SingleFileEvidence {
             case.server
         ));
     };
+
+    // Resolve the spawn program the way the daemon's `spawn_single_file` does —
+    // against this leg's OWN isolated managed home, populated by its own
+    // auto-install kick for an auto-install row (misc 216 ruling b). Held for
+    // the whole probe so an auto-installed managed binary is not torn down before
+    // the spawn below.
+    let evidence_home = match provision_evidence_home(case, require) {
+        Ok(home) => home,
+        Err(e) => {
+            return SingleFileEvidence::ProbeIncomplete(format!(
+                "provision evidence managed home: {e:#}"
+            ));
+        }
+    };
+    let program = catenary_cli::managed_home::resolve_spawn_program(
+        &evidence_home.home,
+        &catenary_cli::recipes::active_manifest(),
+        case.server,
+        def,
+        config.prefer_managed(),
+    );
 
     let dir = match tempfile::tempdir() {
         Ok(dir) => dir,
@@ -1242,7 +1401,7 @@ fn single_file_evidence(case: &Case) -> SingleFileEvidence {
     rt.block_on(async {
         let args: Vec<&str> = def.args.iter().map(String::as_str).collect();
         let mut client = match LspClient::spawn(
-            def.program(case.server),
+            &program,
             &args,
             // The fixture dir name IS the language key throughout CASES
             // (`rust`, `shellscript`, `dockerfile`, …), so it is the
