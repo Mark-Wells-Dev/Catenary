@@ -538,7 +538,7 @@ mod tests {
 
     use crate::config::{LanguageConfig, ServerBinding, ServerDef};
     use crate::install::{CommandOutcome, InstallCommand};
-    use crate::recipes::{BlessedEntry, Ecosystem, VerificationTier};
+    use crate::recipes::{BlessedEntry, ConformanceProvision, Ecosystem, VerificationTier};
 
     use super::*;
 
@@ -580,6 +580,7 @@ mod tests {
             hash: None,
             note: None,
             conformance: true,
+            provision: ConformanceProvision::Bash,
             co_install: Vec::new(),
             artifact: std::collections::BTreeMap::new(),
             runtime: None,

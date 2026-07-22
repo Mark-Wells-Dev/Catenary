@@ -14,9 +14,16 @@ on, plus the fields that source's install step needs:
 
     recipe:    { server, source, ecosystem, package, version, tier, hash,
                  co_install, artifact_url, artifact_hash, artifact_bin,
-                 runtime_name, runtime_version }
+                 runtime_name, runtime_version, provision }
     provision: { server, source, kind, version, component, apt, repo, asset,
                  sha256, bin, git, rev, url, gem, runtime_name, runtime_version }
+
+The recipe entry's `provision` (misc 212) is `bash` (default — the workflow's
+hand-rolled per-ecosystem install) or `auto-install` (the workflow SKIPS its
+bash install and the harness dogfoods the daemon's auto-install loop). The
+"Install pinned server" step gates on `matrix.provision != 'auto-install'`. A
+provision-class stanza is always bash (a provision cannot dogfood the loop until
+recipes grow toolchain pins), so its entry carries no `provision` field.
 
 The `artifact_*` fields (lsm 04) are the recipe's pinned linux-x86_64 official
 upstream release binary — url + SRI hash + launcher path — resolved from its
@@ -44,10 +51,15 @@ REFERENCED (not re-pinned) so a Linux pin bump cannot diverge — the generator
 resolves the reference against recipes.toml / ci-provision.toml when emitting the
 entry:
 
-    macos homebrew:        { server, source, kind, formula, bin }
+    macos homebrew:        { server, source, kind, formula, bin, provision }
     macos linux-recipe:    { server, source, kind, ecosystem, package, version,
-                             hash, co_install }
-    macos linux-provision: { server, source, kind, prov_kind, git, rev, version }
+                             hash, co_install, provision }
+    macos linux-provision: { server, source, kind, prov_kind, git, rev, version,
+                             provision }
+
+Every macOS entry carries `provision` too (misc 212): brew and linux-provision
+jobs are always `bash`, a `linux-recipe` inherits the referenced recipe's flag
+so an `auto-install` flip reaches BOTH platform legs with no second flag.
 
 Before emitting, the macOS file is validated as a PARTITION of the
 Linux-conformed set: every server the Linux matrix conforms appears exactly once
@@ -141,6 +153,11 @@ def recipe_entry(name: str, recipe: dict) -> dict:
         "artifact_bin": artifact.get("bin", ""),
         "runtime_name": runtime.get("name", ""),
         "runtime_version": runtime.get("version", ""),
+        # misc 212: how the conform job obtains this server. `bash` (default) runs
+        # the hand-rolled per-ecosystem install below; `auto-install` SKIPS it and
+        # the harness dogfoods the daemon's auto-install loop. The workflow's
+        # "Install pinned server" step gates on `matrix.provision != 'auto-install'`.
+        "provision": recipe.get("provision", "bash"),
     }
 
 
@@ -207,6 +224,11 @@ def macos_entry(
         "prov_kind": "",
         "git": "",
         "rev": "",
+        # misc 212: a brew/linux-provision job always bash-installs; a
+        # linux-recipe reference inherits the referenced Linux recipe's provision
+        # (an `auto-install` recipe dogfoods the loop on macOS too — the leg flips
+        # BOTH platforms). Resolved from the Linux source below where it applies.
+        "provision": "bash",
     }
     if kind == MACOS_HOMEBREW:
         entry["formula"] = prov.get("formula", "")
@@ -221,6 +243,10 @@ def macos_entry(
         # through here too (misc 195) — a Linux pin bump reaches macOS with no
         # second pin to maintain.
         entry["co_install"] = co_installs(recipe)
+        # The referenced recipe's provisioning rides along (misc 212): tombi's
+        # `auto-install` flip reaches the macOS leg with no second flag to
+        # maintain, so the conform-macos install step skips its bash install too.
+        entry["provision"] = recipe.get("provision", "bash")
     elif kind == MACOS_LINUX_PROVISION:
         source = provisions[name]
         entry["prov_kind"] = source.get("kind", "")

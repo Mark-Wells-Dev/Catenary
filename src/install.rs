@@ -1665,6 +1665,7 @@ mod tests {
             hash: None,
             note: None,
             conformance: true,
+            provision: crate::recipes::ConformanceProvision::Bash,
             co_install: Vec::new(),
             artifact: std::collections::BTreeMap::new(),
             runtime: None,

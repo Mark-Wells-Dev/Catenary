@@ -217,6 +217,60 @@ impl VerificationTier {
     }
 }
 
+/// How the conformance CI matrix obtains this server before running the harness
+/// (misc 212).
+///
+/// The default, [`Self::Bash`], is the workflow's hand-rolled per-ecosystem
+/// install (fetch tarball → verify sha512 → `npm install -g --ignore-scripts`,
+/// and the cargo/pip/go twins) — a deliberate *mirror* of the engine's
+/// discipline that never runs the engine. [`Self::AutoInstall`] instead
+/// **dogfoods** Catenary's own self-healing loop: the workflow skips the bash
+/// install, and the harness lets the daemon's `SessionStart` auto-install
+/// ([`crate::auto_install`]) detect the missing blessed server, fetch and verify
+/// it through the exact guided-install engine, land it in the managed home, and
+/// pre-warm — the full path a user with `[servers] auto_install = true` gets.
+///
+/// A trust ratchet (misc 212 lead ruling): the mechanism is generic, but only a
+/// proven-out row flips to `auto-install`; the rest keep `bash` until the loop
+/// conforms on a dispatch run. Recipe-only for now — provision-class rows
+/// (brew/cargo/pip/go/gem/apt) cannot dogfood the loop until recipes grow
+/// toolchain pins, so they are always [`Self::Bash`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConformanceProvision {
+    /// The workflow's hand-rolled per-ecosystem bash install (the pre-212
+    /// default, still the norm for every non-flipped row).
+    #[default]
+    Bash,
+    /// Dogfood the daemon's `SessionStart` auto-install loop: the workflow skips
+    /// the bash install and the harness drives the full detect → engine →
+    /// managed-home → pre-warm path (misc 212).
+    AutoInstall,
+}
+
+impl ConformanceProvision {
+    /// The kebab-case token used in TOML and matrix jobs (`bash` /
+    /// `auto-install`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::AutoInstall => "auto-install",
+        }
+    }
+}
+
+/// serde `skip_serializing_if` for [`InstallRecipe::provision`] — omit it from
+/// TOML when it holds its `bash` default, so only an explicit
+/// `provision = "auto-install"` flip is written. Signature per serde's contract.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires an fn(&T) -> bool"
+)]
+const fn is_bash_provision(p: &ConformanceProvision) -> bool {
+    matches!(p, ConformanceProvision::Bash)
+}
+
 /// A runtime dependency beyond the ecosystem's own host toolchain.
 ///
 /// The npm/cargo/pip/go ecosystems each imply their own host (node, cargo,
@@ -368,6 +422,17 @@ pub struct InstallRecipe {
     /// exempt one must NOT. The `note` records the honest reason (tui-rework 13).
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub conformance: bool,
+    /// How the conformance CI matrix obtains this server (misc 212).
+    ///
+    /// Defaults to [`ConformanceProvision::Bash`] — the workflow's hand-rolled
+    /// per-ecosystem install. A row flipped to `provision = "auto-install"`
+    /// instead dogfoods Catenary's own `SessionStart` auto-install loop: the
+    /// workflow skips its bash install and the harness drives the full
+    /// detect → engine → managed-home → pre-warm path. A trust ratchet — only a
+    /// proven-out row flips (misc 212 lead ruling). A plain scalar key, so it
+    /// sits among the top-level scalars before the composite fields.
+    #[serde(default, skip_serializing_if = "is_bash_provision")]
+    pub provision: ConformanceProvision,
     /// Pinned npm packages co-installed alongside this server because it needs
     /// them resolvable at runtime but does not bundle them (misc 195). Empty for
     /// the common case. TOML serializes a `Vec<struct>` as `[[recipe.<name>.co_install]]`
@@ -502,6 +567,17 @@ pub fn validate_recipes(recipes: &BTreeMap<String, InstallRecipe>) -> Vec<String
             errors.push(format!(
                 "recipe `{name}` is `conformance = false` but carries no `note` — an \
                  exemption must state honestly why the shipped lifecycle cannot conform it"
+            ));
+        }
+        // misc 212: an `auto-install` row dogfoods the loop *inside* the
+        // conformance run, so it must actually conform. A `conformance = false`
+        // recipe never reaches the matrix, making the flag dead — refuse the
+        // contradiction rather than ship a flag that does nothing.
+        if matches!(recipe.provision, ConformanceProvision::AutoInstall) && !recipe.conformance {
+            errors.push(format!(
+                "recipe `{name}` is `provision = auto-install` but `conformance = false` — the \
+                 auto-install dogfood runs inside the conformance harness, so an exempt recipe \
+                 can never exercise it"
             ));
         }
         for co in &recipe.co_install {
@@ -917,6 +993,27 @@ pub fn conformance_exempt_names(
         .filter(|(_, p)| !p.pending && !p.conformance)
         .map(|(name, _)| name.clone());
     from_recipes.chain(from_provisions).collect()
+}
+
+/// How the conformance matrix provisions `name` (misc 212).
+///
+/// A recipe flipped to `provision = "auto-install"` dogfoods the daemon's
+/// auto-install loop; every other recipe, and every provision-class server (a
+/// provision stanza never dogfoods the loop — it is always
+/// [`ConformanceProvision::Bash`]), takes the workflow's hand-rolled install.
+///
+/// The single source of truth the matrix↔`CASES` drift guard reads: the harness
+/// `Case`'s provisioning must equal this, and `tools/conformance_matrix.py`
+/// emits the same token on each matrix entry, so the workflow's skip-the-bash
+/// gate, the matrix, and the harness leg agree by construction.
+#[must_use]
+pub fn conformance_provision_for(
+    name: &str,
+    recipes: &BTreeMap<String, InstallRecipe>,
+) -> ConformanceProvision {
+    recipes
+        .get(name)
+        .map_or(ConformanceProvision::Bash, |r| r.provision)
 }
 
 /// The publisher discipline of a blessed server — the bug-82 taxonomy, made data
@@ -3129,6 +3226,83 @@ bin = "bin/srv"
                 .iter()
                 .any(|e| e.contains("conformance = false") && e.contains("note")),
             "a noteless conformance exemption must fail validation: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn provision_defaults_bash_and_flips_to_auto_install(/* misc 212 */) {
+        // Omitting `provision` defaults to the hand-rolled bash install; an
+        // author opts a row into the dogfooded auto-install loop explicitly.
+        let recipes = parse_recipes(
+            "[recipe.bashy]\necosystem = \"go\"\npackage = \"x\"\n\
+             version = \"v1.0.0\"\ntier = \"go-checksumdb\"\n\
+             [recipe.dogfood]\necosystem = \"npm\"\npackage = \"y\"\n\
+             version = \"1.0.0\"\ntier = \"npm-tarball-sha512\"\n\
+             hash = \"sha512-AA==\"\nprovision = \"auto-install\"\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            recipes["bashy"].provision,
+            ConformanceProvision::Bash,
+            "omitted provision defaults to bash",
+        );
+        assert_eq!(
+            recipes["dogfood"].provision,
+            ConformanceProvision::AutoInstall,
+            "an explicit flip parses to auto-install",
+        );
+        assert_eq!(
+            conformance_provision_for("dogfood", &recipes),
+            ConformanceProvision::AutoInstall,
+            "the accessor reads the recipe's flag",
+        );
+        assert_eq!(
+            conformance_provision_for("absent", &recipes),
+            ConformanceProvision::Bash,
+            "an unknown server provisions via bash by default",
+        );
+    }
+
+    #[test]
+    fn tombi_is_the_first_dogfooded_auto_install_row(/* misc 212 */) {
+        // The trust-ratchet invariant: exactly tombi flips in this change; every
+        // other shipped recipe keeps its bash install until the loop proves out.
+        let recipes = default_recipes().expect("recipes parse");
+        assert_eq!(
+            conformance_provision_for("tombi", &recipes),
+            ConformanceProvision::AutoInstall,
+            "tombi dogfoods the auto-install loop (misc 212)",
+        );
+        let flipped: Vec<&String> = recipes
+            .iter()
+            .filter(|(_, r)| matches!(r.provision, ConformanceProvision::AutoInstall))
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            flipped,
+            vec![&"tombi".to_string()],
+            "only tombi is flipped — the ratchet holds: {flipped:?}",
+        );
+    }
+
+    #[test]
+    fn auto_install_on_an_exempt_recipe_fails_validation(/* misc 212 */) {
+        // The flag dogfoods the loop inside the conformance run, so a
+        // `conformance = false` recipe could never exercise it — the
+        // contradiction is a validation error, not silent dead data.
+        let recipes = parse_recipes(
+            "[recipe.demo]\necosystem = \"npm\"\npackage = \"x\"\n\
+             version = \"1.0.0\"\ntier = \"npm-tarball-sha512\"\nhash = \"sha512-AA==\"\n\
+             conformance = false\nnote = \"exempt for a real reason\"\n\
+             provision = \"auto-install\"\n",
+        )
+        .expect("parses");
+        let errors = validate_recipes(&recipes);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("auto-install") && e.contains("conformance = false")),
+            "an exempt recipe flagged auto-install must fail validation: {errors:?}"
         );
     }
 

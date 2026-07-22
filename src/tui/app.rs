@@ -1299,7 +1299,7 @@ mod tests {
 
     use crate::health::{Finding, Severity};
     use crate::install::{CommandOutcome, InstallCommand};
-    use crate::recipes::{BlessedEntry, Ecosystem, VerificationTier};
+    use crate::recipes::{BlessedEntry, ConformanceProvision, Ecosystem, VerificationTier};
 
     /// A runner that records each program it is asked to run and always succeeds.
     struct RecordingRunner(Rc<RefCell<Vec<String>>>);
@@ -1334,6 +1334,7 @@ mod tests {
             hash: None,
             note: None,
             conformance: true,
+            provision: ConformanceProvision::Bash,
             co_install: Vec::new(),
             artifact: BTreeMap::new(),
             runtime: None,

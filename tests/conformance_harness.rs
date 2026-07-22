@@ -76,6 +76,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use catenary_cli::recipes::ConformanceProvision;
 use common::{BridgeProcess, mockls_lsp_arg};
 use serde_json::json;
 
@@ -112,6 +113,24 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 /// to offer the editing loop anyway. Slow-start cases (jdtls) ride
 /// [`CONFORMANCE_WALL_BOUND`] instead — JVM spin-up dominates their clock.
 const SINGLE_FILE_EVIDENCE_BOUND: Duration = Duration::from_mins(1);
+
+/// The bounded wait for a `provision = auto-install` row's background install to
+/// land in the managed home (misc 212).
+///
+/// The daemon's `SessionStart` auto-install is a background task that fetches
+/// the pinned npm tarball, verifies its sha512, and runs `npm install
+/// --ignore-scripts` (which also resolves the platform binary via
+/// optionalDependencies). That is a network fetch plus an install, so the bound
+/// is generous — but finite and honest: on expiry the case FAILS naming the
+/// record's last state (installing / failed + reason), never a generic settle
+/// timeout, so a stuck or failed install reads as itself. Fetch-class npm
+/// installs land in seconds; this is orders of magnitude of headroom for a
+/// contended CI runner without ever masking a wedged install.
+const AUTO_INSTALL_WAIT_BOUND: Duration = Duration::from_mins(4);
+
+/// Poll cadence for the auto-install landing wait — cheap re-reads of the daemon
+/// snapshot between checks (the harness's wall-bound idiom).
+const AUTO_INSTALL_POLL: Duration = Duration::from_millis(250);
 
 /// Env var the conformance CI matrix sets to select the one server a job runs.
 const CONFORMANCE_ENV: &str = "CATENARY_CONFORMANCE";
@@ -183,6 +202,13 @@ struct Case {
     /// `true` for a cold-start-heavy server (jdtls): use
     /// [`CONFORMANCE_WALL_BOUND_SLOW`] instead of [`CONFORMANCE_WALL_BOUND`].
     slow_start: bool,
+    /// How the CI matrix obtains this server (misc 212): the workflow's
+    /// hand-rolled bash install ([`ConformanceProvision::Bash`], the default for
+    /// every row) or Catenary's own auto-install loop
+    /// ([`ConformanceProvision::AutoInstall`], the dogfooded path — currently
+    /// only `tombi`). This MUST equal the recipe's `provision` flag; the
+    /// [`matrix_and_cases_have_no_drift`] guard pins the two together.
+    provision: ConformanceProvision,
 }
 
 /// Every conformance case. The dogfooded fleet (marked) has a sentinel `#[test]`
@@ -220,6 +246,7 @@ const CASES: &[Case] = &[
         file: "src/main.rs",
         binding: None,
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     Case {
         server: "taplo",
@@ -227,6 +254,7 @@ const CASES: &[Case] = &[
         file: "broken.toml",
         binding: None,
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     Case {
         server: "lattice",
@@ -234,6 +262,7 @@ const CASES: &[Case] = &[
         file: "broken.md",
         binding: None,
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     Case {
         server: "yaml-language-server",
@@ -241,6 +270,7 @@ const CASES: &[Case] = &[
         file: "broken.yaml",
         binding: None,
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     Case {
         server: "vscode-json-language-server",
@@ -248,6 +278,7 @@ const CASES: &[Case] = &[
         file: "broken.json",
         binding: None,
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     Case {
         server: "bash-language-server",
@@ -255,6 +286,7 @@ const CASES: &[Case] = &[
         file: "broken.sh",
         binding: None,
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     // ── npm / cargo / pip / go tranche (CI matrix) ─────────────────────
     Case {
@@ -263,6 +295,7 @@ const CASES: &[Case] = &[
         file: "broken.py",
         binding: None,
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     Case {
         server: "vscode-css-language-server",
@@ -270,6 +303,7 @@ const CASES: &[Case] = &[
         file: "broken.css",
         binding: None,
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     Case {
         server: "intelephense",
@@ -277,6 +311,7 @@ const CASES: &[Case] = &[
         file: "broken.php",
         binding: None,
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     Case {
         server: "svelteserver",
@@ -284,6 +319,7 @@ const CASES: &[Case] = &[
         file: "src/Broken.svelte",
         binding: None,
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     Case {
         server: "elm-language-server",
@@ -291,6 +327,7 @@ const CASES: &[Case] = &[
         file: "src/Main.elm",
         binding: None,
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     Case {
         server: "docker-langserver",
@@ -298,6 +335,7 @@ const CASES: &[Case] = &[
         file: "Dockerfile",
         binding: None,
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     Case {
         server: "gopls",
@@ -305,6 +343,7 @@ const CASES: &[Case] = &[
         file: "main.go",
         binding: None,
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     Case {
         server: "lua-language-server",
@@ -312,6 +351,7 @@ const CASES: &[Case] = &[
         file: "broken.lua",
         binding: None,
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     // ── tui-rework 10 coverage (CI matrix via ci-provision.toml) ───────
     Case {
@@ -320,6 +360,7 @@ const CASES: &[Case] = &[
         file: "broken.c",
         binding: None,
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     Case {
         server: "jdtls",
@@ -327,6 +368,7 @@ const CASES: &[Case] = &[
         file: "Broken.java",
         binding: None,
         slow_start: true,
+        provision: ConformanceProvision::Bash,
     },
     Case {
         server: "ruby-lsp",
@@ -334,6 +376,7 @@ const CASES: &[Case] = &[
         file: "broken.rb",
         binding: None,
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     // ── tui-rework 13 coverage (matrix/CASES drift closed) ─────────────
     // vscode-html-language-server publishes through its default embedded-CSS
@@ -349,6 +392,7 @@ const CASES: &[Case] = &[
         file: "broken.html",
         binding: None,
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     Case {
         server: "ansible-language-server",
@@ -363,6 +407,7 @@ const CASES: &[Case] = &[
             }),
         }),
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     // ── diagnostics-debt 05: ts-ls un-exempted behind the declared-constant gate ──
     // typescript-language-server was `conformance = false` (tui-rework 13) because
@@ -378,6 +423,7 @@ const CASES: &[Case] = &[
         file: "broken.ts",
         binding: None,
         slow_start: false,
+        provision: ConformanceProvision::Bash,
     },
     // ── misc 207: TOML succession (dual-bless-and-watch, PULL lane) ────
     // tombi reuses the `toml` fixture (same broken.toml that taplo's case
@@ -385,6 +431,17 @@ const CASES: &[Case] = &[
     // it, an ambient taplo would satisfy the intentional-diagnostic assertion
     // on taplo's work, laundering the exact evidence this job exists to
     // produce.
+    //
+    // misc 212: tombi is the FIRST dogfooded auto-install row
+    // (`ConformanceProvision::AutoInstall`). The CI matrix skips its bash npm
+    // install and the harness instead drives the daemon's SessionStart
+    // auto-install loop (`run_auto_install_provision`), which detects the
+    // missing blessed tombi, installs it through the guided-install engine into
+    // the managed home, and pre-warms — the full self-healing path a user with
+    // `[servers] auto_install = true` gets. Detection is marker-gated, so the
+    // auto-install leg supplies a `root_markers` binding and drops the matching
+    // marker file into the copied fixture root (the shipped `[lsp.language.toml]`
+    // carries no root marker of its own).
     Case {
         server: "tombi",
         fixture: "toml",
@@ -395,8 +452,23 @@ const CASES: &[Case] = &[
             classify: None,
         }),
         slow_start: false,
+        provision: ConformanceProvision::AutoInstall,
     },
 ];
+
+/// The root-marker filename the auto-install leg drops into a `provision =
+/// auto-install` case's fixture root (misc 212).
+///
+/// `SessionStart` auto-install detection is marker-gated: it nominates a
+/// language's blessed servers only for a root carrying one of that language's
+/// `root_markers` (the same `dir_has_marker` predicate that binds roots to
+/// languages everywhere else). The shipped `[lsp.language.toml]` carries no
+/// root marker, so the auto-install leg's throwaway user config adds
+/// `root_markers = [AUTO_INSTALL_MARKER]` and the harness writes an (empty)
+/// marker file of this name into the copied fixture root, so the fixture reads
+/// as a TOML project and tombi is nominated. `tombi.toml` is tombi's own
+/// config-file convention, so the marker is honest, not synthetic.
+const AUTO_INSTALL_MARKER: &str = "tombi.toml";
 
 /// Finds `case` by server name.
 fn lookup(server: &str) -> Option<&'static Case> {
@@ -518,10 +590,26 @@ fn read_editing_stop_wall_bounded(socket: &Path, file: &str, wall: Duration) -> 
 /// `require` distinguishes the two gating modes: `false` (local sentinel) skips
 /// cleanly when the probe binary is absent; `true` (CI-matrix selection) treats
 /// an absent binary as a failed install and errors.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the conformance lifecycle is one linear orchestration (gate → copy \
+              → route → optional auto-install dogfood → settle → assert → shutdown \
+              → single-file evidence); splitting it would scatter the shared root/\
+              config/bridge state across helpers for no readability gain"
+)]
 fn run_conformance(case: &Case, require: bool) -> Result<()> {
+    let auto_install = matches!(case.provision, ConformanceProvision::AutoInstall);
+
     // The server key IS the executable (misc 162), so its presence on PATH is
     // exactly the local-run gate — no separate probe binary.
-    if !on_path(case.server) {
+    //
+    // An `auto-install` row (misc 212) is the exception: its binary is NEVER on
+    // PATH by design — the daemon's SessionStart auto-install loop installs it
+    // into the managed home, off PATH. So the PATH gate does not apply; the
+    // provisioning proof is the loop landing the managed-home executable
+    // (`run_auto_install_provision` below waits for exactly that). A local run
+    // without the binary is the mechanism-under-test itself, not a skip.
+    if !auto_install && !on_path(case.server) {
         if require {
             bail!(
                 "conformance for `{}` was selected via {CONFORMANCE_ENV} but its binary \
@@ -585,12 +673,40 @@ fn run_conformance(case: &Case, require: bool) -> Result<()> {
                     let _ = writeln!(config, "filenames = {names}");
                 }
             }
+            // An `auto-install` row (misc 212) needs two more things in this
+            // throwaway USER config: a `root_markers` for the bound language so
+            // SessionStart auto-install detection nominates its blessed server
+            // for the fixture root (the shipped binding carries none), and the
+            // `[servers] auto_install = true` opt-in itself — user-config only,
+            // exactly the layer a real user enables it in. `prefer_managed`
+            // stays at its `true` default so the landed managed install resolves
+            // for spawn.
+            if auto_install {
+                use std::fmt::Write as _;
+                let marker = toml_string_array(&[AUTO_INSTALL_MARKER]);
+                let _ = writeln!(config, "root_markers = {marker}");
+                let _ = writeln!(
+                    config,
+                    "\n# misc 212: dogfood the daemon's auto-install loop.\n\
+                     [servers]\nauto_install = true"
+                );
+            }
             let config_path = root.path().join("conformance-user-config.toml");
             std::fs::write(&config_path, config).context("write conformance routing override")?;
             Some(config_path)
         }
         None => None,
     };
+
+    // The auto-install detection marker (misc 212): drop the (empty) marker file
+    // into the copied fixture root so `dir_has_marker` reads it as a project of
+    // the bound language and the SessionStart detection nominates the missing
+    // blessed server. Written beside the fixture in the throwaway copy — the
+    // checked-in fixture is untouched.
+    if auto_install {
+        std::fs::write(root.path().join(AUTO_INSTALL_MARKER), b"")
+            .context("write auto-install detection marker")?;
+    }
 
     let file = root.path().join(case.file);
 
@@ -602,6 +718,19 @@ fn run_conformance(case: &Case, require: bool) -> Result<()> {
     let mut bridge =
         BridgeProcess::spawn_conformance_with_config(root.path(), user_config.as_deref())?;
     bridge.initialize()?;
+
+    // The dogfood leg (misc 212): with the daemon up under `[servers]
+    // auto_install = true`, drive a real SessionStart hook naming the fixture
+    // root, then wait — bounded, honestly — for the daemon's background
+    // auto-install loop to land the blessed server in the managed home. This is
+    // the whole self-healing path a user gets: detect → guided-install engine →
+    // managed home → pre-warm. It runs BEFORE the conformance settle so the
+    // server the settle spawns IS the auto-installed managed one. Only the CI
+    // selection path (`require`) waits — a local sentinel with no binary already
+    // returned above.
+    if auto_install && require {
+        run_auto_install_provision(&bridge, root.path(), case.server)?;
+    }
 
     // ONE cold settle-and-pull, wall-bounded — no retries, by landing-gate
     // ruling (tui-rework 07, 2026-07-07): a retry that absorbs a
@@ -686,6 +815,162 @@ fn run_conformance(case: &Case, require: bool) -> Result<()> {
     // suite failure, so nothing here asserts.
     eprintln!("{}", single_file_evidence(case).render(case.server));
     Ok(())
+}
+
+/// Drive the daemon's `SessionStart` auto-install loop for `server` and wait,
+/// bounded, for its background install to land in the managed home (misc 212).
+///
+/// The full dogfooded self-healing path: a real `catenary hook session-start`
+/// (naming `root` as the session's cwd) reaches the daemon, which — under the
+/// throwaway config's `[servers] auto_install = true` — detects the missing
+/// blessed `server` from the fixture's root marker, kicks a background install
+/// through the exact guided-install engine, and pre-warms on landing. The
+/// install lands under this test's ISOLATED data dir
+/// (`<state_home>/data/catenary/servers/…`, since `isolate_env` points
+/// `CATENARY_DATA_DIR` there and `ManagedHome::resolve` roots at `data_dir`), so
+/// it can never escape to the operator's real `~/.local/share`.
+///
+/// The wait polls the daemon snapshot's `auto_installs` records — the same
+/// doctor/TUI-visible surface `record_auto_install` writes and `catenary doctor`
+/// reads. On the bounded expiry it FAILS naming the record's last state
+/// (`installing` — still running past the bound; `failed` + the recorded reason;
+/// or no record at all — the kick never fired, e.g. a marker/detection miss), so
+/// a stuck or failed install is diagnosed as itself, never a generic timeout.
+/// A landed record is then cross-checked against the managed-home executable
+/// invariant the engine itself confirms, so a "success" the spawn path cannot
+/// resolve still fails here.
+fn run_auto_install_provision(bridge: &BridgeProcess, root: &Path, server: &str) -> Result<()> {
+    // Fire a real SessionStart hook at the daemon: the payload's top-level `cwd`
+    // becomes `host_payload.cwd`, which the daemon reads as the session's root
+    // (`extract_session_roots`) — the marker-gated detection seam. `source` is
+    // an inject source (not `resume`) so the dispatch runs the auto-install leg.
+    let root_str = root.to_str().context("fixture root is not UTF-8")?;
+    let payload = json!({
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+        "session_id": "conformance-auto-install",
+        "cwd": root_str,
+    });
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_catenary"));
+    common::isolate_env(&mut cmd, bridge.state_home());
+    // Restore the inherited PATH the daemon's install command needs (npm/node);
+    // isolate_env clears it, exactly as spawn_conformance restores it.
+    cmd.env("PATH", std::env::var_os("PATH").unwrap_or_default());
+    cmd.args(["hook", "session-start", "--format=claude"]);
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().context("spawn `hook session-start`")?;
+    {
+        let mut stdin = child.stdin.take().context("session-start hook stdin")?;
+        writeln!(stdin, "{payload}").context("write session-start payload")?;
+    }
+    let out = child
+        .wait_with_output()
+        .context("wait for session-start hook")?;
+    // The hook is fire-and-forget for the kick; its own exit is not the signal
+    // (the install runs in the background daemon). Surface its output only if the
+    // wait below fails, so a red names the whole picture.
+    let hook_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let hook_stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    // Wait, bounded, for the landed record on the daemon snapshot.
+    let snapshot = common::xdg_runtime_dir(bridge.state_home())
+        .join("catenary")
+        .join("state.json");
+    let deadline = Instant::now() + AUTO_INSTALL_WAIT_BOUND;
+    loop {
+        let record = read_auto_install_record(&snapshot, server);
+        if let Some(record) = &record
+            && record.status == "installed"
+        {
+            // The engine confirms `<home>/<server>/<version>/bin/<server>`; re-check
+            // it here so a "success" the spawn path cannot resolve still fails.
+            let home = catenary_cli::managed_home::ManagedHome::at(
+                common::xdg_data_home(bridge.state_home())
+                    .join("catenary")
+                    .join("servers"),
+            );
+            if home
+                .pinned_executable(server, &record.version, server)
+                .is_some()
+            {
+                eprintln!(
+                    "conformance: `{server}` auto-installed {} into the managed home \
+                     (misc 212 dogfood)",
+                    record.version
+                );
+                return Ok(());
+            }
+            bail!(
+                "auto-install of `{server}` recorded `installed` at {} but the managed-home \
+                 executable did not resolve — the install landed no runnable binary\n\
+                 hook stdout:\n{hook_stdout}\nhook stderr:\n{hook_stderr}",
+                record.version,
+            );
+        }
+        if Instant::now() >= deadline {
+            let state = record.map_or_else(
+                || {
+                    "no auto_install record — the SessionStart kick never fired (detection \
+                     found nothing missing: check the root marker and the auto_install opt-in)"
+                        .to_string()
+                },
+                |r| match r.status.as_str() {
+                    "failed" => format!(
+                        "the install FAILED: {}",
+                        r.detail.as_deref().unwrap_or("no reason recorded")
+                    ),
+                    other => format!("still `{other}` at the bound (install did not finish)"),
+                },
+            );
+            bail!(
+                "auto-install of `{server}` did not land within {AUTO_INSTALL_WAIT_BOUND:?} — \
+                 {state}\nhook stdout:\n{hook_stdout}\nhook stderr:\n{hook_stderr}"
+            );
+        }
+        std::thread::sleep(AUTO_INSTALL_POLL);
+    }
+}
+
+/// One auto-install record read from a daemon `state.json` snapshot — the fields
+/// the landing wait consults (misc 212). Mirrors
+/// `catenary_cli::state_snapshot::AutoInstallEntry`, read permissively so a torn
+/// or partial snapshot never panics the wait.
+struct AutoInstallRecord {
+    version: String,
+    status: String,
+    detail: Option<String>,
+}
+
+/// Read the latest `auto_installs` record for `server` from the snapshot at
+/// `path`, or `None` when the file is absent/torn or carries no record for the
+/// server yet. Parses the raw JSON (the same shape the `auto_install` unit
+/// tests poll) so a newly-added snapshot field never breaks the read.
+fn read_auto_install_record(path: &Path, server: &str) -> Option<AutoInstallRecord> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("auto_installs")?
+        .as_array()?
+        .iter()
+        .find(|e| e.get("server").and_then(serde_json::Value::as_str) == Some(server))
+        .map(|e| AutoInstallRecord {
+            version: e
+                .get("version")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            status: e
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            detail: e
+                .get("detail")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        })
 }
 
 /// Whether the receipt carries a verified-contract-violation fault note
@@ -1720,13 +2005,20 @@ fn every_case_fixture_exists() {
 /// `Case` could name a server the matrix never installs). The guard reads the
 /// SAME two data files `tools/conformance_matrix.py` reads and applies the SAME
 /// filter, so the two agree by construction.
+///
+/// It also pins the **provisioning kind** (misc 212): each `Case`'s `provision`
+/// must equal its recipe's `provision` flag. That single equality ties the three
+/// surfaces the auto-install dogfood spans — the recipe data, the matrix job the
+/// generator emits (whose `provision` field gates the workflow's skip-the-bash
+/// step), and the harness's auto-install leg — so a row flipped in one place but
+/// not the others fails `make check` rather than mis-provisioning in CI.
 #[test]
 fn matrix_and_cases_have_no_drift() {
     use std::collections::BTreeSet;
 
     use catenary_cli::recipes::{
-        conformance_exempt_names, conformed_server_names, default_provisioning, default_recipes,
-        provisioning_pending,
+        conformance_exempt_names, conformance_provision_for, conformed_server_names,
+        default_provisioning, default_recipes, provisioning_pending,
     };
 
     let recipes = default_recipes().expect("default recipes parse");
@@ -1779,6 +2071,31 @@ fn matrix_and_cases_have_no_drift() {
         orphan_case.is_empty(),
         "matrix↔CASES drift: these `CASES` name servers with no non-exempt, \
          non-pending recipe/provision, so the matrix never installs them: {orphan_case:?}"
+    );
+
+    // The provisioning-kind pin (misc 212): each Case's `provision` equals its
+    // recipe's flag. The matrix generator emits that same flag on the job, which
+    // gates the workflow's bash-install skip, so this one equality keeps the
+    // recipe data, the CI matrix, and the harness auto-install leg from drifting.
+    let provision_drift: Vec<String> = CASES
+        .iter()
+        .filter_map(|c| {
+            let recipe_provision = conformance_provision_for(c.server, &recipes);
+            (c.provision != recipe_provision).then(|| {
+                format!(
+                    "`{}` (Case: {}, recipe: {})",
+                    c.server,
+                    c.provision.as_str(),
+                    recipe_provision.as_str(),
+                )
+            })
+        })
+        .collect();
+    assert!(
+        provision_drift.is_empty(),
+        "matrix↔CASES provision drift (misc 212): a Case's `provision` disagrees with its \
+         recipe's `provision` flag — flip both, or neither, so the workflow's skip-the-bash \
+         gate, the matrix, and the harness leg stay aligned: {provision_drift:?}"
     );
 }
 

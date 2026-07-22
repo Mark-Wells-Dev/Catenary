@@ -221,6 +221,16 @@ note = "diagnostics depend on ansible-lint being present; a conformance job prov
 # `make refresh-recipes ONLY=tombi` (the registry dist.integrity, never
 # hand-computed). BLESSED (misc 207 bless branch, 2026-07-21): `[discipline.tombi]`
 # and `[blessed.tombi.*]` rows landed; conformance workflow dispatched on green.
+#
+# provision = "auto-install" (misc 212): tombi is the FIRST row to dogfood
+# Catenary's own self-healing install loop in CI instead of the workflow's
+# hand-rolled npm bash step. The conform job skips its bash install and the
+# harness lets the daemon's SessionStart auto-install detect the missing blessed
+# tombi, fetch+verify it through the guided-install engine, land it in the
+# managed home, and pre-warm — the exact path a user with `[servers]
+# auto_install = true` gets. A trust ratchet: only this proven-out row flips;
+# every other recipe keeps its bash install until the loop conforms on a
+# dispatch run (misc 212 lead ruling).
 [recipe.tombi]
 ecosystem = "npm"
 package = "tombi"
@@ -229,6 +239,7 @@ hash = "sha512-Kquct5cmTCZWFmrXOE0fu8PMV1foDKHoCjxqVe1E17YgDueJmBkibGYlsGGb23Fc4
 tier = "npm-tarball-sha512"
 draft = true
 note = "resolves its platform binary via optionalDependencies at install time within the pinned version; the engine's --ignore-scripts install caps the residual to non-executing dep code."
+provision = "auto-install"
 
 # ── cargo tranche ────────────────────────────────────────────────────
 # cargo is the implied host toolchain; `--locked` + index checksums verify.

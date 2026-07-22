@@ -1954,7 +1954,8 @@ mod tests {
         use crate::install::{BlessedRecipe, InstallPlan};
         use crate::managed_home::ManagedHome;
         use crate::recipes::{
-            BlessedEntry, BlessedManifest, Ecosystem, InstallRecipe, VerificationTier,
+            BlessedEntry, BlessedManifest, ConformanceProvision, Ecosystem, InstallRecipe,
+            VerificationTier,
         };
 
         let recipe = InstallRecipe {
@@ -1966,6 +1967,7 @@ mod tests {
             hash: None,
             note: None,
             conformance: true,
+            provision: ConformanceProvision::Bash,
             co_install: Vec::new(),
             artifact: std::collections::BTreeMap::new(),
             runtime: None,

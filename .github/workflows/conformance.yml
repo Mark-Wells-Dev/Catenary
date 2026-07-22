@@ -291,8 +291,15 @@ jobs:
           echo "elm compiler on PATH: $(command -v elm)"
           echo "elm --version: $(elm --version)"
 
+      # SKIPPED for an `auto-install` row (misc 212): that row dogfoods the
+      # daemon's own self-healing install loop instead of this hand-rolled bash
+      # mirror. The harness lets the SessionStart auto-install detect the
+      # missing blessed server, fetch+verify it through the guided-install
+      # engine, land it in the managed home, and pre-warm — so provisioning it
+      # here would mask the exact loop the row exists to conform. A trust
+      # ratchet: only proven-out rows flip; every `bash` row still installs.
       - name: Install pinned server (${{ matrix.server }})
-        if: matrix.source == 'recipe'
+        if: matrix.source == 'recipe' && matrix.provision != 'auto-install'
         run: |
           set -euo pipefail
           # lsm 04: a pinned official upstream release binary for this platform
@@ -388,8 +395,13 @@ jobs:
       # image's ambient global (an unpinned tsserver behind a pinned gate — the
       # exact thing the pin doctrine forbids). `matrix.co_install` is a JSON
       # list; `[]` for every other recipe makes the loop a no-op.
+      # Also skipped for an `auto-install` row (misc 212): the engine installs a
+      # recipe's co-installs with the server (misc 195), so the loop covers them
+      # too — a hand-rolled co-install here would mask that.
       - name: Install pinned co-installs (${{ matrix.server }})
-        if: matrix.source == 'recipe' && toJson(matrix.co_install) != '[]'
+        if: >-
+          matrix.source == 'recipe' && matrix.provision != 'auto-install'
+          && toJson(matrix.co_install) != '[]'
         env:
           CO_INSTALL: ${{ toJson(matrix.co_install) }}
         run: |
@@ -827,8 +839,13 @@ jobs:
       # macos-latest image ships node. The generator resolved the package /
       # version / hash from the referenced Linux recipe, so a Linux pin bump
       # flows through here with no second pin to maintain.
+      #
+      # SKIPPED for an `auto-install` row (misc 212): the referenced recipe's
+      # provisioning rides along, so tombi's flip reaches the macOS leg too —
+      # the harness dogfoods the daemon's auto-install loop instead of this bash
+      # install, on BOTH platforms.
       - name: Install pinned server (linux-recipe ${{ matrix.server }})
-        if: matrix.kind == 'linux-recipe'
+        if: matrix.kind == 'linux-recipe' && matrix.provision != 'auto-install'
         run: |
           set -euo pipefail
           case "${{ matrix.ecosystem }}" in
@@ -861,8 +878,12 @@ jobs:
       # deterministically at initialize ("Could not find a valid TypeScript
       # installation") until this step pinned tsserver. Same BSD-base64 handling
       # as the server install above (no -w0; strip newlines). `[]` → no-op.
+      # Also skipped for an `auto-install` row (misc 212): the engine
+      # co-installs them with the server, so the loop covers the macOS leg too.
       - name: Install pinned co-installs (linux-recipe ${{ matrix.server }})
-        if: matrix.kind == 'linux-recipe' && toJson(matrix.co_install) != '[]'
+        if: >-
+          matrix.kind == 'linux-recipe' && matrix.provision != 'auto-install'
+          && toJson(matrix.co_install) != '[]'
         env:
           CO_INSTALL: ${{ toJson(matrix.co_install) }}
         run: |
@@ -906,7 +927,13 @@ jobs:
       # The resolved binary and its version land in the step log, so a
       # provisioning miss reads as a provisioning miss. `brew list` runs only
       # for a homebrew job (a neutral-kind job has no formula).
+      #
+      # SKIPPED for an `auto-install` row (misc 212): nothing is on PATH yet —
+      # the binary lands in the managed home only when the harness kicks the
+      # loop, so a `which` here would fail a not-yet-installed server. The
+      # harness's own wait-for-land + managed-home check is that row's proof.
       - name: Echo provisioned binary
+        if: matrix.provision != 'auto-install'
         run: |
           set -euo pipefail
           which "${{ matrix.server }}"
