@@ -783,9 +783,14 @@ impl HookRouter {
     /// `has_undelivered`-keyed block armed unconditionally on the first Stop. The
     /// gate now asks the single source of truth: for each candidate, is it still
     /// DUE on its root's ledger ([`crate::lock::due_candidates_in`])? Block iff any
-    /// candidate is unpaid, and the block message NAMES those files (mirroring the
-    /// Bash gate's named message — the old bare "run diagnostics" text hid which
-    /// files were owed).
+    /// candidate is unpaid. The block message NAMES the FULL ledger due set of the
+    /// roots those candidates touch ([`crate::lock::due_in_candidate_roots_in`]),
+    /// not the `batch ∩ ledger` subset the DECISION uses — the batch and the
+    /// ledger are separate seams, so a covered edit the daemon batch dropped is
+    /// still booked on disk and must not vanish from the nag (bug 141: the nag
+    /// under-reported a subset while the bare run diagnosed the whole set). This
+    /// mirrors the Bash gate, which names its root's full [`crate::lock::due_files`]
+    /// set (the old bare "run diagnostics" text hid which files were owed).
     ///
     /// The `stop_hook_active` retry arm clears editing state **unconditionally** —
     /// the safety valve. Doctrine (bug 79): an unstable daemon must never lock a
@@ -831,7 +836,21 @@ impl HookRouter {
             return None;
         }
 
-        Some(HookResult::Block(self.stop_block_message(&due)))
+        // Render the message from the FULL ledger due set of the roots those
+        // candidates touch, not the `batch ∩ ledger` subset the DECISION uses
+        // (bug 141). The in-memory batch and the on-disk ledger are separate
+        // seams: a covered edit the daemon batch dropped is still booked on the
+        // ledger, so `due` (batch-filtered) can name a subset while a bare
+        // `catenary diagnostics` (ledger-read) diagnoses the whole set — the nag
+        // under-reported. Naming the roots' full due set makes the nag equal what
+        // payment covers and mirrors the Bash gate ([`due_files`] over its root).
+        // The block DECISION above is unchanged (still keyed on the candidate
+        // batch's due-ness — no new gate semantics); only the rendered file list
+        // widens to the honest ledger truth. A `due_files` union is never smaller
+        // than `due` (every unpaid candidate lives in one of these roots), so the
+        // block-iff-`due` invariant holds.
+        let named = crate::lock::due_in_candidate_roots_in(locks_base, &candidates);
+        Some(HookResult::Block(self.stop_block_message(&named)))
     }
 
     /// The Stop-block message — names the due files and points at the payment
@@ -1248,6 +1267,159 @@ mod tests {
         assert!(
             router.require_release_in(None, "", false, &locks).is_none(),
             "the aliased candidate reads the same paid ledger and passes"
+        );
+    }
+
+    /// Books a file into the real ledger WITHOUT recording it in the in-memory
+    /// batch — the state a covered edit leaves on disk. The daemon-side batch
+    /// record is driven separately (via `dispatch`) so a divergence between the
+    /// two surfaces is observable.
+    fn book_only(locks: &Path, file: &Path) {
+        let owner = crate::lock::Owner::new("test", "", "");
+        let booking =
+            crate::lock::Booking::from_config(&crate::config::Config::load().expect("cfg"));
+        let acquired =
+            crate::lock::acquire_in(locks, file, &owner, &booking, std::time::SystemTime::now());
+        assert!(
+            matches!(acquired, crate::lock::Acquired::Ours),
+            "the edit books the ledger"
+        );
+    }
+
+    #[test]
+    fn stop_nag_names_ledger_due_file_missing_from_batch() {
+        // BUG 141: the ledger holds BOTH files due, but the in-memory candidate
+        // batch recorded only ONE (the daemon-batch accumulation surface and the
+        // on-disk ledger booking are separate seams; a covered edit the batch
+        // dropped is still booked on disk). The pre-fix nag rendered
+        // `batch ∩ ledger-due`, so it named only the batch file — while a bare
+        // `catenary diagnostics` (ledger-read) diagnosed BOTH (the sighting).
+        // The fix renders the full ledger due set of the candidates' roots, so
+        // the nag names BOTH — equal to what payment covers.
+        let (router, root, locks) = stop_router_with_ledger();
+        let file_a = root.join("src/a.rs");
+        let file_b = root.join("src/b.rs");
+        std::fs::write(&file_a, b"").expect("write a");
+        std::fs::write(&file_b, b"").expect("write b");
+
+        // BOTH booked on the ledger (the client-side lock gate books every
+        // covered edit unconditionally).
+        book_only(&locks, &file_a);
+        book_only(&locks, &file_b);
+        // Only file_b lands in the in-memory batch (file_a slipped the
+        // daemon-side accumulation — the surface that diverges from the ledger).
+        let _ = router.session.editing.start_editing(None, "");
+        router
+            .session
+            .editing
+            .record_covered_edit(None, "", file_b.clone(), true);
+
+        // The ledger holds both — bare diagnostics would diagnose both.
+        let due = crate::lock::due_files_in(&locks, &root);
+        assert!(
+            due.contains(&file_a) && due.contains(&file_b),
+            "the ledger must hold both due; got: {due:?}"
+        );
+
+        let result = router.require_release_in(None, "", false, &locks);
+        let Some(HookResult::Block(msg)) = result else {
+            unreachable!("expected Block on unpaid ledger, got {result:?}");
+        };
+        // The regression pin: file_a (on the ledger, missing from the batch) must
+        // NOT be dropped from the nag.
+        assert!(
+            msg.contains(&file_a.display().to_string()),
+            "the nag must NAME file_a (ledger-due, batch-missing); got:\n{msg}"
+        );
+        assert!(
+            msg.contains(&file_b.display().to_string()),
+            "the nag must NAME file_b; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn stop_nag_two_edited_files_names_both_through_dispatch() {
+        // BUG 141 companion: two covered files edited in one turn, driven through
+        // the REAL dispatch accumulation path (`handle_file_accumulation` via
+        // `dispatch`) with the ledger booked as the client-side lock gate would.
+        // Both surfaces agree here (the batch records both); the nag names both.
+        let (router, root, locks) = stop_router_with_ledger();
+        let file_a = root.join("src/a.rs");
+        let file_b = root.join("src/b.rs");
+        std::fs::write(&file_a, b"").expect("write a");
+        std::fs::write(&file_b, b"").expect("write b");
+
+        for f in [&file_a, &file_b] {
+            book_only(&locks, f);
+            router.dispatch(HookRequest::PreTool {
+                tool_name: "Edit".to_string(),
+                file_path: Some(f.display().to_string()),
+                command: None,
+                cwd: Some(root.display().to_string()),
+                agent_id: String::new(),
+                session_id: None,
+                writes: Vec::new(),
+                self_booked: Vec::new(),
+            });
+        }
+
+        // Sanity: the in-memory batch recorded both.
+        let batch = router.session.editing.files(None, "");
+        assert!(
+            batch.contains(&file_a) && batch.contains(&file_b),
+            "the batch must record both edited files; got: {batch:?}"
+        );
+
+        let result = router.require_release_in(None, "", false, &locks);
+        let Some(HookResult::Block(msg)) = result else {
+            unreachable!("expected Block on unpaid ledger, got {result:?}");
+        };
+        assert!(
+            msg.contains(&file_a.display().to_string()),
+            "the nag must NAME file_a; got:\n{msg}"
+        );
+        assert!(
+            msg.contains(&file_b.display().to_string()),
+            "the nag must NAME file_b; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn stop_nag_message_stays_scoped_to_candidate_roots() {
+        // BUG 141 guard: widening the message to the roots' full due set must NOT
+        // leak debt from a root NONE of this agent's candidates touch. A file due
+        // in an UNRELATED root (no candidate resolves there) never appears.
+        let (router, root, locks) = stop_router_with_ledger();
+        let file_a = root.join("src/a.rs");
+        std::fs::write(&file_a, b"").expect("write a");
+
+        // A second, unrelated repo root with its own unpaid ledger debt.
+        let other_root = root.parent().expect("root parent").join("other");
+        std::fs::create_dir_all(other_root.join(".git")).expect("mk other .git");
+        std::fs::create_dir_all(other_root.join("src")).expect("mk other src");
+        let other_file = other_root.join("src/z.rs");
+        std::fs::write(&other_file, b"").expect("write z");
+        book_only(&locks, &other_file);
+
+        // This agent edited only file_a.
+        book_only(&locks, &file_a);
+        let _ = router.session.editing.start_editing(None, "");
+        router
+            .session
+            .editing
+            .record_covered_edit(None, "", file_a.clone(), true);
+
+        let result = router.require_release_in(None, "", false, &locks);
+        let Some(HookResult::Block(msg)) = result else {
+            unreachable!("expected Block on unpaid ledger, got {result:?}");
+        };
+        assert!(
+            msg.contains(&file_a.display().to_string()),
+            "the nag names the candidate's own root debt; got:\n{msg}"
+        );
+        assert!(
+            !msg.contains(&other_file.display().to_string()),
+            "the nag must NOT leak an unrelated root's debt; got:\n{msg}"
         );
     }
 

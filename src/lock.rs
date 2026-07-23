@@ -818,6 +818,59 @@ pub fn due_candidates(candidates: &[PathBuf]) -> Vec<PathBuf> {
     due_candidates_in(&locks_dir(), candidates)
 }
 
+/// The FULL due set of every root any candidate resolves to, unioned across the
+/// candidates' kitchens (bug 141).
+///
+/// [`due_candidates_in`] answers "which of THESE candidate paths are due?" — the
+/// Stop gate's block DECISION. This answers the companion "what will a bare
+/// `catenary diagnostics` diagnose in the kitchens these candidates touch?" — the
+/// Stop MESSAGE's file list. The two diverge when the in-memory candidate batch
+/// is missing a file the durable ledger still holds due (the accumulation surface
+/// and the ledger booking are separate seams; a covered edit the daemon batch
+/// dropped is still booked on disk). Rendering the message from the candidate
+/// batch alone under-reported such a file — the nag named a subset while the bare
+/// run diagnosed the whole set (the sighting). Naming the roots' full ledger due
+/// set instead makes the nag equal what payment will actually cover, mirroring the
+/// Bash gate ([`due_files`] over the command's root).
+///
+/// Each candidate is canonicalized at the ingestion seam (misc 193, the
+/// [`due_candidates_in`] rule) so its root resolves against the canonical ledger.
+/// A markerless candidate (no repository marker) contributes its own file-scope
+/// debt ([`file_has_debt_in`], brackets 03), the per-file analogue of a root's due
+/// set. Each distinct root's ledger is read once (cached), and the union is
+/// deduplicated and sorted for a stable message. A candidate that resolves to a
+/// paid or empty root contributes nothing.
+#[must_use]
+pub fn due_in_candidate_roots_in(locks_base: &Path, candidates: &[PathBuf]) -> Vec<PathBuf> {
+    use std::collections::BTreeSet;
+    let mut seen_roots: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut out: BTreeSet<PathBuf> = BTreeSet::new();
+    for candidate in candidates {
+        let file = candidate
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.clone());
+        let Some(root) = resolve_lock_root(&file) else {
+            // Markerless: the candidate's own file-scope ledger is its "root".
+            if file_has_debt_in(locks_base, &file) {
+                out.insert(file);
+            }
+            continue;
+        };
+        // Read each distinct root's ledger once.
+        if seen_roots.insert(root.clone()) {
+            out.extend(due_files_in(locks_base, &root));
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Production wrapper for [`due_in_candidate_roots_in`] resolving the base through
+/// [`locks_dir`].
+#[must_use]
+pub fn due_in_candidate_roots(candidates: &[PathBuf]) -> Vec<PathBuf> {
+    due_in_candidate_roots_in(&locks_dir(), candidates)
+}
+
 /// The current owner of a root's lock, or `None` when the root is unlocked or
 /// the lock dir is ownerless (root-ownership stage 3).
 ///
@@ -3010,6 +3063,95 @@ mod tests {
         assert!(
             due_candidates_in(&locks, &[via_alias]).is_empty(),
             "the aliased candidate reads the same paid canonical ledger"
+        );
+    }
+
+    #[test]
+    fn due_in_candidate_roots_names_the_full_root_due_set() {
+        // Bug 141: the Stop MESSAGE names every unpaid file in the candidates'
+        // roots, not just the candidate paths themselves — so a ledger-due file
+        // the in-memory batch dropped is still named. Given a single candidate `a`
+        // and a sibling `b` both booked in the same root, the candidate-root due
+        // set names BOTH, even though only `a` is a candidate.
+        let fx = Fixture::new();
+        let a = fx.file("src/a.rs");
+        let b = fx.file("src/b.rs");
+        let owner = Owner::new("claude", "sess-a", "");
+        let booking = rust_booking();
+        let now = SystemTime::now();
+        let locks = fx.locks();
+
+        for f in [&a, &b] {
+            assert!(matches!(
+                acquire_in(&locks, f, &owner, &booking, now),
+                Acquired::Ours
+            ));
+        }
+
+        // `due_candidates_in` (the DECISION) names only the candidate `a`.
+        assert_eq!(
+            due_candidates_in(&locks, std::slice::from_ref(&a)),
+            vec![a.clone()],
+            "the decision set is the candidate itself"
+        );
+        // `due_in_candidate_roots_in` (the MESSAGE) names the whole root's debt.
+        let mut named = due_in_candidate_roots_in(&locks, std::slice::from_ref(&a));
+        named.sort();
+        assert_eq!(
+            named,
+            vec![a.clone(), b.clone()],
+            "the message names every unpaid file in the candidate's root"
+        );
+
+        // Paying the whole root empties both sets.
+        unlink_delivered_in(&locks, &fx.root, &[a.clone(), b]);
+        assert!(
+            due_in_candidate_roots_in(&locks, std::slice::from_ref(&a)).is_empty(),
+            "a paid root contributes no named debt"
+        );
+    }
+
+    #[test]
+    fn due_in_candidate_roots_unions_across_kitchens_only_where_candidates_touch() {
+        // A candidate in root R1 and a candidate in root R2 union both roots' due
+        // sets; a third root R3 with debt but NO candidate contributes nothing (the
+        // message stays scoped to the kitchens the agent actually touched).
+        let fx = Fixture::new(); // R1 = fx.root
+        let a = fx.file("src/a.rs");
+        let owner = Owner::new("claude", "sess-a", "");
+        let booking = rust_booking();
+        let now = SystemTime::now();
+        let locks = fx.locks();
+
+        // A second and third repo root under the same tempdir.
+        let mk_repo = |name: &str| -> PathBuf {
+            let r = fx.dir.path().join(name);
+            std::fs::create_dir_all(r.join(".git")).expect("mk .git");
+            std::fs::create_dir_all(r.join("src")).expect("mk src");
+            r.canonicalize().expect("canon")
+        };
+        let r2 = mk_repo("repo2");
+        let r3 = mk_repo("repo3");
+        let b = r2.join("src/b.rs");
+        let c = r3.join("src/c.rs");
+        std::fs::write(&b, b"").expect("write b");
+        std::fs::write(&c, b"").expect("write c");
+
+        for f in [&a, &b, &c] {
+            assert!(matches!(
+                acquire_in(&locks, f, &owner, &booking, now),
+                Acquired::Ours
+            ));
+        }
+
+        // Candidates touch R1 (a) and R2 (b), not R3.
+        let mut named = due_in_candidate_roots_in(&locks, &[a.clone(), b.clone()]);
+        named.sort();
+        let mut expected = vec![a, b];
+        expected.sort();
+        assert_eq!(
+            named, expected,
+            "the union names R1 and R2's debt but not R3's untouched debt"
         );
     }
 
