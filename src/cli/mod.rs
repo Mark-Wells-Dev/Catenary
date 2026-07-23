@@ -268,7 +268,7 @@ impl Output {
     /// for the query result path: the whole body is assembled into one owned
     /// buffer and flushed with a single `write_all`, so `io::Stdout`'s line
     /// buffering never splits it into per-line syscalls that a physically-merged
-    /// stderr advisory could interleave (bug 112 — a `for its listing:` hint
+    /// stderr advisory could interleave (bug 112 — a glob directory `dir/*` note
     /// fusing mid-line into a stdout result under `2>&1` piping). Flushing here,
     /// before the caller writes any advisory to stderr, drains stdout fully so the
     /// two streams never interleave under a merged fd.

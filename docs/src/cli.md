@@ -154,8 +154,9 @@ nothing prints nothing on stdout (empty set, exit 0) and reports `no matches
 for pattern: <pattern> (relative patterns anchor at cwd)` on **stderr**,
 followed by a raw-string disclosure when the target exists but is
 gitignored/hidden. Teaching — the metachar-bearing matched-name note and the
-`for its listing: catenary glob '<dir>/*'` hint — rides stderr too; an
-explicit `2>/dev/null` is consent to lose it.
+directory note (`<dir>` is summarized above; `catenary glob '<dir>/*'` matches
+its entries as first-class, individually-enriched paths) — rides stderr too;
+an explicit `2>/dev/null` is consent to lose it.
 
 The outline is a **map, not a mirror** — it renders **types and callables
 only**. It recurses into containers (modules/namespaces/packages and
@@ -192,7 +193,7 @@ freely — and `--count` answers "how many" without the listing.
 | Flag | Description |
 |------|-------------|
 | `PATH` | A single glob pattern (quoted) — absolute or cwd-relative, anchor in the pattern; a metachar-free spelling is a self-matching literal |
-| `--exclude-pattern <pat>` | Glob pattern to exclude from results (repeatable; a path is dropped when any matches) |
+| `--exclude-pattern <pat>` | Glob pattern to exclude (repeatable; a path is dropped when any matches). Reaches a matched directory's listing too: an excluded entry neither renders nor counts in the directory's file/dir tally |
 | `--count` | Report the path count instead of results (the sole tally) |
 | `--include-gitignored` | Include files ignored by .gitignore |
 | `--include-hidden` | Include hidden files and directories |

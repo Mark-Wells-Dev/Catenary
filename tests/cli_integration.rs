@@ -1257,10 +1257,10 @@ fn test_version_piped_stdout_delivers_full_output() -> Result<()> {
     Ok(())
 }
 
-// ── bug 112: the glob `for its listing:` hint fuses into stdout under piping ──
+// ── bug 112: the glob directory `dir/*` note fuses into stdout under piping ──
 
 /// Builds a workspace whose `**` glob resolves to a directory (firing the
-/// teaching-moment-4 `for its listing:` hint) plus a large, multi-line body
+/// teaching-moment-4 directory note) plus a large, multi-line body
 /// (many files, each long) so the stdout stream is well over the kernel pipe
 /// buffer — the geometry under which `io::Stdout`'s line buffering used to split
 /// the body across syscalls a merged-fd stderr hint could interleave. Returns
@@ -1280,14 +1280,19 @@ fn bug112_workspace(root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// The hint line the glob emits when its pattern resolves a directory
-/// (teaching moment 4). This substring must appear ONLY on stderr, never fused
-/// into a stdout result line.
-const GLOB_HINT_MARKER: &str = "for its listing:";
+/// A substring unique to the note the glob emits when its pattern resolves a
+/// directory (teaching moment 4, misc 222) — it appears in no result row. This
+/// substring must appear ONLY on stderr, never fused into a stdout result line.
+const GLOB_HINT_MARKER: &str = "summarized above";
+
+/// The prefix every glob teaching note (moment 3 and moment 4) opens with. A
+/// hint-carrying line must START here — a result row (absolute path or indented
+/// outline row) never does, so a note welded onto a result line is detectable.
+const GLOB_NOTE_PREFIX: &str = "note:";
 
 /// Deterministic contract regression for bug 112: an enriched `catenary glob`
-/// whose `**` pattern matches a directory emits the `for its listing:` hint —
-/// and that hint rides **stderr only**. The stdout capture holds zero hint bytes
+/// whose `**` pattern matches a directory emits the directory note — and that
+/// note rides **stderr only**. The stdout capture holds zero hint bytes
 /// and every stdout line is a well-formed result line (an absolute path listing
 /// row or an indented outline/summary row), never prose.
 ///
@@ -1365,7 +1370,7 @@ fn test_glob_listing_hint_rides_stderr_only() -> Result<()> {
 /// Stream-discipline guard for bug 112 under the real merged-fd geometry: run
 /// `catenary glob '**'` with stdout and stderr sharing ONE physical pipe (exactly
 /// how a backgrounding agent harness captures a command with `2>&1`), and assert
-/// the `for its listing:` hint always lands on its OWN line — never fused mid-line
+/// the directory note always lands on its OWN line — never fused mid-line
 /// into a stdout result row — and that no other line carries the hint's command
 /// fragment.
 ///
@@ -1448,12 +1453,12 @@ fn test_glob_listing_hint_never_fuses_in_merged_stream() -> Result<()> {
         for line in merged.lines() {
             if line.contains(GLOB_HINT_MARKER) {
                 // A line touching the hint must BE the hint line, whole — starting
-                // at the marker, never a result row with the hint welded onto its
-                // front or tail (the fusion signature). The hint is the only line
-                // that may carry the `for its listing:` / `catenary glob '`
+                // at the `note:` prefix, never a result row with the hint welded
+                // onto its front or tail (the fusion signature). The hint is the
+                // only line that may carry the `summarized above` / `catenary glob '`
                 // fragments.
                 assert!(
-                    line.starts_with(GLOB_HINT_MARKER),
+                    line.starts_with(GLOB_NOTE_PREFIX),
                     "iter {iter}: the hint fused into a result line (bug 112); line:\n{line}"
                 );
             } else {

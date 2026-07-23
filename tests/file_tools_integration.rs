@@ -2638,6 +2638,94 @@ fn glob_exclude_pattern_drops_git_contents() -> Result<()> {
     Ok(())
 }
 
+/// The lead's receipt geometry (misc 222 half 2), end-to-end through the real
+/// CLI binary: an **absolute** positional targets a tree the shell is NOT
+/// sitting in (cwd is an unrelated sibling tree), with a relative slash-bearing
+/// exclude (`**/*.md`). The exclude must reach the candidate paths — the pre-fix
+/// code anchored it to cwd, so its absolute prefix pointed at the wrong tree and
+/// it went silently inert (rendering every `.md` and counting it in the tally).
+/// Anchoring the relative exclude at the positional's tree (`anchor_base`) fixes
+/// both the listing enrichment and the first-class match set.
+#[test]
+fn glob_exclude_reaches_absolute_cross_root_positional() -> Result<()> {
+    // Two sibling trees under a shared parent — neither a prefix of the other,
+    // the `Catenary` vs `CatenaryInternal` shape. `tickets/` holds a
+    // SUBDIRECTORY (`misc/`), so `tickets/*` matches the subdir and renders its
+    // listing — the receipt's exact shape, where the excluded `.md` lives inside
+    // a listed subdirectory (not a direct file match).
+    let parent = common::canonical_tempdir()?;
+    let cwd_tree = parent.path().join("project");
+    let target_tree = parent.path().join("project-internal");
+    let misc = target_tree.join("tickets").join("misc");
+    std::fs::create_dir_all(&cwd_tree)?;
+    std::fs::create_dir_all(&misc)?;
+    std::fs::write(misc.join("222.md"), "# ticket\n")?;
+    std::fs::write(misc.join("code.rs"), "fn code() {}\n")?;
+
+    // The daemon is rooted at the target tree (where the candidates live); the
+    // CLI runs from the UNRELATED cwd tree.
+    let mut bridge = spawn_no_lsp(&target_tree.to_string_lossy())?;
+    bridge.initialize()?;
+
+    // ── Listing leg: the absolute positional (`tickets/*`) matches the `misc`
+    //    subdirectory, whose listing enrichment renders — the exclude must reach
+    //    those nested entries and their tally.
+    let listing = bridge.call_glob(&json!({
+        "paths": [target_tree.join("tickets").join("*").to_string_lossy().as_ref()],
+        "exclude": "**/*.md",
+        "directory": cwd_tree.to_string_lossy().as_ref(),
+    }))?;
+    assert!(
+        listing.contains("code.rs"),
+        "the surviving nested entry lists: {listing}"
+    );
+    assert!(
+        !listing.contains("222.md"),
+        "the cross-root exclude drops the .md from the nested listing (was inert pre-fix): {listing}"
+    );
+    assert!(
+        listing.contains("(1 file, 0 dirs)"),
+        "the subdirectory tally counts only the surviving entry: {listing}"
+    );
+
+    // ── Match-set leg: an absolute pattern matching the `.md` directly. With
+    //    every match excluded the pattern reports the honest no-match.
+    let match_pattern = misc.join("22*");
+    let raw = bridge.call_search_raw(
+        "tool/glob",
+        &json!({
+            "paths": [match_pattern.to_string_lossy().as_ref()],
+            "exclude": "**/*.md",
+            "directory": cwd_tree.to_string_lossy().as_ref(),
+        }),
+    )?;
+    let output = raw
+        .get("output")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    assert!(
+        output.trim().is_empty(),
+        "the only match (222.md) is excluded, so nothing renders: {output:?}"
+    );
+
+    // ── `--count` agrees: zero surviving matches.
+    let count_raw = bridge.call_search_raw(
+        "tool/glob",
+        &json!({
+            "paths": [match_pattern.to_string_lossy().as_ref()],
+            "exclude": "**/*.md",
+            "count": true,
+            "directory": cwd_tree.to_string_lossy().as_ref(),
+        }),
+    )?;
+    assert_eq!(
+        count_raw.get("paths").and_then(serde_json::Value::as_u64),
+        Some(0),
+        "--count agrees with the excluded match set: {count_raw}"
+    );
+    Ok(())
+}
+
 /// A pattern whose every match is excluded renders the honest no-match report
 /// (the daemon's `no_match_patterns`, echoing the original spelling) with empty
 /// output — it must not silently vanish (bug 73).

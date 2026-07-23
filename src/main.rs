@@ -1406,8 +1406,9 @@ enum SearchKind {
         /// raw-string gitignore/hidden disclosure when the pattern names an
         /// existing-but-hidden target (moment 2).
         no_match_patterns: Vec<String>,
-        /// Display paths of matched directories — each gets a
-        /// `for its listing: catenary glob '<dir>/*'` hint (moment 4).
+        /// Display paths of matched directories — each gets a moment-4 note
+        /// teaching that `catenary glob '<dir>/*'` promotes the already-summarized
+        /// entries to first-class, individually-enriched matches (misc 222).
         dir_hints: Vec<String>,
         /// Result basenames carrying a glob metacharacter — one note teaches the
         /// escaped `'\<name>'` spelling (moment 3).
@@ -1475,7 +1476,8 @@ fn forward_display(paths: &SearchPaths) -> String {
 ///   disclosure when the pattern names an existing-but-hidden target (teaching
 ///   moment 2). Rides `err`.
 /// - **Teaching moments 3 & 4** (glob, stderr) — the metachar-bearing
-///   matched-name note and the directory-listing hint ride `err`.
+///   matched-name note and the directory `dir/*` first-class-entries note ride
+///   `err`.
 /// - **Missing** (grep names, stderr) — a loud `path does not exist: <path>` per
 ///   non-existent plain-path argument. Rides `err`.
 fn render_search_outcome(
@@ -1547,10 +1549,17 @@ fn render_search_outcome(
                 escape_glob_metachars(name)
             ));
         }
-        // Teaching moment 4: a pattern resolved a directory; hand over the
-        // listing spelling.
+        // Teaching moment 4: a pattern resolved a directory — its entries are
+        // already summarized on stdout, so the hint says what `dir/*` does
+        // *differently* (promote each entry to a first-class match with its own
+        // enrichment), not that it "lists" a directory whose listing just
+        // rendered (misc 222).
         for dir in dir_hints {
-            let _ = err.writeln(format_args!("for its listing: `catenary glob '{dir}/*'`"));
+            let _ = err.writeln(format_args!(
+                "note: `{dir}` is a directory, summarized above — to match its \
+                 entries as first-class paths (each enriched on its own): \
+                 `catenary glob '{dir}/*'`"
+            ));
         }
     }
     for path in &paths.missing {
@@ -3278,15 +3287,27 @@ fn emit_quarantine_marker(warning: Option<&str>) {
 /// Resolves one glob `--exclude-pattern` argument — glob's historical
 /// per-pattern rule, run CLI-side since the ws43-03 cutover: a basename (no
 /// `/`) becomes the depth-independent `**/<name>`; a slash-bearing pattern is
-/// tilde-expanded and resolved against the invoking cwd.
+/// tilde-expanded and, when relative, anchored to `base` — the tree the
+/// positional walks, NOT the invoking cwd.
+///
+/// Anchoring to the positional's tree (misc 222): an absolute positional can
+/// target a tree the shell is not sitting in (`catenary glob '/other/root/*'`
+/// from an unrelated cwd), and the candidate paths then live under `/other/root`
+/// while cwd is elsewhere. A cwd-anchored exclude compiles to an absolute glob
+/// whose prefix is the wrong tree, so `ExcludeSet::is_match` (full-path match for
+/// an absolute pattern) selects nothing and the exclude goes silently inert —
+/// for the match set, the listing enrichment, and the tallies alike. Anchoring at
+/// `base` keeps a relative exclude pointed at the very tree being globbed, so
+/// exclusion behaves identically whether the positional is relative-in-cwd or
+/// absolute-cross-root.
 #[cfg(unix)]
-fn resolve_glob_exclude(pattern: &str, cwd: &Path) -> String {
+fn resolve_glob_exclude(pattern: &str, base: &Path) -> String {
     if pattern.contains('/') {
         let expanded = catenary_cli::bridge::expand_tilde(pattern);
         if Path::new(&expanded).is_absolute() {
             expanded
         } else {
-            cwd.join(&expanded).to_string_lossy().into_owned()
+            base.join(&expanded).to_string_lossy().into_owned()
         }
     } else {
         format!("**/{pattern}")
@@ -3353,20 +3374,6 @@ async fn run_glob(
         missing: Vec::new(),
     };
 
-    // A usage error (an uncompilable --exclude-pattern) is stderr + exit 2 on
-    // both the bare and `--count` forms — the retired executor's same class.
-    let exclude_resolved: Vec<String> = exclude
-        .iter()
-        .map(|pattern| resolve_glob_exclude(pattern, &cwd))
-        .collect();
-    let exclude_set = match ExcludeSet::compile(&exclude_resolved) {
-        Ok(set) => set,
-        Err(e) => {
-            eprintln!("{e:#}");
-            std::process::exit(2);
-        }
-    };
-
     // The request-builder legs the daemon used to run, CLI-side: auto-enable
     // hidden for a relative pattern that names a dotted target, absolutize
     // against the cwd, canonicalize the metachar-free base (misc 193).
@@ -3378,6 +3385,26 @@ async fn run_glob(
         cwd.join(&pattern)
     };
     let abs_pattern = canonicalize_pattern_base(&abs_pattern);
+
+    // A usage error (an uncompilable --exclude-pattern) is stderr + exit 2 on
+    // both the bare and `--count` forms — the retired executor's same class. A
+    // relative slash-bearing exclude anchors at the positional's tree, not cwd
+    // (misc 222): the two diverge when an absolute positional walks a tree the
+    // shell is not in, and a cwd-anchored exclude then goes inert against every
+    // candidate. `anchor_base` is the positional's metachar-free prefix — the
+    // very directory the walk roots at.
+    let exclude_anchor = catenary_cli::bridge::anchor_base(&abs_pattern);
+    let exclude_resolved: Vec<String> = exclude
+        .iter()
+        .map(|pattern| resolve_glob_exclude(pattern, &exclude_anchor))
+        .collect();
+    let exclude_set = match ExcludeSet::compile(&exclude_resolved) {
+        Ok(set) => set,
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::exit(2);
+        }
+    };
 
     // The anchor-decided enrichment tier (brackets 04), resolved BEFORE any
     // walk I/O: glob's declared anchor is the single positional pattern — its
@@ -5978,12 +6005,68 @@ mod tests {
             "the listing is unchanged on stdout"
         );
         assert!(
-            err.contains("for its listing: `catenary glob 'src/*'`"),
-            "moment 4 dir hint on stderr: {err}"
+            err.contains("`catenary glob 'src/*'`"),
+            "moment 4 dir note carries the `dir/*` spelling on stderr: {err}"
         );
         assert!(
             err.contains("`*.md`") && err.contains("catenary glob '\\*.md'"),
             "moment 3 escaped-spelling note on stderr: {err}"
+        );
+    }
+
+    #[test]
+    fn render_glob_dir_note_says_what_dir_star_does_differently() {
+        // misc 222: the moment-4 note must not read as a non sequitur beside the
+        // listing that just rendered. It acknowledges the entries are already
+        // summarized (`summarized above`), then teaches what `dir/*` does
+        // *differently* — promote each entry to a first-class, individually
+        // enriched match. The retired copy said `for its listing:`, which
+        // collided with the tree the command had just printed.
+        let paths = SearchPaths {
+            forward: vec![PathBuf::from("tickets/")],
+            missing: vec![],
+        };
+        let kind = SearchKind::Glob {
+            no_match_patterns: vec![],
+            dir_hints: vec!["/abs/tickets".to_string()],
+            metachar_names: vec![],
+        };
+        let (_out, err) = render(paths, "/abs/tickets/  (0 files, 17 dirs)", true, kind);
+        assert!(
+            !err.contains("for its listing:"),
+            "the retired non-sequitur copy must be gone: {err}"
+        );
+        assert!(
+            err.contains("summarized above"),
+            "the note acknowledges the listing just rendered: {err}"
+        );
+        assert!(
+            err.contains("first-class") && err.contains("enriched"),
+            "the note says what `dir/*` does differently: {err}"
+        );
+        assert!(
+            err.contains("`catenary glob '/abs/tickets/*'`"),
+            "the note hands over the `dir/*` spelling: {err}"
+        );
+    }
+
+    #[test]
+    fn render_glob_dir_note_absent_when_no_directory_matched() {
+        // The note fires per matched directory (moment 4) — a query that
+        // resolved only files carries an empty `dir_hints`, so no note appears.
+        let paths = SearchPaths {
+            forward: vec![PathBuf::from("*.rs")],
+            missing: vec![],
+        };
+        let (_out, err) = render(
+            paths,
+            "/abs/a.rs  (10 lines)\n/abs/b.rs  (20 lines)",
+            true,
+            glob_kind(vec![]),
+        );
+        assert!(
+            !err.contains("summarized above") && !err.contains("is a directory"),
+            "no directory matched → no moment-4 note: {err}"
         );
     }
 
@@ -6554,6 +6637,98 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(2),
             "wait_daemon_teardown with dead pid must return promptly, took {:?}",
             start.elapsed(),
+        );
+    }
+
+    // ── misc 222 half 2: exclude anchoring across roots ─────────────────
+
+    /// The lead's receipt geometry: an **absolute** positional pattern targets a
+    /// tree *different from* the invoking cwd, and the exclude is a relative
+    /// slash-bearing pattern (`**/*.md`). The exclude must still reach the
+    /// candidate paths (match set, listing, and tally) — a relative exclude
+    /// anchors at the positional's tree (`anchor_base`), NOT the cwd.
+    /// `resolve_glob_exclude` used to cwd-absolutize it, which pinned its prefix
+    /// to a tree the candidates never lived under, so the exclude went inert
+    /// whenever cwd and the positional's root differed.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn glob_exclude_reaches_across_roots() {
+        use catenary_cli::bridge::filesystem_manager::FilesystemManager;
+        use catenary_cli::bridge::session::ExcludeSet;
+        use catenary_cli::bridge::{
+            anchor_base, build_glob_plan, count_glob_paths, render_glob_plan,
+        };
+        use tokio_util::sync::CancellationToken;
+
+        // Two distinct trees: `cwd_tree` is where the command is invoked;
+        // `target_tree` is the unrelated tree the absolute positional walks. They
+        // share a parent but neither is a prefix of the other — exactly the
+        // `Catenary` vs `CatenaryInternal` shape.
+        let parent = tempfile::tempdir().expect("tempdir");
+        let parent = parent.path().canonicalize().expect("canonicalize");
+        let cwd_tree = parent.join("project");
+        let target_tree = parent.join("project-internal");
+        let tickets = target_tree.join("tickets");
+        std::fs::create_dir_all(&cwd_tree).expect("mkdir cwd_tree");
+        std::fs::create_dir_all(&tickets).expect("mkdir tickets");
+        std::fs::write(tickets.join("222.md"), "# md\n").expect("write 222.md");
+        std::fs::write(tickets.join("code.rs"), "fn x() {}\n").expect("write code.rs");
+
+        let fs_manager = FilesystemManager::new();
+
+        // ── The listing/tally leg: an absolute positional naming the target
+        //    directory renders its listing. `run_glob` anchors the exclude at
+        //    the positional's base (`anchor_base`), NOT cwd — reproduce that.
+        let list_anchor = anchor_base(&tickets);
+        let list_exclude = ExcludeSet::compile(&[resolve_glob_exclude("**/*.md", &list_anchor)])
+            .expect("compile listing exclude");
+        // Guard the regression's premise: anchoring at cwd (the pre-fix code)
+        // resolves a DIFFERENT string than anchoring at the positional's tree.
+        assert_ne!(
+            resolve_glob_exclude("**/*.md", &cwd_tree),
+            resolve_glob_exclude("**/*.md", &list_anchor),
+            "the fix must change the anchor for a cross-root positional"
+        );
+        let plan =
+            build_glob_plan(&fs_manager, &tickets, &list_exclude, false, false).expect("plan");
+        let rendered = render_glob_plan(&plan, &std::collections::HashMap::new());
+        assert!(
+            rendered.contains("code.rs"),
+            "the surviving entry still lists: {rendered}"
+        );
+        assert!(
+            !rendered.contains("222.md"),
+            "the cross-root exclude must drop the .md from the listing: {rendered}"
+        );
+        assert!(
+            rendered.contains("(1 file, 0 dirs)"),
+            "the tally counts only the surviving entry: {rendered}"
+        );
+
+        // ── The match-set leg: an absolute pattern that matches the `.md`
+        //    directly must have it excluded from the first-class match set too.
+        let pattern = tickets.join("22*");
+        let match_anchor = anchor_base(&pattern);
+        let match_exclude = ExcludeSet::compile(&[resolve_glob_exclude("**/*.md", &match_anchor)])
+            .expect("compile match exclude");
+        let match_plan = build_glob_plan(&fs_manager, &pattern, &match_exclude, false, false)
+            .expect("match plan");
+        assert!(
+            match_plan.no_match,
+            "the only match (222.md) is excluded, so the pattern reports no matches"
+        );
+        let count = count_glob_paths(
+            &fs_manager,
+            std::slice::from_ref(&pattern),
+            false,
+            false,
+            &match_exclude,
+            &CancellationToken::new(),
+        );
+        assert_eq!(
+            count, 0,
+            "--count agrees: the excluded .md is the only match"
         );
     }
 }

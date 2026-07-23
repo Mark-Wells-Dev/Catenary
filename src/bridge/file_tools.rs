@@ -225,8 +225,10 @@ pub struct GlobPlan {
     /// argument spelling.
     pub no_match: bool,
     /// Display paths of matched directories (teaching moment 4): the CLI emits
-    /// a `for its listing: catenary glob '<dir>/*'` hint per directory on
-    /// stderr. Deduplicated, in first-seen order.
+    /// a note per directory on stderr teaching that `catenary glob '<dir>/*'`
+    /// promotes the already-summarized entries to first-class,
+    /// individually-enriched matches (misc 222). Deduplicated, in first-seen
+    /// order.
     pub dir_hints: Vec<String>,
     /// Result basenames carrying a glob metacharacter (teaching moment 3): the
     /// CLI teaches the escaped `'\*.md'` spelling on stderr; the result paths
@@ -1294,11 +1296,19 @@ pub fn canonicalize_pattern_base(pattern: &Path) -> PathBuf {
     }
 }
 
-/// The metachar-free base of one declared anchor argument: the walk's anchor
-/// directory as the command declared it, before any expansion — a plain path is
-/// its own base, a glob pattern's base is its metachar-free prefix (the same
-/// split point [`canonicalize_pattern_base`] and `ResolvedGlob::base_dir` use).
-fn anchor_base(anchor: &Path) -> PathBuf {
+/// The metachar-free base of one declared anchor argument.
+///
+/// The walk's anchor directory as the command declared it, before any expansion
+/// — a plain path is its own base, a glob pattern's base is its metachar-free
+/// prefix (the same split point [`canonicalize_pattern_base`] and
+/// `ResolvedGlob::base_dir` use).
+///
+/// Public so the CLI can anchor a relative `--exclude-pattern` to the tree the
+/// positional walks, not to the invoking cwd (misc 222): the two differ when an
+/// absolute positional targets a tree the shell is not sitting in, and a
+/// cwd-anchored exclude then points at the wrong tree and goes inert.
+#[must_use]
+pub fn anchor_base(anchor: &Path) -> PathBuf {
     let mut base = PathBuf::new();
     for component in anchor.components() {
         if component_has_metachar(component.as_os_str()) {
@@ -2606,6 +2616,100 @@ mod tests {
             "a fired token quits the directory walk (got {} entries)",
             cancelled.len(),
         );
+    }
+
+    // ─── exclude reaches the directory-listing enrichment (misc 222) ─────
+
+    /// misc 222 half 2: `--exclude-pattern` filters not only the top-level
+    /// match set but the listing enrichment a matched **directory** renders.
+    /// An excluded entry neither appears in the rendered listing nor counts in
+    /// the directory's `(N files, M dirs)` tally — the tally stays truthful to
+    /// what is shown. The ticket's repro was
+    /// `catenary glob 'tickets/*' --exclude-pattern '**/*.md'` rendering 40 KB
+    /// of exactly the `.md` content it excluded; this pins that it does not.
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn exclude_reaches_directory_listing_and_tally() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let dir = root.join("d");
+        std::fs::create_dir(&dir).expect("mkdir d");
+        std::fs::write(dir.join("keep.rs"), "fn main() {}\n").expect("write keep.rs");
+        std::fs::write(dir.join("drop.md"), "# md\n").expect("write drop.md");
+
+        let fs_manager = FilesystemManager::new();
+        // resolve_glob_exclude('**/*.md', cwd) absolutizes a slash-bearing
+        // relative pattern against cwd — mirror that with the absolute form.
+        let exclude = ExcludeSet::compile(&[root.join("**/*.md").to_string_lossy().into_owned()])
+            .expect("compile exclude");
+
+        // A directly-matched directory renders its listing; the exclude reaches it.
+        let plan = build_glob_plan(&fs_manager, &dir, &exclude, false, false).expect("plan");
+        let rendered = render_glob_plan(&plan, &std::collections::HashMap::new());
+        assert!(
+            rendered.contains("keep.rs"),
+            "the surviving entry still lists: {rendered}"
+        );
+        assert!(
+            !rendered.contains("drop.md"),
+            "the excluded .md must not render in the listing: {rendered}"
+        );
+        // The tally stays truthful to what is shown: one file (keep.rs), zero
+        // dirs — the excluded .md is not counted.
+        assert!(
+            rendered.contains("(1 file, 0 dirs)"),
+            "the header tally counts only the surviving entry: {rendered}"
+        );
+    }
+
+    /// The exact repro geometry: a pattern (`tickets/*`) resolves to a *set of
+    /// subdirectories*, each rendering its own listing, and the exclude must
+    /// reach those nested listings — not only a directly-named directory.
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertions")]
+    fn exclude_reaches_nested_subdirectory_listings() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let tickets = root.join("tickets");
+        let misc = tickets.join("misc");
+        std::fs::create_dir_all(&misc).expect("mkdir tickets/misc");
+        std::fs::write(misc.join("222.md"), "# ticket\n").expect("write 222.md");
+        std::fs::write(misc.join("code.rs"), "fn x() {}\n").expect("write code.rs");
+
+        let fs_manager = FilesystemManager::new();
+        let exclude = ExcludeSet::compile(&[root.join("**/*.md").to_string_lossy().into_owned()])
+            .expect("compile exclude");
+
+        // `tickets/*` expands to the `misc` subdirectory, whose listing renders.
+        let star = tickets.join("*");
+        let plan = build_glob_plan(&fs_manager, &star, &exclude, false, false).expect("plan");
+        let rendered = render_glob_plan(&plan, &std::collections::HashMap::new());
+        assert!(
+            rendered.contains("code.rs"),
+            "the surviving nested entry still lists: {rendered}"
+        );
+        assert!(
+            !rendered.contains("222.md"),
+            "the excluded .md inside a listed subdir must not render: {rendered}"
+        );
+        // The subdirectory's child count (the `misc/  (N files, M dirs)` preview)
+        // must also exclude the .md — one surviving file.
+        assert!(
+            rendered.contains("(1 file, 0 dirs)"),
+            "the subdirectory child count excludes the .md: {rendered}"
+        );
+
+        // `--count` counts the same surviving match set (the pattern matched one
+        // directory, `misc`, which the exclude does not touch).
+        let count = count_glob_paths(
+            &fs_manager,
+            std::slice::from_ref(&star),
+            false,
+            false,
+            &exclude,
+            &CancellationToken::new(),
+        );
+        assert_eq!(count, 1, "the match set is the one surviving subdirectory");
     }
 
     // ─── expansion pathology tier (bug 78 / misc 159) ──────────────────
