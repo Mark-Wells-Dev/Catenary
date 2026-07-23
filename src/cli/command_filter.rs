@@ -335,11 +335,58 @@ pub struct Denial {
     pub skipped_writes: Vec<std::path::PathBuf>,
 }
 
+/// The session class the filter judges a command for (misc 221).
+///
+/// The branch guard is scoped to **subagent** sessions only — the top-level /
+/// lead agent is explicitly untouched (maintainer ruling 2026-07-23). The daemon
+/// knows worktree-anchored subagents through the `WorktreeCreate` anchoring, but
+/// the command filter runs entirely client-side in the `PreToolUse` hook (no
+/// daemon round-trip; enforcement keys are user-level). What the hook *does*
+/// carry is the identity that distinguishes the two classes: a non-empty
+/// `agent_id` in the hook payload is a subagent, an empty one is the main/lead
+/// agent (`extract_agent_id`). This context carries that distinction plus the
+/// subagent's anchored worktree (its hook `cwd`) into the filter, so the guard
+/// can honor the subagents-only scope without inventing daemon state.
+///
+/// [`Lead`](Self::Lead) is the default and the untouched path: every existing
+/// caller ([`check_command`], the tests) judges as a lead, so the guard is inert
+/// unless a caller explicitly threads a [`Subagent`](Self::Subagent) context.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SessionContext {
+    /// The top-level / lead agent (or any caller with no session identity). The
+    /// branch guard never fires — the lead is explicitly out of scope.
+    #[default]
+    Lead,
+    /// A worktree-anchored subagent, carrying the anchor its branch work belongs
+    /// to (the subagent's hook `cwd`). The branch guard denies branch
+    /// manipulation targeting a repo outside this anchor.
+    Subagent {
+        /// The subagent's anchored worktree — its hook `cwd`. A branch operation
+        /// whose target repo lies outside this path is denied. `None` when the
+        /// hook carried no cwd (fail-open for the guard: with no anchor to
+        /// compare against, an outside-target cannot be established).
+        anchor: Option<std::path::PathBuf>,
+    },
+}
+
+impl SessionContext {
+    /// The subagent's anchor, or `None` for a lead (the guard is inert).
+    fn subagent_anchor(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Lead => None,
+            Self::Subagent { anchor } => anchor.as_deref(),
+        }
+    }
+}
+
 /// Check all commands in a shell command string against the allowlist rules.
 ///
 /// `cwd` is used for per-root `build` tool lookup. Pass `None` when no
 /// working directory is available (falls back to the user-level default
 /// build tool).
+///
+/// Judged as a [lead session](SessionContext::Lead): the subagent branch guard
+/// (misc 221) is inert. Use [`check_command_in_session`] to judge a subagent.
 ///
 /// Returns a [`Denial`] for the first denied command, or `None` if all
 /// commands are allowed.
@@ -352,6 +399,26 @@ pub fn check_command(
     check_and_resolve_command(cmd, rules, cwd).err()
 }
 
+/// Check a command as a specific [`SessionContext`] (misc 221).
+///
+/// The session-aware twin of [`check_command`]: a [subagent](SessionContext::Subagent)
+/// context arms the branch guard (branch manipulation targeting a repo outside
+/// the subagent's anchor is denied), a [lead](SessionContext::Lead) context
+/// leaves it inert. Discards the write-set — use
+/// [`check_and_resolve_command_in_session`] to keep it.
+///
+/// Returns a [`Denial`] for the first denied command, or `None` if all
+/// commands are allowed.
+#[must_use]
+pub fn check_command_in_session(
+    cmd: &str,
+    rules: &ResolvedCommands,
+    cwd: Option<&std::path::Path>,
+    session: &SessionContext,
+) -> Option<Denial> {
+    check_and_resolve_command_in_session(cmd, rules, cwd, session).err()
+}
+
 /// Check the command against the allowlist **and** resolve its write-set.
 ///
 /// The write-carrying twin of [`check_command`]: `Ok(writes)` means the
@@ -362,6 +429,10 @@ pub fn check_command(
 /// decision 026). `check_command` discards the write-set;
 /// [`crate::cli::hooks::run_pre_tool`] keeps it.
 ///
+/// Judges as a [lead session](SessionContext::Lead): the subagent branch guard
+/// (misc 221) is inert. Use [`check_and_resolve_command_in_session`] to judge a
+/// subagent.
+///
 /// # Errors
 ///
 /// Returns the first [`Denial`] in document order (allowlist violation before
@@ -371,6 +442,27 @@ pub fn check_and_resolve_command(
     cmd: &str,
     rules: &ResolvedCommands,
     cwd: Option<&std::path::Path>,
+) -> Result<resolver::LineWrites, Denial> {
+    check_and_resolve_command_in_session(cmd, rules, cwd, &SessionContext::Lead)
+}
+
+/// The session-aware core of [`check_and_resolve_command`] (misc 221).
+///
+/// Identical to [`check_and_resolve_command`] except it judges the command for a
+/// given [`SessionContext`]: a subagent context arms the branch guard (see
+/// [`check_parsed_command`]). The `session` is threaded down the allowlist walk;
+/// the resolve-or-deny write pass is session-agnostic.
+///
+/// # Errors
+///
+/// Returns the first [`Denial`] in document order (branch guard / allowlist
+/// violation before an opaque-write denial for the same line, since the
+/// allowlist walk runs first).
+pub fn check_and_resolve_command_in_session(
+    cmd: &str,
+    rules: &ResolvedCommands,
+    cwd: Option<&std::path::Path>,
+    session: &SessionContext,
 ) -> Result<resolver::LineWrites, Denial> {
     // One faithful parse drives segmentation end-to-end (decision 020 §3): the
     // list operators (`;` / `&&` / `||` / newline / `&`) separate
@@ -386,7 +478,7 @@ pub fn check_and_resolve_command(
         effective_cwd: cwd.map(std::path::PathBuf::from),
         saw_unresolved_cd: false,
     };
-    if let Some((denied_stmt, mut denial)) = check_script(&script, rules, &mut cwd_state) {
+    if let Some((denied_stmt, mut denial)) = check_script(&script, rules, &mut cwd_state, session) {
         // A denied compound never says the earlier write leg didn't run
         // (misc 206, bug 117): when statements *before* the denied one carry
         // write targets, resolve them — the same resolution the gate would
@@ -474,10 +566,11 @@ fn check_script(
     script: &parse::ParsedScript,
     rules: &ResolvedCommands,
     cwd: &mut CwdState,
+    session: &SessionContext,
 ) -> Option<(usize, Denial)> {
     for (stmt_idx, pipeline) in script.pipelines.iter().enumerate() {
         for (pipe_pos, command) in pipeline.commands.iter().enumerate() {
-            if let Some(denial) = check_parsed_command(command, pipe_pos, rules, cwd) {
+            if let Some(denial) = check_parsed_command(command, pipe_pos, rules, cwd, session) {
                 return Some((stmt_idx, denial));
             }
         }
@@ -494,6 +587,7 @@ fn check_parsed_command(
     pipe_pos: usize,
     rules: &ResolvedCommands,
     cwd: &mut CwdState,
+    session: &SessionContext,
 ) -> Option<Denial> {
     // Recurse substitutions first — a denied command (or a redirect) inside
     // `$()` / `` `…` `` / `<(…)` / `>(…)` is caught regardless of the host
@@ -502,7 +596,7 @@ fn check_parsed_command(
     // index (the outer walk's) is the one the misc-206 skipped-writes
     // resolution reads.
     for sub in &command.substitutions {
-        if let Some((_, denial)) = check_script(sub, rules, cwd) {
+        if let Some((_, denial)) = check_script(sub, rules, cwd, session) {
             return Some(denial);
         }
     }
@@ -532,6 +626,29 @@ fn check_parsed_command(
             unresolved_cd: cwd.saw_unresolved_cd,
             effective_cwd: cwd.effective_cwd.clone(),
             message: Some(git_worktree_teaching()),
+            skipped_writes: Vec::new(),
+        });
+    }
+
+    // Subagent branch guard (misc 221): a worktree-anchored subagent must not
+    // manipulate branches in a repo OUTSIDE its anchored worktree — the incident
+    // was a worker leaving the SHARED checkout on a stray branch. Scoped to
+    // subagents only (the lead is explicitly untouched, maintainer ruling
+    // 2026-07-23); a lead `session` yields no anchor and this is inert. The
+    // targeting is the bug-140 vocabulary: an explicit `git -C <path>` /
+    // `--git-dir` / `--work-tree` naming a repo outside the anchor. A bare
+    // (anchor-targeted) branch op is allowed — the anchored worktree is where
+    // branch work belongs.
+    if name == "git"
+        && let Some(anchor) = session.subagent_anchor()
+        && let Some(target) = git_branch_op_outside_anchor(&command.argv, anchor)
+    {
+        return Some(Denial {
+            command: format!("git {target}"),
+            reason: DenialReason::DeniedSubcommand,
+            unresolved_cd: cwd.saw_unresolved_cd,
+            effective_cwd: cwd.effective_cwd.clone(),
+            message: Some(subagent_branch_guard_teaching(anchor)),
             skipped_writes: Vec::new(),
         });
     }
@@ -1467,6 +1584,194 @@ fn git_worktree_teaching() -> String {
      never a hand-run add (misc 177). Catenary owns worktree placement and \
      disposal (misc 144/151)."
         .to_string()
+}
+
+/// The git globals that redirect a command at a repo other than the cwd's, with
+/// their value carried in the FOLLOWING token (`git -C <path> …`,
+/// `git --git-dir <path> …`, `git --work-tree <path> …`). Extracting the value
+/// is what lets the subagent branch guard (misc 221) tell whether a branch
+/// operation targets a repo OUTSIDE the anchored worktree. Mirrors the write
+/// resolver / tier `split_git` option-skip, but captures the target rather than
+/// merely stepping over it.
+const GIT_TARGET_GLOBALS: &[&str] = &["-C", "--git-dir", "--work-tree"];
+
+/// The `git` global options that carry a value in the following token but do
+/// **not** re-target the repo (`-c key=val`, `--namespace ns`, …). Stepped over
+/// so the subcommand is read from the right position, exactly like
+/// [`GIT_TARGET_GLOBALS`], but their values are irrelevant to the guard.
+const GIT_VALUE_GLOBALS: &[&str] = &["-c", "--namespace", "--exec-path", "--super-prefix"];
+
+/// The branch-manipulating `git` subcommand of a subagent command that targets a
+/// repo OUTSIDE its `anchor`, or `None` when the command is not such an
+/// operation (misc 221).
+///
+/// Walks `argv` as globals → subcommand → subcommand-args, capturing any
+/// `-C`/`--git-dir`/`--work-tree` target along the way (the bug-140 flag-aware
+/// vocabulary; value-carrying non-target globals are stepped over so the
+/// subcommand is read from the right position). The guard fires only when BOTH
+/// hold:
+///
+/// 1. an explicit target global names a repo whose resolved path lies outside
+///    `anchor` — a bare (anchor-targeted) command carries no external target and
+///    is allowed, since the anchored worktree is where branch work belongs; and
+/// 2. the subcommand is branch-manipulating: `switch` (always), `checkout` with
+///    `-b`/`-B` or a branch-moving bare form, or `branch` in a create / delete /
+///    move / copy form.
+///
+/// Returns the matched subcommand token (`switch` / `checkout` / `branch`) for
+/// the `"git {token}"` denial form. Deliberately conservative: with no external
+/// target the guard never fires, so an anchored-repo branch op is never
+/// false-denied.
+fn git_branch_op_outside_anchor(argv: &[String], anchor: &std::path::Path) -> Option<&'static str> {
+    // Phase 1 — walk the globals, capturing a target and locating the subcommand.
+    let mut target: Option<&str> = None;
+    let mut i = 0;
+    let sub_idx = loop {
+        let a = argv.get(i)?.as_str();
+        if !a.starts_with('-') {
+            break i; // first positional — the subcommand
+        }
+        // `--opt=value` target global (`-C` is short-only, so the `=` forms are
+        // `--git-dir=…` / `--work-tree=…`); carries its own value.
+        if let Some((flag, value)) = a.split_once('=')
+            && GIT_TARGET_GLOBALS.contains(&flag)
+        {
+            target = Some(value);
+            i += 1;
+            continue;
+        }
+        // Separated-value target global: the value is the following token.
+        if GIT_TARGET_GLOBALS.contains(&a) {
+            target = argv.get(i + 1).map(String::as_str);
+            i += 2;
+            continue;
+        }
+        // Non-target value-carrying globals consume the following token; every
+        // other option (`-p`, `--paginate`, a `--opt=value` non-target) consumes
+        // one — the same fail-safe step the tier/resolver split uses.
+        if GIT_VALUE_GLOBALS.contains(&a) {
+            i += 2;
+        } else {
+            i += 1;
+        }
+    };
+
+    // No external target → not in scope for the guard (the anchored worktree is
+    // the sanctioned place for branch work). An unresolvable target (`$VAR`,
+    // command substitution) can't be established as outside — fail open, matching
+    // the `cd`-target and skipped-write conservatism elsewhere in this file.
+    let target = target?;
+    if !target_is_outside_anchor(target, anchor) {
+        return None;
+    }
+
+    // Phase 2 — classify the subcommand as branch-manipulating.
+    let sub = argv.get(sub_idx)?.as_str();
+    let rest = &argv[sub_idx + 1..];
+    match sub {
+        // A branch switch is always a branch operation.
+        "switch" => Some("switch"),
+        // `checkout -b`/`-B` creates+switches; a bare `git checkout <ref>` moves
+        // HEAD to a branch. The pathspec-restore forms (`checkout -- <path>`,
+        // `checkout <ref> -- <path>`) touch files, not the branch, so they are
+        // NOT branch-manipulating.
+        "checkout" if checkout_is_branch_move(rest) => Some("checkout"),
+        // `git branch <name>` creates; `-d`/`-D`/`--delete`, `-m`/`-M`/`--move`,
+        // `-c`/`-C`/`--copy` delete/move/copy. A read-only listing
+        // (`git branch`, `git branch --list`, `-a`/`-r`/`-v`) manipulates
+        // nothing.
+        "branch" if branch_is_create_delete_move(rest) => Some("branch"),
+        _ => None,
+    }
+}
+
+/// Whether a `git checkout` tail (the tokens after `checkout`) is a
+/// branch-moving form rather than a pathspec restore (misc 221).
+///
+/// Branch-moving: `-b`/`-B` (create+switch) anywhere in the tail, or a bare
+/// `checkout <ref>` with no `--` pathspec separator. A `--` separator (or the
+/// detach-only `git checkout` with no operand) reads as a file restore /
+/// no-branch-move — not the guard's target. Conservative in the guard's favor:
+/// an ambiguous `checkout <x>` with no `--` is treated as a branch move (the
+/// incident's shape), and since the whole guard is already gated on an external
+/// `-C` target, this can only deny a cross-repo checkout.
+fn checkout_is_branch_move(rest: &[String]) -> bool {
+    // `-b`/`-B` — explicit branch creation+switch.
+    if rest
+        .iter()
+        .any(|a| a == "-b" || a == "-B" || a.starts_with("-b") || a.starts_with("-B"))
+    {
+        return true;
+    }
+    // A `--` pathspec separator marks a file restore, not a branch move.
+    if rest.iter().any(|a| a == "--") {
+        return false;
+    }
+    // A bare positional operand is the branch/ref to move to.
+    rest.iter().any(|a| !a.starts_with('-'))
+}
+
+/// Whether a `git branch` tail is a create / delete / move / copy form rather
+/// than a read-only listing (misc 221).
+///
+/// Mutating: a delete/move/copy flag (`-d`/`-D`/`--delete`, `-m`/`-M`/`--move`,
+/// `-c`/`-C`/`--copy`) or a bare positional operand (`git branch <name>` creates
+/// it). Read-only listing (`git branch`, `--list`, `-a`/`-r`/`-v`/`--contains …`)
+/// carries no operand and no mutating flag.
+fn branch_is_create_delete_move(rest: &[String]) -> bool {
+    const MUTATING_FLAGS: &[&str] = &[
+        "-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy",
+    ];
+    if rest
+        .iter()
+        .any(|a| MUTATING_FLAGS.contains(&a.split_once('=').map_or(a.as_str(), |(f, _)| f)))
+    {
+        return true;
+    }
+    // A bare positional (the new branch name) means a create.
+    rest.iter().any(|a| !a.starts_with('-'))
+}
+
+/// Whether a `git -C`/`--git-dir`/`--work-tree` target resolves to a location
+/// OUTSIDE `anchor` (misc 221).
+///
+/// The target is resolved relative to the anchor (a relative `-C ../shared`
+/// escapes it), then compared by path prefix. A target that resolves at or under
+/// the anchor is inside (allowed); anything else is outside. An unresolvable /
+/// absolute-elsewhere target is outside. `.git`-suffixed targets (a bare
+/// `--git-dir /repo/.git`) compare by their parent-agnostic prefix — a `.git`
+/// dir under the anchor is still inside.
+fn target_is_outside_anchor(target: &str, anchor: &std::path::Path) -> bool {
+    // Resolve the target: absolute stays as-is, relative joins the anchor (the
+    // subagent's cwd), then normalize `.`/`..` lexically (no filesystem touch,
+    // so a not-yet-existing path still resolves — mirrors `resolve_cd_target`).
+    let target_path = std::path::Path::new(target);
+    let resolved = if target_path.is_absolute() {
+        normalize_path(target_path)
+    } else {
+        normalize_path(&anchor.join(target_path))
+    };
+    let anchor_norm = normalize_path(anchor);
+    // Inside iff the resolved target is the anchor or a descendant of it.
+    !resolved.starts_with(&anchor_norm)
+}
+
+/// The teaching message for a subagent branch-guard denial (misc 221).
+///
+/// Names the anchored worktree as where branch work belongs — the worker's
+/// deliverable is its worktree branch — mirroring the `git worktree` denial's
+/// shape (a built-in, always-lands pointer). The incident this closes: a worker
+/// left the SHARED checkout on a stray branch.
+fn subagent_branch_guard_teaching(anchor: &std::path::Path) -> String {
+    format!(
+        "Branch work belongs in your anchored worktree ({}), not another repo — a \
+         subagent must not create, switch, delete, or move branches in a checkout \
+         outside its worktree (the incident: a worker left a shared checkout on a \
+         stray branch). Your deliverable is your worktree's own branch: commit \
+         there, and let the lead land it. Drop the `-C`/`--git-dir`/`--work-tree` \
+         target and run branch commands inside your worktree.",
+        anchor.display()
+    )
 }
 
 /// Client-keyed teaching denial for agent-side `catenary worktree add` on
@@ -2455,6 +2760,208 @@ mod tests {
         let rules = basic_rules();
         assert!(check_command("git status", &rules, None).is_none());
         assert!(check_command("git commit -m x", &rules, None).is_none());
+    }
+
+    // ── Subagent branch guard (misc 221) ─────────────────────────────
+    //
+    // A worktree-anchored subagent must not manipulate branches in a repo
+    // OUTSIDE its anchored worktree — the incident was a worker leaving the
+    // SHARED checkout on a stray branch. Scope is subagents ONLY (the lead is
+    // explicitly untouched, maintainer ruling 2026-07-23); the guard fires only
+    // when a `-C`/`--git-dir`/`--work-tree` target names a repo outside the
+    // anchor.
+
+    /// A subagent context anchored at `/wt/agent` — the standard fixture for the
+    /// guard tests below.
+    fn subagent_at(anchor: &str) -> SessionContext {
+        SessionContext::Subagent {
+            anchor: Some(std::path::PathBuf::from(anchor)),
+        }
+    }
+
+    #[test]
+    fn subagent_branch_ops_denied_outside_anchor() {
+        // Every branch-manipulating form, targeting the SHARED checkout outside
+        // the subagent's worktree, is denied.
+        let rules = basic_rules();
+        let sub = subagent_at("/wt/agent");
+        for cmd in [
+            "git -C /shared/repo switch main",
+            "git -C /shared/repo checkout -b topic",
+            "git -C /shared/repo checkout -B topic",
+            "git -C /shared/repo checkout main",
+            "git -C /shared/repo branch newbranch",
+            "git -C /shared/repo branch -d oldbranch",
+            "git -C /shared/repo branch -D oldbranch",
+            "git -C /shared/repo branch -m old new",
+            "git --git-dir /shared/repo/.git branch feature",
+            "git --work-tree /shared/repo switch main",
+            "git --git-dir=/shared/repo/.git switch main",
+            // A relative target escaping the anchor is still outside.
+            "git -C ../shared switch main",
+        ] {
+            let denial = check_command_in_session(cmd, &rules, None, &sub)
+                .expect("branch op outside the anchor must be denied for a subagent");
+            assert_eq!(denial.reason, DenialReason::DeniedSubcommand);
+            let msg = format_denial(&denial.command, &rules, &denial, None, None);
+            assert!(
+                msg.contains("/wt/agent"),
+                "`{cmd}` denial must name the anchored worktree, got: {msg}",
+            );
+            assert!(
+                msg.contains("anchored worktree"),
+                "`{cmd}` denial must teach that branch work belongs in the anchor, got: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_branch_ops_allowed_inside_anchor() {
+        // A branch op with NO external target operates on the anchored worktree's
+        // own repo — the sanctioned place for the worker's branch work.
+        let rules = basic_rules();
+        let sub = subagent_at("/wt/agent");
+        for cmd in [
+            "git switch main",
+            "git checkout -b topic",
+            "git checkout main",
+            "git branch newbranch",
+            "git branch -d oldbranch",
+            // An explicit target INSIDE the anchor (a subdir) is still inside.
+            "git -C /wt/agent switch main",
+            "git -C /wt/agent/sub branch feature",
+            // A relative target that stays within the anchor.
+            "git -C ./sub switch main",
+        ] {
+            assert!(
+                check_command_in_session(cmd, &rules, None, &sub).is_none(),
+                "`{cmd}` must be allowed for a subagent inside its anchor",
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_non_branch_git_ops_untouched_even_outside_anchor() {
+        // The guard is surgical: only BRANCH manipulation is guarded. A subagent
+        // may still run non-branch git against a repo it names (`git -C` status /
+        // log / a pathspec restore / a plain commit) — those are not the
+        // stray-branch hazard.
+        let rules = basic_rules();
+        let sub = subagent_at("/wt/agent");
+        for cmd in [
+            "git -C /shared/repo status",
+            "git -C /shared/repo log --oneline",
+            "git -C /shared/repo commit -m x",
+            // A pathspec restore is not a branch move.
+            "git -C /shared/repo checkout -- src/main.rs",
+            "git -C /shared/repo checkout main -- src/main.rs",
+            // A read-only branch listing manipulates nothing.
+            "git -C /shared/repo branch --list",
+            "git -C /shared/repo branch -a",
+        ] {
+            // The branch GUARD must not fire for these — proven by the subagent
+            // verdict matching the lead verdict (the guard is the only difference
+            // between the two contexts). The write resolver may independently
+            // deny a pathspec checkout as an opaque write, but that verdict is
+            // identical for lead and subagent, so this isolates the guard.
+            let lead = check_command_in_session(cmd, &rules, None, &SessionContext::Lead)
+                .map(|d| d.command);
+            let subagent = check_command_in_session(cmd, &rules, None, &sub).map(|d| d.command);
+            assert_eq!(
+                subagent, lead,
+                "`{cmd}` is not branch manipulation — the guard must not change \
+                 the verdict vs a lead session",
+            );
+        }
+    }
+
+    #[test]
+    fn lead_branch_ops_untouched_outside_any_repo() {
+        // The binding scope: the lead / top-level agent is EXPLICITLY untouched.
+        // The same cross-repo branch ops that a subagent is denied run freely for
+        // a lead — both via the lead-context entry point and the default
+        // `check_command`.
+        let rules = basic_rules();
+        for cmd in [
+            "git -C /shared/repo switch main",
+            "git -C /shared/repo checkout -b topic",
+            "git -C /shared/repo branch -D oldbranch",
+        ] {
+            assert!(
+                check_command_in_session(cmd, &rules, None, &SessionContext::Lead).is_none(),
+                "`{cmd}` must be untouched for a lead session",
+            );
+            assert!(
+                check_command(cmd, &rules, None).is_none(),
+                "`{cmd}` must be untouched on the default (lead) entry point",
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_branch_guard_inert_with_no_anchor() {
+        // A subagent whose hook carried no cwd has no anchor to compare against,
+        // so no target can be established as "outside" — the guard fails open
+        // rather than denying blind.
+        let rules = basic_rules();
+        let sub = SessionContext::Subagent { anchor: None };
+        assert!(
+            check_command_in_session("git -C /shared/repo switch main", &rules, None, &sub)
+                .is_none(),
+            "with no anchor the guard cannot establish an outside target — fail open",
+        );
+    }
+
+    #[test]
+    fn subagent_branch_guard_survives_global_option_shuffle() {
+        // The bug-140 vocabulary: a value-carrying non-target global (`-c
+        // key=val`) before the target/subcommand must not shift the read. The
+        // guard still sees the `-C` target and the `switch` subcommand.
+        let rules = basic_rules();
+        let sub = subagent_at("/wt/agent");
+        assert!(
+            check_command_in_session(
+                "git -c core.pager=cat -C /shared/repo switch main",
+                &rules,
+                None,
+                &sub,
+            )
+            .is_some(),
+            "a non-target global before `-C` must not hide the cross-repo switch",
+        );
+    }
+
+    #[test]
+    fn subagent_branch_guard_unresolvable_target_fails_open() {
+        // An unresolvable target (a variable) can't be established as outside the
+        // anchor — fail open, matching the `cd`-target conservatism.
+        let rules = basic_rules();
+        let sub = subagent_at("/wt/agent");
+        assert!(
+            check_command_in_session("git -C $REPO switch main", &rules, None, &sub).is_none(),
+            "a variable `-C` target is unresolvable — the guard fails open",
+        );
+    }
+
+    #[test]
+    fn subagent_branch_guard_distinguishes_global_c_from_branch_copy_c() {
+        // `git -C <path>` is the repo-targeting GLOBAL; `git branch -C` is the
+        // branch-COPY flag (after the subcommand). The phase-1 walk stops at
+        // `branch`, so a post-subcommand `-C` is never mistaken for a target.
+        let rules = basic_rules();
+        let sub = subagent_at("/wt/agent");
+        // Global `-C` outside + `branch -C` copy → denied (cross-repo copy).
+        assert!(
+            check_command_in_session("git -C /shared/repo branch -C old new", &rules, None, &sub)
+                .is_some(),
+            "`git -C /shared branch -C` copies a branch in the shared repo — denied",
+        );
+        // No global target, only the branch-copy `-C` in the anchor's own repo →
+        // allowed (branch work in the anchored worktree is sanctioned).
+        assert!(
+            check_command_in_session("git branch -C old new", &rules, None, &sub).is_none(),
+            "`git branch -C` with no external target is anchor-local branch work",
+        );
     }
 
     // ── Subshell recursion ───────────────────────────────────────────

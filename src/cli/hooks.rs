@@ -1962,7 +1962,68 @@ fn check_shell_command(
         return Ok(LineWrites::default());
     };
     let cwd = extract_cwd_str(hook_json, format).map(PathBuf::from);
-    check_resolved_command(resolved, cmd, cwd)
+    let session = session_context_from_hook(hook_json, cwd.as_deref());
+    check_resolved_command(resolved, cmd, cwd, &session)
+}
+
+/// Build the [`SessionContext`](crate::cli::command_filter::SessionContext) for
+/// the command filter from the hook payload (misc 221).
+///
+/// The subagent branch guard is scoped to subagent sessions only. The daemon
+/// knows worktree-anchored subagents through the `WorktreeCreate` anchoring, but
+/// the filter runs client-side in the hook (no daemon round-trip) — so the class
+/// is read from the identity the payload already carries: a **non-empty
+/// `agent_id` is a subagent**, an empty one the main/lead agent
+/// (`extract_agent_id`). A subagent's anchored worktree derives from its hook
+/// `cwd` — the value `run_subagent_start` forwards to the daemon to mount as the
+/// worktree root — truncated to the managed worktree ROOT when the cwd has
+/// descended into a subdirectory ([`anchor_from_cwd`]). A lead (empty
+/// `agent_id`) yields
+/// [`Lead`](crate::cli::command_filter::SessionContext::Lead), leaving the guard
+/// inert.
+fn session_context_from_hook(
+    hook_json: &serde_json::Value,
+    cwd: Option<&std::path::Path>,
+) -> crate::cli::command_filter::SessionContext {
+    use crate::cli::command_filter::SessionContext;
+    if extract_agent_id(hook_json).is_empty() {
+        // Main / lead agent — explicitly out of scope for the branch guard.
+        return SessionContext::Lead;
+    }
+    SessionContext::Subagent {
+        anchor: cwd.map(anchor_from_cwd),
+    }
+}
+
+/// The branch-guard anchor for a subagent cwd: the enclosing MANAGED worktree
+/// root when the cwd sits under one, the cwd itself otherwise (misc 221, landing
+/// review).
+///
+/// The guard's inside/outside test is `starts_with(anchor)`, and the hook `cwd`
+/// moves with the shell — a subagent that has `cd`d into `src/` of its own
+/// worktree would otherwise anchor at the subdirectory and false-deny a `-C`
+/// target at or beside it that is still within the worktree. Managed agent
+/// worktrees live at `state_dir/worktrees/agents/<session>/<tree>`, so a cwd
+/// under that base truncates to the `<tree>` component. Any other cwd (a
+/// non-isolated subagent in a plain checkout) anchors as-is — for it, the
+/// checkout it was pointed at IS its sanctioned workspace.
+fn anchor_from_cwd(cwd: &std::path::Path) -> PathBuf {
+    anchor_from_cwd_in(
+        cwd,
+        &crate::paths::state_dir().join("worktrees").join("agents"),
+    )
+}
+
+/// The base-injectable core of [`anchor_from_cwd`] (`base` is the managed
+/// agents-worktree dir, `state_dir/worktrees/agents` in production).
+fn anchor_from_cwd_in(cwd: &std::path::Path, base: &std::path::Path) -> PathBuf {
+    if let Ok(rel) = cwd.strip_prefix(base) {
+        let mut components = rel.components();
+        if let (Some(session), Some(tree)) = (components.next(), components.next()) {
+            return base.join(session.as_os_str()).join(tree.as_os_str());
+        }
+    }
+    cwd.to_path_buf()
 }
 
 /// The config-independent core of [`check_shell_command`]: given an already
@@ -1981,9 +2042,11 @@ fn check_shell_command(
 ///   [`merge_project_commands`](crate::config::ResolvedCommands::merge_project_commands)).
 /// - an inactive allowlist (`!is_active()`) short-circuits to allow.
 /// - otherwise the command faces
-///   [`check_and_resolve_command`](crate::cli::command_filter::check_and_resolve_command):
+///   [`check_and_resolve_command_in_session`](crate::cli::command_filter::check_and_resolve_command_in_session):
 ///   `Ok(writes)` on allow, or `Err((denial, resolved))` on deny with the
-///   resolved config it was judged against.
+///   resolved config it was judged against. `session` scopes the subagent branch
+///   guard (misc 221) — a [`Lead`](crate::cli::command_filter::SessionContext::Lead)
+///   leaves it inert.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "owns `resolved`: it is reassigned by the project merge and returned \
@@ -1993,6 +2056,7 @@ fn check_resolved_command(
     mut resolved: crate::config::ResolvedCommands,
     cmd: &str,
     cwd: Option<PathBuf>,
+    session: &crate::cli::command_filter::SessionContext,
 ) -> Result<
     LineWrites,
     Box<(
@@ -2023,7 +2087,12 @@ fn check_resolved_command(
         return Ok(LineWrites::default());
     }
 
-    match crate::cli::command_filter::check_and_resolve_command(cmd, &resolved, cwd.as_deref()) {
+    match crate::cli::command_filter::check_and_resolve_command_in_session(
+        cmd,
+        &resolved,
+        cwd.as_deref(),
+        session,
+    ) {
         Ok(writes) => Ok(writes),
         Err(denial) => Err(Box::new((denial, resolved))),
     }
@@ -3241,8 +3310,13 @@ mod tests {
         // reason), not `None`. This is the assertion the `-> None` mutant
         // (allow-everything) must fail.
         let resolved = resolved_from_toml("[commands]\nallow = [\"git\", \"ls\"]\n");
-        let (denial, _) = *check_resolved_command(resolved, "cargo build", None)
-            .expect_err("a command off the allowlist must be denied client-side");
+        let (denial, _) = *check_resolved_command(
+            resolved,
+            "cargo build",
+            None,
+            &crate::cli::command_filter::SessionContext::Lead,
+        )
+        .expect_err("a command off the allowlist must be denied client-side");
         assert_eq!(denial.command, "cargo");
         assert_eq!(
             denial.reason,
@@ -3255,7 +3329,13 @@ mod tests {
         // An allowlisted command passes the gate → `Ok` (no denial).
         let resolved = resolved_from_toml("[commands]\nallow = [\"git\", \"ls\"]\n");
         assert!(
-            check_resolved_command(resolved, "git status", None).is_ok(),
+            check_resolved_command(
+                resolved,
+                "git status",
+                None,
+                &crate::cli::command_filter::SessionContext::Lead,
+            )
+            .is_ok(),
             "an allowlisted command must pass the client-side gate",
         );
     }
@@ -3272,7 +3352,13 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            check_resolved_command(resolved, "cargo build", None).is_ok(),
+            check_resolved_command(
+                resolved,
+                "cargo build",
+                None,
+                &crate::cli::command_filter::SessionContext::Lead,
+            )
+            .is_ok(),
             "client_enforcement_only must bypass the client-side gate",
         );
     }
@@ -3287,8 +3373,107 @@ mod tests {
             "an empty allowlist should be inactive",
         );
         assert!(
-            check_resolved_command(resolved, "cargo build", None).is_ok(),
+            check_resolved_command(
+                resolved,
+                "cargo build",
+                None,
+                &crate::cli::command_filter::SessionContext::Lead,
+            )
+            .is_ok(),
             "an inactive allowlist must not deny client-side",
+        );
+    }
+
+    // ── session_context_from_hook (subagent branch-guard scope, misc 221) ──
+    //
+    // The branch guard is subagents-only. The class is read from the identity
+    // the PreToolUse payload already carries: a non-empty `agent_id` is a
+    // subagent, an empty (or absent) one the main/lead agent. The anchor is the
+    // subagent's hook `cwd`.
+
+    #[test]
+    fn session_context_lead_when_agent_id_empty_or_absent() {
+        use crate::cli::command_filter::SessionContext;
+        // Absent `agent_id` (the main-agent default).
+        let payload = serde_json::json!({ "cwd": "/wt/agent" });
+        assert_eq!(
+            session_context_from_hook(&payload, Some(std::path::Path::new("/wt/agent"))),
+            SessionContext::Lead,
+            "an absent agent_id is the main/lead agent — guard inert",
+        );
+        // Explicitly empty `agent_id` is also the main agent.
+        let payload = serde_json::json!({ "agent_id": "", "cwd": "/wt/agent" });
+        assert_eq!(
+            session_context_from_hook(&payload, Some(std::path::Path::new("/wt/agent"))),
+            SessionContext::Lead,
+            "an empty agent_id is the main/lead agent — guard inert",
+        );
+    }
+
+    #[test]
+    fn session_context_subagent_when_agent_id_present_carries_cwd_anchor() {
+        use crate::cli::command_filter::SessionContext;
+        let payload = serde_json::json!({ "agent_id": "sub-1", "cwd": "/wt/agent" });
+        assert_eq!(
+            session_context_from_hook(&payload, Some(std::path::Path::new("/wt/agent"))),
+            SessionContext::Subagent {
+                anchor: Some(std::path::PathBuf::from("/wt/agent")),
+            },
+            "a non-empty agent_id is a subagent, anchored at its hook cwd",
+        );
+    }
+
+    #[test]
+    fn anchor_truncates_managed_worktree_subdir_cwd_to_the_root() {
+        // The guard's inside/outside test is `starts_with(anchor)` and the hook
+        // cwd moves with the shell — a subagent `cd`'d into src/ of its own
+        // managed worktree must still anchor at the worktree ROOT, or a `-C`
+        // target at/beside the cwd but within the worktree would false-deny.
+        let base = std::path::Path::new("/state/worktrees/agents");
+        let root = base.join("sess-uuid").join("tree-id");
+        // A subdirectory cwd (any depth) truncates to the worktree root.
+        assert_eq!(anchor_from_cwd_in(&root.join("src"), base), root);
+        assert_eq!(anchor_from_cwd_in(&root.join("src/cli/deep"), base), root);
+        // The root itself anchors as-is.
+        assert_eq!(anchor_from_cwd_in(&root, base), root);
+        // A cwd outside the managed base (a non-isolated subagent in a plain
+        // checkout) anchors as-is — that checkout IS its sanctioned workspace.
+        let plain = std::path::Path::new("/home/user/project/sub");
+        assert_eq!(anchor_from_cwd_in(plain, base), plain);
+        // Under the base but too shallow to name a worktree (session dir only):
+        // no truncation target exists — anchor as-is.
+        let shallow = base.join("sess-uuid");
+        assert_eq!(anchor_from_cwd_in(&shallow, base), shallow);
+    }
+
+    #[test]
+    fn check_resolved_command_denies_subagent_cross_repo_branch_switch() {
+        // End-to-end at the hook seam: a subagent context denies a branch switch
+        // targeting a repo outside its anchor, while a lead context (same config,
+        // same command) allows it — the subagents-only scope, honored client-side.
+        use crate::cli::command_filter::SessionContext;
+        let cmd = "git -C /shared/repo switch main";
+        let sub = SessionContext::Subagent {
+            anchor: Some(std::path::PathBuf::from("/wt/agent")),
+        };
+        let denial = check_resolved_command(
+            resolved_from_toml("[commands]\nallow = [\"git\"]\n"),
+            cmd,
+            Some(PathBuf::from("/wt/agent")),
+            &sub,
+        )
+        .expect_err("a subagent's cross-repo branch switch must be denied");
+        assert_eq!(denial.0.command, "git switch");
+        // The lead runs the same command untouched.
+        assert!(
+            check_resolved_command(
+                resolved_from_toml("[commands]\nallow = [\"git\"]\n"),
+                cmd,
+                Some(PathBuf::from("/wt/agent")),
+                &SessionContext::Lead,
+            )
+            .is_ok(),
+            "a lead session is explicitly untouched by the branch guard",
         );
     }
 

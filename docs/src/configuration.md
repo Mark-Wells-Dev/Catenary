@@ -682,6 +682,21 @@ in-program `system()`/`print > file`, or `sed -i`, resolves to its write-set
 or is surgically denied), so keeping them out of the position-0 pipeline simply
 avoids masking that check behind a bare `awk 'prog'`.
 
+### What earns a place on the surface
+
+The allowlist criterion is a single question: **does a Catenary-native
+replacement exist?** Where one does, the tool is **redirected** — `ls`/`find` →
+[`catenary glob`](cli.md), `rg`/`grep`/`ag` → [`catenary grep`](cli.md) — because
+the native command carries the code-intelligence enrichment the raw tool cannot.
+Where none does, the tool is **admitted**: `tar` has no Catenary equivalent
+(pack/extract is the use case), so it is granted as an archiver rather than
+pointed elsewhere. Admission is not a blank cheque — an admitted tool's
+exec/traversal levers are still shaped away with `deny_flags` (see `tar` above),
+and its writes still face the [write model](#the-write-model). `tar` extraction
+is the one accepted residual there: the write-set lives inside the archive,
+invisible to argv, so extracted files aren't attributed — accepted, because
+archives are not an editing path.
+
 ### Keys
 
 | Key | Description |

@@ -84,6 +84,11 @@ const TEMPLATE: &str = r#"#:schema https://twowells.github.io/catenary/schemas/c
 # # `sqlite3` is granted with `-cmd` denied (see [commands.deny] below):
 # # it's a read tool we have no alternative for (like `git log`), and the
 # # `-cmd` carve-out closes its arbitrary-exec lever.
+# # `tar` is granted because pack/extract is the use case and there is no
+# # Catenary-native replacement for it (unlike ls -> glob, rg -> grep): an
+# # archiver, not a command host (its exec/traversal levers are denied via
+# # deny_flags below). Extraction writes are unattributed by the resolver —
+# # accepted, archives are not an editing path.
 # # `sed` and `perl` are allowed as bulk writers: their in-place edits
 # # (`sed -i`, `perl -i -pe`) are script-checked and resolved into the
 # # diagnostics batch, and an unparseable/executing script (`sed -i 'w …'`,
