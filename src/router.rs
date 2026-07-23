@@ -792,6 +792,10 @@ struct RootBoardImpl {
     /// The ephemeral idle clocks, so the board can surface each activity-mounted
     /// root's idle-remaining figure alongside its class.
     ephemeral_mounts: EphemeralMounts,
+    /// Orphan provenance (ws49-02), so the board can mark a demoted root as
+    /// `orphaned from session <sid>` — distinguishing an orphan riding out its
+    /// idle window from ordinary activity coverage.
+    orphan_provenance: OrphanProvenance,
 }
 
 #[cfg(unix)]
@@ -809,11 +813,16 @@ impl crate::state_snapshot::RootBoard for RootBoardImpl {
                     .ephemeral_mounts
                     .idle_remaining(&path, now, EPHEMERAL_ROOT_IDLE_TIMEOUT)
                     .map(|d| d.as_secs());
+                // Orphan provenance (ws49-02): display metadata for an ephemeral
+                // entry demoted from a vanished session's worktree mount. `None`
+                // for an ordinary activity mount or a pinned root.
+                let orphaned_from = self.orphan_provenance.line_for(&path);
                 crate::state_snapshot::RootEntry {
                     path: path.display().to_string(),
                     ephemeral: root_is_ephemeral(&sources),
                     sources,
                     idle_remaining_secs,
+                    orphaned_from,
                 }
             })
             .collect()
@@ -1062,6 +1071,13 @@ struct HookDispatchContext {
     /// its enclosing project root under an `ephemeral:*` contributor and records
     /// activity here; the idle reaper reads it to tear the mount down.
     ephemeral_mounts: EphemeralMounts,
+    /// Orphan provenance for demoted roots (ws49-02). When a session vanishes,
+    /// [`release_session`] demotes each of its worktree roots (directory still
+    /// present) to an `ephemeral:` contributor and records here where it came
+    /// from; the root board surfaces the line, adoption and idle expiry clear it.
+    /// Display metadata beside the ordinary ephemeral mount — no new lifecycle
+    /// class.
+    orphan_provenance: OrphanProvenance,
     /// Daemon-side first-sighting ledger for the Antigravity `PreInvocation`
     /// teaching injection (teaching-surface ticket 03). Records each
     /// `conversationId` the hook has taught, so the persisted `userMessage` is
@@ -1500,13 +1516,15 @@ impl RootTracker {
     /// Removes every contributor whose key `starts_with(prefix)`, in one shot.
     ///
     /// Sweeps a whole namespace at once — e.g. all `worktree:{session_id}:*`
-    /// roots a session leaked when a `WorktreeRemove` was missed (the
-    /// `SessionEnd` backstop and the daemon root-GC, workstream 30).
+    /// roots at once. Returns the number of contributor keys removed.
     ///
-    /// Returns the number of contributor keys removed. `remove_contributor`
-    /// returns nothing and callers re-sync unconditionally; the count here
-    /// lets a sweep caller skip `sync_roots` when nothing matched (`0`) and
-    /// re-sync only when the union actually changed (`> 0`).
+    /// Test-only since ws49-02: the session-release sweep no longer *drops* a
+    /// session's worktree roots wholesale — it iterates them
+    /// ([`contributors_with_prefix`](Self::contributors_with_prefix)) and either
+    /// demotes each to `ephemeral:` (directory present) or releases it
+    /// ([`remove_root`](Self::remove_root), directory gone). This one-shot
+    /// primitive survives as the pure-tracker fixture those tests still exercise.
+    #[cfg(test)]
     fn remove_contributors_with_prefix(&self, prefix: &str) -> usize {
         let mut inner = self
             .inner
@@ -1752,6 +1770,27 @@ fn sweep_interval() -> Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|ms| *ms > 0)
         .map_or(EPHEMERAL_ROOT_SWEEP_INTERVAL, Duration::from_millis)
+}
+
+/// Resolves the ephemeral-root idle timeout: `CATENARY_EPHEMERAL_IDLE_MS` when
+/// set to a parseable, non-zero milliseconds value, otherwise the production
+/// [`EPHEMERAL_ROOT_IDLE_TIMEOUT`] (ws49-02).
+///
+/// The demote→expire integration leg needs the idle window (today's de-facto
+/// grace period) to elapse in milliseconds, not the production seven minutes —
+/// the same across-the-process-boundary test shrink [`sweep_interval`] uses for
+/// the sweep cadence. This is a TEST-INJECTION seam, not a new user knob: absent
+/// the env var the production default is unchanged, and no config surface exposes
+/// it. It shrinks the *existing* grace window for a test; it introduces no new
+/// timer (the model's "no new timer, no new knob" holds — the grace is still the
+/// ephemeral idle economy, only sped up under test).
+#[cfg(unix)]
+fn ephemeral_idle_timeout() -> Duration {
+    std::env::var("CATENARY_EPHEMERAL_IDLE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map_or(EPHEMERAL_ROOT_IDLE_TIMEOUT, Duration::from_millis)
 }
 
 /// Builds the `ephemeral:{canonical root path}` contributor key for a root.
@@ -2055,6 +2094,122 @@ impl EphemeralMounts {
             .cloned()
             .collect()
     }
+}
+
+/// One orphaned root's provenance: the session it was orphaned from and the
+/// instant it demoted, keyed by canonical root path (ws49-02).
+///
+/// Recorded when [`release_session`] demotes a `worktree:{sid}:{path}`
+/// contributor into an `ephemeral:{path}` one instead of dropping it — the
+/// existing idle economy becomes the grace window, and this metadata lets the
+/// board mark the ephemeral entry as an *orphan riding out its idle window*
+/// rather than ordinary activity-coverage. Cleared on adoption (a session-keyed
+/// contributor for the same path landing) and on idle expiry. Display metadata
+/// only — the contributor is an ordinary `ephemeral:` entry; this creates no new
+/// lifecycle class.
+#[cfg(unix)]
+#[derive(Clone)]
+struct OrphanRecord {
+    /// The session the root was orphaned from (surfaced as
+    /// `orphaned from session <sid>`).
+    session_id: String,
+    /// When the demotion happened — the start of the vanish→re-adopt interval
+    /// the memory receipts (ws49-02, part 4) measure at adoption.
+    orphaned_at: Instant,
+}
+
+/// Orphan provenance for demoted roots, keyed by canonical root path (ws49-02).
+///
+/// The demotion metadata store: [`release_session`] records a path here when it
+/// demotes a session's worktree contributor to `ephemeral:` (the directory still
+/// exists); adoption ([`take_orphan`](Self::take_orphan)) and idle expiry
+/// ([`clear`](Self::clear)) drop it. Kept beside [`EphemeralMounts`] rather than
+/// folded into the contributor key so the ephemeral entry stays an ordinary
+/// activity mount — the orphan is that mount plus this display metadata, never a
+/// distinct class. Arc-backed and `Clone` so the board pull, the reaper, and the
+/// dispatch handlers share one live map.
+#[cfg(unix)]
+#[derive(Clone)]
+struct OrphanProvenance {
+    inner: Arc<std::sync::Mutex<HashMap<PathBuf, OrphanRecord>>>,
+}
+
+#[cfg(unix)]
+impl OrphanProvenance {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Records `root` as orphaned from `session_id` at `now`.
+    fn record(&self, root: &Path, session_id: &str, now: Instant) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                root.to_path_buf(),
+                OrphanRecord {
+                    session_id: session_id.to_string(),
+                    orphaned_at: now,
+                },
+            );
+    }
+
+    /// Drops `root`'s provenance unconditionally (idle expiry, teardown).
+    fn clear(&self, root: &Path) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(root);
+    }
+
+    /// Removes and returns `root`'s orphan record if present — the adoption
+    /// primitive. A returned record means this path was an orphan a landing
+    /// session-keyed contributor just adopted; `None` means it was never
+    /// orphaned (ordinary coverage) and adoption is a no-op.
+    fn take_orphan(&self, root: &Path) -> Option<OrphanRecord> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(root)
+    }
+
+    /// The provenance display line for `root` (`orphaned from session <sid>`),
+    /// or `None` when the root is not an orphan. Pulled by the root board so the
+    /// TUI can distinguish an orphan riding out its idle window from ordinary
+    /// activity coverage.
+    fn line_for(&self, root: &Path) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(root)
+            .map(|record| format!("orphaned from session {}", record.session_id))
+    }
+}
+
+/// Reads the daemon's own resident-set size (RSS) in bytes from
+/// `/proc/self/statm`, the freed-RSS measurement the release economy surfaces
+/// (ws49-02, part 4; the RESOURCES "measure and surface" ruling).
+///
+/// A plain file read — no `unsafe`, no `libc`, no new dependency — matching the
+/// vanish edge's Linux-only reality (off Linux the vanish edge never fires, so
+/// no release-RSS figure exists to report). Field 2 of `statm` is the resident
+/// page count; multiplied by the 4 KiB page size it yields bytes. Returns `None`
+/// when the file is unreadable or malformed — the caller then omits the RSS
+/// figure from its release log rather than fabricating one.
+///
+/// The freed RSS a release reclaims is bounded by glibc arena retention (bug
+/// 136): the daemon's own churn sits in per-arena free lists the allocator does
+/// not return to the kernel, so a `before − after` delta quantifies the
+/// *actually released* memory, not the theoretical footprint of the torn-down
+/// servers. `MALLOC_ARENA_MAX=2` (ticket 04) shrinks that retention; this figure
+/// is the evidence for its effect.
+#[cfg(target_os = "linux")]
+fn self_rss_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(resident_pages * 4096)
 }
 
 /// Daemon-side first-sighting ledger for the Antigravity `PreInvocation`
@@ -3783,6 +3938,10 @@ impl SessionManager {
         // Shared with the root board so `state.json` can surface each ephemeral
         // root's idle-remaining figure; the hook context holds the same handle.
         let ephemeral_mounts = EphemeralMounts::new();
+        // Orphan provenance (ws49-02): shared between the release path (which
+        // records a demotion), adoption (which clears it), the reaper (which
+        // clears on idle expiry), and the root board (which surfaces the line).
+        let orphan_provenance = OrphanProvenance::new();
         // Shared with the session board so `state.json` carries each session's
         // live subagents; the hook context records/prunes into the same handle.
         let subagents = SubagentRegistry::new();
@@ -3799,6 +3958,7 @@ impl SessionManager {
             snapshot.set_root_board(Arc::new(RootBoardImpl {
                 tracker: root_tracker.clone(),
                 ephemeral_mounts: ephemeral_mounts.clone(),
+                orphan_provenance: orphan_provenance.clone(),
             }));
             // Wire the live MCP bridge census (pulse-05): each flush reads the
             // same connection counter the shutdown grace window keys on, so
@@ -3855,6 +4015,7 @@ impl SessionManager {
             diag_rounds: DiagRoundRegistry::default(),
             worktree_watcher,
             ephemeral_mounts,
+            orphan_provenance,
             first_sightings: FirstSightings::new(),
             project_config_nudges: ProjectConfigNudges::new(),
             auto_installer,
@@ -4043,11 +4204,15 @@ impl SessionManager {
                     &tracker,
                     &mounts,
                     Instant::now(),
-                    EPHEMERAL_ROOT_IDLE_TIMEOUT,
+                    ephemeral_idle_timeout(),
                 );
                 if !expired.is_empty() {
                     // Same sync the request handlers use: re-sync the (now
                     // smaller) union once, shutting down the reaped roots' servers.
+                    // Measure the freed RSS this reaper release reclaimed (ws49-02,
+                    // part 4) — the same arena-bounded figure the session-release
+                    // path reports, on the reaper's own teardown.
+                    let rss_before = self_rss_bytes_or_none();
                     if let Err(e) = session.sync_roots(tracker.global_roots_rich()).await {
                         debug!(
                             source = Source::DaemonDispatch.as_str(),
@@ -4055,12 +4220,19 @@ impl SessionManager {
                         );
                     }
                     for root in &expired {
+                        // An expired orphan is the "nobody returned" outcome —
+                        // clear its provenance so no stale line survives the mount,
+                        // and note whether this was an orphan riding out its window.
+                        let was_orphan = ctx.orphan_provenance.line_for(root).is_some();
+                        ctx.orphan_provenance.clear(root);
                         info!(
                             source = Source::DaemonDispatch.as_str(),
                             root = %root.display(),
+                            was_orphan = was_orphan,
                             "expired idle ephemeral root",
                         );
                     }
+                    emit_release_rss_receipt("", "ephemeral idle expiry", expired.len(), rss_before);
                     // The root board changed — flush the snapshot so the
                     // expired mount leaves `state.json` promptly.
                     session.touch_snapshot();
@@ -4680,6 +4852,29 @@ fn worktree_to_auto_mount(file_path: &Path, tracked: &HashSet<PathBuf>) -> Optio
     }
 }
 
+/// Resolves the orphaned worktree a `cwd` should ADOPT, or `None` (ws49-02).
+///
+/// The re-mount adoption edge's predicate, the counterpart to
+/// [`worktree_to_auto_mount`]: that predicate rejects an already-tracked
+/// worktree (idempotent), which INCLUDES a demoted orphan (tracked by its
+/// `ephemeral:*` contributor) — so a returning session's mount would otherwise
+/// no-op and never re-key the orphan to a session-keyed contributor. This
+/// predicate handles exactly that case: it resolves `cwd`'s enclosing worktree
+/// and returns it iff [`OrphanProvenance`] carries a provenance line for that
+/// path — i.e. it is an orphan riding out its idle window, and this mount is the
+/// adoption the ticket names.
+///
+/// Provenance-gated, not merely "tracked-and-ephemeral": only a root a prior
+/// session's release genuinely demoted is adoptable here. An ordinary
+/// activity-mounted ephemeral root (a CLI query's mount, never orphaned) is left
+/// to its own idle economy — a subagent-start in it is not a takeover.
+#[cfg(unix)]
+fn worktree_to_adopt(cwd: &Path, orphans: &OrphanProvenance) -> Option<PathBuf> {
+    let worktree = crate::companions::enclosing_worktree_root(cwd)?;
+    let worktree = worktree.canonicalize().unwrap_or(worktree);
+    orphans.line_for(&worktree).map(|_| worktree)
+}
+
 /// Canonicalizes a subagent worktree path and builds its
 /// `worktree:{session_id}:{path}` root-contributor key, returning both the
 /// canonical path (for logging) and the key.
@@ -4986,27 +5181,83 @@ async fn release_session(ctx: &HookDispatchContext, session_id: &str, trigger: &
     ctx.primary.touch_snapshot();
 
     if let Some(ref tracker) = ctx.root_tracker {
-        // Leak backstop (workstream 30, ticket 03): reclaim any of THIS session's
-        // worktree roots whose `WorktreeRemove` was missed. The `session_id` baked
-        // into the contributor key finds them without enumerating paths.
+        // Release economy (ws49-02): a session's worktree roots do NOT drop
+        // outright on release — they DEMOTE into the ephemeral bucket, and the
+        // existing idle economy becomes the grace window. A returning session
+        // (host restart, upgrade, `/clear`) re-adopts a still-warm root by
+        // mounting it; nobody returning, the ordinary ephemeral idle-expiry
+        // reaper reclaims it. No new timer, no new knob.
+        //
+        // The demotion rides the ONE shared release path both edges use — the
+        // graceful `SessionEnd` caller and the vanish watch — so it unifies both:
+        // the smaller diff (one shared path) the ticket's Decision point allows,
+        // with the lead lean (unify, when the directory exists). Each edge stays
+        // separately testable (the `trigger` label distinguishes them).
+        //
+        // The demote is directory-gated: a worktree whose dir still exists has
+        // something to adopt, so it demotes; a dir already gone releases outright
+        // (nothing to adopt — the deletion watch / GC discipline stands). The
+        // `worktree:{session_id}:{path}` prefix finds this session's roots without
+        // enumerating paths.
         let prefix = format!("worktree:{session_id}:");
-        let removed = tracker.remove_contributors_with_prefix(&prefix);
-        // Drop this session's in-memory deletion watches too so they never outlive
-        // the roots; idempotent vs the reaper and the GC.
+        let now = Instant::now();
+        let mut demoted = 0usize;
+        let mut released = 0usize;
+        for (contributor, roots) in tracker.contributors_with_prefix(&prefix) {
+            for root in roots {
+                if root.exists() {
+                    // Demote: add the `ephemeral:{path}` contributor BEFORE
+                    // dropping the worktree one so the root's refcount never dips
+                    // to 0 — no `Root` reap/reload flap, the server stays warm and
+                    // untouched by the later single `sync_roots`. Reuses the same
+                    // ephemeral contributor + idle clock an activity mount uses
+                    // (not a new class), plus the orphan provenance the board
+                    // surfaces. The `hook` upgrade (`tool/roots-add`) and a worktree
+                    // re-mount both drop exactly this pair on adoption.
+                    tracker.add_roots(&ephemeral_contributor(&root), std::slice::from_ref(&root));
+                    tracker.remove_root(&contributor, &root);
+                    ctx.ephemeral_mounts.touch(&root, now);
+                    ctx.orphan_provenance.record(&root, session_id, now);
+                    demoted += 1;
+                    info!(
+                        source = Source::DaemonDispatch.as_str(),
+                        session_id = %session_id,
+                        worktree = %root.display(),
+                        trigger = trigger,
+                        "released session: demoted worktree root to orphan (idle window is the grace period)",
+                    );
+                } else {
+                    // Dir already gone: nothing to adopt, so drop it outright (the
+                    // deletion watch / GC discipline stands).
+                    tracker.remove_root(&contributor, &root);
+                    released += 1;
+                    debug!(
+                        source = Source::DaemonDispatch.as_str(),
+                        session_id = %session_id,
+                        worktree = %root.display(),
+                        trigger = trigger,
+                        "released session: worktree dir gone — released outright (nothing to adopt)",
+                    );
+                }
+            }
+        }
+        // Drop this session's in-memory deletion watches and worktree mount
+        // clocks (misc 150) — session-keyed lifecycle state the demoted root no
+        // longer needs (its lifetime is now the ephemeral idle clock). Idempotent
+        // vs the reaper and the GC.
         if let Some(ref watcher) = ctx.worktree_watcher {
             watcher.unregister_with_prefix(&prefix);
         }
-        // Drop this session's worktree idle clocks (misc 150) and subagent board
-        // entries (tui-rework 03).
         ctx.worktree_mounts.remove_prefix(&prefix);
         ctx.subagents.clear_session(session_id);
-        if removed > 0 {
+        if demoted > 0 || released > 0 {
             info!(
                 source = Source::DaemonDispatch.as_str(),
                 session_id = %session_id,
-                count = removed,
+                demoted = demoted,
+                released = released,
                 trigger = trigger,
-                "released session: swept leaked worktree roots",
+                "released session: swept worktree roots (demoted present, released gone)",
             );
         } else {
             debug!(
@@ -5017,8 +5268,13 @@ async fn release_session(ctx: &HookDispatchContext, session_id: &str, trigger: &
             );
         }
 
-        // Sync the reduced root set — shuts down the released roots' per-root
-        // servers.
+        // Sync the reduced-or-re-keyed root set. A demoted root stays in the union
+        // (its server stays warm — no shutdown/re-index churn); only a released
+        // gone-dir root leaves it. Same `sync_roots` path a pinned root's removal
+        // rides. Then measure the RSS a release actually reclaimed (ws49-02, part
+        // 4): the freed delta is bounded by glibc arena retention (bug 136), so
+        // the figure is honest about what release can and cannot return.
+        let rss_before = self_rss_bytes_or_none();
         let global = tracker.global_roots_rich();
         if let Err(e) = ctx.primary.sync_roots(global).await {
             debug!(
@@ -5026,6 +5282,7 @@ async fn release_session(ctx: &HookDispatchContext, session_id: &str, trigger: &
                 "root sync after {trigger} release failed: {e}",
             );
         }
+        emit_release_rss_receipt(session_id, trigger, released, rss_before);
 
         info!(
             source = Source::DaemonDispatch.as_str(),
@@ -5033,6 +5290,127 @@ async fn release_session(ctx: &HookDispatchContext, session_id: &str, trigger: &
             trigger = trigger,
             "released session: roots cleaned up",
         );
+    }
+}
+
+/// The daemon self-RSS in bytes on Linux, `None` elsewhere — a cfg shim over
+/// [`self_rss_bytes`] so the release path can call it unconditionally (ws49-02).
+///
+/// The vanish edge is Linux-only (`/proc/<pid>` liveness), so a non-Linux daemon
+/// never reaches the demotion path with a real release to measure; returning
+/// `None` off Linux keeps the receipt honest (no figure fabricated) without a
+/// second cfg block at the call site.
+#[cfg(unix)]
+fn self_rss_bytes_or_none() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        self_rss_bytes()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Emits the freed-RSS receipt for a root release (ws49-02, part 4; the
+/// RESOURCES "measure and surface" ruling).
+///
+/// Logs the daemon self-RSS after the `sync_roots` that tore down any released
+/// root's servers, and the delta from `rss_before`. A demotion frees nothing
+/// (the root stays warm), so the figure is meaningful only when at least one root
+/// was `released` outright — but it is emitted regardless so the field data shows
+/// the arena-retention floor (a warm daemon's RSS barely moving on a demote is
+/// itself the evidence). Routine lifecycle: `info!` when a release happened,
+/// `debug!` for a demote-only pass — never `warn!`/`error!`.
+///
+/// `saturating_sub` guards the delta: RSS can rise across the sync (allocator
+/// bookkeeping, a concurrent request), and a negative "freed" figure would be a
+/// nonsense receipt, so an increase reads as `0` freed with the honest
+/// `rss_after` alongside.
+#[cfg(unix)]
+fn emit_release_rss_receipt(
+    session_id: &str,
+    trigger: &str,
+    released: usize,
+    rss_before: Option<u64>,
+) {
+    let Some(before) = rss_before else {
+        return; // No baseline (non-Linux, or unreadable statm) — no receipt.
+    };
+    let after = self_rss_bytes_or_none().unwrap_or(before);
+    let freed = before.saturating_sub(after);
+    if released > 0 {
+        info!(
+            source = Source::DaemonDispatch.as_str(),
+            session_id = %session_id,
+            trigger = trigger,
+            released_roots = released,
+            rss_before_bytes = before,
+            rss_after_bytes = after,
+            rss_freed_bytes = freed,
+            "release RSS receipt: freed is bounded by glibc arena retention (bug 136)",
+        );
+    } else {
+        debug!(
+            source = Source::DaemonDispatch.as_str(),
+            session_id = %session_id,
+            trigger = trigger,
+            rss_before_bytes = before,
+            rss_after_bytes = after,
+            "release RSS receipt: demote-only pass (root stays warm — nothing freed)",
+        );
+    }
+}
+
+/// Adopts an orphaned root when a session-keyed contributor for `root` lands
+/// (ws49-02, part 3): drops the demoted `ephemeral:{path}` contributor and its
+/// idle clock, clears the orphan provenance, and — when `root` was in fact an
+/// orphan — emits the vanish→re-adopt interval receipt (the second memory
+/// receipt the ticket measures).
+///
+/// The takeover is *natural*: the session-keyed contributor the caller just
+/// added (a `worktree:*` re-mount, or the `hook` pin) already holds the root in
+/// the union, so dropping the ephemeral holder frees no server — no re-index
+/// churn, the warm server carries straight through. This is the mirror of
+/// [`release_session`]'s demote and reuses the exact contributor pair (the same
+/// `tool/roots-add` upgrade drops). Called by every landing edge; a no-op when
+/// `root` was never orphaned (ordinary coverage), so it composes freely.
+///
+/// Verifies both orders by construction: mount-after-demotion finds the orphan
+/// record and clears it here; mount-before-demotion (the demotion tick arriving
+/// while a session-keyed contributor already holds the path) never records an
+/// orphan, because [`release_session`] only demotes `worktree:{that_session}:*`
+/// contributors — a different session's live mount is untouched and no orphan is
+/// created. Returns `true` iff an orphan was adopted (test signal).
+///
+/// Routine lifecycle: `info!` on an actual adoption, nothing otherwise — never
+/// `warn!`/`error!`.
+#[cfg(unix)]
+fn adopt_orphaned_root(ctx: &HookDispatchContext, tracker: &RootTracker, root: &Path) -> bool {
+    // Drop the demoted ephemeral holder + idle clock regardless — the landing
+    // session-keyed contributor is the root's new owner. Idempotent when no
+    // ephemeral contributor exists (an ordinary first mount).
+    let had_ephemeral = tracker.remove_root(&ephemeral_contributor(root), root);
+    if had_ephemeral {
+        ctx.ephemeral_mounts.remove(root);
+    }
+    // Clear provenance and, if this path was genuinely an orphan, report the
+    // vanish→re-adopt interval — the data that would justify tuning the ephemeral
+    // idle timeout (today's de-facto grace window).
+    match ctx.orphan_provenance.take_orphan(root) {
+        Some(record) => {
+            let interval = Instant::now().saturating_duration_since(record.orphaned_at);
+            info!(
+                source = Source::DaemonDispatch.as_str(),
+                worktree = %root.display(),
+                orphaned_from_session = %record.session_id,
+                vanish_to_readopt_secs = interval.as_secs(),
+                vanish_to_readopt_millis = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX),
+                "adopted orphaned root (warm server carried through; provenance cleared)",
+            );
+            true
+        }
+        None => false,
     }
 }
 
@@ -5682,11 +6060,19 @@ async fn handle_hook_dispatch(
                 // is held only by `ephemeral:*` contributors. The CLI renders the
                 // class distinctly (`catenary roots ls`).
                 let ephemeral = root_is_ephemeral(&sources);
-                serde_json::json!({
+                // Orphan provenance (ws49-02): the `orphaned from session <sid>`
+                // line for a demoted root, so the same board the TUI reads carries
+                // it. `None` for ordinary coverage — the key is then omitted.
+                let orphaned_from = ctx.orphan_provenance.line_for(&path);
+                let mut entry = serde_json::json!({
                     "path": path.display().to_string(),
                     "sources": sources,
                     "ephemeral": ephemeral,
-                })
+                });
+                if let Some(line) = orphaned_from {
+                    entry["orphaned_from"] = serde_json::Value::String(line);
+                }
+                entry
             })
             .collect();
 
@@ -5970,7 +6356,17 @@ async fn handle_hook_dispatch(
             && let Some(cwd) = raw.get("cwd").and_then(|v| v.as_str())
         {
             let roots: HashSet<PathBuf> = tracker.global_roots().into_iter().collect();
-            if let Some(worktree) = worktree_to_auto_mount(Path::new(cwd), &roots) {
+            // Two landing edges resolve to the same worktree mount:
+            //   1. a FRESH mount — `worktree_to_auto_mount` (cwd is a worktree of a
+            //      tracked project, not yet tracked); or
+            //   2. an ORPHAN ADOPTION (ws49-02) — `worktree_to_adopt` (cwd's
+            //      worktree is a demoted orphan a prior session's release left, so
+            //      it IS already tracked and the auto-mount predicate rejected it).
+            // The adoption edge takes precedence only when the fresh one declines,
+            // and both land the same session-keyed `worktree:*` contributor.
+            let mount_target = worktree_to_auto_mount(Path::new(cwd), &roots)
+                .or_else(|| worktree_to_adopt(Path::new(cwd), &ctx.orphan_provenance));
+            if let Some(worktree) = mount_target {
                 // Uniformly path-shaped (`worktree:{session}:{canonical-path}`):
                 // the teardown routes (SubagentStop, WorktreeRemove) rebuild the
                 // exact key by canonicalizing the same worktree path, so no
@@ -5979,6 +6375,14 @@ async fn handle_hook_dispatch(
                 // identity lookups (root-ownership 04, AUDIT #10/#11).
                 let (_canonical, contributor) = worktree_contributor(&session_id, &worktree);
                 tracker.set_roots(&contributor, vec![worktree.clone()]);
+                // Adoption (ws49-02, part 3): if this path is an orphan a prior
+                // session's release demoted, the session-keyed mount just landed
+                // takes it over — drop the demoted `ephemeral:*` holder and its
+                // idle clock, clear provenance, and report the vanish→re-adopt
+                // interval. The warm server carries straight through (the mount
+                // already holds the root in the union, so no server drops). A
+                // no-op for an ordinary first mount (no orphan to adopt).
+                adopt_orphaned_root(&ctx, tracker, &worktree);
                 // Track the mounted worktree root (root-ownership 04): a LIVE
                 // worktree is pinned-class (no countdown) — its release edge is
                 // the vanish-watch — until its subagent stops dirty, when the
@@ -6784,11 +7188,11 @@ async fn handle_hook_dispatch(
                 // Upgrade an ephemerally-mounted root to pinned (ticket 02): drop
                 // its `ephemeral:*` contributor and idle clock so it no longer
                 // expires. The `hook` contributor just added keeps the root in the
-                // union, so this drops no server — no re-index churn.
-                let upgraded = tracker.remove_root(&ephemeral_contributor(&canonical), &canonical);
-                if upgraded {
-                    ctx.ephemeral_mounts.remove(&canonical);
-                }
+                // union, so this drops no server — no re-index churn. A pin is also
+                // an adoption edge (ws49-02): if the root is an orphan a vanished
+                // session's release demoted, this takes it over and clears the
+                // provenance, reporting the vanish→re-adopt interval.
+                let upgraded = adopt_orphaned_root(&ctx, tracker, &canonical);
                 let global = tracker.global_roots_rich();
                 if let Err(e) = ctx.primary.sync_roots(global).await {
                     debug!(
@@ -6799,7 +7203,7 @@ async fn handle_hook_dispatch(
                 info!(
                     source = Source::DaemonDispatch.as_str(),
                     path = %canonical.display(),
-                    upgraded_from_ephemeral = upgraded,
+                    adopted_orphan = upgraded,
                     "added root via hook contributor",
                 );
                 // Persistence leg (misc 175): record the pin in the user config's
@@ -12661,6 +13065,37 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Round-trip `tool/roots-ls` and return `(path, ephemeral, orphaned_from)`
+    /// per root (ws49-02) — the class bool and the orphan provenance line the
+    /// demotion surfaces on the board.
+    async fn roots_ls_full(ipc_path: &Path) -> Vec<(String, bool, Option<String>)> {
+        let resp = hook_roundtrip(ipc_path, &serde_json::json!({"method": "tool/roots-ls"})).await;
+        let json: serde_json::Value = serde_json::from_str(&resp).expect("roots-ls json");
+        json.get("roots")
+            .and_then(|r| r.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|e| {
+                        let path = e
+                            .get("path")
+                            .and_then(serde_json::Value::as_str)
+                            .expect("path")
+                            .to_string();
+                        let ephemeral = e
+                            .get("ephemeral")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        let orphaned_from = e
+                            .get("orphaned_from")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string);
+                        (path, ephemeral, orphaned_from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn subagent_start_mounts_worktree_when_canonical_root_tracked() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -13636,11 +14071,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn session_end_sweeps_only_that_sessions_worktree_roots() {
-        // Leak backstop (graceful tier): `session-end/cleanup` for session 1
-        // removes every `worktree:sess-1:*` contributor while session 2's
-        // worktree and the project roots survive (the sweep is keyed by the
-        // `session_id` baked into the contributor key).
+    async fn session_end_demotes_only_that_sessions_worktree_roots() {
+        // ws49-02 (unified SessionEnd): `session-end/cleanup` for session 1 routes
+        // through the SAME `release_session` the vanish watch uses — so the
+        // graceful edge DEMOTES too. Session 1's worktree (dir present) becomes an
+        // ephemeral orphan (`orphaned from session sess-1`); session 2's live
+        // worktree and the project roots are untouched (the demote re-keys only
+        // `worktree:sess-1:*`). This is the "mount BEFORE the demotion tick" order:
+        // session 2's live mount, present when session 1 ends, is never demoted, so
+        // no orphan is created for it.
         let dir = tempfile::tempdir().expect("create tempdir");
         let ipc_path = ipc_socket_in(dir.path());
         let base = dir.path().canonicalize().expect("canonicalize");
@@ -13689,18 +14128,21 @@ mod tests {
         )
         .await;
 
-        let before = roots_ls(&ipc_path).await;
-        assert!(
-            before.iter().any(|(p, _)| Path::new(p) == worktree_a),
-            "precondition: sess-1 worktree mounted",
+        // Both mounts are pinned-class (worktree:*), no orphan provenance.
+        let before = roots_ls_full(&ipc_path).await;
+        assert_eq!(
+            before.iter().find(|e| Path::new(&e.0) == worktree_a),
+            Some(&(worktree_a.display().to_string(), false, None)),
+            "precondition: sess-1 worktree mounted, pinned, not orphaned",
         );
-        assert!(
-            before.iter().any(|(p, _)| Path::new(p) == worktree_b),
-            "precondition: sess-2 worktree mounted",
+        assert_eq!(
+            before.iter().find(|e| Path::new(&e.0) == worktree_b),
+            Some(&(worktree_b.display().to_string(), false, None)),
+            "precondition: sess-2 worktree mounted, pinned, not orphaned",
         );
 
-        // Graceful end for sess-1 only — sweeps worktree:sess-1:* (no
-        // WorktreeRemove was sent for it).
+        // Graceful end for sess-1 only — DEMOTES worktree:sess-1:* (no
+        // WorktreeRemove was sent for it, and the dir still exists).
         let _ = hook_roundtrip(
             &ipc_path,
             &serde_json::json!({
@@ -13710,22 +14152,172 @@ mod tests {
         )
         .await;
 
-        let after = roots_ls(&ipc_path).await;
-        assert!(
-            !after.iter().any(|(p, _)| Path::new(p) == worktree_a),
-            "sess-1's worktree root swept at session end: {after:?}",
+        let after = roots_ls_full(&ipc_path).await;
+        // sess-1's worktree DEMOTED: still tracked, now ephemeral, orphaned.
+        assert_eq!(
+            after.iter().find(|e| Path::new(&e.0) == worktree_a),
+            Some(&(
+                worktree_a.display().to_string(),
+                true,
+                Some("orphaned from session sess-1".to_string()),
+            )),
+            "sess-1's worktree DEMOTED to an orphan at session end: {after:?}",
+        );
+        // sess-2's live worktree is UNTOUCHED — pinned, never orphaned (the
+        // mount-before-demotion order: a different session's live mount is never
+        // demoted).
+        assert_eq!(
+            after.iter().find(|e| Path::new(&e.0) == worktree_b),
+            Some(&(worktree_b.display().to_string(), false, None)),
+            "sess-2's live worktree survives untouched: {after:?}",
         );
         assert!(
-            after.iter().any(|(p, _)| Path::new(p) == worktree_b),
-            "sess-2's worktree (different session prefix) survives: {after:?}",
+            after.iter().any(|(p, ..)| Path::new(p) == project_a),
+            "project_a (hook contributor) survives the demotion",
         );
         assert!(
-            after.iter().any(|(p, _)| Path::new(p) == project_a),
-            "project_a (hook contributor) survives the worktree sweep",
-        );
-        assert!(
-            after.iter().any(|(p, _)| Path::new(p) == project_b),
+            after.iter().any(|(p, ..)| Path::new(p) == project_b),
             "project_b (hook contributor) survives",
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "sequential lifecycle: mount → demote → adopt → re-demote, read end-to-end"
+    )]
+    async fn session_end_demote_then_remount_adopts_the_orphan() {
+        // ws49-02, part 3 — the "mount AFTER the demotion tick" order, in-process
+        // and deterministic (no vanish-watch timing): sess-1 ends → its worktree
+        // demotes to an orphan; a DIFFERENT session re-mounts the same path → the
+        // session-keyed worktree contributor lands, ADOPTS the warm orphan (drops
+        // the ephemeral holder, clears provenance), and the root is pinned-class
+        // again. Then a graceful end for the ADOPTING session re-demotes it — the
+        // orphan economy is repeatable, and provenance now names the new session.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let ipc_path = ipc_socket_in(dir.path());
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (project, worktree) = linked_worktree_layout(&base);
+
+        let manager = Arc::new(bind_with_session(dir.path()));
+        let shutdown = manager.shutdown_token();
+        let m = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = m.accept_loop().await;
+        });
+
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "tool/roots-add",
+                "path": project.display().to_string(),
+            }),
+        )
+        .await;
+        // sess-1 mounts the worktree (pinned-class).
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "subagent-start/mount-worktree",
+                "session_id": "sess-1",
+                "cwd": worktree.display().to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            roots_ls_full(&ipc_path)
+                .await
+                .into_iter()
+                .find(|e| Path::new(&e.0) == worktree),
+            Some((worktree.display().to_string(), false, None)),
+            "precondition: worktree mounted pinned under sess-1",
+        );
+
+        // sess-1 ends → demote to orphan.
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "session-end/cleanup",
+                "session_id": "sess-1",
+            }),
+        )
+        .await;
+        assert_eq!(
+            roots_ls_full(&ipc_path)
+                .await
+                .into_iter()
+                .find(|e| Path::new(&e.0) == worktree),
+            Some((
+                worktree.display().to_string(),
+                true,
+                Some("orphaned from session sess-1".to_string()),
+            )),
+            "sess-1's worktree is now an orphan",
+        );
+        // The orphan is adoptable: the same path is tracked, and its enclosing
+        // worktree resolves to itself with provenance present.
+        {
+            let ctx = manager.hook_ctx.as_ref().expect("hook_ctx");
+            assert!(
+                worktree_to_adopt(&worktree, &ctx.orphan_provenance).is_some(),
+                "the demoted orphan is adoptable by a re-mount",
+            );
+        }
+
+        // A returning session re-mounts the SAME worktree path → adopts.
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "subagent-start/mount-worktree",
+                "session_id": "sess-2",
+                "cwd": worktree.display().to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            roots_ls_full(&ipc_path)
+                .await
+                .into_iter()
+                .find(|e| Path::new(&e.0) == worktree),
+            Some((worktree.display().to_string(), false, None)),
+            "the re-mount ADOPTED the orphan: pinned-class again, provenance cleared",
+        );
+        // The adopting session holds the session-keyed contributor now.
+        let sources: Vec<String> = roots_ls(&ipc_path)
+            .await
+            .into_iter()
+            .find(|(p, _)| Path::new(p) == worktree)
+            .map(|(_, s)| s)
+            .expect("worktree present");
+        assert_eq!(
+            sources,
+            vec![format!("worktree:sess-2:{}", worktree.display())],
+            "held by the adopting session's worktree contributor only",
+        );
+
+        // The orphan economy repeats: ending the adopting session re-demotes, now
+        // orphaned from sess-2.
+        let _ = hook_roundtrip(
+            &ipc_path,
+            &serde_json::json!({
+                "method": "session-end/cleanup",
+                "session_id": "sess-2",
+            }),
+        )
+        .await;
+        assert_eq!(
+            roots_ls_full(&ipc_path)
+                .await
+                .into_iter()
+                .find(|e| Path::new(&e.0) == worktree),
+            Some((
+                worktree.display().to_string(),
+                true,
+                Some("orphaned from session sess-2".to_string()),
+            )),
+            "re-demotion re-keys the provenance to the adopting session",
         );
 
         shutdown.cancel();
@@ -14182,6 +14774,7 @@ mod tests {
 
         let tracker = RootTracker::new();
         let mounts = EphemeralMounts::new();
+        let provenance = OrphanProvenance::new();
 
         let pinned = PathBuf::from("/p/Catenary");
         let ephemeral = PathBuf::from("/p/Scratch");
@@ -14197,6 +14790,7 @@ mod tests {
         let board = RootBoardImpl {
             tracker,
             ephemeral_mounts: mounts,
+            orphan_provenance: provenance,
         };
         // `list_roots` sorts by path: Catenary before Scratch.
         let roots = board.roots();
@@ -14214,6 +14808,10 @@ mod tests {
             cat.idle_remaining_secs.is_none(),
             "a pinned root has no idle clock",
         );
+        assert!(
+            cat.orphaned_from.is_none(),
+            "a pinned root is not an orphan"
+        );
 
         let scratch = &roots[1];
         assert_eq!(scratch.path, "/p/Scratch");
@@ -14226,6 +14824,194 @@ mod tests {
             remaining <= EPHEMERAL_ROOT_IDLE_TIMEOUT.as_secs()
                 && remaining + 5 >= EPHEMERAL_ROOT_IDLE_TIMEOUT.as_secs(),
             "idle-remaining sits just under the full band: {remaining}",
+        );
+        assert!(
+            scratch.orphaned_from.is_none(),
+            "an ordinary activity mount carries no orphan provenance",
+        );
+    }
+
+    #[test]
+    fn root_board_surfaces_orphan_provenance_line() {
+        // ws49-02, part 2: a demoted root (ephemeral contributor + recorded
+        // provenance) reads as `orphaned from session <sid>` on the board — the
+        // orphan is an ordinary ephemeral entry PLUS this display metadata, never
+        // a new lifecycle class (`ephemeral` stays `true`, sources stay the plain
+        // ephemeral key).
+        use crate::state_snapshot::RootBoard;
+
+        let tracker = RootTracker::new();
+        let mounts = EphemeralMounts::new();
+        let provenance = OrphanProvenance::new();
+
+        let orphan = PathBuf::from("/p/orphan-wt");
+        tracker.add_roots(
+            &ephemeral_contributor(&orphan),
+            std::slice::from_ref(&orphan),
+        );
+        mounts.touch(&orphan, Instant::now());
+        provenance.record(&orphan, "sess-gone", Instant::now());
+
+        let board = RootBoardImpl {
+            tracker,
+            ephemeral_mounts: mounts,
+            orphan_provenance: provenance,
+        };
+        let roots = board.roots();
+        assert_eq!(roots.len(), 1);
+        let entry = &roots[0];
+        assert!(
+            entry.ephemeral,
+            "an orphan is still an ordinary ephemeral entry (no new class)",
+        );
+        assert_eq!(
+            entry.sources,
+            vec![ephemeral_contributor(&orphan)],
+            "held only by the plain ephemeral contributor",
+        );
+        assert_eq!(
+            entry.orphaned_from.as_deref(),
+            Some("orphaned from session sess-gone"),
+            "the provenance line names the vanished session",
+        );
+    }
+
+    #[test]
+    fn orphan_provenance_take_and_clear() {
+        // The adoption/expiry primitives (ws49-02): `record` then `take_orphan`
+        // returns the record once (adoption) and `None` after; `clear` drops it
+        // unconditionally (idle expiry). `line_for` reflects presence.
+        let provenance = OrphanProvenance::new();
+        let root = PathBuf::from("/p/wt");
+        let t0 = Instant::now();
+
+        assert!(provenance.line_for(&root).is_none(), "no orphan yet");
+        provenance.record(&root, "sess-1", t0);
+        assert_eq!(
+            provenance.line_for(&root).as_deref(),
+            Some("orphaned from session sess-1"),
+        );
+
+        let taken = provenance.take_orphan(&root).expect("orphan present");
+        assert_eq!(taken.session_id, "sess-1");
+        assert_eq!(taken.orphaned_at, t0);
+        assert!(
+            provenance.take_orphan(&root).is_none(),
+            "adoption consumes the orphan exactly once",
+        );
+        assert!(provenance.line_for(&root).is_none(), "cleared after take");
+
+        // `clear` is the idle-expiry path — idempotent and unconditional.
+        provenance.record(&root, "sess-2", t0);
+        provenance.clear(&root);
+        assert!(provenance.line_for(&root).is_none(), "cleared");
+        provenance.clear(&root); // no-op on absent
+    }
+
+    #[test]
+    fn worktree_to_adopt_gates_on_orphan_provenance() {
+        // The re-mount adoption predicate (ws49-02): resolves the enclosing
+        // worktree of a cwd and returns it ONLY when that worktree carries orphan
+        // provenance — an ordinary (never-orphaned) worktree is not adoptable
+        // here, so a subagent-start in it is not a takeover.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        let (_project, worktree) = linked_worktree_layout(&base);
+        let subdir = worktree.join("src");
+        std::fs::create_dir_all(&subdir).expect("mkdir src");
+        let worktree = worktree.canonicalize().expect("canonicalize worktree");
+
+        let orphans = OrphanProvenance::new();
+        // No provenance → not adoptable, even from a subdirectory cwd.
+        assert!(
+            worktree_to_adopt(&subdir, &orphans).is_none(),
+            "a non-orphan worktree is not adoptable",
+        );
+
+        // A cwd enclosing no worktree is never adoptable (checked before we move
+        // `worktree` into the adoptable assertion below).
+        assert!(
+            worktree_to_adopt(&base, &orphans).is_none(),
+            "a cwd with no enclosing worktree is not adoptable",
+        );
+
+        // Record provenance for the worktree → adoptable, resolving the enclosing
+        // worktree from a subdirectory cwd.
+        orphans.record(&worktree, "sess-gone", Instant::now());
+        assert_eq!(
+            worktree_to_adopt(&subdir, &orphans),
+            Some(worktree),
+            "an orphan is adoptable, resolved from a subdirectory cwd",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn self_rss_bytes_reads_a_plausible_figure() {
+        // The freed-RSS measurement helper (ws49-02, part 4): reads the daemon's
+        // own resident set from `/proc/self/statm`. A live process always has a
+        // non-zero RSS, and it must be a whole number of 4 KiB pages.
+        let rss = self_rss_bytes().expect("statm readable for the test process");
+        assert!(rss > 0, "a live process has non-zero RSS");
+        assert_eq!(rss % 4096, 0, "RSS is a whole number of 4 KiB pages: {rss}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "measurement, not an invariant: run explicitly to quantify the arena-retention gap (ws49-02)"]
+    fn measure_arena_retention_gap() {
+        // ws49-02, part 4 — the freed-RSS receipt's method, made concrete: glibc
+        // returns MANY SMALL freed allocations to its per-arena free lists, NOT to
+        // the kernel, so a process's RSS barely drops when they are freed. This is
+        // exactly bug 136's mechanism — the daemon's own churn is small protocol
+        // buffers, not one big block (a single large alloc goes through `mmap` and
+        // DOES `munmap` back, which is why only the small-allocation path shows the
+        // gap). Measuring here with the same `self_rss_bytes` reader the release
+        // path uses gives the report a real number with method, not a fabrication.
+        //
+        // Allocates ~64 MiB as ~1M small boxed blocks (below the mmap threshold, so
+        // they land in the arenas), samples RSS, frees them all, samples again. The
+        // RSS still held after the free is the retention gap. Writes the figures to
+        // `target/` for the report. `#[ignore]` so `make check` never runs a
+        // measurement.
+        const BLOCK: usize = 64; // below M_MMAP_THRESHOLD → arena-allocated
+        const COUNT: usize = 1024 * 1024; // ~64 MiB of live small allocations
+        let rss_baseline = self_rss_bytes().expect("statm readable");
+        let mut blocks: Vec<Box<[u8; BLOCK]>> = Vec::with_capacity(COUNT);
+        for i in 0..COUNT {
+            let mut b = Box::new([0u8; BLOCK]);
+            b[0] = u8::try_from(i & 0xff).unwrap_or(0); // touch → page resident
+            blocks.push(b);
+        }
+        // A read the optimizer cannot elide, keeping the blocks live to here.
+        let live = blocks.iter().map(|b| u64::from(b[0])).sum::<u64>();
+        let rss_allocated = self_rss_bytes().expect("statm readable");
+        drop(blocks);
+        let rss_after_free = self_rss_bytes().expect("statm readable");
+
+        let grew = rss_allocated.saturating_sub(rss_baseline);
+        let returned = rss_allocated.saturating_sub(rss_after_free);
+        let retained = rss_after_free.saturating_sub(rss_baseline);
+        let report = format!(
+            "arena-retention-gap measurement (ws49-02)\n\
+             block_bytes      = {BLOCK}\n\
+             block_count      = {COUNT}\n\
+             live_checksum    = {live}\n\
+             rss_baseline     = {rss_baseline}\n\
+             rss_allocated    = {rss_allocated}  (grew {grew})\n\
+             rss_after_free   = {rss_after_free}  (returned {returned}, retained {retained})\n\
+             note: `retained` is the RSS glibc kept in its arenas after freeing many\n\
+             small blocks — the gap that bounds what a root release can reclaim\n\
+             (MALLOC_ARENA_MAX=2, ticket 04, shrinks it). Numbers vary run-to-run\n\
+             with allocator state; the method is fixed.\n"
+        );
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("ws49-02-arena-retention.txt");
+        let _ = std::fs::write(&out, &report);
+        assert!(
+            grew >= (BLOCK * COUNT) as u64 / 4,
+            "many small allocations must grow RSS materially (grew {grew})",
         );
     }
 

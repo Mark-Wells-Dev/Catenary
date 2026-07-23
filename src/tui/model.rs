@@ -108,6 +108,11 @@ pub struct RootRow {
     pub ephemeral: bool,
     /// Seconds until an ephemeral root expires, when tracked.
     pub idle_remaining_secs: Option<u64>,
+    /// Orphan provenance (ws49-02): `orphaned from session <sid>` when this root
+    /// is an ephemeral entry a vanished/ended session's release demoted — an
+    /// orphan riding out its idle window. `None` for ordinary coverage. Renders
+    /// as a marker so the TUI distinguishes an orphan from a plain activity mount.
+    pub orphaned_from: Option<String>,
     /// Whether this root is currently expanded (server rows shown).
     pub expanded: bool,
     /// Servers up (healthy/busy/initializing/probing) in this root.
@@ -493,6 +498,7 @@ pub fn build_root_tree(
                 sources: meta.map(|m| m.sources.clone()).unwrap_or_default(),
                 ephemeral: meta.is_some_and(|m| m.ephemeral),
                 idle_remaining_secs: meta.and_then(|m| m.idle_remaining_secs),
+                orphaned_from: meta.and_then(|m| m.orphaned_from.clone()),
                 expanded: expanded_roots.contains(path),
                 up,
                 total: servers.len(),
@@ -1036,6 +1042,7 @@ mod tests {
             ephemeral: true,
             sources: vec!["ephemeral:query".to_string()],
             idle_remaining_secs: Some(42),
+            orphaned_from: None,
         });
         let rows = build_root_tree(&snap, &[], None, &HashSet::new(), false);
         let Row::Root(r) = &rows[0] else {

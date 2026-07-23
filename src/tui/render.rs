@@ -371,6 +371,13 @@ fn root_parts(
         );
         left.push(Span::styled(format!("  {idle}"), theme.timestamp));
     }
+    // Orphan marker (ws49-02): a demoted root riding out its idle window as its
+    // grace period reads `[orphan]`, distinguishing it from a plain activity
+    // mount. The full `orphaned from session <sid>` line surfaces in the detail
+    // pane (`root_detail`).
+    if r.orphaned_from.is_some() {
+        left.push(Span::styled("  [orphan]".to_string(), theme.muted));
+    }
     // The durable-lock badge (root-ownership stage 6): a root a cook holds shows
     // `[locked N]` when N files await diagnosis, `[locked]` when the lock is paid
     // (inside its idle window). Read from the state dir at rebuild time — a
@@ -1016,6 +1023,11 @@ fn root_detail(path: &str, snapshot: &Snapshot, theme: &Theme) -> Vec<Line<'stat
                 .map_or_else(|| "tracked".to_string(), |s| format!("{s}s remaining"));
             lines.push(kv("idle", idle, theme));
         }
+        // Orphan provenance (ws49-02): the full `orphaned from session <sid>` line
+        // for a demoted root, so the detail pane names where the orphan came from.
+        if let Some(line) = &meta.orphaned_from {
+            lines.push(kv("orphan", line.clone(), theme));
+        }
     }
     // The durable-lock facts (root-ownership stage 6, deliverable 1): the owner
     // label, the due count, and the last-activity age — read fresh from the
@@ -1453,6 +1465,7 @@ mod tests {
             sources: vec!["hook".to_string()],
             ephemeral: false,
             idle_remaining_secs: None,
+            orphaned_from: None,
             expanded: false,
             up: 1,
             total: 1,
@@ -1503,6 +1516,66 @@ mod tests {
         assert!(
             !text.contains('↑'),
             "a paid lock shows no due count: {text}"
+        );
+    }
+
+    #[test]
+    fn orphan_root_renders_the_orphan_marker_and_detail_line() {
+        // ws49-02: a demoted root (ephemeral + orphan provenance) shows `[orphan]`
+        // on its header row, and the full `orphaned from session <sid>` line in the
+        // detail pane. An ordinary ephemeral mount (no provenance) shows neither.
+        let theme = Theme::new();
+        let icons = IconSet::from_config(crate::config::IconConfig::default());
+
+        let orphan = RootRow {
+            path: "/wt/orphaned".to_string(),
+            sources: vec!["ephemeral:/wt/orphaned".to_string()],
+            ephemeral: true,
+            idle_remaining_secs: Some(300),
+            orphaned_from: Some("orphaned from session sess-gone".to_string()),
+            expanded: false,
+            up: 1,
+            total: 1,
+            worst: None,
+            companion_of: None,
+            lock: None,
+        };
+        let (left, _) = root_parts(&orphan, &theme, &icons);
+        let text: String = left.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("[orphan]"),
+            "a demoted orphan shows the [orphan] marker: {text}"
+        );
+
+        // The detail pane names the source session.
+        let mut snapshot = Snapshot::default();
+        snapshot.roots.push(crate::state_snapshot::RootEntry {
+            path: "/wt/orphaned".to_string(),
+            ephemeral: true,
+            sources: vec!["ephemeral:/wt/orphaned".to_string()],
+            idle_remaining_secs: Some(300),
+            orphaned_from: Some("orphaned from session sess-gone".to_string()),
+        });
+        let detail = root_detail("/wt/orphaned", &snapshot, &theme);
+        let detail_text: String = detail
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(
+            detail_text.contains("orphaned from session sess-gone"),
+            "the detail pane names the vanished session: {detail_text}"
+        );
+
+        // An ordinary ephemeral mount (no provenance) shows no orphan marker.
+        let plain = RootRow {
+            orphaned_from: None,
+            ..orphan
+        };
+        let (left, _) = root_parts(&plain, &theme, &icons);
+        let text: String = left.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !text.contains("[orphan]"),
+            "a plain activity mount shows no orphan marker: {text}"
         );
     }
 

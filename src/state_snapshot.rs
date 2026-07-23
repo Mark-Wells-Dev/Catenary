@@ -498,6 +498,15 @@ pub struct RootEntry {
     /// no ephemeral mount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_remaining_secs: Option<u64>,
+    /// Orphan provenance (ws49-02): `orphaned from session <sid>` when this root
+    /// is an ephemeral entry demoted from a vanished session's worktree mount —
+    /// an orphan riding out its idle window as its grace period. `None` for an
+    /// ordinary activity mount or a pinned root. Display metadata only: the
+    /// contributor stays an ordinary `ephemeral:*` entry, so this adds no
+    /// lifecycle class — the TUI renders it to distinguish an orphan from plain
+    /// coverage. Serde-additive: an older reader ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphaned_from: Option<String>,
 }
 
 /// Source of the live root board, pulled at each snapshot flush.
@@ -2767,12 +2776,14 @@ mod tests {
                 ephemeral: false,
                 sources: vec!["hook".to_string(), "mcp:3".to_string()],
                 idle_remaining_secs: None,
+                orphaned_from: None,
             },
             RootEntry {
                 path: "/p/Lattice".to_string(),
                 ephemeral: true,
                 sources: vec!["ephemeral:/p/Lattice".to_string()],
                 idle_remaining_secs: Some(312),
+                orphaned_from: None,
             },
         ];
         let json = state.to_json(std::slice::from_ref(&session), &roots, Some(3));

@@ -73,12 +73,24 @@ fn init_repo(dir: &Path) {
 /// `isolate_env` clears so the daemon can shell out to `git`; XDG bases stay
 /// isolated per-test.
 fn spawn_daemon(repo: &Path) -> BridgeProcess {
+    spawn_daemon_with_idle(repo, None)
+}
+
+/// Spawns the daemon as [`spawn_daemon`] does, additionally shrinking the
+/// ephemeral-root idle timeout to `idle_ms` when given (ws49-02) so the
+/// demote→expire leg's grace window elapses in milliseconds instead of the
+/// production seven minutes — the idle-shrink half of the `CATENARY_*_MS` test
+/// seam family.
+fn spawn_daemon_with_idle(repo: &Path, idle_ms: Option<u64>) -> BridgeProcess {
     let root = repo.to_str().expect("repo path").to_string();
     BridgeProcess::spawn_with(move |cmd| {
         cmd.env("CATENARY_ROOTS", &root);
         // Shrink the reaper cadence across the process boundary (the same shrink
         // `CATENARY_BIRTH_GRACE_SECS` uses) so the vanish watch fires promptly.
         cmd.env("CATENARY_SWEEP_INTERVAL_MS", "50");
+        if let Some(ms) = idle_ms {
+            cmd.env("CATENARY_EPHEMERAL_IDLE_MS", ms.to_string());
+        }
         if let Some(path) = std::env::var_os("PATH") {
             cmd.env("PATH", path);
         }
@@ -205,8 +217,55 @@ fn wait_for_root_state(socket: &Path, path: &Path, want: bool, timeout: Duration
     }
 }
 
+/// The `tool/roots-ls` entry for `path`, or `None` when the root is not tracked
+/// (ws49-02): `(ephemeral, orphaned_from)` — the class bool and the orphan
+/// provenance line the board carries for a demoted root.
+fn root_entry(socket: &Path, path: &Path) -> Option<(bool, Option<String>)> {
+    let response =
+        ipc_request(socket, &json!({ "method": "tool/roots-ls" })).expect("roots-ls ipc");
+    let json: serde_json::Value = serde_json::from_str(&response).expect("roots-ls json");
+    let target = path.display().to_string();
+    json.get("roots")?.as_array()?.iter().find_map(|entry| {
+        (entry.get("path").and_then(serde_json::Value::as_str) == Some(target.as_str())).then(
+            || {
+                let ephemeral = entry
+                    .get("ephemeral")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let orphaned_from = entry
+                    .get("orphaned_from")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                (ephemeral, orphaned_from)
+            },
+        )
+    })
+}
+
+/// Polls `tool/roots-ls` until `path` reports an `orphaned_from` line (the
+/// demotion landed on the board), or the deadline elapses. Returns the line.
+fn wait_for_orphan_line(socket: &Path, path: &Path, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some((_, Some(line))) = root_entry(socket, path) {
+            return Some(line);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
-fn killed_host_releases_the_session_roots_on_the_next_watch_tick() {
+fn killed_host_demotes_the_worktree_root_to_an_orphan_on_the_next_watch_tick() {
+    // ws49-02, part 1+2: a killed host (no SessionEnd) no longer DROPS its
+    // worktree roots — because the worktree directory still exists, the vanish
+    // watch DEMOTES each into the ephemeral bucket, surfacing `orphaned from
+    // session <sid>` on the board. The root stays tracked (server warm), riding
+    // out the ephemeral idle window as its grace period. This test uses the
+    // production idle timeout, so the orphan cannot expire within the test —
+    // isolating the demotion edge from the expiry edge (proven separately below).
     let repo_dir = tempfile::tempdir().expect("repo dir");
     let repo = repo_dir.path().join("repo");
     init_repo(&repo);
@@ -240,6 +299,12 @@ fn killed_host_releases_the_session_roots_on_the_next_watch_tick() {
         wait_for_root_state(&socket, &canonical_worktree, true, Duration::from_secs(10)),
         "the worktree root is mounted after subagent-start",
     );
+    // A LIVE mount is pinned-class (worktree:*), never ephemeral, never orphaned.
+    assert_eq!(
+        root_entry(&socket, &canonical_worktree),
+        Some((false, None)),
+        "a live worktree mount is pinned-class with no orphan provenance",
+    );
 
     // Spawn a real host process and declare it as the session's host — the hook's
     // ancestry-walk result, delivered on a neutral Read tool call.
@@ -248,30 +313,187 @@ fn killed_host_releases_the_session_roots_on_the_next_watch_tick() {
     let host_start_time = proc_start_time(host_pid);
     declare_host(&socket, session_id, host_pid, host_start_time, &repo);
 
-    // The session is live: its worktree root must NOT be torn down while the host
+    // The session is live: its worktree root must NOT be demoted while the host
     // is alive, even across several watch ticks. Sleep past a few sweeps and
-    // re-check — a false teardown of a live session would show here.
+    // re-check — a false demotion of a live session would show here.
     std::thread::sleep(Duration::from_millis(400));
-    assert!(
-        root_tracked(&socket, &canonical_worktree),
-        "a LIVE host's session keeps its roots across watch ticks",
+    assert_eq!(
+        root_entry(&socket, &canonical_worktree),
+        Some((false, None)),
+        "a LIVE host's worktree root stays pinned across watch ticks — no demotion",
     );
 
     // Kill the host without any SessionEnd — the crash/kill/OOM case. The vanish
-    // watch must detect the gone pid on the next tick and release the session's
-    // roots through the normal path.
+    // watch must detect the gone pid on the next tick and DEMOTE the worktree root
+    // (the dir still exists) through the normal release path.
     host.kill().expect("kill fake host");
     host.wait().expect("reap fake host");
 
-    assert!(
-        wait_for_root_state(&socket, &canonical_worktree, false, Duration::from_secs(10)),
-        "the vanished host's worktree root is released by the vanish watch",
+    // The orphan provenance lands on the board — the demotion edge fired.
+    let orphan_line = wait_for_orphan_line(&socket, &canonical_worktree, Duration::from_secs(10))
+        .expect("the vanished host's worktree root demotes to an orphan");
+    assert_eq!(
+        orphan_line,
+        format!("orphaned from session {session_id}"),
+        "the provenance names the vanished session",
     );
 
-    // Scoped release: the project root the worktree branched from survives — the
-    // normal release path removes only this session's contributions.
+    // Warm, not released: the root is still tracked, now as an ephemeral entry —
+    // the server stays warm for a returning session to adopt.
+    let (ephemeral, orphaned) = root_entry(&socket, &canonical_worktree)
+        .expect("demoted root is still tracked (warm, not released)");
+    assert!(ephemeral, "the demoted root is now an ephemeral entry");
+    assert!(orphaned.is_some(), "and carries orphan provenance");
+
+    // Scoped: the project root the worktree branched from is untouched by the
+    // demotion — the release path only re-keys this session's own contributions.
+    assert_eq!(
+        root_entry(&socket, &canonical_repo).map(|(eph, _)| eph),
+        Some(false),
+        "the project root survives the vanished session's demotion, still pinned",
+    );
+}
+
+#[test]
+fn orphan_idle_expiry_reclaims_the_worktree_root_absent_adoption() {
+    // ws49-02, part 1 (the expiry leg) + acceptance: after the vanish-demotion,
+    // with NOBODY returning to adopt, the ordinary ephemeral idle-expiry reaper
+    // reclaims the orphan. Shrinks the idle window to 300 ms via the test seam so
+    // the grace period elapses within the test — the idle-shrink half of the
+    // `CATENARY_*_MS` family the ticket names.
+    let repo_dir = tempfile::tempdir().expect("repo dir");
+    let repo = repo_dir.path().join("repo");
+    init_repo(&repo);
+
+    let mut bridge = spawn_daemon_with_idle(&repo, Some(300));
+    let state_home = bridge.state_home().to_string();
+
+    let canonical_repo = repo.canonicalize().expect("canonicalize repo");
+    bridge
+        .initialize_with_roots(&[canonical_repo.to_str().expect("repo str")])
+        .expect("initialize with repo root");
+
+    let socket = bridge.wait_for_ipc_socket().expect("socket");
+    bridge
+        .wait_for_root(
+            canonical_repo.to_str().expect("repo str"),
+            Duration::from_secs(10),
+        )
+        .expect("project root tracked");
+
+    let session_id = "orphan-expiry-test";
+    let agent_id = "agent-expiry-1";
+    let worktree = create_worktree(&state_home, &repo, session_id, "agent-expiry");
+    let canonical_worktree = worktree.canonicalize().expect("canonicalize worktree");
+    mount_worktree(&socket, session_id, agent_id, &worktree);
+    assert!(
+        wait_for_root_state(&socket, &canonical_worktree, true, Duration::from_secs(10)),
+        "the worktree root is mounted after subagent-start",
+    );
+
+    let mut host = spawn_fake_host();
+    let host_pid = host.id();
+    let host_start_time = proc_start_time(host_pid);
+    declare_host(&socket, session_id, host_pid, host_start_time, &repo);
+
+    // Kill the host — demote to orphan.
+    host.kill().expect("kill fake host");
+    host.wait().expect("reap fake host");
+    wait_for_orphan_line(&socket, &canonical_worktree, Duration::from_secs(10))
+        .expect("the vanished host's worktree root demotes to an orphan");
+
+    // Nobody adopts within the (shrunk) idle window → the reaper reclaims it.
+    // Both the ephemeral contributor and its orphan provenance leave the board.
+    assert!(
+        wait_for_root_state(&socket, &canonical_worktree, false, Duration::from_secs(10)),
+        "the idle orphan is reclaimed by the ephemeral idle-expiry reaper absent adoption",
+    );
+    // The project root is untouched by the orphan's expiry.
     assert!(
         root_tracked(&socket, &canonical_repo),
-        "the project root survives the vanished session's release",
+        "the project root survives the orphan's idle expiry",
+    );
+}
+
+#[test]
+fn remount_within_the_idle_window_adopts_the_warm_orphan() {
+    // ws49-02, part 3 + acceptance: a session (re)mounting the orphaned path
+    // within the idle window ADOPTS the warm root — the ephemeral contributor
+    // retires when the session-keyed worktree contributor lands, the provenance
+    // clears, and (proof of "no server restart") the root never leaves the union.
+    // Uses the production idle timeout so the window cannot expire during the
+    // test — the adoption, not the reaper, is what clears the orphan.
+    //
+    // This is the "mount AFTER the demotion tick" order (the second of the two
+    // orders); the "mount BEFORE the demotion tick" order holds by construction —
+    // a live session-keyed mount for the path is never demoted, because the
+    // release path only re-keys `worktree:{that_session}:*`, so no orphan is even
+    // created (asserted in the in-process router unit tests).
+    let repo_dir = tempfile::tempdir().expect("repo dir");
+    let repo = repo_dir.path().join("repo");
+    init_repo(&repo);
+
+    let mut bridge = spawn_daemon(&repo);
+    let state_home = bridge.state_home().to_string();
+
+    let canonical_repo = repo.canonicalize().expect("canonicalize repo");
+    bridge
+        .initialize_with_roots(&[canonical_repo.to_str().expect("repo str")])
+        .expect("initialize with repo root");
+
+    let socket = bridge.wait_for_ipc_socket().expect("socket");
+    bridge
+        .wait_for_root(
+            canonical_repo.to_str().expect("repo str"),
+            Duration::from_secs(10),
+        )
+        .expect("project root tracked");
+
+    let session_id = "adopt-test-gone";
+    let agent_id = "agent-adopt-1";
+    let worktree = create_worktree(&state_home, &repo, session_id, "agent-adopt");
+    let canonical_worktree = worktree.canonicalize().expect("canonicalize worktree");
+    mount_worktree(&socket, session_id, agent_id, &worktree);
+    assert!(
+        wait_for_root_state(&socket, &canonical_worktree, true, Duration::from_secs(10)),
+        "the worktree root is mounted after subagent-start",
+    );
+
+    let mut host = spawn_fake_host();
+    let host_pid = host.id();
+    let host_start_time = proc_start_time(host_pid);
+    declare_host(&socket, session_id, host_pid, host_start_time, &repo);
+
+    // Kill the host — demote to orphan.
+    host.kill().expect("kill fake host");
+    host.wait().expect("reap fake host");
+    wait_for_orphan_line(&socket, &canonical_worktree, Duration::from_secs(10))
+        .expect("the vanished host's worktree root demotes to an orphan");
+
+    // A returning session re-mounts the same path (host restart / upgrade). The
+    // session-keyed worktree contributor lands and ADOPTS the warm orphan.
+    let returning_session = "adopt-test-returned";
+    mount_worktree(&socket, returning_session, "agent-returned", &worktree);
+
+    // Adoption: provenance clears and the root is pinned-class again (a
+    // session-keyed worktree contributor holds it). The root NEVER left the
+    // union across demotion→adoption — the warm server carried straight through.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match root_entry(&socket, &canonical_worktree) {
+            Some((false, None)) => break, // pinned again, no orphan line — adopted
+            other => {
+                assert!(
+                    Instant::now() < deadline,
+                    "re-mount did not adopt the orphan in time (last: {other:?})",
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    // The root was continuously tracked — adoption never dropped it (no restart).
+    assert!(
+        root_tracked(&socket, &canonical_worktree),
+        "the adopted root stays tracked — the warm server was never torn down",
     );
 }
