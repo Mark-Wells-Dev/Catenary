@@ -60,6 +60,8 @@ pub mod recipes;
 pub mod registry;
 /// Daemon session manager and MCP socket listener.
 pub mod router;
+/// Always-on service management: systemd `--user` unit / launchd plist (ws49-04).
+pub mod service;
 /// Canonical `source` taxonomy for structured tracing events.
 pub mod source;
 /// Daemon-owned `state.json` live-state snapshot.

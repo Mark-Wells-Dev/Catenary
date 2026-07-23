@@ -126,6 +126,13 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
         }
     }
 
+    // Service + idle-footprint line (ws49-04): the daemon is always-on under a
+    // service manager, so surface whether the service is installed and — when a
+    // daemon is up — its idle resident set (the figure MALLOC_ARENA_MAX=2
+    // bounds). Daemon down ⇒ no snapshot ⇒ no footprint.
+    render_service_section(out);
+    let _ = out.writeln(format_args!(""));
+
     // Config migration walk — runs before the load so its rename guidance can
     // print above a config-load error. A non-empty set also lets the load-error
     // path drop the self-referential "run catenary doctor" pointer.
@@ -330,6 +337,69 @@ async fn gather_probe_feed(
     let (active_languages, provenance) = crate::health::servers::activity_inputs(&activity);
 
     ProbeFeed::new(statuses, active_languages, daemon_version).with_provenance(provenance)
+}
+
+/// Render the service state + the idle daemon's footprint (ws49-04).
+///
+/// The daemon runs always-on under a per-user service manager (`catenary
+/// service install`), so this reports whether the service is installed and, when
+/// a daemon is up, its idle resident set — the RSS figure `MALLOC_ARENA_MAX=2`
+/// (carried in the service unit) bounds. The footprint reads the *daemon's*
+/// `/proc/<pid>/statm` by the pid on the snapshot, the ws49-02 helper's method
+/// parameterized by pid (Linux only; `None` elsewhere, and the line simply omits
+/// the figure). Daemon down ⇒ no snapshot ⇒ no footprint, honestly.
+fn render_service_section(out: &mut Output) {
+    let _ = out.writeln(format_args!("{}:", out.colors.bold("Service")));
+    let installed = crate::service::is_installed();
+    let manager = crate::service::manager_label();
+    if installed {
+        let _ = out.writeln(format_args!(
+            "  {} installed ({manager})",
+            out.colors.green("✓"),
+        ));
+    } else {
+        let _ = out.writeln(format_args!(
+            "  {} not installed — daemon spawns on demand; \
+             `catenary service install` to run it always-on ({manager})",
+            out.colors.dim("○"),
+        ));
+    }
+
+    match read_snapshot()
+        .map(|s| s.daemon.pid)
+        .filter(|pid| *pid != 0)
+    {
+        Some(pid) => match crate::service::idle_footprint_bytes(pid) {
+            Some(bytes) => {
+                let _ = out.writeln(format_args!(
+                    "  idle footprint: {} (RSS, pid {pid}; bounded by MALLOC_ARENA_MAX=2)",
+                    format_mib(bytes),
+                ));
+            }
+            None => {
+                let _ = out.writeln(format_args!(
+                    "  idle footprint: {}",
+                    out.colors.dim("unavailable on this platform"),
+                ));
+            }
+        },
+        None => {
+            let _ = out.writeln(format_args!(
+                "  idle footprint: {}",
+                out.colors.dim("no daemon running"),
+            ));
+        }
+    }
+}
+
+/// Format a byte count as a one-decimal MiB string (e.g. `82.4 MiB`).
+fn format_mib(bytes: u64) -> String {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "display formatting; MiB precision is ample for an RSS figure"
+    )]
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    format!("{mib:.1} MiB")
 }
 
 /// Render the language→server routing table with each server's capabilities.

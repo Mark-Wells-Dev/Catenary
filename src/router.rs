@@ -3001,20 +3001,17 @@ impl crate::hitstream::BatchEnricher for HitstreamAnnotator<'_> {
     }
 }
 
-/// Grace window between the MCP connection census reaching zero and the
-/// daemon's "last client disconnected" exit (pulse-03).
-///
-/// Host-driven bridge churn — SIGINT at session transitions, resumes, model
-/// switches — drops the census to zero for moments at a time; exiting on the
-/// instant zero tore down the warm LSP fleet four times in 25 minutes during
-/// the 2026-07-17 incident. The accept loop instead arms this window and
-/// exits only if the census is still zero when it expires; a connection
-/// arriving during the window disarms it. Ticket 90's abandoned-daemon exit
-/// is debounced, not replaced — a genuinely abandoned daemon still exits,
-/// one grace window late. Tests inject a smaller window via
-/// [`SessionManager::disconnect_grace_override`].
-#[cfg(unix)]
-const DISCONNECT_GRACE: Duration = Duration::from_mins(1);
+// The last-client-disconnect self-exit (pulse-03, ticket 90) is RETIRED in
+// production (ws49-04): an always-on daemon does not exit itself — the service
+// manager (`catenary service install`, systemd `--user` / launchd) owns its
+// lifetime. Production builds the manager with `disconnect_grace: None`, so the
+// accept loop's `disconnect.notified()` arm never arms a deadline and the
+// daemon stays resident through census zero. The arm and its
+// `disconnect_grace_override` test seam survive so the in-process lifecycle
+// tests still exercise the (now test-only) disconnect-exit path in
+// milliseconds. Bug 131's never-served birth grace and bug 129's
+// socket-vanished tripwire are unaffected — they are reap/self-defense guards,
+// not idle exits, and both stay armed in production.
 
 /// How often the accept loop verifies that its own socket files still exist
 /// (bug 129 fix C — ghost self-defense tripwire).
@@ -3030,12 +3027,15 @@ const TRIPWIRE_INTERVAL: Duration = Duration::from_secs(30);
 /// Idle window between a daemon's birth and its "never served a client"
 /// exit (bug 131).
 ///
-/// The daemon's exit lifecycle is disconnect-event-driven: a
-/// last-bridge-disconnect arms [`DISCONNECT_GRACE`]. A daemon born into
-/// silence — spawned by a restart race, an accidental `catenary start`, a
-/// test that never connected — therefore never armed anything and lived
-/// forever. Birth grace bounds that: a daemon that has **never** been
-/// served exits cleanly when this window expires.
+/// The daemon born into silence — spawned by a restart race, an accidental
+/// `catenary start`, a test that never connected — never arms any exit and
+/// would live forever (the last-client-disconnect exit that formerly owned the
+/// idle lifecycle is retired under always-on, ws49-04, and never armed for an
+/// unserved daemon anyway). Birth grace bounds that: a daemon that has **never**
+/// been served exits cleanly when this window expires. This reap guard stays in
+/// production under the always-on posture — a stillborn spawn is still worth
+/// reaping — and is the daemon-side half of bug 131's leak fix (the test-side
+/// half is `tests/common`'s `DaemonGuard`).
 ///
 /// "Served" means real service — an accepted MCP (bridge) connection, or a
 /// hook/CLI request that actually parsed off the IPC socket. The spawn
@@ -3044,8 +3044,9 @@ const TRIPWIRE_INTERVAL: Duration = Duration::from_secs(30);
 /// its own birth grace at birth. A deliberate hookful-but-bridgeless daemon
 /// (`catenary start` + hook dispatches, zero MCP bridges) survives — its
 /// dispatches are service. One-shot: once served, the window retires
-/// permanently and the disconnect-driven lifecycle owns the daemon; it is
-/// never re-armed.
+/// permanently and the always-on daemon simply stays resident until the
+/// service manager (or a deliberate `catenary stop`) ends it; it is never
+/// re-armed.
 ///
 /// Tests inject a smaller window via `CATENARY_BIRTH_GRACE_SECS`
 /// (subprocess daemons, read by [`birth_grace_window`]) or
@@ -3103,11 +3104,15 @@ pub struct SessionManager {
     root_tracker: Option<RootTracker>,
     shutdown: CancellationToken,
     disconnect: Arc<tokio::sync::Notify>,
-    /// Grace window for the debounced last-client exit (pulse-03). Defaults
-    /// to [`DISCONNECT_GRACE`]; tests shrink it via
-    /// [`Self::disconnect_grace_override`] so expiry paths run in
-    /// milliseconds.
-    disconnect_grace: Duration,
+    /// Grace window for the debounced last-client exit (pulse-03), or `None`
+    /// when the last-client self-exit is retired.
+    ///
+    /// Production is always `None` (ws49-04): an always-on daemon does not
+    /// exit itself, so the accept loop's `disconnect.notified()` arm never
+    /// arms a deadline. Only [`Self::disconnect_grace_override`] sets it
+    /// `Some`, so the in-process lifecycle tests can still drive the
+    /// (test-only) disconnect-exit path in milliseconds.
+    disconnect_grace: Option<Duration>,
     /// Observability seam for the exit grace window: `true` while the window
     /// is armed (census at zero, exit pending). Written only by
     /// [`Self::accept_loop`]; read by tests to sequence deterministically
@@ -3238,7 +3243,10 @@ impl SessionManager {
             root_tracker: None,
             shutdown: CancellationToken::new(),
             disconnect: Arc::new(tokio::sync::Notify::new()),
-            disconnect_grace: DISCONNECT_GRACE,
+            // Retired in production (ws49-04): an always-on daemon does not
+            // self-exit on last-client disconnect. Tests re-arm it via
+            // `disconnect_grace_override`.
+            disconnect_grace: None,
             grace_armed: AtomicBool::new(false),
             worktree_watch_rx: std::sync::Mutex::new(None),
             config_path_override: None,
@@ -3296,7 +3304,10 @@ impl SessionManager {
             root_tracker: None,
             shutdown: CancellationToken::new(),
             disconnect: Arc::new(tokio::sync::Notify::new()),
-            disconnect_grace: DISCONNECT_GRACE,
+            // Retired in production (ws49-04): an always-on daemon does not
+            // self-exit on last-client disconnect. Tests re-arm it via
+            // `disconnect_grace_override`.
+            disconnect_grace: None,
             grace_armed: AtomicBool::new(false),
             worktree_watch_rx: std::sync::Mutex::new(None),
             config_path_override: None,
@@ -3319,19 +3330,25 @@ impl SessionManager {
     /// responses.
     ///
     /// Returns `Ok(())` when the daemon should shut down. Exit triggers:
-    /// - Last MCP client disconnected (disconnect notify, count == 0) and the
-    ///   count is still zero when the grace window expires (pulse-03): bridge
-    ///   churn at session transitions is normal host behavior, so the exit is
-    ///   debounced by [`DISCONNECT_GRACE`] — a connection arriving during the
-    ///   window disarms it and the warm LSP fleet survives.
-    /// - Never served (bug 131): the [`BIRTH_GRACE`] window expired and no
-    ///   client was ever served — no MCP connection accepted, no IPC request
-    ///   parsed. One-shot: a served daemon retires the window permanently on
-    ///   its single expiry pass and the disconnect-driven exits above own the
-    ///   lifecycle from there.
     /// - `catenary stop` received on the IPC socket (shutdown token) —
     ///   deliberate stops do not debounce.
-    /// - External signal cancelled the shutdown token
+    /// - External signal cancelled the shutdown token (SIGINT/SIGTERM — the
+    ///   path the service manager and the test `DaemonGuard` both drive).
+    /// - Never served (bug 131): the birth-grace window expired and no client
+    ///   was ever served — no MCP connection accepted, no IPC request parsed.
+    ///   One-shot: a served daemon retires the window permanently on its single
+    ///   expiry pass, and never re-arms. This reap-the-stillborn guard stays
+    ///   armed in production even under the always-on posture (a spawn-race
+    ///   orphan is still worth reaping).
+    /// - Socket file(s) vanished externally (bug 129 tripwire): the daemon is
+    ///   an unreachable ghost and exits cleanly without re-unlinking.
+    ///
+    /// The last-client-disconnect self-exit (pulse-03) is RETIRED in production
+    /// (ws49-04): an always-on daemon does not exit itself, so `disconnect_grace`
+    /// is `None` and the `disconnect.notified()` arm never arms a deadline. The
+    /// arm survives only for the in-process lifecycle tests, which re-arm it via
+    /// `disconnect_grace_override`; the disconnect-exit arm below is therefore
+    /// reachable only under a test override.
     ///
     /// On exit, socket files are removed so new bridges start a fresh
     /// daemon instead of connecting to one that is shutting down.
@@ -3454,16 +3471,22 @@ impl SessionManager {
                     return Ok(());
                 }
                 () = self.disconnect.notified() => {
-                    if self.connection_count.load(Ordering::Acquire) == 0
+                    // The last-client self-exit is retired in production
+                    // (ws49-04): `disconnect_grace` is `None`, so no deadline
+                    // is armed and the always-on daemon stays resident through
+                    // census zero — the service manager owns its lifetime. Only
+                    // a test override sets it `Some`, arming the (test-only)
+                    // disconnect-exit path.
+                    if let Some(grace) = self.disconnect_grace
+                        && self.connection_count.load(Ordering::Acquire) == 0
                         && grace_deadline.is_none()
                     {
-                        grace_deadline =
-                            Some(tokio::time::Instant::now() + self.disconnect_grace);
+                        grace_deadline = Some(tokio::time::Instant::now() + grace);
                         self.grace_armed.store(true, Ordering::Release);
                         info!(
                             source = Source::DaemonLifecycle.as_str(),
                             "last client disconnected — exit armed ({}s grace)",
-                            self.disconnect_grace.as_secs(),
+                            grace.as_secs(),
                         );
                     }
                 }
@@ -3826,15 +3849,17 @@ impl SessionManager {
         &self.ipc_socket_path
     }
 
-    /// Shrinks the last-client-disconnect grace window (pulse-03, test-only).
+    /// Arms the last-client-disconnect grace window (pulse-03, test-only).
     ///
-    /// Production always debounces the last-client exit by
-    /// [`DISCONNECT_GRACE`]; tests inject a small window so expiry-path
-    /// tests run in milliseconds instead of a minute. No production caller.
+    /// Production retired the last-client self-exit (ws49-04): the field is
+    /// `None`, so the accept loop never arms a deadline on census zero. This
+    /// override sets it `Some(grace)` so the in-process lifecycle tests can
+    /// still drive the disconnect-exit path in milliseconds instead of a
+    /// minute. No production caller.
     #[cfg(test)]
     #[must_use]
     const fn disconnect_grace_override(mut self, grace: Duration) -> Self {
-        self.disconnect_grace = grace;
+        self.disconnect_grace = Some(grace);
         self
     }
 
@@ -9377,15 +9402,21 @@ mod tests {
 
     /// Bridge churn survival (pulse-03, acceptance 1): the census drops to
     /// zero, the exit window arms, and a client reconnecting within the
-    /// window disarms it — the daemon (and its warm LSP fleet) survives. The
-    /// production 60 s grace stays in place so the test never races the
-    /// clock: it sequences on the armed flag, not on elapsed time.
+    /// window disarms it — the daemon (and its warm LSP fleet) survives.
+    ///
+    /// The last-client self-exit is retired in production (ws49-04), so this
+    /// test arms the (now test-only) disconnect grace explicitly via the
+    /// override; without it the field is `None` and no window ever arms. A
+    /// long-ish window (1 s) sequences the test on the armed flag rather than
+    /// racing the clock — the daemon disarms on reconnect well before it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn grace_window_disarmed_by_reconnect() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let mcp_path = mcp_socket_in(dir.path());
 
-        let manager = Arc::new(bind_in(dir.path()));
+        let manager = Arc::new(
+            bind_in(dir.path()).disconnect_grace_override(std::time::Duration::from_secs(1)),
+        );
         let m = Arc::clone(&manager);
         let handle = tokio::spawn(async move { m.accept_loop().await });
 

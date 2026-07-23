@@ -335,6 +335,19 @@ enum Command {
         dry_run: bool,
     },
 
+    /// Manage the always-on Catenary daemon service (install/uninstall/status).
+    ///
+    /// Installs the daemon under the host's per-user service manager — a
+    /// systemd `--user` unit on Linux, a launchd `LaunchAgent` plist on macOS —
+    /// so the daemon is resident and restarted for you instead of spawned on
+    /// demand. Both carry `MALLOC_ARENA_MAX=2` (the ws49-02 arena receipt). The
+    /// service is an upgrade, not a requirement: without it, the `SessionStart`
+    /// hook still ensures a daemon on demand.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
+
     /// Self-update the Catenary binary from GitHub releases.
     Update {
         /// Print whether an update is available without downloading.
@@ -761,6 +774,17 @@ enum HookCommand {
     },
 }
 
+/// Subcommands for the always-on daemon service (ws49-04).
+#[derive(Subcommand, Debug)]
+enum ServiceCommand {
+    /// Write the service unit/plist, then enable and start it.
+    Install,
+    /// Stop, disable, and remove the service unit/plist.
+    Uninstall,
+    /// Report the service state (installed / active) in both cases.
+    Status,
+}
+
 /// Host targets for the install command.
 #[derive(Subcommand, Debug)]
 enum InstallHost {
@@ -1114,6 +1138,14 @@ fn main() -> Result<()> {
                         dry_run,
                     )
                 }
+            }
+        }
+        Some(Command::Service { command }) => {
+            let mut out = cli::Output::stdout(false);
+            match command {
+                ServiceCommand::Install => catenary_cli::service::install(&mut out),
+                ServiceCommand::Uninstall => catenary_cli::service::uninstall(&mut out),
+                ServiceCommand::Status => catenary_cli::service::status(&mut out),
             }
         }
         Some(Command::Update { check, force }) => {

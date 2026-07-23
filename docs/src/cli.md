@@ -512,6 +512,11 @@ deleted in a later release.
 
 Verify language servers and hook installation. See [Installation](installation.md#verify).
 
+The report opens with a **Service** line: whether the always-on service is
+installed (see [`catenary service`](#catenary-service)) and, when a daemon is
+running, its idle footprint — the resident-set figure `MALLOC_ARENA_MAX=2`
+bounds. With the daemon down there is no footprint to read, reported honestly.
+
 Pass a server name for verbose single-server diagnostics:
 
 ```sh
@@ -589,6 +594,41 @@ catenary quit --force    # skip the prompt
 | Flag | Description |
 |------|-------------|
 | `--force` | `stop`/`quit`: skip the confirmation prompt, even with live sessions |
+
+### `catenary service`
+
+Install the daemon under your host's per-user service manager so it runs
+always-on — resident and restarted for you, instead of spawned on demand. The
+daemon no longer exits itself when the last session disconnects; its lifetime
+belongs to the service manager (or to a deliberate `catenary stop`).
+
+| Platform | Manager | Unit |
+|----------|---------|------|
+| Linux | systemd `--user` | `$XDG_CONFIG_HOME/systemd/user/catenary.service` |
+| macOS | launchd (per-user LaunchAgent) | `~/Library/LaunchAgents/dev.markwells.catenary.plist` |
+
+Both carry `Environment=MALLOC_ARENA_MAX=2`: the arena cap bounds the resident
+set the always-on daemon accretes (a small-allocation free retained ~82 of 94
+MiB in glibc arenas — the measured protocol-churn class), and the unit/plist
+body carries that citation.
+
+```sh
+catenary service install     # write the unit/plist, enable it, and start it
+catenary service status      # installed? active? — honest in both states
+catenary service uninstall   # stop, disable, and remove it
+```
+
+The service is an **upgrade, not a requirement**. With none installed, the
+`SessionStart` hook still ensures a daemon on demand — today's behavior — so
+Catenary works whether or not you install the service. `catenary doctor` reports
+the service state and, when a daemon is up, its idle footprint (the RSS figure
+the arena cap bounds).
+
+Writing the unit and starting it are separate steps: the unit/plist file is the
+durable artifact and always lands, while the live enable/start leg rides your
+user service manager and is reported (not fatal) — a headless box or a sandbox
+with no user bus still gets the file, with a note to start it once a manager is
+available.
 
 ### `catenary version`
 

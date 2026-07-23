@@ -170,8 +170,15 @@ it through `Session::sync_roots`:
 
 ## Shutdown
 
-The daemon exits when the last client disconnects, on `catenary stop`,
-or on SIGINT/SIGTERM:
+The daemon is **always-on**: it does not exit itself when the last client
+disconnects (that idle self-exit retired with the always-on service, ws49-04).
+Its lifetime belongs to the service manager — see
+[`catenary service`](../cli.md#catenary-service). It shuts down on `catenary
+stop`, on SIGINT/SIGTERM (the service manager's stop signal, or the test
+`DaemonGuard`), and — as reap/self-defense guards, not idle exits — a daemon
+that was *never served* still exits after a birth-grace window (so a spawn-race
+orphan is reaped), and one whose socket files vanish externally exits as an
+unreachable ghost:
 
 1. The accept loop stops and both socket listeners are torn down.
 2. `Session::shutdown()` sends LSP `shutdown` requests to all active

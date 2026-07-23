@@ -277,6 +277,42 @@ fn hook_connect(_hook_json: &serde_json::Value) -> Option<std::fs::File> {
     None
 }
 
+/// Ensures a daemon is running for a starting session, spawning one on demand
+/// when no always-on service owns the lifetime (ws49-04).
+///
+/// The daemon no longer self-exits on idle (the last-client-disconnect exit
+/// retired with this ticket), so its lifetime belongs to a service manager —
+/// but the service is an upgrade, not a requirement. A host without
+/// `catenary service install` keeps today's spawn-on-demand path: this walks
+/// the same single-instance start ceremony
+/// [`crate::router::ensure_daemon_running`] the `catenary start` verb uses,
+/// spawning a daemon iff none answers. When the service *is* installed the
+/// manager brings the daemon up, so this returns early and spawns nothing —
+/// two owners racing to spawn would just lose the race harmlessly, but the
+/// early return keeps the ceremony off the hot path.
+///
+/// Best-effort by contract: a hook must never break the host's flow, so any
+/// spawn failure is swallowed to `debug!` — the subsequent `hook_connect`
+/// still degrades gracefully to the no-daemon path.
+#[cfg(unix)]
+fn ensure_daemon_for_session_start() {
+    if crate::service::is_installed() {
+        return;
+    }
+    if let Err(e) = crate::router::ensure_daemon_running() {
+        tracing::debug!(
+            source = crate::source::Source::HookDispatch.as_str(),
+            "session-start daemon ensure failed (spawn-on-demand fallback): {e}",
+        );
+    }
+}
+
+/// Ensures a daemon is running for a starting session (Windows stub).
+///
+/// The daemon is Unix-only; there is nothing to ensure here.
+#[cfg(windows)]
+fn ensure_daemon_for_session_start() {}
+
 /// Connects to a notify IPC endpoint and returns a stream for I/O.
 ///
 /// Returns `None` silently on failure (hooks must not break Claude Code's flow).
@@ -622,6 +658,12 @@ pub fn run_session_start(format: HostFormat) {
         print!("{}", opencode_session_start_body());
         return;
     }
+
+    // Spawn-on-demand fallback (ws49-04): with no always-on service installed,
+    // SessionStart brings the daemon up itself — today's behavior, now that the
+    // MCP bridge is no longer the sole spawner and the daemon does not
+    // self-exit on idle. A no-op when the service owns the lifetime.
+    ensure_daemon_for_session_start();
 
     let mut builder = SystemMessageBuilder::new();
 
