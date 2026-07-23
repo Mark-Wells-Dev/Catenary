@@ -5293,23 +5293,21 @@ async fn release_session(ctx: &HookDispatchContext, session_id: &str, trigger: &
     }
 }
 
-/// The daemon self-RSS in bytes on Linux, `None` elsewhere — a cfg shim over
-/// [`self_rss_bytes`] so the release path can call it unconditionally (ws49-02).
-///
-/// The vanish edge is Linux-only (`/proc/<pid>` liveness), so a non-Linux daemon
-/// never reaches the demotion path with a real release to measure; returning
-/// `None` off Linux keeps the receipt honest (no figure fabricated) without a
-/// second cfg block at the call site.
-#[cfg(unix)]
+/// The daemon self-RSS in bytes — a shim over [`self_rss_bytes`] so the release
+/// path can call it unconditionally (ws49-02).
+#[cfg(all(unix, target_os = "linux"))]
 fn self_rss_bytes_or_none() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        self_rss_bytes()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+    self_rss_bytes()
+}
+
+/// The daemon self-RSS: `None` off Linux (no `/proc`; the vanish edge never
+/// fires there, so no real release reaches this measurement — the receipt stays
+/// honest, no figure fabricated). Whole-function platform split per the ws49-01
+/// macOS-clippy lesson: an inner-cfg fallback body is const-able off Linux and
+/// fails the macOS clippy leg.
+#[cfg(all(unix, not(target_os = "linux")))]
+const fn self_rss_bytes_or_none() -> Option<u64> {
+    None
 }
 
 /// Emits the freed-RSS receipt for a root release (ws49-02, part 4; the
