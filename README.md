@@ -116,7 +116,7 @@ reached through four decoupled surfaces:
 - **TUI** — real-time observability across every session and language
   server.
 
-## Quick start
+## Quick Start
 
 ### 1. Install
 
@@ -242,4 +242,4 @@ Full documentation at **[twowells.github.io/Catenary](https://twowells.github.io
 **AGPL-3.0-or-later** — see [LICENSE](LICENSE) for details.
 
 **Commercial licensing** available for proprietary use — see
-[LICENSE-COMMERCIAL](LICENSE-COMMERCIAL). Contact `contact@markwells.dev`.
+[LICENSE-COMMERCIAL](LICENSE-COMMERCIAL). Contact `contact@twowells.dev`.
