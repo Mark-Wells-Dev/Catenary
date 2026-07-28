@@ -1,17 +1,18 @@
 Catenary Commercial License
 ===========================
 
-This version of Catenary is available under a commercial license for
-organizations that wish to use, modify, or integrate Catenary into proprietary
-software without the restrictions of the GNU Affero General Public License v3.0.
+Catenary is available under a commercial license for organizations that wish to
+use, modify, or integrate Catenary into proprietary software without the
+copyleft restrictions of the GNU Affero General Public License v3.0 (AGPL-3.0).
 
-To obtain a commercial license, please contact:
+To inquire about or purchase a commercial license, please contact:
 
-Mark Wells Dev
-Email: contact@markwells.dev
-Website: https://markwells.dev
+    Two Wells, LLC
+    Email: contact@twowells.dev
+    Website: https://twowells.dev
+    GitHub: https://github.com/TwoWells
 
 Commercial licenses include:
-- Right to link Catenary libraries into proprietary applications.
-- Right to modify Catenary without releasing source code.
-- Priority support and feature development.
+  - Right to use, modify, and integrate Catenary without AGPL source-disclosure obligations.
+  - Right to bundle Catenary into proprietary applications and workflows.
+  - Priority support, issue resolution, and custom feature development.
