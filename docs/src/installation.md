@@ -42,13 +42,13 @@ The script detects your platform, downloads the matching release asset
 **From crates.io (any platform with a Rust toolchain):**
 
 ```bash
-cargo install catenary-mcp
+cargo install catenary-cli
 ```
 
 **From source:**
 
 ```bash
-cargo install --git https://github.com/TwoWells/Catenary catenary-mcp
+cargo install --git https://github.com/TwoWells/Catenary catenary-cli
 ```
 
 ## Connect to Your AI CLI

@@ -140,7 +140,7 @@ curl -fsSL https://raw.githubusercontent.com/TwoWells/Catenary/main/install.sh |
 **From source (any platform with a Rust toolchain):**
 
 ```bash
-cargo install catenary-mcp
+cargo install catenary-cli
 ```
 
 The `catenary` binary must be on your `PATH` before configuring any

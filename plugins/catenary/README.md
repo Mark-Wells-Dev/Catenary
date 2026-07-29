@@ -17,7 +17,7 @@ Run `catenary primer` for the full agent-facing workflow.
 ### 1. Install the binary
 
 ```bash
-cargo install catenary-mcp
+cargo install catenary-cli
 ```
 
 The `catenary` binary must be on your PATH. The plugin does not include it —

@@ -9,6 +9,139 @@ Per-release binaries and auto-generated commit notes are published on the
 file records the curated highlights and, for major releases, the migration
 guidance.
 
+## [2.1.0] - 2026-07-29
+
+### Added
+
+- **Blessed language servers install themselves — `auto_install`.** Opt in
+  with `auto_install` under `[servers]` in your user config (a project-level
+  opt-in is ignored by construction; the default is off). At session start
+  the daemon works out, from the session's root markers, which blessed
+  servers a served root wants but cannot spawn — no path override, nothing
+  on `PATH`, no managed install at the pin — and kicks each one off as a
+  background install. Kicking is not awaiting: session-start latency is
+  unchanged. The install is the same verified guided-install engine used by
+  `catenary install`, aimed at the managed server home and post-checked
+  against its `bin/` invariant, so a hollow success reports as an honest
+  failure; on completion the server pre-warms itself, so coverage arrives
+  without a restart. A failure is skip-with-a-finding — `catenary doctor`
+  renders it, one warning per server per daemon lifetime, no retry loop —
+  and the next session start simply tries again.
+- **The managed server home: pinned installs the system can't break.**
+  Managed installs now land under
+  `<data_dir>/catenary/servers/<name>/<version>/` with executables at
+  `bin/`, instead of delegating into ecosystem-owned prefixes
+  (`~/.cargo/bin`, system `node_modules`) that a routine system upgrade
+  could void. Spawn resolution prefers the managed home, so a server that
+  Catenary installed keeps working through PATH churn; recipes install
+  upstream official artifacts pinned by checksum and unpacked in-process;
+  and the home garbage-collects itself at the next successful install,
+  keeping the pinned version plus the most recently installed other one,
+  with every deletion named in the install's own output.
+- **The always-on service — `catenary service install`, `uninstall`,
+  `status`.** Opt-in supervision for the daemon: a `systemd --user` unit on
+  Linux, a launchd agent on macOS. With it installed the daemon starts with
+  your login session and stays up across client churn; `SessionStart` keeps
+  a fallback that ensures a daemon for hosts running without the service.
+  `catenary doctor` reports the daemon's idle footprint so the always-on
+  choice is made against a real number.
+- **`catenary restart` and `catenary quit`.** `stop` now means stop — the
+  intent is recorded before the shutdown IPC, so a stopped daemon stays
+  stopped; `restart` clears that intent, bounces, waits out the teardown,
+  and starts the new daemon itself (no client needed, works with zero
+  sessions connected); `quit` confirms first and names the consequence for
+  connected MCP servers. `make install` now bounces through `restart`, so
+  the from-source ritual is genuinely one word.
+- **Sessions carry a host handle, so a killed host is really gone.** Hooks
+  declare the host's process identity (pid plus start-time, resolved by an
+  ancestry walk) when the session opens, and a vanish watch on the daemon's
+  reaper tick releases sessions whose host process disappeared — through
+  the same path a clean `SessionEnd` takes. A host that dies without a
+  goodbye no longer leaves a phantom session holding roots.
+- **Subagent branch guard.** A worktree-anchored subagent is denied
+  branch operations that reach outside its own worktree, so an isolated
+  agent cannot move or delete branches in the parent repository. The lead
+  agent's branch operations are untouched, and targets inside the
+  subagent's own worktree — including from a subdirectory of it — are
+  never denied.
+- **Diagnostics for files that belong to no project.** A file outside any
+  marked root is now served rootless, as a single-file target with its own
+  per-file debt, instead of being skipped for want of a project root.
+  `clangd`, `gopls`, and `typescript-language-server` serve single-file
+  diagnostics on conformance evidence.
+- **TOML diagnostics.** `tombi` graduates to the blessed fleet as a
+  diagnostics-serving TOML server, on conformance evidence from both
+  supported platforms.
+- **Pins survive a daemon restart.** `catenary pin` / `unpin` record the
+  root under `[roots] pinned` in your user config with comment-preserving
+  writes, and the daemon restores them at boot at zero cost — nothing
+  spawns until first touch. Hand-editing the array is a first-class way to
+  pin (effective at the next daemon start), and a pinned path that has gone
+  missing becomes a `catenary doctor` finding rather than a silent
+  rewrite.
+
+### Changed
+
+- **The `catenary` binary now installs from `catenary-cli`.** The workspace
+  was split: `catenary-mcp` becomes the bridge library (the bridge↔daemon
+  wire-protocol definition), and a new `catenary-cli` package owns the
+  `catenary` binary (CLI search, the daemon, hooks, and the TUI). From-source
+  installs are now `cargo install catenary-cli`, whose first real version is
+  this release, 2.1.0. The final 2.x `catenary-mcp` binary release carries a
+  description pointing installers at the new package; after `catenary-mcp`
+  3.0.0 ships as the bridge library — a library with no binaries — a stale
+  `cargo install catenary-mcp` fails with cargo's own "no binaries" error
+  rather than silently installing an old binary. Homebrew, the prebuilt-binary
+  installer, and the plugin/extension surfaces are unaffected — only the
+  from-source crate name changed.
+- **`catenary grep` and `catenary glob` walk in the CLI.** Both verbs now
+  own their file walk and stream hits to the daemon for enrichment, retiring
+  the daemon-side executors: results render as they resolve, `--count` and
+  `-l` are computed locally, and a stalled or absent daemon degrades to plain
+  (unenriched) results with one advisory instead of a re-walk. Directory
+  listings carry top-level symbol structure by default — a naming-only
+  listing no longer pays for full outlines — with `--outline` opting up; a
+  single named file keeps its full outline as before. Lint-covered hits are
+  annotated by a local, budgeted linter run, so lint annotations work even
+  with the daemon stopped.
+- **The daemon's lifetime follows the service model, not the client count.**
+  The exit-when-the-last-client-leaves behavior is retired (the birth grace
+  for a never-served daemon, and the unreachable-socket tripwire, stay), so
+  bridge churn no longer costs a fleet of language servers. In its place the
+  idle economy governs memory: when a session vanishes or ends, its worktree
+  roots demote to ephemeral with provenance recorded, and if that session
+  comes back the roots re-adopt warm rather than respawning from cold.
+- **A missing language server is a classification, not a crash.** A server
+  that isn't installed is resolved before the spawn attempt and reported as
+  one calm finding naming both ways to install it; installing it heals the
+  root without a daemon restart, and the session board reports the honest
+  not-installed state instead of a spawn failure.
+- **`catenary worktree land` and `catenary worktree diff` are retired to
+  teaching stubs.** Both verbs still parse, but they print the git-native
+  flow (commit in the branch; `git diff main...branch`; `git merge
+  --squash`; commit; `catenary worktree rm`) and exit 2 — the bespoke patch
+  engine they were built on is deleted. `catenary worktree rm` and
+  `catenary worktree ls` are unchanged.
+
+### Fixed
+
+- **The Stop-hook nag names every file that is actually due.** It listed
+  only the files present in both the daemon's in-memory batch and the
+  ledger, so a booked file the batch had dropped went unnamed — the nag
+  under-reported the work left. It now renders the full due set for the
+  candidates' roots. The block decision itself is unchanged.
+- **A relative `--exclude-pattern` anchors at the search's base, not the
+  process cwd.** Running a search against another root left every relative
+  exclude silently inert — matches, listings, and `--count` tallies alike;
+  the pattern now anchors at the positional's base, and repeated
+  `--exclude-pattern` flags union across every leg of the search. Relatedly,
+  `catenary glob`'s directory-hit note now says what `dir/*` does
+  differently instead of implying the bare directory form would have worked.
+- **Daemon shutdown always completes.** A stop could wedge, and killed
+  language servers could go unreaped; teardown now runs a bounded ladder —
+  graceful, then `SIGTERM`, then `SIGKILL` under a ceiling — and names any
+  straggler it had to escalate on.
+
 ## [2.0.2] - 2026-07-10
 
 ### Fixed

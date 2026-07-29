@@ -1,6 +1,6 @@
 [package]
 name = "catenary-mcp"
-version = "2.0.2"
+version = "3.0.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Catenary's bridge crate: the bridge↔daemon wire-protocol definition (MCP JSON-RPC message types, their serialization, and the protocol version constant) shared by the host-spawned bridge process and the Catenary daemon."

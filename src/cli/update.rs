@@ -156,7 +156,7 @@ fn replace_binary(new_binary: &std::path::Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn replace_binary(_new_binary: &std::path::Path) -> Result<()> {
-    bail!("self-update is not supported on this platform; use: cargo install catenary-mcp");
+    bail!("self-update is not supported on this platform; use: cargo install catenary-cli");
 }
 
 /// Checks whether a Catenary daemon is currently running by attempting
@@ -194,7 +194,7 @@ pub fn run_update(out: &mut Output, check: bool, force: bool) -> Result<()> {
                 "{} failed to check for updates: {e}",
                 out.colors.red("✗"),
             ));
-            let _ = out.writeln(format_args!("  try: cargo install catenary-mcp"));
+            let _ = out.writeln(format_args!("  try: cargo install catenary-cli"));
             return Err(e);
         }
     };
@@ -258,7 +258,7 @@ pub fn run_update(out: &mut Output, check: bool, force: bool) -> Result<()> {
         // Clean up partial download
         let _ = std::fs::remove_file(&tmp);
         let _ = out.writeln(format_args!(" {}", out.colors.red("failed")));
-        let _ = out.writeln(format_args!("  try: cargo install catenary-mcp"));
+        let _ = out.writeln(format_args!("  try: cargo install catenary-cli"));
         return Err(e);
     }
 
