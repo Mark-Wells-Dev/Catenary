@@ -474,13 +474,16 @@ single_file = "serves-diagnostics"
 [discipline.tombi]
 discipline = "pull"
 advertise_pull_dynamic_registration = true
-# single_file (brackets 01; upgraded brackets 06): TOML is overwhelmingly
-# per-file-natured — core stray population. Verified live 2026-07-20 by the
-# conformance suite's single-file leg (`single_file_evidence`): under a
-# genuine null-root session (null rootUri/rootPath, no workspaceFolders) a
-# lone dirty broken.toml drew a settled publish carrying its diagnostic
-# ~0.1 s after didOpen — the direct null-root verification the misc-196
-# evidence bar demands.
+# single_file: GRADUATED — maintainer act 2026-07-29 (misc 216) on
+# conformance dispatch run 29948582414, which carried tombi's two install
+# receipts AND the single-file leg's `SERVES DIAGNOSTICS under null root`
+# line on BOTH platforms (linux-x86_64 and macos-arm64) — the direct
+# null-root verification the misc-196 evidence bar demands. TOML is
+# overwhelmingly per-file-natured (brackets 01), the core stray population.
+# The brackets-06 wording this row carried until the graduation described
+# taplo's 2026-07-20 probe, inherited when the bless commit inserted this
+# header above taplo's stray line (2026-07-21); the dispatch run above is
+# tombi's own evidence.
 single_file = "serves-diagnostics"
 
 # yaml-language-server — event + DECLARED PUSH (misc 196 verified live 2026-07-14).

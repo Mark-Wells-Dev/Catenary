@@ -2512,8 +2512,10 @@ bin = "bin/srv"
         // publish, no pull answer), so it stays enrichment-only — on evidence
         // now, not caution. clangd/gopls/typescript-language-server joined by
         // maintainer ruling (brackets 07, 2026-07-20) on their rootless probes;
-        // rust-analyzer remains the keyless project-semantic case —
-        // `unsupported`, fail closed.
+        // tombi's row graduated on its own evidence (misc 216, 2026-07-29:
+        // conformance dispatch run 29948582414 carried the null-root SERVES
+        // line on both platforms); rust-analyzer remains the keyless
+        // project-semantic case — `unsupported`, fail closed.
         let manifest = default_blessed_manifest().expect("manifest parses");
         for name in [
             "bash-language-server",

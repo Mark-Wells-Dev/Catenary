@@ -729,7 +729,9 @@ mod tests {
         // spawn allowed, never a diagnostics source. clangd/gopls/
         // typescript-language-server joined by maintainer ruling 2026-07-20 on
         // the brackets-07 probes (true positives + sibling resolution +
-        // genuinely-missing controls under null root).
+        // genuinely-missing controls under null root). tombi's row was
+        // graduated separately (misc 216, 2026-07-29) on conformance dispatch
+        // run 29948582414 — its own null-root SERVES line, both platforms.
         use crate::recipes::SingleFileSupport;
         for name in [
             "bash-language-server",
@@ -843,7 +845,8 @@ mod tests {
 
     /// The blessed tombi discipline record: `discipline = "pull"` (the
     /// vscode-json shape) plus the pull-lane selector and verified single-file
-    /// claim (brackets 06 null-root probe, 2026-07-20).
+    /// claim (misc 216 graduation, 2026-07-29: conformance dispatch run
+    /// 29948582414 carried tombi's null-root SERVES line on both platforms).
     fn tombi_staged_record() -> crate::recipes::DisciplineRecord {
         crate::recipes::DisciplineRecord {
             discipline: Some(crate::recipes::Discipline::Pull),
@@ -884,12 +887,12 @@ mod tests {
             json!({ "linkSupport": true }),
             "sibling capabilities are untouched"
         );
-        // The blessed row carries the verified single-file claim (brackets 06,
-        // null-root probe 2026-07-20: broken.toml drew a settled publish ~0.1 s).
+        // The blessed row carries the graduated single-file claim (misc 216,
+        // dispatch run 29948582414: the null-root SERVES line on both platforms).
         assert_eq!(
             profile.single_file(),
             crate::recipes::SingleFileSupport::ServesDiagnostics,
-            "tombi verified null-root diagnostics (brackets 06)"
+            "tombi verified null-root diagnostics (misc 216)"
         );
     }
 
@@ -898,7 +901,7 @@ mod tests {
         // The blessed row's TOML (now active in defaults/blessed-manifest.toml)
         // parses to exactly the constructed record the mechanics pins use — so
         // the row and the construction agree on all fields, including the
-        // verified single-file claim (brackets 06).
+        // graduated single-file claim (misc 216).
         let doc: crate::recipes::BlessedManifest = toml::from_str(
             "[discipline.tombi]\ndiscipline = \"pull\"\nadvertise_pull_dynamic_registration = true\nsingle_file = \"serves-diagnostics\"\n",
         )
@@ -944,11 +947,11 @@ mod tests {
             json!({ "linkSupport": true }),
             "sibling capabilities are untouched"
         );
-        // single_file verified live 2026-07-20 (brackets 06 null-root probe).
+        // single_file graduated 2026-07-29 (misc 216, dispatch run 29948582414).
         assert_eq!(
             profile.single_file(),
             crate::recipes::SingleFileSupport::ServesDiagnostics,
-            "tombi verified null-root diagnostics (brackets 06)"
+            "tombi verified null-root diagnostics (misc 216)"
         );
     }
 
