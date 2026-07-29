@@ -127,9 +127,10 @@ brew install twowells/tap/catenary
 ```
 
 > Switching from a `cargo install` (the previously recommended path)?
-> Run `cargo uninstall catenary-mcp` first — `~/.cargo/bin` usually
-> precedes brew's bin dir on `PATH`, so the stale binary keeps
-> answering otherwise.
+> Run `cargo uninstall catenary-cli` first — or `cargo uninstall
+> catenary-mcp` if you installed before 2.1.0, when the crate carried
+> that name. `~/.cargo/bin` usually precedes brew's bin dir on `PATH`,
+> so the stale binary keeps answering otherwise.
 
 **Prebuilt binary (Linux x86_64 / macOS arm64):**
 

@@ -122,6 +122,11 @@ guidance.
   --squash`; commit; `catenary worktree rm`) and exit 2 — the bespoke patch
   engine they were built on is deleted. `catenary worktree rm` and
   `catenary worktree ls` are unchanged.
+- **Config mistakes degrade loudly, not totally.** An invalid `[commands]`
+  section quarantines itself — its consumers degrade with a named finding
+  instead of every surface going down with the config; `catenary pin`/`unpin`
+  and other config mutations write atomically and never destroy neighboring
+  sections; and the shipped recommended template passes its own validator.
 
 ### Fixed
 
@@ -141,6 +146,19 @@ guidance.
   language servers could go unreaped; teardown now runs a bounded ladder —
   graceful, then `SIGTERM`, then `SIGKILL` under a ceiling — and names any
   straggler it had to escalate on.
+- **The command filter parses more of real shell.** `case … esac` no longer
+  names the scrutinee as a denied command, loop constructs in subshell
+  position parse as compounds, denied subcommands resolve past global
+  options (`git -C <path> grep` is caught), and a denied compound names the
+  writes that never ran.
+- **Diagnostics rounds are honest under pressure.** One round per identity —
+  stacked reruns follow the running round instead of piling; an explicitly
+  named diagnose target always serves; a stale close-clear can no longer
+  settle a dirty file to clean; and an announced progress token holds
+  settle.
+- **Small search parities.** `catenary glob --count` counts the match set
+  rather than the listing expansion, and an empty grep pattern matches
+  every line (ripgrep parity).
 
 ## [2.0.2] - 2026-07-10
 
