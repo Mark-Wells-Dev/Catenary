@@ -16,7 +16,7 @@ exclude = ["fuzz", "tests/fixtures/rust_repo", "tests/fixtures/conformance/rust"
 
 [package]
 name = "catenary-cli"
-version = "2.1.1"
+version = "2.1.2"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 default-run = "catenary"
