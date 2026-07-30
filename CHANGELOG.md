@@ -9,6 +9,39 @@ Per-release binaries and auto-generated commit notes are published on the
 file records the curated highlights and, for major releases, the migration
 guidance.
 
+## [2.1.1] - 2026-07-30
+
+### Fixed
+
+- **A service-started daemon no longer roots your home directory.** With
+  `CATENARY_ROOTS` unset or empty the daemon now boots rootless. The old
+  fallback seeded its launcher's working directory as a permanent root —
+  `$HOME` under `systemd --user`, `/` under launchd — so every project
+  became a subdirectory of an existing root and no real workspace ever
+  mounted. No seed is needed: hooks register each session's roots and
+  activity mounts anything a session touches. A rootless boot now names
+  itself honestly in the log instead of claiming an empty workspace, and
+  the boot-seed line only ever fires for an explicitly set variable.
+- **Registered file watchers now see the files Catenary's own walks
+  skip.** Server watch registrations (lattice's `**/.lattice.toml`,
+  rust-analyzer's `Cargo.{lock,toml}` and build-output watchers) were
+  honored on delivery but starved at the source: observations came only
+  from search-posture walks, which skip hidden and gitignored paths, so a
+  live config edit never reached the running server and its behavior stayed
+  frozen at spawn. Registered patterns are now observed directly with the
+  search filters off — literals by direct stat, `**/NAME` markers at the
+  root and every walked directory, watcher-named directories by a bounded
+  walk — while search itself keeps its posture. Relatedly, a file edited in
+  the same batch one server diagnoses is no longer withheld from a
+  different server that only watches it.
+- **A reconnecting session can no longer lose its workspace roots to its
+  predecessor's cleanup.** Each connection's roots were keyed by its socket
+  file descriptor, which the OS reuses, so a disconnecting session's
+  cleanup could strip the roots of a successor that had been accepted on
+  the same descriptor. Roots are now keyed by the connection's monotonic
+  session id — the same identity its telemetry carries, so the roots board
+  and the firehose finally agree on a session's name.
+
 ## [2.1.0] - 2026-07-30
 
 ### Added
