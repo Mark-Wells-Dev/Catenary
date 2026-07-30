@@ -9,6 +9,16 @@ Per-release binaries and auto-generated commit notes are published on the
 file records the curated highlights and, for major releases, the migration
 guidance.
 
+## [2.1.2] - 2026-07-30
+
+Re-release of 2.1.1 for crates.io. The repo README gained badges after
+2.1.0 shipped, and two already-published crates (`catenary-proc`,
+`catenary-mcp`) package that README — so their packaged bytes drifted
+under published version numbers and the publish backstop refused the
+2.1.1 crates.io leg (correctly; nothing partial shipped). `catenary-proc
+0.2.2` and `catenary-mcp 3.0.1` republish with the current README and
+identical code. Binaries and behavior are those of 2.1.1 below.
+
 ## [2.1.1] - 2026-07-30
 
 ### Fixed
