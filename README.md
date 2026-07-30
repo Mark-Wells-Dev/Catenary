@@ -5,7 +5,10 @@
 
 <img width="1280" height="640" alt="github_catenary_hero_image" src="https://github.com/user-attachments/assets/1f797daa-94bc-4ffd-bc85-f445da88d1e4" />
 
-
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg?style=flat-square)](https://github.com/TwoWells/Catenary/blob/main/LICENSE)
+[![Language: Rust](https://img.shields.io/badge/Language-Rust-orange.svg?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Protocol: MCP](https://img.shields.io/badge/Protocol-MCP-8A2BE2.svg?style=flat-square)](https://modelcontextprotocol.io/)
+[![GitHub Discussions](https://img.shields.io/github/discussions/TwoWells/Catenary?style=flat-square&color=008080&logo=github)](https://github.com/TwoWells/Catenary/discussions)
 
 Catenary hands an AI coding agent a small, opinionated set of
 code-intelligent commands — and a hook that keeps it on them. Reach for
