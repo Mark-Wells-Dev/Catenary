@@ -50,6 +50,13 @@ pub(crate) struct ParsedWatcher {
     /// Bitmask of watched kinds: Create=1, Change=2, Delete=4 (LSP
     /// `WatchKind`); absent ⇒ all three (LSP default 7).
     kind: u8,
+    /// The supplemental observation plan derived from this watcher's pattern
+    /// (bug 143). Catenary's own walks run in search posture
+    /// (gitignore-aware, hidden-skipping), so a registered dotfile / gitignored
+    /// / `baseUri`-anchored pattern is structurally unobservable no matter how
+    /// correctly delivery fans out. The plan says what to stat supplementally;
+    /// it is derived once here, at registration, and read on every nudge.
+    probe: crate::lsp::watch_probe::WatchProbe,
 }
 
 impl ParsedWatcher {
@@ -82,6 +89,11 @@ impl ParsedWatcher {
             return false;
         }
         self.glob.matches_paths(rel, abs)
+    }
+
+    /// Returns this watcher's supplemental observation plan (bug 143).
+    pub(crate) const fn probe(&self) -> &crate::lsp::watch_probe::WatchProbe {
+        &self.probe
     }
 
     /// Parses a single `FileSystemWatcher` JSON value into a [`ParsedWatcher`].
@@ -125,7 +137,8 @@ impl ParsedWatcher {
             .and_then(|v| u8::try_from(v).ok())
             .unwrap_or(WATCH_KIND_ALL);
 
-        Some(Self { glob, kind })
+        let probe = crate::lsp::watch_probe::WatchProbe::derive(&glob);
+        Some(Self { glob, kind, probe })
     }
 }
 

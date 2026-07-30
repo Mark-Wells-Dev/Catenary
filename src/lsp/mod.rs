@@ -38,6 +38,8 @@ pub mod settle;
 pub mod state;
 /// Small local types for LSP concepts.
 pub(crate) mod types;
+/// Supplemental watch-observation probe planning (bug 143).
+pub(crate) mod watch_probe;
 
 /// Shared test helpers for LSP unit tests.
 ///

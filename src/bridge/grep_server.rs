@@ -33,7 +33,7 @@ use anyhow::{Result, anyhow};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -421,7 +421,9 @@ pub(super) async fn nudge_observed_files(
                 .push((rel.to_path_buf(), *mtime));
         }
     }
-    let no_exclude: HashSet<PathBuf> = HashSet::new();
+    // Search surfaces open no documents ahead of the nudge, so nothing rides
+    // document-sync and nothing is excluded from the emission.
+    let no_exclude: HashMap<PathBuf, BTreeSet<String>> = HashMap::new();
     for (root, observed) in &by_root {
         let breadth = if client_manager.has_covering_watchers(root).await {
             WalkBreadth::Full

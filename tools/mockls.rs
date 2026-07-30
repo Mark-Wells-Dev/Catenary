@@ -338,6 +338,13 @@ struct Args {
     #[arg(long)]
     watcher_kind: Option<u8>,
 
+    /// Register the watcher as an LSP 3.17 `RelativePattern` anchored at this
+    /// directory: `{ "baseUri": "file://<dir>", "pattern": <watcher-glob> }`.
+    /// This is the shape rust-analyzer uses for build-script `OUT_DIR`
+    /// watchers. Only meaningful with `--register-file-watchers`.
+    #[arg(long)]
+    watcher_base: Option<String>,
+
     /// Include the number of currently-open documents in the diagnostic
     /// message. Enables tests to verify that the batch pipeline opens all
     /// files before settling (batch: "N open" vs sequential: "1 open").
@@ -2507,7 +2514,16 @@ impl MockServer {
     }
 
     fn send_register_file_watchers(&self) {
-        let mut watcher = serde_json::json!({ "globPattern": &self.args.watcher_glob });
+        let glob_pattern = self.args.watcher_base.as_ref().map_or_else(
+            || serde_json::json!(&self.args.watcher_glob),
+            |base| {
+                serde_json::json!({
+                    "baseUri": format!("file://{base}"),
+                    "pattern": &self.args.watcher_glob,
+                })
+            },
+        );
+        let mut watcher = serde_json::json!({ "globPattern": glob_pattern });
         if let Some(kind) = self.args.watcher_kind {
             watcher["kind"] = serde_json::json!(kind);
         }
@@ -3206,6 +3222,7 @@ mod tests {
             register_file_watchers: false,
             watcher_glob: "**/*".to_string(),
             watcher_kind: None,
+            watcher_base: None,
             report_open_count: false,
             reject_null_workspace: false,
             stderr_message: None,

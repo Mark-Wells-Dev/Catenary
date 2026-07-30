@@ -34,6 +34,8 @@
 //! file B or root C.
 
 use anyhow::{Result, anyhow};
+use ignore::WalkBuilder;
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -44,7 +46,9 @@ use tracing::{debug, info, warn};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::bridge::filesystem_manager::{Change, ChangeKind, FilesystemManager, Root};
+use crate::bridge::filesystem_manager::{
+    Change, ChangeKind, FilesystemManager, Root, mtime_nanos, observe_mtime, stat_with_retry,
+};
 use crate::config::{Config, DispatchMethod, LanguageConfig, ServerDef};
 use crate::logging::LoggingServer;
 use crate::lsp::LspClient;
@@ -241,6 +245,42 @@ struct Covering {
     client: Arc<Mutex<LspClient>>,
     name: String,
     watchers: Vec<crate::lsp::server::ParsedWatcher>,
+}
+
+/// Stats one supplemental watch-probe candidate and records it if it is a
+/// present regular file the main walk did not already observe (bug 143).
+///
+/// Absence is the expected answer for most candidates (a marker name probed in
+/// a directory that has none), and an absent path must contribute nothing — a
+/// probe never invents a baseline member. The stat is the shared
+/// [`stat_with_retry`] so the sub-millisecond atomic-rename window that would
+/// otherwise read as "absent" (and, on a reaping sweep, as a deletion) is closed
+/// the same way every walk surface closes it (WS31-review H1).
+///
+/// A candidate outside `root` is dropped: the per-root baseline keys
+/// root-relative paths, so a path with no root-relative form has no
+/// representation in the model (bug 143's out-of-root leg, flagged not invented).
+fn probe_watched_path(
+    root: &Path,
+    abs: &Path,
+    walked: &HashSet<&Path>,
+    recorded: &mut HashSet<PathBuf>,
+    extra: &mut Vec<(PathBuf, i64)>,
+) {
+    let Ok(rel) = abs.strip_prefix(root) else {
+        return;
+    };
+    if walked.contains(rel) || recorded.contains(rel) {
+        return;
+    }
+    let Some(metadata) = stat_with_retry(abs) else {
+        return;
+    };
+    if !metadata.is_file() {
+        return;
+    }
+    recorded.insert(rel.to_path_buf());
+    extra.push((rel.to_path_buf(), mtime_nanos(&metadata)));
 }
 
 /// How wide the changed-set engine should walk for a given command — the
@@ -3911,15 +3951,181 @@ impl LspClientManager {
         !self.covering_watchers(root).await.is_empty()
     }
 
+    /// Observes the union of registered watcher globs with the search filters
+    /// **off** — the supplemental observation leg (bug 143).
+    ///
+    /// Catenary runs no OS watcher: every observation set fed to
+    /// [`nudge_changed_set`](Self::nudge_changed_set) comes from one of
+    /// Catenary's own walks, and each is built in search posture
+    /// (`git_ignore(true).hidden(true)` — right for `grep`/`glob`). Registrations
+    /// were consumed only as a *filter* over what those walks happened to see,
+    /// never as a *subscription* driving what we look at, so three path classes
+    /// were structurally unobservable however correctly delivery fanned out:
+    /// dotfiles (`**/.lattice.toml`), gitignored paths (rust-analyzer's `baseUri`
+    /// watchers on `target/…/out`), and paths outside every root. A server's
+    /// autonomous interests — config reload, manifest watching — have no
+    /// Catenary request to front-run, so nothing ever looked on their behalf.
+    ///
+    /// This leg closes that scope, registration-driven and unconditional
+    /// (maintainer ruling, bug 143): the union of registered globs says what to
+    /// observe, and it is observed with hidden/gitignore filtering off. The main
+    /// walk keeps its search posture untouched — it is never de-filtered.
+    ///
+    /// **Cost bounding.** The plan per watcher is derived once at registration
+    /// ([`WatchProbe`](crate::lsp::watch_probe::WatchProbe)) and is targeted
+    /// stats, never a second full walk:
+    ///
+    /// - a literal pattern (`build/compile_commands.json`, a `baseUri`-anchored
+    ///   literal) is one stat;
+    /// - a `**/`-prefixed literal marker (`**/.lattice.toml`) is stat'd at the
+    ///   root plus each directory the main walk **already visited** (parents of
+    ///   `observed`), so its cost scales with — and stays below — the walk that
+    ///   produced it;
+    /// - a `baseUri`-anchored pattern that genuinely needs recursion
+    ///   (`{ baseUri: …/out, pattern: "**/*" }`) gets a de-filtered walk of that
+    ///   one server-named directory — the only leg that recurses, and the
+    ///   directory must be a **proper descendant** of `root`: a base at or above
+    ///   the root is the main walk's territory, and de-filtering that is exactly
+    ///   what the ruling forbids. It runs on every nudge like the stat legs; a
+    ///   walk gated on `reap` would leave the annotator's per-batch nudges blind
+    ///   to it, and the first *reaping* nudge would then read a
+    ///   present-since-before-we-looked file as `Created` against an
+    ///   already-populated baseline — invisible to a Change-only watcher.
+    /// - a wildcarded name that is not `baseUri`-anchored (`**/*.rs`, `**/*.md`)
+    ///   plans nothing — the main walk already serves it in search posture.
+    ///
+    /// **Reap safety.** The result is merged into the walk's observation set
+    /// before the baseline diff, so a supplementally-observed path is a normal
+    /// baseline member and a reaping sweep may delete it. Every leg is therefore
+    /// deterministic and un-truncated: a probe that finds nothing contributes
+    /// nothing (the file is genuinely absent), and enumerated dir-walk entries
+    /// follow the walks' "stat-with-retry, sentinel on miss, **never omit**"
+    /// contract (WS31-review H1) so a racing stat cannot false-reap them.
+    ///
+    /// **Out-of-root paths are dropped.** The per-root baseline keys
+    /// root-relative paths and `changed_file_uri` rebuilds the URI by joining
+    /// them onto the root, so a path outside `root` (rust-analyzer's
+    /// `/home/…/.config/rust-analyzer` watcher) has no representation in the
+    /// model. It is skipped here rather than modelled by invention — flagged for
+    /// a maintainer ruling (bug 143).
+    fn supplemental_watch_observations(
+        root: &Path,
+        covering: &[Covering],
+        observed: &[(PathBuf, i64)],
+    ) -> Vec<(PathBuf, i64)> {
+        let mut literals: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut markers: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut walk_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+        for c in covering {
+            for watcher in &c.watchers {
+                let plan = watcher.probe();
+                if plan.is_empty() {
+                    // A wildcarded name with no `baseUri` anchor: the main walk
+                    // serves it in search posture and nothing supplemental is
+                    // affordable (that would be a second full walk).
+                    continue;
+                }
+                literals.extend(plan.paths().iter().cloned());
+                markers.extend(plan.suffixes().iter().cloned());
+                walk_dirs.extend(plan.dirs().iter().cloned());
+            }
+        }
+        if literals.is_empty() && markers.is_empty() && walk_dirs.is_empty() {
+            return Vec::new();
+        }
+
+        // Paths the main walk already observed need no probe — it saw them in
+        // search posture and its entry is authoritative.
+        let walked: HashSet<&Path> = observed.iter().map(|(rel, _)| rel.as_path()).collect();
+        let mut recorded: HashSet<PathBuf> = HashSet::new();
+        let mut extra: Vec<(PathBuf, i64)> = Vec::new();
+
+        for literal in &literals {
+            let abs = if literal.is_absolute() {
+                literal.clone()
+            } else {
+                root.join(literal)
+            };
+            probe_watched_path(root, &abs, &walked, &mut recorded, &mut extra);
+        }
+
+        if !markers.is_empty() {
+            // The root, plus every directory the main walk already visited.
+            let mut dirs: BTreeSet<&Path> = BTreeSet::new();
+            dirs.insert(Path::new(""));
+            for (rel, _) in observed {
+                if let Some(parent) = rel.parent() {
+                    dirs.insert(parent);
+                }
+            }
+            for dir in dirs {
+                for marker in &markers {
+                    let abs = root.join(dir).join(marker);
+                    probe_watched_path(root, &abs, &walked, &mut recorded, &mut extra);
+                }
+            }
+        }
+
+        for dir in &walk_dirs {
+            if dir == root || !dir.starts_with(root) {
+                debug!(
+                    source = Source::LspDispatch.as_str(),
+                    "supplemental watch observation skips base {} (not a proper \
+                     descendant of the root)",
+                    dir.display(),
+                );
+                continue;
+            }
+            let defiltered = WalkBuilder::new(dir)
+                .hidden(false)
+                .ignore(false)
+                .git_ignore(false)
+                .git_global(false)
+                .git_exclude(false)
+                .parents(false)
+                .build();
+            for entry in defiltered.flatten() {
+                if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                    continue;
+                }
+                let Ok(rel) = entry.path().strip_prefix(root) else {
+                    continue;
+                };
+                if walked.contains(rel) || !recorded.insert(rel.to_path_buf()) {
+                    continue;
+                }
+                // Enumerated present ⇒ never omitted (WS31-review H1): a racing
+                // stat records the sentinel rather than dropping the file, which
+                // a reaping sweep would read as a deletion.
+                extra.push((rel.to_path_buf(), observe_mtime(entry.path())));
+            }
+        }
+
+        extra
+    }
+
     /// Diffs one coherence walk's observations against the per-root baseline and
     /// routes the resulting changed set to each covering server, then settles
     /// every server that received changes (WS31 Consumer A — the precise,
     /// per-server changed-set nudge).
     ///
     /// `observed` is the set of `(root-relative path, mtime)` pairs the walk
-    /// visited; `exclude` is the set of root-relative paths to drop from the
-    /// emission but **not** from the baseline (the diagnostics edited-set, which
-    /// rides document-sync). The pipeline:
+    /// visited, widened by the supplemental observation leg
+    /// ([`supplemental_watch_observations`](Self::supplemental_watch_observations),
+    /// bug 143) so the registered patterns the search-posture walk cannot see —
+    /// dotfiles, gitignored paths — are observed too.
+    ///
+    /// `exclude` maps a root-relative path to the **server names that receive it
+    /// via document-sync** this round (the diagnostics edited-set, which rides
+    /// didOpen/didSave). Those servers drop it from the emission, but it stays in
+    /// the baseline for everyone. The map is per-server because document-sync is
+    /// per-server: a file edited and diagnosed by *taplo* is watched by *lattice*,
+    /// which is never sent the document and would otherwise be starved of the
+    /// change permanently — the baseline advances for the whole root, so a later
+    /// walk sees no delta to re-emit (bug 143). A server the file is not
+    /// document-synced to receives the ordinary watched-files route.
+    ///
+    /// The pipeline:
     ///
     /// 1. Snapshot the rooted servers whose scope root is within `root`, with
     ///    each server's registered watchers ([`watched_files_snapshot`]).
@@ -3989,7 +4195,7 @@ impl LspClientManager {
         &self,
         root: &Path,
         observed: &[(PathBuf, i64)],
-        exclude: &HashSet<PathBuf>,
+        exclude: &HashMap<PathBuf, BTreeSet<String>>,
         reap: bool,
     ) {
         // Step 1: snapshot covering servers + their watchers. Lock each client
@@ -4000,6 +4206,27 @@ impl LspClientManager {
         if covering.is_empty() {
             return;
         }
+
+        // Step 1b: the supplemental observation leg (bug 143). The walk that
+        // produced `observed` ran in search posture, so whatever the union of
+        // registered globs asks for in a hidden or gitignored path was never
+        // looked at. Serve those patterns here, filters off, and merge the
+        // result into the walk's set before the union filter — from step 2 on
+        // they are ordinary observations.
+        let supplemental = Self::supplemental_watch_observations(root, &covering, observed);
+        let observed: Cow<'_, [(PathBuf, i64)]> = if supplemental.is_empty() {
+            Cow::Borrowed(observed)
+        } else {
+            debug!(
+                source = Source::LspDispatch.as_str(),
+                "supplemental watch observation added {} path(s) the search-posture \
+                 walk could not see",
+                supplemental.len(),
+            );
+            let mut merged = observed.to_vec();
+            merged.extend(supplemental);
+            Cow::Owned(merged)
+        };
 
         // Step 2: filter observations to the union of registered watch globs —
         // the baseline tracks a file if SOME covering server's glob matches it,
@@ -4065,7 +4292,13 @@ impl LspClientManager {
             // entries this server should have received (F4 recovery, below).
             let mut candidates: Vec<(String, u8, &Change)> = Vec::new();
             for change in &change_set.changes {
-                if exclude.contains(&change.rel) {
+                // Suppressed only for the servers this round document-syncs the
+                // file to — a watching server that is never sent the document
+                // still needs the watched-files route (bug 143).
+                if exclude
+                    .get(&change.rel)
+                    .is_some_and(|synced| synced.contains(c.name.as_str()))
+                {
                     continue;
                 }
                 let abs = root.join(&change.rel);

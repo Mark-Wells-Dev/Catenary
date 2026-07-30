@@ -21,7 +21,7 @@ use crate::symbol_index::SymbolIndex;
 use anyhow::{Result, anyhow};
 use ignore::WalkBuilder;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -926,6 +926,14 @@ impl DiagnosticsServer {
         // is skipped (no stat-walk, no nudge). The edited-set rides document-sync
         // (didOpen/didSave), so it is excluded from the emission — but its mtime
         // is still recorded in the baseline (so a later walk won't re-flag it).
+        //
+        // The exclusion is **per server**, keyed by `path_servers` — the servers
+        // this round actually opens the file on. A file edited and diagnosed by
+        // one server may be *watched* by another (the bug-143 incident: taplo
+        // diagnoses `.lattice.toml`, lattice watches it); the watcher is never
+        // sent the document, so excluding it there would starve it permanently —
+        // the baseline advances for the whole root, leaving no delta for a later
+        // walk to re-emit.
         {
             let roots: std::collections::BTreeSet<PathBuf> = canonical_paths
                 .iter()
@@ -940,10 +948,18 @@ impl DiagnosticsServer {
                 if !breadth.runs_engine() {
                     continue;
                 }
-                // Edited paths (relative to this root) to exclude from emission.
-                let exclude: HashSet<PathBuf> = canonical_paths
+                // Edited paths (relative to this root), each carrying the servers
+                // that receive it via document-sync this round.
+                let exclude: HashMap<PathBuf, BTreeSet<String>> = canonical_paths
                     .iter()
-                    .filter_map(|p| p.strip_prefix(root).ok().map(std::path::Path::to_path_buf))
+                    .filter_map(|p| {
+                        let rel = p.strip_prefix(root).ok()?.to_path_buf();
+                        let synced = path_servers
+                            .get(p.to_string_lossy().as_ref())
+                            .cloned()
+                            .unwrap_or_default();
+                        Some((rel, synced))
+                    })
                     .collect();
                 let observed = stat_walk(root);
                 self.client_manager

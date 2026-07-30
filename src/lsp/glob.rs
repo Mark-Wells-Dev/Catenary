@@ -20,6 +20,13 @@ use globset::{GlobBuilder, GlobMatcher};
 #[derive(Clone, Debug)]
 pub struct LspGlob {
     matcher: GlobMatcher,
+    /// The source pattern string, retained verbatim.
+    ///
+    /// A compiled matcher answers "does this path match?" but not "which
+    /// literal paths *could* match?" — the question the supplemental
+    /// watch-observation probe planner asks (bug 143;
+    /// [`crate::lsp::watch_probe`]).
+    source: String,
 }
 
 impl LspGlob {
@@ -37,13 +44,22 @@ impl LspGlob {
             .build()
             .map_err(|e| anyhow!("invalid glob pattern: {e}"))?
             .compile_matcher();
-        Ok(Self { matcher })
+        Ok(Self {
+            matcher,
+            source: pattern.to_string(),
+        })
     }
 
     /// Tests whether a path matches this pattern.
     #[must_use]
     pub fn is_match(&self, path: &Path) -> bool {
         self.matcher.is_match(path)
+    }
+
+    /// Returns the source pattern string this glob was compiled from.
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
     }
 }
 
