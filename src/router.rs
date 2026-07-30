@@ -1409,7 +1409,10 @@ pub const WORKTREE_ROOT_GC_INTERVAL: Duration = Duration::from_hours(1);
 /// have their per-root server instances shut down.
 ///
 /// Contributor keys:
-/// - `"mcp:{fd}"` — roots from MCP `roots/list` for a connection
+/// - `"mcp:{conn_id}"` — roots from MCP `roots/list` for a connection, keyed by
+///   the connection's monotonic session key (never its socket fd, which the
+///   daemon reuses — bug 147), so the key also matches the connection's
+///   `session_id` in the firehose
 /// - `"hook"` — roots from `catenary add-root` CLI commands
 /// - `"seed:env"` — the daemon's boot roots from `CATENARY_ROOTS` (misc 192),
 ///   registered once at boot so the env seed is a first-class contributor: every
@@ -1735,7 +1738,7 @@ fn reap_missing_worktree_roots(tracker: &RootTracker) -> Vec<String> {
 /// Contributor-key prefix for activity-mounted ephemeral roots.
 ///
 /// A `RootTracker` contributor keyed `ephemeral:{canonical root path}` (decision
-/// 021's namespace discipline — a dedicated class beside `mcp:{fd}` / `hook` /
+/// 021's namespace discipline — a dedicated class beside `mcp:{conn_id}` / `hook` /
 /// `worktree:*`, keyed on the canonical root path). A CLI query (`grep` / `glob`
 /// / `diagnostics`) touching a path outside every mounted root mounts the
 /// enclosing project root under this key; the idle-expiry reaper tears it down.
@@ -1891,7 +1894,7 @@ fn persist_unpin(config_path: &Path, canonical: &Path) -> bool {
 
 /// Contributor key for the daemon's `CATENARY_ROOTS` boot seed (misc 192).
 ///
-/// A single fixed key (not a `{...}`-parameterized namespace like `mcp:{fd}` or
+/// A single fixed key (not a `{...}`-parameterized namespace like `mcp:{conn_id}` or
 /// `worktree:*`) — there is exactly one env seed per daemon. Registered once at
 /// boot in [`register_env_seed`], so every re-sync (a pin via `tool/roots-add`,
 /// an MCP disconnect, a worktree reap) rebuilds a union that still carries the
@@ -3088,7 +3091,9 @@ pub struct SessionManager {
     connection_count: Arc<AtomicUsize>,
     /// Monotonic counter for unique MCP connection IDs. Incremented
     /// once per accepted connection; never decremented. Used as the
-    /// session key (`mcp:{n}`) to avoid fd-reuse collisions.
+    /// session key (`mcp:{n}`) — which is also the connection's
+    /// `RootTracker` contributor key (bug 147) — to avoid fd-reuse
+    /// collisions.
     next_connection_id: Arc<AtomicUsize>,
     /// Accepted MCP connection sockets (bug 134). The accept loop's shutdown
     /// arm sweeps this registry with `shutdown(Shutdown::Both)` so every
@@ -3726,6 +3731,16 @@ impl SessionManager {
                 let tracker_cleanup = root_tracker.clone();
                 let session_cleanup = primary_session.clone();
                 let lsp_cleanup = lsp.clone();
+                // Root-tracker contributor key (bug 147): the MONOTONIC session
+                // key, never the socket fd. Fds recycle within a daemon's
+                // lifetime, so an fd-keyed contributor let a disconnecting
+                // connection's cleanup strip the roots of a successor accepted
+                // on the same fd. Registration (below) takes this clone and
+                // disconnect cleanup takes `session_key` itself, so the two
+                // sides are the same string by construction — and the roots
+                // board now names a connection exactly as its firehose spans do
+                // (`session_id`), which the fd key could not be correlated with.
+                let contributor_key = session_key.clone();
 
                 let result = tokio::task::spawn_blocking(move || {
                     let _entered = span_for_blocking.enter();
@@ -3752,7 +3767,6 @@ impl SessionManager {
                     // without clobbering each other.
                     match (root_tracker, lsp, primary_session) {
                         (Some(tracker), Some(_), Some(session)) => {
-                            let mcp_key = format!("mcp:{fd}");
                             mcp = mcp.on_roots_changed(Box::new(move |roots| {
                                 // Expand the client's declared roots with any
                                 // configured companions (workstream 29), then
@@ -3760,7 +3774,7 @@ impl SessionManager {
                                 // the full declared set on every change tracks
                                 // add/remove for free (no provenance bookkeeping).
                                 let paths = companion_expanded_roots(&roots, &session.config);
-                                tracker.set_roots(&mcp_key, paths);
+                                tracker.set_roots(&contributor_key, paths);
                                 let global = tracker.global_roots_rich();
                                 tokio::runtime::Handle::current()
                                     .block_on(session.sync_roots(global))?;
@@ -3807,8 +3821,9 @@ impl SessionManager {
                 // Remove roots from the tracker and sync the reduced root
                 // set to LSP servers.
                 if let Some(ref tracker) = tracker_cleanup {
-                    let mcp_key = format!("mcp:{fd}");
-                    tracker.remove_contributor(&mcp_key);
+                    // The same key registration used — the monotonic session
+                    // key, not the reusable fd (bug 147).
+                    tracker.remove_contributor(&session_key);
 
                     // Sync the reduced root set through the primary
                     // session so both FilesystemManager and PathValidator
@@ -4637,7 +4652,7 @@ fn parse_root_uris(roots: &[crate::mcp::Root]) -> Vec<PathBuf> {
 
 /// Expands an MCP client's declared roots with any configured companions.
 ///
-/// This is the body of the `mcp:{fd}` `on_roots_changed` callback (workstream
+/// This is the body of the `mcp:{conn_id}` `on_roots_changed` callback (workstream
 /// 29), factored out so it can be tested without a live socket: parse the
 /// client's root URIs, then — when `[roots.companions]` is configured — union in
 /// each root's derived companion via [`expand_companions`]. With no rules
@@ -12701,7 +12716,7 @@ mod tests {
     //
     // These exercise the `on_roots_changed` seam: the callback recomputes
     // `expand_companions(declared, rules)` and `set_roots`-REPLACEs the
-    // `mcp:{fd}` set on every change. Driving the tracker the same way the
+    // `mcp:{conn_id}` set on every change. Driving the tracker the same way the
     // callback does proves companions ride `global_roots`, track add/remove
     // for free, and refcount across connections.
 

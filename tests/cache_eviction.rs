@@ -25,6 +25,7 @@
 
 mod common;
 
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -33,6 +34,28 @@ use serde_json::json;
 use common::{BridgeProcess, grep_until_enriched, ipc_request, mockls_lsp_arg};
 
 const MOCK_LANG: &str = "evict_test";
+
+/// The `mcp:*` contributor keys `roots-ls` attributes to `target`, sorted.
+///
+/// Reads a connection's root-contributor key back off the board, so a test can
+/// pin the key's derivation and a disconnect's blast radius (bug 147).
+fn mcp_contributors(socket: &Path, target: &str) -> Result<Vec<String>> {
+    let resp = ipc_request(socket, &json!({ "method": "tool/roots-ls" }))?;
+    let board: serde_json::Value = serde_json::from_str(resp.trim()).context("roots-ls json")?;
+    let mut keys: Vec<String> = board["roots"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["path"].as_str() == Some(target))
+        .filter_map(|e| e["sources"].as_array())
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .filter(|s| s.starts_with("mcp:"))
+        .map(String::from)
+        .collect();
+    keys.sort();
+    Ok(keys)
+}
 
 /// Body where a callee is defined first, then a caller whose braced body names
 /// the callee. Grepping the callee surfaces its in-body usage, which is enclosed
@@ -135,6 +158,10 @@ fn enrichment_evicted_on_root_removal() -> Result<()> {
 /// set through `Session::sync_roots`, which evicts the dropped root. A second
 /// bridge (declaring only an unrelated base root) keeps the daemon alive and
 /// observes that the dropped root no longer serves enrichment.
+///
+/// The same two-connection register/cleanup path carries bug 147's guards: each
+/// connection's root contributor is keyed by its monotonic session key, and a
+/// disconnect removes only that connection's own contributor.
 #[test]
 fn untracked_root_does_not_serve_cached_enrichment() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
@@ -143,8 +170,11 @@ fn untracked_root_does_not_serve_cached_enrichment() -> Result<()> {
     let _daemon_guard = common::DaemonGuard::new(state_home);
 
     // The base root keeps the daemon alive after the warming bridge drops.
+    // Canonicalized so it matches the form `roots-ls` reports (the contributor
+    // assertions below look it up on the board by path).
     let base = tempfile::tempdir()?;
-    let base_str = base.path().to_str().context("base path")?;
+    let base_path = base.path().canonicalize()?;
+    let base_str = base_path.to_str().context("base path")?;
 
     // The warmed-then-dropped root.
     let dropped = tempfile::tempdir()?;
@@ -161,6 +191,7 @@ fn untracked_root_does_not_serve_cached_enrichment() -> Result<()> {
         cmd.env("CATENARY_ROOTS", base_str);
     })?;
     keeper.initialize_with_roots(&[base_str])?;
+    let socket = keeper.wait_for_ipc_socket()?;
 
     // Warming bridge — declares the dropped root.
     let mut warmer = BridgeProcess::spawn_in_state(state_home, |cmd| {
@@ -169,6 +200,30 @@ fn untracked_root_does_not_serve_cached_enrichment() -> Result<()> {
     })?;
     warmer.initialize_with_roots(&[dropped_str])?;
     warmer.wait_for_root(dropped_str, Duration::from_secs(5))?;
+
+    // ── Bug 147: the root contributor is keyed by the session key ────────
+    //
+    // Both connections' roots are on the board, each attributed to its
+    // declaring connection's MONOTONIC session key (`mcp:{conn_id}` — 0 then 1
+    // for a fresh daemon's first two accepts), never the socket fd, which is
+    // ≥ 3 and recycles across a daemon's lifetime. The fd cannot be forced from
+    // a test, so this pins the derivation instead: an fd-keyed contributor
+    // would be re-minted for a later connection accepted on the recycled fd,
+    // and the earlier connection's disconnect cleanup would then strip the
+    // successor's roots. Keying by the session key also makes the board name a
+    // connection exactly as its firehose spans do (`session_id`).
+    let keeper_key = mcp_contributors(&socket, base_str)?;
+    let warmer_key = mcp_contributors(&socket, dropped_str)?;
+    assert_eq!(
+        keeper_key,
+        ["mcp:0"],
+        "the first connection's roots register under its session key",
+    );
+    assert_eq!(
+        warmer_key,
+        ["mcp:1"],
+        "the second connection's roots register under its own session key",
+    );
 
     // Warm the SymbolIndex via the warming bridge. Retry until the `calls:`
     // enrichment signal appears (the readiness signal) instead of a fixed sleep.
@@ -186,7 +241,6 @@ fn untracked_root_does_not_serve_cached_enrichment() -> Result<()> {
     drop(warmer);
 
     // Wait until the keeper no longer sees the dropped root as tracked.
-    let socket = keeper.wait_for_ipc_socket()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let ls = ipc_request(&socket, &json!({ "method": "tool/roots-ls" }))?;
@@ -199,6 +253,16 @@ fn untracked_root_does_not_serve_cached_enrichment() -> Result<()> {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+
+    // Bug 147 regression guard: the disconnect removed ONLY the warmer's own
+    // contributor. The still-connected keeper keeps its roots under its own
+    // key — the collision the fd-derived key could produce (one connection's
+    // cleanup stripping another's roots) is impossible by construction.
+    assert_eq!(
+        mcp_contributors(&socket, base_str)?,
+        keeper_key.as_slice(),
+        "a peer's disconnect must not touch a live connection's contributor",
+    );
 
     // Through the keeper, the dropped (now untracked) path still serves the raw
     // ripgrep match. There is no per-position enrichment cache in the

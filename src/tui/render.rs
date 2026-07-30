@@ -130,7 +130,7 @@ pub fn contributor_label(sources: &[String]) -> String {
 }
 
 /// A short, disambiguating tag for a contributor connection id — the raw id when
-/// it is already short (a small `mcp:{fd}`), else its `…`-elided tail so a long
+/// it is already short (a small `mcp:{conn_id}`), else its `…`-elided tail so a long
 /// opaque id stays compact (tui-rework 14, item 6b).
 fn session_tag(id: &str) -> String {
     if id.chars().count() <= 6 {
