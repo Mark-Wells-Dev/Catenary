@@ -9,7 +9,7 @@ Per-release binaries and auto-generated commit notes are published on the
 file records the curated highlights and, for major releases, the migration
 guidance.
 
-## [2.1.0] - 2026-07-29
+## [2.1.0] - 2026-07-30
 
 ### Added
 
