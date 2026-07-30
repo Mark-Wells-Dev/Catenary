@@ -1914,8 +1914,11 @@ const SEED_ENV_CONTRIBUTOR: &str = "seed:env";
 /// Zero-cost, mirroring [`restore_pinned_roots`]: `set_roots` births a
 /// config-loaded [`Root`] per path but spawns nothing (the session's own
 /// `spawn_all` at boot already covers these roots), and no `sync_roots` push is
-/// needed — the session already serves the seed. An empty seed (never the case:
-/// `CATENARY_ROOTS` defaults to `["."]`, canonicalized) is a benign no-op.
+/// needed — the session already serves the seed. An empty seed is the ROOTLESS
+/// boot — `CATENARY_ROOTS` unset or empty, the ordinary service-manager start
+/// since bug 145 dropped the cwd fallback — and registers nothing: the seed line
+/// below only ever fires for an explicit env seed, so a reader who sees it knows
+/// the variable was set.
 #[cfg(unix)]
 fn register_env_seed(tracker: &RootTracker, session: &Arc<Session>) {
     let seed = session.roots();

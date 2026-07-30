@@ -1930,15 +1930,27 @@ fn serve_daemon(
     // 133). Best-effort — a filesystem error leaves the config untouched.
     catenary_cli::config::schema::install_toml_schema_association(&mut config);
 
+    // Boot roots come from an EXPLICIT `CATENARY_ROOTS` only — unset or empty
+    // means the daemon boots ROOTLESS (bug 145). There is no cwd fallback: the
+    // daemon is no longer launched from the project it serves, and cwd is
+    // whatever its launcher happened to hold — `$HOME` under `systemd --user`,
+    // `/` under launchd — so seeding it made every project a subdirectory of one
+    // permanent, un-removable `seed:env` root and no real root ever mounted.
+    // Coverage is automatic without it: hooks register each session's roots and
+    // activity mounts anything a session touches.
     let raw_roots: Vec<PathBuf> = match std::env::var("CATENARY_ROOTS") {
         Ok(val) if !val.is_empty() => std::env::split_paths(&val).collect(),
-        _ => vec![PathBuf::from(".")],
+        _ => Vec::new(),
     };
     let roots: Vec<PathBuf> = raw_roots
         .into_iter()
         .map(|r| r.canonicalize())
         .collect::<std::io::Result<Vec<_>>>()?;
 
+    // Captured before `roots` moves into the session below, for the honest boot
+    // trace at the end of setup (bug 145): a rootless boot says so plainly
+    // instead of naming an empty workspace.
+    let rootless_boot = roots.is_empty();
     let workspace_display = roots
         .iter()
         .map(|r| r.to_string_lossy().into_owned())
@@ -2080,10 +2092,21 @@ fn serve_daemon(
     // is a network-free no-op until the maintainer stands up the registry.
     manager.spawn_registry_refresh(rt.handle());
 
-    info!(
-        source = Source::DaemonLifecycle.as_str(),
-        "daemon serving workspace: {workspace_display}",
-    );
+    // Honest boot trace (bug 145): name the workspace only when an explicit
+    // `CATENARY_ROOTS` seeded one. A rootless boot is the normal service-manager
+    // start, not a fault — say so at info level and name where roots come from
+    // instead, so the next reader never hunts for a seed that was never set.
+    if rootless_boot {
+        info!(
+            source = Source::DaemonLifecycle.as_str(),
+            "daemon booted rootless: CATENARY_ROOTS unset — roots mount from session activity",
+        );
+    } else {
+        info!(
+            source = Source::DaemonLifecycle.as_str(),
+            "daemon serving workspace: {workspace_display}",
+        );
+    }
 
     // Check installed hooks against expected — fire error!() (→ desktop
     // notification) if stale. The LoggingServer is active at this point,

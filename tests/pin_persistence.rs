@@ -11,6 +11,11 @@
 //! shared, externally-owned state dir, then bounce the daemon (`catenary stop` +
 //! a fresh bridge in the same state) to exercise boot restore.
 //!
+//! The daemon's own `CATENARY_ROOTS` boot seed shares the file, since it is the
+//! other contributor a boot installs: its survivability across a pin/unpin
+//! re-sync (misc 192) and its source — an explicit variable and nothing else,
+//! no cwd fallback (bug 145).
+//!
 //! The config the daemon writes and reads is `$CATENARY_CONFIG_DIR/catenary/
 //! config.toml`, which `isolate_env` points at `<state>/config` — the same file
 //! on both the write leg (daemon-side pin) and the read leg (boot restore). Tests
@@ -160,6 +165,22 @@ fn roots_ls_sources(socket: &Path, target: &str) -> Result<Option<Vec<String>>> 
                     .collect()
             })
     }))
+}
+
+/// Every root path `roots-ls` reports, sorted — the whole board, not one entry.
+///
+/// The boot-seed tests (bug 145) assert on the board's *size*: that a rootless
+/// boot registers nothing at all is a claim no per-target lookup can make.
+fn roots_ls_paths(socket: &Path) -> Result<Vec<String>> {
+    let resp = ipc_request(socket, &json!({ "method": "tool/roots-ls" }))?;
+    let roots: serde_json::Value = serde_json::from_str(resp.trim()).context("roots-ls json")?;
+    let mut paths: Vec<String> = roots["roots"].as_array().map_or_else(Vec::new, |arr| {
+        arr.iter()
+            .filter_map(|e| e["path"].as_str().map(String::from))
+            .collect()
+    });
+    paths.sort();
+    Ok(paths)
 }
 
 /// Reads the daemon's `state.json` snapshot from the isolated runtime dir.
@@ -605,6 +626,129 @@ fn env_seed_survives_an_unpin() -> Result<()> {
         roots_ls_sources(&socket, seed_str)?,
         Some(vec!["seed:env".to_string()]),
         "env seed survives the unpin"
+    );
+
+    drop(bridge);
+    stop_daemon(state_home)?;
+    Ok(())
+}
+
+/// A daemon booted with **no** `CATENARY_ROOTS` registers no boot roots at all
+/// (bug 145).
+///
+/// The dropped fallback seeded `PathBuf::from(".")` — the daemon's cwd — as the
+/// `seed:env` contributor whenever the variable was unset. The daemon is no
+/// longer launched from the project it serves, so that cwd is whatever its
+/// launcher held: `$HOME` under `systemd --user`, `/` under launchd. The first
+/// live always-on boot rooted the operator's entire home directory, which made
+/// every project a subdirectory of an existing root so no real root ever
+/// mounted; the seed is deliberately un-removable (misc 192), so nothing short
+/// of a restart corrected it.
+///
+/// The assertion is ordered, not raced: the daemon binds its sockets before boot
+/// setup but only *serves* IPC once its accept loop runs, which is after
+/// `with_session` has done its env-seed registration. A `roots-ls` that answers
+/// at all therefore answers after any boot seed would already be on the board.
+///
+/// Red before the fix: the board carries the harness's cwd (this crate's root)
+/// as `seed:env`. Green after: the board is empty.
+#[test]
+fn boot_without_catenary_roots_registers_no_roots() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave daemon
+    // lifecycle to the test, so a failed assertion before `stop_daemon` would
+    // leak the daemon without this guard.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
+
+    // `isolate_env` clears every inherited `CATENARY_*` var and this spawn adds
+    // no `CATENARY_ROOTS` back — the unset case verbatim. The mock server
+    // binding keeps the daemon off the shipped registry; it matches nothing.
+    let lsp = mockls_lsp_arg(MOCK_LANG, "");
+    let mut bridge = BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_SERVERS", &lsp);
+    })?;
+    bridge.initialize()?;
+    let socket = bridge.wait_for_ipc_socket()?;
+
+    assert!(
+        roots_ls_paths(&socket)?.is_empty(),
+        "a daemon booted without CATENARY_ROOTS tracks no roots, got: {:?}",
+        roots_ls_paths(&socket)?,
+    );
+
+    drop(bridge);
+    stop_daemon(state_home)?;
+    Ok(())
+}
+
+/// An **empty** `CATENARY_ROOTS` is the same rootless boot as an unset one
+/// (bug 145).
+///
+/// The env read has always treated `""` as absent; the fallback then supplied
+/// cwd for both. With the fallback gone the two must still agree — an operator
+/// who clears the variable in a unit file gets a rootless daemon, not a
+/// home-rooted one.
+#[test]
+fn boot_with_empty_catenary_roots_registers_no_roots() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+    let _daemon_guard = common::DaemonGuard::new(state_home);
+
+    let lsp = mockls_lsp_arg(MOCK_LANG, "");
+    let mut bridge = BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_SERVERS", &lsp);
+        cmd.env("CATENARY_ROOTS", "");
+    })?;
+    bridge.initialize()?;
+    let socket = bridge.wait_for_ipc_socket()?;
+
+    assert!(
+        roots_ls_paths(&socket)?.is_empty(),
+        "an empty CATENARY_ROOTS tracks no roots, got: {:?}",
+        roots_ls_paths(&socket)?,
+    );
+
+    drop(bridge);
+    stop_daemon(state_home)?;
+    Ok(())
+}
+
+/// An explicit `CATENARY_ROOTS` still seeds exactly its roots at boot, and
+/// nothing else (bug 145).
+///
+/// The other half of the contract: dropping the cwd fallback changed the *unset*
+/// case only. A set variable seeds the named roots as the first-class `seed:env`
+/// contributor exactly as before — the survivability machinery (misc 192) is
+/// untouched, and the board carries those roots and no phantom extra.
+#[test]
+fn explicit_catenary_roots_still_seeds_the_boot_roots() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+    let _daemon_guard = common::DaemonGuard::new(state_home);
+
+    // Canonical, so it matches the daemon's stored (canonicalized) spelling.
+    let seed = common::canonical_tempdir()?;
+    let seed_str = seed.path().to_str().context("seed path")?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG, "");
+    let mut bridge = BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_SERVERS", &lsp);
+        cmd.env("CATENARY_ROOTS", seed_str);
+    })?;
+    bridge.initialize()?;
+    let socket = bridge.wait_for_ipc_socket()?;
+    bridge.wait_for_root(seed_str, Duration::from_secs(5))?;
+
+    assert_eq!(
+        roots_ls_paths(&socket)?,
+        vec![seed_str.to_string()],
+        "the explicit seed is the whole board — no cwd root rides along"
+    );
+    assert_eq!(
+        roots_ls_sources(&socket, seed_str)?,
+        Some(vec!["seed:env".to_string()]),
+        "the explicit seed is still attributed to seed:env"
     );
 
     drop(bridge);

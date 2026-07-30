@@ -30,8 +30,9 @@ daemon. Daemon startup, in order:
    environment overrides (`CATENARY_SERVERS`, `CATENARY_ROOTS`) are
    applied last.
 
-4. **Root resolution.** Workspace roots come from `CATENARY_ROOTS`
-   (path-separated) or default to the current directory. Roots are
+4. **Root resolution.** Boot roots come from an explicit `CATENARY_ROOTS`
+   (path-separated) and nowhere else — unset or empty means the daemon
+   boots rootless, which is the ordinary service-manager start. Roots are
    canonicalized to absolute paths.
 
 5. **Primary session assembly.** The daemon builds one shared,
@@ -84,8 +85,9 @@ exits only when the last one disconnects.
 
 ## Root discovery
 
-Workspace roots are known at startup from `CATENARY_ROOTS` or the
-current directory. The MCP `initialize` handshake may also provide
+Workspace roots are known at startup only when `CATENARY_ROOTS` is set;
+otherwise the daemon starts with none and roots arrive from session
+activity. The MCP `initialize` handshake may also provide
 roots via `roots/list`. Each root is checked for a `.catenary.toml`
 project config, which can override language and server definitions for
 that root's scope.
