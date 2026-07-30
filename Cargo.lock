@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "catenary-mcp"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "catenary-proc"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "libc",
  "mach2",
