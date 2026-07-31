@@ -7773,22 +7773,27 @@ mod tests {
             "the calm finding fired once"
         );
 
+        // Poll the COMPLETION signal — the staged executable at the pin — not
+        // the runner's entry counter: `runs` increments before the staging
+        // writes land, so a counter poll races the on-disk assert (it lost that
+        // race on macOS CI, run 30637514759). Completion is what bounds the
+        // wait; the exactly-once assert then reads a settled counter, since the
+        // already-surfaced dedupe means no later kick can still be in flight.
+        let home = crate::managed_home::ManagedHome::at(home_root);
         for _ in 0..200 {
-            if runs.load(Ordering::SeqCst) >= 1 {
+            if home.pinned_executable(server, version, server).is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert!(
+            home.pinned_executable(server, version, server).is_some(),
+            "the JIT install landed in the managed home at the pin"
+        );
         assert_eq!(
             runs.load(Ordering::SeqCst),
             1,
             "one kick across repeated spawn demands"
-        );
-        assert!(
-            crate::managed_home::ManagedHome::at(home_root)
-                .pinned_executable(server, version, server)
-                .is_some(),
-            "the JIT install landed in the managed home at the pin"
         );
         Ok(())
     }
