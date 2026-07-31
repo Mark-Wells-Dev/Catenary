@@ -157,10 +157,17 @@ Flag synopses (long forms)
 ///
 /// Keys truthfully on the per-agent debt model without any agent-type
 /// branching (the subagent namespace is open, carrying no capability signal).
+///
+/// The deadline is pay-FIRST, not merely "before you finish" (misc 228): the
+/// host returns a worker's LAST message to its dispatcher, so a debt receipt
+/// produced after the report is composed arrives in the report's place. Naming
+/// the deadline and its reason is the whole fix on this surface — the Stop-block
+/// message carries the recovery half for a worker that hits the trap anyway.
 const SUBAGENT_DEBT: &str = "\
 Subagent note: your diagnostic debt is tracked per-agent — the main agent's
-`catenary diagnostics` does not pay yours. Diagnose the files you edit before
-you finish.";
+`catenary diagnostics` does not pay yours. Diagnose the files you edit BEFORE
+you compose your final report: your last message is what your dispatcher
+receives, and a receipt written afterward becomes that message.";
 
 /// One restrained line prepended to the payload when the serving daemon runs a
 /// different build than this CLI (detected via
@@ -894,6 +901,38 @@ mod tests {
         assert!(
             sub.contains("your diagnostic debt is tracked per-agent"),
             "subagent payload missing the per-agent debt line: {sub}"
+        );
+    }
+
+    #[test]
+    fn subagent_payload_teaches_the_pay_first_deadline() {
+        // misc 228: the deadline is pay-FIRST, not "before you finish" — the host
+        // returns a worker's LAST message, so a receipt written after the report
+        // arrives in the report's place. Both halves are pinned: the deadline and
+        // the reason that makes it stick. Substrings never span a wrap, so
+        // rewrapping the const cannot silently drop the teaching.
+        assert!(
+            SUBAGENT_DEBT.contains("Diagnose the files you edit BEFORE"),
+            "the debt line must state the pay-first deadline: {SUBAGENT_DEBT}"
+        );
+        assert!(
+            SUBAGENT_DEBT.contains("you compose your final report"),
+            "the deadline must anchor on composing the report: {SUBAGENT_DEBT}"
+        );
+        assert!(
+            SUBAGENT_DEBT.contains("your last message is what your dispatcher"),
+            "the debt line must give the reason (last message wins): {SUBAGENT_DEBT}"
+        );
+        // The retired, weaker deadline must not survive alongside the new one —
+        // two deadlines teach neither.
+        assert!(
+            !SUBAGENT_DEBT.contains("before\nyou finish"),
+            "the superseded 'before you finish' deadline must be gone: {SUBAGENT_DEBT}"
+        );
+        // And it rides the live subagent payload, not just the const.
+        assert!(
+            subagent_payload().contains("you compose your final report"),
+            "the pay-first deadline must ride the emitted subagent payload"
         );
     }
 

@@ -861,7 +861,14 @@ impl HookRouter {
     /// Stop tells the agent exactly which edits are still owed instead of the old
     /// bare "run `catenary diagnostics` before finishing" — the opacity that made
     /// this bug need a firehose dig to see. There is no command to re-run at a
-    /// Stop, so the trailer just teaches the two payment forms.
+    /// Stop, so the trailer teaches the two payment forms and closes with the
+    /// recovery half (misc 228): a worker blocked here has usually already
+    /// composed its report, and the host returns its LAST message — so paying
+    /// without restating would hand the dispatcher this receipt instead of the
+    /// deliverable. The line is agent-neutral by construction (the same Stop
+    /// gate serves the main agent, whose last message its reader sees the same
+    /// way), matching the pay-first deadline the `SubagentStart` payload teaches
+    /// up front.
     fn stop_block_message(&self, files: &[PathBuf]) -> String {
         use std::collections::BTreeMap;
         use std::fmt::Write as _;
@@ -900,7 +907,12 @@ impl HookRouter {
             msg,
             "Run `catenary diagnostics` to check them all, or name paths to check only some:"
         );
-        let _ = write!(msg, "  catenary diagnostics {scoped}");
+        let _ = writeln!(msg, "  catenary diagnostics {scoped}");
+        let _ = write!(
+            msg,
+            "Then restate your report — your last message is what your dispatcher \
+             receives, so it must not be this receipt."
+        );
         msg
     }
 
@@ -1159,6 +1171,44 @@ mod tests {
         assert!(
             router.session.editing.is_editing(None, ""),
             "a blocked Stop leaves editing state intact"
+        );
+    }
+
+    #[test]
+    fn stop_block_teaches_restating_the_report_after_paying() {
+        // misc 228: a worker blocked here has usually already composed its
+        // report, and the host returns its LAST message — so the block must
+        // teach the recovery half (pay, then RESTATE), or the dispatcher
+        // receives the debt receipt instead of the deliverable. The line is one
+        // rendered line, so the pinned phrases cannot span a wrap.
+        let (router, root, locks) = stop_router_with_ledger();
+        let file = root.join("src/main.rs");
+        std::fs::write(&file, b"").expect("write file");
+        book_and_record(&router, &locks, &file);
+
+        let result = router.require_release_in(None, "", false, &locks);
+        let Some(HookResult::Block(msg)) = result else {
+            unreachable!("expected Block on unpaid ledger, got {result:?}");
+        };
+        assert!(
+            msg.contains("Then restate your report"),
+            "the block must teach restating the report; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("your last message is what your dispatcher receives"),
+            "the block must give the reason (last message wins); got:\n{msg}"
+        );
+        // Recovery, not payment: the restate line closes the message, after the
+        // two payment forms it already taught.
+        let pay = msg
+            .find("catenary diagnostics")
+            .expect("the block teaches the payment command");
+        let restate = msg
+            .find("Then restate your report")
+            .expect("the block teaches the restate");
+        assert!(
+            pay < restate,
+            "restate must follow the payment teaching; got:\n{msg}"
         );
     }
 

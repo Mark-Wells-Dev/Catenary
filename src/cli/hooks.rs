@@ -4488,6 +4488,18 @@ mod tests {
             ctx.contains("your diagnostic debt is tracked per-agent"),
             "per-agent debt line present: {ctx}",
         );
+        // …carrying the pay-first deadline (misc 228): the host returns the
+        // worker's LAST message, so the debt is paid BEFORE the report is
+        // composed. Checked on the emitted context, not just the const, so a
+        // payload-assembly change that dropped the line would fail here.
+        assert!(
+            ctx.contains("Diagnose the files you edit BEFORE"),
+            "pay-first deadline present: {ctx}",
+        );
+        assert!(
+            ctx.contains("you compose your final report"),
+            "the deadline anchors on composing the report: {ctx}",
+        );
         // Deliberately client-neutral (misc 177): the worker does not dispatch
         // isolated work itself, so the dispatch section stays out and the
         // misc-146 mention rides as-is.
