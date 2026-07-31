@@ -1421,6 +1421,12 @@ impl DiagnosticsServer {
     /// them renders the cause's wording: `[unverified — <server> stuck; will
     /// retry on demand]` while revivable, or the terminal `[broken — …]` /
     /// `[unstable — …]` labels once struck out.
+    ///
+    /// Each server the receipt names unavailable is then asked, once, what the
+    /// daemon's shared auto-installer is doing about it
+    /// ([`LspClientManager::auto_install_progress`]) — a running install or a
+    /// failed one amends that server's banner line, so the demanding round
+    /// reports it in-band (bug 148 receipt amendment).
     #[allow(
         clippy::too_many_arguments,
         reason = "one linear renderer over the distinct receipt inputs (covered paths, results, uncovered, out-of-scope, per-file servers, stuck servers, collapse flag)"
@@ -1553,6 +1559,7 @@ impl DiagnosticsServer {
             &clean_files,
             &unverified_files,
             collapse_clean,
+            &self.install_progress(&unverified_files),
         );
 
         // A scoped pull's named paths that fell out of scope (nonexistent, or
@@ -1569,6 +1576,29 @@ impl DiagnosticsServer {
             warnings,
             served: canonical_paths.to_vec(),
         }
+    }
+
+    /// What the daemon's shared auto-installer is doing about each server the
+    /// receipt is about to name unavailable (bug 148 receipt amendment).
+    ///
+    /// Read at render time off the ONE installer — no polling, no second store —
+    /// so the banner can tell the demanding agent, in-band, that the absence is
+    /// already being handled (or that the install failed). Only the named
+    /// servers are asked, once each; a server with nothing running and nothing
+    /// failed contributes no entry, so its banner line stays exactly as it was.
+    fn install_progress(&self, unverified: &[UnverifiedEntry]) -> InstallProgress {
+        let mut named: BTreeSet<&str> = BTreeSet::new();
+        for ue in unverified {
+            named.extend(ue.server.split(", ").filter(|name| !name.is_empty()));
+        }
+        named
+            .into_iter()
+            .filter_map(|name| {
+                self.client_manager
+                    .auto_install_progress(name)
+                    .map(|progress| (name.to_owned(), progress))
+            })
+            .collect()
     }
 
     /// Runs a server's batch, then makes one bounded recovery attempt if the
@@ -3409,6 +3439,46 @@ fn unverified_label(server: &str, cause: UnverifiedCause) -> String {
     }
 }
 
+/// Auto-install progress for the servers a receipt names unavailable, keyed by
+/// server name (bug 148 receipt amendment).
+///
+/// Resolved once per round in [`DiagnosticsServer::format_output`] from the
+/// daemon's ONE shared installer and handed to the render as data, so the
+/// formatter stays pure. Empty everywhere no install is running or failed — and
+/// everywhere no installer is wired at all — in which case the banner renders
+/// exactly as it did before.
+type InstallProgress = BTreeMap<String, crate::auto_install::AutoInstallProgress>;
+
+/// One `unavailable:` banner line (decision 027), amended with the auto-install
+/// truth when the daemon is already handling the absence (bug 148).
+///
+/// The banner is the agent's only in-band view of a missing server: the JIT
+/// announce is a `warn!`, a TUI health finding agents never see. So when the
+/// shared installer has a background install running for this server the line
+/// says so in the present tense and names the cheap next move (re-run), and when
+/// an install already failed it says *that*, with the by-hand retry and the
+/// automatic one. Restrained banner voice throughout — name the server and what
+/// is happening to it, never internal state, never doctor advice (ruled). With
+/// no auto-install in play the line is the bare `unavailable: <server>` it has
+/// always been.
+fn unavailable_banner_line(
+    server: &str,
+    progress: Option<crate::auto_install::AutoInstallProgress>,
+) -> String {
+    use crate::auto_install::AutoInstallProgress;
+    match progress {
+        None => format!("unavailable: {server}"),
+        Some(AutoInstallProgress::InFlight) => format!(
+            "unavailable: {server} \u{2014} installing in background (auto_install); this round \
+             served without it, re-run to include it"
+        ),
+        Some(AutoInstallProgress::Failed) => format!(
+            "unavailable: {server} \u{2014} install failed; `catenary install {server}` retries by \
+             hand, the next session start retries automatically"
+        ),
+    }
+}
+
 /// Per-root dirty rows for the receipt render: `(display, entries,
 /// single_file)`.
 type DiagByRoot<'a> = BTreeMap<&'a PathBuf, Vec<(&'a str, &'a [DiagEntry], bool)>>;
@@ -3444,6 +3514,9 @@ type UnverifiedByRoot<'a> = BTreeMap<&'a PathBuf, Vec<(&'a str, &'a str, Unverif
 /// When any file is unverified, the receipt **opens with an `unavailable:
 /// <server>` banner** ([`prepend_unavailable_banner`], decision 027) naming the
 /// server(s) that degraded, so degraded coverage never reads as clean.
+/// `installs` amends those banner lines with the auto-install truth for the
+/// servers the daemon is already handling (bug 148); an empty map renders the
+/// banner byte-for-byte as before.
 #[allow(
     clippy::too_many_lines,
     reason = "one linear renderer: the four file categories (dirty / clean / unverified / uncovered) each render in the collapsed and multi-file branches, top-to-bottom"
@@ -3454,6 +3527,7 @@ fn format_diagnostics(
     clean: &[CleanEntry],
     unverified: &[UnverifiedEntry],
     collapse_clean: bool,
+    installs: &InstallProgress,
 ) -> String {
     use std::fmt::Write;
 
@@ -3609,7 +3683,7 @@ fn format_diagnostics(
         }
     }
 
-    prepend_unavailable_banner(unverified, output)
+    prepend_unavailable_banner(unverified, installs, output)
 }
 
 /// Prepends the `unavailable: <server>` banner to a rendered receipt when the
@@ -3624,7 +3698,17 @@ fn format_diagnostics(
 /// never dump internal state — and one line per distinct server, sorted. With
 /// no unverified files there is no banner (a fully-recovered run is silent
 /// about the transient death).
-fn prepend_unavailable_banner(unverified: &[UnverifiedEntry], body: String) -> String {
+///
+/// `installs` carries what the daemon's shared auto-installer is doing about
+/// each named server (bug 148 receipt amendment): a running install and a failed
+/// one each amend their own banner line ([`unavailable_banner_line`]), so the
+/// demanding round tells the agent in-band what the TUI-only announce never
+/// could. A server with no entry keeps the bare line unchanged.
+fn prepend_unavailable_banner(
+    unverified: &[UnverifiedEntry],
+    installs: &InstallProgress,
+    body: String,
+) -> String {
     use std::fmt::Write;
 
     let mut servers: BTreeSet<&str> = BTreeSet::new();
@@ -3641,7 +3725,11 @@ fn prepend_unavailable_banner(unverified: &[UnverifiedEntry], body: String) -> S
 
     let mut out = String::new();
     for name in &servers {
-        _ = writeln!(out, "unavailable: {name}");
+        _ = writeln!(
+            out,
+            "{}",
+            unavailable_banner_line(name, installs.get(*name).copied()),
+        );
     }
     out.push_str(&body);
     out
@@ -3753,7 +3841,7 @@ mod tests {
             entries: vec![de(1, ":1:1 [error] test: msg")],
             single_file: false,
         }];
-        let output = format_diagnostics(&diag_files, &[], &[], &[], false);
+        let output = format_diagnostics(&diag_files, &[], &[], &[], false, &BTreeMap::new());
         assert!(!output.contains("[LSP available]"), "output: {output}");
         // Single file under root → collapsed path.
         assert!(output.contains("/test/file.rs:"), "output: {output}");
@@ -3771,7 +3859,7 @@ mod tests {
             entries,
             single_file: false,
         }];
-        let output = format_diagnostics(&diag_files, &[], &[], &[], false);
+        let output = format_diagnostics(&diag_files, &[], &[], &[], false, &BTreeMap::new());
         // All entries should be present (no paging).
         for i in 0..5 {
             assert!(output.contains(&format!("msg {i}")), "output: {output}");
@@ -3783,7 +3871,7 @@ mod tests {
         // A batch with no diagnosed files at all — no dirty, clean, or
         // uncovered entries — renders nothing. The empty-set sentinel
         // (`[no edited files]`) is the CLI's job, not the formatter's.
-        let output = format_diagnostics(&[], &[], &[], &[], false);
+        let output = format_diagnostics(&[], &[], &[], &[], false, &BTreeMap::new());
         assert!(output.is_empty(), "expected empty output, got: {output:?}");
     }
 
@@ -3796,7 +3884,7 @@ mod tests {
             root: PathBuf::from("/test"),
             single_file: false,
         }];
-        let output = format_diagnostics(&[], &[], &clean, &[], false);
+        let output = format_diagnostics(&[], &[], &clean, &[], false, &BTreeMap::new());
         // Single file under root → collapsed path with `[clean]` beside it.
         assert_eq!(output.trim(), "/test/file.rs [clean]", "output: {output}");
     }
@@ -3823,7 +3911,7 @@ mod tests {
                 single_file: false,
             },
         ];
-        let output = format_diagnostics(&diag_files, &[], &[], &[], false);
+        let output = format_diagnostics(&diag_files, &[], &[], &[], false, &BTreeMap::new());
         // /alpha has 2 diag files → expanded with directory header.
         let alpha_pos = output.find("/alpha\n").expect("missing /alpha header");
         assert!(output.contains("\tsrc/lib.rs:"), "output: {output}");
@@ -3855,7 +3943,7 @@ mod tests {
             root: PathBuf::from("/alpha"),
             single_file: false,
         }];
-        let output = format_diagnostics(&diag_files, &[], &clean, &[], false);
+        let output = format_diagnostics(&diag_files, &[], &clean, &[], false, &BTreeMap::new());
         // Two printed files under /alpha → directory header, indented entries.
         assert!(output.contains("/alpha\n"), "output: {output}");
         assert!(output.contains("\tsrc/lib.rs:"), "output: {output}");
@@ -3871,7 +3959,7 @@ mod tests {
             entries: vec![de(2, ":3:1 [warning] test: standalone warning")],
             single_file: false,
         }];
-        let output = format_diagnostics(&diag_files, &[], &[], &[], false);
+        let output = format_diagnostics(&diag_files, &[], &[], &[], false, &BTreeMap::new());
         // Single file → collapsed path.
         assert!(output.contains("/tmp/scratch.sh:"), "output: {output}");
         assert!(output.contains("\t:3:1 [warning]"), "output: {output}");
@@ -3889,7 +3977,7 @@ mod tests {
             entries: vec![de(1, ":1:1 [error] test: msg")],
             single_file: false,
         }];
-        let output = format_diagnostics(&diag_files, &[], &[], &[], false);
+        let output = format_diagnostics(&diag_files, &[], &[], &[], false, &BTreeMap::new());
         // No status header — output starts directly with file content.
         assert!(!output.contains("[LSP available]"), "output: {output}");
         // Bare path, no prefix.
@@ -3903,7 +3991,7 @@ mod tests {
             display: "data.csv".to_string(),
             root: PathBuf::from("/project"),
         }];
-        let output = format_diagnostics(&[], &uncovered, &[], &[], false);
+        let output = format_diagnostics(&[], &uncovered, &[], &[], false, &BTreeMap::new());
         // Single file → collapsed path with [no LSP coverage].
         assert!(output.contains("/project/data.csv\n"), "output: {output}");
         assert!(output.contains("\t[no LSP coverage]"), "output: {output}");
@@ -3924,7 +4012,7 @@ mod tests {
             display: "data.csv".to_string(),
             root: PathBuf::from("/project"),
         }];
-        let output = format_diagnostics(&[], &uncovered, &clean, &[], false);
+        let output = format_diagnostics(&[], &uncovered, &clean, &[], false, &BTreeMap::new());
         assert!(output.contains("/project\n"), "output: {output}");
         assert!(output.contains("\tlib.rs [clean]"), "output: {output}");
         assert!(output.contains("\tdata.csv"), "output: {output}");
@@ -3946,7 +4034,7 @@ mod tests {
                 single_file: false,
             })
             .collect();
-        let output = format_diagnostics(&[], &[], &clean, &[], true);
+        let output = format_diagnostics(&[], &[], &clean, &[], true, &BTreeMap::new());
         assert!(output.contains("/project\n"), "output: {output}");
         assert!(output.contains("\t3 files clean"), "output: {output}");
         assert!(!output.contains("a.rs"), "clean names leaked: {output}");
@@ -3973,7 +4061,7 @@ mod tests {
                 single_file: false,
             })
             .collect();
-        let output = format_diagnostics(&diag_files, &[], &clean, &[], true);
+        let output = format_diagnostics(&diag_files, &[], &clean, &[], true, &BTreeMap::new());
         assert!(output.contains("\tbroken.rs:"), "output: {output}");
         assert!(
             output.contains("\t\t:1:1 [error] test: boom"),
@@ -3998,7 +4086,7 @@ mod tests {
             root: PathBuf::from("/project"),
             single_file: false,
         }];
-        let output = format_diagnostics(&diag_files, &[], &clean, &[], true);
+        let output = format_diagnostics(&diag_files, &[], &clean, &[], true, &BTreeMap::new());
         assert!(output.contains("\t1 file clean"), "output: {output}");
         assert!(!output.contains("ok.rs"), "clean name leaked: {output}");
     }
@@ -4039,7 +4127,7 @@ mod tests {
         // line beside its path — never silence (bug 56). Single file under root →
         // collapsed path.
         let unverified = vec![ue("file.rs", "/test", "rust-analyzer")];
-        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        let output = format_diagnostics(&[], &[], &[], &unverified, false, &BTreeMap::new());
         // The receipt opens with the `unavailable:` banner (decision 027),
         // then the per-file `[unverified — …]` line beneath it.
         assert_eq!(
@@ -4060,7 +4148,7 @@ mod tests {
         // alive-but-silent server. The banner still names it; the gate is
         // still paid (the receipt returns non-empty).
         let unverified = vec![ue_stuck("file.rs", "/test", "rust-analyzer")];
-        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        let output = format_diagnostics(&[], &[], &[], &unverified, false, &BTreeMap::new());
         assert_eq!(
             output.trim(),
             "unavailable: rust-analyzer\n\
@@ -4087,7 +4175,7 @@ mod tests {
             "typescript-language-server",
             UnverifiedCause::ContractViolation,
         )];
-        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        let output = format_diagnostics(&[], &[], &[], &unverified, false, &BTreeMap::new());
         assert_eq!(
             output.trim(),
             "unavailable: typescript-language-server\n\
@@ -4168,7 +4256,7 @@ mod tests {
             ue_stuck("src/a.rs", "/project", "rust-analyzer"),
             ue("src/b.rs", "/project", "gopls"),
         ];
-        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        let output = format_diagnostics(&[], &[], &[], &unverified, false, &BTreeMap::new());
         assert!(
             output.contains(
                 "\tsrc/a.rs [unverified \u{2014} rust-analyzer stuck; will retry on demand]"
@@ -4192,7 +4280,7 @@ mod tests {
             "rust-analyzer",
             UnverifiedCause::BenchedBroken,
         )];
-        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        let output = format_diagnostics(&[], &[], &[], &unverified, false, &BTreeMap::new());
         assert_eq!(
             output.trim(),
             "unavailable: rust-analyzer\n\
@@ -4210,7 +4298,7 @@ mod tests {
             "rust-analyzer",
             UnverifiedCause::BenchedUnstable,
         )];
-        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        let output = format_diagnostics(&[], &[], &[], &unverified, false, &BTreeMap::new());
         assert_eq!(
             output.trim(),
             "unavailable: rust-analyzer\n\
@@ -4231,7 +4319,7 @@ mod tests {
             "tombi",
             UnverifiedCause::NotInstalled,
         )];
-        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        let output = format_diagnostics(&[], &[], &[], &unverified, false, &BTreeMap::new());
         assert_eq!(
             output.trim(),
             "unavailable: tombi\n\
@@ -4276,7 +4364,7 @@ mod tests {
             ue("src/a.rs", "/project", "rust-analyzer"),
             ue("src/b.rs", "/project", "rust-analyzer"),
         ];
-        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        let output = format_diagnostics(&[], &[], &[], &unverified, false, &BTreeMap::new());
         assert!(!output.trim().is_empty(), "must never be empty: {output:?}");
         // Two files under /project → directory header, indented per-file lines.
         assert!(output.contains("/project\n"), "output: {output}");
@@ -4307,7 +4395,14 @@ mod tests {
             single_file: false,
         }];
         let unverified = vec![ue("src/dead.rs", "/alpha", "rust-analyzer")];
-        let output = format_diagnostics(&diag_files, &[], &clean, &unverified, false);
+        let output = format_diagnostics(
+            &diag_files,
+            &[],
+            &clean,
+            &unverified,
+            false,
+            &BTreeMap::new(),
+        );
         // Three printed files under /alpha → directory header, indented entries.
         assert!(output.contains("/alpha\n"), "output: {output}");
         assert!(output.contains("\tsrc/lib.rs:"), "output: {output}");
@@ -4337,7 +4432,7 @@ mod tests {
             ue("y.rs", "/project", "rust-analyzer"),
             ue("z.rs", "/project", "rust-analyzer"),
         ];
-        let output = format_diagnostics(&[], &[], &clean, &unverified, true);
+        let output = format_diagnostics(&[], &[], &clean, &unverified, true, &BTreeMap::new());
         assert!(output.contains("/project\n"), "output: {output}");
         assert!(output.contains("\t2 files clean"), "output: {output}");
         assert!(output.contains("\t3 files unverified"), "output: {output}");
@@ -4362,7 +4457,7 @@ mod tests {
             single_file: false,
         }];
         let unverified = vec![ue("dead.rs", "/project", "rust-analyzer")];
-        let output = format_diagnostics(&diag_files, &[], &[], &unverified, true);
+        let output = format_diagnostics(&diag_files, &[], &[], &unverified, true, &BTreeMap::new());
         assert!(output.contains("\t1 file unverified"), "output: {output}");
         assert!(
             !output.contains("dead.rs"),
@@ -4377,7 +4472,7 @@ mod tests {
         // A run with a degraded server opens with a top-line banner naming it,
         // and the per-file `[unverified — …]` line stays beneath (decision 027).
         let unverified = vec![ue("file.rs", "/test", "rust-analyzer")];
-        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        let output = format_diagnostics(&[], &[], &[], &unverified, false, &BTreeMap::new());
         let banner_pos = output
             .find("unavailable: rust-analyzer")
             .expect("banner present");
@@ -4408,7 +4503,7 @@ mod tests {
             root: PathBuf::from("/test"),
             single_file: false,
         }];
-        let output = format_diagnostics(&diag_files, &[], &clean, &[], false);
+        let output = format_diagnostics(&diag_files, &[], &clean, &[], false, &BTreeMap::new());
         assert!(
             !output.contains("unavailable:"),
             "no banner without unverified files: {output}"
@@ -4424,7 +4519,7 @@ mod tests {
             ue("src/b.rs", "/project", "rust-analyzer"),
             ue("src/c.rs", "/project", "rust-analyzer"),
         ];
-        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        let output = format_diagnostics(&[], &[], &[], &unverified, false, &BTreeMap::new());
         assert_eq!(
             output.matches("unavailable: rust-analyzer").count(),
             1,
@@ -4439,7 +4534,7 @@ mod tests {
             ue("a.jl", "/project", "julia-language-server"),
             ue("b.rs", "/project", "rust-analyzer"),
         ];
-        let output = format_diagnostics(&[], &[], &[], &unverified, false);
+        let output = format_diagnostics(&[], &[], &[], &unverified, false, &BTreeMap::new());
         let julia = output
             .find("unavailable: julia-language-server")
             .expect("julia banner");
@@ -4457,7 +4552,7 @@ mod tests {
             ue("x.rs", "/project", "rust-analyzer"),
             ue("y.rs", "/project", "rust-analyzer"),
         ];
-        let output = format_diagnostics(&[], &[], &[], &unverified, true);
+        let output = format_diagnostics(&[], &[], &[], &unverified, true, &BTreeMap::new());
         assert!(
             output.starts_with("unavailable: rust-analyzer\n"),
             "banner opens the collapsed receipt: {output}"
@@ -4473,10 +4568,162 @@ mod tests {
         // A file whose server field joins multiple dead servers yields one
         // banner line per server (split on ", "), deduped and sorted.
         let unverified = vec![ue("f.rs", "/p", "server-b, server-a")];
-        let out = prepend_unavailable_banner(&unverified, String::from("BODY"));
+        let out = prepend_unavailable_banner(&unverified, &BTreeMap::new(), String::from("BODY"));
         assert_eq!(
             out, "unavailable: server-a\nunavailable: server-b\nBODY",
             "each joined server banners once, sorted, above the body: {out}"
+        );
+    }
+
+    // ── the banner names the auto-install (bug 148 receipt amendment) ──
+
+    /// An [`InstallProgress`] map with one server at one progress state.
+    fn installs(
+        server: &str,
+        progress: crate::auto_install::AutoInstallProgress,
+    ) -> InstallProgress {
+        let mut map = InstallProgress::new();
+        map.insert(server.to_string(), progress);
+        map
+    }
+
+    #[test]
+    fn banner_names_an_in_flight_auto_install() {
+        // bug 148's receipt amendment: the JIT announce is a `warn!` — a TUI
+        // health finding agents never see — so the demanding round's own
+        // receipt carries the present-tense truth and the cheap next move.
+        let unverified = vec![ue_cause(
+            "Cargo.toml",
+            "/test",
+            "tombi",
+            UnverifiedCause::NotInstalled,
+        )];
+        let output = format_diagnostics(
+            &[],
+            &[],
+            &[],
+            &unverified,
+            false,
+            &installs("tombi", crate::auto_install::AutoInstallProgress::InFlight),
+        );
+        assert!(
+            output.starts_with(
+                "unavailable: tombi \u{2014} installing in background (auto_install); this round \
+                 served without it, re-run to include it\n"
+            ),
+            "the banner names the running install and the re-run: {output}"
+        );
+        assert!(
+            output.contains("[not installed \u{2014} tombi is configured but not installed]"),
+            "the per-file line is untouched: {output}"
+        );
+        assert!(
+            !output.contains("doctor"),
+            "no doctor advice in an agent receipt (ruled): {output}"
+        );
+    }
+
+    #[test]
+    fn banner_names_a_failed_auto_install_with_both_retries() {
+        // The failure arm is honest about both exits — the by-hand retry and
+        // the automatic next-session one — and invents no `status` verb: the
+        // re-run IS the check (ruled).
+        let unverified = vec![ue_cause(
+            "Cargo.toml",
+            "/test",
+            "tombi",
+            UnverifiedCause::NotInstalled,
+        )];
+        let output = format_diagnostics(
+            &[],
+            &[],
+            &[],
+            &unverified,
+            false,
+            &installs("tombi", crate::auto_install::AutoInstallProgress::Failed),
+        );
+        assert!(
+            output.starts_with(
+                "unavailable: tombi \u{2014} install failed; `catenary install tombi` retries by \
+                 hand, the next session start retries automatically\n"
+            ),
+            "the banner says the install failed and names both retries: {output}"
+        );
+        assert!(
+            !output.contains("installing in background"),
+            "a failed install must never read as running: {output}"
+        );
+        assert!(
+            !output.contains("doctor"),
+            "no doctor advice in an agent receipt (ruled): {output}"
+        );
+    }
+
+    #[test]
+    fn banner_without_auto_install_is_byte_unchanged() {
+        // The unchanged case is the contract: no install running, none failed
+        // (a landed one included — it just serves), or no installer wired at
+        // all → the banner is exactly the line it has always been.
+        let unverified = vec![ue_cause(
+            "Cargo.toml",
+            "/test",
+            "tombi",
+            UnverifiedCause::NotInstalled,
+        )];
+        let output = format_diagnostics(&[], &[], &[], &unverified, false, &InstallProgress::new());
+        assert_eq!(
+            output.trim(),
+            "unavailable: tombi\n\
+             /test/Cargo.toml [not installed \u{2014} tombi is configured but not installed]",
+            "no auto-install in play renders today's banner verbatim: {output}"
+        );
+    }
+
+    #[test]
+    fn banner_amends_only_the_server_the_installer_knows() {
+        // Two degraded servers, one being installed: the note rides its own
+        // line only — the other keeps the bare banner.
+        let unverified = vec![
+            ue_cause("Cargo.toml", "/p", "tombi", UnverifiedCause::NotInstalled),
+            ue("b.rs", "/p", "rust-analyzer"),
+        ];
+        let output = format_diagnostics(
+            &[],
+            &[],
+            &[],
+            &unverified,
+            false,
+            &installs("tombi", crate::auto_install::AutoInstallProgress::InFlight),
+        );
+        assert!(
+            output.contains("unavailable: rust-analyzer\n"),
+            "the untouched server keeps its bare line: {output}"
+        );
+        assert_eq!(
+            output.matches("installing in background").count(),
+            1,
+            "only the installing server is annotated: {output}"
+        );
+    }
+
+    #[test]
+    fn banner_line_renders_one_shape_per_progress() {
+        use crate::auto_install::AutoInstallProgress;
+        assert_eq!(unavailable_banner_line("srv", None), "unavailable: srv");
+        let in_flight = unavailable_banner_line("srv", Some(AutoInstallProgress::InFlight));
+        assert!(
+            in_flight.contains("installing in background (auto_install)")
+                && in_flight.contains("re-run to include it"),
+            "{in_flight}"
+        );
+        let failed = unavailable_banner_line("srv", Some(AutoInstallProgress::Failed));
+        assert!(
+            failed.contains("install failed") && failed.contains("`catenary install srv`"),
+            "{failed}"
+        );
+        assert!(
+            failed.contains("next session start retries automatically"),
+            "the automatic retry is named: {failed}"
         );
     }
 
@@ -4877,7 +5124,7 @@ mod tests {
             ],
             single_file: false,
         }];
-        let out = format_diagnostics(&diag_files, &[], &[], &[], false);
+        let out = format_diagnostics(&diag_files, &[], &[], &[], false, &BTreeMap::new());
         assert!(
             out.contains("warn-a") && out.contains("err-b") && out.contains("warn-c"),
             "the complete report keeps every diagnostic: {out}"

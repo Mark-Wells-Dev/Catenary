@@ -243,6 +243,11 @@ server yields an honest receipt rather than a silent hang, and paying is
 diagnosing, not fixing. The receipt **opens with a top-line
 banner naming the unavailable server** (`unavailable: <server>`) so degraded
 never reads as clean — the absence of evidence is not evidence of absence.
+When `[servers] auto_install` is already handling that server, its banner line
+says so in the present tense — `installing in background (auto_install); this
+round served without it, re-run to include it`, or, if the install failed,
+`install failed; catenary install <server> retries by hand, the next session
+start retries automatically` — so the re-run *is* the status check.
 An all-unverified run can never render as empty stdout (mistakable for a
 hang), and the exit stays `0`: the run completed and its receipt is
 truthful. The gate releases the degraded file exactly as a paid one — editing

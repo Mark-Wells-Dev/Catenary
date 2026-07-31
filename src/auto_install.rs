@@ -82,6 +82,25 @@ pub struct MissingServer {
     pub class: InstallClass,
 }
 
+/// What the daemon's ONE shared installer is doing about a server right now —
+/// the read-only state a diagnostics receipt renders in-band (bug 148 receipt
+/// amendment).
+///
+/// Derived at read time from the installer's own dedupe and failure state; there
+/// is no second store and nothing polls. A server with neither a running install
+/// nor a recorded failure yields `None` — so a server whose install **lands**
+/// mid-session stops producing any line at all: it just serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoInstallProgress {
+    /// A background install of this server is running right now — kicked by the
+    /// eager session-start leg or the JIT spawn-failure leg, possibly still
+    /// queued behind [`MAX_CONCURRENT_INSTALLS`].
+    InFlight,
+    /// An install of this server already failed this daemon lifetime. Nothing
+    /// retries on its own until the next session start re-detects it.
+    Failed,
+}
+
 /// The one-line user-visible announcement for a kicked auto-install.
 ///
 /// Ridden on the `SessionStart` `systemMessage` surface by the CLI; the
@@ -309,7 +328,10 @@ struct Inner {
     in_flight: Mutex<HashSet<String>>,
     /// Servers whose failure has already fired its one `warn!` this daemon
     /// lifetime — the dedupe the ticket rules (a failing server must not warn
-    /// on every session start).
+    /// on every session start). Written only on the failure arm and never
+    /// cleared, so it doubles as **the** failure ledger
+    /// ([`AutoInstaller::progress`] reads it for the receipt's honest
+    /// install-failed line — one ledger, no second store).
     warned: Mutex<HashSet<String>>,
     /// Concurrency cap across different servers.
     limiter: Arc<tokio::sync::Semaphore>,
@@ -468,6 +490,37 @@ impl AutoInstaller {
             report_outcome(&inner, &missing, result, on_installed);
         });
         true
+    }
+
+    /// What this installer is doing about `server` right now — the receipt's
+    /// read-only window onto the shared state (bug 148 receipt amendment).
+    ///
+    /// Two brief lock peeks, no I/O, no polling, nothing mutated: the answer is
+    /// whatever the in-flight set and the failure ledger say at the moment of
+    /// the call. In-flight **wins** over a recorded failure — a re-kicked server
+    /// IS installing now, whatever an earlier attempt did, and the receipt
+    /// speaks in the present tense.
+    #[must_use]
+    pub fn progress(&self, server: &str) -> Option<AutoInstallProgress> {
+        if self
+            .inner
+            .in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(server)
+        {
+            return Some(AutoInstallProgress::InFlight);
+        }
+        if self
+            .inner
+            .warned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(server)
+        {
+            return Some(AutoInstallProgress::Failed);
+        }
+        None
     }
 
     /// The manifest detection and the blessing gate read: the injected
@@ -1357,6 +1410,105 @@ mod tests {
         }
         assert_eq!(runs.load(Ordering::SeqCst), 2, "the retry ran once");
         assert!(!prewarmed.load(Ordering::SeqCst));
+    }
+
+    // ── the receipt's read-only progress window (bug 148 amendment) ───
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn progress_reads_in_flight_then_falls_silent_once_the_install_lands() {
+        // The receipt's state source: while the gated install runs, `progress`
+        // reports it in the present tense; the moment it LANDS the server stops
+        // producing any line at all — it just serves.
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home_root = home_dir.path().join("servers");
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let installer = installer_with_runner(
+            &home_root,
+            Box::new(StagingRunner {
+                home_root: home_root.clone(),
+                gate: Some(gate.clone()),
+                runs: runs.clone(),
+            }),
+        );
+        assert_eq!(
+            installer.progress(SERVER),
+            None,
+            "an untouched server has nothing to report"
+        );
+
+        let missing = MissingServer {
+            server: SERVER.to_string(),
+            version: VERSION.to_string(),
+            class: InstallClass::Compile,
+        };
+        let landed = Arc::new(AtomicBool::new(false));
+        let flag = landed.clone();
+        assert!(installer.kick(&missing, move || {
+            flag.store(true, Ordering::SeqCst);
+        }));
+        assert_eq!(
+            installer.progress(SERVER),
+            Some(AutoInstallProgress::InFlight),
+            "the kicked install reads as running while it is gated",
+        );
+
+        gate.add_permits(1);
+        for _ in 0..200 {
+            if landed.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(landed.load(Ordering::SeqCst), "the install landed");
+        // The seat drops with the task; poll the release so the assert reads a
+        // settled state rather than racing the completion callback.
+        for _ in 0..200 {
+            if installer.progress(SERVER).is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            installer.progress(SERVER),
+            None,
+            "a landed install reports nothing — the server simply serves",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn progress_reads_failed_off_the_one_failure_ledger() {
+        // The failure arm reads the SAME one-failure-per-server-per-lifetime
+        // ledger the warn dedupe uses — no second store.
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home_root = home_dir.path().join("servers");
+        let runs = Arc::new(AtomicUsize::new(0));
+        let installer =
+            installer_with_runner(&home_root, Box::new(FailingRunner { runs: runs.clone() }));
+
+        let missing = MissingServer {
+            server: SERVER.to_string(),
+            version: VERSION.to_string(),
+            class: InstallClass::Compile,
+        };
+        assert!(installer.kick(&missing, || {}));
+        for _ in 0..200 {
+            if installer.progress(SERVER) == Some(AutoInstallProgress::Failed) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            installer.progress(SERVER),
+            Some(AutoInstallProgress::Failed),
+            "the failed install is reported honestly",
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "no retry loop");
+        assert_eq!(
+            installer.progress("some-other-server"),
+            None,
+            "the ledger is per-server",
+        );
     }
 
     // ── warranty-renewal GC on landing (lsm 06) ───────────────────────

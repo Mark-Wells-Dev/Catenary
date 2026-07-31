@@ -1284,6 +1284,28 @@ impl LspClientManager {
         }
     }
 
+    /// What the daemon's shared auto-installer is doing about `server` right
+    /// now — the diagnostics receipt's in-band read (bug 148 receipt
+    /// amendment).
+    ///
+    /// The demanding round renders this beside its unavailable-server banner, so
+    /// an agent learns present-tense truth (an install is running; an install
+    /// failed) instead of nothing — the JIT announce lives in the TUI `warn!`,
+    /// which agents never see. Read-only and allocation-free: the same
+    /// `OnceLock` seam the JIT leg kicks through
+    /// ([`crate::auto_install::AutoInstaller::progress`]), never a second state
+    /// store and never a poll. `None` where no installer is wired
+    /// (doctor/CLI/test managers) or where the server has no install running and
+    /// none failed — including the moment one **lands**, after which the server
+    /// simply serves.
+    #[must_use]
+    pub fn auto_install_progress(
+        &self,
+        server: &str,
+    ) -> Option<crate::auto_install::AutoInstallProgress> {
+        self.auto_install.get()?.installer.progress(server)
+    }
+
     /// Whether an install of `server` is constructible at all — the
     /// recipe-teaching axis for the flag-unset branches.
     ///
@@ -7813,6 +7835,65 @@ mod tests {
             matches!(&stance, AutoInstallStance::Blocked { reason } if reason.contains("background installer")),
             "no installer wired, nothing kicked: {stance:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auto_install_progress_exposes_the_shared_installer_to_the_receipt() {
+        // bug 148's receipt amendment reads the JIT seam, not a second store:
+        // an unwired manager reports nothing, and a wired one reports the kick
+        // the spawn-failure site just made — the state a diagnostics round
+        // renders beside its unavailable-server banner.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let server = crate::auto_install::test_support::SERVER;
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home_root = home_dir.path().join("servers");
+        let runs = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let bare = Arc::new(LspClientManager::new(
+            jit_config(server, true, true, None),
+            test_logging(),
+            test_fs(),
+        ));
+        assert_eq!(
+            bare.auto_install_progress(server),
+            None,
+            "no installer wired, nothing to report"
+        );
+
+        let manager = Arc::new(LspClientManager::new(
+            jit_config(server, true, true, None),
+            test_logging(),
+            test_fs(),
+        ));
+        manager.attach_auto_installer(jit_installer(&home_root, runs.clone(), Some(gate.clone())));
+        assert_eq!(
+            manager.auto_install_progress(server),
+            None,
+            "a wired installer with nothing running reports nothing"
+        );
+
+        let stance = manager.auto_install_stance(server, &ServerDef::default());
+        assert!(
+            matches!(&stance, AutoInstallStance::Kicked { .. }),
+            "the spawn failure kicks: {stance:?}"
+        );
+        assert_eq!(
+            manager.auto_install_progress(server),
+            Some(crate::auto_install::AutoInstallProgress::InFlight),
+            "the receipt can see the in-flight install the TUI warn announced",
+        );
+
+        // Drain the gated install so the blocking task finishes before the
+        // runtime drops.
+        gate.add_permits(1);
+        for _ in 0..200 {
+            if runs.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "exactly one install ran");
     }
 
     #[test]
