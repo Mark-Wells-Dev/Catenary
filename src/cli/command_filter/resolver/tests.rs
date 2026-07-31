@@ -311,7 +311,7 @@ fn variable_expanding_to_flag_is_opaque() {
 #[test]
 fn tilde_target_resolves_to_home() {
     let t = tmp();
-    let home = dirs::home_dir().expect("home dir");
+    let home = crate::paths::home_dir().expect("home dir");
     assert_eq!(
         ok("echo x > ~/cat-res-test.txt", t.path()),
         BTreeSet::from([home.join("cat-res-test.txt")]),

@@ -683,7 +683,7 @@ fn resolve_binding_value(a: &Assignment, state: &State) -> Binding {
     }
     // Assignment-value tilde (`F=~/x`) expands when unquoted.
     if (value == "~" || value.starts_with("~/")) && !m.literal_meta {
-        let Some(home) = dirs::home_dir() else {
+        let Some(home) = crate::paths::home_dir() else {
             return Binding::Tainted;
         };
         value = if value == "~" {
@@ -731,7 +731,7 @@ fn apply_cd(cmd: &SimpleCommand, state: &mut State, ctx: SegCtx) {
         return;
     }
     let Some(target) = cmd.argv.first() else {
-        state.cwd = dirs::home_dir().map_or(Cwd::Poisoned, Cwd::Abs);
+        state.cwd = crate::paths::home_dir().map_or(Cwd::Poisoned, Cwd::Abs);
         return;
     };
     if target == "-" {
@@ -1154,7 +1154,7 @@ fn tilde_expand(word: &str) -> Result<String, Unresolved> {
         return Ok(word.to_string());
     }
     let home = || {
-        dirs::home_dir().ok_or_else(|| {
+        crate::paths::home_dir().ok_or_else(|| {
             u(
                 "tilde-no-home",
                 "`~` can't be expanded here — there's no home directory to stand in for \

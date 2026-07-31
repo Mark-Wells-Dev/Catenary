@@ -145,8 +145,16 @@ fn write_if_changed(target: &Path, content: &str) -> Result<bool> {
 ///
 /// Returns `None` when the plugin is not installed. A symlinked plugin dir is a
 /// developer install and is flagged as a dev link so the rewrite skips it.
+///
+/// The home comes from [`crate::paths::home_dir`], **not** `dirs::home_dir()`
+/// (bug 149): this function names a file Catenary *writes*, and `isolate_env`
+/// does not redirect `$HOME`, so resolving through the OS answer let an
+/// agy-format subprocess test rewrite the operator's real rules file. The
+/// resolver's `CATENARY_HOME_DIR` override is what keeps the rewrite inside the
+/// tempdir under test; production, with no override set, resolves exactly as
+/// before.
 fn antigravity_rewrite_target() -> Option<RewriteTarget> {
-    let home = dirs::home_dir()?;
+    let home = crate::paths::home_dir()?;
     let plugin_dir = home.join(".gemini/config/plugins/catenary");
     let is_symlink = plugin_dir.is_symlink();
     if !plugin_dir.is_dir() && !is_symlink {

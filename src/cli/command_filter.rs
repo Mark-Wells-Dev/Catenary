@@ -709,9 +709,9 @@ fn resolve_cd_target(
     }
 
     let path = if target == "~" {
-        dirs::home_dir()?
+        crate::paths::home_dir()?
     } else if let Some(rest) = target.strip_prefix("~/") {
-        dirs::home_dir()?.join(rest)
+        crate::paths::home_dir()?.join(rest)
     } else if target.starts_with('~') {
         // ~user — can't resolve
         return effective_cwd.map(std::path::PathBuf::from);
@@ -4042,7 +4042,7 @@ mod tests {
     fn cd_tilde_expands_home() {
         // Just verify resolve_cd_target handles ~ correctly.
         let result = resolve_cd_target("~/projects", Some(std::path::Path::new("/tmp")));
-        let home = dirs::home_dir().expect("HOME");
+        let home = crate::paths::home_dir().expect("HOME");
         assert_eq!(result, Some(home.join("projects")));
     }
 

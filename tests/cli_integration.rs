@@ -18,10 +18,13 @@ use anyhow::{Context, Result};
 
 use common::isolate_env;
 
-/// `isolate_env` must point the four XDG base dirs at *distinct* subdirs
-/// of the root, so a subprocess writing under the wrong base can no
-/// longer silently land in the one shared directory. Regression guard
-/// for the split.
+/// `isolate_env` must point every isolated base at a *distinct* subdir of the
+/// root, so a subprocess writing under the wrong base can no longer silently
+/// land in the one shared directory. Regression guard for the split.
+///
+/// The home base (`CATENARY_HOME_DIR`, bug 149) rides the same guard: it has no
+/// XDG counterpart, but it is where the home-rooted host-CLI artifacts land, and
+/// collapsing it onto another base would blind the detector exactly there.
 #[test]
 fn isolate_env_distinct_subdirs() {
     use std::collections::{HashMap, HashSet};
@@ -44,9 +47,10 @@ fn isolate_env_distinct_subdirs() {
         "XDG_STATE_HOME",
         "XDG_DATA_HOME",
         "XDG_RUNTIME_DIR",
+        "CATENARY_HOME_DIR",
     ]
     .iter()
-    .map(|var| envs.get(*var).expect("XDG base dir set by isolate_env"))
+    .map(|var| envs.get(*var).expect("base dir set by isolate_env"))
     .collect();
 
     // Every base dir lives under the root...
@@ -54,12 +58,12 @@ fn isolate_env_distinct_subdirs() {
         assert!(dir.starts_with(root), "{dir} should be under root {root}");
     }
 
-    // ...and all four resolve to distinct paths.
+    // ...and all five resolve to distinct paths.
     let distinct: HashSet<&&String> = dirs.iter().collect();
     assert_eq!(
         distinct.len(),
-        4,
-        "the four XDG base dirs should be distinct, got: {dirs:?}"
+        5,
+        "the isolated base dirs should be distinct, got: {dirs:?}"
     );
 }
 

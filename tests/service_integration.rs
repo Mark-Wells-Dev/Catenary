@@ -97,18 +97,20 @@ fn service_install_writes_isolated_unit_with_arena_cap() {
         "unit must cite the ws49-02 arena receipt and bug 136:\n{unit}",
     );
 
-    // Poison guard: the operator's real unit dir is never touched.
-    let real = dirs::config_dir().map(|d| d.join("systemd/user/catenary.service"));
-    if let Some(real) = real {
-        // We cannot assert absence (the operator may genuinely have installed
-        // one), but the isolated ExecStart must name the TEST binary, proving
-        // the write landed in the sandbox, not the real path.
-        assert!(
-            unit.contains(env!("CARGO_BIN_EXE_catenary")),
-            "isolated unit must exec the test binary, not a real install ({}):\n{unit}",
-            real.display(),
-        );
-    }
+    // Poison guard: the operator's real unit dir is never touched. Resolved
+    // through the production resolver (`dirs::config_dir()` is denied outside
+    // `src/paths.rs`, bug 149); the harness process sets no `CATENARY_CONFIG_DIR`
+    // — `isolate_env` writes it onto the *subprocess* — so this names the real
+    // base, which is exactly the path the guard is about.
+    let real = catenary_cli::paths::config_dir().join("systemd/user/catenary.service");
+    // We cannot assert absence (the operator may genuinely have installed
+    // one), but the isolated ExecStart must name the TEST binary, proving
+    // the write landed in the sandbox, not the real path.
+    assert!(
+        unit.contains(env!("CARGO_BIN_EXE_catenary")),
+        "isolated unit must exec the test binary, not a real install ({}):\n{unit}",
+        real.display(),
+    );
 }
 
 /// `service uninstall` removes the unit cleanly and is idempotent: a second

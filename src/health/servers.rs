@@ -97,7 +97,7 @@ pub fn activity_inputs(
 
 /// Collapse a canonical root path's home prefix to `~` for provenance display.
 fn display_root(root: &str) -> String {
-    if let Some(home) = dirs::home_dir()
+    if let Some(home) = crate::paths::home_dir()
         && let Ok(rel) = std::path::Path::new(root).strip_prefix(&home)
     {
         if rel.as_os_str().is_empty() {
@@ -790,7 +790,7 @@ fn is_rustup_proxy(resolved: &std::path::Path) -> bool {
     }
     let cargo_bin = std::env::var_os("CARGO_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".cargo")))
+        .or_else(|| crate::paths::home_dir().map(|h| h.join(".cargo")))
         .map(|c| c.join("bin"));
     cargo_bin.is_some_and(|dir| resolved.parent() == Some(dir.as_path()))
 }
@@ -1334,7 +1334,7 @@ mod tests {
         // is the proxy shim; one under a toolchain bin (or anywhere else) is not.
         let cargo_bin = std::env::var_os("CARGO_HOME")
             .map(std::path::PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|h| h.join(".cargo")))
+            .or_else(|| crate::paths::home_dir().map(|h| h.join(".cargo")))
             .map(|c| c.join("bin"))
             .expect("a cargo-bin dir resolves on the test host");
 

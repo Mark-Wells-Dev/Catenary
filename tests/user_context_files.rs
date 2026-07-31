@@ -21,6 +21,12 @@
 //! is set, and the context files are written under `common::xdg_config_home`, so
 //! the hook and the test agree on one tempdir config base and the operator's
 //! real `~/.config/catenary` is never read.
+//!
+//! The Antigravity turn-0 leg landed later than the rest (bug 149): driving
+//! `--format=antigravity` in a subprocess used to rewrite the operator's real
+//! `~/.gemini` rules file, because that rewrite target resolved through
+//! `dirs::home_dir()`. It now resolves through `paths::home_dir()`, which
+//! `isolate_env` redirects with `CATENARY_HOME_DIR`.
 
 mod common;
 
@@ -79,6 +85,38 @@ fn run_hook(root: &str, args: &[&str], payload: &Value) -> Result<String> {
     }
     let out = child.wait_with_output().context("wait for hook")?;
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Bring the isolated daemon up (`catenary start`).
+///
+/// Antigravity's `PreInvocation` first-sighting ledger lives daemon-side and
+/// fails closed, so the turn-0 leg needs a daemon answering — unlike Claude
+/// Code's `SessionStart`, this hook spawns none on demand.
+fn start_daemon(root: &str) -> Result<()> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, root);
+    cmd.arg("start");
+    let out = cmd.output().context("run catenary start")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "catenary start must exit 0, stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    Ok(())
+}
+
+/// The single `injectSteps[0].userMessage` string carried by an Antigravity
+/// `PreInvocation` response.
+fn inject_steps_user_message(stdout: &str) -> Result<String> {
+    let v: Value = serde_json::from_str(stdout.trim())
+        .with_context(|| format!("hook stdout should be JSON, got: {stdout}"))?;
+    v.get("injectSteps")
+        .and_then(Value::as_array)
+        .and_then(|steps| steps.first())
+        .and_then(|step| step.get("userMessage"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .with_context(|| format!("no injectSteps userMessage in hook stdout: {stdout}"))
 }
 
 /// The `hookSpecificOutput.additionalContext` string carried by a hook's stdout.
@@ -282,6 +320,71 @@ fn context_content_rides_verbatim() -> Result<()> {
     assert!(
         ctx.contains(raw.trim_end_matches('\n')),
         "the file's bytes must ride verbatim: {ctx}"
+    );
+    Ok(())
+}
+
+/// A lead is served the AGENTS pair on Antigravity's turn-0 seam — the
+/// `PreInvocation` `injectSteps` `userMessage`, the host's only persisted
+/// session-start vehicle — and never the worker's `SUBAGENTS.md`.
+///
+/// This leg was withheld when misc 224 shipped: driving `--format=antigravity`
+/// in a subprocess rewrote the operator's real `~/.gemini` rules file, because
+/// the rewrite target resolved through `dirs::home_dir()` (bug 149). With the
+/// target on `paths::home_dir()` and `isolate_env` setting `CATENARY_HOME_DIR`,
+/// the agy hook is safe to drive here.
+///
+/// First-sighting is decided daemon-side and fails closed, so this needs a live
+/// daemon; [`DaemonGuard`] tears it down on drop, panic unwind included.
+#[test]
+fn pre_invocation_serves_the_agents_pair_at_turn_zero() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_str().context("tempdir path")?;
+    let _guard = DaemonGuard::new(root);
+
+    write_context_file(root, "AGENTS.md", "LEAD-SHARED-CORE\n")?;
+    write_context_file(root, "AGENTS.antigravity.md", "LEAD-AGY-ADDENDUM\n")?;
+    write_context_file(root, "AGENTS.claude.md", "LEAD-CLAUDE-ADDENDUM\n")?;
+    write_context_file(root, "SUBAGENTS.md", "WORKER-ONLY-POLICY\n")?;
+
+    start_daemon(root)?;
+
+    let payload = json!({
+        "conversationId": "agy-conv-user-context",
+        "workspacePaths": [root],
+        "invocationNum": 0,
+    });
+    let stdout = run_hook(root, &["pre-invocation", "--format=antigravity"], &payload)?;
+    let message = inject_steps_user_message(&stdout)?;
+
+    let shared_at = message
+        .find("LEAD-SHARED-CORE")
+        .context("the shared AGENTS.md must ride the turn-0 injection")?;
+    let addendum_at = message
+        .find("LEAD-AGY-ADDENDUM")
+        .context("the antigravity addendum must ride the turn-0 injection")?;
+    assert!(
+        shared_at < addendum_at,
+        "shared core first, addendum after: {message}"
+    );
+    assert!(
+        !message.contains("LEAD-CLAUDE-ADDENDUM"),
+        "an antigravity dispatch must not pull the claude addendum: {message}"
+    );
+    assert!(
+        !message.contains("WORKER-ONLY-POLICY"),
+        "a lead must never be served the worker's SUBAGENTS.md — and Antigravity \
+         registers no subagent seam at all: {message}"
+    );
+    assert!(
+        message.contains(&provenance_target(root, "AGENTS.md"))
+            && message.contains(&provenance_target(root, "AGENTS.antigravity.md")),
+        "each block names the file it came from: {message}"
+    );
+    assert_eq!(
+        message.matches(PROVENANCE_LABEL).count(),
+        2,
+        "exactly one provenance header per file: {message}"
     );
     Ok(())
 }

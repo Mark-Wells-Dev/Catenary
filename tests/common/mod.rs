@@ -43,6 +43,11 @@ use serde_json::{Value, json};
 /// `dirs` crate honors the XDG vars only on Linux; on macOS they are inert and
 /// the overrides carry the whole isolation.
 ///
+/// Plus `CATENARY_HOME_DIR` → `<root>/home` (bug 149), a sixth distinct base
+/// with no XDG counterpart: it isolates the home-rooted host-CLI artifacts
+/// (`~/.claude`, `~/.gemini`, `~/.config/opencode`) that Catenary reads and
+/// rewrites, without redirecting `$HOME` itself (see the note in the body).
+///
 /// Clears all `CATENARY_*` env vars that could leak from the user's
 /// shell and override test-specific settings. Clears `PATH` so built-in
 /// server defaults (julia-language-server, cmake-language-server, etc.)
@@ -91,6 +96,18 @@ pub fn isolate_env(cmd: &mut Command, root: &str) {
     cmd.env("CATENARY_CACHE_DIR", xdg_cache_home(root));
     cmd.env("CATENARY_CONFIG_DIR", xdg_config_home(root));
     cmd.env("CATENARY_DATA_DIR", xdg_data_home(root));
+    // The home base (bug 149). Not an XDG dir, but the same problem: the
+    // host-CLI integration artifacts hang off `$HOME` (`~/.claude`, `~/.gemini`,
+    // `~/.config/opencode`) and the Antigravity `PreInvocation` hook REWRITES one
+    // of them per model call. Resolved through the OS answer that write escaped
+    // into the operator's real `~/.gemini/…/rules/catenary.md` on any agy-format
+    // subprocess test — which is why misc 224 kept its agy leg unit-level.
+    // `paths::home_dir()` resolves `CATENARY_HOME_DIR` first on every platform,
+    // so pointing it at a sixth distinct subdir isolates that class the same way
+    // the five above isolate theirs, WITHOUT redirecting `$HOME` itself (see the
+    // note below — that stays deliberately un-redirected). Kept distinct from the
+    // other five so the mislocation detector holds here too.
+    cmd.env("CATENARY_HOME_DIR", catenary_home(root));
     // Config-WRITE isolation (bug 109) is complete on every platform via the line
     // above: `paths::config_dir()` resolves `CATENARY_CONFIG_DIR` FIRST — before
     // the `dirs` crate's `XDG_CONFIG_HOME` (Linux) / `~/Library/Application
@@ -274,6 +291,21 @@ pub fn xdg_cache_home(root: impl AsRef<Path>) -> PathBuf {
 /// The `XDG_RUNTIME_DIR` [`isolate_env`] configures under `root`.
 pub fn xdg_runtime_dir(root: impl AsRef<Path>) -> PathBuf {
     root.as_ref().join("runtime")
+}
+
+/// The `CATENARY_HOME_DIR` subdir [`isolate_env`] configures under `root`.
+///
+/// `paths::home_dir()` resolves here, so every home-rooted host-CLI artifact —
+/// `~/.claude/plugins`, `~/.gemini/config/plugins/catenary`,
+/// `~/.config/opencode/plugin` — lands under this subdir instead of the
+/// operator's real home (bug 149). Test-side code that stages or inspects one of
+/// those artifacts must derive its path through this helper so both sides agree.
+///
+/// Deliberately **not** `$HOME`: `isolate_env` leaves the real `$HOME` alone for
+/// the tests that need it, and this override is what lets Catenary's own
+/// resolution be isolated anyway.
+pub fn catenary_home(root: impl AsRef<Path>) -> PathBuf {
+    root.as_ref().join("home")
 }
 
 // ── Daemon teardown guard (bug 131) ──────────────────────────────────

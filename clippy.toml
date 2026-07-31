@@ -2,3 +2,34 @@
 # `..` splices in clippy's default list (OpenGL, OpenSSL, OpenTelemetry, …)
 # rather than replacing it, so existing allowed idents keep working.
 doc-valid-idents = ["OpenCode", ".."]
+
+# ── Base-dir resolution gate (bug 149) ────────────────────────────────
+#
+# Every one of these `dirs` accessors resolves a REAL user directory, and a
+# path built on one is invisible to `isolate_env`: the test harness redirects
+# Catenary's own `CATENARY_*_DIR` overrides, never the underlying OS answer
+# (`$HOME` in particular is deliberately left alone, because other tooling in a
+# test subprocess legitimately needs the real one). So a seam that calls one of
+# these directly reads — and, the way bug 149 bit, WRITES — the operator's real
+# state from inside a test.
+#
+# `src/paths.rs` is the single blessed call site for all of them. Each resolver
+# there layers its `CATENARY_*` env override on top, first and on every
+# platform, and carries a `#[allow(clippy::disallowed_methods, reason = …)]`
+# naming the override that makes it testable. New code resolving a user path
+# calls `crate::paths::…` — never the `dirs` accessor — and a new base gets a
+# new resolver with a new override, not an allow.
+#
+# `make clippy` runs with `-D warnings`, so this gate is hard.
+disallowed-methods = [
+  { path = "dirs::home_dir", reason = "resolve the home through `crate::paths::home_dir()` — its `CATENARY_HOME_DIR` override is what keeps a home-rooted write inside test isolation (bug 149)" },
+  { path = "dirs::state_dir", reason = "resolve the state base through `crate::paths::state_dir()` — its `CATENARY_STATE_DIR` override is the test-isolation lever" },
+  { path = "dirs::runtime_dir", reason = "resolve the runtime base through `crate::paths::runtime_dir()` — its `CATENARY_RUNTIME_DIR` override is the test-isolation lever" },
+  { path = "dirs::config_dir", reason = "resolve the config base through `crate::paths::config_dir()` — its `CATENARY_CONFIG_DIR` override is the test-isolation lever" },
+  { path = "dirs::config_local_dir", reason = "no Catenary base resolves here; if one ever should, add a resolver in `src/paths.rs` with its own `CATENARY_*` override" },
+  { path = "dirs::cache_dir", reason = "resolve the cache base through `crate::paths::cache_dir()` — its `CATENARY_CACHE_DIR` override is the test-isolation lever" },
+  { path = "dirs::data_dir", reason = "resolve the data base through `crate::paths::data_dir()` — its `CATENARY_DATA_DIR` override is the test-isolation lever" },
+  { path = "dirs::data_local_dir", reason = "reachable only as `crate::paths::state_dir()`'s macOS/Windows fallback; resolve the state base through that resolver" },
+  { path = "dirs::preference_dir", reason = "no Catenary base resolves here; if one ever should, add a resolver in `src/paths.rs` with its own `CATENARY_*` override" },
+  { path = "dirs::executable_dir", reason = "no Catenary base resolves here; if one ever should, add a resolver in `src/paths.rs` with its own `CATENARY_*` override" },
+]

@@ -12,6 +12,21 @@
 //! - [`cache_dir`] — regenerable, high-volume telemetry (the JSONL firehose).
 //! - [`data_dir`] — regenerable installed artifacts (the managed server home,
 //!   `catenary/servers/<name>/<version>/`).
+//! - [`home_dir`] — the user's home, the base every host-CLI integration
+//!   artifact hangs off (`~/.claude`, `~/.gemini`, `~/.config/opencode`).
+//!
+//! Every resolver here reads a `CATENARY_*_DIR` override **first**, on every
+//! platform, and only then falls back to the `dirs` crate. That ordering is what
+//! makes the whole surface testable: `isolate_env` (tests/common/mod.rs) points
+//! each override at a distinct subdir of a tempdir, so a subprocess test can
+//! never write the operator's real state — and because the bases stay distinct,
+//! code that writes under the *wrong* base is caught rather than silently
+//! absorbed.
+//!
+//! This module owns the **only** blessed `dirs::*` base-dir calls in the
+//! codebase; `clippy.toml`'s `disallowed-methods` gate denies them everywhere
+//! else (bug 149), so a new home- or base-rooted path cannot re-enter without
+//! an override behind it.
 //!
 //! [`encode_cwd`] flattens an absolute path into a single filesystem-safe
 //! directory-name component, used as the per-root shard key in the firehose tree.
@@ -26,6 +41,10 @@ use std::path::{Path, PathBuf};
 /// 3. `dirs::data_local_dir()` (macOS / Windows fallback).
 /// 4. `/tmp` as a last resort.
 #[must_use]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "blessed base-dir resolver: `CATENARY_STATE_DIR` is resolved first, which is what makes the state base testable"
+)]
 pub fn state_dir() -> PathBuf {
     std::env::var_os("CATENARY_STATE_DIR")
         .map(PathBuf::from)
@@ -47,6 +66,10 @@ pub fn state_dir() -> PathBuf {
 /// 3. [`state_dir`] as a fallback when no runtime dir is configured (macOS /
 ///    Windows, or `XDG_RUNTIME_DIR` unset).
 #[must_use]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "blessed base-dir resolver: `CATENARY_RUNTIME_DIR` is resolved first, which is what makes the runtime base testable"
+)]
 pub fn runtime_dir() -> PathBuf {
     std::env::var_os("CATENARY_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -71,6 +94,10 @@ pub fn runtime_dir() -> PathBuf {
 ///    durability expectation for a user config file; `/tmp` would lose the
 ///    config on reboot, making the fallback useless in practice.
 #[must_use]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "blessed base-dir resolver: `CATENARY_CONFIG_DIR` is resolved first, which is what makes the config base testable"
+)]
 pub fn config_dir() -> PathBuf {
     std::env::var_os("CATENARY_CONFIG_DIR")
         .map(PathBuf::from)
@@ -90,6 +117,10 @@ pub fn config_dir() -> PathBuf {
 /// 2. `dirs::cache_dir()` (`XDG_CACHE_HOME` on Linux).
 /// 3. [`state_dir`] as a fallback when no cache dir is configured.
 #[must_use]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "blessed base-dir resolver: `CATENARY_CACHE_DIR` is resolved first, which is what makes the cache base testable"
+)]
 pub fn cache_dir() -> PathBuf {
     std::env::var_os("CATENARY_CACHE_DIR")
         .map(PathBuf::from)
@@ -111,11 +142,53 @@ pub fn cache_dir() -> PathBuf {
 /// 2. `dirs::data_dir()` (`XDG_DATA_HOME` on Linux).
 /// 3. [`state_dir`] as a fallback when no data dir is configured.
 #[must_use]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "blessed base-dir resolver: `CATENARY_DATA_DIR` is resolved first, which is what makes the data base testable"
+)]
 pub fn data_dir() -> PathBuf {
     std::env::var_os("CATENARY_DATA_DIR")
         .map(PathBuf::from)
         .or_else(dirs::data_dir)
         .unwrap_or_else(state_dir)
+}
+
+/// Resolve the user's home directory.
+///
+/// Not an XDG base, but the same kind of resolution problem: it is the root
+/// every host-CLI integration artifact hangs off — Claude Code's `~/.claude`,
+/// Antigravity's `~/.gemini/config/plugins/catenary`, OpenCode's
+/// `~/.config/opencode/plugin` — as well as the reference point for `~`
+/// expansion and `~`-compressed display. So it gets a `CATENARY_*` override for
+/// exactly the reason the XDG bases have one.
+///
+/// **Bug 149.** `isolate_env` deliberately does *not* redirect `$HOME` (other
+/// tooling inside a test subprocess legitimately needs the real one), so a
+/// seam that resolved a *write* target straight through `dirs::home_dir()`
+/// escaped test isolation and rewrote the operator's real
+/// `~/.gemini/…/rules/catenary.md`. Routing every home-rooted path through this
+/// resolver — and denying bare `dirs::home_dir()` elsewhere via `clippy.toml`'s
+/// `disallowed-methods` — closes the class: `CATENARY_HOME_DIR` is the one lever
+/// that moves them all.
+///
+/// Resolution order:
+/// 1. `CATENARY_HOME_DIR` environment variable (cross-platform override); an
+///    empty value reads as unset, since an empty home would silently reroot
+///    every host artifact onto a relative path.
+/// 2. `dirs::home_dir()` (`$HOME` on Unix, `%USERPROFILE%` on Windows).
+///
+/// `None` when neither resolves — callers treat a homeless host as "nothing
+/// installed" rather than guessing a location.
+#[must_use]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the one blessed `dirs::home_dir()`: the `CATENARY_HOME_DIR` override layered over it here is what makes home-rooted writes testable (bug 149)"
+)]
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("CATENARY_HOME_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
 }
 
 /// Flatten a string into one filesystem-safe path component.

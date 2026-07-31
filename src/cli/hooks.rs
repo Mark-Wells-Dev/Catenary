@@ -2276,7 +2276,7 @@ fn resolve_client_build_hint(
 pub(crate) fn find_project_config(
     cwd: &std::path::Path,
 ) -> Option<(PathBuf, crate::config::ProjectConfig)> {
-    let home = dirs::home_dir();
+    let home = crate::paths::home_dir();
     let mut dir = Some(cwd);
     while let Some(d) = dir {
         if let Ok(Some(pc)) = crate::config::load_project_config(d) {

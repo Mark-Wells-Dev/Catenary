@@ -152,7 +152,7 @@ pub fn launchd_plist_path() -> PathBuf {
 fn launchd_home() -> PathBuf {
     std::env::var_os("CATENARY_DATA_DIR")
         .map(PathBuf::from)
-        .or_else(dirs::home_dir)
+        .or_else(crate::paths::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
 }
 

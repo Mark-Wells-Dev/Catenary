@@ -28,7 +28,7 @@ fn parse_source(source: &str) -> InstallSource {
         let expanded = source.strip_prefix('~').map_or_else(
             || PathBuf::from(source),
             |rest| {
-                dirs::home_dir().map_or_else(
+                crate::paths::home_dir().map_or_else(
                     || PathBuf::from(source),
                     |h| h.join(rest.strip_prefix('/').unwrap_or(rest)),
                 )
@@ -86,7 +86,7 @@ fn detect_claude() -> HostStatus {
 
 /// Get Claude Code plugin install status from `installed_plugins.json`.
 fn claude_install_status() -> String {
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = crate::paths::home_dir() else {
         return "unknown".to_string();
     };
     let plugins_file = home.join(".claude/plugins/installed_plugins.json");
@@ -117,8 +117,8 @@ fn claude_install_status() -> String {
 /// Detect Antigravity CLI install status.
 fn detect_antigravity() -> HostStatus {
     let agy_exists = binary_exists("agy");
-    let global_dir_exists =
-        dirs::home_dir().is_some_and(|h| h.join(".gemini/config/plugins/catenary").is_dir());
+    let global_dir_exists = crate::paths::home_dir()
+        .is_some_and(|h| h.join(".gemini/config/plugins/catenary").is_dir());
     let detected = agy_exists || global_dir_exists;
 
     let status = if !detected {
@@ -139,7 +139,7 @@ fn detect_antigravity() -> HostStatus {
 /// Detect OpenCode install status.
 fn detect_opencode() -> HostStatus {
     let binary = binary_exists("opencode");
-    let plugin = dirs::home_dir().map(|h| h.join(".config/opencode/plugin/catenary.js"));
+    let plugin = crate::paths::home_dir().map(|h| h.join(".config/opencode/plugin/catenary.js"));
     let linked = plugin.as_ref().is_some_and(|p| p.is_symlink());
     // `is_file()` follows symlinks, so check `linked` first to distinguish.
     let bundled = plugin
@@ -378,7 +378,7 @@ fn claude_ensure_plugin(out: &mut Output, dry_run: bool) -> Result<()> {
 
 /// Check if the catenary plugin is currently installed in Claude Code.
 fn claude_plugin_is_installed() -> bool {
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = crate::paths::home_dir() else {
         return false;
     };
     let plugins_file = home.join(".claude/plugins/installed_plugins.json");
@@ -397,7 +397,7 @@ fn claude_plugin_is_installed() -> bool {
 
 /// Read the current Claude Code marketplace source for catenary.
 fn read_claude_marketplace_source() -> Option<String> {
-    let home = dirs::home_dir()?;
+    let home = crate::paths::home_dir()?;
     let path = home.join(".claude/plugins/known_marketplaces.json");
     let contents = std::fs::read_to_string(path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&contents).ok()?;
@@ -478,7 +478,7 @@ pub fn run_install_antigravity(
 
     let parsed_source = source.map(parse_source);
 
-    let home = dirs::home_dir().context("cannot determine home directory")?;
+    let home = crate::paths::home_dir().context("cannot determine home directory")?;
     let target_dir = home.join(".gemini/config/plugins/catenary");
 
     match parsed_source {
@@ -642,7 +642,7 @@ fn opencode_targets(workspace: bool) -> Result<OpenCodeTargets> {
             plugin: root.join(".opencode/plugin/catenary.js"),
         })
     } else {
-        let home = dirs::home_dir().context("cannot determine home directory")?;
+        let home = crate::paths::home_dir().context("cannot determine home directory")?;
         Ok(OpenCodeTargets {
             plugin: home.join(".config/opencode/plugin/catenary.js"),
         })
@@ -811,10 +811,10 @@ fn install_opencode_bundled(
 /// Returns an error if any install step fails.
 pub fn refresh_installed_hosts(out: &mut Output) -> Result<()> {
     let claude = binary_exists("claude") && claude_plugin_is_installed();
-    let antigravity = dirs::home_dir()
+    let antigravity = crate::paths::home_dir()
         .map(|h| h.join(".gemini/config/plugins/catenary"))
         .is_some_and(|p| p.is_dir() || p.is_symlink());
-    let opencode = dirs::home_dir()
+    let opencode = crate::paths::home_dir()
         .map(|h| h.join(".config/opencode/plugin/catenary.js"))
         .is_some_and(|p| p.is_file() || p.is_symlink());
 
