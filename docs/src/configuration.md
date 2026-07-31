@@ -936,6 +936,57 @@ its predicate/backlink intelligence: grep/glob enrichment across the planning
 graph, and `catenary diagnostics` link/predicate checks on planning edits — for
 free, every session.
 
+## Agent Context Files
+
+Two optional markdown files live beside `config.toml` in the config directory.
+Catenary injects them on each host's session-start seam, so behavior you want
+your agents to follow rides every session of every client — without living in
+one client's memory tree.
+
+| File | Served to |
+|------|-----------|
+| `~/.config/catenary/AGENTS.md` | Lead (top-level) agents |
+| `~/.config/catenary/SUBAGENTS.md` | Dispatched subagent workers |
+
+The **filename is the whole of the scoping** — there are no config keys. Role
+separation is the point: policy that directs a lead ("discuss before
+dispatching") is actively wrong inside a worker whose job is autonomous
+execution, and every line you keep out of the worker file is context the
+dispatched tier never pays for.
+
+**Client addenda.** Client-specific content rides a suffixed sibling keyed by
+the host token the hooks already speak (the `--format` value):
+
+```text
+~/.config/catenary/
+├── config.toml
+├── AGENTS.md                 # every lead, every client
+├── AGENTS.claude.md          # Claude Code leads, after the shared file
+├── AGENTS.antigravity.md     # Antigravity leads, after the shared file
+├── SUBAGENTS.md              # every worker, every client
+└── SUBAGENTS.claude.md       # Claude Code workers, after the shared file
+```
+
+The shared file and the addendum are **concatenated, never overridden** —
+shared core first, addendum after — so the invariant core is written once and
+cannot drift between clients.
+
+**Opaque content.** Catenary does not parse, validate, or transform these
+files: no markdown processing, no frontmatter handling, no templating. Each
+emitted block is preceded by a one-line provenance header naming its source
+file, so any line an agent read is traceable to the file that taught it.
+
+**Absent files are silent.** No file means no block — no warning, no error.
+This is opt-in; nothing is created for you.
+
+Delivery per host:
+
+| Host | Lead | Worker |
+|------|------|--------|
+| Claude Code | `SessionStart` (appended to the session-start context) | `SubagentStart` |
+| Antigravity | `PreInvocation`, first turn only | *(no subagent seam exists — not served)* |
+| OpenCode | *(not served)* | *(not served)* |
+
 ## Notifications
 
 The `[notifications]` table has a single knob: `desktop`, which controls

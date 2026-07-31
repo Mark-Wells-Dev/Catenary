@@ -13,6 +13,7 @@ pub mod install;
 pub mod jsonl_reader;
 pub mod teaching;
 pub mod update;
+pub mod user_context;
 pub mod version;
 #[cfg(unix)]
 pub mod worktree;

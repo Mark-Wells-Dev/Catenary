@@ -188,12 +188,13 @@ fn opencode_session_start_body() -> String {
 
 /// Build the Antigravity `PreInvocation` output that injects `payload` as a
 /// **persisted** `injectSteps` `userMessage` (teaching-surface ticket 03; the
-/// payload is the per-session sliver as of ticket 14).
+/// payload narrowed to the per-session sliver in ticket 14 and gained the user
+/// context leg in misc 224).
 ///
-/// `payload` is the per-session teaching sliver
-/// ([`crate::cli::teaching::session_sliver`]) — the cwd build tool the always-on
-/// rules file structurally cannot carry — not the full teaching body (that rides
-/// the rules file every turn). A `userMessage` step is written into the
+/// `payload` is [`pre_invocation_payload`] — the per-session teaching sliver
+/// (the cwd build tool the always-on rules file structurally cannot carry) and
+/// the user's lead context files (misc 224) — not the full teaching body (that
+/// rides the rules file every turn). A `userMessage` step is written into the
 /// conversation transcript and stales like any transcript content, unlike the
 /// per-model-call `ephemeralMessage` channel (excluded by maintainer ruling — it
 /// is transient per call, not a session-start surface). The daemon-side
@@ -692,8 +693,10 @@ pub fn run_session_start(format: HostFormat) {
     let announce = session_start_should_announce(source);
 
     let Some(stream) = hook_connect(&hook_json) else {
-        let ctx =
-            with_bridge_mismatch_line(with_orphan_line(session_start_context(announce, format)));
+        let ctx = with_user_context(
+            with_bridge_mismatch_line(with_orphan_line(session_start_context(announce, format))),
+            format,
+        );
         emit_session_start(builder, ctx.as_deref());
         return;
     };
@@ -732,9 +735,12 @@ pub fn run_session_start(format: HostFormat) {
         }
     }
 
-    let ctx = with_project_config_line(
-        with_bridge_mismatch_line(with_orphan_line(session_start_context(announce, format))),
-        nudge.as_deref(),
+    let ctx = with_user_context(
+        with_project_config_line(
+            with_bridge_mismatch_line(with_orphan_line(session_start_context(announce, format))),
+            nudge.as_deref(),
+        ),
+        format,
     );
     emit_session_start(builder, ctx.as_deref());
 }
@@ -789,20 +795,45 @@ fn with_project_config_line(ctx: Option<String>, nudge: Option<&str>) -> Option<
     }
 }
 
-/// Inject the per-session teaching sliver on a conversation's first sighting
-/// (Antigravity `PreInvocation` hook handler, teaching-surface ticket 03; sliver
-/// as of ticket 14).
+/// Append the user's LEAD context files (misc 224) to a `SessionStart` context.
+///
+/// `~/.config/catenary/AGENTS.md` plus the `AGENTS.<client>.md` addendum keyed by
+/// the declared `--format` token, concatenated shared-first under per-file
+/// provenance headers ([`crate::cli::user_context`]). Mirrors [`with_orphan_line`]
+/// / [`with_bridge_mismatch_line`] / [`with_project_config_line`]: it only
+/// augments a `Some` context — the announce+Claude path, the one `SessionStart`
+/// surface that carries `additionalContext` — so a withheld payload (a `resume`,
+/// whose transcript already carries the previous injection) stays withheld and a
+/// non-Claude host never receives a Claude-shaped standalone block. Appended
+/// last, after the situational one-liners, so the user's policy closes the
+/// payload. Absent files are the identity.
+#[must_use]
+fn with_user_context(ctx: Option<String>, format: HostFormat) -> Option<String> {
+    Some(crate::cli::user_context::appended(
+        ctx?,
+        crate::cli::user_context::Audience::Lead,
+        format,
+    ))
+}
+
+/// Inject a conversation's first-sighting payload (Antigravity `PreInvocation`
+/// hook handler).
+///
+/// The payload is the per-session teaching sliver plus the user's lead context
+/// files (teaching-surface ticket 03; sliver as of ticket 14; user context misc
+/// 224).
 ///
 /// Antigravity has no `SessionStart` surface; its `PreInvocation` hook fires
 /// before **every** model call carrying `invocationNum` and `conversationId`.
 /// Rather than inject per-call (the `ephemeralMessage` channel is transient and
-/// excluded by ruling), this delivers, once per conversation, the per-session
-/// **sliver** ([`crate::cli::teaching::session_sliver`]) as a single
-/// **persisted** `injectSteps` `userMessage`. The always-on rules file already
-/// carries the workspace-invariant surface every turn (teaching-surface ticket
-/// 14), so the injection carries only the session-specific delta the rules file
-/// structurally cannot — the cwd build tool. When the cwd resolves no build tool
-/// there is no delta, so nothing is injected (the rules file has it all).
+/// excluded by ruling), this delivers, once per conversation, the
+/// [`pre_invocation_payload`] as a single **persisted** `injectSteps`
+/// `userMessage`. The always-on rules file already carries the
+/// workspace-invariant surface every turn (teaching-surface ticket 14), so the
+/// teaching leg carries only the session-specific delta the rules file
+/// structurally cannot — the cwd build tool — and the user-context leg carries
+/// `AGENTS.md` plus its `antigravity` addendum. With neither leg present nothing
+/// is injected (the rules file has it all).
 ///
 /// First-sighting is decided **daemon-side**, keyed on `conversationId`, not by
 /// the stateless `invocationNum == 0` trigger: the daemon already sees
@@ -836,16 +867,53 @@ pub fn run_pre_invocation(format: HostFormat) {
         return;
     };
 
-    // Inject only on the first sighting, and only when there is a session-specific
-    // delta to carry — the rules file already delivers the shared surface. The
-    // sliver render is computed only on the first sighting, so the per-model-call
+    // Inject only on the first sighting, and only when there is something to
+    // carry — the rules file already delivers the shared teaching surface. The
+    // payload render is computed only on the first sighting, so the per-model-call
     // hot path pays only the ledger round-trip, not a second config load.
     if pre_invocation_first_sighting(&hook_json, format)
-        && let Some(sliver) = crate::cli::teaching::session_sliver()
+        && let Some(payload) = pre_invocation_payload()
     {
-        print!("{}", pre_invocation_injection(&sliver));
+        print!("{}", pre_invocation_injection(&payload));
     } else {
         print!("{}", empty_pre_invocation());
+    }
+}
+
+/// The Antigravity `PreInvocation` first-sighting payload: the per-session
+/// teaching sliver and the user's LEAD context files, whichever exist.
+///
+/// Two independent legs on one vehicle — Antigravity's only persisted
+/// session-start seam. The sliver is the cwd build tool the always-on rules file
+/// structurally cannot carry ([`crate::cli::teaching::session_sliver`]); the
+/// user context is `AGENTS.md` plus its `antigravity` addendum (misc 224).
+/// `None` when neither exists, so nothing is injected.
+///
+/// **Recorded gap (misc 224):** Antigravity registers no subagent-start seam, so
+/// `SUBAGENTS.md` injects nowhere on this host. It is deliberately NOT
+/// approximated via `PreToolUse` — the turn-0 vehicle ruling holds.
+#[must_use]
+fn pre_invocation_payload() -> Option<String> {
+    join_pre_invocation(
+        crate::cli::teaching::session_sliver(),
+        crate::cli::user_context::compose(
+            crate::cli::user_context::Audience::Lead,
+            HostFormat::Antigravity,
+        ),
+    )
+}
+
+/// Join the two `PreInvocation` legs into one injected message: the sliver
+/// first (this session's workspace specifics), then the user context.
+///
+/// Pure, so the "either leg alone", "both", and "neither" shapes are testable
+/// without a cwd or a config dir.
+#[must_use]
+fn join_pre_invocation(sliver: Option<String>, user_context: Option<String>) -> Option<String> {
+    match (sliver, user_context) {
+        (Some(sliver), Some(ctx)) => Some(format!("{sliver}\n\n{ctx}")),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
     }
 }
 
@@ -980,11 +1048,20 @@ fn emit_subagent_start_announcement(format: HostFormat) {
 /// ([`crate::cli::teaching::emitted_subagent_payload`]) — self-contained and
 /// prefix-identifiable, since a subagent's `additionalContext` lands in its own
 /// window under one shared label alongside other hooks' context.
+///
+/// The user's WORKER context files close the payload (misc 224):
+/// `~/.config/catenary/SUBAGENTS.md` plus its `SUBAGENTS.<client>.md` addendum.
+/// The role scoping is the filename — a worker never reads the lead's
+/// `AGENTS.md`, so lead-directed policy cannot bleed into a dispatched context.
 fn build_subagent_start_response(format: HostFormat) -> Option<serde_json::Value> {
     if !matches!(format, HostFormat::Claude) {
         return None;
     }
-    let ctx = crate::cli::teaching::emitted_subagent_payload();
+    let ctx = crate::cli::user_context::appended(
+        crate::cli::teaching::emitted_subagent_payload(),
+        crate::cli::user_context::Audience::Subagent,
+        format,
+    );
     Some(serde_json::json!({
         "hookSpecificOutput": announcement_hook_specific_output("SubagentStart", &ctx),
     }))
@@ -4390,11 +4467,16 @@ mod tests {
         let ctx = obj["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .expect("additionalContext string");
-        // The emitted subagent payload verbatim (the shared body, the per-agent
-        // debt line, and the daemon-staleness note when the daemon is stale).
-        // Compared against the same source so the check is deterministic
-        // regardless of daemon staleness.
-        assert_eq!(ctx, crate::cli::teaching::emitted_subagent_payload());
+        // The emitted subagent payload opens it verbatim (the shared body, the
+        // per-agent debt line, and the daemon-staleness note when the daemon is
+        // stale). Compared against the same source so the check is deterministic
+        // regardless of daemon staleness. A PREFIX check, not equality: the
+        // user's `SUBAGENTS.md` (misc 224) closes the payload when the operator
+        // running this suite has populated one.
+        assert!(
+            ctx.starts_with(&crate::cli::teaching::emitted_subagent_payload()),
+            "the teaching payload must open the subagent context: {ctx}"
+        );
         // Prefix-identifiable header present (it opens the block, or follows the
         // one-line staleness note when the daemon is stale).
         assert!(
@@ -4421,6 +4503,10 @@ mod tests {
 
     #[test]
     fn subagent_start_response_non_claude_is_none() {
+        // No other supported host spawns subagents. For Antigravity this is the
+        // recorded misc-224 gap: with no subagent-start seam there, `SUBAGENTS.md`
+        // injects nowhere — deliberately NOT approximated via `PreToolUse` (the
+        // turn-0 vehicle ruling holds), so agy is served leads only.
         assert!(build_subagent_start_response(HostFormat::Antigravity).is_none());
         assert!(build_subagent_start_response(HostFormat::OpenCode).is_none());
     }
@@ -4466,6 +4552,61 @@ mod tests {
                 .is_some_and(|s| s.contains("The edit→diagnostics loop")),
             "the sliver must not carry the full invariants: {out}",
         );
+    }
+
+    // ── User context files (misc 224) ───────────────────────────────────
+
+    #[test]
+    fn with_user_context_keeps_a_withheld_context_withheld() {
+        // A `None` context (a `resume`, or a non-Claude host) must stay `None` —
+        // the user context rides the existing `additionalContext` surface, it
+        // does not create one. Mirrors `with_orphan_line` / `with_project_config_line`.
+        assert!(with_user_context(None, HostFormat::Claude).is_none());
+        assert!(with_user_context(None, HostFormat::Antigravity).is_none());
+    }
+
+    #[test]
+    fn with_user_context_appends_after_the_base_payload() {
+        // Whether the operator running this suite has populated
+        // `~/.config/catenary/AGENTS.md` or not, the base payload must survive
+        // as the opening of the result — the user context is APPENDED, never a
+        // replacement.
+        let out = with_user_context(Some("BASE-PAYLOAD".to_string()), HostFormat::Claude)
+            .expect("a Some context stays Some");
+        assert!(
+            out.starts_with("BASE-PAYLOAD"),
+            "the base payload must open the context: {out}"
+        );
+    }
+
+    #[test]
+    fn join_pre_invocation_orders_sliver_then_user_context() {
+        // Both legs: the session sliver first, the user context after, one blank
+        // line between them.
+        let joined = join_pre_invocation(Some("SLIVER".to_string()), Some("USER-CTX".to_string()))
+            .expect("both legs compose");
+        assert_eq!(joined, "SLIVER\n\nUSER-CTX");
+    }
+
+    #[test]
+    fn join_pre_invocation_carries_either_leg_alone() {
+        // Each leg is independent — the ticket-14 sliver still injects with no
+        // user context, and a user context still injects with no build tool.
+        assert_eq!(
+            join_pre_invocation(Some("SLIVER".to_string()), None).as_deref(),
+            Some("SLIVER"),
+        );
+        assert_eq!(
+            join_pre_invocation(None, Some("USER-CTX".to_string())).as_deref(),
+            Some("USER-CTX"),
+        );
+    }
+
+    #[test]
+    fn join_pre_invocation_with_neither_leg_injects_nothing() {
+        // No delta and no user context → nothing injected (the always-on rules
+        // file already carries the shared surface).
+        assert!(join_pre_invocation(None, None).is_none());
     }
 
     #[test]
