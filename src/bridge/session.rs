@@ -171,6 +171,11 @@ impl ResolvedGlob {
     /// repo-scoped (matching ripgrep and editors): outside a git repository no
     /// `.gitignore` rules apply. Results are sorted for deterministic output.
     ///
+    /// The hidden skip carries the "tracked beats hidden" rule
+    /// ([`crate::tracked`], misc 227): a dot-leading path the repository tracks
+    /// is traversed by default, untracked hidden stays skipped, and outside a
+    /// repository the plain hidden rule stands.
+    ///
     /// Only meaningful for absolute patterns — the sole form path-argument
     /// expansion sees, because every relative path argument is absolutized
     /// against the invoking `cwd` first (the CLI-side request builders;
@@ -213,9 +218,19 @@ impl ResolvedGlob {
             return Vec::new();
         };
         let mut builder = WalkBuilder::new(base);
-        builder
-            .git_ignore(!include_gitignored)
-            .hidden(!include_hidden);
+        builder.git_ignore(!include_gitignored);
+        // "Tracked beats hidden" (misc 227, folding bug 66): a hidden directory
+        // git tracks is traversed whether the pattern *anchors* at it or reaches
+        // it through a parent's `**`. Before this, anchoring was exempt (the
+        // `ignore` walker never filters its own root) while traversal was not,
+        // so two sibling hidden dirs answered differently for the same pattern
+        // shape — bug 66's finding 1.
+        crate::tracked::apply_hidden_posture(
+            &mut builder,
+            base,
+            !include_hidden,
+            &crate::tracked::TrackedHidden::new(),
+        );
         // Bound the walk to the deepest a match can lie (misc 159): a
         // single-star pattern (`/base/t*`) matches only `base`'s direct
         // children, so descending every sibling subtree is pure waste — the

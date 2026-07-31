@@ -617,12 +617,15 @@ fn collect_dir_entries(
     exclude: &ExcludeSet,
     cancel: &CancellationToken,
 ) -> Result<Vec<GlobEntry>> {
+    // One tracked-set consultation for both walks below (misc 227).
+    let tracked = crate::tracked::TrackedHidden::new();
+
     // Build non-gitignored set for flag detection.
     let non_ignored: HashSet<PathBuf> = if include_gitignored {
-        WalkBuilder::new(canonical)
-            .max_depth(Some(1))
-            .git_ignore(true)
-            .hidden(!include_hidden)
+        let mut builder = WalkBuilder::new(canonical);
+        builder.max_depth(Some(1)).git_ignore(true);
+        crate::tracked::apply_hidden_posture(&mut builder, canonical, !include_hidden, &tracked);
+        builder
             .build()
             .flatten()
             .map(ignore::DirEntry::into_path)
@@ -631,11 +634,10 @@ fn collect_dir_entries(
         HashSet::new()
     };
 
-    let walker = WalkBuilder::new(canonical)
-        .max_depth(Some(1))
-        .git_ignore(!include_gitignored)
-        .hidden(!include_hidden)
-        .build();
+    let mut builder = WalkBuilder::new(canonical);
+    builder.max_depth(Some(1)).git_ignore(!include_gitignored);
+    crate::tracked::apply_hidden_posture(&mut builder, canonical, !include_hidden, &tracked);
+    let walker = builder.build();
 
     let mut entries = Vec::new();
 
@@ -937,11 +939,15 @@ fn count_dir_children(
     include_hidden: bool,
     exclude: &ExcludeSet,
 ) -> (usize, usize) {
-    let walker = WalkBuilder::new(dir)
-        .max_depth(Some(1))
-        .git_ignore(!include_gitignored)
-        .hidden(!include_hidden)
-        .build();
+    let mut builder = WalkBuilder::new(dir);
+    builder.max_depth(Some(1)).git_ignore(!include_gitignored);
+    crate::tracked::apply_hidden_posture(
+        &mut builder,
+        dir,
+        !include_hidden,
+        &crate::tracked::TrackedHidden::new(),
+    );
+    let walker = builder.build();
     let mut files = 0usize;
     let mut dirs = 0usize;
     for entry in walker.flatten() {
@@ -1149,6 +1155,11 @@ fn collect_scoped_observations(
     exclude: &ExcludeSet,
 ) -> Vec<(PathBuf, i64)> {
     let mut observed: Vec<(PathBuf, i64)> = Vec::new();
+    // One tracked-set consultation for every resolved directory (misc 227). The
+    // posture must match the listing's, or the observation set and the surfaced
+    // set disagree — and a baseline the reaping full walk cannot re-observe
+    // phantom-reaps a live file as `Deleted`.
+    let tracked = crate::tracked::TrackedHidden::new();
     for path in resolved {
         // Directories first — `is_dir()` follows symlinks, so a symlink-to-dir
         // routes here and is walked at its literal path; each entry is then
@@ -1164,11 +1175,10 @@ fn collect_scoped_observations(
             // canonicalize to resolve its target. `None` when the dir itself
             // can't canonicalize → fall back to per-entry resolution.
             let canonical_dir = path.canonicalize().ok();
-            let walker = WalkBuilder::new(path)
-                .max_depth(Some(1))
-                .git_ignore(!include_gitignored)
-                .hidden(!include_hidden)
-                .build();
+            let mut builder = WalkBuilder::new(path);
+            builder.max_depth(Some(1)).git_ignore(!include_gitignored);
+            crate::tracked::apply_hidden_posture(&mut builder, path, !include_hidden, &tracked);
+            let walker = builder.build();
             for entry in walker.flatten() {
                 let entry_is_symlink = entry.path_is_symlink();
                 let entry_path = entry.into_path();

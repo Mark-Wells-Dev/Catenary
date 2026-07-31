@@ -167,6 +167,10 @@ where
     let types = build_types(&options.flags)?;
     let mut batcher = Batcher::new(HIT_BATCH_SIZE, &mut on_batch);
     let mut skips: Vec<SkipRecord> = Vec::new();
+    // One tracked-set consultation for the whole walk (misc 227): every root
+    // shares it, so a multi-root grep over one repository reads that
+    // repository's index at most once. See `crate::tracked` for the bound.
+    let tracked = crate::tracked::TrackedHidden::new();
     // Canonical paths already searched — the cross-root dedup set. Same memory
     // order as the observation set (both are O(visited files), the executor's
     // own accumulation shape); the hit stream itself stays streaming.
@@ -183,6 +187,7 @@ where
             &matcher,
             types.as_ref(),
             options,
+            &tracked,
             &mut batcher,
             &mut skips,
             &mut dedup,
@@ -245,7 +250,12 @@ fn build_types(flags: &GrepFlags) -> Result<Option<Types>> {
 /// binary skip into `skips`, and every visited regular file into the
 /// batcher's pending observation set (the WS31 observations, shipped with the
 /// next batch). `dedup` is the cross-root canonical-path dedup set — a file
-/// already searched under an earlier root is skipped.
+/// already searched under an earlier root is skipped. `tracked` is the walk-wide
+/// tracked-set consultation behind the hidden posture (misc 227).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one root's full walk context; the tracked-set consultation is walk-wide by design"
+)]
 #[allow(
     clippy::too_many_lines,
     reason = "one linear pass: observation, filter gates, binary skip, then the search"
@@ -255,6 +265,7 @@ fn walk_root<F>(
     matcher: &grep_regex::RegexMatcher,
     types: Option<&Types>,
     options: &WalkOptions,
+    tracked: &Arc<crate::tracked::TrackedHidden>,
     batcher: &mut Batcher<'_, F>,
     skips: &mut Vec<SkipRecord>,
     dedup: &mut HashSet<PathBuf>,
@@ -275,8 +286,11 @@ where
     let mut builder = WalkBuilder::new(root);
     builder
         .git_ignore(skip_gitignored)
-        .hidden(skip_hidden)
         .sort_by_file_path(std::cmp::Ord::cmp);
+    // "Tracked beats hidden" (misc 227): a dot-leading path git tracks joins the
+    // default walk; untracked hidden stays skipped; `--include-hidden`
+    // (`skip_hidden == false`) is unchanged.
+    crate::tracked::apply_hidden_posture(&mut builder, root, skip_hidden, tracked);
     if !root_is_file {
         if !options.flags.globs.is_empty() {
             let mut ob = OverrideBuilder::new(root);

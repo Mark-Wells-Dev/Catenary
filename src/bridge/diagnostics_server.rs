@@ -1140,10 +1140,20 @@ impl DiagnosticsServer {
     /// a standalone linter covers are kept — a whole-directory scope diagnoses
     /// the diagnosable files, it does not flag every unrelated file as
     /// `[no LSP coverage]`. Shares the walk scope of [`stat_walk`] and the grep
-    /// walker (respects `.gitignore`, skips hidden entries).
+    /// walker (respects `.gitignore`, skips hidden entries — with the "tracked
+    /// beats hidden" rule of [`crate::tracked`], misc 227, so a directory scope
+    /// diagnoses the tracked CI config grep now finds in it).
     fn expand_directory(&self, dir: &std::path::Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
-        let walker = WalkBuilder::new(dir).git_ignore(true).hidden(true).build();
+        let mut builder = WalkBuilder::new(dir);
+        builder.git_ignore(true);
+        crate::tracked::apply_hidden_posture(
+            &mut builder,
+            dir,
+            true,
+            &crate::tracked::TrackedHidden::new(),
+        );
+        let walker = builder.build();
         for entry in walker.flatten() {
             if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 continue;
@@ -2760,8 +2770,12 @@ fn retain_unheard(server: &LspServer, pending: &mut HashSet<String>) {
 /// Stat-walks a workspace root, returning every regular file as a
 /// `(root-relative path, mtime)` pair for the WS31 changed-set baseline diff.
 ///
-/// Respects `.gitignore` and skips hidden files (the same scope as the grep
-/// walk and `detect_workspace_languages`). Unlike `grep`, `diagnostics` reads
+/// Respects `.gitignore` and skips hidden files — carrying grep's "tracked
+/// beats hidden" rule ([`crate::tracked`], misc 227), which this walk **must**
+/// share: this result feeds `nudge_changed_set(..., reap=true)`, so a file
+/// grep's walk baselined and this walk could not re-observe would be
+/// phantom-reaped as `Deleted`. Coverage symmetry between the two full walks is
+/// the correctness property, not a convenience. Unlike `grep`, `diagnostics` reads
 /// the server's index rather than file contents, so this is a dedicated
 /// stat-walk — the per-file `mtime` is the only thing read. The manager scopes
 /// the result to the union of registered watch globs before diffing.
@@ -2777,7 +2791,15 @@ fn retain_unheard(server: &LspServer, pending: &mut HashSet<String>) {
 /// F1/H1). The same per-entry contract grep's walker uses.
 fn stat_walk(root: &std::path::Path) -> Vec<(PathBuf, i64)> {
     let mut observed = Vec::new();
-    let walker = WalkBuilder::new(root).git_ignore(true).hidden(true).build();
+    let mut builder = WalkBuilder::new(root);
+    builder.git_ignore(true);
+    crate::tracked::apply_hidden_posture(
+        &mut builder,
+        root,
+        true,
+        &crate::tracked::TrackedHidden::new(),
+    );
+    let walker = builder.build();
     for entry in walker.flatten() {
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;

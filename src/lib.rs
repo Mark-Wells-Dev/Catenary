@@ -68,6 +68,11 @@ pub mod source;
 pub mod state_snapshot;
 /// Symbol index for workspace-wide symbol extraction.
 pub mod symbol_index;
+/// The search walks' "tracked beats hidden" rule (misc 227).
+///
+/// Consults git's tracked set so a hidden path the repository tracks joins the
+/// default walk.
+pub mod tracked;
 /// Interactive TUI for session browsing and event tailing.
 pub mod tui;
 /// Out-of-tree agent worktree creation for Claude Code's `WorktreeCreate` hook.

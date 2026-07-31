@@ -1433,10 +1433,12 @@ enum SearchKind {
     Glob {
         /// Glob-pattern arguments (original spelling, daemon-reported) that
         /// expanded to zero matches. Rendered as `no matches for pattern:
-        /// <pattern> (relative patterns anchor at cwd)` regardless of whether
-        /// other arguments produced results (misc 118). Each is followed by a
-        /// raw-string gitignore/hidden disclosure when the pattern names an
-        /// existing-but-hidden target (moment 2).
+        /// <pattern>` regardless of whether other arguments produced results
+        /// (misc 118), with the `(relative patterns anchor at cwd)` explanation
+        /// appended only for a **relative** pattern — on an absolute one it
+        /// describes nothing and misdirects (bug 66, finding 2). Each is
+        /// followed by a raw-string gitignore/hidden disclosure when the pattern
+        /// names an existing-but-hidden target (moment 2).
         no_match_patterns: Vec<String>,
         /// Display paths of matched directories — each gets a moment-4 note
         /// teaching that `catenary glob '<dir>/*'` promotes the already-summarized
@@ -1502,9 +1504,10 @@ fn forward_display(paths: &SearchPaths) -> String {
 ///   distinguishing "ran here, found nothing" from "did not run") then `no
 ///   matches for: <pattern>` plus the `searched:` scope.
 /// - **No-match patterns** (glob, stderr) — a loud `no matches for pattern:
-///   <pattern> (relative patterns anchor at cwd)` per glob-pattern argument that
-///   expanded to nothing, regardless of whether *other* arguments produced
-///   results (misc 118), each followed by a raw-string gitignore/hidden
+///   <pattern>` per glob-pattern argument that expanded to nothing, regardless
+///   of whether *other* arguments produced results (misc 118), carrying the
+///   `(relative patterns anchor at cwd)` explanation only when the pattern is
+///   relative (bug 66, finding 2), each followed by a raw-string gitignore/hidden
 ///   disclosure when the pattern names an existing-but-hidden target (teaching
 ///   moment 2). Rides `err`.
 /// - **Teaching moments 3 & 4** (glob, stderr) — the metachar-bearing
@@ -1565,9 +1568,7 @@ fn render_search_outcome(
     } = kind
     {
         for pattern in no_match_patterns {
-            let _ = err.writeln(format_args!(
-                "no matches for pattern: {pattern} (relative patterns anchor at cwd)"
-            ));
+            let _ = err.writeln(format_args!("{}", glob_no_match_report(pattern)));
             if let Some(line) = glob_zero_match_disclosure(pattern, cwd) {
                 let _ = err.writeln(format_args!("{line}"));
             }
@@ -1596,6 +1597,24 @@ fn render_search_outcome(
     }
     for path in &paths.missing {
         let _ = err.writeln(format_args!("path does not exist: {path}"));
+    }
+}
+
+/// The loud per-argument zero-match report for one glob pattern (misc 118).
+///
+/// The `(relative patterns anchor at cwd)` parenthetical explains *why* a
+/// pattern may have matched nothing somewhere other than where the agent
+/// expected — which is only ever true of a relative pattern. On an absolute
+/// pattern it is noise at best and misdirection at worst: bug 66's finding 2,
+/// where it steered a research agent toward re-anchoring a `/opt/...` pattern
+/// when the real answer was `--include-hidden`. An absolute pattern therefore
+/// gets the bare report, and the anchoring explanation is reserved for the
+/// patterns it actually describes.
+fn glob_no_match_report(pattern: &str) -> String {
+    if Path::new(pattern).is_absolute() {
+        format!("no matches for pattern: {pattern}")
+    } else {
+        format!("no matches for pattern: {pattern} (relative patterns anchor at cwd)")
     }
 }
 
@@ -6038,6 +6057,47 @@ mod tests {
                 "no matches for pattern: src/**/none.rs (relative patterns anchor at cwd)"
             ),
             "zero-match pattern is loud on stderr alongside a rendered sibling: {err}"
+        );
+    }
+
+    #[test]
+    fn render_glob_zero_match_omits_cwd_anchoring_hint_for_an_absolute_pattern() {
+        // Bug 66 finding 2: the parenthetical explains relative anchoring, so on
+        // an absolute pattern it describes nothing — and it misdirected a real
+        // agent toward re-anchoring when `--include-hidden` was the answer.
+        let paths = SearchPaths {
+            forward: vec![PathBuf::from("/opt/absent/**")],
+            missing: vec![],
+        };
+        let (_out, err) = render(
+            paths,
+            "",
+            true,
+            glob_kind(vec!["/opt/absent/**".to_string()]),
+        );
+        assert!(
+            err.contains("no matches for pattern: /opt/absent/**"),
+            "the zero-match report itself stays loud: {err}"
+        );
+        assert!(
+            !err.contains("relative patterns anchor at cwd"),
+            "an absolute pattern must not carry the relative-anchoring hint: {err}"
+        );
+    }
+
+    #[test]
+    fn glob_no_match_report_keeps_the_hint_for_a_relative_pattern() {
+        assert_eq!(
+            glob_no_match_report("src/**/none.rs"),
+            "no matches for pattern: src/**/none.rs (relative patterns anchor at cwd)"
+        );
+    }
+
+    #[test]
+    fn glob_no_match_report_drops_the_hint_for_an_absolute_pattern() {
+        assert_eq!(
+            glob_no_match_report("/opt/absent/**"),
+            "no matches for pattern: /opt/absent/**"
         );
     }
 
