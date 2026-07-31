@@ -2,12 +2,18 @@
 // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
 
 //! MCP server implementation.
+//!
+//! The roots channel has exactly two triggers: a roots-capable
+//! `initialize` arms the fetch itself (misc 169 — replay-safe, so a bridge
+//! reattaching to a fresh daemon re-anchors its roots), and a client-pushed
+//! `notifications/roots/list_changed` arms it again on every announced
+//! change. Both are message-driven; nothing polls this run loop from
+//! outside it.
 
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
@@ -162,6 +168,9 @@ pub struct McpServer {
     /// Whether the client advertised any `roots` capability.
     client_has_roots: bool,
     /// Flag: should we send a `roots/list` request after this message?
+    ///
+    /// Two triggers arm it: a roots-capable `initialize` (misc 169,
+    /// replay-safe) and a client-pushed `notifications/roots/list_changed`.
     should_fetch_roots: bool,
     /// Guard: are we currently inside `fetch_roots`? Prevents recursion.
     fetching_roots: bool,
@@ -176,9 +185,6 @@ pub struct McpServer {
     /// Shared with the stdin reader thread so `notifications/cancelled`
     /// can trigger cancellation while a tool call blocks the main loop.
     cancel_map: CancelMap,
-    /// External signal requesting a `roots/list` poll. Set via the shared
-    /// flag, cleared by this run loop after triggering `fetch_roots`.
-    roots_refresh: Option<Arc<AtomicBool>>,
 }
 
 impl McpServer {
@@ -200,7 +206,6 @@ impl McpServer {
             on_roots_changed: None,
             current_exchange_id: None,
             cancel_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            roots_refresh: None,
         }
     }
 
@@ -222,18 +227,6 @@ impl McpServer {
     #[must_use]
     pub fn on_roots_changed(mut self, callback: RootsChangedCallback) -> Self {
         self.on_roots_changed = Some(callback);
-        self
-    }
-
-    /// Set an external flag that triggers a `roots/list` poll when set.
-    ///
-    /// The run loop checks this flag after each message dispatch. When
-    /// set and the client advertises the `roots` capability, the flag
-    /// is cleared and `fetch_roots` is triggered. Used by `HookRouter`
-    /// to request a roots refresh at each turn boundary.
-    #[must_use]
-    pub fn on_roots_refresh(mut self, flag: Arc<AtomicBool>) -> Self {
-        self.roots_refresh = Some(flag);
         self
     }
 
@@ -306,17 +299,11 @@ impl McpServer {
 
             self.current_exchange_id.clone_from(&exchange_id);
 
-            // Check for turn-boundary roots refresh BEFORE dispatch.
-            // This guarantees tool calls execute against current roots:
-            // the current message is buffered behind the roots/list
-            // response, then replayed after roots are updated.
-            if self.client_has_roots
-                && let Some(ref flag) = self.roots_refresh
-                && flag.swap(false, Ordering::AcqRel)
-            {
-                self.should_fetch_roots = true;
-            }
-
+            // A fetch still pending from an earlier iteration (armed by a
+            // `roots/list_changed` that arrived while a previous fetch was
+            // waiting on its response) is served BEFORE this message is
+            // dispatched: the message is buffered behind the roots/list
+            // response and replayed once the roots are applied.
             if self.should_fetch_roots {
                 let initial = Some((line, exchange_id, method));
                 if let Err(e) = self.fetch_roots(&rx, &mut writer, initial) {
@@ -712,8 +699,8 @@ impl McpServer {
     ///
     /// `initial_message` is an already-read message (line, exchange UUID,
     /// method) that should be buffered behind the roots response. Used by
-    /// the turn-boundary refresh path to ensure tool calls execute against
-    /// updated roots.
+    /// the run loop when a fetch is still pending as the next message
+    /// arrives, so that message executes against the updated roots.
     fn fetch_roots(
         &mut self,
         inbox: &std::sync::mpsc::Receiver<String>,
@@ -1577,165 +1564,6 @@ mod tests {
         Ok(())
     }
 
-    // ── Turn-boundary roots refresh tests ────────────────────────────
-
-    #[test]
-    fn test_roots_refresh_flag_triggers_fetch() -> Result<()> {
-        use std::sync::{Arc, Mutex};
-
-        let mut server = McpServer::new(LoggingServer::new());
-        initialize_server(&mut server, true)?;
-
-        // Simulate an external signal setting the roots-refresh flag.
-        let flag = Arc::new(AtomicBool::new(true));
-        server.roots_refresh = Some(flag.clone());
-
-        let received_roots: Arc<Mutex<Vec<Root>>> = Arc::new(Mutex::new(Vec::new()));
-        let roots_clone = received_roots.clone();
-        server.on_roots_changed = Some(Box::new(move |roots| {
-            if let Ok(mut guard) = roots_clone.lock() {
-                *guard = roots;
-            }
-            Ok(())
-        }));
-
-        // Manually simulate what `run()` does: check the flag BEFORE
-        // dispatch, then call `fetch_roots` with the current message
-        // as initial_message so it's buffered behind the roots response.
-        // Clear the init arm (misc 169) first — this test is about the
-        // turn-boundary flag, not the one `initialize` already set.
-        server.should_fetch_roots = false;
-        assert!(!server.should_fetch_roots);
-        if server.client_has_roots
-            && let Some(ref f) = server.roots_refresh
-            && f.swap(false, Ordering::AcqRel)
-        {
-            server.should_fetch_roots = true;
-        }
-        assert!(server.should_fetch_roots, "flag should trigger fetch");
-        assert!(!flag.load(Ordering::Acquire), "flag should be cleared");
-
-        // Simulate: a tool call arrives, but fetch_roots runs first
-        // with the tool call as initial_message. The roots/list response
-        // is in the inbox. The tool call should be buffered and replayed
-        // AFTER roots are updated.
-        let response_json = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": "catenary-0",
-            "result": {"roots": [{"uri": "file:///tmp/refreshed"}]}
-        });
-        let inbox = mock_inbox(&[response_json]);
-        let mut writer: Vec<u8> = Vec::new();
-
-        // The initial message is a ping (simulating a tool call).
-        let initial = Some((
-            r#"{"jsonrpc":"2.0","id":42,"method":"ping"}"#.to_string(),
-            Some("exchange-100".to_string()),
-            "ping".to_string(),
-        ));
-        server.fetch_roots(&inbox, &mut writer, initial)?;
-
-        // Roots should be updated.
-        let roots = received_roots.lock().map_err(|e| anyhow!("{e}"))?;
-        assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0].uri, "file:///tmp/refreshed");
-        drop(roots);
-
-        // The ping should have been replayed AFTER roots were applied.
-        // Verify: roots/list request appears first, then ping response.
-        let output = String::from_utf8(writer)?;
-        let roots_pos = output
-            .find("roots/list")
-            .ok_or_else(|| anyhow!("roots/list not found"))?;
-        let ping_pos = output
-            .find(r#""id":42"#)
-            .ok_or_else(|| anyhow!("ping response not found"))?;
-        assert!(
-            roots_pos < ping_pos,
-            "ping response should appear after roots/list (was buffered)"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_roots_refresh_skipped_without_capability() -> Result<()> {
-        let mut server = McpServer::new(LoggingServer::new());
-        // Initialize WITHOUT roots capability.
-        initialize_server(&mut server, false)?;
-
-        let flag = Arc::new(AtomicBool::new(true));
-        server.roots_refresh = Some(flag.clone());
-
-        // Check the flag — should NOT trigger because client_has_roots is false.
-        if server.client_has_roots
-            && let Some(ref f) = server.roots_refresh
-            && f.swap(false, Ordering::AcqRel)
-        {
-            server.should_fetch_roots = true;
-        }
-        assert!(
-            !server.should_fetch_roots,
-            "should not fetch without roots capability"
-        );
-        // Flag stays set (was never consumed).
-        assert!(
-            flag.load(Ordering::Acquire),
-            "flag should remain set when capability is absent"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_roots_refresh_noop_when_not_set() -> Result<()> {
-        let mut server = McpServer::new(LoggingServer::new());
-        initialize_server(&mut server, true)?;
-
-        // Clear the init arm (misc 169) so the assertion below is about the
-        // turn-boundary flag alone.
-        server.should_fetch_roots = false;
-
-        // Flag exists but is false.
-        let flag = Arc::new(AtomicBool::new(false));
-        server.roots_refresh = Some(flag);
-
-        if server.client_has_roots
-            && let Some(ref f) = server.roots_refresh
-            && f.swap(false, Ordering::AcqRel)
-        {
-            server.should_fetch_roots = true;
-        }
-        assert!(
-            !server.should_fetch_roots,
-            "should not fetch when flag is not set"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_roots_refresh_without_external_flag() -> Result<()> {
-        let mut server = McpServer::new(LoggingServer::new());
-        initialize_server(&mut server, true)?;
-
-        // Clear the init arm (misc 169) so the assertion below is about the
-        // turn-boundary flag alone.
-        server.should_fetch_roots = false;
-
-        // No external flag wired (roots_refresh is None).
-        assert!(server.roots_refresh.is_none());
-
-        if server.client_has_roots
-            && let Some(ref f) = server.roots_refresh
-            && f.swap(false, Ordering::AcqRel)
-        {
-            server.should_fetch_roots = true;
-        }
-        assert!(
-            !server.should_fetch_roots,
-            "should not fetch when no external flag is wired"
-        );
-        Ok(())
-    }
-
     // ── Bridge hello notification tests ────────────────────────────
 
     #[test]
@@ -1961,77 +1789,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_list_changed_and_refresh_coexist() -> Result<()> {
-        use std::sync::{Arc, Mutex};
-
-        let mut server = McpServer::new(LoggingServer::new());
-        initialize_server(&mut server, true)?;
-
-        let flag = Arc::new(AtomicBool::new(false));
-        server.roots_refresh = Some(flag.clone());
-        // Clear the init arm (misc 169) so each trigger below is observed on
-        // its own.
-        server.should_fetch_roots = false;
-
-        let received_roots: Arc<Mutex<Vec<Root>>> = Arc::new(Mutex::new(Vec::new()));
-        let roots_clone = received_roots.clone();
-        server.on_roots_changed = Some(Box::new(move |roots| {
-            if let Ok(mut guard) = roots_clone.lock() {
-                *guard = roots;
-            }
-            Ok(())
-        }));
-
-        // list_changed fires first — sets should_fetch_roots directly.
-        let notification = Notification {
-            jsonrpc: "2.0".to_string(),
-            method: "notifications/roots/list_changed".to_string(),
-            params: None,
-        };
-        server.handle_notification(&notification);
-        assert!(server.should_fetch_roots);
-
-        // Fetch roots via list_changed.
-        let response1 = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": "catenary-0",
-            "result": {"roots": [{"uri": "file:///tmp/via_list_changed"}]}
-        });
-        let inbox = mock_inbox(&[response1]);
-        let mut writer: Vec<u8> = Vec::new();
-        server.fetch_roots(&inbox, &mut writer, None)?;
-
-        let roots = received_roots.lock().map_err(|e| anyhow!("{e}"))?;
-        assert_eq!(roots[0].uri, "file:///tmp/via_list_changed");
-        drop(roots);
-
-        // Now turn-boundary flag fires.
-        flag.store(true, Ordering::Release);
-        if server.client_has_roots
-            && let Some(ref f) = server.roots_refresh
-            && f.swap(false, Ordering::AcqRel)
-        {
-            server.should_fetch_roots = true;
-        }
-        assert!(server.should_fetch_roots);
-
-        // Fetch roots via turn-boundary poll.
-        let response2 = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": "catenary-1",
-            "result": {"roots": [{"uri": "file:///tmp/via_turn_boundary"}]}
-        });
-        let inbox = mock_inbox(&[response2]);
-        writer.clear();
-        server.fetch_roots(&inbox, &mut writer, None)?;
-
-        let roots = received_roots.lock().map_err(|e| anyhow!("{e}"))?;
-        assert_eq!(roots[0].uri, "file:///tmp/via_turn_boundary");
-        drop(roots);
-        Ok(())
-    }
-
     // ── run() loop tests ────────────────────────────────────────────
 
     /// Build newline-delimited JSON bytes from a slice of messages,
@@ -2043,6 +1800,182 @@ mod tests {
             buf.push(b'\n');
         }
         std::io::Cursor::new(buf)
+    }
+
+    /// An `initialize` request as it arrives on the wire, with or without
+    /// the client `roots` capability.
+    fn initialize_json(with_roots: bool) -> serde_json::Value {
+        let capabilities = if with_roots {
+            serde_json::json!({"roots": {"listChanged": true}})
+        } else {
+            serde_json::json!({})
+        };
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": capabilities,
+                "clientInfo": {"name": "test", "version": "1.0"}
+            }
+        })
+    }
+
+    /// The client's answer to the outbound `roots/list` request `id`.
+    fn roots_response_json(id: &str, uri: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"roots": [{"uri": uri}]}
+        })
+    }
+
+    /// The client-pushed roots-changed notification.
+    fn list_changed_json() -> serde_json::Value {
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"})
+    }
+
+    /// A server wired only through public builders, plus the roots each
+    /// completed `roots/list` round hands to `on_roots_changed`.
+    fn roots_probe() -> (McpServer, Arc<std::sync::Mutex<Vec<Root>>>) {
+        let seen: Arc<std::sync::Mutex<Vec<Root>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        let server =
+            McpServer::new(LoggingServer::new()).on_roots_changed(Box::new(move |roots| {
+                if let Ok(mut w) = seen_clone.lock() {
+                    *w = roots;
+                }
+                Ok(())
+            }));
+        (server, seen)
+    }
+
+    /// The URIs the last completed `roots/list` round delivered.
+    fn seen_uris(seen: &Arc<std::sync::Mutex<Vec<Root>>>) -> Vec<String> {
+        seen.lock()
+            .expect("roots lock")
+            .iter()
+            .map(|root| root.uri.clone())
+            .collect()
+    }
+
+    #[test]
+    fn run_fetches_roots_off_a_capable_initialize() -> Result<()> {
+        // misc 169: `initialize` is a roots trigger on its own. Driven end to
+        // end through `run()` — the public seam — so a trigger that stops
+        // being wired to the run loop cannot keep this test green.
+        let (mut server, seen) = roots_probe();
+        let stdin = synthetic_stdin(&[
+            initialize_json(true),
+            roots_response_json("catenary-0", "file:///tmp/via_initialize"),
+            serde_json::json!({"jsonrpc": "2.0", "id": 42, "method": "ping"}),
+        ]);
+        let mut writer: Vec<u8> = Vec::new();
+
+        server.run(stdin, &mut writer)?;
+
+        assert_eq!(
+            seen_uris(&seen),
+            vec!["file:///tmp/via_initialize".to_string()],
+            "a roots-capable initialize must complete a roots/list round",
+        );
+        let output = String::from_utf8(writer)?;
+        assert!(
+            output.contains("roots/list"),
+            "the run loop must put the roots/list request on the wire",
+        );
+        assert!(
+            output.contains(r#""id":42"#),
+            "ordinary traffic after the fetch is still answered",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_fetches_roots_off_list_changed() -> Result<()> {
+        // The second surviving trigger: a client-pushed
+        // `notifications/roots/list_changed` — honored even from a client
+        // that advertised no roots capability.
+        let (mut server, seen) = roots_probe();
+        let stdin = synthetic_stdin(&[
+            initialize_json(false),
+            list_changed_json(),
+            roots_response_json("catenary-0", "file:///tmp/via_list_changed"),
+        ]);
+        let mut writer: Vec<u8> = Vec::new();
+
+        server.run(stdin, &mut writer)?;
+
+        assert_eq!(
+            seen_uris(&seen),
+            vec!["file:///tmp/via_list_changed".to_string()],
+            "list_changed must complete a roots/list round on its own",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_issues_no_roots_list_without_a_trigger() -> Result<()> {
+        // Neither trigger fires: a capability-less initialize, its
+        // `initialized` (which arms nothing — misc 169), and ordinary
+        // traffic. Nothing may poll roots from outside those two triggers.
+        let (mut server, seen) = roots_probe();
+        let stdin = synthetic_stdin(&[
+            initialize_json(false),
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 42, "method": "ping"}),
+        ]);
+        let mut writer: Vec<u8> = Vec::new();
+
+        server.run(stdin, &mut writer)?;
+
+        assert!(seen_uris(&seen).is_empty(), "no roots round should run");
+        let output = String::from_utf8(writer)?;
+        assert!(
+            !output.contains("roots/list"),
+            "no trigger fired — no roots/list belongs on the wire",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_buffers_the_next_message_behind_a_pending_fetch() -> Result<()> {
+        // A `list_changed` that arrives while a fetch waits on its response
+        // re-arms the fetch. The run loop serves that pending fetch before
+        // dispatching the next message: the message is buffered behind the
+        // roots/list response and replayed against the updated roots.
+        let (mut server, seen) = roots_probe();
+        let stdin = synthetic_stdin(&[
+            initialize_json(true),
+            roots_response_json("catenary-0", "file:///tmp/first"),
+            list_changed_json(),
+            // Interleaved: arrives while the second fetch waits, re-arming it.
+            list_changed_json(),
+            roots_response_json("catenary-1", "file:///tmp/second"),
+            serde_json::json!({"jsonrpc": "2.0", "id": 42, "method": "ping"}),
+            roots_response_json("catenary-2", "file:///tmp/third"),
+        ]);
+        let mut writer: Vec<u8> = Vec::new();
+
+        server.run(stdin, &mut writer)?;
+
+        assert_eq!(
+            seen_uris(&seen),
+            vec!["file:///tmp/third".to_string()],
+            "the re-armed fetch must run against the message that followed it",
+        );
+
+        let output = String::from_utf8(writer)?;
+        let third_fetch = output
+            .find("catenary-2")
+            .ok_or_else(|| anyhow!("the pending fetch never reached the wire"))?;
+        let ping = output
+            .find(r#""id":42"#)
+            .ok_or_else(|| anyhow!("ping response not written"))?;
+        assert!(
+            third_fetch < ping,
+            "the ping must be replayed after the roots it was buffered behind",
+        );
+        Ok(())
     }
 
     #[test]
