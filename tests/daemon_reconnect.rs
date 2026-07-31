@@ -525,6 +525,130 @@ fn wait_pid_gone(pid: u32) -> bool {
     true
 }
 
+/// Returns the contributor sources `roots-ls` reports for `target`, or `None`
+/// when `target` is not on the board at all.
+fn roots_ls_sources(socket: &Path, target: &str) -> Result<Option<Vec<String>>> {
+    let resp = common::ipc_request(socket, &json!({ "method": "tool/roots-ls" }))?;
+    let roots: serde_json::Value = serde_json::from_str(resp.trim()).context("roots-ls json")?;
+    Ok(roots["roots"].as_array().and_then(|arr| {
+        arr.iter()
+            .find(|e| e["path"].as_str() == Some(target))
+            .and_then(|e| e["sources"].as_array())
+            .map(|s| {
+                s.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+    }))
+}
+
+/// Polls `roots-ls` until `target` carries an `mcp:` contributor, returning the
+/// sources it settled on — or the last read at the backstop, so the caller's
+/// assertion (never this helper) reports the failure.
+///
+/// Tolerates transport errors while polling: a daemon mid-respawn refuses the
+/// IPC connect, which is a not-yet, not a verdict.
+fn wait_for_mcp_sources(socket: &Path, target: &str) -> Vec<String> {
+    let backstop = Instant::now() + Duration::from_mins(2);
+    loop {
+        let sources = roots_ls_sources(socket, target)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if sources.iter().any(|s| s.starts_with("mcp:")) || Instant::now() >= backstop {
+            return sources;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// misc 169: a session that reattaches to a fresh daemon re-anchors its roots.
+///
+/// The pinned specimen (three live sessions across a `catenary stop` +
+/// `systemctl --user restart`): every bridge reattached and replayed
+/// `initialize` — the streams even log "Client supports roots capability" — and
+/// **no `roots/list` round ever followed**, so the board read `No tracked roots`
+/// under three live connections, and each session lived on root-orphaned until a
+/// manual `/mcp`. The cause: the roots trigger hung off
+/// `notifications/initialized`, a once-per-client-start notification the replay
+/// never re-sends. It now hangs off `initialize` itself, which the replay does
+/// send — so a replayed init and a fresh init get identical treatment.
+///
+/// SIGKILL is the reproducer here (the clean-stop path reaches the same replay
+/// through a longer route); what matters is that the fresh daemon asks, and that
+/// the answer lands under the reattached connection's own session key.
+#[test]
+fn reattached_session_re_anchors_its_roots() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?.to_string();
+    // Panic-safe daemon teardown (bug 131): this test kills a daemon
+    // deliberately; the guard covers the assertion-failure exits in between.
+    let _daemon_guard = common::DaemonGuard::new(&state_home);
+    let (ipc_sock, mcp_sock) = socket_paths(&state_home);
+
+    let root_dir = common::canonical_tempdir()?;
+    let root = root_dir.path().to_str().context("root path")?.to_string();
+
+    // Session up with roots declared over MCP — daemon #1 anchors them under
+    // its `mcp:` session key.
+    let mut bridge = BridgeProcess::spawn_in_state(&state_home, |_cmd| {})?;
+    bridge.initialize_with_roots(&[&root])?;
+    let before = wait_for_mcp_sources(&ipc_sock, &root);
+    assert!(
+        before.iter().any(|s| s.starts_with("mcp:")),
+        "daemon #1 must anchor the declared root under an `mcp:` contributor, got: {before:?}",
+    );
+
+    // Kill it. The bridge reconnects, respawns a daemon through the same
+    // single-instance path, and replays the captured `initialize` against it —
+    // the specimen's exact shape, with no host involvement at all.
+    let pid = bridge.daemon_pid().context("daemon pid before kill")?;
+    sigkill(pid)?;
+    let fresh_pid = wait_for_respawn(&state_home, pid).context("bridge should respawn a daemon")?;
+    assert_ne!(fresh_pid, pid, "the respawned daemon must be a new process");
+    assert!(
+        mcp_sock.exists(),
+        "respawned daemon should re-bind its MCP socket"
+    );
+
+    // The fix: the replayed `initialize` makes the fresh daemon ask for roots
+    // back through the still-live connection. The bridge swallows the replayed
+    // initialize response, so this request is the first thing the host sees.
+    // Bounded read — under the old behavior nothing is ever sent, and a bare
+    // `recv()` would hang the suite instead of failing here.
+    let asked = bridge
+        .recv_timeout(Duration::from_secs(30))?
+        .context("the fresh daemon never asked for roots after the replayed initialize")?;
+    assert_eq!(
+        asked.get("method").and_then(serde_json::Value::as_str),
+        Some("roots/list"),
+        "expected a roots/list request after the replayed initialize, got: {asked:?}",
+    );
+    let request_id = asked
+        .get("id")
+        .context("roots/list request missing id")?
+        .clone();
+
+    // Answer exactly as the host would.
+    bridge.send(&json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": { "roots": [{"uri": format!("file://{root}")}] }
+    }))?;
+
+    // The board carries the root again, under the FRESH daemon's session key
+    // (bug 147: `mcp:{conn_id}` — the same key its disconnect cleanup uses).
+    let after = wait_for_mcp_sources(&ipc_sock, &root);
+    assert!(
+        after.iter().any(|s| s.starts_with("mcp:")),
+        "the reattached session must re-anchor its root under an `mcp:` \
+         contributor on the fresh daemon, got: {after:?}",
+    );
+
+    drop(bridge);
+    Ok(())
+}
+
 /// Stop-loss (the 2026-07-20 sighting): a graceful `catenary stop` issued while
 /// a bridge session is attached must end the daemon *process* — its exit is
 /// what closes the accepted MCP connection, and that close is the only signal

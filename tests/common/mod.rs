@@ -803,6 +803,40 @@ impl BridgeProcess {
         serde_json::from_str(&line).context("Failed to parse JSON response")
     }
 
+    /// Reads one message with a bounded wait, returning `None` on timeout.
+    ///
+    /// [`recv`](Self::recv) blocks forever, which turns "the daemon never sent
+    /// the message we expect" into a hung suite instead of a failing test — the
+    /// exact regression shape misc 169 pins (a reattached session that is never
+    /// asked for its roots). This moves the stdout half into a reader thread and
+    /// waits on a channel, handing the half back when the line lands.
+    ///
+    /// On timeout the reader thread stays parked on the pipe and the stdout half
+    /// stays taken, so a timeout is terminal for this `BridgeProcess`: assert and
+    /// end the test. The parked thread is harmless — it only ever reads, and it
+    /// dies with the test process.
+    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<Option<Value>> {
+        let mut stdout = self.stdout.take().context("Stdout already closed")?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let read = stdout.read_line(&mut line);
+            let _ = tx.send((read, line, stdout));
+        });
+
+        let Ok((read, line, stdout)) = rx.recv_timeout(timeout) else {
+            return Ok(None);
+        };
+        self.stdout = Some(stdout);
+        let n = read.context("Failed to read from stdout")?;
+        if n == 0 {
+            bail!("bridge process closed stdout (EOF) while awaiting a message");
+        }
+        serde_json::from_str(&line)
+            .map(Some)
+            .context("Failed to parse JSON response")
+    }
+
     pub fn initialize(&mut self) -> Result<()> {
         self.send(&json!({
             "jsonrpc": "2.0",

@@ -575,9 +575,10 @@ impl McpServer {
             "notifications/initialized" => {
                 info!("MCP client initialized");
                 self.initialized = true;
-                if self.client_has_roots {
-                    self.should_fetch_roots = true;
-                }
+                // No roots arm here (misc 169): `initialize` itself arms the
+                // fetch, and it always precedes this notification. Arming in
+                // both places would issue a second, redundant `roots/list`
+                // round on every fresh connection.
             }
             "notifications/roots/list_changed" => {
                 info!("MCP client roots changed");
@@ -664,6 +665,18 @@ impl McpServer {
 
         if self.client_has_roots {
             info!("Client supports roots capability");
+            // Arm the roots fetch off `initialize` itself (misc 169) — NOT off
+            // the `notifications/initialized` that follows it on a fresh client
+            // start. A bridge that reattaches after a daemon loss (crash, or a
+            // clean `catenary stop` + service restart) replays exactly one
+            // captured line, the `initialize` request; `initialized` is a
+            // once-per-client-start notification that never re-arrives. Arming
+            // here is what makes a replayed init and a fresh init identical:
+            // the run loop issues `roots/list` back through the still-live
+            // connection as soon as this response is written, so a reattached
+            // session re-anchors its roots under the fresh daemon's session key
+            // instead of living out its life root-orphaned.
+            self.should_fetch_roots = true;
         }
 
         // Notify callback of client info
@@ -1048,7 +1061,23 @@ mod tests {
     }
 
     #[test]
-    fn test_should_fetch_roots_after_initialized() -> Result<()> {
+    fn test_initialize_arms_roots_fetch() -> Result<()> {
+        // misc 169: the arm rides `initialize` itself, so it is already set
+        // before any `notifications/initialized` arrives.
+        let mut server = McpServer::new(LoggingServer::new());
+        assert!(!server.should_fetch_roots);
+
+        initialize_server(&mut server, true)?;
+
+        assert!(
+            server.should_fetch_roots,
+            "a roots-capable initialize must arm the roots fetch on its own",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_initialized_notification_marks_initialized() -> Result<()> {
         let mut server = McpServer::new(LoggingServer::new());
         initialize_server(&mut server, true)?;
 
@@ -1059,7 +1088,6 @@ mod tests {
         };
         server.handle_notification(&notification);
 
-        assert!(server.should_fetch_roots);
         assert!(server.initialized);
         Ok(())
     }
@@ -1068,6 +1096,9 @@ mod tests {
     fn test_should_fetch_roots_on_list_changed() -> Result<()> {
         let mut server = McpServer::new(LoggingServer::new());
         initialize_server(&mut server, true)?;
+        // Clear the init arm (misc 169) so this asserts the list_changed
+        // trigger alone, not the one `initialize` already set.
+        server.should_fetch_roots = false;
 
         let notification = Notification {
             jsonrpc: "2.0".to_string(),
@@ -1084,6 +1115,10 @@ mod tests {
     fn test_no_fetch_without_capability() -> Result<()> {
         let mut server = McpServer::new(LoggingServer::new());
         initialize_server(&mut server, false)?;
+        assert!(
+            !server.should_fetch_roots,
+            "an initialize without the roots capability must not arm the fetch",
+        );
 
         let notification = Notification {
             jsonrpc: "2.0".to_string(),
@@ -1567,6 +1602,9 @@ mod tests {
         // Manually simulate what `run()` does: check the flag BEFORE
         // dispatch, then call `fetch_roots` with the current message
         // as initial_message so it's buffered behind the roots response.
+        // Clear the init arm (misc 169) first — this test is about the
+        // turn-boundary flag, not the one `initialize` already set.
+        server.should_fetch_roots = false;
         assert!(!server.should_fetch_roots);
         if server.client_has_roots
             && let Some(ref f) = server.roots_refresh
@@ -1652,6 +1690,10 @@ mod tests {
         let mut server = McpServer::new(LoggingServer::new());
         initialize_server(&mut server, true)?;
 
+        // Clear the init arm (misc 169) so the assertion below is about the
+        // turn-boundary flag alone.
+        server.should_fetch_roots = false;
+
         // Flag exists but is false.
         let flag = Arc::new(AtomicBool::new(false));
         server.roots_refresh = Some(flag);
@@ -1673,6 +1715,10 @@ mod tests {
     fn test_roots_refresh_without_external_flag() -> Result<()> {
         let mut server = McpServer::new(LoggingServer::new());
         initialize_server(&mut server, true)?;
+
+        // Clear the init arm (misc 169) so the assertion below is about the
+        // turn-boundary flag alone.
+        server.should_fetch_roots = false;
 
         // No external flag wired (roots_refresh is None).
         assert!(server.roots_refresh.is_none());
@@ -1861,6 +1907,31 @@ mod tests {
     }
 
     #[test]
+    fn replayed_initialize_arms_roots_without_initialized() -> Result<()> {
+        // misc 169: the reattach shape. A bridge that respawned a daemon
+        // replays the captured `initialize` and re-sends its hello, then
+        // ordinary host traffic — `notifications/initialized` never re-arrives,
+        // so it cannot be the roots trigger. The replayed init must arm the
+        // fetch itself, and nothing that follows may clear it before
+        // `fetch_roots` consumes it; otherwise the reattached session lives out
+        // its life with no `mcp:` root contributor (the pinned specimen).
+        let mut server = McpServer::new(LoggingServer::new());
+        initialize_server(&mut server, true)?;
+        assert!(
+            server.should_fetch_roots,
+            "a replayed initialize must arm the roots fetch with no `initialized` to follow",
+        );
+
+        server.handle_message(&hello_line("9.9.9"))?;
+        server.handle_message(PING_LINE)?;
+        assert!(
+            server.should_fetch_roots,
+            "the arm stays pending across the replay's trailing traffic",
+        );
+        Ok(())
+    }
+
+    #[test]
     fn legacy_version_mismatch_reads_as_pre_handshake() -> Result<()> {
         // A ws41-01-generation bridge sends `catenary/version-mismatch` (then
         // bails). It maps to the same callback as an absent hello — one None —
@@ -1899,6 +1970,9 @@ mod tests {
 
         let flag = Arc::new(AtomicBool::new(false));
         server.roots_refresh = Some(flag.clone());
+        // Clear the init arm (misc 169) so each trigger below is observed on
+        // its own.
+        server.should_fetch_roots = false;
 
         let received_roots: Arc<Mutex<Vec<Root>>> = Arc::new(Mutex::new(Vec::new()));
         let roots_clone = received_roots.clone();
