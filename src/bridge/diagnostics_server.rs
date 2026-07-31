@@ -3470,7 +3470,7 @@ fn unavailable_banner_line(
         None => format!("unavailable: {server}"),
         Some(AutoInstallProgress::InFlight) => format!(
             "unavailable: {server} \u{2014} installing in background (auto_install); this round \
-             served without it, re-run to include it"
+             served without it, coverage arrives when it lands"
         ),
         Some(AutoInstallProgress::Failed) => format!(
             "unavailable: {server} \u{2014} install failed; `catenary install {server}` retries by \
@@ -4609,7 +4609,7 @@ mod tests {
         assert!(
             output.starts_with(
                 "unavailable: tombi \u{2014} installing in background (auto_install); this round \
-                 served without it, re-run to include it\n"
+                 served without it, coverage arrives when it lands\n"
             ),
             "the banner names the running install and the re-run: {output}"
         );
@@ -4713,7 +4713,7 @@ mod tests {
         let in_flight = unavailable_banner_line("srv", Some(AutoInstallProgress::InFlight));
         assert!(
             in_flight.contains("installing in background (auto_install)")
-                && in_flight.contains("re-run to include it"),
+                && in_flight.contains("coverage arrives when it lands"),
             "{in_flight}"
         );
         let failed = unavailable_banner_line("srv", Some(AutoInstallProgress::Failed));
