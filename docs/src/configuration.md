@@ -349,7 +349,7 @@ auto_install = false    # default: nothing is ever installed without this opt-in
 | Option | Default | Description |
 |--------|---------|-------------|
 | `prefer_managed` | `true` | Spawn a blessed server from the managed home at its pinned version when that install exists; PATH remains the fallback. Set `false` to always resolve on PATH. |
-| `auto_install` | `false` | Opt in to background installs of missing blessed servers at session start. |
+| `auto_install` | `false` | Opt in to background installs of missing blessed servers — at session start, and on first demand. |
 
 Spawn resolution order, first hit wins: an explicit `path` on
 `[lsp.server.*]` (your own resolution — the managed home is never
@@ -360,14 +360,22 @@ it tracks your Rust toolchain and is never version-pinned or managed.
 ### `auto_install`
 
 With the opt-in set, each session start detects configured servers your
-workspace roots need (by root markers) that cannot spawn — no managed
-install at the pin and nothing on PATH — and installs each one into the
-managed home in the background. Session start never waits: the kick is
-announced, coverage arrives when the install lands, and a landed install
-pre-warms the server for live matching roots. There is no per-server
-install command — enabling the flag *is* the setup. The interactive
-alternative is the TUI's [guided install](cli.md#guided-install): the same
-engine, run per server from a consent overlay instead of the opt-in.
+workspace roots need that cannot spawn — no managed install at the pin and
+nothing on PATH — and installs each one into the managed home in the
+background. A root needs a language when its root markers match (a
+`Cargo.toml` for Rust), or — for languages defined by file presence alone
+(TOML, JSON, YAML, Markdown, …) — when a file of that language sits at the
+root's own surface. Session start never waits: the kick is announced,
+coverage arrives when the install lands, and a landed install pre-warms the
+server for live matching roots.
+
+Anything session start does not see is caught on demand: the first time a
+server is actually needed and its binary does not resolve, that install
+kicks too, and the finding says so ("installing tombi 1.2.4 in the
+background") instead of pointing at a setting you already have on. There is
+no per-server install command — enabling the flag *is* the setup. The
+interactive alternative is the TUI's [guided install](cli.md#guided-install):
+the same engine, run per server from a consent overlay instead of the opt-in.
 
 Only blessed servers qualify, at their exact pinned version, through
 Catenary's verified install engine. A server already on PATH, or one with

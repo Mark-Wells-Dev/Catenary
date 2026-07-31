@@ -5,12 +5,24 @@
 //!
 //! Opt-in (`[servers] auto_install`, user-config only — default `false`): at
 //! each `SessionStart` the daemon's hook dispatch detects, from the session's
-//! root markers ([`detect_missing`]), blessed servers that a served root wants
-//! but that are **not resolvable for spawn** — no managed install at the
-//! blessed pin and nothing on `PATH` — and kicks each one as a daemon-side
+//! roots ([`detect_missing`]), blessed servers that a served root wants but
+//! that are **not resolvable for spawn** — no managed install at the blessed
+//! pin and nothing on `PATH` — and kicks each one as a daemon-side
 //! **background** task ([`AutoInstaller::kick`]). The dispatch is a spawn,
 //! never an await: session start returns immediately whether or not an install
 //! kicked, and even the success path never waits on registry latency.
+//!
+//! **Two legs, not one** (bug 148 ruling). *Eager*: the session-start detection
+//! above — a root wants a marker language's servers when a `root_markers` hit
+//! binds it, and a **markerless** (file-presence) language's servers when a
+//! matching file sits at the root's own surface, one depth-0 directory read, no
+//! walk. Before that leg existed, no server bound to a markerless language
+//! (toml / json / yaml / …) could ever be detected as missing, under any flag.
+//! *JIT*: the spawn path's not-installed classification
+//! ([`crate::lsp::manager`]) is the ground-truth "wants but cannot spawn"
+//! signal, and kicks through the same [`AutoInstaller`] — same announce, same
+//! in-flight dedupe, same concurrency cap, same one-warn-per-lifetime failure
+//! contract. The eligibility gate both legs ask is [`AutoInstaller::install_target`].
 //!
 //! The install itself is the exact engine `catenary`'s guided install runs —
 //! [`BlessedRecipe::resolve`] → [`InstallPlan::resolve`] → [`install::execute`]
@@ -37,12 +49,12 @@
 //! doctor/TUI-visible record) holds even for hosts with no `systemMessage`.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, LanguageConfig};
 use crate::install::{self, BlessedRecipe, CommandRunner, InstallPlan, TarballFetcher};
 use crate::managed_home::ManagedHome;
 use crate::recipes::{BlessedManifest, InstallClass, InstallRecipe, current_platform_token};
@@ -90,20 +102,101 @@ pub fn announce_line(missing: &MissingServer) -> String {
     }
 }
 
+/// The install a server's blessing data actually supports, or `None` when
+/// nothing is constructible — the shared eligibility gate (bug 148).
+///
+/// Both legs ask exactly this before kicking: the blessed-manifest row is
+/// pinned ([`BlessedManifest::pinned_version`] — rust-analyzer reports no pin
+/// and so never qualifies, by design), a shipped recipe carries **that exact**
+/// pinned version (a recipe/manifest skew could install a version the pin would
+/// never resolve — refuse), and the structural blessing gate resolves
+/// ([`BlessedRecipe::resolve`], never bypassed). One definition, so "the
+/// finding says auto-install will act" and "auto-install acts" cannot disagree.
+#[must_use]
+fn blessed_target(
+    server: &str,
+    manifest: &BlessedManifest,
+    recipes: &BTreeMap<String, InstallRecipe>,
+) -> Option<MissingServer> {
+    let version = manifest.pinned_version(server)?;
+    let recipe = recipes.get(server)?;
+    if recipe.version != version {
+        return None;
+    }
+    BlessedRecipe::resolve(server, recipe, manifest).map(|_blessed| MissingServer {
+        server: server.to_owned(),
+        version: version.to_owned(),
+        class: recipe.install_class_on(current_platform_token()),
+    })
+}
+
+/// The names of `root`'s own directory entries that are not directories — the
+/// root's **surface** (bug 148's eager leg).
+///
+/// One `read_dir` at depth 0: no recursion, no walk, no `.gitignore` pass. An
+/// unreadable root reads as an empty surface (detection nominates nothing
+/// rather than guessing).
+fn root_surface(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| !kind.is_dir()))
+        .map(|entry| PathBuf::from(entry.file_name()))
+        .collect()
+}
+
+/// Whether a **markerless** language is wanted at a root whose `surface` is
+/// already read: a `filenames` (exact) or `extensions` hit at depth 0.
+///
+/// Mirrors the classification predicate the filesystem manager applies to a
+/// path (filename first, then extension without the dot), asked per language
+/// rather than through the winner-takes-the-extension global table — the
+/// question here is "does THIS language claim a file at the surface", which is
+/// what binds the root to the language's servers. A language with no
+/// classification fields at all claims nothing.
+fn surface_wants(surface: &[PathBuf], lang_config: &LanguageConfig) -> bool {
+    let filenames = lang_config.filenames.as_deref().unwrap_or_default();
+    let extensions = lang_config.extensions.as_deref().unwrap_or_default();
+    if filenames.is_empty() && extensions.is_empty() {
+        return false;
+    }
+    surface.iter().any(|name| {
+        name.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| filenames.iter().any(|f| f == n))
+            || name
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| extensions.iter().any(|e| e == ext))
+    })
+}
+
 /// Detect the blessed servers `roots` need but cannot spawn (lsm 05).
 ///
-/// For each root, each configured language with a `root_markers` hit at that
-/// root (the same [`crate::lsp::project_config::dir_has_marker`] predicate that
-/// binds roots to languages everywhere else) nominates its bound servers.
+/// For each root, a configured language nominates its bound servers when that
+/// root **wants** it:
+///
+/// - a language with `root_markers` is wanted on a marker hit at the root (the
+///   same [`crate::lsp::project_config::dir_has_marker`] predicate that binds
+///   roots to languages everywhere else);
+/// - a **markerless** language — the file-presence class: toml / json / yaml /
+///   html / css / bash / markdown, which declare only `extensions` /
+///   `filenames` — is wanted when a matching file sits at the root's own
+///   surface ([`surface_wants`] over one depth-0 [`root_surface`] read). This
+///   is bug 148's eager leg, and the ruling's own definition of eager: the file
+///   is literally right there at the surface. Nothing recurses — a match only
+///   below depth 0 does not nominate here; the demand-driven (JIT) leg at the
+///   spawn-failure site covers that case when the file is actually opened.
+///
 /// A nominated server is **missing** — and only then eligible — when all of:
 ///
 /// - it has no `[lsp.server.*]` `path` override (an explicitly configured
 ///   executable is the user's own resolution; auto-install never second-guesses
 ///   it);
-/// - its blessed-manifest row is pinned ([`BlessedManifest::pinned_version`] —
-///   rust-analyzer reports no pin and so never qualifies, by design) and a
-///   recipe exists whose version clears the blessing gate
-///   ([`BlessedRecipe::resolve`]), so an install is actually constructible;
+/// - [`blessed_target`] resolves for it (pinned row, version-matched recipe,
+///   blessing gate), so an install is actually constructible;
 /// - the managed home has no install at the pin
 ///   ([`ManagedHome::pinned_executable`] — the lsm-02 resolution leg), and
 /// - nothing resolves on `PATH`
@@ -128,18 +221,27 @@ pub fn detect_missing(
         return Vec::new();
     }
 
-    let mut languages: Vec<(&String, &crate::config::LanguageConfig)> =
-        config.language.iter().collect();
+    let mut languages: Vec<(&String, &LanguageConfig)> = config.language.iter().collect();
     languages.sort_by(|a, b| a.0.cmp(b.0));
 
     let mut seen: HashSet<&str> = HashSet::new();
     let mut missing = Vec::new();
     for root in roots {
+        // The root's depth-0 listing, read at most once per root and only when
+        // a markerless language actually asks for it (bug 148) — a
+        // marker-only workspace costs exactly what it did before.
+        let mut surface: Option<Vec<PathBuf>> = None;
         for (_lang, lang_config) in &languages {
-            let Some((markers, compiled)) = lang_config.marker_set() else {
-                continue;
+            let wanted = match lang_config.marker_set() {
+                Some((markers, compiled)) => {
+                    crate::lsp::project_config::dir_has_marker(root, markers, compiled)
+                }
+                None => surface_wants(
+                    surface.get_or_insert_with(|| root_surface(root)),
+                    lang_config,
+                ),
             };
-            if !crate::lsp::project_config::dir_has_marker(root, markers, compiled) {
+            if !wanted {
                 continue;
             }
             for binding in lang_config.servers() {
@@ -152,32 +254,20 @@ pub fn detect_missing(
                     // An explicit executable override is its own resolution.
                     continue;
                 }
-                let Some(version) = manifest.pinned_version(name) else {
-                    continue; // unpinned (or the deliberate RA exemption)
+                let Some(target) = blessed_target(name, manifest, recipes) else {
+                    continue; // unpinned, recipeless, skewed, or unblessed
                 };
-                let Some(recipe) = recipes.get(name) else {
-                    continue; // no recipe — nothing constructible
-                };
-                if recipe.version != version {
-                    // A recipe/manifest version skew could install a version
-                    // the pin would never resolve — refuse to kick.
-                    continue;
-                }
-                if BlessedRecipe::resolve(name, recipe, manifest).is_none() {
-                    continue; // the blessing gate is structural — never bypassed
-                }
-                if home.pinned_executable(name, version, name).is_some() {
+                if home
+                    .pinned_executable(name, &target.version, name)
+                    .is_some()
+                {
                     continue; // the managed install already exists
                 }
                 if crate::health::servers::server_binary_installed(name, def.program(name)) {
                     continue; // PATH-managed is NOT missing
                 }
                 seen.insert(&binding.name);
-                missing.push(MissingServer {
-                    server: name.to_owned(),
-                    version: version.to_owned(),
-                    class: recipe.install_class_on(current_platform_token()),
-                });
+                missing.push(target);
             }
         }
     }
@@ -296,6 +386,19 @@ impl AutoInstaller {
             &self.inner.recipes,
             &self.inner.home,
         )
+    }
+
+    /// The install target for `server` under this installer's manifest and
+    /// recipes — [`blessed_target`] with the injected seams, `None` when
+    /// nothing is constructible (unpinned, recipeless, version-skewed, or
+    /// unblessed).
+    ///
+    /// The demand-driven (JIT) leg's eligibility question (bug 148): the spawn
+    /// path found the server missing and asks this before kicking, so it clears
+    /// exactly the gates [`detect_missing`] applies at session start.
+    #[must_use]
+    pub fn install_target(&self, server: &str) -> Option<MissingServer> {
+        blessed_target(server, &self.manifest(), &self.inner.recipes)
     }
 
     /// Kick a background install for `missing`, returning whether a task was
@@ -527,29 +630,40 @@ fn run_install(inner: &Inner, missing: &MissingServer) -> Result<Vec<String>, St
     Ok(collected)
 }
 
+/// Unit-test scaffolding for the auto-install seams, shared across modules.
+///
+/// Lives outside `mod tests` so the manager's demand-driven (JIT) leg tests
+/// (bug 148) drive the *same* stub installer machinery — the synthetic blessed
+/// manifest and recipe, the staging and failing runners — rather than inventing
+/// a second stub set that could drift from this one.
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
-    reason = "tests use expect for readable assertions"
+    reason = "test scaffolding uses expect for readable assertions"
 )]
-mod tests {
+pub(crate) mod test_support {
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::config::{LanguageConfig, ServerBinding, ServerDef};
-    use crate::install::{CommandOutcome, InstallCommand};
-    use crate::recipes::{BlessedEntry, ConformanceProvision, Ecosystem, VerificationTier};
+    use crate::install::{CommandOutcome, CommandRunner, InstallCommand, TarballFetcher};
+    use crate::managed_home::ManagedHome;
+    use crate::recipes::{
+        BlessedEntry, BlessedManifest, ConformanceProvision, Ecosystem, InstallRecipe,
+        VerificationTier,
+    };
 
-    use super::*;
+    use super::{AutoInstaller, BTreeMap};
 
-    const SERVER: &str = "lsm05-test-ls";
-    const VERSION: &str = "1.2.3";
-    const MARKER: &str = "lsm05.marker";
+    /// The synthetic server name every stub-seamed test installs.
+    pub const SERVER: &str = "lsm05-test-ls";
+    /// The version the synthetic manifest pins and the recipe carries.
+    pub const VERSION: &str = "1.2.3";
 
     /// A manifest with one blessed row for [`SERVER`] pinning [`VERSION`] under
     /// a synthetic platform token, so the preferred-row lookup falls back to it
     /// deterministically on every host.
-    fn manifest() -> BlessedManifest {
+    pub fn manifest() -> BlessedManifest {
         let mut rows = std::collections::BTreeMap::new();
         rows.insert(
             "synthetic".to_string(),
@@ -570,7 +684,7 @@ mod tests {
 
     /// A cargo-class recipe for [`SERVER`] at [`VERSION`] (compile-class, no
     /// hash needed — cargo verifies via `--locked`).
-    fn recipe() -> InstallRecipe {
+    pub fn recipe() -> InstallRecipe {
         InstallRecipe {
             ecosystem: Ecosystem::Cargo,
             package: SERVER.to_string(),
@@ -587,35 +701,15 @@ mod tests {
         }
     }
 
-    fn recipes() -> BTreeMap<String, InstallRecipe> {
+    /// The seed recipe map: [`SERVER`] at [`VERSION`], nothing else.
+    pub fn recipes() -> BTreeMap<String, InstallRecipe> {
         let mut map = BTreeMap::new();
         map.insert(SERVER.to_string(), recipe());
         map
     }
 
-    /// A config with one language whose marker is [`MARKER`], bound to
-    /// [`SERVER`].
-    fn config() -> Config {
-        let mut config = Config::default();
-        let mut lang = LanguageConfig {
-            root_markers: Some(vec![MARKER.to_string()]),
-            servers: Some(vec![ServerBinding::new(SERVER)]),
-            ..LanguageConfig::default()
-        };
-        lang.compile_markers().expect("plain marker compiles");
-        config.language.insert("lsm05-lang".to_string(), lang);
-        config
-    }
-
-    /// A root dir carrying the language marker.
-    fn marked_root() -> tempfile::TempDir {
-        let root = tempfile::tempdir().expect("tempdir");
-        std::fs::write(root.path().join(MARKER), b"").expect("write marker");
-        root
-    }
-
     /// Stage an executable at `<home>/<SERVER>/<VERSION>/bin/<SERVER>`.
-    fn stage_managed(home: &ManagedHome) {
+    pub fn stage_managed(home: &ManagedHome) {
         let bin = home.bin_dir(SERVER, VERSION).expect("bin dir");
         std::fs::create_dir_all(&bin).expect("mkdir");
         let exe = bin.join(SERVER);
@@ -629,12 +723,14 @@ mod tests {
 
     /// A runner that reports success and stages the managed executable —
     /// standing in for the real `cargo install --root <version-dir>` leg.
-    struct StagingRunner {
-        home_root: PathBuf,
+    pub struct StagingRunner {
+        /// The managed home root the staged executable lands under.
+        pub home_root: PathBuf,
         /// Blocks the install until released, so a test can assert `kick`
         /// returned while the work is still pending (the latency pin).
-        gate: Option<Arc<tokio::sync::Semaphore>>,
-        runs: Arc<AtomicUsize>,
+        pub gate: Option<Arc<tokio::sync::Semaphore>>,
+        /// Counts the installs that actually ran.
+        pub runs: Arc<AtomicUsize>,
     }
 
     impl CommandRunner for StagingRunner {
@@ -661,8 +757,9 @@ mod tests {
     }
 
     /// A runner that fails every install — the simulated registry failure.
-    struct FailingRunner {
-        runs: Arc<AtomicUsize>,
+    pub struct FailingRunner {
+        /// Counts the installs that actually ran (and failed).
+        pub runs: Arc<AtomicUsize>,
     }
 
     impl CommandRunner for FailingRunner {
@@ -677,14 +774,16 @@ mod tests {
     }
 
     /// A fetcher no test path reaches (cargo-class plans never fetch).
-    struct NoFetch;
+    pub struct NoFetch;
     impl TarballFetcher for NoFetch {
         fn fetch(&self, url: &str) -> anyhow::Result<Vec<u8>> {
             anyhow::bail!("unexpected fetch of {url}")
         }
     }
 
-    fn installer_with_runner(
+    /// An installer over `home_root` with the synthetic manifest/recipes and
+    /// the given runner — the stub-seamed constructor every test starts from.
+    pub fn installer_with_runner(
         home_root: &std::path::Path,
         runner: Box<dyn CommandRunner + Send + Sync>,
     ) -> AutoInstaller {
@@ -696,6 +795,75 @@ mod tests {
             Box::new(NoFetch),
             None,
         )
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use crate::config::{LanguageConfig, ServerBinding, ServerDef};
+
+    use super::test_support::{
+        FailingRunner, NoFetch, SERVER, StagingRunner, VERSION, installer_with_runner, manifest,
+        recipes, stage_managed,
+    };
+    use super::*;
+
+    const MARKER: &str = "lsm05.marker";
+    /// The surface filename a markerless language claims exactly (the
+    /// `Cargo.toml`-shaped case, bug 148).
+    const SURFACE_FILE: &str = "Surface.tick";
+    /// The surface extension a markerless language claims (without the dot).
+    const SURFACE_EXT: &str = "tick";
+
+    /// A config with one language whose marker is [`MARKER`], bound to
+    /// [`SERVER`].
+    fn config() -> Config {
+        let mut config = Config::default();
+        let mut lang = LanguageConfig {
+            root_markers: Some(vec![MARKER.to_string()]),
+            servers: Some(vec![ServerBinding::new(SERVER)]),
+            ..LanguageConfig::default()
+        };
+        lang.compile_markers().expect("plain marker compiles");
+        config.language.insert("lsm05-lang".to_string(), lang);
+        config
+    }
+
+    /// A root dir carrying the language marker.
+    fn marked_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join(MARKER), b"").expect("write marker");
+        root
+    }
+
+    /// A config with one **markerless** (file-presence) language bound to
+    /// [`SERVER`] — the toml/json/yaml-shaped class bug 148 was blind to.
+    /// `filenames` carries the exact-name leg, `extensions` the suffix leg;
+    /// `root_markers` is absent, so `marker_set()` is `None`.
+    fn markerless_config(filenames: bool, extensions: bool) -> Config {
+        let mut config = Config::default();
+        let lang = LanguageConfig {
+            filenames: filenames.then(|| vec![SURFACE_FILE.to_string()]),
+            extensions: extensions.then(|| vec![SURFACE_EXT.to_string()]),
+            servers: Some(vec![ServerBinding::new(SERVER)]),
+            ..LanguageConfig::default()
+        };
+        config.language.insert("lsm05-markerless".to_string(), lang);
+        config
+    }
+
+    /// An empty root plus a fresh managed home — the standing detection fixture.
+    fn empty_root_and_home() -> (tempfile::TempDir, tempfile::TempDir, ManagedHome) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home = ManagedHome::at(home_dir.path().join("servers"));
+        (root, home_dir, home)
     }
 
     // ── detection ─────────────────────────────────────────────────────
@@ -792,6 +960,169 @@ mod tests {
             &home,
         );
         assert!(missing.is_empty(), "no marker, no nomination");
+    }
+
+    // ── the eager depth-0 leg for markerless languages (bug 148) ──────
+
+    #[test]
+    fn markerless_language_with_a_surface_filename_detects_missing() {
+        // The tombi case: a file-presence language (no `root_markers`) whose
+        // exact filename sits at the root's surface — Cargo.toml-shaped. Before
+        // bug 148 the language loop skipped it outright, so no server bound to
+        // it could ever be detected as missing, under any flag.
+        let (root, _home_dir, home) = empty_root_and_home();
+        std::fs::write(root.path().join(SURFACE_FILE), b"").expect("write surface file");
+
+        let missing = detect_missing(
+            &[root.path().to_path_buf()],
+            &markerless_config(true, false),
+            &manifest(),
+            &recipes(),
+            &home,
+        );
+        assert_eq!(missing.len(), 1, "the surface hit nominates: {missing:?}");
+        assert_eq!(missing[0].server, SERVER);
+        assert_eq!(missing[0].version, VERSION);
+    }
+
+    #[test]
+    fn markerless_language_extension_hit_at_depth_zero_detects_missing() {
+        // The extension leg of the same surface read: `notes.tick` at depth 0.
+        let (root, _home_dir, home) = empty_root_and_home();
+        std::fs::write(root.path().join("notes.tick"), b"").expect("write surface file");
+
+        let missing = detect_missing(
+            &[root.path().to_path_buf()],
+            &markerless_config(false, true),
+            &manifest(),
+            &recipes(),
+            &home,
+        );
+        assert_eq!(missing.len(), 1, "the extension hit nominates: {missing:?}");
+        assert_eq!(missing[0].server, SERVER);
+    }
+
+    #[test]
+    fn markerless_language_without_a_surface_hit_detects_nothing() {
+        // No matching file at the surface: the root does not want the language,
+        // so nothing is nominated (a non-matching file present is still a miss).
+        let (root, _home_dir, home) = empty_root_and_home();
+        std::fs::write(root.path().join("unrelated.txt"), b"").expect("write");
+
+        let missing = detect_missing(
+            &[root.path().to_path_buf()],
+            &markerless_config(true, true),
+            &manifest(),
+            &recipes(),
+            &home,
+        );
+        assert!(missing.is_empty(), "no surface hit, no kick: {missing:?}");
+    }
+
+    #[test]
+    fn surface_detection_never_recurses_below_depth_zero() {
+        // The ruling's eager definition is depth-0 visibility: ONE root-level
+        // directory read. A match nested under the root must not nominate here
+        // — that demand is the JIT leg's, at the spawn-failure site.
+        let (root, _home_dir, home) = empty_root_and_home();
+        let nested = root.path().join("sub");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        std::fs::write(nested.join(SURFACE_FILE), b"").expect("write nested filename hit");
+        std::fs::write(nested.join("notes.tick"), b"").expect("write nested extension hit");
+
+        let missing = detect_missing(
+            &[root.path().to_path_buf()],
+            &markerless_config(true, true),
+            &manifest(),
+            &recipes(),
+            &home,
+        );
+        assert!(
+            missing.is_empty(),
+            "a hit below the surface must not nominate: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn a_directory_named_like_a_surface_hit_does_not_nominate() {
+        // The surface is files, not entries: a directory called `notes.tick`
+        // (or `Surface.tick`) is not a file of the language.
+        let (root, _home_dir, home) = empty_root_and_home();
+        std::fs::create_dir_all(root.path().join(SURFACE_FILE)).expect("mkdir");
+        std::fs::create_dir_all(root.path().join("notes.tick")).expect("mkdir");
+
+        let missing = detect_missing(
+            &[root.path().to_path_buf()],
+            &markerless_config(true, true),
+            &manifest(),
+            &recipes(),
+            &home,
+        );
+        assert!(
+            missing.is_empty(),
+            "a directory is not a surface file: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn a_classificationless_markerless_language_nominates_nothing() {
+        // No markers AND no `extensions`/`filenames`: nothing can make a root
+        // want it, so the surface read can never nominate.
+        let (root, _home_dir, home) = empty_root_and_home();
+        std::fs::write(root.path().join(SURFACE_FILE), b"").expect("write");
+
+        let missing = detect_missing(
+            &[root.path().to_path_buf()],
+            &markerless_config(false, false),
+            &manifest(),
+            &recipes(),
+            &home,
+        );
+        assert!(missing.is_empty(), "nothing claims the file: {missing:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_markerless_surface_hit_kicks_the_install_through_the_shared_machinery() {
+        // End-to-end for the eager leg: detection through `AutoInstaller` (its
+        // own injected manifest/recipes/home), then the ordinary kick — every
+        // gate downstream of the want-decision is shared, unchanged.
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join(SURFACE_FILE), b"").expect("write surface file");
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home_root = home_dir.path().join("servers");
+        let runs = Arc::new(AtomicUsize::new(0));
+        let installer = installer_with_runner(
+            &home_root,
+            Box::new(StagingRunner {
+                home_root: home_root.clone(),
+                gate: None,
+                runs: runs.clone(),
+            }),
+        );
+
+        let config = markerless_config(true, false);
+        let missing = installer.detect(&[root.path().to_path_buf()], &config);
+        assert_eq!(missing.len(), 1, "the surface hit detects: {missing:?}");
+        let landed = Arc::new(AtomicBool::new(false));
+        let flag = landed.clone();
+        assert!(
+            installer.kick(&missing[0], move || flag.store(true, Ordering::SeqCst)),
+            "the markerless nomination kicks like any other"
+        );
+        for _ in 0..200 {
+            if landed.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(landed.load(Ordering::SeqCst), "the install landed");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "exactly one install ran");
+        assert!(
+            installer
+                .detect(&[root.path().to_path_buf()], &config)
+                .is_empty(),
+            "the landed install is no longer missing",
+        );
     }
 
     #[test]

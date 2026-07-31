@@ -60,6 +60,7 @@ use crate::lsp::rust_toolchain;
 use crate::lsp::server::LspServer;
 use crate::lsp::settle::{IdleDetector, SettleResult, await_idle};
 use crate::lsp::state::{ServerLifecycle, ServerStatus};
+use crate::recipes::InstallClass;
 use crate::source::Source;
 
 /// Looks up an existing client instance for a `(lang, server, root)` triple.
@@ -611,11 +612,14 @@ fn warn_bench_once(key: &InstanceKey, verdict: ReviveVerdict) {
 /// A blessed recipe is one auto-install could actually act on: the active
 /// manifest pins the server, a shipped recipe carries that exact pinned
 /// version, and the blessing gate resolves ([`crate::install::BlessedRecipe::resolve`]).
-/// This mirrors the recipe gate in [`crate::auto_install::detect_missing`], so
-/// "the finding suggests auto-install" and "auto-install would act" never
-/// disagree. When it returns `false` there is nothing for auto-install to
-/// fetch, so the finding offers only the honest half — never a suggestion
-/// auto-install cannot fulfill.
+/// This mirrors the shared eligibility gate both auto-install legs ask
+/// ([`crate::auto_install::AutoInstaller::install_target`]) over the live
+/// shipped data, so "the finding suggests auto-install" and "auto-install would
+/// act" never disagree. When it returns `false` there is nothing for
+/// auto-install to fetch, so the finding offers only the honest half — never a
+/// suggestion auto-install cannot fulfill. The daemon reads the wired
+/// installer's own data instead when the JIT seam is attached
+/// ([`LspClientManager::blessed_recipe_exists`]).
 fn has_blessed_recipe(server: &str) -> bool {
     let Ok(recipes) = crate::recipes::default_recipes() else {
         return false;
@@ -633,29 +637,84 @@ fn has_blessed_recipe(server: &str) -> bool {
     crate::install::BlessedRecipe::resolve(server, recipe, &manifest).is_some()
 }
 
-/// The not-installed finding text (misc 210), split from the `warn!` so the two
-/// teaching variants are unit-testable.
+/// What `[servers] auto_install` can actually do for a server the spawn path
+/// just found missing — the axis the not-installed teaching branches on
+/// (bug 148).
 ///
-/// Honest first — "configured for `<language>` but not installed". When a
-/// blessed recipe exists (`recipe_teaching = true`), it carries **both** auto-heal
-/// exits: the one-shot `catenary install <server>` and the standing
-/// `[servers] auto_install = true` opt-in (background installs of missing blessed
-/// servers at session start). A server with no blessed recipe gets only the
-/// honest half — suggesting auto-install there would point at something it can
-/// never fetch.
-fn not_installed_message(server: &str, language: &str, recipe_teaching: bool) -> String {
-    if recipe_teaching {
-        format!(
-            "{server} is configured for {language} but not installed. Install it \
-             with `catenary install {server}`, or set `[servers] auto_install = true` \
-             to install missing blessed servers automatically at session start."
-        )
-    } else {
-        format!(
-            "{server} is configured for {language} but not installed. Install the \
-             binary and place it on PATH — coverage heals on the next demand, no \
-             daemon restart needed."
-        )
+/// The bug this types away: the finding recommended `auto_install = true`
+/// unconditionally, including to users who already had it set and to servers
+/// the flag could never act on. Each variant here is a distinct honest thing to
+/// say, and only one of them recommends the flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AutoInstallStance {
+    /// The flag is unset and a blessed, version-matched recipe exists: the
+    /// standing opt-in is genuinely worth teaching — the **only** branch that
+    /// recommends it.
+    OfferFlag,
+    /// The flag is unset and nothing is installable anyway (no blessed
+    /// recipe): the honest half only, as before.
+    NoRecipe,
+    /// The flag is on, the gates cleared, and this surfacing kicked the
+    /// background install — the message announces it instead of advising.
+    Kicked {
+        /// The blessed pin the install lands.
+        version: String,
+        /// Fetch- or compile-class, for the honest "takes minutes" wording.
+        class: InstallClass,
+    },
+    /// The flag is on and an install of this server is already in flight (the
+    /// eager session-start leg, or another root's demand, got there first).
+    InFlight {
+        /// The blessed pin the running install lands.
+        version: String,
+    },
+    /// The flag is on but nothing can act — `reason` says why, briefly. Never
+    /// recommends the flag: it is already set and still cannot help.
+    Blocked {
+        /// The short, honest reason auto-install stands aside.
+        reason: String,
+    },
+}
+
+/// The not-installed finding text (misc 210 + bug 148), split from the `warn!`
+/// so every teaching branch is unit-testable.
+///
+/// Honest first — "configured for `<language>` but not installed" — then one
+/// branch per [`AutoInstallStance`]: a fired kick **announces the install**, a
+/// running one says so, an enabled-but-powerless flag says why nothing can act,
+/// and the `auto_install = true` recommendation survives only where it is
+/// genuinely unset and a blessed recipe exists.
+fn not_installed_message(server: &str, language: &str, stance: &AutoInstallStance) -> String {
+    let honest = format!("{server} is configured for {language} but not installed.");
+    let by_hand = "Install the binary and place it on PATH — coverage heals on the next demand, \
+                   no daemon restart needed.";
+    match stance {
+        AutoInstallStance::OfferFlag => format!(
+            "{honest} Install it with `catenary install {server}`, or set \
+             `[servers] auto_install = true` to install missing blessed servers \
+             automatically — at session start and on first demand."
+        ),
+        AutoInstallStance::NoRecipe => format!("{honest} {by_hand}"),
+        AutoInstallStance::Kicked { version, class } => {
+            let pace = match class {
+                InstallClass::Fetch => String::new(),
+                InstallClass::Compile => {
+                    " (compiles from source — this can take minutes)".to_owned()
+                }
+            };
+            format!(
+                "{honest} `[servers] auto_install` is on: installing {server} {version} in the \
+                 background{pace}; coverage arrives when it lands."
+            )
+        }
+        AutoInstallStance::InFlight { version } => format!(
+            "{honest} `[servers] auto_install` is on and an install of {server} {version} is \
+             already running; coverage arrives when it lands."
+        ),
+        AutoInstallStance::Blocked { reason } => format!(
+            "{honest} `[servers] auto_install` is on but cannot install {server}: {reason}. \
+             {by_hand}"
+        ),
     }
 }
 
@@ -663,10 +722,10 @@ fn not_installed_message(server: &str, language: &str, recipe_teaching: bool) ->
 /// finding, not a desktop interrupt: a missing binary is actionable but never
 /// urgent, the same posture as a strike-out).
 ///
-/// One calm finding per server (deduped by the caller); the wording — and its
-/// blessed-recipe teaching variant — comes from [`not_installed_message`].
-fn warn_not_installed(server: &str, language: &str) {
-    let message = not_installed_message(server, language, has_blessed_recipe(server));
+/// One calm finding per server (deduped by the caller); the wording comes from
+/// [`not_installed_message`] and the `stance` its caller resolved (bug 148).
+fn warn_not_installed(server: &str, language: &str, stance: &AutoInstallStance) {
+    let message = not_installed_message(server, language, stance);
     warn!(
         source = Source::LspLifecycle.as_str(),
         language = language,
@@ -722,6 +781,25 @@ pub struct NotInstalled {
 /// (misc 210): the calm not-installed finding is already surfaced.
 fn is_not_installed(err: &anyhow::Error) -> bool {
     err.downcast_ref::<NotInstalled>().is_some()
+}
+
+/// The daemon's background auto-installer as the spawn path sees it — bug 148's
+/// demand-driven (JIT) seam.
+///
+/// The eager leg runs at `SessionStart` off the dispatch context's installer;
+/// this is the *same* [`crate::auto_install::AutoInstaller`] handed to the
+/// manager (a cheap `Arc` clone), so both legs share one in-flight dedupe, one
+/// concurrency cap, and one failure-warn ledger. Attached by
+/// [`LspClientManager::attach_auto_installer`] in daemon wiring only —
+/// doctor/CLI/test managers leave it unset and never kick.
+struct JitAutoInstall {
+    /// The daemon-wide installer: announce, dedupe, cap, snapshot records.
+    installer: crate::auto_install::AutoInstaller,
+    /// Weak handle to the manager that owns this seam. A landed install is a
+    /// coverage change, so completion fires the same `spawn_all` pre-warm a
+    /// `catenary pin` runs — through a `Weak`, so the seam never keeps its own
+    /// manager alive (and a dead manager simply skips the pre-warm).
+    manager: std::sync::Weak<LspClientManager>,
 }
 
 /// Manages the lifecycle of LSP clients, document state, and language detection.
@@ -802,6 +880,13 @@ pub struct LspClientManager {
     /// [`Self::teardown_timings_override`] so ladder paths run in
     /// milliseconds.
     teardown_timings: TeardownTimings,
+    /// The demand-driven auto-install seam (bug 148), wired once by
+    /// [`Self::attach_auto_installer`] in daemon mode. `OnceLock` because the
+    /// daemon builds the installer *after* the manager exists (the manager is
+    /// already behind an `Arc` by then) and it never changes afterwards — the
+    /// read on the spawn path is lock-free. Unset in doctor/CLI/test contexts,
+    /// where nothing kicks.
+    auto_install: std::sync::OnceLock<JitAutoInstall>,
 }
 
 impl LspClientManager {
@@ -830,6 +915,33 @@ impl LspClientManager {
             fs,
             snapshot: None,
             teardown_timings: TeardownTimings::PRODUCTION,
+            auto_install: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Wires the daemon's background auto-installer onto the spawn path —
+    /// bug 148's demand-driven (JIT) leg.
+    ///
+    /// Called once from the daemon's session wiring with the same installer the
+    /// `SessionStart` (eager) leg uses, so the two share the in-flight dedupe,
+    /// the concurrency cap, and the once-per-lifetime failure warn. Takes
+    /// `&Arc<Self>` to keep a `Weak` self-handle for the post-install pre-warm
+    /// (`spawn_all`, the same leg a `catenary pin` runs) — a `Weak`, so this
+    /// seam never forms an ownership cycle with the manager. A second call is a
+    /// no-op: the seam is wired once per manager.
+    pub fn attach_auto_installer(self: &Arc<Self>, installer: crate::auto_install::AutoInstaller) {
+        if self
+            .auto_install
+            .set(JitAutoInstall {
+                installer,
+                manager: Arc::downgrade(self),
+            })
+            .is_err()
+        {
+            debug!(
+                source = Source::LspLifecycle.as_str(),
+                "auto-installer already attached to this manager — keeping the first",
+            );
         }
     }
 
@@ -1069,12 +1181,14 @@ impl LspClientManager {
     ///
     /// Surfaces exactly one calm `warn!` per server per daemon lifetime (the
     /// dedupe below) and mirrors the honest `not-installed` state onto the
-    /// `state.json` board — never `initializing`, never a bench. The finding
-    /// carries both auto-heal exits when a blessed recipe exists (the
-    /// one-shot `catenary install`, and the standing `[servers] auto_install`
-    /// opt-in); a server with no blessed recipe gets only the honest half,
-    /// because there is nothing for auto-install to fetch.
-    fn classify_not_installed(&self, key: &InstanceKey, program: &str) {
+    /// `state.json` board — never `initializing`, never a bench. This is also
+    /// the ground-truth "wants but cannot spawn" signal, so the first surfacing
+    /// resolves the [`AutoInstallStance`] — which, with `[servers] auto_install`
+    /// on and the gates clear, **kicks the background install right here**
+    /// (bug 148's JIT leg) — and the finding is worded from what actually
+    /// happened. Repeat attempts take the already-surfaced path below and can
+    /// never re-kick.
+    fn classify_not_installed(&self, key: &InstanceKey, program: &str, def: &ServerDef) {
         if let Some(writer) = &self.snapshot {
             writer.mark_not_installed(key);
         }
@@ -1085,7 +1199,8 @@ impl LspClientManager {
             .insert(key.server.clone());
         if !first {
             // Already warned once this daemon lifetime — a second root or a
-            // repeat spawn demand does not re-fire the finding.
+            // repeat spawn demand does not re-fire the finding, and does not
+            // kick a second install.
             debug!(
                 source = Source::LspLifecycle.as_str(),
                 server = key.server.as_str(),
@@ -1095,7 +1210,91 @@ impl LspClientManager {
             );
             return;
         }
-        warn_not_installed(&key.server, &key.language_id);
+        let stance = self.auto_install_stance(&key.server, def);
+        warn_not_installed(&key.server, &key.language_id, &stance);
+    }
+
+    /// Resolves — and, when it can, **enacts** — what `[servers] auto_install`
+    /// does for a server the spawn path just found missing (bug 148's JIT leg).
+    ///
+    /// With the flag on, the server faces exactly the gates
+    /// [`crate::auto_install::detect_missing`] applies at session start: no
+    /// `[lsp.server.*]` `path` override (the user's own resolution is never
+    /// second-guessed), `prefer_managed` on (otherwise a landed install would
+    /// never be consulted at spawn), and a blessed, version-matched recipe
+    /// ([`crate::auto_install::AutoInstaller::install_target`]). Clearing them
+    /// all kicks the background install through the daemon's shared installer —
+    /// announce, in-flight dedupe, concurrency cap, one failure `warn!` per
+    /// server per daemon lifetime, snapshot record, and the completion pre-warm.
+    /// Anything short of that returns the honest reason instead, and the flag is
+    /// only ever *recommended* when it is genuinely unset.
+    ///
+    /// Called once per server per daemon lifetime, from the first-surfacing
+    /// branch of [`Self::classify_not_installed`].
+    fn auto_install_stance(&self, server: &str, def: &ServerDef) -> AutoInstallStance {
+        if !self.config.auto_install() {
+            return if self.blessed_recipe_exists(server) {
+                AutoInstallStance::OfferFlag
+            } else {
+                AutoInstallStance::NoRecipe
+            };
+        }
+        if def.path.is_some() {
+            return AutoInstallStance::Blocked {
+                reason: format!(
+                    "`[lsp.server.{server}] path` is your own resolution, which auto-install \
+                     never replaces"
+                ),
+            };
+        }
+        if !self.config.prefer_managed() {
+            return AutoInstallStance::Blocked {
+                reason: "`[servers] prefer_managed = false` keeps managed installs out of spawn \
+                         resolution"
+                    .to_owned(),
+            };
+        }
+        let Some(jit) = self.auto_install.get() else {
+            return AutoInstallStance::Blocked {
+                reason: "this process runs no background installer (the daemon installs blessed \
+                         servers)"
+                    .to_owned(),
+            };
+        };
+        let Some(target) = jit.installer.install_target(server) else {
+            return AutoInstallStance::Blocked {
+                reason: format!("no blessed, version-matched install recipe pins {server}"),
+            };
+        };
+        let version = target.version.clone();
+        let class = target.class;
+        let manager = jit.manager.clone();
+        if jit.installer.kick(&target, move || {
+            // A landed install is a coverage change: run the same
+            // fire-and-forget `spawn_all` pre-warm a `catenary pin` (and the
+            // session-start leg) runs, so the new server spawns for every live
+            // matching root rather than lazily on the next query.
+            if let Some(manager) = manager.upgrade() {
+                tokio::spawn(async move { manager.spawn_all().await });
+            }
+        }) {
+            AutoInstallStance::Kicked { version, class }
+        } else {
+            AutoInstallStance::InFlight { version }
+        }
+    }
+
+    /// Whether an install of `server` is constructible at all — the
+    /// recipe-teaching axis for the flag-unset branches.
+    ///
+    /// Reads the daemon installer's manifest/recipes when the JIT seam is wired
+    /// (so the teaching and the kick can never disagree) and falls back to the
+    /// live shipped data ([`has_blessed_recipe`]) elsewhere.
+    fn blessed_recipe_exists(&self, server: &str) -> bool {
+        self.auto_install.get().map_or_else(
+            || has_blessed_recipe(server),
+            |jit| jit.installer.install_target(server).is_some(),
+        )
     }
 
     /// Clears a server's not-installed dedupe and its `not-installed` board
@@ -2608,7 +2807,11 @@ impl LspClientManager {
         // strike-ledger entry, no bench, no dead tombstone. One calm finding per
         // server and an honest `not-installed` board state, then bail with the
         // typed error `spawn_all`/`ensure_clients_for_paths` recognize so they
-        // do not pile a second per-root warning on top. A later spawn demand
+        // do not pile a second per-root warning on top. This is also the
+        // ground-truth "wants but cannot spawn" signal, so with
+        // `[servers] auto_install` on the classification kicks the background
+        // install here (bug 148's JIT leg) instead of merely advising a flag.
+        // A later spawn demand
         // re-resolves; if the binary appeared (a `catenary install`, an
         // auto-install pre-warm), the classification clears and the spawn
         // proceeds normally — coverage heals without a daemon restart. The
@@ -2623,7 +2826,7 @@ impl LspClientManager {
         // before (misc 162's rust-analyzer exemption).
         if wrap.is_none() && !crate::health::servers::server_binary_installed(server_name, program)
         {
-            self.classify_not_installed(&ledger_key, program);
+            self.classify_not_installed(&ledger_key, program, &server_def);
             return Err(anyhow::Error::new(NotInstalled {
                 server: server_name.to_string(),
                 language: lang.to_string(),
@@ -7208,11 +7411,11 @@ mod tests {
 
     #[test]
     fn not_installed_message_teaches_both_exits_only_with_a_recipe() {
-        // The maintainer addendum: a blessed-recipe server names both auto-heal
-        // exits (the one-shot install and the standing auto_install opt-in); a
-        // recipe-less server gets only the honest half — never a suggestion
-        // auto_install cannot fulfill.
-        let with_recipe = not_installed_message("tombi", "toml", true);
+        // The maintainer addendum: with the flag UNSET, a blessed-recipe server
+        // names both auto-heal exits (the one-shot install and the standing
+        // auto_install opt-in); a recipe-less server gets only the honest half —
+        // never a suggestion auto_install cannot fulfill.
+        let with_recipe = not_installed_message("tombi", "toml", &AutoInstallStance::OfferFlag);
         assert!(
             with_recipe.contains("catenary install tombi"),
             "recipe variant names the one-shot install: {with_recipe}"
@@ -7226,7 +7429,7 @@ mod tests {
             "recipe variant keeps the honest half: {with_recipe}"
         );
 
-        let no_recipe = not_installed_message("mycustomls", "toml", false);
+        let no_recipe = not_installed_message("mycustomls", "toml", &AutoInstallStance::NoRecipe);
         assert!(
             no_recipe.contains("configured for toml but not installed"),
             "recipe-less variant is honest: {no_recipe}"
@@ -7238,6 +7441,372 @@ mod tests {
         assert!(
             !no_recipe.contains("catenary install"),
             "recipe-less variant must not suggest an install it cannot fulfill: {no_recipe}"
+        );
+    }
+
+    #[test]
+    fn not_installed_message_announces_a_fired_kick_instead_of_advising() {
+        // bug 148: with the flag already on and the install kicked, the finding
+        // reports what is happening — it never recommends the setting that is
+        // already set.
+        let kicked = not_installed_message(
+            "tombi",
+            "toml",
+            &AutoInstallStance::Kicked {
+                version: "1.2.4".to_string(),
+                class: InstallClass::Fetch,
+            },
+        );
+        assert!(
+            kicked.contains("installing tombi 1.2.4 in the background"),
+            "the kick is announced: {kicked}"
+        );
+        assert!(
+            !kicked.contains("auto_install = true"),
+            "a fired kick never recommends the flag: {kicked}"
+        );
+        assert!(
+            !kicked.contains("take minutes"),
+            "fetch-class is quick — no compile warning: {kicked}"
+        );
+
+        // Compile-class states its minutes, the same honesty as the
+        // session-start announcement.
+        let compiling = not_installed_message(
+            "tombi",
+            "toml",
+            &AutoInstallStance::Kicked {
+                version: "1.2.4".to_string(),
+                class: InstallClass::Compile,
+            },
+        );
+        assert!(
+            compiling.contains("can take minutes"),
+            "compile-class warns: {compiling}"
+        );
+
+        // An install already running (the eager leg got there first) says so.
+        let in_flight = not_installed_message(
+            "tombi",
+            "toml",
+            &AutoInstallStance::InFlight {
+                version: "1.2.4".to_string(),
+            },
+        );
+        assert!(
+            in_flight.contains("already running"),
+            "a running install is reported: {in_flight}"
+        );
+        assert!(
+            !in_flight.contains("auto_install = true"),
+            "never recommends the flag that is already on: {in_flight}"
+        );
+    }
+
+    #[test]
+    fn not_installed_message_never_recommends_an_enabled_flag_that_cannot_act() {
+        // bug 148's honesty leg: flag on, server ineligible — say why nothing
+        // can act, briefly, and point at the only exit that works.
+        let blocked = not_installed_message(
+            "mycustomls",
+            "toml",
+            &AutoInstallStance::Blocked {
+                reason: "no blessed, version-matched install recipe pins mycustomls".to_string(),
+            },
+        );
+        assert!(
+            blocked.contains("configured for toml but not installed"),
+            "honest first: {blocked}"
+        );
+        assert!(
+            blocked.contains("no blessed, version-matched install recipe"),
+            "the reason nothing can act is named: {blocked}"
+        );
+        assert!(
+            !blocked.contains("auto_install = true"),
+            "never recommends a flag that is already set: {blocked}"
+        );
+        assert!(
+            blocked.contains("place it on PATH"),
+            "the exit that does work is named: {blocked}"
+        );
+    }
+
+    // ── The demand-driven (JIT) auto-install leg (bug 148) ───────────────
+
+    /// A config binding `MOCK_LANG_A` to `server` with `[servers]
+    /// auto_install` as asked — the JIT-leg fixture. `path_override` and
+    /// `prefer_managed` drive the ineligibility branches.
+    fn jit_config(
+        server: &str,
+        auto_install: bool,
+        prefer_managed: bool,
+        path_override: Option<&str>,
+    ) -> Arc<Config> {
+        let mut defs = HashMap::new();
+        defs.insert(
+            server.to_string(),
+            ServerDef {
+                path: path_override.map(str::to_string),
+                args: vec![MOCK_LANG_A.to_string()],
+                ..ServerDef::default()
+            },
+        );
+        let mut language = HashMap::new();
+        language.insert(
+            MOCK_LANG_A.to_string(),
+            LanguageConfig {
+                servers: Some(vec![ServerBinding::new(server)]),
+                ..LanguageConfig::default()
+            },
+        );
+        Arc::new(Config {
+            language,
+            server: defs,
+            servers: Some(crate::config::ServersConfig {
+                prefer_managed,
+                auto_install,
+            }),
+            ..test_config_raw()
+        })
+    }
+
+    /// The stub-seamed installer the JIT tests attach: the auto-install
+    /// module's own scaffolding (synthetic blessed manifest + version-matched
+    /// recipe for `auto_install::test_support::SERVER`) over a tempdir managed
+    /// home, with a staging runner so a landed install is observable.
+    fn jit_installer(
+        home_root: &Path,
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+        gate: Option<Arc<tokio::sync::Semaphore>>,
+    ) -> crate::auto_install::AutoInstaller {
+        crate::auto_install::test_support::installer_with_runner(
+            home_root,
+            Box::new(crate::auto_install::test_support::StagingRunner {
+                home_root: home_root.to_path_buf(),
+                gate,
+                runs,
+            }),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auto_install_stance_kicks_at_the_spawn_failure_then_reports_in_flight() {
+        // bug 148's JIT leg: the flag is on and every gate clears, so the
+        // ground-truth "wants but cannot spawn" signal kicks the background
+        // install itself. A second resolution while that install runs reports
+        // it honestly rather than kicking a duplicate.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let server = crate::auto_install::test_support::SERVER;
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home_root = home_dir.path().join("servers");
+        let runs = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let manager = Arc::new(LspClientManager::new(
+            jit_config(server, true, true, None),
+            test_logging(),
+            test_fs(),
+        ));
+        manager.attach_auto_installer(jit_installer(&home_root, runs.clone(), Some(gate.clone())));
+
+        let def = ServerDef::default();
+        let stance = manager.auto_install_stance(server, &def);
+        assert!(
+            matches!(&stance, AutoInstallStance::Kicked { version, .. } if version == crate::auto_install::test_support::VERSION),
+            "the spawn failure kicks the install: {stance:?}"
+        );
+
+        // The install is still gated, so its in-flight seat is held: a second
+        // resolution reports the running install instead of kicking again.
+        let again = manager.auto_install_stance(server, &def);
+        assert!(
+            matches!(&again, AutoInstallStance::InFlight { .. }),
+            "a second demand never double-kicks: {again:?}"
+        );
+
+        // Release the gate and let the one install land (also drains the
+        // blocking task before the runtime is dropped).
+        gate.add_permits(1);
+        for _ in 0..200 {
+            if runs.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "exactly one install ran");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auto_install_stance_blocks_honestly_when_the_flag_cannot_act() {
+        // bug 148: with the flag ALREADY on, an ineligible server must never be
+        // told to set it — each branch names why nothing can act instead. The
+        // gates mirror `detect_missing`'s, one for one.
+        use std::sync::atomic::AtomicUsize;
+        let server = crate::auto_install::test_support::SERVER;
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home_root = home_dir.path().join("servers");
+        let def_with_path = ServerDef {
+            path: Some("/nowhere/mine".to_string()),
+            ..ServerDef::default()
+        };
+
+        // An explicit `path` override is the user's own resolution.
+        let manager = Arc::new(LspClientManager::new(
+            jit_config(server, true, true, Some("/nowhere/mine")),
+            test_logging(),
+            test_fs(),
+        ));
+        manager.attach_auto_installer(jit_installer(
+            &home_root,
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        ));
+        let stance = manager.auto_install_stance(server, &def_with_path);
+        assert!(
+            matches!(&stance, AutoInstallStance::Blocked { reason } if reason.contains("path")),
+            "a path override blocks the kick: {stance:?}"
+        );
+
+        // `prefer_managed = false`: a landed install would never be consulted.
+        let manager = Arc::new(LspClientManager::new(
+            jit_config(server, true, false, None),
+            test_logging(),
+            test_fs(),
+        ));
+        manager.attach_auto_installer(jit_installer(
+            &home_root,
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        ));
+        let stance = manager.auto_install_stance(server, &ServerDef::default());
+        assert!(
+            matches!(&stance, AutoInstallStance::Blocked { reason } if reason.contains("prefer_managed")),
+            "prefer_managed = false blocks the kick: {stance:?}"
+        );
+
+        // No blessed, version-matched recipe: nothing is constructible.
+        let manager = Arc::new(LspClientManager::new(
+            jit_config("not-a-blessed-server", true, true, None),
+            test_logging(),
+            test_fs(),
+        ));
+        manager.attach_auto_installer(jit_installer(
+            &home_root,
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        ));
+        let stance = manager.auto_install_stance("not-a-blessed-server", &ServerDef::default());
+        assert!(
+            matches!(&stance, AutoInstallStance::Blocked { reason } if reason.contains("no blessed")),
+            "an unblessed server blocks the kick: {stance:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auto_install_stance_offers_the_flag_only_while_it_is_unset() {
+        // The surviving advice branch: the flag is genuinely off, so the
+        // standing opt-in is worth teaching — and only for a server it could
+        // actually fetch.
+        use std::sync::atomic::AtomicUsize;
+        let server = crate::auto_install::test_support::SERVER;
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home_root = home_dir.path().join("servers");
+        let manager = Arc::new(LspClientManager::new(
+            jit_config(server, false, true, None),
+            test_logging(),
+            test_fs(),
+        ));
+        manager.attach_auto_installer(jit_installer(
+            &home_root,
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        ));
+
+        assert_eq!(
+            manager.auto_install_stance(server, &ServerDef::default()),
+            AutoInstallStance::OfferFlag,
+            "a blessed, recipe-backed server gets the standing opt-in"
+        );
+        assert_eq!(
+            manager.auto_install_stance("not-a-blessed-server", &ServerDef::default()),
+            AutoInstallStance::NoRecipe,
+            "nothing installable — never a suggestion auto-install cannot fulfill"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_failure_kicks_the_background_install_exactly_once() -> Result<()> {
+        // The whole JIT leg end to end: repeated spawn demands for a missing
+        // blessed server kick exactly ONE background install — the
+        // already-surfaced dedupe holds the second and third attempts — and the
+        // install lands in the managed home.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let server = crate::auto_install::test_support::SERVER;
+        let version = crate::auto_install::test_support::VERSION;
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_string_lossy().to_string();
+        let home_dir = tempfile::tempdir()?;
+        let home_root = home_dir.path().join("servers");
+        let runs = Arc::new(AtomicUsize::new(0));
+        let manager = Arc::new(LspClientManager::new(
+            jit_config(server, true, true, None),
+            test_logging(),
+            test_fs_with_roots(&[&root]),
+        ));
+        manager.attach_auto_installer(jit_installer(&home_root, runs.clone(), None));
+
+        // Three spawn demands against the same missing server. The Ok variant
+        // (`LspClient`) is not `Debug`, so take the error via `.err()`.
+        for _ in 0..3 {
+            let err = manager
+                .spawn(server, MOCK_LANG_A, dir.path())
+                .await
+                .err()
+                .expect("a missing binary never spawns");
+            assert!(
+                is_not_installed(&err),
+                "each attempt classifies not-installed"
+            );
+        }
+        assert!(
+            manager.not_installed_was_warned(server),
+            "the calm finding fired once"
+        );
+
+        for _ in 0..200 {
+            if runs.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "one kick across repeated spawn demands"
+        );
+        assert!(
+            crate::managed_home::ManagedHome::at(home_root)
+                .pinned_executable(server, version, server)
+                .is_some(),
+            "the JIT install landed in the managed home at the pin"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_attached_installer_never_kicks_and_says_so() {
+        // Doctor/CLI/test managers wire no installer: the flag being on cannot
+        // conjure one, and the finding says that instead of advising the flag.
+        let server = crate::auto_install::test_support::SERVER;
+        let manager = Arc::new(LspClientManager::new(
+            jit_config(server, true, true, None),
+            test_logging(),
+            test_fs(),
+        ));
+        let stance = manager.auto_install_stance(server, &ServerDef::default());
+        assert!(
+            matches!(&stance, AutoInstallStance::Blocked { reason } if reason.contains("background installer")),
+            "no installer wired, nothing kicked: {stance:?}"
         );
     }
 

@@ -4046,6 +4046,14 @@ impl SessionManager {
             .auto_installer_override
             .clone()
             .unwrap_or_else(|| crate::auto_install::AutoInstaller::new(session.snapshot.clone()));
+        // The demand-driven (JIT) leg (bug 148): hand the SAME installer to the
+        // shared LSP manager, so a spawn that finds a blessed server missing
+        // kicks the install at that ground-truth signal instead of only
+        // advising a flag. One installer, so both legs share the in-flight
+        // dedupe, the concurrency cap, and the one-warn-per-lifetime contract.
+        session
+            .lsp_client_manager()
+            .attach_auto_installer(auto_installer.clone());
 
         self.hook_ctx = Some(HookDispatchContext {
             sessions,
