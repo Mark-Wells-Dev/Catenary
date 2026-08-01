@@ -505,9 +505,16 @@ fn boot_restore_spawns_no_servers() -> Result<()> {
             let tracked = roots.iter().any(|r| r["path"].as_str() == Some(target_str));
             let servers = snap["servers"].as_array().cloned().unwrap_or_default();
             if tracked {
+                // Name both tempdirs in the failure (bug 155): the daemon may
+                // canonicalize registered roots, so on macOS a canonical
+                // `scope_root` alone cannot say whether the erroneous spawn was
+                // the pinned target (an eager-restore violation) or the session
+                // base (a first-touch-on-boot question) — two different bugs.
                 assert!(
                     servers.is_empty(),
-                    "boot restore spawned a server (should be lazy): {servers:?}"
+                    "boot restore spawned a server (should be lazy): {servers:?}\n\
+                     pinned target root: {target_str}\n\
+                     session base root:  {base_str}"
                 );
                 break;
             }
