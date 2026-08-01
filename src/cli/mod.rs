@@ -244,13 +244,28 @@ impl Output {
         }
     }
 
-    /// Write formatted text followed by a newline.
+    /// Write formatted text followed by a newline, as ONE atomic `write_all`.
+    ///
+    /// The advisory-line analogue of [`Output::write_block`], and the second half
+    /// of bug 112's stream discipline (bug 153). Handing `args` straight to
+    /// `write_fmt` splits the line at every interpolation boundary — `fmt::write`
+    /// pushes each literal piece and each rendered argument through a separate
+    /// `write_all`, and `io::Stderr` is unbuffered, so each one is its own
+    /// syscall. The glob directory note went out as six writes
+    /// (`` note: ` `` / dir / `` ` is a directory… `` / dir / `` /*'` `` / `\n`).
+    ///
+    /// Every one of those boundaries is a place a merged capture can interleave:
+    /// a harness reading stdout and stderr as two pipes appends whichever chunk
+    /// arrives first, so a stdout result row could land between the note's head
+    /// and its tail — the reported corruption, a summary path spliced into the
+    /// middle of a `note:` line. Rendering the line first and emitting it whole
+    /// leaves no interior boundary to splice at.
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if the write fails.
+    /// Returns an I/O error if the write or flush fails.
     pub fn writeln(&mut self, args: std::fmt::Arguments<'_>) -> io::Result<()> {
-        writeln!(self.w, "{args}")
+        self.write_block(&args.to_string())
     }
 
     /// Write formatted text without a trailing newline.
@@ -273,6 +288,9 @@ impl Output {
     /// fusing mid-line into a stdout result under `2>&1` piping). Flushing here,
     /// before the caller writes any advisory to stderr, drains stdout fully so the
     /// two streams never interleave under a merged fd.
+    ///
+    /// [`Output::writeln`] funnels through here too, so every unit this type
+    /// emits — result block or advisory line — reaches the fd as one write.
     ///
     /// # Errors
     ///
@@ -465,6 +483,125 @@ mod tests {
         let mut out = Output::buffer(80);
         out.write_block("solo").expect("write_block");
         assert_eq!(out.into_string(), "solo\n");
+    }
+
+    // ── writeln (bug 153: atomic advisory-line write) ─────────────────
+
+    /// A writer that records every `write` call as its own chunk — the test-side
+    /// stand-in for a syscall boundary on a real fd.
+    ///
+    /// Chunk boundaries are exactly where a merged capture can interleave: a
+    /// harness reading the child's stdout and stderr as two pipes appends
+    /// whatever chunk arrives first, so any line split across several writes can
+    /// be torn apart with the other stream's bytes wedged into the gap. "One
+    /// whole line per chunk" is the property that makes a line un-spliceable.
+    #[derive(Clone, Default)]
+    struct ChunkLog(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl ChunkLog {
+        /// The chunks recorded so far, one per `write` call.
+        fn chunks(&self) -> Vec<String> {
+            self.0.lock().expect("chunk log poisoned").clone()
+        }
+
+        /// An [`Output`] that writes into this log.
+        fn output(&self) -> Output {
+            Output {
+                w: Box::new(self.clone()),
+                colors: ColorConfig::new(true),
+                width: 80,
+            }
+        }
+    }
+
+    impl Write for ChunkLog {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("chunk log poisoned")
+                .push(String::from_utf8_lossy(buf).into_owned());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl OutputWriter for ChunkLog {
+        fn into_bytes(self: Box<Self>) -> Option<Vec<u8>> {
+            Some(self.chunks().concat().into_bytes())
+        }
+    }
+
+    /// `writeln` emits the whole rendered line — interpolations included — in ONE
+    /// write, so no fd-level boundary falls inside it (bug 153).
+    ///
+    /// Routing `format_args!` straight through `write_fmt` split a line at every
+    /// interpolation boundary: the glob directory note below went out as six
+    /// writes on unbuffered stderr (`note: ` / dir / ` is a directory…` / dir /
+    /// `/*'` / `\n`). Under a two-pipe merged capture that let a stdout result
+    /// row land between the note's head and its tail — the reported corruption,
+    /// a summary path spliced into the middle of a `note:` line.
+    #[test]
+    fn writeln_emits_the_whole_line_as_one_write() {
+        let log = ChunkLog::default();
+        let mut out = log.output();
+        let dir = "/home/mark/Projects/Catenary/plugins/catenary/hooks";
+        out.writeln(format_args!(
+            "note: `{dir}` is a directory, summarized above — to match its \
+             entries as first-class paths (each enriched on its own): \
+             `catenary glob '{dir}/*'`"
+        ))
+        .expect("writeln");
+
+        let chunks = log.chunks();
+        assert_eq!(
+            chunks.len(),
+            1,
+            "an advisory line must reach the fd as ONE write; got {} chunks: {chunks:?}",
+            chunks.len(),
+        );
+        assert_eq!(
+            chunks[0],
+            format!(
+                "note: `{dir}` is a directory, summarized above — to match its \
+                 entries as first-class paths (each enriched on its own): \
+                 `catenary glob '{dir}/*'`\n"
+            ),
+        );
+    }
+
+    /// The bug 153 shape end to end: a multi-line result body followed by an
+    /// advisory is exactly TWO writes — one per whole unit. Neither the body nor
+    /// the note offers an interior boundary for the other stream's bytes to
+    /// wedge into under a merged capture.
+    #[test]
+    fn result_body_then_advisory_are_two_whole_writes() {
+        let log = ChunkLog::default();
+        let mut out = log.output();
+        out.write_block("/root/plugins/catenary/  (2 files, 1 dir)\n\thooks/  (1 file, 0 dirs)")
+            .expect("write_block");
+        out.writeln(format_args!(
+            "note: `{}` is a directory, summarized above",
+            "/root/plugins/catenary"
+        ))
+        .expect("writeln");
+
+        let chunks = log.chunks();
+        assert_eq!(
+            chunks.len(),
+            2,
+            "body and advisory must be one write each; got {} chunks: {chunks:?}",
+            chunks.len(),
+        );
+        for chunk in &chunks {
+            assert!(
+                chunk.ends_with('\n'),
+                "every write must end at a line boundary, else a merged reader \
+                 can splice the other stream mid-line; chunk: {chunk:?}"
+            );
+        }
     }
 
     // ── HostFormat tests ────────────────────────────────────────────
