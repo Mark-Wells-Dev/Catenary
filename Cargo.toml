@@ -14,6 +14,38 @@ members = ["crates/catenary-mcp", "crates/catenary-proc"]
 # rust-analyzer compiles, so it is excluded for the identical reason.
 exclude = ["fuzz", "tests/fixtures/rust_repo", "tests/fixtures/conformance/rust"]
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# Lint groups
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+# Hard denials — no agent should produce these
+unwrap_used = "deny"
+expect_used = "deny" # test modules opt out via #[allow(clippy::expect_used)]
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+wildcard_imports = "deny"
+
+# Force agents to justify exceptions
+allow_attributes_without_reason = "deny"
+
+# Dependencies
+multiple_crate_versions = "allow"
+
+# Documentation
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+missing_safety_doc = "warn"
+
 [package]
 name = "catenary-cli"
 version = "2.1.2"
@@ -165,38 +197,6 @@ proptest = "1.11"
 # suite for its wall-clock length. Dev-only — the runtime graph keeps the plain
 # `full` feature set; same crate, same version, no new dependency.
 tokio = { version = "1.49.0", features = ["full", "test-util"] }
-
-[workspace.lints.rust]
-unsafe_code = "forbid"
-missing_docs = "warn"
-
-[workspace.lints.clippy]
-# Lint groups
-pedantic = { level = "warn", priority = -1 }
-nursery = { level = "warn", priority = -1 }
-cargo = { level = "warn", priority = -1 }
-
-# Hard denials — no agent should produce these
-unwrap_used = "deny"
-expect_used = "deny" # test modules opt out via #[allow(clippy::expect_used)]
-panic = "deny"
-todo = "deny"
-unimplemented = "deny"
-dbg_macro = "deny"
-print_stdout = "deny"
-print_stderr = "deny"
-wildcard_imports = "deny"
-
-# Force agents to justify exceptions
-allow_attributes_without_reason = "deny"
-
-# Dependencies
-multiple_crate_versions = "allow"
-
-# Documentation
-missing_errors_doc = "warn"
-missing_panics_doc = "warn"
-missing_safety_doc = "warn"
 
 [profile.release]
 panic = "abort"
