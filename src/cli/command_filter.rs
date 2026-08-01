@@ -834,6 +834,21 @@ enum Sub {
     Primer,
     /// `catenary commands` — prints the allowed-command surface.
     Commands,
+    /// `catenary config` — prints the recommended annotated config template
+    /// (misc 225, ratified allow). Read-only: it writes nothing itself, takes
+    /// no handoff, and its output is complete and client-owned, so it is
+    /// Search-class and redirects freely — `catenary config > config.toml` is
+    /// the documented way to seed a config.
+    Config,
+    /// `catenary doctor` — language-server / installation health check (misc
+    /// 225, ratified allow). A read-only probe: no handoff, no tracked-set
+    /// interaction, complete client-owned output, so Search-class like `query`.
+    Doctor,
+    /// `catenary service status` — reports the daemon service's installed /
+    /// active state (misc 225, ratified allow). Read-only, Search-class. Its
+    /// `install`/`uninstall` siblings are daemon-control and stay maintainer-run
+    /// ([`Recog::MaintainerOnly`]).
+    ServiceStatus,
     /// `catenary worktree ls` — registry+sidecar view (misc 151). Search-class:
     /// no handoff, output is complete and client-owned, so it chains and pipes
     /// like `query`.
@@ -867,9 +882,14 @@ impl Sub {
     /// Correlation class governing the canonical-form rules.
     const fn class(self) -> CatenaryClass {
         match self {
-            Self::Grep | Self::Glob | Self::Query | Self::WorktreeLs | Self::WorktreeDiff => {
-                CatenaryClass::Search
-            }
+            Self::Grep
+            | Self::Glob
+            | Self::Query
+            | Self::Config
+            | Self::Doctor
+            | Self::ServiceStatus
+            | Self::WorktreeLs
+            | Self::WorktreeDiff => CatenaryClass::Search,
             Self::Sed | Self::Diagnostics | Self::EditingStop => CatenaryClass::Correlated,
             Self::EditingStart
             | Self::Roots
@@ -902,6 +922,9 @@ impl Sub {
             Self::Claim => "claim",
             Self::Primer => "primer",
             Self::Commands => "commands",
+            Self::Config => "config",
+            Self::Doctor => "doctor",
+            Self::ServiceStatus => "service status",
             Self::WorktreeLs => "worktree ls",
             Self::WorktreeAdd => "worktree add",
             Self::WorktreeRm => "worktree rm",
@@ -926,8 +949,98 @@ enum Recog {
     GlobalRead,
     /// A real catenary subcommand reserved for host hooks / interactive use.
     NotAgent,
+    /// A real catenary verb reserved for the maintainer: daemon control
+    /// (`start`/`stop`/`restart`/`quit`) or self-update / installation
+    /// (`update`/`install`, `service install`/`uninstall`). Distinct from
+    /// [`Recog::Unknown`] because the verb *exists* — the teaching says so
+    /// (misc 225). The payload is the verb's canonical spelling, taken from the
+    /// static inventory or a two-word literal, never from the caller's tokens.
+    MaintainerOnly(&'static str),
     /// Not a recognized subcommand (typo, bare `catenary`, `$VAR`, …).
     Unknown,
+}
+
+/// How a top-level `catenary` verb relates to the agent surface (misc 225).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerbKind {
+    /// An explicit arm of [`recognize_catenary_sub`] decides it — an
+    /// agent-invocable [`Sub`], a [`Recog::GlobalRead`], or a multi-word split
+    /// whose halves classify differently (`service status` is agent-invocable,
+    /// `service install` is maintainer-run).
+    Dispatched,
+    /// Real, but maintainer-run: daemon control or self-update / installation.
+    /// Denied with teaching that names the verb and admits it exists.
+    MaintainerOnly,
+    /// Internal plumbing invoked by host hooks and the bridge proxy, never by
+    /// hand (both are clap-hidden). Denied with the host-CLI teaching.
+    HostInternal,
+}
+
+/// Every top-level verb the `catenary` binary ships, in clap's own spelling,
+/// with its agent-surface disposition.
+///
+/// The single source of truth for "is this a real `catenary` command" (misc
+/// 225). Before this table the deny path carried a second, hand-copied verb
+/// list that drifted from the clap tree — `service` was added to one and not
+/// the other, so `catenary service status` was denied as "not a recognized
+/// command" by the binary that ships it, and the stale `debug` was still named
+/// as real. The clap tree lives in the `catenary` binary and this filter in the
+/// `catenary-cli` library, so the library cannot read `Args` directly; the
+/// binary's `clap_command_tree_matches_filter_verb_inventory` test pins the two
+/// sets equal, which is what kills the drift class. Add a top-level subcommand
+/// to `src/main.rs` and this table must gain it in the same change.
+///
+/// Retired spellings the filter still recognizes for a redirect (`sed`,
+/// `editing stop`, `roots add/rm`, `worktree diff/land`) are deliberately
+/// *not* here: they are handled by explicit arms above the inventory lookup and
+/// are not part of the shipped clap surface.
+const CATENARY_VERBS: &[(&str, VerbKind)] = &[
+    ("claim", VerbKind::Dispatched),
+    ("commands", VerbKind::Dispatched),
+    ("config", VerbKind::Dispatched),
+    ("daemon", VerbKind::HostInternal),
+    ("diagnostics", VerbKind::Dispatched),
+    ("doctor", VerbKind::Dispatched),
+    ("editing", VerbKind::Dispatched),
+    ("glob", VerbKind::Dispatched),
+    ("grep", VerbKind::Dispatched),
+    ("help", VerbKind::Dispatched),
+    ("hook", VerbKind::HostInternal),
+    ("install", VerbKind::MaintainerOnly),
+    ("pin", VerbKind::Dispatched),
+    ("primer", VerbKind::Dispatched),
+    ("query", VerbKind::Dispatched),
+    ("quit", VerbKind::MaintainerOnly),
+    ("restart", VerbKind::MaintainerOnly),
+    ("roots", VerbKind::Dispatched),
+    ("service", VerbKind::Dispatched),
+    ("start", VerbKind::MaintainerOnly),
+    ("stop", VerbKind::MaintainerOnly),
+    ("unpin", VerbKind::Dispatched),
+    ("update", VerbKind::MaintainerOnly),
+    ("version", VerbKind::Dispatched),
+    ("worktree", VerbKind::Dispatched),
+];
+
+/// The inventory entry for a top-level verb — its canonical `'static` spelling
+/// and disposition — or `None` when the word is not a verb the binary ships.
+fn shipped_verb(verb: &str) -> Option<(&'static str, VerbKind)> {
+    CATENARY_VERBS
+        .iter()
+        .copied()
+        .find(|(name, _)| *name == verb)
+}
+
+/// Every top-level `catenary` verb the command filter believes the binary ships.
+///
+/// Exposed for the binary's `clap_command_tree_matches_filter_verb_inventory`
+/// test (misc 225): the clap command tree is defined in `src/main.rs`, so this
+/// library cannot read it, and that test is what keeps
+/// [`CATENARY_VERBS`] a derived copy of the clap tree rather than a second
+/// source of truth.
+#[must_use]
+pub fn known_catenary_verbs() -> Vec<&'static str> {
+    CATENARY_VERBS.iter().map(|(name, _)| *name).collect()
 }
 
 /// Classify the tokens following the `catenary` command word.
@@ -960,6 +1073,13 @@ fn recognize_catenary_sub(rest: &[&str]) -> Recog {
         // flow and exits 2. These arms delete with the stubs in a later release.
         (Some("worktree"), Some("diff")) => Recog::Agent(Sub::WorktreeDiff),
         (Some("worktree"), Some("land")) => Recog::Agent(Sub::WorktreeLand),
+        // `service` splits (misc 225): `status` is a read-only report and is
+        // agent-invocable; `install`/`uninstall` write and enable the daemon's
+        // service unit, so they stay maintainer-run — with teaching that names
+        // them as real, not as unrecognized.
+        (Some("service"), Some("status")) => Recog::Agent(Sub::ServiceStatus),
+        (Some("service"), Some("install")) => Recog::MaintainerOnly("service install"),
+        (Some("service"), Some("uninstall")) => Recog::MaintainerOnly("service uninstall"),
         (Some("grep"), _) => Recog::Agent(Sub::Grep),
         (Some("glob"), _) => Recog::Agent(Sub::Glob),
         (Some("query"), _) => Recog::Agent(Sub::Query),
@@ -967,13 +1087,10 @@ fn recognize_catenary_sub(rest: &[&str]) -> Recog {
         (Some("diagnostics"), _) => Recog::Agent(Sub::Diagnostics),
         (Some("primer"), _) => Recog::Agent(Sub::Primer),
         (Some("commands"), _) => Recog::Agent(Sub::Commands),
-        (
-            Some(
-                "hook" | "start" | "stop" | "restart" | "quit" | "debug" | "config" | "doctor"
-                | "install" | "update" | "daemon",
-            ),
-            _,
-        ) => Recog::NotAgent,
+        // Read-only introspection, ratified agent-invocable (misc 225): the
+        // config template goes to stdout and `doctor` only probes.
+        (Some("config"), _) => Recog::Agent(Sub::Config),
+        (Some("doctor"), _) => Recog::Agent(Sub::Doctor),
         // Global reads — pure, side-effect-free introspection (no handoff, no
         // tracked-set interaction), admitted after the subcommand arms and
         // before the fail-closed fallthrough (bug 22 / misc 142):
@@ -981,6 +1098,9 @@ fn recognize_catenary_sub(rest: &[&str]) -> Recog {
         // - `catenary version`: a real subcommand (reports the CLI version and
         //   the running daemon's) — the richer version probe, recognized like
         //   the other subcommand arms above.
+        // - `catenary help [sub]`: clap's generated help subcommand — the same
+        //   pure read as `--help`, in subcommand spelling, so it is admitted
+        //   with its optional topic argument (misc 225).
         // - a subcommand-less `--version`/`-V` or `--help`/`-h`: clap
         //   short-circuits these before any subcommand, so they reach here only
         //   as the *first* token (the subcommand arms above already claimed
@@ -988,10 +1108,23 @@ fn recognize_catenary_sub(rest: &[&str]) -> Recog {
         //   argument (`rest.get(1)` is `None`) — a flag plus an extra arg
         //   (`catenary --version extra`), paired flags, or an unknown flag stay
         //   fail-closed.
-        (Some("version"), _) | (Some("--version" | "-V" | "--help" | "-h"), None) => {
+        (Some("version" | "help"), _) | (Some("--version" | "-V" | "--help" | "-h"), None) => {
             Recog::GlobalRead
         }
-        _ => Recog::Unknown,
+        // Fail-closed fallthrough, resolved against the shipped verb inventory
+        // (misc 225) rather than a second hand-kept list. A verb the binary
+        // ships gets teaching that admits it is real; only a word that is not a
+        // `catenary` verb at all takes the unrecognized denial.
+        (Some(word), _) => match shipped_verb(word) {
+            Some((name, VerbKind::MaintainerOnly)) => Recog::MaintainerOnly(name),
+            Some((_, VerbKind::HostInternal)) => Recog::NotAgent,
+            // A dispatched verb reaching here carries an incomplete or unknown
+            // sub-verb (`catenary editing`, `catenary service frobnicate`): the
+            // invocation, not the verb, is what is unrecognized.
+            Some((_, VerbKind::Dispatched)) | None => Recog::Unknown,
+        },
+        // Bare `catenary`.
+        (None, _) => Recog::Unknown,
     }
 }
 
@@ -1198,7 +1331,7 @@ pub fn analyze_catenary_command(cmd: &str, client: Option<HostFormat>) -> Catena
         .iter()
         .filter_map(|o| match o.recog {
             Recog::Agent(s) => Some(s),
-            Recog::GlobalRead | Recog::NotAgent | Recog::Unknown => None,
+            Recog::GlobalRead | Recog::NotAgent | Recog::MaintainerOnly(_) | Recog::Unknown => None,
         })
         .collect();
 
@@ -1260,11 +1393,22 @@ const fn occ_needs_isolation(occ: &CatenaryOcc) -> bool {
             | Sub::WorktreeRm
             | Sub::WorktreeLand,
         ) => true,
-        // search (grep/glob/query/worktree ls/diff), the subcommand-less global
-        // read, and the already-denied non-agent/unknown forms carry no handoff.
-        Recog::Agent(Sub::Grep | Sub::Glob | Sub::Query | Sub::WorktreeLs | Sub::WorktreeDiff)
+        // search (grep/glob/query/config/doctor/service status/worktree
+        // ls/diff), the subcommand-less global read, and the already-denied
+        // non-agent/maintainer-only/unknown forms carry no handoff.
+        Recog::Agent(
+            Sub::Grep
+            | Sub::Glob
+            | Sub::Query
+            | Sub::Config
+            | Sub::Doctor
+            | Sub::ServiceStatus
+            | Sub::WorktreeLs
+            | Sub::WorktreeDiff,
+        )
         | Recog::GlobalRead
         | Recog::NotAgent
+        | Recog::MaintainerOnly(_)
         | Recog::Unknown => false,
     }
 }
@@ -1391,6 +1535,7 @@ fn catenary_occ_denial(occ: &CatenaryOcc) -> Option<String> {
     let sub = match occ.recog {
         Recog::Unknown => return Some(unknown_subcommand_denial()),
         Recog::NotAgent => return Some(not_agent_invocable_denial()),
+        Recog::MaintainerOnly(verb) => return Some(maintainer_only_denial(verb)),
         // A subcommand-less global read (`--version`/`--help`) is a pure read —
         // admit it with no output-ownership concern (bug 22).
         Recog::GlobalRead => return None,
@@ -1431,8 +1576,9 @@ fn catenary_occ_denial(occ: &CatenaryOcc) -> Option<String> {
 
 /// The recognized agent-facing command surface, for "unknown subcommand" denials.
 const CATENARY_SURFACE: &str = "Available: `grep`, `glob`, `query`, `diagnostics`, \
-     `editing start`, `pin`, `unpin`, `roots`, `worktree ls/add/rm`, \
-     `commands`, `primer`, `version`. Run `catenary primer` for the workflow.";
+     `editing start`, `pin`, `unpin`, `claim`, `roots`, `worktree ls/add/rm`, \
+     `commands`, `config`, `doctor`, `service status`, `primer`, `version`, \
+     `help`. Run `catenary primer` for the workflow.";
 
 fn unknown_subcommand_denial() -> String {
     format!("That isn't a recognized `catenary` command. {CATENARY_SURFACE}")
@@ -1442,6 +1588,22 @@ fn not_agent_invocable_denial() -> String {
     format!(
         "That `catenary` command is for host CLI hooks and interactive use, not \
          agents. {CATENARY_SURFACE}"
+    )
+}
+
+/// A real but maintainer-run verb: daemon control or self-update / installation
+/// (misc 225).
+///
+/// The verb exists — telling the agent it "isn't a recognized `catenary`
+/// command" would be a lie about the binary's own surface, and lying about the
+/// surface teaches nothing. It stays off the agent surface on its own merits:
+/// bouncing the daemon disrupts every other session, and swapping the binary
+/// mid-run swaps the code the session is running against. So the denial names
+/// the verb, admits it is real, and points at the human path.
+fn maintainer_only_denial(verb: &str) -> String {
+    format!(
+        "`catenary {verb}` is a real command, but daemon-control and self-update \
+         verbs are maintainer-run — use `!` or a terminal. {CATENARY_SURFACE}"
     )
 }
 
@@ -1481,6 +1643,13 @@ fn stdin_denial(sub: Sub) -> Option<String> {
             "`catenary worktree diff` takes no stdin — invoke it first in the pipeline."
                 .to_string(),
         ),
+        // Search-class reads that source their own input (misc 225): the
+        // config template is generated, and `doctor` / `service status` probe
+        // the machine. Their output still pipes freely.
+        Sub::Config | Sub::Doctor | Sub::ServiceStatus => Some(format!(
+            "`catenary {}` takes no stdin — invoke it first in the pipeline.",
+            sub.label()
+        )),
         Sub::Diagnostics => {
             Some("`catenary diagnostics` takes no input — run it bare.".to_string())
         }
@@ -5949,17 +6118,18 @@ mod tests {
         assert!(deny_text("catenary $FOO").contains("isn't a recognized"));
         assert!(deny_text("catenary").contains("isn't a recognized"));
         assert!(deny_text("catenary editing").contains("isn't a recognized"));
+        // `debug` was named as a real verb by the old hand-copied list long
+        // after the subcommand was gone (misc 225); the inventory pin makes the
+        // clap tree the arbiter, so it is simply unknown now.
+        assert!(deny_text("catenary debug list").contains("isn't a recognized"));
+        // A shipped verb with an unknown sub-verb: the *invocation* is what is
+        // unrecognized, and the fail-closed fallthrough still denies.
+        assert!(deny_text("catenary service frobnicate").contains("isn't a recognized"));
     }
 
     #[test]
     fn matcher_denies_not_agent_invocable() {
-        for cmd in [
-            "catenary hook pre-tool",
-            "catenary stop",
-            "catenary debug list",
-            "catenary config",
-            "catenary daemon",
-        ] {
+        for cmd in ["catenary hook pre-tool", "catenary daemon"] {
             assert!(
                 deny_text(cmd).contains("host CLI hooks"),
                 "{cmd} should be not-agent-invocable",
@@ -5968,60 +6138,196 @@ mod tests {
     }
 
     /// Regression pin (misc 123 / feedback 08 finding 3): `catenary stop` is a
-    /// host-only daemon-lifecycle command — an agent must never be able to turn
-    /// the daemon off (and disrupt every other session). The stop-confirmation
-    /// UX (a human-TTY-only prompt, `--force` to skip) does NOT open an agent
-    /// path: `recognize_catenary_sub` keeps classifying `stop` as `NotAgent`,
-    /// and the `--force` flag does not change that. Do not weaken without a
-    /// maintainer ruling.
+    /// maintainer-run daemon-lifecycle command — an agent must never be able to
+    /// turn the daemon off (and disrupt every other session). The
+    /// stop-confirmation UX (a human-TTY-only prompt, `--force` to skip) does
+    /// NOT open an agent path: `recognize_catenary_sub` keeps classifying
+    /// `stop` off the agent surface, and the `--force` flag does not change
+    /// that. Do not weaken without a maintainer ruling.
     #[test]
-    fn recognize_catenary_stop_stays_not_agent() {
-        assert_eq!(recognize_catenary_sub(&["stop"]), Recog::NotAgent);
+    fn recognize_catenary_stop_stays_maintainer_only() {
+        assert_eq!(
+            recognize_catenary_sub(&["stop"]),
+            Recog::MaintainerOnly("stop")
+        );
         // Trailing args (the new `--force`) don't reclassify it.
         assert_eq!(
             recognize_catenary_sub(&["stop", "--force"]),
-            Recog::NotAgent,
+            Recog::MaintainerOnly("stop"),
         );
         // And the full pipeline still denies both forms for the agent surface.
-        assert!(deny_text("catenary stop").contains("host CLI hooks"));
-        assert!(deny_text("catenary stop --force").contains("host CLI hooks"));
+        assert!(deny_text("catenary stop").contains("maintainer-run"));
+        assert!(deny_text("catenary stop --force").contains("maintainer-run"));
     }
 
     /// `catenary start` (bug 80, leg 2) is a daemon-lifecycle verb like `stop`,
-    /// not an agent surface: `recognize_catenary_sub` classifies it `NotAgent`
-    /// (so it is not an unknown-subcommand denial), and the full agent pipeline
-    /// still routes it away from the agent surface.
+    /// not an agent surface: `recognize_catenary_sub` classifies it
+    /// `MaintainerOnly` (so it is not an unknown-subcommand denial), and the
+    /// full agent pipeline still routes it away from the agent surface.
     #[test]
-    fn recognize_catenary_start_stays_not_agent() {
-        assert_eq!(recognize_catenary_sub(&["start"]), Recog::NotAgent);
-        assert!(deny_text("catenary start").contains("host CLI hooks"));
+    fn recognize_catenary_start_stays_maintainer_only() {
+        assert_eq!(
+            recognize_catenary_sub(&["start"]),
+            Recog::MaintainerOnly("start")
+        );
+        assert!(deny_text("catenary start").contains("maintainer-run"));
     }
 
     /// `catenary restart` / `catenary quit` (pulse 04) are daemon-lifecycle
-    /// verbs like `start`/`stop`: host-CLI-only, never agent-invocable — an
+    /// verbs like `start`/`stop`: maintainer-run, never agent-invocable — an
     /// agent must not bounce the daemon or end other sessions' bridges. They
-    /// classify `NotAgent` (accurate host-CLI teaching, not an
-    /// unknown-subcommand denial), and they stay OUT of the agent-available
-    /// surface listing.
+    /// classify `MaintainerOnly` (accurate teaching, not an unknown-subcommand
+    /// denial), and they stay OUT of the agent-available surface listing.
     #[test]
-    fn recognize_catenary_restart_and_quit_stay_not_agent() {
-        assert_eq!(recognize_catenary_sub(&["restart"]), Recog::NotAgent);
-        assert_eq!(recognize_catenary_sub(&["quit"]), Recog::NotAgent);
+    fn recognize_catenary_restart_and_quit_stay_maintainer_only() {
+        assert_eq!(
+            recognize_catenary_sub(&["restart"]),
+            Recog::MaintainerOnly("restart")
+        );
+        assert_eq!(
+            recognize_catenary_sub(&["quit"]),
+            Recog::MaintainerOnly("quit")
+        );
         assert_eq!(
             recognize_catenary_sub(&["quit", "--force"]),
-            Recog::NotAgent,
+            Recog::MaintainerOnly("quit"),
         );
-        assert!(deny_text("catenary restart").contains("host CLI hooks"));
-        assert!(deny_text("catenary quit").contains("host CLI hooks"));
-        assert!(deny_text("catenary quit --force").contains("host CLI hooks"));
+        assert!(deny_text("catenary restart").contains("maintainer-run"));
+        assert!(deny_text("catenary quit").contains("maintainer-run"));
+        assert!(deny_text("catenary quit --force").contains("maintainer-run"));
         // The agent-available listing in the denial must not name the
-        // host-only lifecycle verbs.
+        // maintainer-only lifecycle verbs.
         for verb in ["`restart`", "`quit`", "`start`", "`stop`"] {
             assert!(
                 !CATENARY_SURFACE.contains(verb),
                 "{verb} must stay out of the agent-available surface listing",
             );
         }
+    }
+
+    // ---- Shipped-verb inventory (misc 225) ----
+
+    /// The inventory is a lookup table read on the deny path: duplicate or
+    /// unsorted entries make it unreviewable and let a second entry for the
+    /// same verb silently shadow the first.
+    #[test]
+    fn shipped_verb_inventory_is_sorted_and_unique() {
+        let names = known_catenary_verbs();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "keep CATENARY_VERBS sorted by verb");
+        sorted.dedup();
+        assert_eq!(
+            names.len(),
+            sorted.len(),
+            "duplicate verb in CATENARY_VERBS"
+        );
+    }
+
+    /// Misc 225, the core defect: the filter must never tell an agent that a
+    /// verb the binary ships "isn't a recognized `catenary` command". Every
+    /// non-agent verb in the shipped inventory denies with teaching that admits
+    /// the verb is real.
+    #[test]
+    fn shipped_verbs_never_take_the_unrecognized_teaching() {
+        for (verb, kind) in CATENARY_VERBS {
+            if *kind == VerbKind::Dispatched {
+                continue;
+            }
+            let msg = deny_text(&format!("catenary {verb}"));
+            assert!(
+                !msg.contains("isn't a recognized"),
+                "`catenary {verb}` ships — its denial must not deny it exists: {msg}",
+            );
+        }
+    }
+
+    /// The maintainer-only teaching is honest teaching: it names the verb,
+    /// says it is real, gives the reason, and points at the human path.
+    #[test]
+    fn maintainer_only_teaching_names_the_verb_and_the_human_path() {
+        for (cmd, verb) in [
+            ("catenary stop", "stop"),
+            ("catenary update", "update"),
+            ("catenary install claude", "install"),
+            ("catenary service install", "service install"),
+            ("catenary service uninstall", "service uninstall"),
+        ] {
+            let msg = deny_text(cmd);
+            assert!(
+                msg.contains(&format!("`catenary {verb}` is a real command")),
+                "{cmd} must be named as real: {msg}",
+            );
+            assert!(msg.contains("maintainer-run"), "got: {msg}");
+            assert!(msg.contains("use `!` or a terminal"), "got: {msg}");
+            assert!(!msg.contains("isn't a recognized"), "got: {msg}");
+        }
+    }
+
+    /// Misc 225, the reported symptom: `catenary service status` is a
+    /// read-only report the binary ships, and it was denied as unrecognized.
+    /// It is Search-class now — allowed bare, chaining and piping like `query`
+    /// (its output is complete and client-owned).
+    #[test]
+    fn service_status_is_agent_invocable() {
+        assert_eq!(
+            recognize_catenary_sub(&["service", "status"]),
+            Recog::Agent(Sub::ServiceStatus),
+        );
+        assert_eq!(
+            analyze_catenary_command("catenary service status", None),
+            CatenaryAction::Allow { has_foreign: false },
+        );
+        // Search-class: chains with allowlisted foreign commands and pipes.
+        assert!(matches!(
+            analyze_catenary_command("catenary service status | grep active", None),
+            CatenaryAction::Allow { .. }
+        ));
+        // Its daemon-control siblings stay off the agent surface.
+        assert_eq!(
+            recognize_catenary_sub(&["service", "install"]),
+            Recog::MaintainerOnly("service install"),
+        );
+    }
+
+    /// `config` and `doctor` are read-only introspection the binary ships
+    /// (misc 225, ratified allow): the template goes to stdout and `doctor`
+    /// only probes. Both are Search-class, so redirecting the template — the
+    /// documented way to seed a config — is not a bare-only violation.
+    #[test]
+    fn config_and_doctor_are_agent_invocable() {
+        assert_eq!(
+            recognize_catenary_sub(&["config"]),
+            Recog::Agent(Sub::Config)
+        );
+        assert_eq!(
+            recognize_catenary_sub(&["doctor"]),
+            Recog::Agent(Sub::Doctor)
+        );
+        assert_eq!(
+            analyze_catenary_command("catenary config", None),
+            CatenaryAction::Allow { has_foreign: false },
+        );
+        assert!(matches!(
+            analyze_catenary_command("catenary config > config.toml", None),
+            CatenaryAction::Allow { .. }
+        ));
+        assert!(matches!(
+            analyze_catenary_command("catenary doctor --nocolor", None),
+            CatenaryAction::Allow { .. }
+        ));
+    }
+
+    /// `catenary help [topic]` is clap's generated help subcommand — the same
+    /// pure read as `--help`, so it is a global read, not an unknown verb.
+    #[test]
+    fn help_subcommand_is_a_global_read() {
+        assert_eq!(recognize_catenary_sub(&["help"]), Recog::GlobalRead);
+        assert_eq!(recognize_catenary_sub(&["help", "grep"]), Recog::GlobalRead);
+        assert_eq!(
+            analyze_catenary_command("catenary help", None),
+            CatenaryAction::Allow { has_foreign: false },
+        );
     }
 
     // ---- Foreign regime unaffected ----

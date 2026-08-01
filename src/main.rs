@@ -4091,6 +4091,46 @@ fn resolve_claude_directory_hooks_path(home: &std::path::Path) -> Option<std::pa
 mod tests {
     use super::*;
 
+    // ── Command-filter verb inventory pin (misc 225) ──────────────
+
+    /// The command filter's shipped-verb inventory must equal this binary's
+    /// clap command tree, name for name.
+    ///
+    /// This is what makes `command_filter::CATENARY_VERBS` a *derived* copy of
+    /// the clap tree rather than a second source of truth. The tree is defined
+    /// here in the `catenary` binary and the filter lives in the `catenary-cli`
+    /// library, so the library cannot read `Args` directly — the pin is the
+    /// derivation.
+    ///
+    /// Its absence is what let misc 225 happen: ws49-04 added the `service`
+    /// subcommand here and not to the filter's hand-copied list, so
+    /// `catenary service status` was denied as "not a recognized `catenary`
+    /// command" by the very binary that ships it, while the long-gone `debug`
+    /// was still listed as real. Adding, renaming, or removing a top-level
+    /// subcommand now fails here until the inventory follows.
+    #[test]
+    fn clap_command_tree_matches_filter_verb_inventory() {
+        use clap::CommandFactory as _;
+
+        let mut cmd = Args::command();
+        // Build so clap's generated `help` subcommand is present — the agent's
+        // shell invocation reaches the built tree, so the filter must too.
+        cmd.build();
+        let mut clap_verbs: Vec<&str> =
+            cmd.get_subcommands().map(clap::Command::get_name).collect();
+        clap_verbs.sort_unstable();
+
+        let mut filter_verbs = catenary_cli::cli::command_filter::known_catenary_verbs();
+        filter_verbs.sort_unstable();
+
+        assert_eq!(
+            clap_verbs, filter_verbs,
+            "the command filter's verb inventory has drifted from the clap \
+             command tree — update `CATENARY_VERBS` in \
+             `src/cli/command_filter.rs` and classify the verb (misc 225)",
+        );
+    }
+
     // ── Legacy DB drain tests (observability ticket 07) ───────────
 
     #[cfg(unix)]
