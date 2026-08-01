@@ -850,7 +850,7 @@ impl HookRouter {
         // than `due` (every unpaid candidate lives in one of these roots), so the
         // block-iff-`due` invariant holds.
         let named = crate::lock::due_in_candidate_roots_in(locks_base, &candidates);
-        Some(HookResult::Block(self.stop_block_message(&named)))
+        Some(HookResult::Block(self.stop_block_message(&named, agent_id)))
     }
 
     /// The Stop-block message — names the due files and points at the payment
@@ -862,14 +862,23 @@ impl HookRouter {
     /// bare "run `catenary diagnostics` before finishing" — the opacity that made
     /// this bug need a firehose dig to see. There is no command to re-run at a
     /// Stop, so the trailer teaches the two payment forms and closes with the
-    /// recovery half (misc 228): a worker blocked here has usually already
-    /// composed its report, and the host returns its LAST message — so paying
-    /// without restating would hand the dispatcher this receipt instead of the
-    /// deliverable. The line is agent-neutral by construction (the same Stop
-    /// gate serves the main agent, whose last message its reader sees the same
-    /// way), matching the pay-first deadline the `SubagentStart` payload teaches
-    /// up front.
-    fn stop_block_message(&self, files: &[PathBuf]) -> String {
+    /// recovery half (misc 228): an agent blocked here has usually already
+    /// composed its final message, and the host returns exactly that LAST
+    /// message — so paying without restating would hand its reader this receipt
+    /// instead of the deliverable. Matches the pay-first deadline the
+    /// `SubagentStart` payload teaches up front.
+    ///
+    /// The recovery line BRANCHES on agent identity (misc 228, the ruled
+    /// lead-wording edge). One Stop gate serves both stop events — Claude Code's
+    /// `Stop` (the LEAD, whose `agent_id` is empty) and `SubagentStop` (a WORKER,
+    /// carrying its spawn identity) — and no single wording is true for both: a
+    /// lead has no dispatcher, its last message goes to the USER. So the worker
+    /// wording names the dispatcher and the lead wording names the user; each
+    /// says the same thing about the reader it actually has. Identity is read
+    /// off `agent_id` alone (the protocol's documented "empty string for the
+    /// main agent" convention — see [`crate::hook::HookRequest::PostAgent`]),
+    /// not the host event name, which never reaches this layer.
+    fn stop_block_message(&self, files: &[PathBuf], agent_id: &str) -> String {
         use std::collections::BTreeMap;
         use std::fmt::Write as _;
 
@@ -908,11 +917,21 @@ impl HookRouter {
             "Run `catenary diagnostics` to check them all, or name paths to check only some:"
         );
         let _ = writeln!(msg, "  catenary diagnostics {scoped}");
-        let _ = write!(
-            msg,
-            "Then restate your report — your last message is what your dispatcher \
-             receives, so it must not be this receipt."
-        );
+        if agent_id.is_empty() {
+            // The LEAD (top-level `Stop`): no dispatcher — the user is the reader.
+            let _ = write!(
+                msg,
+                "Then restate your answer — your last message is what the user \
+                 sees, so it must not be this receipt."
+            );
+        } else {
+            // A WORKER (`SubagentStop`): the shipped 12d60b9 wording, verbatim.
+            let _ = write!(
+                msg,
+                "Then restate your report — your last message is what your dispatcher \
+                 receives, so it must not be this receipt."
+            );
+        }
         msg
     }
 
@@ -1129,7 +1148,13 @@ mod tests {
     /// Books a file into the real ledger under `locks` and records it in the
     /// in-memory candidate batch — the state a covered edit leaves behind.
     fn book_and_record(router: &HookRouter, locks: &Path, file: &Path) {
-        let owner = crate::lock::Owner::new("test", "", "");
+        book_and_record_as(router, locks, file, "");
+    }
+
+    /// [`book_and_record`] for a named agent identity — the WORKER shape (a
+    /// `SubagentStop` carries its spawn `agent_id`; the main agent's is empty).
+    fn book_and_record_as(router: &HookRouter, locks: &Path, file: &Path, agent_id: &str) {
+        let owner = crate::lock::Owner::new("test", "", agent_id);
         let booking =
             crate::lock::Booking::from_config(&crate::config::Config::load().expect("cfg"));
         let acquired =
@@ -1138,11 +1163,11 @@ mod tests {
             matches!(acquired, crate::lock::Acquired::Ours),
             "the edit books the ledger"
         );
-        let _ = router.session.editing.start_editing(None, "");
+        let _ = router.session.editing.start_editing(None, agent_id);
         router
             .session
             .editing
-            .record_covered_edit(None, "", file.to_path_buf(), true);
+            .record_covered_edit(None, agent_id, file.to_path_buf(), true);
     }
 
     #[test]
@@ -1175,18 +1200,20 @@ mod tests {
     }
 
     #[test]
-    fn stop_block_teaches_restating_the_report_after_paying() {
+    fn subagent_stop_block_teaches_restating_the_report_to_the_dispatcher() {
         // misc 228: a worker blocked here has usually already composed its
         // report, and the host returns its LAST message — so the block must
         // teach the recovery half (pay, then RESTATE), or the dispatcher
-        // receives the debt receipt instead of the deliverable. The line is one
-        // rendered line, so the pinned phrases cannot span a wrap.
+        // receives the debt receipt instead of the deliverable. The WORKER
+        // identity (a `SubagentStop` carries its spawn `agent_id`) draws the
+        // shipped 12d60b9 wording verbatim. The line is one rendered line, so
+        // the pinned phrases cannot span a wrap.
         let (router, root, locks) = stop_router_with_ledger();
         let file = root.join("src/main.rs");
         std::fs::write(&file, b"").expect("write file");
-        book_and_record(&router, &locks, &file);
+        book_and_record_as(&router, &locks, &file, "sub-1");
 
-        let result = router.require_release_in(None, "", false, &locks);
+        let result = router.require_release_in(None, "sub-1", false, &locks);
         let Some(HookResult::Block(msg)) = result else {
             unreachable!("expected Block on unpaid ledger, got {result:?}");
         };
@@ -1198,6 +1225,12 @@ mod tests {
             msg.contains("your last message is what your dispatcher receives"),
             "the block must give the reason (last message wins); got:\n{msg}"
         );
+        // The wrong reader must be absent: a worker's last message goes to its
+        // dispatcher, not to the user.
+        assert!(
+            !msg.contains("what the user sees"),
+            "a worker must not be told the user reads its last message; got:\n{msg}"
+        );
         // Recovery, not payment: the restate line closes the message, after the
         // two payment forms it already taught.
         let pay = msg
@@ -1205,6 +1238,49 @@ mod tests {
             .expect("the block teaches the payment command");
         let restate = msg
             .find("Then restate your report")
+            .expect("the block teaches the restate");
+        assert!(
+            pay < restate,
+            "restate must follow the payment teaching; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn main_agent_stop_block_teaches_restating_the_answer_to_the_user() {
+        // misc 228, the ruled lead-wording edge: the same Stop gate serves the
+        // LEAD (a top-level `Stop`, whose `agent_id` is empty), and a lead has
+        // no dispatcher — its last message goes to the USER. The recovery half
+        // must therefore name the reader it actually has, and the worker's
+        // dispatcher clause must be ABSENT (it read vacuously-true here).
+        let (router, root, locks) = stop_router_with_ledger();
+        let file = root.join("src/main.rs");
+        std::fs::write(&file, b"").expect("write file");
+        book_and_record(&router, &locks, &file);
+
+        let result = router.require_release_in(None, "", false, &locks);
+        let Some(HookResult::Block(msg)) = result else {
+            unreachable!("expected Block on unpaid ledger, got {result:?}");
+        };
+        assert!(
+            msg.contains("Then restate your answer"),
+            "the block must teach restating the answer; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("your last message is what the user sees"),
+            "the lead's reason names the user; got:\n{msg}"
+        );
+        // The wrong clause must be absent — a lead has no dispatcher.
+        assert!(
+            !msg.contains("dispatcher"),
+            "the lead wording must not mention a dispatcher; got:\n{msg}"
+        );
+        // Recovery, not payment: the restate line closes the message, after the
+        // two payment forms it already taught.
+        let pay = msg
+            .find("catenary diagnostics")
+            .expect("the block teaches the payment command");
+        let restate = msg
+            .find("Then restate your answer")
             .expect("the block teaches the restate");
         assert!(
             pay < restate,
