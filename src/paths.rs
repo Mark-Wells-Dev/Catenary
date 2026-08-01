@@ -26,7 +26,11 @@
 //! This module owns the **only** blessed `dirs::*` base-dir calls in the
 //! codebase; `clippy.toml`'s `disallowed-methods` gate denies them everywhere
 //! else (bug 149), so a new home- or base-rooted path cannot re-enter without
-//! an override behind it.
+//! an override behind it. It likewise owns the only environment read of `HOME`
+//! (misc 229) — clippy cannot key a denial on an *argument*, so that half of the
+//! class is held by a source-scan pin test in this module's tests, and
+//! [`compress_home`] (the one `~`-compressing display helper) reads home through
+//! [`home_dir`] like everything else.
 //!
 //! [`encode_cwd`] flattens an absolute path into a single filesystem-safe
 //! directory-name component, used as the per-root shard key in the firehose tree.
@@ -189,6 +193,33 @@ pub fn home_dir() -> Option<PathBuf> {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(dirs::home_dir)
+}
+
+/// Render `path` with a leading `~` when it lies under the user's home.
+///
+/// The **one** `~`-compressing display helper (misc 229). CLI receipts, the
+/// `cwd:` anchor lines, the config file's `[roots] pinned` entries and the TUI
+/// all render home-rooted paths this way, and they must agree byte for byte —
+/// three hand-copied definitions used to, and had already drifted.
+///
+/// Home itself renders as the bare `~`; a path beneath it as `~/<rel>`; a path
+/// outside home (or a homeless host) as the plain absolute form.
+///
+/// Resolution goes through [`home_dir`], so `CATENARY_HOME_DIR` moves the
+/// compression along with every other home-rooted path.
+#[must_use]
+pub fn compress_home(path: &Path) -> String {
+    let Some(home) = home_dir() else {
+        return path.display().to_string();
+    };
+    let Ok(rel) = path.strip_prefix(&home) else {
+        return path.display().to_string();
+    };
+    if rel.as_os_str().is_empty() {
+        // `~` alone for the home directory itself; `~/rel` otherwise.
+        return "~".to_string();
+    }
+    format!("~/{}", rel.display())
 }
 
 /// Flatten a string into one filesystem-safe path component.
@@ -418,5 +449,152 @@ mod tests {
             "unexpected leaf path: {}",
             dir.display(),
         );
+    }
+
+    // ── compress_home (the one `~`-compressing helper, misc 229) ──
+
+    #[test]
+    fn compress_home_renders_home_itself_as_bare_tilde() {
+        let Some(home) = home_dir() else {
+            return; // homeless host — the compression is a no-op by contract
+        };
+        assert_eq!(compress_home(&home), "~");
+    }
+
+    #[test]
+    fn compress_home_renders_a_path_under_home_relative() {
+        let Some(home) = home_dir() else {
+            return;
+        };
+        assert_eq!(
+            compress_home(&home.join("Projects/Widget")),
+            "~/Projects/Widget"
+        );
+    }
+
+    #[test]
+    fn compress_home_leaves_a_path_outside_home_absolute() {
+        assert_eq!(compress_home(Path::new("/srv/project")), "/srv/project");
+    }
+
+    // ── The raw-`$HOME` gate (misc 229) ───────────────────────────
+
+    /// No production code may read `HOME` from the environment directly — every
+    /// home-rooted path resolves through [`home_dir`].
+    ///
+    /// Bug 149 closed the `dirs::*` route with `clippy.toml`'s
+    /// `disallowed-methods` gate, but a raw `std::env::var`/`var_os` of `HOME`
+    /// walks straight past it: `std::env::var` is legitimately everywhere and
+    /// clippy cannot key a denial on an *argument*. So this class gets a source
+    /// scan instead. What it protects is the *next* home-rooted write: built on
+    /// a raw read it escapes both `CATENARY_HOME_DIR` and `isolate_env`
+    /// silently, and a test rewrites the operator's real `~/.claude` (the
+    /// bug-109/149 family).
+    ///
+    /// `#[cfg(test)]` code is exempt — a test may legitimately read the real
+    /// `HOME` — and the scan finds those regions structurally: a column-0
+    /// `#[cfg(test)]` opens a region that ends at its item's column-0 closing
+    /// delimiter (rustfmt puts every top-level item's closer there). An
+    /// *indented* `#[cfg(test)]` (a test-only method inside an `impl`) is
+    /// deliberately not exempt — the scan errs toward flagging, never toward
+    /// waving code through.
+    #[test]
+    fn production_code_reads_home_only_through_the_paths_resolver() {
+        let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&src_root, &mut files);
+        assert!(
+            files.len() > 50,
+            "the source walk found only {} file(s) under {} — the walk is \
+             broken, not the tree",
+            files.len(),
+            src_root.display(),
+        );
+
+        // This file is the blessed home: the resolver, and this scan's needles.
+        let blessed = src_root.join("paths.rs");
+        let mut offenders = Vec::new();
+        for file in files.iter().filter(|f| **f != blessed) {
+            let Ok(text) = std::fs::read_to_string(file) else {
+                continue;
+            };
+            for (line_no, line) in production_lines(&text) {
+                if line.trim_start().starts_with("//") {
+                    continue; // prose about the class, not a read
+                }
+                if line.contains("var(\"HOME\")") || line.contains("var_os(\"HOME\")") {
+                    offenders.push(format!("{}:{line_no}", file.display()));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "raw `$HOME` reads in production code — route them through \
+             `crate::paths::home_dir()`, whose `CATENARY_HOME_DIR` override is \
+             what keeps home-rooted paths inside test isolation (misc 229):\n  {}",
+            offenders.join("\n  "),
+        );
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The `(1-based line number, line)` pairs of `source` that live outside a
+    /// top-level `#[cfg(test)]` item.
+    fn production_lines(source: &str) -> Vec<(usize, &str)> {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i] != "#[cfg(test)]" {
+                out.push((i + 1, lines[i]));
+                i += 1;
+                continue;
+            }
+            i += 1;
+            // Further attributes / doc comments before the item head.
+            while i < lines.len() && (lines[i].starts_with("#[") || lines[i].starts_with("//")) {
+                let one_line = lines[i].starts_with("//") || lines[i].trim_end().ends_with(']');
+                i += 1;
+                if !one_line {
+                    // A wrapped attribute: run to its column-0 `)]`.
+                    while i < lines.len() && !closes_at_column_zero(lines[i]) {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            // The item itself: a one-liner ends at its `;`, a block at its
+            // column-0 closing delimiter.
+            let Some(head) = lines.get(i) else { break };
+            let is_block = !head.trim_end().ends_with(';');
+            i += 1;
+            if is_block {
+                while i < lines.len() && !closes_at_column_zero(lines[i]) {
+                    i += 1;
+                }
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Whether `line` opens a top-level item's closer (`}`, `];`, `)]`) —
+    /// rustfmt puts it at column 0.
+    fn closes_at_column_zero(line: &str) -> bool {
+        line.starts_with('}') || line.starts_with(']') || line.starts_with(')')
     }
 }

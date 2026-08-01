@@ -159,14 +159,19 @@ fn relative_scope_results_disclose_the_cwd_anchor() -> Result<()> {
     // The sighting command shape: relative glob, cwd = tree A. The expected
     // anchor uses the canonical path (the CLI reads its cwd via `getcwd`,
     // which resolves symlinked prefixes — macOS `/var` → `/private/var`) and
-    // applies the CLI's `~` home compression.
+    // applies the CLI's `~` home compression. That compression resolves home
+    // through `paths::home_dir()`, so under `isolate_env` the reference point is
+    // the isolated home base, not the operator's real `$HOME` (misc 229) — the
+    // test derives it the same way so both sides agree wherever `TMPDIR` lives.
     let (stdout, _, ok) = run_cli(state_home, tree_a.path(), &["grep", "M172_", "src/**/*.rs"])?;
     assert!(ok, "relative-scope grep must exit 0");
-    let canon = tree_a.path().canonicalize()?.display().to_string();
-    let compressed = std::env::var("HOME")
-        .ok()
-        .and_then(|home| canon.strip_prefix(&home).map(|rest| format!("~{rest}")))
-        .unwrap_or(canon);
+    let canon = tree_a.path().canonicalize()?;
+    let compressed = canon
+        .strip_prefix(common::catenary_home(state_home))
+        .map_or_else(
+            |_| canon.display().to_string(),
+            |rest| format!("~/{}", rest.display()),
+        );
     let cwd_line = format!("cwd: {compressed}");
     assert!(
         stdout.starts_with(&cwd_line),

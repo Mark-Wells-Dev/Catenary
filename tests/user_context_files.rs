@@ -36,7 +36,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use common::{DaemonGuard, isolate_env, xdg_config_home};
+use common::{DaemonGuard, catenary_home, isolate_env, xdg_config_home};
 
 /// The provenance-header label every emitted block opens with.
 const PROVENANCE_LABEL: &str = "Catenary user context —";
@@ -50,18 +50,15 @@ fn write_context_file(root: &str, name: &str, content: &str) -> Result<()> {
 
 /// The spelling of a context file's path that its provenance header must carry.
 ///
-/// Mirrors the production `~`-compression (`bridge::compress_home`, `pub(crate)`
-/// and so unreachable from an integration test): `$HOME`-prefixed paths render
-/// `~/…`, everything else absolute. `isolate_env` deliberately does not redirect
-/// `$HOME`, so both sides resolve the same one — and the assertion holds even
-/// where `TMPDIR` lives under the home directory.
+/// Mirrors the production `~`-compression (`paths::compress_home`): a path under
+/// the home directory renders `~/…`, everything else absolute. Home is whatever
+/// `paths::home_dir()` resolves to, which under `isolate_env` is the isolated
+/// home base — **not** the operator's real `$HOME` (misc 229). Deriving it from
+/// [`catenary_home`] is what keeps both sides on one home, and it is why the
+/// assertion holds even where `TMPDIR` lives under the operator's home.
 fn provenance_target(root: &str, name: &str) -> String {
     let path = xdg_config_home(root).join("catenary").join(name);
-    let home = std::env::var("HOME").unwrap_or_default();
-    if home.is_empty() {
-        return path.display().to_string();
-    }
-    path.strip_prefix(&home).map_or_else(
+    path.strip_prefix(catenary_home(root)).map_or_else(
         |_| path.display().to_string(),
         |rel| format!("~/{}", rel.display()),
     )

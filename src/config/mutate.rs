@@ -309,7 +309,7 @@ pub fn pin_config(path: &Path, canonical: &Path) -> Result<bool> {
     if pinned_array_contains(array, canonical) {
         return Ok(false);
     }
-    push_pin_entry(array, &compress_home(canonical));
+    push_pin_entry(array, &crate::paths::compress_home(canonical));
     write_document(path, &doc)?;
     Ok(true)
 }
@@ -475,22 +475,6 @@ fn pinned_entry_matches(raw: &str, canonical: &Path) -> bool {
         std::path::absolute(expanded).unwrap_or_else(|_| expanded.to_path_buf())
     });
     resolved == canonical
-}
-
-/// Renders `path` with a leading `~` when it lies under `$HOME`, matching the
-/// config file's hand-authored idiom; otherwise the plain absolute form.
-fn compress_home(path: &Path) -> String {
-    if let Ok(home) = std::env::var("HOME") {
-        let home = Path::new(&home);
-        if let Ok(rel) = path.strip_prefix(home) {
-            // `~` alone for `$HOME` itself; `~/rel` otherwise.
-            if rel.as_os_str().is_empty() {
-                return "~".to_string();
-            }
-            return format!("~/{}", rel.display());
-        }
-    }
-    path.display().to_string()
 }
 
 /// Rewrite `[lsp.language.<language>].servers` from `bindings`, with `server`'s

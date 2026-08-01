@@ -670,7 +670,7 @@ impl DiagnosticsServer {
             // path is a direct request and earns a line (bug 58).
             let Ok(path) = resolve_path(&file_str) else {
                 out_of_scope.push(OutOfScopeEntry {
-                    display: super::compress_home(std::path::Path::new(file_str.as_ref())),
+                    display: crate::paths::compress_home(std::path::Path::new(file_str.as_ref())),
                     kind: OutOfScopeKind::Missing,
                 });
                 continue;
@@ -819,7 +819,7 @@ impl DiagnosticsServer {
                     // ruling 1: the command answers for every named file,
                     // never refuses).
                     out_of_scope.push(OutOfScopeEntry {
-                        display: super::compress_home(&canonical),
+                        display: crate::paths::compress_home(&canonical),
                         kind: OutOfScopeKind::NoSingleFileDiagnostics { server: named },
                     });
                 } else {
@@ -3343,13 +3343,13 @@ fn format_diagnostics_entries(
 fn classify_out_of_scope(resolved: &std::path::Path) -> OutOfScopeEntry {
     resolved.canonicalize().map_or_else(
         |_| OutOfScopeEntry {
-            display: super::compress_home(resolved),
+            display: crate::paths::compress_home(resolved),
             kind: OutOfScopeKind::Missing,
         },
         |canonical| {
             let enclosing_root = crate::companions::enclosing_worktree_root(&canonical);
             OutOfScopeEntry {
-                display: super::compress_home(&canonical),
+                display: crate::paths::compress_home(&canonical),
                 kind: OutOfScopeKind::OutsideRoots { enclosing_root },
             }
         },
@@ -3390,7 +3390,7 @@ fn render_out_of_scope(entries: &[OutOfScopeEntry]) -> String {
                     out,
                     "{} [no language servers running for {} \u{2014} not a mounted root; see `catenary roots -h`]",
                     entry.display,
-                    super::compress_home(root),
+                    crate::paths::compress_home(root),
                 );
             }
             OutOfScopeKind::OutsideRoots {

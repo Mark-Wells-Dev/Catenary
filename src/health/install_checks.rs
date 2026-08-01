@@ -33,14 +33,14 @@ const CONSTRAINED_BASH_MIGRATION: &str = "Command filtering is now built into `c
 /// Claude Code plugin-hook findings, compared against the shipped hooks.
 #[must_use]
 pub fn claude_hooks_findings() -> Vec<Finding> {
-    let Ok(home_str) = std::env::var("HOME") else {
+    let Some(home) = crate::paths::home_dir() else {
         return vec![Finding::new(
             FindingCode::NotInstalled,
             Severity::Info,
             "Claude Code hooks: cannot determine home directory",
         )];
     };
-    claude_hooks_findings_at(&PathBuf::from(home_str))
+    claude_hooks_findings_at(&home)
 }
 
 /// [`claude_hooks_findings`] against an explicit home directory.
@@ -226,14 +226,13 @@ pub fn path_binary_findings() -> Vec<Finding> {
 /// Claude Code plugin registration staleness (installed version vs this build).
 #[must_use]
 pub fn claude_instructions_findings() -> Vec<Finding> {
-    let Ok(home_str) = std::env::var("HOME") else {
+    let Some(home) = crate::paths::home_dir() else {
         return vec![Finding::new(
             FindingCode::NotInstalled,
             Severity::Info,
             "Claude Code instructions: cannot determine home directory",
         )];
     };
-    let home = PathBuf::from(home_str);
 
     let plugins_file = home.join(".claude/plugins/installed_plugins.json");
     let Ok(plugins_json) = std::fs::read_to_string(&plugins_file) else {
@@ -359,10 +358,10 @@ pub fn antigravity_instructions_findings(project_root: &Path) -> Vec<Finding> {
 /// Legacy `constrained_bash.py` findings for Claude Code's settings.
 #[must_use]
 pub fn legacy_script_findings() -> Vec<Finding> {
-    let Ok(home_str) = std::env::var("HOME") else {
+    let Some(home) = crate::paths::home_dir() else {
         return Vec::new();
     };
-    let settings_path = PathBuf::from(home_str).join(".claude/settings.json");
+    let settings_path = home.join(".claude/settings.json");
     let Ok(settings_json) = std::fs::read_to_string(&settings_path) else {
         return Vec::new();
     };
@@ -470,9 +469,8 @@ fn find_antigravity_plugin_dir(project_root: &Path) -> Option<(PathBuf, &'static
         return Some((dir, "workspace"));
     }
 
-    let global_candidate = std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join(".gemini/config/plugins/catenary"))
+    let global_candidate = crate::paths::home_dir()
+        .map(|h| h.join(".gemini/config/plugins/catenary"))
         .filter(|p| p.is_dir());
     global_candidate.map(|p| (p, "global"))
 }

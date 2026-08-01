@@ -8,12 +8,15 @@ use std::path::Path;
 use super::filesystem_manager::FilesystemManager;
 
 /// Expands a leading `~` or `~/` to the user's home directory.
+///
+/// Home resolves through [`crate::paths::home_dir`] (misc 229), so a test's
+/// `CATENARY_HOME_DIR` moves this expansion with every other home-rooted path.
 #[must_use]
 pub fn expand_tilde(path: &str) -> String {
     if (path == "~" || path.starts_with("~/"))
-        && let Ok(home) = std::env::var("HOME")
+        && let Some(home) = crate::paths::home_dir()
     {
-        return format!("{home}{}", &path[1..]);
+        return format!("{}{}", home.display(), &path[1..]);
     }
     path.to_string()
 }

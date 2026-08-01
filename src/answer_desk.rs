@@ -347,28 +347,19 @@ fn path_is_within(path: &Path, prefix: &Path) -> bool {
 /// Collapse a leading `$HOME` in `path` to a `~`-rooted path for glob matching.
 ///
 /// `~/.ssh/id_ed25519` in a pattern must match the absolute `/home/me/.ssh/…`
-/// realpath, so both meet at the `~`-collapsed spelling. A path outside `$HOME`
-/// (or a missing `$HOME`) is returned unchanged.
+/// realpath, so both meet at the `~`-collapsed spelling. A path outside the home
+/// directory (or a homeless host) is returned unchanged.
+///
+/// Home resolves through [`crate::paths::home_dir`] (misc 229) — the same
+/// resolver every other home-rooted path uses, `%USERPROFILE%` fallback
+/// included, so a `CATENARY_HOME_DIR` test moves the denylist's home with it.
 #[must_use]
 fn collapse_home(path: &Path) -> PathBuf {
-    let Some(home) = home_dir() else {
+    let Some(home) = crate::paths::home_dir() else {
         return path.to_path_buf();
     };
     path.strip_prefix(&home)
         .map_or_else(|_| path.to_path_buf(), |rest| PathBuf::from("~").join(rest))
-}
-
-/// The user's home directory, from `$HOME` (Unix) / `%USERPROFILE%` (Windows).
-///
-/// Read directly from the environment rather than the `dirs` crate so the glob
-/// collapse is a pure string op with no extra dependency; a missing var yields
-/// `None` and the collapse is a no-op.
-#[must_use]
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
 }
 
 // ── The PostToolUse secret-redaction backstop ────────────────────────────────

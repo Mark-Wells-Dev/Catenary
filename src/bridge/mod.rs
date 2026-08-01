@@ -62,16 +62,8 @@ pub use path_security::PathValidator;
 // render in both modes and cannot see the daemon's mounted roots, so
 // degradation is disclosed per result, never as a scope header.
 
-/// Compresses a path by replacing the `$HOME` prefix with `~`.
-pub(crate) fn compress_home(path: &Path) -> String {
-    if let Ok(home) = std::env::var("HOME") {
-        let home_path = Path::new(&home);
-        if let Ok(rel) = path.strip_prefix(home_path) {
-            return format!("~/{}", rel.display());
-        }
-    }
-    path.display().to_string()
-}
+// `compress_home` lives in `crate::paths` (misc 229) — one `~`-compressing
+// helper beside the `home_dir` resolver it reads, not a copy per surface.
 
 /// Reads source files once and serves any line by 0-based index.
 ///

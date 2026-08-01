@@ -131,11 +131,11 @@ pub fn systemd_unit_path() -> PathBuf {
 
 /// The launchd `LaunchAgent` plist path: `~/Library/LaunchAgents/<label>.plist`.
 ///
-/// Prefers `$XDG_DATA_HOME` under an `isolate_env` test (the crate points
-/// `CATENARY_DATA_DIR`/`XDG_DATA_HOME` at an isolated subdir) so a test never
-/// touches the operator's real `~/Library`; falls back to `$HOME/Library` in
-/// production. The `LaunchAgents` layout is fixed by launchd, so the isolation
-/// hangs it under the data base's `Library/LaunchAgents`.
+/// Resolved through [`crate::paths::home_dir`], so an `isolate_env` test — which
+/// points `CATENARY_HOME_DIR` at an isolated home base — never touches the
+/// operator's real `~/Library`, while production lands on the real `$HOME`. The
+/// `LaunchAgents` layout is fixed by launchd, so the isolation hangs it under
+/// the isolated home's `Library/LaunchAgents`.
 #[must_use]
 pub fn launchd_plist_path() -> PathBuf {
     launchd_home()
@@ -146,14 +146,12 @@ pub fn launchd_plist_path() -> PathBuf {
 
 /// The base directory that holds `Library/LaunchAgents` for the plist.
 ///
-/// Under an `isolate_env` test `CATENARY_DATA_DIR` names an isolated data base,
-/// so the plist lands there instead of the real `~/Library`; production reads
-/// `$HOME`. Kept private — callers use [`launchd_plist_path`].
+/// The home base, one resolver for every home-rooted artifact (misc 229): it
+/// used to ride the *data* base's `CATENARY_DATA_DIR` override, which isolated
+/// the plist correctly but spelled "home" as "data" — a mislocation the distinct
+/// bases exist to catch. Kept private — callers use [`launchd_plist_path`].
 fn launchd_home() -> PathBuf {
-    std::env::var_os("CATENARY_DATA_DIR")
-        .map(PathBuf::from)
-        .or_else(crate::paths::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
+    crate::paths::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// The absolute path to the currently-running `catenary` binary, for `ExecStart`

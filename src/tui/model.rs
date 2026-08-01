@@ -817,19 +817,22 @@ fn expand_companion_template(template: &str, root: &str) -> String {
     expand_home(&substituted)
 }
 
-/// Expands a leading `~`/`~/` to `$HOME`, leaving the string unchanged when
-/// `HOME` is unset or no tilde is present.
+/// Expands a leading `~`/`~/` to the user's home directory, leaving the string
+/// unchanged when home does not resolve or no tilde is present.
+///
+/// Home resolves through [`crate::paths::home_dir`] (misc 229), the one resolver
+/// every home-rooted path in Catenary reads.
 #[must_use]
 fn expand_home(s: &str) -> String {
     if let Some(rest) = s.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
+        && let Some(home) = crate::paths::home_dir()
     {
-        return format!("{}/{rest}", home.to_string_lossy());
+        return format!("{}/{rest}", home.display());
     }
     if s == "~"
-        && let Some(home) = std::env::var_os("HOME")
+        && let Some(home) = crate::paths::home_dir()
     {
-        return home.to_string_lossy().into_owned();
+        return home.display().to_string();
     }
     s.to_string()
 }

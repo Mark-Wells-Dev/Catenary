@@ -60,12 +60,12 @@ const PROVENANCE_LABEL: &str = "Catenary user context —";
 
 /// The provenance header naming `path` as the source of the block that follows.
 ///
-/// The path is rendered `~`-compressed ([`crate::bridge::compress_home`]) — the
+/// The path is rendered `~`-compressed ([`crate::paths::compress_home`]) — the
 /// same spelling the rest of Catenary's user-facing surfaces use, and the one
 /// the user can paste straight back into an editor.
 #[must_use]
 fn provenance_header(path: &Path) -> String {
-    format!("{PROVENANCE_LABEL} {}:", crate::bridge::compress_home(path))
+    format!("{PROVENANCE_LABEL} {}:", crate::paths::compress_home(path))
 }
 
 /// The two files that compose this audience's payload, in emission order:
@@ -226,7 +226,7 @@ mod tests {
         );
         let shared = tmp.path().join("catenary").join("AGENTS.md");
         assert!(
-            payload.contains(&crate::bridge::compress_home(&shared)),
+            payload.contains(&crate::paths::compress_home(&shared)),
             "the provenance header must name {}: {payload}",
             shared.display(),
         );
@@ -255,11 +255,11 @@ mod tests {
         // The addendum NEVER replaces the shared file — both are present.
         let dir = tmp.path().join("catenary");
         assert!(
-            payload.contains(&crate::bridge::compress_home(&dir.join("AGENTS.md"))),
+            payload.contains(&crate::paths::compress_home(&dir.join("AGENTS.md"))),
             "shared provenance header: {payload}"
         );
         assert!(
-            payload.contains(&crate::bridge::compress_home(&dir.join("AGENTS.claude.md"))),
+            payload.contains(&crate::paths::compress_home(&dir.join("AGENTS.claude.md"))),
             "addendum provenance header: {payload}"
         );
         // One header per file, and the blocks are separated by a blank line.
@@ -333,7 +333,7 @@ mod tests {
         );
         // The stems are distinct files, not a prefix match.
         assert!(
-            worker.contains(&crate::bridge::compress_home(
+            worker.contains(&crate::paths::compress_home(
                 &tmp.path().join("catenary").join("SUBAGENTS.md")
             )),
             "the worker's provenance header names SUBAGENTS.md: {worker}"

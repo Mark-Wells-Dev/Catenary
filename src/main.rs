@@ -21,6 +21,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use catenary_cli::cli::{self, HostFormat, QueryFormat};
 use catenary_cli::logging::LoggingServer;
+// The one `~`-compressing display helper (misc 229) — the binary shares the
+// library's, it does not keep a copy.
+use catenary_cli::paths::compress_home;
 
 use catenary_cli::source::Source;
 
@@ -1448,16 +1451,6 @@ enum SearchKind {
         /// escaped `'\<name>'` spelling (moment 3).
         metachar_names: Vec<String>,
     },
-}
-
-/// Compresses a path by replacing the `$HOME` prefix with `~`.
-fn compress_home(path: &Path) -> String {
-    if let Ok(home) = std::env::var("HOME")
-        && let Ok(rel) = path.strip_prefix(&home)
-    {
-        return format!("~/{}", rel.display());
-    }
-    path.display().to_string()
 }
 
 /// Whether a search's scope was anchored at the invoking cwd: no path
@@ -3995,10 +3988,9 @@ fn check_stale_hooks() {
         }
     }
 
-    let Ok(home) = std::env::var("HOME") else {
+    let Some(home) = catenary_cli::paths::home_dir() else {
         return;
     };
-    let home = std::path::PathBuf::from(home);
 
     // Claude Code: hooks live inside the plugin install path, which is
     // recorded in installed_plugins.json. Resolve the actual path.

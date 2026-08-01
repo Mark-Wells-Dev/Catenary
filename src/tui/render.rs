@@ -1137,7 +1137,7 @@ fn server_detail(
         // "where is it?" is the question the pane answers (ticket 11 item 5).
         let binary = crate::health::servers::resolve_binary(program).map_or_else(
             || "NOT found on $PATH".to_string(),
-            |path| crate::bridge::compress_home(&path),
+            |path| crate::paths::compress_home(&path),
         );
         lines.push(kv("binary", binary, theme));
     }
