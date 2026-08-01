@@ -3082,6 +3082,31 @@ mod tests {
     }
 
     #[test]
+    fn subagent_git_free_make_pipeline_untouched_by_branch_guard() {
+        // bug 144: a worker reported its most ritual command — `make check` piped
+        // into `tail`, plus an `echo "${PIPESTATUS[0]}"` — refused with THIS
+        // guard's teaching. The guard is gated on a `git` command name, so a
+        // git-free compound can never reach it; the real denier was the host
+        // harness's own worktree-isolation check (its message is not in this
+        // repo). Pin the negative here so the misparse family (bugs 137/139)
+        // cannot reintroduce a phantom `git` segment in this shape, and so the
+        // shipped rule set keeps allowing the `PIPESTATUS` idiom.
+        let rules = recommended_rules();
+        let sub = subagent_at("/wt/agent");
+        for cmd in [
+            "make -s check 2>&1 | tail -40; echo \"EXIT=${PIPESTATUS[0]}\"",
+            "make -s check 2>&1 | tail -40",
+            "echo \"EXIT=${PIPESTATUS[0]}\"",
+            "echo \"EXIT=$PIPESTATUS\"",
+        ] {
+            assert!(
+                check_command_in_session(cmd, &rules, None, &sub).is_none(),
+                "`{cmd}` carries no git command — the branch guard must not fire",
+            );
+        }
+    }
+
+    #[test]
     fn subagent_branch_guard_survives_global_option_shuffle() {
         // The bug-140 vocabulary: a value-carrying non-target global (`-c
         // key=val`) before the target/subcommand must not shift the read. The
