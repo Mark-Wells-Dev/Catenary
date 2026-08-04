@@ -334,3 +334,74 @@ fn denied_write_leaves_no_booking() -> Result<()> {
 
     Ok(())
 }
+
+/// bug 118, invariant 1, under the macOS geometry: a first write to a target
+/// that does NOT EXIST YET, reached through a symlinked root prefix, must still
+/// be allowed — and must still arm the honest gate for the next one.
+///
+/// This is the seam misc 230 stressed and the macOS CI red exposed. The hook
+/// books write targets *before* the shell runs (the fingerprint has to snapshot
+/// the pre-write state), so the booked path is frequently one `canonicalize`
+/// cannot resolve. Every spelling in the round trip therefore has to come from
+/// the same lenient resolver:
+///
+///   - the ledger leaf `acquire` writes,
+///   - the `already_due` membership test that computes the self-arm cut,
+///   - the daemon-side `pre_existing_debt` subtraction.
+///
+/// With a raw fallback at any one of them the cut misses and the command is
+/// denied on its own fresh booking — bug 118, resurrected for exactly the paths
+/// a macOS agent uses, since `/tmp` and every tempdir there sit under a symlink.
+#[test]
+fn ghost_target_under_a_symlinked_root_does_not_self_arm() -> Result<()> {
+    let repo = Repo::new()?;
+    let real = repo.root_str()?;
+    // The aliased spelling: a sibling symlink to the repo root, which is what a
+    // host on macOS hands the hook for every path under `/tmp`.
+    let link_holder = tempfile::tempdir()?;
+    let alias = link_holder.path().join("alias");
+    std::os::unix::fs::symlink(real, &alias)?;
+    let alias_root = alias.to_str().context("alias utf-8")?;
+
+    let bridge = spawn_daemon(alias_root)?;
+    write_user_config(bridge.state_home(), WRITE_COMMANDS)?;
+
+    // The target does not exist — a redirect that CREATES it. `canonicalize`
+    // cannot resolve it, so this is the case the raw fallback broke.
+    let ghost = alias.join("src/ghost.rs");
+    assert!(
+        !ghost.exists(),
+        "the target must be a ghost at booking time"
+    );
+
+    let first = run_bash_hook(&bridge, alias_root, "printf 'x\\n' > src/ghost.rs")?;
+    assert!(
+        deny_reason(&first).is_none(),
+        "a first write to a ghost target must never be denied on its own \
+         booking (bug 118 check-then-book), got: {first}"
+    );
+
+    // The command runs and creates the file.
+    let ghost_str = ghost.to_str().context("ghost utf-8")?;
+    execute_write(ghost_str, "x\n")?;
+
+    // The booking landed on the canonical ledger under the mirrored relative
+    // path — not a flattened alias spelling — so the debt is real and payable.
+    let due = due_files(&bridge, alias_root);
+    assert_eq!(
+        due,
+        vec![ghost.canonicalize()?],
+        "the created ghost is owed under its canonical spelling, got: {due:?}"
+    );
+
+    // …and the honest gate still fires for the NEXT write to the same file.
+    let second = run_bash_hook(&bridge, alias_root, "printf 'y\\n' >> src/ghost.rs")?;
+    let reason =
+        deny_reason(&second).context("the second write to a now-due ghost target must be gated")?;
+    assert!(
+        reason.contains("edited but haven't been diagnosed"),
+        "the honest gate names the undiagnosed debt, got: {reason}"
+    );
+
+    Ok(())
+}

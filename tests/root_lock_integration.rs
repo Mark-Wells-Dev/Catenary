@@ -751,6 +751,34 @@ fn reconcile_bracket_checkout_unbooks_reverted_file() -> Result<()> {
 
 // ── The merge bracket: unpaid worktree debt transfers, nothing else (wf-01) ──
 
+/// A tempdir base reached through a **symlinked prefix** — the macOS geometry,
+/// forced on every platform (misc 230 follow-up).
+///
+/// On macOS every tempdir sits under `/var/folders/…` → `/private/var/folders/…`
+/// and `/tmp` is itself a symlink, so every path a host hands the hook carries an
+/// unresolved prefix. Linux tempdirs do not, which is exactly why ubuntu CI
+/// stayed green while macOS went red on the merge-bracket trio: the edit seam
+/// books targets that do not exist yet (misc 230 — the fingerprint must snapshot
+/// the pre-write state), `canonicalize` fails on those, and the raw spelling then
+/// keyed a different ledger leaf than the later consult resolved.
+///
+/// Returns `<tmp>/alias`, a symlink to `<tmp>/real`. Everything the test builds
+/// underneath — repos, worktrees, hook payloads, git invocations — travels the
+/// aliased spelling, so booking and consult are forced to agree the way they must
+/// on macOS. The link is a SIBLING of the directory it points at (never a
+/// self-referential loop), so git's own walks terminate normally.
+fn symlinked_base(tmp: &tempfile::TempDir) -> Result<std::path::PathBuf> {
+    let real = tmp.path().join("real");
+    std::fs::create_dir_all(&real)?;
+    let alias = tmp.path().join("alias");
+    // Unguarded, matching this suite's norm: these integration tests already
+    // drive unix-only machinery (the daemon's Unix domain socket, `chmod`), so a
+    // `cfg(not(unix))` arm here could only be a vacuously-passing branch on a
+    // platform the suite never runs.
+    std::os::unix::fs::symlink(&real, &alias)?;
+    Ok(alias)
+}
+
 /// Init a real git repo at `dir` with a committed `src/lib.rs`.
 fn init_owning_repo(dir: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
@@ -786,12 +814,15 @@ fn merge_bracket_squash_transfers_unpaid_worktree_debt_only() -> Result<()> {
         return Ok(());
     }
     let tmp = tempfile::tempdir()?;
-    let repo = tmp.path().join("repo");
+    // Every path below travels a symlinked prefix — the macOS geometry that
+    // caught the misc-230 booking seam (see [`symlinked_base`]).
+    let base = symlinked_base(&tmp)?;
+    let repo = base.join("repo");
     init_owning_repo(&repo)?;
     let root = repo.to_str().context("repo path utf-8")?;
 
     // The agent worktree, on branch `topic`.
-    let wt = tmp.path().join("repo-wt");
+    let wt = base.join("repo-wt");
     git(
         &repo,
         &[
@@ -859,11 +890,13 @@ fn merge_bracket_full_merge_transfers_committed_unpaid_debt() -> Result<()> {
         return Ok(());
     }
     let tmp = tempfile::tempdir()?;
-    let repo = tmp.path().join("repo");
+    // Symlinked prefix — the macOS geometry (see [`symlinked_base`]).
+    let base = symlinked_base(&tmp)?;
+    let repo = base.join("repo");
     init_owning_repo(&repo)?;
     let root = repo.to_str().context("repo path utf-8")?;
 
-    let wt = tmp.path().join("repo-wt");
+    let wt = base.join("repo-wt");
     git(
         &repo,
         &[
@@ -910,13 +943,15 @@ fn merge_bracket_plain_merge_books_nothing() -> Result<()> {
         return Ok(());
     }
     let tmp = tempfile::tempdir()?;
-    let repo = tmp.path().join("repo");
+    // Symlinked prefix — the macOS geometry (see [`symlinked_base`]).
+    let base = symlinked_base(&tmp)?;
+    let repo = base.join("repo");
     init_owning_repo(&repo)?;
     let root = repo.to_str().context("repo path utf-8")?;
 
     // An agent worktree with UNPAID debt exists — but its branch is not what
     // merges, so the per-ref match (not a no-worktrees shortcut) must decline.
-    let wt = tmp.path().join("repo-wt");
+    let wt = base.join("repo-wt");
     git(
         &repo,
         &[

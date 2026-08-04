@@ -1814,8 +1814,11 @@ fn root_lock_gate(
                 // cut only if it was NOT already due — a fresh booking, not a
                 // re-affirm of standing debt. Canonicalize to match the ledger's
                 // spelling (`acquire` books canonically) and the daemon's
-                // subtraction (misc 193).
-                let canonical = target.canonicalize().unwrap_or_else(|_| target.clone());
+                // subtraction (misc 193). LENIENT, and load-bearing: a write
+                // target that does not exist yet must produce the SAME spelling
+                // the ledger keyed it under, or the `already_due` membership test
+                // below misses and the command escapes the honest gate.
+                let canonical = crate::paths::canonicalize_lenient(target);
                 if !already_due.contains(&canonical) {
                     self_booked.push(canonical);
                 }

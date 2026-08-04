@@ -322,15 +322,18 @@ pub fn decide_read(realpath: &Path, scope: &ReadScope, denylist: &SensitiveDenyl
 
 // ── Path helpers (the spelling rule) ─────────────────────────────────────────
 
-/// Canonicalize `path` to its realpath, falling back to the input unchanged when
-/// it cannot be resolved (a not-yet-existing path, a permission error).
+/// Canonicalize `path` to its realpath — the read-policy ingestion seam.
 ///
-/// The ingestion seam for every scope/denylist path: a symlinked-prefix alias
-/// resolves to the same canonical spelling, so the scope predicate and the
-/// denylist match give one answer per inode-path.
+/// A thin alias for [`crate::paths::canonicalize_lenient`], which is the single
+/// implementation of the lenient-canonicalize idiom (misc 230 follow-up). It
+/// resolves the nearest existing ancestor and keeps the not-yet-existing tail,
+/// so a symlinked-prefix alias gives one answer per inode-path **whether or not
+/// the leaf exists yet** — a read prompt naming a file that has not been created
+/// no longer classifies against a different spelling than the same file gets a
+/// moment later.
 #[must_use]
 pub fn canonicalize_lenient(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    crate::paths::canonicalize_lenient(path)
 }
 
 /// Whether `path` is `prefix` itself or lives beneath it.

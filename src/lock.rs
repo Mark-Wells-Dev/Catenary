@@ -670,7 +670,7 @@ pub fn vetted_serve_files(owner: &Owner) -> Vec<PathBuf> {
 /// (no lock dir) reports [`UnlinkOutcome::NoLedger`]; payment is parole here
 /// too — the lock dir survives for the paid-idle reaper.
 fn unlink_delivered_file_in(locks_base: &Path, file: &Path) -> UnlinkOutcome {
-    let file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    let file = crate::paths::canonicalize_lenient(file);
     let lock_dir = file_lock_dir_in(locks_base, &file);
     if !lock_dir.exists() {
         return UnlinkOutcome::NoLedger;
@@ -1016,12 +1016,11 @@ pub fn due_candidates_in(locks_base: &Path, candidates: &[PathBuf]) -> Vec<PathB
     let mut out = Vec::new();
     for candidate in candidates {
         // Canonicalize at the seam so the spelling matches the canonical ledger
-        // (misc 193 / bug 116). A path that cannot canonicalize (a vanished
-        // edit) keeps its spelling — it will simply miss the canonical due set,
-        // which is the honest reading (a deleted file books no live debt).
-        let file = candidate
-            .canonicalize()
-            .unwrap_or_else(|_| candidate.clone());
+        // (misc 193 / bug 116). Lenient (misc 230 follow-up): a candidate the
+        // agent deleted — or one booked as a ghost target and never created —
+        // still resolves through its nearest existing ancestor, so it meets the
+        // booking's spelling instead of falling back to the raw one.
+        let file = crate::paths::canonicalize_lenient(candidate);
         let Some(root) = resolve_lock_root(&file) else {
             // Markerless: the per-file ledger answers (brackets 03). A stray
             // file the edit seam file-scope-booked is due until diagnosed; a
@@ -1076,9 +1075,7 @@ pub fn due_in_candidate_roots_in(locks_base: &Path, candidates: &[PathBuf]) -> V
     let mut seen_roots: BTreeSet<PathBuf> = BTreeSet::new();
     let mut out: BTreeSet<PathBuf> = BTreeSet::new();
     for candidate in candidates {
-        let file = candidate
-            .canonicalize()
-            .unwrap_or_else(|_| candidate.clone());
+        let file = crate::paths::canonicalize_lenient(candidate);
         let Some(root) = resolve_lock_root(&file) else {
             // Markerless: the candidate's own file-scope ledger is its "root".
             if file_has_debt_in(locks_base, &file) {
@@ -1232,7 +1229,7 @@ pub fn facts_for_in(locks_base: &Path, root: &Path, now: SystemTime) -> Option<L
 /// held root would render as unlocked. Pin: [`facts_read_through_aliased_spelling`].
 #[must_use]
 pub fn facts_for(root: &Path, now: SystemTime) -> Option<LockFacts> {
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let root = crate::paths::canonicalize_lenient(root);
     facts_for_in(&locks_dir(), &root, now)
 }
 
@@ -1311,7 +1308,7 @@ pub fn owner_label(owner: &Owner) -> String {
 /// [`edit_in_nested_inner_root_books_inner_not_outer`].
 #[must_use]
 pub fn resolve_lock_root(file: &Path) -> Option<PathBuf> {
-    let canonical = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    let canonical = crate::paths::canonicalize_lenient(file);
     let root = crate::companions::enclosing_worktree_root(&canonical)?;
     Some(root.canonicalize().unwrap_or(root))
 }
@@ -1471,7 +1468,16 @@ pub fn acquire_in(
     // ledger it will be paid against. Since stage 3 makes the ledger the single
     // source of truth, this spelling rule is load-bearing: a split spelling
     // splits the debt.
-    let file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    //
+    // LENIENT (misc 230 follow-up): the target may not exist yet — a
+    // `printf … > src/new.rs` books before the shell creates it, because the
+    // fingerprint has to snapshot the pre-write state. Plain `canonicalize`
+    // fails outright on such a path and used to fall back to the RAW spelling,
+    // which then missed `touch_file`'s `strip_prefix(root)` (the root always
+    // canonicalizes — it exists) and flattened the leaf. Booking and payment
+    // keyed different spellings; on macOS, where every tempdir and `/tmp` itself
+    // sit under a symlink, that was every ghost target.
+    let file = crate::paths::canonicalize_lenient(file);
     let file = file.as_path();
     let Some(root) = resolve_lock_root(file) else {
         // Markerless (brackets 03): a type the rootless single-file tier
@@ -1789,8 +1795,10 @@ pub fn unlink_delivered_in(
         // Canonicalize the delivered file at the seam (misc 193): the touch path
         // must be computed from the same spelling `acquire_in` booked it under,
         // or a symlinked-prefix alias would compute a different `.lock` leaf and
-        // fail to unlink — leaving phantom debt on a canonical ledger.
-        let file = file.canonicalize().unwrap_or_else(|_| file.clone());
+        // fail to unlink — leaving phantom debt on a canonical ledger. Lenient,
+        // for the same reason the booking is: a file the agent created and then
+        // deleted must still pay the leaf its ghost booking wrote.
+        let file = crate::paths::canonicalize_lenient(file);
         let touch = touch_file(&lock_dir, root, &file);
         let outcome = match std::fs::remove_file(&touch) {
             Ok(()) => UnlinkOutcome::Unlinked,
@@ -1850,7 +1858,7 @@ pub fn book_transferred_in(locks_base: &Path, root: &Path, owner: &Owner, files:
         let _ = write_owner_atomic(&lock_dir, owner);
     }
     for file in files {
-        let file = file.canonicalize().unwrap_or_else(|_| file.clone());
+        let file = crate::paths::canonicalize_lenient(file);
         // [`Track::Asserted`] (misc 230): this seam's callers hold a git oracle
         // that already proved the content moved, and they run AFTER the command
         // — a fingerprint taken here would snapshot the post-move state and read
@@ -1924,7 +1932,7 @@ pub fn reconcile_bracket_in(
     // direct call (a test, a future caller) is never split by a symlinked prefix.
     let modified: std::collections::BTreeSet<PathBuf> = modified
         .iter()
-        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+        .map(|p| crate::paths::canonicalize_lenient(p))
         .collect();
 
     match direction {
@@ -2000,19 +2008,14 @@ pub fn merge_transfer_in(
     owner: &Owner,
     merged: &std::collections::BTreeSet<PathBuf>,
 ) {
-    let worktree_root = worktree_root
-        .canonicalize()
-        .unwrap_or_else(|_| worktree_root.to_path_buf());
-    let owning_root = owning_root
-        .canonicalize()
-        .unwrap_or_else(|_| owning_root.to_path_buf());
+    let worktree_root = crate::paths::canonicalize_lenient(worktree_root);
+    let owning_root = crate::paths::canonicalize_lenient(owning_root);
     let mut transfer: Vec<PathBuf> = Vec::new();
     for unpaid in due_files_in(locks_base, &worktree_root) {
         let Ok(rel) = unpaid.strip_prefix(&worktree_root) else {
             continue; // not under the worktree — never part of this merge's debt
         };
-        let mapped = owning_root.join(rel);
-        let mapped = mapped.canonicalize().unwrap_or(mapped);
+        let mapped = crate::paths::canonicalize_lenient(&owning_root.join(rel));
         if merged.contains(&mapped) {
             transfer.push(mapped);
         }
@@ -3252,6 +3255,87 @@ mod tests {
         assert!(
             due_files_in(&locks, &fx.root).is_empty(),
             "paying through the alias spelling clears the canonical debt"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ghost_target_under_a_symlinked_root_books_the_mirrored_ledger_path() {
+        // The macOS CI red (misc 230 follow-up). Two facts have to combine:
+        //
+        //   1. misc 230 made the hook book targets that DO NOT YET EXIST — a
+        //      `printf … > src/new.rs` books before the shell creates the file,
+        //      because the fingerprint must snapshot the pre-write state.
+        //   2. On macOS every tempdir (and `/tmp` itself) sits under a symlinked
+        //      prefix: `/var/folders/…` → `/private/var/folders/…`.
+        //
+        // `canonicalize` on a nonexistent path FAILS, so the edit seam kept the
+        // raw `/var/…` spelling while `resolve_lock_root` canonicalized the root
+        // (the root exists) to `/private/var/…`. `touch_file`'s
+        // `strip_prefix(root)` then missed, and the leaf flattened to a single
+        // `encode_cwd` component instead of the mirrored `src/new.rs.lock` — so
+        // the booking and every later consult keyed different spellings.
+        //
+        // Linux tempdirs are not symlinked, which is why ubuntu stayed green;
+        // this drives the alias explicitly so the geometry is reproducible on
+        // any platform. The class is wider than symlinks: any spelling the
+        // caller hands in that canonicalize cannot resolve (a `..` segment, a
+        // relative path) splits the same way.
+        let fx = Fixture::new();
+        let alias = fx.dir.path().join("alias");
+        std::os::unix::fs::symlink(&fx.root, &alias).expect("mk symlink");
+
+        // The ghost target, named through the ALIAS — the spelling a host with a
+        // symlinked cwd sends, for a file that does not exist yet.
+        let via_alias = alias.join("src/ghost.rs");
+        let canonical = fx.root.join("src/ghost.rs");
+        assert!(!via_alias.exists(), "the target is a ghost at booking time");
+
+        let owner = Owner::new("claude", "sess-a", "");
+        let locks = fx.locks();
+        assert!(matches!(
+            acquire_in(
+                &locks,
+                &via_alias,
+                &owner,
+                &rust_booking(),
+                SystemTime::now()
+            ),
+            Acquired::Ours
+        ));
+
+        // The leaf must be the MIRRORED relative path in the canonical ledger.
+        // A flattened `encode_cwd` leaf is the bug: it reconstructs to a path
+        // that never existed, so the consult compares absent-against-absent and
+        // reports no debt for a file the agent really did edit.
+        let lock_dir = root_lock_dir_in(&locks, &fx.root);
+        let mirrored = ledger_dir(&lock_dir).join("src/ghost.rs.lock");
+        assert!(
+            mirrored.is_file(),
+            "the ghost target must book the mirrored ledger path; ledger holds: {:?}",
+            std::fs::read_dir(ledger_dir(&lock_dir))
+                .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+        );
+
+        // …and the write then lands the file, so the debt asserts against the
+        // canonical spelling the serve and the payment both use.
+        std::fs::write(&via_alias, b"fn ghost() {}\n").expect("the admitted write");
+        assert_eq!(
+            due_files_in(&locks, &fx.root),
+            vec![canonical],
+            "the created ghost is owed under its canonical spelling"
+        );
+        assert!(
+            has_debt_in(&locks, &fx.root),
+            "and the Bash write gate sees it"
+        );
+
+        // Payment through the alias spelling clears the canonical ledger — the
+        // round trip the split spelling broke.
+        unlink_delivered_in(&locks, &fx.root, std::slice::from_ref(&via_alias));
+        assert!(
+            due_files_in(&locks, &fx.root).is_empty(),
+            "paying through the alias clears the canonical debt"
         );
     }
 

@@ -108,13 +108,19 @@ fn is_allowed_during_editing(tool_name: &str) -> bool {
 /// subtraction, keeping the honest same-file gate. Paths are canonicalized on
 /// both sides so a symlinked-prefix alias subtracts against the canonical ledger
 /// it booked into (misc 193); `due_files` already reconstructs canonical paths.
+/// The canonicalization is LENIENT
+/// ([`crate::paths::canonicalize_lenient`]) because a self-booked target may not
+/// exist yet (misc 230 books write targets before the write runs) — a raw
+/// fallback here would not match the ledger's spelling, the subtraction would
+/// miss, and the command would be denied on its own fresh booking: the exact
+/// bug-118 self-arm this function exists to prevent.
 fn pre_existing_debt(root: &Path, self_booked: &[PathBuf]) -> Vec<PathBuf> {
     if self_booked.is_empty() {
         return crate::lock::due_files(root);
     }
     let booked: std::collections::BTreeSet<PathBuf> = self_booked
         .iter()
-        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+        .map(|p| crate::paths::canonicalize_lenient(p))
         .collect();
     crate::lock::due_files(root)
         .into_iter()

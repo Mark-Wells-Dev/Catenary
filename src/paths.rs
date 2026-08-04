@@ -251,6 +251,82 @@ pub fn encode_cwd(path: &Path) -> String {
     flatten_component(&path.to_string_lossy())
 }
 
+/// Canonicalize `path` as far as the filesystem allows, keeping the tail that
+/// does not exist yet — the spelling rule for paths that may not exist.
+///
+/// `Path::canonicalize` is all-or-nothing: it resolves symlinks correctly but
+/// FAILS outright on a path whose leaf (or whose parent chain) is not there yet,
+/// leaving callers to fall back to the raw spelling. That fallback is a
+/// correctness hole wherever the resolved path is used as a KEY, because it
+/// silently produces a different spelling for a not-yet-existing path than the
+/// same path gets once it exists:
+///
+/// ```text
+///   /var/folders/T/repo/src/new.rs   (absent)  → canonicalize fails → raw
+///   /var/folders/T/repo/src/new.rs   (present) → /private/var/folders/T/repo/src/new.rs
+/// ```
+///
+/// This resolves the **nearest existing ancestor** — which is what carries the
+/// symlinks — and re-appends the remaining components verbatim, so both readings
+/// agree. `.`/`..` are folded lexically first, so a `..` segment cannot escape
+/// the ancestor walk or survive into the tail.
+///
+/// Where every component exists this is exactly `canonicalize`. Where nothing
+/// resolves (a relative path with no existing base, a permission error) it
+/// degrades to the lexically-normalized input — never an error, because every
+/// caller is on a best-effort path where a hard failure would be worse than an
+/// unresolved spelling.
+///
+/// Used by the durable debt ledger ([`crate::lock`]), whose leaves are keyed by
+/// the edited path: misc 230 books write targets BEFORE the write runs, so
+/// booking a not-yet-existing file and consulting it after it exists must land
+/// on one spelling or the debt splits (the macOS `/tmp` → `/private/tmp` red).
+#[must_use]
+pub fn canonicalize_lenient(path: &Path) -> PathBuf {
+    let normalized = normalize_lexical(path);
+    // Walk up to the nearest ancestor that resolves; everything below it is the
+    // lexical tail. `ancestors()` yields the path itself first, so a fully
+    // existing path canonicalizes on the first step.
+    for ancestor in normalized.ancestors() {
+        let Ok(canonical) = ancestor.canonicalize() else {
+            continue;
+        };
+        return normalized.strip_prefix(ancestor).map_or_else(
+            |_| canonical.clone(),
+            |tail| {
+                if tail.as_os_str().is_empty() {
+                    canonical.clone()
+                } else {
+                    canonical.join(tail)
+                }
+            },
+        );
+    }
+    normalized
+}
+
+/// Fold `.` and `..` components without touching the filesystem.
+///
+/// A leading `..` on a relative path is preserved (there is nothing above it to
+/// pop); `..` directly under the root is dropped, matching POSIX.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut parts: Vec<std::path::Component<'_>> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => match parts.last() {
+                Some(std::path::Component::Normal(_)) => {
+                    parts.pop();
+                }
+                Some(std::path::Component::RootDir | std::path::Component::Prefix(_)) => {}
+                _ => parts.push(component),
+            },
+            other => parts.push(other),
+        }
+    }
+    parts.iter().collect()
+}
+
 /// Root directory under [`state_dir`] that holds Catenary-managed worktrees.
 ///
 /// `<state_dir>/catenary/worktrees/`. A *durable* base (not the regenerable
@@ -331,8 +407,96 @@ pub fn agent_worktree_dir(session_id: &str, segment: &str) -> PathBuf {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests use expect for readable assertions"
+)]
 mod tests {
     use super::*;
+
+    // ── canonicalize_lenient (misc 230 follow-up) ──────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_lenient_resolves_a_symlinked_prefix_for_an_absent_leaf() {
+        // The whole point: plain `canonicalize` fails on a path whose leaf does
+        // not exist, so callers fell back to the RAW spelling — a different key
+        // than the same path gets once it exists. Both readings must agree.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("src")).expect("mk src");
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).expect("mk symlink");
+
+        let absent = alias.join("src/ghost.rs");
+        assert!(!absent.exists(), "the leaf must be absent for this case");
+        assert!(
+            absent.canonicalize().is_err(),
+            "plain canonicalize must fail here — that is the hole being closed"
+        );
+
+        let resolved = canonicalize_lenient(&absent);
+        let expected = real
+            .canonicalize()
+            .expect("canon real")
+            .join("src/ghost.rs");
+        assert_eq!(
+            resolved, expected,
+            "the symlinked prefix resolves and the absent tail is kept"
+        );
+
+        // …and once the file exists, plain canonicalize agrees with what the
+        // lenient form already answered. This equality IS the invariant.
+        std::fs::write(&absent, b"x").expect("create the leaf");
+        assert_eq!(
+            absent.canonicalize().expect("canon once present"),
+            resolved,
+            "the absent and present readings must be the same spelling"
+        );
+    }
+
+    #[test]
+    fn canonicalize_lenient_matches_canonicalize_when_everything_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("present.rs");
+        std::fs::write(&file, b"x").expect("write");
+        assert_eq!(
+            canonicalize_lenient(&file),
+            file.canonicalize().expect("canon"),
+            "where every component exists this is exactly canonicalize"
+        );
+    }
+
+    #[test]
+    fn canonicalize_lenient_keeps_a_deep_absent_tail() {
+        // Not just the leaf: whole directory chains that do not exist yet
+        // (`mkdir -p`-style targets) keep their tail below the resolved base.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canon base");
+        let deep = dir.path().join("a/b/c/d.rs");
+        assert_eq!(canonicalize_lenient(&deep), base.join("a/b/c/d.rs"));
+    }
+
+    #[test]
+    fn canonicalize_lenient_folds_dot_and_dotdot_before_resolving() {
+        // `..` must not survive into the tail — it would key a spelling no
+        // consult would ever reproduce.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canon base");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mk src");
+        let noisy = dir.path().join("src/../src/./ghost.rs");
+        assert_eq!(canonicalize_lenient(&noisy), base.join("src/ghost.rs"));
+    }
+
+    #[test]
+    fn canonicalize_lenient_degrades_to_the_lexical_form_when_nothing_resolves() {
+        // A relative path with no existing base has nothing to resolve; the
+        // contract is "never an error", so it comes back lexically normalized.
+        assert_eq!(
+            canonicalize_lenient(Path::new("no/such/./base/../leaf.rs")),
+            PathBuf::from("no/such/leaf.rs")
+        );
+    }
 
     #[test]
     fn encode_cwd_matches_claude_code_form() {
