@@ -10744,6 +10744,9 @@ mod tests {
             ),
             crate::lock::Acquired::Ours
         ));
+        // The write the admitted edit performs (misc 230): booking tracks, and
+        // debt is asserted at consult only when the content actually moved.
+        std::fs::write(&file, b"// edit\n").expect("apply the edit");
         session
             .editing
             .record_covered_edit(Some("sess-led"), "", file.clone(), true);
@@ -10770,6 +10773,8 @@ mod tests {
             .editing
             .record_covered_edit(Some("sess-led"), "agent-a", file.clone(), true);
         // Re-book (the delivery above cleared it) → the subagent's candidate is due.
+        // The anchor re-set at payment, so this booking snapshots the current
+        // bytes and the following write is what asserts the debt (misc 230).
         let _ = crate::lock::acquire_in(
             &locks,
             &file,
@@ -10777,6 +10782,7 @@ mod tests {
             &booking,
             std::time::SystemTime::now(),
         );
+        std::fs::write(&file, b"// second edit\n").expect("apply the edit");
         assert_eq!(
             session.subagent_status_in("agent-a", &locks),
             SessionStatus::Editing,
@@ -13731,6 +13737,10 @@ mod tests {
             ),
             "the covered edit books the worktree ledger"
         );
+        // The write the admitted edit performs (misc 230): the booking tracks
+        // the pre-write bytes, and debt is asserted at consult only once the
+        // content has actually moved.
+        std::fs::write(&edited, b"fn main() { /* edited */ }\n").expect("apply the edit");
         let _ = hook_roundtrip(
             &ipc_path,
             &serde_json::json!({

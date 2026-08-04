@@ -254,6 +254,18 @@ truthful. The gate releases the degraded file exactly as a paid one — editing
 it again re-arms it, and a server that is back next run resumes the normal
 contract. When nothing was edited it prints `[no edited files]`.
 
+**The ledger owes on content, not on intent.** A tool call that resolves a write
+target is *tracked* the moment it is admitted — Catenary records the path
+alongside a fingerprint of its bytes right then — but nothing is *owed* until the
+bytes actually move. Whatever happens after the admission, the answer falls out
+of that one comparison: a tool your host's permission rules refuse, a call you
+reject at the prompt, a command whose write leg never ran, a `sed -i` whose
+pattern matched nothing, an edit you then revert exactly — none of them owes a
+diagnosis, because none of them changed the file. There is nothing to undo and
+nothing to clear by hand; the gate simply never arms. Creating a file that did
+not exist *is* a change, and so is deleting one. The fingerprint re-anchors each
+time you pay, so the next cycle is measured from the state you last diagnosed.
+
 **The ledger survives a killed client.** A `catenary diagnostics` run pays its
 debt by *delivery*, not at dispatch: a file's ledger entry is unlinked only after
 the daemon's response reaches the CLI. So an invocation killed after dispatch (a

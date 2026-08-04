@@ -150,6 +150,19 @@ fn due_files(bridge: &BridgeProcess, root: &str) -> Vec<std::path::PathBuf> {
     catenary_cli::lock::due_files_in(&locks_base, &canonical)
 }
 
+/// Perform the write the admitted tool would perform (misc 230).
+///
+/// The hook books a TRACKING entry carrying the target's pre-write fingerprint;
+/// debt is asserted at consult only once the content has actually moved. These
+/// tests drive the hook alone — the shell never runs — so a case that models an
+/// EXECUTED write has to move the bytes itself, exactly as the shell would after
+/// the hook allows.
+fn execute_write(path: &str, line: &str) -> Result<()> {
+    let mut bytes = std::fs::read(path).unwrap_or_default();
+    bytes.extend_from_slice(line.as_bytes());
+    std::fs::write(path, &bytes).context("execute the admitted write")
+}
+
 /// Pay a root's ledger for a set of files — the diagnostics delivery seam
 /// unlinks their touch leaves. Simulates `catenary diagnostics <files>` without
 /// needing a real language server.
@@ -185,9 +198,10 @@ fn paid_ledger_then_append_is_allowed() -> Result<()> {
     let bridge = spawn_daemon(root)?;
     write_user_config(bridge.state_home(), WRITE_COMMANDS)?;
 
-    // A covered edit books the file.
+    // A covered edit books the file, and the admitted edit then runs.
     let e = run_edit_hook(&bridge, &file)?;
     assert!(deny_reason(&e).is_none(), "the edit is admitted, got: {e}");
+    execute_write(&file, "// edit\n")?;
     assert_eq!(due_files(&bridge, root).len(), 1, "the edit books one file");
 
     // Pay the ledger (diagnostics delivery unlinks the touch leaf).
@@ -205,6 +219,7 @@ fn paid_ledger_then_append_is_allowed() -> Result<()> {
         deny_reason(&append).is_none(),
         "a paid-ledger append to a covered file must be allowed, got: {append}"
     );
+    execute_write(&file, "// probe\n")?;
 
     // The write DID resolve and book (it runs after this allow), so its target
     // is now honestly due — the write model attributing the redirect like an
@@ -240,6 +255,7 @@ fn executed_write_gates_next_write_until_paid() -> Result<()> {
         deny_reason(&first).is_none(),
         "the first append on an unarmed ledger is allowed, got: {first}"
     );
+    execute_write(&file, "// one\n")?;
     assert_eq!(
         due_files(&bridge, root).len(),
         1,
@@ -288,6 +304,7 @@ fn denied_write_leaves_no_booking() -> Result<()> {
     // real, honest debt.
     let e = run_edit_hook(&bridge, &edited)?;
     assert!(deny_reason(&e).is_none(), "the edit is admitted, got: {e}");
+    execute_write(&edited, "// edit\n")?;
     let before: Vec<_> = due_files(&bridge, root);
     assert_eq!(before.len(), 1, "the unpaid edit is the only debt");
 

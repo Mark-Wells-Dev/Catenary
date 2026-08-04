@@ -24,9 +24,13 @@
 //!   client-scoped opaque strings). All owner-file mutations are atomic
 //!   rename-over — the same idiom config mutation uses (bug 109). Its **mtime**
 //!   is the last-activity clock.
-//! - `dir/`, a mirrored tree of empty **touch files** `<relpath>.lock`, one per
-//!   due file. The `.lock` suffix is deliberate: language servers demonstrably
-//!   index agent-explored state dirs, and ledger entries must not read as source.
+//! - `dir/`, a mirrored tree of **tracking files** `<relpath>.lock`, one per
+//!   file the agent interacted with. The `.lock` suffix is deliberate: language
+//!   servers demonstrably index agent-explored state dirs, and ledger entries
+//!   must not read as source. Each leaf's body is the file's booking-time
+//!   content [`Fingerprint`] (misc 230) — a one-line `c1 <len> <hash>` or
+//!   `c1 absent`; an empty body (a pre-misc-230 entry, or a [`Track::Asserted`]
+//!   booking) asserts debt unconditionally.
 //! - `.root`, the **root record** — the canonical root path in full (the dir
 //!   name's encoding is lossy), written at first booking so the bare-serve
 //!   enumeration can recover every indebted kitchen without a cwd to key from
@@ -42,6 +46,17 @@
 //! paid = the idle countdown starts. **Payment is parole, not release**: the lock
 //! survives payment so the kitchen is not unlocked between a receipt and the next
 //! edit of an actively-working agent.
+//!
+//! **Tracking, not liability (misc 230).** A booking records that the agent
+//! interacted with a path, together with the path's content fingerprint at that
+//! first interaction of the cycle. Debt is ASSERTED later, at consult, by one
+//! pure function: `tracked ∧ content ≠ fingerprint` ([`leaf_asserts_debt`],
+//! reached through [`due_files_in`] / [`due_candidates_in`]). Nothing needs
+//! unwinding when a tool is refused by the host, rejected by the user, or runs
+//! and changes nothing (`sed -i` with no match, a failed leg, an
+//! edit-then-exact-revert) — no debt was ever owed, because it is only owed once
+//! movement is proven. The anchor re-sets at payment, when delivery unlinks the
+//! leaf.
 //!
 //! Only two legs release a lock: the daemon's paid-idle countdown
 //! ([`reap_paid_idle_locks_in`]) and root retirement ([`retire_in`]). Staleness
@@ -270,6 +285,160 @@ fn read_root_record(lock_dir: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(text))
 }
 
+/// A booking-time snapshot of a tracked file's content — the observation a
+/// ledger leaf carries (misc 230).
+///
+/// The RULED framing: a booking TRACKS a file the agent interacted with; it is
+/// not a liability. Debt is ASSERTED at consult, by comparing this snapshot
+/// against the file's content right then ([`leaf_asserts_debt`]). Absence is its
+/// own state, so a ghost target (`printf … > src/new.rs`) that never
+/// materialized reads as unchanged — absent at both ends is no movement.
+///
+/// Content-grade by ruling: metadata will not do. `sed -i` rewrites the file
+/// with a fresh mtime and a new inode even when no substitution fires, so only
+/// the bytes can tell a real edit from a no-op rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fingerprint {
+    /// The path did not exist when the interaction was tracked.
+    Absent,
+    /// The file existed: its byte length and content hash.
+    Content {
+        /// Byte length — a second axis beside the 64-bit hash.
+        len: u64,
+        /// Content hash ([`crate::symbol_index::hash_bytes`]).
+        hash: u64,
+    },
+}
+
+/// Leading token of a rendered [`Fingerprint`], versioning the leaf format.
+///
+/// A leaf whose body does not parse under this token reads as "no fingerprint"
+/// — unconditional debt, the pre-misc-230 semantics. That is the migration
+/// story for ledger entries booked by an older binary (they are empty files) and
+/// the degradation path for any future format bump: always toward over-reporting
+/// debt, never toward silently dropping it.
+const FINGERPRINT_VERSION: &str = "c1";
+
+impl Fingerprint {
+    /// Renders the fingerprint as the ledger leaf's one-line body.
+    fn render(self) -> String {
+        match self {
+            Self::Absent => format!("{FINGERPRINT_VERSION} absent"),
+            Self::Content { len, hash } => format!("{FINGERPRINT_VERSION} {len} {hash:016x}"),
+        }
+    }
+
+    /// Parses a leaf body, or `None` when it carries no recognizable
+    /// fingerprint (an empty pre-misc-230 leaf, a truncated write, a future
+    /// format).
+    fn parse(text: &str) -> Option<Self> {
+        let rest = text.trim().strip_prefix(FINGERPRINT_VERSION)?.trim_start();
+        if rest == "absent" {
+            return Some(Self::Absent);
+        }
+        let (len, hash) = rest.split_once(' ')?;
+        Some(Self::Content {
+            len: len.parse().ok()?,
+            hash: u64::from_str_radix(hash, 16).ok()?,
+        })
+    }
+}
+
+/// The file's content fingerprint right now, or `None` when the bytes are
+/// unreadable for a reason other than absence (a permission error, a directory
+/// in the way).
+///
+/// `None` is deliberately NOT a state that can compare equal: an unreadable
+/// target keeps the pre-misc-230 reading (due), so a transient FS error never
+/// erases debt.
+fn fingerprint_of(file: &Path) -> Option<Fingerprint> {
+    match std::fs::read(file) {
+        Ok(bytes) => Some(Fingerprint::Content {
+            len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            hash: crate::symbol_index::hash_bytes(&bytes),
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Fingerprint::Absent),
+        Err(_) => None,
+    }
+}
+
+/// How a booking records the tracked file's state (misc 230).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Track {
+    /// Edit-seam tracking: record the target's PRE-write fingerprint, so
+    /// due-ness is decided at consult by content comparison. This is the
+    /// booking every hook-side acquisition makes.
+    Fingerprinted,
+    /// Unconditional assertion: the caller already holds an oracle proving the
+    /// content moved (the git-status reconcile, the merge transfer), so the
+    /// leaf carries no fingerprint and asserts debt until it is paid.
+    Asserted,
+}
+
+/// Whether a tracked ledger `leaf` ASSERTS debt for `file` right now — the whole
+/// due-ness predicate, and the one place it lives (misc 230).
+///
+/// `debt(f) = tracked(f) ∧ content(f) ≠ fingerprint(f)`. Every consult surface
+/// — the Bash write gate, the Stop/SubagentStop block, the bare serve — reaches
+/// due-ness through a caller of this function, so they cannot disagree (the
+/// 116/141 lesson). It is a pure function of the filesystem: there is no unwind
+/// event for a host permission deny, a user rejection, a `sed` that matched
+/// nothing, a failed command leg, or an edit-then-exact-revert — every one of
+/// them simply fails to assert.
+///
+/// A leaf with no parseable fingerprint asserts unconditionally: that is both
+/// the pre-misc-230 ledger's migration path and the [`Track::Asserted`] booking
+/// the git-oracle reconcile makes.
+fn leaf_asserts_debt(leaf: &Path, file: &Path) -> bool {
+    let Some(booked) = std::fs::read_to_string(leaf)
+        .ok()
+        .as_deref()
+        .and_then(Fingerprint::parse)
+    else {
+        return true;
+    };
+    fingerprint_of(file) != Some(booked)
+}
+
+/// Creates (or upgrades) the tracking leaf at `touch` for `file`.
+///
+/// [`Track::Fingerprinted`] is **first-interaction-of-the-cycle wins**: an
+/// existing leaf keeps its fingerprint, so a second edit is still measured
+/// against the state before the FIRST one. Re-anchoring on every booking would
+/// erase the debt an earlier write created (edit A→B, then a denied second tool
+/// call re-anchoring at B would read as no movement). The anchor re-sets only at
+/// payment, when delivery unlinks the leaf.
+///
+/// [`Track::Asserted`] overwrites any fingerprint with an empty body — a strict
+/// upgrade to unconditional debt, never a downgrade.
+///
+/// Best-effort throughout: a failed write leaves an absent or empty leaf, both
+/// of which read as debt.
+fn write_tracking_leaf(touch: &Path, file: &Path, track: Track) {
+    match track {
+        Track::Fingerprinted => {
+            // `create_new` is the create-if-absent test and the create in one
+            // step, so two hook processes racing the same leaf cannot both write
+            // an anchor (the root lock already excludes that, but the ledger
+            // never relies on it).
+            if let Ok(mut handle) = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(touch)
+            {
+                use std::io::Write as _;
+                let body = fingerprint_of(file)
+                    .map(Fingerprint::render)
+                    .unwrap_or_default();
+                let _ = handle.write_all(body.as_bytes());
+            }
+        }
+        Track::Asserted => {
+            let _ = std::fs::write(touch, b"");
+        }
+    }
+}
+
 /// The touch-file path for a due file, mirrored under `dir/` with a `.lock`
 /// suffix: `dir/<root-relative-path>.lock`.
 ///
@@ -352,12 +521,13 @@ fn touch_owner(lock_dir: &Path, owner_name: &str) {
         .and_then(|f| f.set_len(0));
 }
 
-/// Books a single due file into the ledger: touch `dir/<relpath>.lock`.
+/// Tracks a single file in the ledger: `dir/<relpath>.lock`, carrying the
+/// booking-time fingerprint (misc 230).
 ///
-/// Idempotent — re-booking an already-booked file is a no-op create. Creates the
-/// mirrored parent directories as needed. Best-effort: a booking failure never
-/// blocks the edit (the gate still reads daemon-side debt this stage).
-fn book_file(lock_dir: &Path, root: &Path, file: &Path) {
+/// Idempotent — re-booking an already-tracked file keeps the first
+/// interaction's anchor ([`write_tracking_leaf`]). Creates the mirrored parent
+/// directories as needed. Best-effort: a booking failure never blocks the edit.
+fn book_file(lock_dir: &Path, root: &Path, file: &Path, track: Track) {
     // Every booking seam funnels through here, so a lock dir with debt always
     // carries its root record (bug 121) — the bare-serve enumeration can name
     // the kitchen without a cwd to key from.
@@ -366,11 +536,7 @@ fn book_file(lock_dir: &Path, root: &Path, file: &Path) {
     if let Some(parent) = touch.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&touch);
+    write_tracking_leaf(&touch, file, track);
 }
 
 /// The single ledger leaf inside a file-scope lock dir: `dir/<name>.lock`
@@ -403,21 +569,21 @@ fn book_file_scope(lock_dir: &Path, file: &Path) {
     if let Some(parent) = touch.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&touch);
+    write_tracking_leaf(&touch, file, Track::Fingerprinted);
 }
 
-/// Whether a markerless file's OWN ledger holds unpaid debt (brackets 03).
+/// Whether a markerless file's OWN ledger asserts unpaid debt (brackets 03).
 ///
-/// The per-file analogue of [`has_debt_in`]: a booked, undiagnosed file-scope
-/// leaf reports `true`; a paid (unlinked) or never-booked file reports
-/// `false`. Best-effort: an unreadable ledger reports `false`.
+/// The per-file analogue of [`has_debt_in`], and the file-scope consult seam for
+/// misc 230: a tracked leaf reports `true` only when the file's content moved
+/// since the booking ([`leaf_asserts_debt`]); a paid (unlinked), never-booked,
+/// or tracked-but-unmoved file reports `false`. Best-effort: an unreadable
+/// ledger reports `false`.
 #[must_use]
 pub fn file_has_debt_in(locks_base: &Path, file: &Path) -> bool {
-    due_count(&file_lock_dir_in(locks_base, file)) > 0
+    let lock_dir = file_lock_dir_in(locks_base, file);
+    let leaf = file_touch_path(&lock_dir, file);
+    leaf.is_file() && leaf_asserts_debt(&leaf, file)
 }
 
 /// Production wrapper for [`file_has_debt_in`] resolving the base through
@@ -443,7 +609,7 @@ pub fn debtor_files_in(locks_base: &Path) -> Vec<PathBuf> {
     };
     for entry in entries.flatten() {
         let lock_dir = entry.path();
-        if !lock_dir.is_dir() || due_count(&lock_dir) == 0 {
+        if !lock_dir.is_dir() {
             continue;
         }
         let Some(file) = read_root_record(&lock_dir) else {
@@ -453,7 +619,10 @@ pub fn debtor_files_in(locks_base: &Path) -> Vec<PathBuf> {
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|name| name == crate::paths::encode_cwd(&file));
-        if record_matches_dir && file.is_file() {
+        // The debt test runs LAST and through the reconcile (misc 230): a lock
+        // dir whose leaves all track unmoved files holds no debt, so it is not a
+        // debtor and the bare serve never pulls it.
+        if record_matches_dir && file.is_file() && lock_dir_asserts_debt(&lock_dir) {
             out.push(file);
         }
     }
@@ -514,12 +683,18 @@ fn unlink_delivered_file_in(locks_base: &Path, file: &Path) -> UnlinkOutcome {
     }
 }
 
-/// The number of files awaiting diagnosis in a lock's ledger (touch-tree leaf
-/// count).
+/// The number of TRACKED files in a lock's ledger (touch-tree leaf count).
 ///
-/// A paid lock reports `0`; a lock with due files reports the count. Used by the
-/// deny briefing and the claim answer. Best-effort: an unreadable ledger reports
-/// `0`.
+/// A paid lock reports `0`; a lock with tracked files reports the count. Used by
+/// the deny briefing, the claim answer, and the board. Best-effort: an
+/// unreadable ledger reports `0`.
+///
+/// **Not the debt count** since misc 230: a leaf is a tracking observation, and
+/// debt is asserted at consult by the content reconcile, so this over-counts a
+/// kitchen holding leaves for files whose content never moved. The holder/claim
+/// read paths keep this raw reading deliberately (bug 154 digs them); every
+/// due-ness decision goes through [`due_files_in`] / [`due_candidates_in`]
+/// instead.
 #[must_use]
 pub fn due_count(lock_dir: &Path) -> usize {
     fn count_dir(dir: &Path) -> usize {
@@ -549,6 +724,14 @@ pub fn due_count(lock_dir: &Path) -> usize {
 /// the batch: a bare `catenary diagnostics` diagnoses exactly this set. Sorted
 /// for a stable receipt order. Best-effort: an unreadable / absent ledger yields
 /// an empty set (no debt).
+///
+/// **Misc 230 — the due-ness choke point.** A leaf is a TRACKING observation
+/// (path + booking-time content fingerprint), not a liability. Debt is asserted
+/// here, at consult: a leaf survives into the due set only when the file's
+/// content differs from its fingerprint ([`leaf_asserts_debt`]). Every consult
+/// surface reaches due-ness through this function or [`due_candidates_in`], so a
+/// refused tool, a `sed` that matched nothing, a failed command leg, and an
+/// edit-then-exact-revert all read the same way — as no debt — on all of them.
 #[must_use]
 pub fn due_files_in(locks_base: &Path, root: &Path) -> Vec<PathBuf> {
     let lock_dir = root_lock_dir_in(locks_base, root);
@@ -561,7 +744,12 @@ pub fn due_files_in(locks_base: &Path, root: &Path) -> Vec<PathBuf> {
 
 /// Recursive touch-tree walker for [`due_files_in`]: for each `<relpath>.lock`
 /// leaf under `base`, rejoins `<relpath>` (the path relative to `base`, minus the
-/// `.lock` suffix) onto `root`.
+/// `.lock` suffix) onto `root`, keeping only the leaves that still ASSERT debt.
+///
+/// This is the root-scope half of the misc-230 choke point: a leaf is a tracking
+/// observation, so the reconcile against the file's current content
+/// ([`leaf_asserts_debt`]) happens here, once, for every caller of
+/// [`due_files_in`].
 fn collect_due(base: &Path, dir: &Path, root: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -575,8 +763,37 @@ fn collect_due(base: &Path, dir: &Path, root: &Path, out: &mut Vec<PathBuf>) {
         {
             // Drop the `.lock` suffix from the leaf, keeping the mirrored parents.
             let stem = rel.with_extension("");
-            out.push(root.join(stem));
+            let file = root.join(stem);
+            if leaf_asserts_debt(&path, &file) {
+                out.push(file);
+            }
         }
+    }
+}
+
+/// Whether a lock dir asserts any debt right now — the reconciled analogue of
+/// `due_count(lock_dir) > 0` for callers that hold only the lock dir (misc 230).
+///
+/// Resolves the scope through the dir's `.root` record: a record naming a
+/// DIRECTORY is a root scope (walk the touch-tree with [`collect_due`]), one
+/// naming a FILE is a markerless file scope (the single leaf). A dir with no
+/// record (booked before bug 121) or one whose anchor has vanished keeps the raw
+/// leaf count — nothing to reconcile against, so the pre-misc-230 reading
+/// stands.
+fn lock_dir_asserts_debt(lock_dir: &Path) -> bool {
+    let Some(anchor) = read_root_record(lock_dir) else {
+        return due_count(lock_dir) > 0;
+    };
+    if anchor.is_dir() {
+        let base = ledger_dir(lock_dir);
+        let mut due = Vec::new();
+        collect_due(&base, &base, &anchor, &mut due);
+        !due.is_empty()
+    } else if anchor.is_file() {
+        let leaf = file_touch_path(lock_dir, &anchor);
+        leaf.is_file() && leaf_asserts_debt(&leaf, &anchor)
+    } else {
+        due_count(lock_dir) > 0
     }
 }
 
@@ -589,13 +806,16 @@ pub fn due_files(root: &Path) -> Vec<PathBuf> {
 /// Whether a root's ledger holds any unpaid debt — the gate's "is there
 /// undelivered debt?" question, answered by the ledger (root-ownership stage 3).
 ///
-/// A non-empty touch-tree means at least one edited file has not been diagnosed
-/// since its last edit. The lock dir surviving with an empty `dir/` (paid,
-/// inside its idle window) reports `false`. Best-effort: an unreadable ledger
-/// reports `false` (never false-gate on a transient FS error).
+/// A touch-tree holding at least one ASSERTING leaf means an edited file has not
+/// been diagnosed since its last edit. The lock dir surviving with an empty
+/// `dir/` (paid, inside its idle window) reports `false`, and so does one whose
+/// leaves all track files whose content never moved (misc 230). Reads the
+/// reconciled due set ([`due_files_in`]) so this gate and the serve cannot
+/// disagree. Best-effort: an unreadable ledger reports `false` (never false-gate
+/// on a transient FS error).
 #[must_use]
 pub fn has_debt_in(locks_base: &Path, root: &Path) -> bool {
-    due_count(&root_lock_dir_in(locks_base, root)) > 0
+    !due_files_in(locks_base, root).is_empty()
 }
 
 /// Production wrapper for [`has_debt_in`] resolving the base through [`locks_dir`].
@@ -624,7 +844,7 @@ pub fn debtor_roots_in(locks_base: &Path) -> Vec<PathBuf> {
     };
     for entry in entries.flatten() {
         let lock_dir = entry.path();
-        if !lock_dir.is_dir() || due_count(&lock_dir) == 0 {
+        if !lock_dir.is_dir() {
             continue;
         }
         let Some(root) = read_root_record(&lock_dir) else {
@@ -634,7 +854,10 @@ pub fn debtor_roots_in(locks_base: &Path) -> Vec<PathBuf> {
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|name| name == crate::paths::encode_cwd(&root));
-        if record_matches_dir && root.is_dir() {
+        // The debt test runs LAST and through the reconcile (misc 230): a kitchen
+        // whose leaves all track unmoved files is not a debtor, so the bare serve
+        // never pulls it.
+        if record_matches_dir && root.is_dir() && lock_dir_asserts_debt(&lock_dir) {
             out.push(root);
         }
     }
@@ -773,6 +996,13 @@ pub fn vetted_serve_roots(cwd: &Path, owner: &Owner) -> Vec<PathBuf> {
 /// edit seam booked and the canonical `due_files_in` reconstructs — a
 /// symlinked-prefix alias must resolve to the SAME ledger answer, or the block
 /// would split from the debt. Pin: [`due_candidates_read_through_aliased_spelling`].
+///
+/// **Misc 230:** the debt assertion is not re-derived here — both arms delegate
+/// ([`due_files_in`] for a rooted candidate, [`file_has_debt_in`] for a
+/// markerless one), so the block sees exactly the set a bare
+/// `catenary diagnostics` would serve. A candidate the agent merely touched
+/// without moving its bytes is not returned, and the Stop block therefore does
+/// not fire on it.
 ///
 /// Roots are read once and cached, so a batch spanning one kitchen reads its
 /// ledger a single time. Preserves input order (minus the paid entries) for a
@@ -1267,7 +1497,7 @@ pub fn acquire_in(
                 return Acquired::Ours;
             }
             let _ = write_owner_atomic(&lock_dir, owner);
-            book_file(&lock_dir, &root, file);
+            book_file(&lock_dir, &root, file, Track::Fingerprinted);
             Acquired::Ours
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1275,7 +1505,7 @@ pub fn acquire_in(
                 Ok(Some(name)) if name == owner.file_name() => {
                     // Ours — book (idempotent), bump last-activity, allow.
                     if books {
-                        book_file(&lock_dir, &root, file);
+                        book_file(&lock_dir, &root, file, Track::Fingerprinted);
                     }
                     touch_owner(&lock_dir, &name);
                     Acquired::Ours
@@ -1621,7 +1851,12 @@ pub fn book_transferred_in(locks_base: &Path, root: &Path, owner: &Owner, files:
     }
     for file in files {
         let file = file.canonicalize().unwrap_or_else(|_| file.clone());
-        book_file(&lock_dir, root, &file);
+        // [`Track::Asserted`] (misc 230): this seam's callers hold a git oracle
+        // that already proved the content moved, and they run AFTER the command
+        // — a fingerprint taken here would snapshot the post-move state and read
+        // as no debt on the very next consult. The leaf therefore carries none
+        // and asserts until it is paid, exactly the pre-misc-230 behaviour.
+        book_file(&lock_dir, root, &file, Track::Asserted);
     }
 }
 
@@ -1895,8 +2130,14 @@ pub fn reap_paid_idle_locks_in(
         if !lock_dir.is_dir() {
             continue;
         }
-        // Paid ⇒ empty ledger.
-        if due_count(&lock_dir) != 0 {
+        // Paid ⇒ no ASSERTING leaf (misc 230). Reading the raw leaf count here
+        // would strand a kitchen forever: a tracking leaf for a file whose
+        // content never moved is never served, so it is never unlinked, so a
+        // count-based test would block the countdown for good. Tracking is not
+        // debt, so a dir holding only trackings is paid and the reap clears it
+        // (and them) on the ordinary idle sweep — the nag-never-hostage
+        // invariant, preserved.
+        if lock_dir_asserts_debt(&lock_dir) {
             continue;
         }
         // Idle past the window? An ownerless dir (a crashed acquisition) ages by
@@ -2141,6 +2382,39 @@ mod tests {
     fn rust_booking() -> Booking {
         let config = crate::config::Config::load().expect("load config");
         Booking::from_config(&config)
+    }
+
+    /// Moves a tracked file's bytes — the write the admitted tool performs
+    /// AFTER the edit seam books it (misc 230).
+    ///
+    /// Booking is tracking; debt is asserted at consult only when the content
+    /// moved. A test that wants standing debt must therefore let the write
+    /// happen. Appending is always a change, so repeated calls keep modelling
+    /// successive real edits.
+    fn apply_edit(file: &Path) {
+        let mut bytes = std::fs::read(file).unwrap_or_default();
+        bytes.extend_from_slice(b"// edit\n");
+        std::fs::write(file, &bytes).expect("apply the edit");
+    }
+
+    /// The edit seam end-to-end: [`acquire_in`] (which tracks the PRE-write
+    /// fingerprint) followed by the write itself.
+    ///
+    /// Tests that assert standing debt use this; the ones probing acquisition
+    /// semantics alone (admission, collision, briefings, raw leaf counts) keep
+    /// calling [`acquire_in`] directly.
+    fn edit_in(
+        locks: &Path,
+        file: &Path,
+        owner: &Owner,
+        booking: &Booking,
+        now: SystemTime,
+    ) -> Acquired {
+        let acquired = acquire_in(locks, file, owner, booking, now);
+        if matches!(acquired, Acquired::Ours) {
+            apply_edit(file);
+        }
+        acquired
     }
 
     #[test]
@@ -2434,7 +2708,7 @@ mod tests {
         let file = stray_file(&scratch, "notes.toml");
         let owner = Owner::new("claude", "sess-a", "");
 
-        let got = acquire_in(
+        let got = edit_in(
             &fx.locks(),
             &file,
             &owner,
@@ -2516,7 +2790,7 @@ mod tests {
         let never_booked = stray_file(&scratch, "never.toml");
         let owner = Owner::new("claude", "sess-a", "");
 
-        let _ = acquire_in(
+        let _ = edit_in(
             &fx.locks(),
             &file,
             &owner,
@@ -2565,8 +2839,8 @@ mod tests {
         let booking = rust_booking();
         let now = SystemTime::now();
 
-        let _ = acquire_in(&fx.locks(), &mine, &me, &booking, now);
-        let _ = acquire_in(&fx.locks(), &foreign, &other, &booking, now);
+        let _ = edit_in(&fx.locks(), &mine, &me, &booking, now);
+        let _ = edit_in(&fx.locks(), &foreign, &other, &booking, now);
 
         assert_eq!(
             vetted_serve_files_in(&fx.locks(), &me),
@@ -2690,7 +2964,7 @@ mod tests {
         let now = SystemTime::now();
         let locks = fx.locks();
         assert!(matches!(
-            acquire_in(&locks, &file, &owner, &rust_booking(), now),
+            edit_in(&locks, &file, &owner, &rust_booking(), now),
             Acquired::Ours
         ));
         let lock_dir = root_lock_dir_in(&locks, &fx.root);
@@ -2859,11 +3133,11 @@ mod tests {
         let now = SystemTime::now();
         let locks = fx.locks();
         assert!(matches!(
-            acquire_in(&locks, &f1, &owner, &booking, now),
+            edit_in(&locks, &f1, &owner, &booking, now),
             Acquired::Ours
         ));
         assert!(matches!(
-            acquire_in(&locks, &f2, &owner, &booking, now),
+            edit_in(&locks, &f2, &owner, &booking, now),
             Acquired::Ours
         ));
 
@@ -2962,7 +3236,7 @@ mod tests {
 
         // Book through the alias spelling.
         assert!(matches!(
-            acquire_in(&locks, &via_alias, &owner, &booking, now),
+            edit_in(&locks, &via_alias, &owner, &booking, now),
             Acquired::Ours
         ));
         // The debt landed on the CANONICAL ledger, and the reconstructed due path
@@ -2998,7 +3272,7 @@ mod tests {
 
         // Only `a` is booked (edited); `b` was never covered.
         assert!(matches!(
-            acquire_in(&locks, &a, &owner, &booking, now),
+            edit_in(&locks, &a, &owner, &booking, now),
             Acquired::Ours
         ));
         let due = due_candidates_in(&locks, &[a.clone(), b.clone()]);
@@ -3046,7 +3320,7 @@ mod tests {
 
         // Book against the canonical ledger.
         assert!(matches!(
-            acquire_in(&locks, &real, &owner, &booking, now),
+            edit_in(&locks, &real, &owner, &booking, now),
             Acquired::Ours
         ));
 
@@ -3083,7 +3357,7 @@ mod tests {
 
         for f in [&a, &b] {
             assert!(matches!(
-                acquire_in(&locks, f, &owner, &booking, now),
+                edit_in(&locks, f, &owner, &booking, now),
                 Acquired::Ours
             ));
         }
@@ -3139,7 +3413,7 @@ mod tests {
 
         for f in [&a, &b, &c] {
             assert!(matches!(
-                acquire_in(&locks, f, &owner, &booking, now),
+                edit_in(&locks, f, &owner, &booking, now),
                 Acquired::Ours
             ));
         }
@@ -3152,6 +3426,347 @@ mod tests {
         assert_eq!(
             named, expected,
             "the union names R1 and R2's debt but not R3's untouched debt"
+        );
+    }
+
+    // ── Payment-time debt assertion (misc 230) ─────────────────────────────
+    //
+    // A booking TRACKS a file the agent interacted with; debt is ASSERTED at
+    // consult by one pure predicate — tracked ∧ content moved since the booking
+    // fingerprint. There is no unwind event for any refusal shape; each simply
+    // fails to assert. Every case below drives the real seams
+    // ([`acquire_in`] → [`due_files_in`]), never the private predicate, so a
+    // consult surface that stopped routing through the choke point goes red.
+
+    #[test]
+    fn fingerprint_round_trips_through_the_leaf_body() {
+        for fp in [
+            Fingerprint::Absent,
+            Fingerprint::Content { len: 0, hash: 0 },
+            Fingerprint::Content {
+                len: 4096,
+                hash: u64::MAX,
+            },
+        ] {
+            assert_eq!(
+                Fingerprint::parse(&fp.render()),
+                Some(fp),
+                "a rendered fingerprint parses back to itself: {fp:?}"
+            );
+        }
+        // A leaf carrying no fingerprint (the pre-misc-230 shape and the
+        // `Track::Asserted` booking) never parses — it asserts unconditionally.
+        assert_eq!(Fingerprint::parse(""), None);
+        assert_eq!(
+            Fingerprint::parse("c2 0 0"),
+            None,
+            "a future format is not read"
+        );
+    }
+
+    #[test]
+    fn booking_without_a_write_asserts_no_debt() {
+        // The whole refusal class in one shape: the seam booked (the command was
+        // about to run) and then nothing wrote — a host permission deny, a user
+        // rejection, a failed leg. The file is TRACKED but its content never
+        // moved, so no consult surface reports debt.
+        let fx = Fixture::new();
+        let file = fx.file("src/main.rs");
+        let owner = Owner::new("claude", "sess-a", "");
+        let locks = fx.locks();
+        assert!(matches!(
+            acquire_in(&locks, &file, &owner, &rust_booking(), SystemTime::now()),
+            Acquired::Ours
+        ));
+
+        // Tracked: the ledger leaf exists (the observation stands).
+        assert_eq!(
+            due_count(&root_lock_dir_in(&locks, &fx.root)),
+            1,
+            "the interaction is tracked"
+        );
+        // Not owed: every consult surface agrees (the 116/141 lesson).
+        assert!(
+            due_files_in(&locks, &fx.root).is_empty(),
+            "the bare serve set is empty — no content moved"
+        );
+        assert!(
+            !has_debt_in(&locks, &fx.root),
+            "the Bash write gate reads no debt"
+        );
+        assert!(
+            due_candidates_in(&locks, std::slice::from_ref(&file)).is_empty(),
+            "the Stop block reads no debt"
+        );
+        assert!(
+            debtor_roots_in(&locks).is_empty(),
+            "the bare-serve enumeration does not name the kitchen a debtor"
+        );
+    }
+
+    #[test]
+    fn no_op_rewrite_with_identical_bytes_asserts_no_debt() {
+        // The maintainer's named case: `sed -i` rewrites the file — fresh mtime,
+        // NEW INODE — even when no substitution fires. Metadata would read that
+        // as an edit; content does not.
+        let fx = Fixture::new();
+        let file = fx.file("src/main.rs");
+        std::fs::write(&file, b"fn main() {}\n").expect("seed content");
+        let owner = Owner::new("claude", "sess-a", "");
+        let locks = fx.locks();
+        assert!(matches!(
+            acquire_in(&locks, &file, &owner, &rust_booking(), SystemTime::now()),
+            Acquired::Ours
+        ));
+
+        // `sed -i`'s footprint: write a sibling temp with the SAME bytes and
+        // rename it over, so the inode changes and the mtime is fresh.
+        let before = std::fs::metadata(&file).expect("meta before");
+        let tmp = fx.root.join("src/.main.rs.sedtmp");
+        std::fs::write(&tmp, b"fn main() {}\n").expect("write temp");
+        std::fs::rename(&tmp, &file).expect("rename over");
+        let after = std::fs::metadata(&file).expect("meta after");
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_ne!(
+                before.ino(),
+                after.ino(),
+                "the no-op rewrite must genuinely replace the inode, or this \
+                 case proves nothing about metadata-grade staleness"
+            );
+        }
+
+        assert!(
+            due_files_in(&locks, &fx.root).is_empty(),
+            "a rewrite that changed no bytes owes nothing"
+        );
+        assert!(!has_debt_in(&locks, &fx.root), "and the gate agrees");
+    }
+
+    #[test]
+    fn a_real_change_after_booking_asserts_debt() {
+        // The positive control for the whole section: without it, every
+        // "no debt" above could mean "this harness cannot see debt at all".
+        let fx = Fixture::new();
+        let file = fx.file("src/main.rs");
+        std::fs::write(&file, b"fn main() {}\n").expect("seed content");
+        let owner = Owner::new("claude", "sess-a", "");
+        let locks = fx.locks();
+        assert!(matches!(
+            acquire_in(&locks, &file, &owner, &rust_booking(), SystemTime::now()),
+            Acquired::Ours
+        ));
+        std::fs::write(&file, b"fn main() { let x = 1; }\n").expect("the write");
+
+        assert_eq!(
+            due_files_in(&locks, &fx.root),
+            vec![file.clone()],
+            "a moved file is owed"
+        );
+        assert!(has_debt_in(&locks, &fx.root));
+        assert_eq!(
+            due_candidates_in(&locks, std::slice::from_ref(&file)),
+            vec![file],
+            "and the Stop block owes it too"
+        );
+    }
+
+    #[test]
+    fn ghost_target_absent_at_both_ends_asserts_no_debt() {
+        // A write target that does not exist yet (`printf … > src/ghost.rs`)
+        // books with the ABSENT fingerprint. If the command never runs the file
+        // is still absent — absent at both ends is no movement. Creating it is.
+        let fx = Fixture::new();
+        let ghost = fx.root.join("src/ghost.rs");
+        let owner = Owner::new("claude", "sess-a", "");
+        let locks = fx.locks();
+        assert!(matches!(
+            acquire_in(&locks, &ghost, &owner, &rust_booking(), SystemTime::now()),
+            Acquired::Ours
+        ));
+        assert!(
+            due_files_in(&locks, &fx.root).is_empty(),
+            "a ghost target that never materialized owes nothing"
+        );
+
+        std::fs::write(&ghost, b"fn ghost() {}\n").expect("materialize");
+        assert_eq!(
+            due_files_in(&locks, &fx.root),
+            vec![ghost],
+            "absent → present is movement, so the created file is owed"
+        );
+    }
+
+    #[test]
+    fn edit_then_exact_revert_within_one_cycle_asserts_no_debt() {
+        // The RULED case, and precedent-consistent with the reconcile bracket's
+        // content-restored stance — see
+        // [`unbook_direction_clears_files_git_reports_clean`] and the real-git
+        // `reconcile_bracket_checkout_unbooks_reverted_file`
+        // (`tests/root_lock_integration.rs`), both of which drop a file whose
+        // content came back. Here the same reading falls out of the predicate
+        // with no bracket and no git.
+        let fx = Fixture::new();
+        let file = fx.file("src/main.rs");
+        let original = b"fn main() {}\n";
+        std::fs::write(&file, original).expect("seed content");
+        let owner = Owner::new("claude", "sess-a", "");
+        let booking = rust_booking();
+        let locks = fx.locks();
+
+        // Edit → owed.
+        assert!(matches!(
+            acquire_in(&locks, &file, &owner, &booking, SystemTime::now()),
+            Acquired::Ours
+        ));
+        std::fs::write(&file, b"fn main() { let x = 1; }\n").expect("first write");
+        assert_eq!(due_files_in(&locks, &fx.root).len(), 1, "the edit is owed");
+
+        // Revert to the EXACT original through a second admitted edit. The
+        // second booking must not re-anchor (or the first write's debt would be
+        // measured against the wrong state).
+        assert!(matches!(
+            acquire_in(&locks, &file, &owner, &booking, SystemTime::now()),
+            Acquired::Ours
+        ));
+        std::fs::write(&file, original).expect("revert");
+        assert!(
+            due_files_in(&locks, &fx.root).is_empty(),
+            "an exact revert within one cycle carries no debt"
+        );
+    }
+
+    #[test]
+    fn a_second_booking_keeps_the_first_interactions_anchor() {
+        // The anchoring rule that makes the revert case above safe in the other
+        // direction: if a later booking re-anchored, an edit followed by a
+        // BOOKED-BUT-REFUSED second tool call would erase the first edit's debt.
+        let fx = Fixture::new();
+        let file = fx.file("src/main.rs");
+        std::fs::write(&file, b"fn main() {}\n").expect("seed content");
+        let owner = Owner::new("claude", "sess-a", "");
+        let booking = rust_booking();
+        let locks = fx.locks();
+
+        assert!(matches!(
+            acquire_in(&locks, &file, &owner, &booking, SystemTime::now()),
+            Acquired::Ours
+        ));
+        std::fs::write(&file, b"fn main() { let x = 1; }\n").expect("the real write");
+
+        // A second tool call books again — and is then refused, so nothing
+        // writes. The first edit's debt must survive.
+        assert!(matches!(
+            acquire_in(&locks, &file, &owner, &booking, SystemTime::now()),
+            Acquired::Ours
+        ));
+        assert_eq!(
+            due_files_in(&locks, &fx.root),
+            vec![file],
+            "a re-booking never re-anchors over standing debt"
+        );
+    }
+
+    #[test]
+    fn payment_re_anchors_the_fingerprint() {
+        // "The fingerprint re-anchors at payment": delivery unlinks the leaf, so
+        // the next interaction observes the CURRENT bytes. A no-op interaction
+        // after payment owes nothing; a real change against the new anchor owes.
+        let fx = Fixture::new();
+        let file = fx.file("src/main.rs");
+        std::fs::write(&file, b"fn main() {}\n").expect("seed content");
+        let owner = Owner::new("claude", "sess-a", "");
+        let booking = rust_booking();
+        let locks = fx.locks();
+
+        assert!(matches!(
+            acquire_in(&locks, &file, &owner, &booking, SystemTime::now()),
+            Acquired::Ours
+        ));
+        let edited = b"fn main() { let x = 1; }\n";
+        std::fs::write(&file, edited).expect("the write");
+        assert_eq!(
+            due_files_in(&locks, &fx.root).len(),
+            1,
+            "owed before payment"
+        );
+
+        // Pay it: the leaf is unlinked, the anchor is gone.
+        unlink_delivered_in(&locks, &fx.root, std::slice::from_ref(&file));
+        assert!(due_files_in(&locks, &fx.root).is_empty(), "paid");
+
+        // A fresh interaction re-anchors at the CURRENT (already-diagnosed)
+        // bytes — reverting to the pre-payment content is now a change, and
+        // leaving it alone is not.
+        assert!(matches!(
+            acquire_in(&locks, &file, &owner, &booking, SystemTime::now()),
+            Acquired::Ours
+        ));
+        assert!(
+            due_files_in(&locks, &fx.root).is_empty(),
+            "the re-anchored booking owes nothing until the bytes move again"
+        );
+        std::fs::write(&file, b"fn main() {}\n").expect("second write");
+        assert_eq!(
+            due_files_in(&locks, &fx.root),
+            vec![file],
+            "movement against the re-anchored fingerprint is owed"
+        );
+    }
+
+    #[test]
+    fn legacy_leaf_without_a_fingerprint_still_asserts() {
+        // Migration: a ledger entry booked by a pre-misc-230 binary is an EMPTY
+        // touch file. It carries no anchor to reconcile against, so it keeps the
+        // old semantics — due until paid. Degradation is always toward
+        // over-reporting debt, never toward dropping it.
+        let fx = Fixture::new();
+        let file = fx.file("src/main.rs");
+        std::fs::write(&file, b"fn main() {}\n").expect("seed content");
+        let owner = Owner::new("claude", "sess-a", "");
+        let locks = fx.locks();
+        assert!(matches!(
+            acquire_in(&locks, &file, &owner, &rust_booking(), SystemTime::now()),
+            Acquired::Ours
+        ));
+        // Strip the fingerprint, leaving the pre-misc-230 empty leaf.
+        let leaf = touch_file(&root_lock_dir_in(&locks, &fx.root), &fx.root, &file);
+        std::fs::write(&leaf, b"").expect("truncate the leaf");
+
+        assert_eq!(
+            due_files_in(&locks, &fx.root),
+            vec![file],
+            "a fingerprintless entry is due even though the content never moved"
+        );
+    }
+
+    #[test]
+    fn a_tracking_only_kitchen_is_reaped_when_idle() {
+        // The countdown must survive the reshape: leaves that assert nothing are
+        // never served, so they are never unlinked — reading the RAW leaf count
+        // as "unpaid" would block the paid-idle reaper for good and strand the
+        // root. Tracking is not debt, so a tracking-only kitchen is paid.
+        let fx = Fixture::new();
+        let tracked = fx.file("src/tracked.rs");
+        let owner = Owner::new("claude", "sess-a", "");
+        let now = SystemTime::now();
+        let locks = fx.locks();
+        assert!(matches!(
+            acquire_in(&locks, &tracked, &owner, &rust_booking(), now),
+            Acquired::Ours
+        ));
+        let lock_dir = root_lock_dir_in(&locks, &fx.root);
+        assert_eq!(due_count(&lock_dir), 1, "the leaf is on disk");
+
+        let future = now + Duration::from_secs(10_000);
+        assert_eq!(
+            reap_paid_idle_locks_in(&locks, future, PAID_IDLE_TIMEOUT).len(),
+            1,
+            "a kitchen holding only trackings is paid, so the idle sweep clears it"
+        );
+        assert!(
+            !lock_dir.exists(),
+            "the stale trackings go with the lock dir"
         );
     }
 
@@ -3249,11 +3864,11 @@ mod tests {
 
         // Both files are edited and booked.
         assert!(matches!(
-            acquire_in(&locks, &stashed, &owner, &booking, now),
+            edit_in(&locks, &stashed, &owner, &booking, now),
             Acquired::Ours
         ));
         assert!(matches!(
-            acquire_in(&locks, &kept, &owner, &booking, now),
+            edit_in(&locks, &kept, &owner, &booking, now),
             Acquired::Ours
         ));
         assert_eq!(due_files_in(&locks, &fx.root).len(), 2, "both booked");
@@ -3287,13 +3902,20 @@ mod tests {
         let now = SystemTime::now();
         let locks = fx.locks();
         assert!(matches!(
-            acquire_in(&locks, &f1, &owner, &booking, now),
+            edit_in(&locks, &f1, &owner, &booking, now),
             Acquired::Ours
         ));
         assert!(matches!(
-            acquire_in(&locks, &f2, &owner, &booking, now),
+            edit_in(&locks, &f2, &owner, &booking, now),
             Acquired::Ours
         ));
+        // Non-vacuity: the ledger must actually hold debt before the stash, or
+        // the post-condition below proves nothing (misc 230 — a booking alone
+        // no longer asserts).
+        assert!(
+            has_debt_in(&locks, &fx.root),
+            "both edits stand as debt before the stash"
+        );
 
         reconcile_bracket_in(
             &locks,
@@ -3362,7 +3984,7 @@ mod tests {
 
         // edit → booked
         assert!(matches!(
-            acquire_in(&locks, &file, &owner, &booking, now),
+            edit_in(&locks, &file, &owner, &booking, now),
             Acquired::Ours
         ));
         assert!(has_debt_in(&locks, &fx.root), "edit books the file");
@@ -3508,7 +4130,7 @@ mod tests {
         let (wt_c, _own_c) = fx.pair("src/c.rs");
         for f in [&wt_a, &wt_b, &wt_c] {
             assert!(matches!(
-                acquire_in(&locks, f, &worker, &booking, now),
+                edit_in(&locks, f, &worker, &booking, now),
                 Acquired::Ours
             ));
         }
@@ -3590,7 +4212,7 @@ mod tests {
         // The worker books canonically (the edit seam canonicalizes).
         let (wt_b, own_b) = fx.pair("src/b.rs");
         assert!(matches!(
-            acquire_in(&locks, &wt_b, &worker, &booking, now),
+            edit_in(&locks, &wt_b, &worker, &booking, now),
             Acquired::Ours
         ));
 
@@ -3758,7 +4380,7 @@ mod tests {
         );
 
         assert!(matches!(
-            acquire_in(&locks, &inner_file, &owner, &booking, now),
+            edit_in(&locks, &inner_file, &owner, &booking, now),
             Acquired::Ours
         ));
 
@@ -3822,7 +4444,7 @@ mod tests {
             std::fs::write(&file, b"").expect("write file");
             assert!(
                 matches!(
-                    acquire_in(
+                    edit_in(
                         &self.locks(),
                         &file,
                         owner,

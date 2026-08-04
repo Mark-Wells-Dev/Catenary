@@ -263,6 +263,9 @@ fn stray_edit_books_per_file_debt_and_the_rootless_serve_pays_it() -> Result<()>
         !hook_out.contains("deny"),
         "a lone agent's stray edit is admitted. Got: {hook_out}"
     );
+    // The admitted edit then RUNS (misc 230): the booking tracked the stray's
+    // pre-write bytes, and debt is asserted at consult only once they moved.
+    std::fs::write(&stray, "echo edited\n")?;
 
     // 2. Per-file booking: the FILE's own ledger leaf exists — and it names
     //    the file, not a root-relative mirror.

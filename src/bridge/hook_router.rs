@@ -1157,8 +1157,18 @@ mod tests {
         )
     }
 
-    /// Books a file into the real ledger under `locks` and records it in the
-    /// in-memory candidate batch — the state a covered edit leaves behind.
+    /// Moves a tracked file's bytes — the write the admitted tool performs after
+    /// the `PreToolUse` seam books it (misc 230). Appending is always a change,
+    /// so repeated calls keep modelling successive real edits.
+    fn apply_edit(file: &Path) {
+        let mut bytes = std::fs::read(file).unwrap_or_default();
+        bytes.extend_from_slice(b"// edit\n");
+        std::fs::write(file, &bytes).expect("apply the edit");
+    }
+
+    /// Books a file into the real ledger under `locks`, performs the write, and
+    /// records it in the in-memory candidate batch — the state a covered edit
+    /// leaves behind.
     fn book_and_record(router: &HookRouter, locks: &Path, file: &Path) {
         book_and_record_as(router, locks, file, "");
     }
@@ -1175,6 +1185,11 @@ mod tests {
             matches!(acquired, crate::lock::Acquired::Ours),
             "the edit books the ledger"
         );
+        // The WRITE the hook just admitted (misc 230): booking is tracking, and
+        // debt is asserted at consult only when the content actually moved — so
+        // an edit that models a real one must move the bytes, exactly as the
+        // tool does after the `PreToolUse` seam allows it.
+        apply_edit(file);
         let _ = router.session.editing.start_editing(None, agent_id);
         router
             .session
@@ -1384,6 +1399,8 @@ mod tests {
             ),
             crate::lock::Acquired::Ours
         ));
+        // The write the admitted edit performs (misc 230) — see [`apply_edit`].
+        apply_edit(&real);
         let _ = router.session.editing.start_editing(None, "");
         router
             .session
@@ -1422,6 +1439,8 @@ mod tests {
             matches!(acquired, crate::lock::Acquired::Ours),
             "the edit books the ledger"
         );
+        // The write the admitted tool performs (misc 230) — see [`apply_edit`].
+        apply_edit(file);
     }
 
     #[test]

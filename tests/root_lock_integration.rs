@@ -667,10 +667,14 @@ fn reconcile_bracket_round_trip_edit_stash_pop() -> Result<()> {
     git(dir, &["commit", "-qm", "init"])?;
     let file_str = file.to_str().context("file path utf-8")?;
 
-    // The cook edits the file (a real content change) and the edit hook books it.
-    std::fs::write(&file, "fn main() { let x = 1; }\n")?;
+    // The cook edits the file: the hook books it (tracking the PRE-write bytes,
+    // misc 230), then the admitted edit performs the real content change. The
+    // hook-then-write order is the production order — `PreToolUse` runs before
+    // the tool — and it is load-bearing now that debt is asserted by content
+    // movement against the booking fingerprint.
     let e = run_edit_hook(root, "cook", file_str)?;
     assert!(deny_reason(&e).is_none(), "the edit is admitted, got: {e}");
+    std::fs::write(&file, "fn main() { let x = 1; }\n")?;
     assert_eq!(due_count(root), 1, "the edit books one file");
 
     // `git stash` moves the modification out of the working tree; the bracket's
@@ -719,11 +723,12 @@ fn reconcile_bracket_checkout_unbooks_reverted_file() -> Result<()> {
     git(dir, &["add", "."])?;
     git(dir, &["commit", "-qm", "init"])?;
 
-    // Both files edited and booked.
-    std::fs::write(&reverted, "fn a() { 1; }\n")?;
-    std::fs::write(&kept, "fn b() { 2; }\n")?;
+    // Both files edited and booked — hook first (it tracks the PRE-write bytes,
+    // misc 230), then the admitted write, as in production.
     run_edit_hook(root, "cook", reverted.to_str().context("path")?)?;
     run_edit_hook(root, "cook", kept.to_str().context("path")?)?;
+    std::fs::write(&reverted, "fn a() { 1; }\n")?;
+    std::fs::write(&kept, "fn b() { 2; }\n")?;
     assert_eq!(due_count(root), 2, "both edits booked");
 
     // Revert only `reverted.rs` via checkout; the bracket unbooks exactly it.
@@ -801,14 +806,17 @@ fn merge_bracket_squash_transfers_unpaid_worktree_debt_only() -> Result<()> {
 
     // The worker edits three covered files; the edit hook books each into the
     // WORKTREE root's ledger.
+    // Hook first (it tracks the PRE-write state — here `absent`, misc 230), then
+    // the admitted write creates the file: the production order, and the order
+    // the content-movement assertion depends on.
     for rel in ["src/a.rs", "src/b.rs", "src/c.rs"] {
         let f = wt.join(rel);
-        std::fs::write(&f, "fn w() {}\n")?;
         let out = run_edit_hook(root, "worker", f.to_str().context("file path utf-8")?)?;
         assert!(
             deny_reason(&out).is_none(),
             "the worker's edit must be admitted, got: {out}"
         );
+        std::fs::write(&f, "fn w() {}\n")?;
     }
     let wt_canon = wt.canonicalize()?;
     assert_eq!(due_in(root, &wt).len(), 3, "three worker edits booked");
@@ -868,10 +876,11 @@ fn merge_bracket_full_merge_transfers_committed_unpaid_debt() -> Result<()> {
         ],
     )?;
 
-    // One unpaid covered edit, committed in the worktree.
+    // One unpaid covered edit, committed in the worktree. Hook first, then the
+    // admitted write (the production order — misc 230).
     let f = wt.join("src/b.rs");
-    std::fs::write(&f, "fn w() {}\n")?;
     run_edit_hook(root, "worker", f.to_str().context("file path utf-8")?)?;
+    std::fs::write(&f, "fn w() {}\n")?;
     git(&wt, &["add", "src/b.rs"])?;
     git(&wt, &["commit", "-qm", "work"])?;
 
@@ -920,12 +929,13 @@ fn merge_bracket_plain_merge_books_nothing() -> Result<()> {
         ],
     )?;
     let unrelated = wt.join("src/unrelated.rs");
-    std::fs::write(&unrelated, "fn w() {}\n")?;
+    // Hook first, then the admitted write (the production order — misc 230).
     run_edit_hook(
         root,
         "worker",
         unrelated.to_str().context("file path utf-8")?,
     )?;
+    std::fs::write(&unrelated, "fn w() {}\n")?;
 
     // An upstream-ish branch made in the owning repo itself (no worktree).
     git(&repo, &["checkout", "-qb", "upstream"])?;

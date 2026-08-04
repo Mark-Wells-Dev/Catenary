@@ -89,6 +89,13 @@ fn book_via_hook(bridge: &BridgeProcess, tool: &str, file: &str) -> Result<()> {
         !out.contains("\"deny\""),
         "the {tool} booking hook must be admitted, got: {out}"
     );
+    // The admitted edit then RUNS (misc 230): the hook tracked the target's
+    // pre-write fingerprint, and debt is asserted at consult only once the
+    // content moved. This harness drives the hook alone, so the write happens
+    // here — exactly what the edit tool does after the allow.
+    let mut bytes = std::fs::read(file).unwrap_or_default();
+    bytes.extend_from_slice(b"echo edited\n");
+    std::fs::write(file, &bytes).context("execute the admitted edit")?;
     Ok(())
 }
 
