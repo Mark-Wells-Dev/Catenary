@@ -42,6 +42,18 @@ use common::{BridgeProcess, ipc_request, mockls_lsp_arg, xdg_config_home, xdg_ru
 
 const MOCK_LANG: &str = "pIn17";
 
+/// How long the boot-restore laziness tests keep sampling the snapshot after
+/// their positive signal has landed.
+///
+/// These assert that something never happens, which no completion signal can
+/// prove outright — so they anchor on the strongest positive signal available
+/// (the restored pin on the roots board; in the warm-root sibling, a spawned
+/// server for the boot root) and then observe for a bounded period, sampling at
+/// `POLL_SPACING` throughout. Sized well past the ~250 ms at which the bug-155
+/// macOS spawn landed: a violation the daemon commits at boot has long since
+/// surfaced on the snapshot board by the end of this window.
+const BOOT_OBSERVATION_WINDOW: Duration = Duration::from_secs(2);
+
 /// The user config file the daemon reads and the pin write targets, under the
 /// isolated state home.
 fn user_config_path(state_home: &str) -> PathBuf {
@@ -190,6 +202,22 @@ fn read_snapshot(state_home: &str) -> Option<serde_json::Value> {
         .join("state.json");
     let text = std::fs::read_to_string(state_json).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+/// Whether the daemon's servers board carries any server scoped to `root`.
+///
+/// The board's `scope_root` renders the daemon's canonical spelling, so callers
+/// pass a canonical path (`common::canonical_tempdir`) — which is also what
+/// makes a hit attributable to one specific tempdir rather than merely proving
+/// that *something* spawned (bug 155).
+fn servers_for_root(state_home: &str, root: &str) -> bool {
+    read_snapshot(state_home).is_some_and(|snap| {
+        snap["servers"].as_array().is_some_and(|servers| {
+            servers
+                .iter()
+                .any(|s| s["scope_root"].as_str() == Some(root))
+        })
+    })
 }
 
 /// A pin survives a daemon restart: pinning writes the config, and a fresh daemon
@@ -496,35 +524,141 @@ fn boot_restore_spawns_no_servers() -> Result<()> {
     bridge.wait_for_root(target_str, Duration::from_secs(5))?;
 
     // The restored pin is tracked (roots board carries it) but no server spawned.
-    // Poll the snapshot briefly to let any (erroneous) spawn surface, then assert
-    // the servers board is empty for the mock language.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
+    //
+    // Observe the WHOLE boot window, sampling throughout — never assert once at
+    // the instant the root appears tracked and break (bug 155). Boot restore is
+    // a sequence, not an event: the tracker entry (what `wait_for_root` and the
+    // roots board see) lands first, the root push that makes the root visible to
+    // the spawn machinery lands after it, and an erroneous spawn after that. An
+    // assert-and-break at tracked-appears therefore samples the one moment the
+    // violation is guaranteed absent, and a spawn landing a few hundred
+    // milliseconds later is never looked at — which is exactly how this stayed
+    // green on Linux while going red on 2 of 5 macOS runs.
+    let observe_until = Instant::now() + BOOT_OBSERVATION_WINDOW;
+    let mut ever_tracked = false;
+    while Instant::now() < observe_until {
         if let Some(snap) = read_snapshot(state_home) {
             let roots = snap["roots"].as_array().cloned().unwrap_or_default();
-            let tracked = roots.iter().any(|r| r["path"].as_str() == Some(target_str));
+            ever_tracked |= roots.iter().any(|r| r["path"].as_str() == Some(target_str));
             let servers = snap["servers"].as_array().cloned().unwrap_or_default();
-            if tracked {
-                // Name both tempdirs in the failure (bug 155): the daemon may
-                // canonicalize registered roots, so on macOS a canonical
-                // `scope_root` alone cannot say whether the erroneous spawn was
-                // the pinned target (an eager-restore violation) or the session
-                // base (a first-touch-on-boot question) — two different bugs.
-                assert!(
-                    servers.is_empty(),
-                    "boot restore spawned a server (should be lazy): {servers:?}\n\
-                     pinned target root: {target_str}\n\
-                     session base root:  {base_str}"
-                );
-                break;
-            }
+            // Name both tempdirs in the failure (bug 155): the daemon
+            // canonicalizes registered roots, so on macOS a canonical
+            // `scope_root` alone cannot say whether the erroneous spawn was the
+            // pinned target (an eager-restore violation) or the session base (a
+            // first-touch-on-boot question) — two different bugs.
+            assert!(
+                servers.is_empty(),
+                "boot restore spawned a server (should be lazy): {servers:?}\n\
+                 pinned target root: {target_str}\n\
+                 session base root:  {base_str}"
+            );
         }
+        std::thread::sleep(common::POLL_SPACING);
+    }
+    assert!(
+        ever_tracked,
+        "restored pin never appeared on the roots board: {}",
+        read_snapshot(state_home).unwrap_or_default()
+    );
+
+    drop(bridge);
+    stop_daemon(state_home)?;
+    Ok(())
+}
+
+/// Boot restore stays lazy even when the daemon's own boot root is warm
+/// (bug 155) — the deterministic half of the laziness contract.
+///
+/// The zero-cost-restore claim rested on a premise: "on a fresh daemon no
+/// language is active, so `spawn_for_added_roots` — the warm-language spawn leg
+/// — fires for nothing". That premise holds only while the boot root carries no
+/// code, which the empty-tempdir sibling above arranges and which no real daemon
+/// ever does. Give the boot root a file of the mock language and it collapses,
+/// in **either** interleaving of the two fire-and-forget boot tasks:
+///
+/// - restore's root push lands first ⇒ the boot pre-warm reads the roots live
+///   and walks the restored pin directly;
+/// - the boot pre-warm lands first ⇒ it spawns for the boot root, which makes
+///   the mock language *active*, and the restore's own push then runs
+///   `spawn_for_added_roots` over the newly added pin and spawns for it too.
+///
+/// Both orderings lose, which is what makes this deterministic on every platform
+/// where the macOS-only sibling caught the same defect once in five runs. The
+/// pinned root is one no session ever touched — the contract says it stays a
+/// tracker entry and a roots-board line until an actual query or edit lands on
+/// it.
+///
+/// Red before the fix: two servers, one scoped to the restored pin. Green after:
+/// exactly one, scoped to the boot root — the boot pre-warm still does its job.
+#[test]
+fn boot_restore_stays_lazy_beside_a_warm_boot_root() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state_home = state_dir.path().to_str().context("state dir")?;
+    // Panic-safe daemon teardown (bug 131): shared-state spawns leave daemon
+    // lifecycle to the test, so a failed assertion before `stop_daemon` would
+    // leak the daemon without this guard.
+    let _daemon_guard = common::DaemonGuard::new(state_home);
+
+    // The daemon's own boot root, WARM: it carries a mock-language file, so the
+    // boot pre-warm legitimately spawns a server for it. Canonical, so its
+    // `scope_root` on the servers board is comparable.
+    let base = common::canonical_tempdir()?;
+    let base_str = base.path().to_str().context("base path")?;
+    std::fs::write(
+        base.path().join(format!("boot.{MOCK_LANG}")),
+        "fn boot_symbol()\n",
+    )?;
+
+    // The pinned root carries a mock-language file too, so an eager restore WOULD
+    // spawn a server for it. It must not — nothing ever touches this root.
+    let target = common::canonical_tempdir()?;
+    let target_str = target.path().to_str().context("target path")?;
+    std::fs::write(
+        target.path().join(format!("code.{MOCK_LANG}")),
+        "fn restored_symbol()\n",
+    )?;
+
+    // Pin it directly in the config so the restore path (not a runtime pin) is
+    // what tracks it at boot.
+    let config = format!("[roots]\npinned = [\n  \"{target_str}\",\n]\n");
+    write_user_config(state_home, &config)?;
+
+    let lsp = mockls_lsp_arg(MOCK_LANG, "--scan-roots");
+    let mut bridge = BridgeProcess::spawn_in_state(state_home, |cmd| {
+        cmd.env("CATENARY_SERVERS", &lsp);
+        cmd.env("CATENARY_ROOTS", base_str);
+    })?;
+    bridge.initialize()?;
+    bridge.wait_for_root(target_str, Duration::from_secs(5))?;
+
+    // Positive completion signal: the boot pre-warm has run and produced the
+    // server it SHOULD produce, for the warm boot root. Waiting on this (rather
+    // than on the clock) is what makes the observation window below meaningful —
+    // the spawn machinery has demonstrably executed by the time it opens.
+    let deadline = Instant::now() + common::POLL_BACKSTOP;
+    while !servers_for_root(state_home, base_str) {
         if Instant::now() >= deadline {
-            // The root should have been tracked by now (wait_for_root returned).
-            let snap = read_snapshot(state_home).unwrap_or_default();
-            bail!("restored pin never appeared on the roots board: {snap}");
+            bail!(
+                "boot pre-warm never spawned a server for the warm boot root {base_str}: {}",
+                read_snapshot(state_home).unwrap_or_default()
+            );
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(common::POLL_SPACING);
+    }
+
+    // …and the restored pin has none, throughout the rest of the boot window.
+    let observe_until = Instant::now() + BOOT_OBSERVATION_WINDOW;
+    while Instant::now() < observe_until {
+        let snap = read_snapshot(state_home).unwrap_or_default();
+        let servers = snap["servers"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !servers_for_root(state_home, target_str),
+            "boot restore spawned a server for the restored pin (should be lazy \
+             until first touch): {servers:?}\n\
+             pinned target root: {target_str}\n\
+             warm boot root:     {base_str}"
+        );
+        std::thread::sleep(common::POLL_SPACING);
     }
 
     drop(bridge);

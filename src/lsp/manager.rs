@@ -1825,12 +1825,31 @@ impl LspClientManager {
     /// Spawns a separate `Scope::Root` instance per root. Unrelated
     /// projects never share an LSP server.
     pub async fn spawn_all(&self) {
-        let roots = self.fs.roots();
+        self.spawn_for_roots(&self.fs.roots()).await;
+    }
 
+    /// Like [`spawn_all`](Self::spawn_all) but over an **explicit** root set
+    /// instead of whatever is installed when the call runs (bug 155).
+    ///
+    /// The daemon's boot pre-warm is a fire-and-forget task racing the boot
+    /// setup that spawned it, and boot restore (misc 175) installs the persisted
+    /// pins into this manager from a second such task. A pre-warm that reads
+    /// `fs.roots()` at its own start therefore covers a root set nobody chose:
+    /// win the race and it warms the boot roots as intended, lose it and it
+    /// warms the restored pins too — eagerly spawning servers for projects no
+    /// session has touched, which is precisely the zero-cost promise restore
+    /// makes. macOS CI lost that race on 2 of 5 runs; Linux won it every time.
+    ///
+    /// Passing the set closes the race by construction: the caller names the
+    /// roots it means, at the moment it means them, and a concurrent root
+    /// installation can no longer widen the walk.
+    pub async fn spawn_for_roots(&self, roots: &[PathBuf]) {
         // Each tracked root already carries its `.catenary.toml` config +
         // classification (loaded at birth, ticket 00a) — no config loading
         // here. Surface any orphan `[lsp.server.*]` entries while we hold every
-        // root's config.
+        // root's config. Deliberately over *every* tracked root, not just the
+        // walked ones: this is a config-validation sweep, not part of the
+        // spawn decision, and a narrower pre-warm must not silence it.
         for root in self.fs.root_views() {
             crate::config::validate::warn_orphan_project_servers(
                 root.config(),
@@ -1848,7 +1867,7 @@ impl LspClientManager {
         // bash, yaml) into roots that have no files of that language —
         // a language detected in one served root would spawn a server
         // in every served root.
-        for root in &roots {
+        for root in roots {
             // `disable_lsp` roots stay tracked but never reach a language
             // server (ticket 00).
             if self.is_lsp_disabled(root) {
@@ -2172,6 +2191,42 @@ impl LspClientManager {
     ///
     /// Returns an error if any root path cannot be converted to a valid URI.
     pub async fn sync_roots(&self, new_roots: Vec<Arc<Root>>) -> Result<Vec<PathBuf>> {
+        self.sync_roots_inner(new_roots, true).await
+    }
+
+    /// Like [`sync_roots`](Self::sync_roots) but **without** spawning for the
+    /// added roots — the boot-restore installation path (misc 175, bug 155).
+    ///
+    /// Every other leg of the sync is identical (the diff, removal teardown, the
+    /// orphan sweep, the atomic root install), so a restored pin becomes
+    /// resolvable exactly as a pinned root should. Only the warm-language spawn
+    /// is withheld, because a restored pin has never been touched.
+    ///
+    /// Restore used to rely on that leg no-opping by itself: on a fresh daemon
+    /// no language is active, so there is nothing to spawn. That premise is only
+    /// true while the daemon's *own* boot roots carry no code — the moment the
+    /// boot pre-warm lands a server first, the language is active, and the
+    /// restore's own root installation spawns for a project nobody asked for.
+    /// Withholding the spawn makes the laziness structural instead of incidental.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any root path cannot be converted to a valid URI.
+    pub async fn sync_roots_without_spawn(
+        &self,
+        new_roots: Vec<Arc<Root>>,
+    ) -> Result<Vec<PathBuf>> {
+        self.sync_roots_inner(new_roots, false).await
+    }
+
+    /// Shared root-sync body. `spawn_added` gates the warm-language
+    /// [`spawn_for_added_roots`](Self::spawn_for_added_roots) leg: on for the
+    /// ordinary path, off for boot restore.
+    async fn sync_roots_inner(
+        &self,
+        new_roots: Vec<Arc<Root>>,
+        spawn_added: bool,
+    ) -> Result<Vec<PathBuf>> {
         // Snapshot the old paths, then compute the diff against it. The diff
         // uses the snapshot (not `fs.roots()`), so `fs.set_roots_rich` can run
         // later.
@@ -2249,8 +2304,9 @@ impl LspClientManager {
             self.shutdown_single_file_instances().await;
         }
 
-        // Spawn instances for added roots.
-        if !to_add.is_empty() {
+        // Spawn instances for added roots — unless the caller is boot restore,
+        // whose roots stay lazy until first touch (bug 155).
+        if spawn_added && !to_add.is_empty() {
             self.spawn_for_added_roots(&to_add).await;
         }
 
@@ -5452,6 +5508,16 @@ mod tests {
         paths.into_iter().map(|p| Arc::new(Root::bare(p))).collect()
     }
 
+    /// Whether any live instance is scoped to `root` — "did a server spawn for
+    /// this project", asked of the registry rather than of a log line.
+    async fn has_instance_at(manager: &LspClientManager, root: &Path) -> bool {
+        manager
+            .clients()
+            .await
+            .keys()
+            .any(|k| k.scope.root_path() == Some(root))
+    }
+
     fn test_config_raw() -> Config {
         Config {
             language: HashMap::new(),
@@ -6660,6 +6726,124 @@ mod tests {
             roots_for(LANG_B),
             HashSet::from([root_b.path().to_path_buf()]),
             "LANG_B should spawn only at root_b (the root that contains its files)",
+        );
+
+        Ok(())
+    }
+
+    /// The pre-warm walks the roots it was HANDED, never every root that happens
+    /// to be installed by the time it runs (bug 155).
+    ///
+    /// The daemon dispatches its boot pre-warm as a background task and then
+    /// carries on with boot setup, which installs the persisted pins (misc 175)
+    /// into this same manager. While the walk read `fs.roots()` itself, its
+    /// scope was decided by a race: win it and the pre-warm covers the boot
+    /// roots as intended, lose it and it covers the restored pins too — an eager
+    /// spawn for a project no session has touched. macOS CI lost that race on
+    /// 2 of 5 runs and Linux won it every time, which is why the end-to-end test
+    /// could only catch this by luck.
+    ///
+    /// Here the losing interleaving is forced rather than raced: both roots are
+    /// already installed — the state the daemon is in once restore has landed —
+    /// and both are full of matching files, so a `fs.roots()`-reading walk
+    /// spawns for both. Only the named root may get a server.
+    #[tokio::test]
+    async fn spawn_for_roots_walks_only_the_named_roots() -> Result<()> {
+        let boot = tempfile::tempdir().expect("boot tempdir");
+        let restored = tempfile::tempdir().expect("restored tempdir");
+        std::fs::write(boot.path().join(format!("boot.{MOCK_LANG_A}")), "x").expect("write boot");
+        std::fs::write(restored.path().join(format!("pin.{MOCK_LANG_A}")), "x")
+            .expect("write restored");
+
+        let fs = test_fs_with_roots(&[
+            boot.path().to_str().expect("boot path"),
+            restored.path().to_str().expect("restored path"),
+        ]);
+        let manager = LspClientManager::new(mockls_config(), test_logging(), fs);
+
+        manager.spawn_for_roots(&[boot.path().to_path_buf()]).await;
+
+        assert!(
+            has_instance_at(&manager, boot.path()).await,
+            "the named boot root must be pre-warmed — otherwise the negative \
+             below passes for the wrong reason",
+        );
+        assert!(
+            !has_instance_at(&manager, restored.path()).await,
+            "a tracked root the pre-warm was NOT handed must stay cold, however \
+             many matching files it holds: a restored pin is a tracker entry and \
+             a roots-board line until its first touch",
+        );
+
+        Ok(())
+    }
+
+    /// Boot restore installs its roots without spawning for them, even once the
+    /// language is warm (bug 155).
+    ///
+    /// Restore's laziness rested on a premise rather than a mechanism: on a
+    /// fresh daemon no language is active, so the warm-language
+    /// `spawn_for_added_roots` leg fires for nothing. The premise dies the moment
+    /// the daemon's own boot root carries code — which every real daemon's does.
+    /// The boot pre-warm lands a server, the language goes active, and then
+    /// restore's own root installation spawns for the untouched pin. Withholding
+    /// the leg makes the laziness structural.
+    ///
+    /// The control root keeps the negative honest: one call later, through the
+    /// ordinary `sync_roots`, this very manager DOES spawn for a newly added
+    /// root — so the pin's coldness is a decision, not a broken fixture.
+    #[tokio::test]
+    async fn sync_roots_without_spawn_leaves_added_roots_cold() -> Result<()> {
+        let boot = tempfile::tempdir().expect("boot tempdir");
+        let restored = tempfile::tempdir().expect("restored tempdir");
+        let control = tempfile::tempdir().expect("control tempdir");
+        for (dir, stem) in [(&boot, "boot"), (&restored, "pin"), (&control, "ctl")] {
+            std::fs::write(dir.path().join(format!("{stem}.{MOCK_LANG_A}")), "x")
+                .expect("write source file");
+        }
+
+        let fs = test_fs_with_roots(&[boot.path().to_str().expect("boot path")]);
+        let manager = LspClientManager::new(mockls_config(), test_logging(), fs);
+
+        // The boot pre-warm: this is what makes the mock language active, and
+        // with it the warm-language leg live.
+        manager.spawn_all().await;
+        assert!(
+            has_instance_at(&manager, boot.path()).await,
+            "the boot root must be warm — the whole point is what happens with \
+             an ACTIVE language",
+        );
+
+        // Boot restore installs the pin: resolvable, but never spawned for.
+        manager
+            .sync_roots_without_spawn(rich_bufs(vec![
+                boot.path().to_path_buf(),
+                restored.path().to_path_buf(),
+            ]))
+            .await?;
+        assert!(
+            !has_instance_at(&manager, restored.path()).await,
+            "boot restore must not spawn for the pin it installs, warm language \
+             or not — first touch means an actual query or edit",
+        );
+
+        // Control: the ordinary sync still pre-warms what it adds.
+        manager
+            .sync_roots(rich_bufs(vec![
+                boot.path().to_path_buf(),
+                restored.path().to_path_buf(),
+                control.path().to_path_buf(),
+            ]))
+            .await?;
+        assert!(
+            has_instance_at(&manager, control.path()).await,
+            "the ordinary sync still spawns for an added root — the restore \
+             assertion above is a decision, not a dead fixture",
+        );
+        assert!(
+            !has_instance_at(&manager, restored.path()).await,
+            "and that later sync must not retroactively warm the restored pin: \
+             it spawns for what it ADDS, and the pin was added lazily",
         );
 
         Ok(())

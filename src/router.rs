@@ -1948,12 +1948,18 @@ fn register_env_seed(tracker: &RootTracker, session: &Arc<Session>) {
 /// transiently absent mount stays pinned.
 ///
 /// Restore is zero-cost. `add_roots` births a config-loaded [`Root`] (a tracker
-/// entry + a roots-board line) but spawns nothing: on a fresh daemon no language
-/// is active, so `spawn_for_added_roots` (the warm-language spawn leg) fires for
-/// none of them, and the first-touch lazy spawn pays only when a root is used.
-/// The single `sync_roots` push (fire-and-forget on the session runtime, like the
-/// startup `spawn_all`) makes the roots resolvable by tool calls without eager
-/// spawning.
+/// entry + a roots-board line) and the single `sync_roots_no_prewarm` push
+/// (fire-and-forget on the session runtime, like the startup pre-warm) makes the
+/// roots resolvable by tool calls; only the first-touch lazy spawn pays, when a
+/// root is actually used.
+///
+/// That laziness is now enforced, not inferred (bug 155). It used to rest on the
+/// claim that a fresh daemon has no active language, so the warm-language
+/// `spawn_for_added_roots` leg fires for nothing — true only while the daemon's
+/// own boot roots carry no code, which no real workspace manages. `Session::
+/// sync_roots_no_prewarm` withholds both spawn legs outright, and the boot
+/// pre-warm walks the root set it was handed at dispatch rather than re-reading
+/// whatever this function has since installed.
 #[cfg(unix)]
 fn restore_pinned_roots(tracker: &RootTracker, session: &Arc<Session>) {
     let mut restored: Vec<PathBuf> = Vec::new();
@@ -1988,11 +1994,12 @@ fn restore_pinned_roots(tracker: &RootTracker, session: &Arc<Session>) {
     );
 
     // Push the restored union into the FilesystemManager/LspClientManager so a
-    // first-touch tool call resolves the root, WITHOUT the eager pre-warm:
-    // `sync_roots_no_prewarm` skips the fire-and-forget `spawn_all`, so a restored
-    // pin spawns no server (its `spawn_for_added_roots` leg is a no-op on a fresh
-    // daemon). The lazy first-touch path is preserved. Fire-and-forget on the
-    // session runtime, mirroring the startup spawn.
+    // first-touch tool call resolves the root, WITHOUT any eager spawn:
+    // `sync_roots_no_prewarm` withholds both the fire-and-forget `spawn_all` and
+    // the warm-language `spawn_for_added_roots` leg, so a restored pin spawns no
+    // server whatever else the daemon has already warmed (bug 155). The lazy
+    // first-touch path is preserved. Fire-and-forget on the session runtime,
+    // mirroring the startup pre-warm.
     let session = Arc::clone(session);
     let global = tracker.global_roots_rich();
     session.runtime.clone().spawn(async move {
@@ -3955,9 +3962,9 @@ impl SessionManager {
         // entry as a `hook` contributor so a pin survives a daemon restart. A
         // hand-edit to the array is honored the same way — adding a path IS a
         // pin, effective now. Restore is zero-cost: `add_roots` births a
-        // config-loaded `Root` (a tracker entry + roots-board line) but nothing
-        // is active on a fresh daemon, so `spawn_for_added_roots` spawns no
-        // server until the root's first touch (the lazy path is preserved). A
+        // config-loaded `Root` (a tracker entry + roots-board line) and the
+        // push that follows withholds every spawn leg, so no server starts
+        // until the root's first touch (the lazy path is preserved). A
         // missing path (deleted repo, unmounted volume) is left in the config and
         // NOT added to the tracker — the doctor missing-pin finding surfaces it;
         // Catenary never rewrites the user's config outside an explicit

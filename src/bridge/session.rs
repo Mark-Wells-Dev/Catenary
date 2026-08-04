@@ -1373,6 +1373,18 @@ impl Session {
         self.client_manager.spawn_all().await;
     }
 
+    /// Pre-warms an **explicit** root set rather than whatever is installed when
+    /// the call runs — the daemon's boot pre-warm (bug 155).
+    ///
+    /// The boot pre-warm is dispatched as a background task while boot setup
+    /// continues, and that setup goes on to install the restored pins (misc 175)
+    /// into the same manager. Naming the roots at dispatch time keeps the two
+    /// independent: the pre-warm covers the roots the daemon booted with however
+    /// the two tasks interleave, and a restored pin stays lazy.
+    pub async fn spawn_for_roots(&self, roots: &[PathBuf]) {
+        self.client_manager.spawn_for_roots(roots).await;
+    }
+
     /// Synchronizes workspace roots with a new set.
     ///
     /// Updates path validation, notifies LSP servers of folder changes,
@@ -1408,16 +1420,22 @@ impl Session {
             .await
     }
 
-    /// Like [`sync_roots`](Self::sync_roots) but **without** the eager `spawn_all`
-    /// pre-warm — the boot-restore path for persisted pins (misc 175).
+    /// Like [`sync_roots`](Self::sync_roots) but spawning **nothing** — the
+    /// boot-restore path for persisted pins (misc 175, bug 155).
     ///
-    /// Registers the roots (so a first-touch tool call resolves them) and runs the
-    /// manager's `spawn_for_added_roots` leg, which is a no-op on a fresh daemon
-    /// (no language is active elsewhere yet). Skipping the pre-warm keeps the
-    /// zero-cost-restore promise: a restored pin is a tracker entry and a
-    /// roots-board line until first use, when the ordinary lazy first-touch spawn
-    /// pays. The runtime `catenary pin` keeps its warm-language pre-warm via
-    /// [`sync_roots`](Self::sync_roots); only boot restore uses this leg.
+    /// Registers the roots (so a first-touch tool call resolves them) and skips
+    /// both spawn legs: the eager `spawn_all` pre-warm and the manager's
+    /// warm-language `spawn_for_added_roots`. That keeps the zero-cost-restore
+    /// promise: a restored pin is a tracker entry and a roots-board line until
+    /// first use, when the ordinary lazy first-touch spawn pays.
+    ///
+    /// Both legs must be withheld explicitly. The warm-language one was long
+    /// assumed self-limiting — nothing is active on a fresh daemon, so it fires
+    /// for nothing — but that holds only while the daemon's own boot roots carry
+    /// no code; a boot root with real files makes the language active and the
+    /// leg then spawns for the untouched pin. The runtime `catenary pin` keeps
+    /// its warm-language pre-warm via [`sync_roots`](Self::sync_roots); only
+    /// boot restore uses this leg.
     ///
     /// # Errors
     ///
@@ -1426,15 +1444,21 @@ impl Session {
         self.sync_roots_inner(roots, false).await
     }
 
-    /// Shared root-sync body. `prewarm` gates the fire-and-forget `spawn_all`:
-    /// on for the ordinary path (a pin/MCP-sync pre-warms), off for boot restore.
+    /// Shared root-sync body. `prewarm` gates **both** spawn legs — the
+    /// fire-and-forget `spawn_all` below and the manager's warm-language
+    /// `spawn_for_added_roots` — on for the ordinary path (a pin/MCP-sync
+    /// pre-warms), off for boot restore.
     async fn sync_roots_inner(&self, roots: Vec<Arc<Root>>, prewarm: bool) -> Result<()> {
         // Path-only view for the validator (a path-only consumer).
         let paths: Vec<PathBuf> = roots.iter().map(|r| r.path().to_path_buf()).collect();
 
         // sync_roots updates FilesystemManager roots first (before any
         // async work), then reacts to the diff.
-        let removed = self.client_manager.sync_roots(roots).await?;
+        let removed = if prewarm {
+            self.client_manager.sync_roots(roots).await?
+        } else {
+            self.client_manager.sync_roots_without_spawn(roots).await?
+        };
         self.path_validator.write().await.update_roots(paths);
 
         // Evict the per-root `SymbolIndex` entries for every removed root —

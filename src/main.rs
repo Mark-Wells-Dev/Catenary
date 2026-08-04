@@ -2008,9 +2008,17 @@ fn serve_daemon(
             Some(snapshot),
         ));
 
-        // Spawn LSP servers in the background.
+        // Spawn LSP servers in the background, for the roots the daemon booted
+        // WITH — named here, at dispatch, not read by the task when it happens
+        // to start (bug 155). Boot setup continues past this point and installs
+        // the restored pins (misc 175) into the same manager; a pre-warm that
+        // re-read the root set on its own schedule would cover them too on any
+        // machine where it lost that race, eagerly spawning servers for pinned
+        // projects no session has touched. Naming the set makes the boot
+        // pre-warm's scope independent of how the two tasks interleave.
+        let boot_roots = session.roots();
         let session_for_spawn = session.clone();
-        rt.spawn(async move { session_for_spawn.spawn_all().await });
+        rt.spawn(async move { session_for_spawn.spawn_for_roots(&boot_roots).await });
 
         // Firehose reaping (ticket 01). Run the startup instance cap once —
         // every non-self instance dir belongs to a dead daemon (one daemon per
