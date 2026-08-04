@@ -32,6 +32,7 @@ pub mod config_checks;
 pub mod install_checks;
 pub mod pulse;
 pub mod servers;
+pub mod service_checks;
 pub mod skew;
 
 /// Severity of a health finding — the `:checkhealth` ladder.
@@ -192,6 +193,18 @@ pub enum FindingCode {
     /// skip-with-finding: a [`Severity::Warning`] naming the reason; the next
     /// session start's detection retries naturally.
     ServerAutoInstallFailed,
+    /// The installed service unit/plist has drifted from what this build would
+    /// write (ws49-04a): its template predates the live `service.rs` generators,
+    /// or its baked `ExecStart` target no longer names the running daemon's
+    /// binary. Packaging-carried units are immune (their managers regenerate on
+    /// upgrade) — only the manual `service install` path drifts, and the cure is
+    /// the idempotent re-run.
+    ServiceUnitStale,
+    /// A daemon is running while the installed service unit sits inactive
+    /// (ws49-04a) — it is up, but outside supervision, so nothing relaunches it
+    /// when it dies. The next `catenary restart` adopts it into the service;
+    /// this names the window in between.
+    ServiceUnsupervised,
     /// The running daemon serves a different build than this binary.
     VersionSkew,
     /// A connected bridge links a different `catenary-mcp` protocol version than
@@ -267,6 +280,8 @@ impl FindingCode {
             Self::ServerVersionDrift => "server-version-drift",
             Self::ServerAutoInstall => "server-auto-install",
             Self::ServerAutoInstallFailed => "server-auto-install-failed",
+            Self::ServiceUnitStale => "service-unit-stale",
+            Self::ServiceUnsupervised => "service-unsupervised",
             Self::VersionSkew => "version-skew",
             Self::BridgeVersionMismatch => "bridge-version-mismatch",
             Self::SessionPulseless => "session-pulseless",

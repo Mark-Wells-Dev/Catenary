@@ -7951,6 +7951,21 @@ pub enum DaemonStartOutcome {
     Started,
 }
 
+/// Whether a daemon is answering its IPC socket right now.
+///
+/// The probe [`ensure_daemon_running`]'s idempotent fast path uses, named so
+/// callers that must *not* spawn can ask the same question: the supervision-aware
+/// `catenary start` (ws49-04a) delegates to the service manager only when nothing
+/// is already up, and the delegated-bounce wait polls this until the manager's
+/// daemon binds. The **IPC** socket, never the MCP one: an MCP connect-and-drop
+/// would register then release a connection, whereas an IPC probe never holds the
+/// daemon alive.
+#[cfg(unix)]
+#[must_use]
+pub fn daemon_answers() -> bool {
+    std::os::unix::net::UnixStream::connect(socket_path()).is_ok()
+}
+
 /// Starts the Catenary daemon explicitly and idempotently (bug 80, leg 2).
 ///
 /// The `stop` counterpart: brings the daemon up through the **same**
@@ -7978,7 +7993,7 @@ pub fn ensure_daemon_running() -> Result<DaemonStartOutcome> {
     let ipc_path = socket_path();
 
     // Idempotent fast path: a live IPC socket means a daemon is already up.
-    if std::os::unix::net::UnixStream::connect(&ipc_path).is_ok() {
+    if daemon_answers() {
         return Ok(DaemonStartOutcome::AlreadyRunning);
     }
 

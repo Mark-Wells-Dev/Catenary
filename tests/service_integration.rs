@@ -21,6 +21,17 @@
 //!   environment-gated — a CI sandbox has no user bus — so it is NOT asserted;
 //!   the durable artifact is the file, and `install` reports the live leg's
 //!   outcome without failing on it.
+//! - **The supervision-aware bounce (ws49-04a).** With the unit installed in the
+//!   sandbox, `catenary restart`/`start` must ATTEMPT the delegation — the
+//!   sandbox unit is installed and certainly not active, which is exactly the
+//!   ruling's predicate (installed, never installed+active) — and then degrade
+//!   toward today when the manager cannot be reached. `isolate_env` clears
+//!   `PATH`, so the sandbox has no `systemctl` at all: the delegation fails for
+//!   real, the note prints, and the direct spawn still produces a daemon. That
+//!   is the fallthrough leg end to end. What CANNOT be asserted here is the
+//!   happy path — a live user manager taking the bounce — because the sandbox
+//!   has no user bus; the delegated command's exact shape is pinned in
+//!   `service.rs`'s unit tests instead.
 
 #![cfg(target_os = "linux")]
 #![deny(clippy::unwrap_used, clippy::panic)]
@@ -165,6 +176,172 @@ fn service_status_honest_in_both_states() {
     assert!(
         after.contains("Installed: yes"),
         "status must report installed after install:\n{after}",
+    );
+}
+
+/// Runs `catenary <args>` in the isolated sandbox at `state_home`, returning the
+/// captured stdout+stderr and the exit success flag.
+fn run_catenary(state_home: &str, args: &[&str]) -> (String, bool) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catenary"));
+    isolate_env(&mut cmd, state_home);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = cmd.output().expect("run catenary");
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    (combined, out.status.success())
+}
+
+/// ws49-04a, the delegation predicate + the fallthrough leg: with the unit
+/// INSTALLED (and, in a sandbox, certainly not active — the rig specimen's
+/// state), `catenary restart` hands the start half to the service manager rather
+/// than spawning around it. The sandbox has no `systemctl` (`isolate_env` clears
+/// `PATH`), so the invocation genuinely fails: the reason is printed and the
+/// bounce falls through to the direct spawn, which still produces a running
+/// daemon. `make install` must never strand a machine daemon-less.
+#[test]
+fn restart_with_a_unit_installed_delegates_and_falls_through_when_the_manager_is_unreachable() {
+    let state_dir = tempfile::tempdir().expect("state dir");
+    let state_home = state_dir.path().to_str().expect("state home");
+    let guard = DaemonGuard::new(state_home);
+
+    let (_out, ok) = run_service(state_home, "install");
+    assert!(ok, "install must exit 0");
+    assert!(unit_path(state_home).is_file(), "unit installed");
+
+    let (out, ok) = run_catenary(state_home, &["restart"]);
+    assert!(ok, "restart must exit 0; output:\n{out}");
+    assert!(
+        out.contains("Delegating to systemd --user: systemctl --user restart catenary.service"),
+        "an installed unit must delegate the bounce — inactive or not:\n{out}",
+    );
+    assert!(
+        out.contains("starting an unsupervised daemon instead"),
+        "an unreachable manager must degrade toward today, out loud:\n{out}",
+    );
+    assert!(
+        out.contains("Daemon started"),
+        "the fallthrough still produces a daemon:\n{out}",
+    );
+    assert!(
+        guard.daemon_pid().is_some(),
+        "the machine is never left daemon-less by a failed delegation",
+    );
+}
+
+/// ws49-04a: `catenary start` delegates too when a unit is installed and nothing
+/// is running, and falls through the same way. A daemon that is ALREADY up is
+/// left alone (the next test) — adopting an unsupervised daemon is `restart`'s
+/// job, and `catenary doctor` names that window in between.
+#[test]
+fn start_with_a_unit_installed_delegates_and_falls_through_when_the_manager_is_unreachable() {
+    let state_dir = tempfile::tempdir().expect("state dir");
+    let state_home = state_dir.path().to_str().expect("state home");
+    let guard = DaemonGuard::new(state_home);
+
+    let (_out, ok) = run_service(state_home, "install");
+    assert!(ok, "install must exit 0");
+
+    let (out, ok) = run_catenary(state_home, &["start"]);
+    assert!(ok, "start must exit 0; output:\n{out}");
+    assert!(
+        out.contains("Delegating to systemd --user: systemctl --user start catenary.service"),
+        "start delegates the start verb, not restart:\n{out}",
+    );
+    assert!(
+        out.contains("Daemon started"),
+        "the fallthrough still produces a daemon:\n{out}",
+    );
+    assert!(guard.daemon_pid().is_some(), "a daemon came up");
+
+    // Idempotent second run: a daemon is already answering, so there is nothing
+    // to start and nothing to delegate — the manager is not invoked at all.
+    let (again, ok_again) = run_catenary(state_home, &["start"]);
+    assert!(ok_again, "second start must exit 0; output:\n{again}");
+    assert!(
+        again.contains("Daemon already running"),
+        "an already-running daemon is left exactly as it is:\n{again}",
+    );
+    assert!(
+        !again.contains("Delegating to"),
+        "start must not delegate on top of a live daemon:\n{again}",
+    );
+}
+
+/// ws49-04a, the untouched neighbours: with NO unit installed the lifecycle verbs
+/// behave byte-identically to the pre-04a build — no delegation line, no note —
+/// and `stop` never delegates in either state (a clean exit under
+/// `Restart=on-failure` stays stopped, which is why `stop` was ruled direct).
+#[test]
+fn without_a_unit_nothing_delegates_and_stop_never_does() {
+    let state_dir = tempfile::tempdir().expect("state dir");
+    let state_home = state_dir.path().to_str().expect("state home");
+    let guard = DaemonGuard::new(state_home);
+
+    assert!(!unit_path(state_home).exists(), "no unit installed");
+
+    let (restart, ok) = run_catenary(state_home, &["restart"]);
+    assert!(ok, "restart must exit 0; output:\n{restart}");
+    assert!(
+        !restart.contains("Delegating to"),
+        "no unit ⇒ the direct path, unchanged:\n{restart}",
+    );
+    assert!(restart.contains("Daemon started"), "{restart}");
+    assert!(guard.daemon_pid().is_some(), "a daemon came up");
+
+    // `stop` stays direct even once the unit exists: it is the one verb the
+    // ruling left alone.
+    let (_out, ok) = run_service(state_home, "install");
+    assert!(ok, "install must exit 0");
+    let (stop, ok_stop) = run_catenary(state_home, &["stop"]);
+    assert!(ok_stop, "stop must exit 0; output:\n{stop}");
+    assert!(
+        !stop.contains("Delegating to"),
+        "stop never delegates — clean exit + on-failure keeps it stopped:\n{stop}",
+    );
+}
+
+/// ws49-04a doctor currency check: a freshly installed unit is CURRENT, so the
+/// Service section stays quiet; an installed unit that no longer matches what
+/// this build's generator writes is named once, calmly, pointing at the
+/// idempotent `catenary service install` re-run. The tamper stands in for the
+/// real drift source — a `service.rs` generator change the on-disk snapshot
+/// never received.
+#[test]
+fn doctor_names_a_stale_unit_and_stays_quiet_on_a_current_one() {
+    let state_dir = tempfile::tempdir().expect("state dir");
+    let state_home = state_dir.path().to_str().expect("state home");
+
+    let (_out, ok) = run_service(state_home, "install");
+    assert!(ok, "install must exit 0");
+
+    let (current, ok) = run_catenary(state_home, &["doctor", "--nocolor"]);
+    assert!(ok, "doctor must exit 0; output:\n{current}");
+    assert!(
+        current.contains("installed (systemd --user)"),
+        "doctor reports the installed service:\n{current}",
+    );
+    assert!(
+        !current.contains("is stale"),
+        "a freshly installed unit is current — silence is the healthy state:\n{current}",
+    );
+
+    // Drift it: the on-disk snapshot no longer matches the live generator.
+    let path = unit_path(state_home);
+    let unit = std::fs::read_to_string(&path).expect("read unit");
+    std::fs::write(&path, unit.replace("RestartSec=2", "RestartSec=9")).expect("tamper unit");
+
+    let (stale, ok) = run_catenary(state_home, &["doctor", "--nocolor"]);
+    assert!(ok, "doctor must exit 0; output:\n{stale}");
+    assert!(
+        stale.contains("is stale"),
+        "doctor must name the drifted unit:\n{stale}",
+    );
+    assert!(
+        stale.contains("catenary service install"),
+        "the finding points at the idempotent re-run:\n{stale}",
     );
 }
 

@@ -516,6 +516,15 @@ rustglob:
 # `catenary start` afterward. Live bridges see the death as a crash, heal the
 # rename-swap marker (misc 182), and reconnect to the NEW build on their own.
 # Restart never prompts; no daemon running is a clean leg of the bounce.
+#
+# The bounce may now ROUTE THROUGH SUPERVISION (ws49-04a): with a service unit
+# installed, `catenary restart` stops the running daemon directly and hands the
+# start to the manager (`systemctl --user restart` / `launchctl kickstart -k`),
+# so the daemon this recipe leaves behind is the manager's child rather than a
+# detached process its `Restart=on-failure` policy would never relaunch — the
+# 2026-08-04 specimen. Nothing installed (or a manager that cannot be reached)
+# is unchanged: the direct spawn, exactly as before. The recipe itself is
+# untouched — the version pair and the sweep stay.
 install:
 	@cargo install --path . --locked
 	@catenary version

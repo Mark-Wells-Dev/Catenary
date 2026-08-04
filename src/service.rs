@@ -26,6 +26,29 @@
 //! host; the install/uninstall/status/state entry points are whole-function
 //! platform splits (never inner-cfg fallbacks — the ws49-01/02 macOS-clippy
 //! lesson) so each platform carries exactly one real body.
+//!
+//! ## The bounce seam (ws49-04a)
+//!
+//! An installed manager owns the daemon's lifetime, so the lifecycle verbs must
+//! not step around it: a clean token-shutdown exits 0, `Restart=on-failure` does
+//! not relaunch, and a direct respawn would leave the daemon running OUTSIDE
+//! supervision (the live 2026-08-04 specimen: unit installed and enabled,
+//! `Active: inactive`, the freshly bounced daemon detached). [`installed_unit`]
+//! exposes the same detection `status` performs as a queryable seam;
+//! [`bounce_plan`] turns it — plus the platform's manager and a launchd domain
+//! uid — into a pure `Delegate(command) | Direct` decision, so both platforms'
+//! command shapes are unit-testable on either host. Delegation keys on
+//! **installed**, never on active: restart-on-inactive starts the unit, and that
+//! healing is the point.
+//!
+//! Delegation covers the *start* half of a bounce. `restart` still stops the
+//! running daemon directly first ([`crate::router`]'s shutdown path in
+//! `main.rs`), because the daemon it must stop may be the very unsupervised one
+//! the specimen describes — a process the manager does not own and therefore
+//! cannot stop. Only once the socket is free does the manager bring the new
+//! daemon up as its own child. A manager invocation that errors degrades toward
+//! today: the failure is printed and the caller falls through to the direct
+//! spawn, so no bounce ever strands a machine daemon-less.
 
 use std::path::PathBuf;
 
@@ -116,6 +139,71 @@ pub fn launchd_plist(exe: &str) -> String {
     )
 }
 
+/// Render `kind`'s service definition for the daemon at `exe`.
+///
+/// The dispatching face of [`systemd_unit`] / [`launchd_plist`] — pure, so the
+/// doctor currency check (ws49-04a) can regenerate an installed file's expected
+/// content on any host and diff the two.
+#[must_use]
+pub fn render_unit(kind: ManagerKind, exe: &str) -> String {
+    match kind {
+        ManagerKind::Systemd => systemd_unit(exe),
+        ManagerKind::Launchd => launchd_plist(exe),
+    }
+}
+
+/// The daemon binary an installed service definition targets.
+///
+/// Systemd: the `ExecStart=` line minus its trailing ` daemon` argument.
+/// Launchd: the first `<string>` of the `ProgramArguments` array. `None` when
+/// the file carries no recognizable target (a foreign or truncated file), which
+/// the currency check reads as drift like any other mismatch.
+#[must_use]
+pub fn unit_target(kind: ManagerKind, content: &str) -> Option<&str> {
+    match kind {
+        ManagerKind::Systemd => {
+            let rest = content
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("ExecStart="))?;
+            let exe = rest.strip_suffix(" daemon").unwrap_or(rest).trim();
+            (!exe.is_empty()).then_some(exe)
+        }
+        ManagerKind::Launchd => {
+            let after_key = content.split_once("<key>ProgramArguments</key>")?.1;
+            let after_open = after_key.split_once("<string>")?.1;
+            let exe = after_open.split_once("</string>")?.0.trim();
+            (!exe.is_empty()).then_some(exe)
+        }
+    }
+}
+
+/// The binary a running daemon was exec'd from, by pid (Linux).
+///
+/// Reads `/proc/<pid>/exe`. A binary replaced in place under a live daemon (the
+/// `make install` ritual) leaves the kernel's link reading `<path> (deleted)`;
+/// the marker is trimmed here — the *path* is what the currency check compares,
+/// and a stale-inode daemon is version skew's finding, not the service's (misc
+/// 182 trims the same marker for respawn).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn daemon_binary(pid: u32) -> Option<String> {
+    let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    let path = link.to_str()?;
+    Some(path.strip_suffix(" (deleted)").unwrap_or(path).to_string())
+}
+
+/// The binary a running daemon was exec'd from (non-Linux).
+///
+/// `None`: no `/proc/<pid>/exe`, and reading it otherwise needs the `libc` FFI
+/// this crate forbids. Whole-function `const fn` stub per the standing
+/// platform-split line — the currency check simply skips the target comparison
+/// there and keeps its template diff.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub const fn daemon_binary(_pid: u32) -> Option<String> {
+    None
+}
+
 /// The systemd `--user` unit path: `$XDG_CONFIG_HOME/systemd/user/catenary.service`.
 ///
 /// Resolved through [`crate::paths::config_dir`], so an `isolate_env`-driven
@@ -193,29 +281,113 @@ pub const fn idle_footprint_bytes(_pid: u32) -> Option<u64> {
     None
 }
 
-/// Whether the service unit/plist file is installed on disk (platform-dispatched).
+/// The per-user service manager a platform runs the daemon under (ws49-04a).
 ///
-/// Linux checks the systemd unit path; macOS checks the launchd plist path.
-/// Content-only: it reports the file's presence, not whether the manager has it
-/// loaded (that is [`running_state`]).
+/// The kind carries everything the bounce plan needs to name the service to its
+/// manager, so [`bounce_plan`] stays pure and both platforms' command shapes are
+/// testable on either host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagerKind {
+    /// systemd `--user` (Linux) — the unit is [`SYSTEMD_UNIT_NAME`].
+    Systemd,
+    /// launchd (macOS) — a per-user `LaunchAgent` labelled [`LAUNCHD_LABEL`].
+    Launchd,
+}
+
+impl ManagerKind {
+    /// The manager's human label, as `status` and `doctor` print it.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Systemd => "systemd --user",
+            Self::Launchd => "launchd (LaunchAgent)",
+        }
+    }
+
+    /// The name the manager knows the service by (unit name / agent label).
+    #[must_use]
+    pub const fn service_name(self) -> &'static str {
+        match self {
+            Self::Systemd => SYSTEMD_UNIT_NAME,
+            Self::Launchd => LAUNCHD_LABEL,
+        }
+    }
+
+    /// The word for the manager's on-disk artifact — a systemd *unit*, a launchd
+    /// *plist*. Used in prose (`status`, the doctor findings).
+    #[must_use]
+    pub const fn artifact(self) -> &'static str {
+        match self {
+            Self::Systemd => "unit",
+            Self::Launchd => "plist",
+        }
+    }
+}
+
+/// The path `kind`'s manager reads its service definition from.
+///
+/// Pure and platform-independent (both path builders are), so a Linux host can
+/// exercise the launchd arm in tests.
+#[must_use]
+pub fn unit_path_for(kind: ManagerKind) -> PathBuf {
+    match kind {
+        ManagerKind::Systemd => systemd_unit_path(),
+        ManagerKind::Launchd => launchd_plist_path(),
+    }
+}
+
+/// This host's service manager (Linux — systemd `--user`).
 #[cfg(target_os = "linux")]
 #[must_use]
-pub fn is_installed() -> bool {
-    systemd_unit_path().is_file()
+pub const fn manager_kind() -> Option<ManagerKind> {
+    Some(ManagerKind::Systemd)
 }
 
-/// Whether the service plist is installed on disk (macOS).
+/// This host's service manager (macOS — launchd `LaunchAgent`).
 #[cfg(target_os = "macos")]
 #[must_use]
-pub fn is_installed() -> bool {
-    launchd_plist_path().is_file()
+pub const fn manager_kind() -> Option<ManagerKind> {
+    Some(ManagerKind::Launchd)
 }
 
-/// Whether the service is installed (other platforms — never).
+/// This host's service manager (other platforms — none is wired).
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[must_use]
-pub const fn is_installed() -> bool {
-    false
+pub const fn manager_kind() -> Option<ManagerKind> {
+    None
+}
+
+/// An installed service definition: which manager owns it and where it lives.
+///
+/// The queryable form of the detection `status` already performs (ws49-04a's
+/// first step) — the bounce verbs, the doctor currency check, and `status`
+/// itself all read this one seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledUnit {
+    /// The manager whose expected path carried the file.
+    pub kind: ManagerKind,
+    /// The unit/plist path it was found at.
+    pub path: PathBuf,
+}
+
+/// The installed service definition, or `None` when nothing is installed.
+///
+/// Presence-only: it reports that the file sits at the manager's expected path,
+/// never whether the manager has it loaded (that is [`active_state`]). The
+/// delegation predicate is exactly this — installed, not installed+active.
+#[must_use]
+pub fn installed_unit() -> Option<InstalledUnit> {
+    let kind = manager_kind()?;
+    let path = unit_path_for(kind);
+    path.is_file().then_some(InstalledUnit { kind, path })
+}
+
+/// Whether the service unit/plist file is installed on disk.
+///
+/// The boolean face of [`installed_unit`].
+#[must_use]
+pub fn is_installed() -> bool {
+    installed_unit().is_some()
 }
 
 /// Install and start the always-on service (Linux).
@@ -381,7 +553,7 @@ pub fn status(out: &mut Output) -> Result<()> {
     let _ = out.writeln(format_args!("Unit:      {}", path.display()));
     if is_installed() {
         let _ = out.writeln(format_args!("Installed: yes"));
-        let active = systemctl_is_active();
+        let active = active_state();
         let _ = out.writeln(format_args!(
             "Active:    {}",
             active.as_deref().unwrap_or("unknown")
@@ -407,7 +579,7 @@ pub fn status(out: &mut Output) -> Result<()> {
     let _ = out.writeln(format_args!("Plist:     {}", path.display()));
     if is_installed() {
         let _ = out.writeln(format_args!("Installed: yes"));
-        let active = launchctl_is_loaded();
+        let active = active_state();
         let _ = out.writeln(format_args!(
             "Loaded:    {}",
             active.as_deref().unwrap_or("unknown")
@@ -434,34 +606,29 @@ pub fn status(out: &mut Output) -> Result<()> {
     Ok(())
 }
 
-/// The service-manager label for the doctor line (platform-dispatched).
-#[cfg(target_os = "linux")]
-#[must_use]
-pub const fn manager_label() -> &'static str {
-    "systemd --user"
-}
-
-/// The service-manager label for the doctor line (macOS).
-#[cfg(target_os = "macos")]
-#[must_use]
-pub const fn manager_label() -> &'static str {
-    "launchd (LaunchAgent)"
-}
-
-/// The service-manager label for the doctor line (unsupported platforms).
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-#[must_use]
-pub const fn manager_label() -> &'static str {
-    "unsupported"
-}
-
-/// The manager's active/loaded state, or `None` when unknowable (Linux).
+/// The service-manager label for the doctor line.
 ///
-/// Shells to `systemctl --user is-active`. `None` when the query itself cannot
-/// run (no user bus, no `systemctl`), so the doctor/status line can say
-/// "unknown" honestly rather than fabricate "inactive".
+/// One source with [`ManagerKind::label`]; `"unsupported"` where no per-user
+/// manager is wired.
+#[must_use]
+pub const fn manager_label() -> &'static str {
+    match manager_kind() {
+        Some(kind) => kind.label(),
+        None => "unsupported",
+    }
+}
+
+/// The manager's own word for the service's running state, or `None` when
+/// unknowable (Linux).
+///
+/// Shells to `systemctl --user is-active` and returns its raw output
+/// (`active`, `inactive`, `failed`, `activating`, …) — the word is passed
+/// through, never normalized, so `status` stays honest. `None` when the query
+/// itself cannot run (no user bus, no `systemctl`), so a caller can say
+/// "unknown" rather than fabricate "inactive". [`reads_active`] classifies it.
 #[cfg(target_os = "linux")]
-fn systemctl_is_active() -> Option<String> {
+#[must_use]
+pub fn active_state() -> Option<String> {
     let out = std::process::Command::new("systemctl")
         .args(["--user", "is-active", SYSTEMD_UNIT_NAME])
         .stdin(std::process::Stdio::null())
@@ -471,12 +638,13 @@ fn systemctl_is_active() -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-/// Whether the `LaunchAgent` is loaded, or `None` when unknowable (macOS).
+/// The manager's own word for the service's running state (macOS).
 ///
-/// Shells to `launchctl list <label>`: exit 0 means loaded, non-zero means not.
-/// `None` when `launchctl` cannot run at all.
+/// Shells to `launchctl list <label>`: exit 0 means loaded (`yes`), non-zero
+/// means not (`no`). `None` when `launchctl` cannot run at all.
 #[cfg(target_os = "macos")]
-fn launchctl_is_loaded() -> Option<String> {
+#[must_use]
+pub fn active_state() -> Option<String> {
     let out = std::process::Command::new("launchctl")
         .args(["list", LAUNCHD_LABEL])
         .stdin(std::process::Stdio::null())
@@ -485,6 +653,301 @@ fn launchctl_is_loaded() -> Option<String> {
         .status()
         .ok()?;
     Some(if out.success() { "yes" } else { "no" }.to_string())
+}
+
+/// The manager's word for the service's running state (unsupported platforms).
+///
+/// Always `None` — there is no manager to ask. Whole-function `const fn` stub
+/// per the standing platform-split line.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[must_use]
+pub const fn active_state() -> Option<String> {
+    None
+}
+
+/// Whether a manager's [`active_state`] word means "the service is running".
+///
+/// Pure, and deliberately covers both vocabularies: systemd's `is-active`
+/// output (`active` while up, `activating`/`reloading` while coming up) and
+/// launchd's loaded `yes`. Everything else — `inactive`, `failed`,
+/// `deactivating`, `no` — reads as not running.
+#[must_use]
+pub const fn reads_active(raw: &str) -> bool {
+    matches!(
+        raw.as_bytes(),
+        b"active" | b"activating" | b"reloading" | b"yes"
+    )
+}
+
+// ── The bounce plan (ws49-04a) ──────────────────────────────────────────
+
+/// Which lifecycle verb a bounce is being planned for (ws49-04a).
+///
+/// `stop` is deliberately absent: a clean token-shutdown plus the unit's
+/// `Restart=on-failure` policy already leaves the daemon down under supervision
+/// (verified live 2026-08-04), so `catenary stop` stays direct and needs no plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BounceVerb {
+    /// `catenary restart` — the daemon comes back up, supervised.
+    Restart,
+    /// `catenary start` — a daemon comes up where none was running.
+    Start,
+}
+
+impl BounceVerb {
+    /// The systemd `--user` subcommand for this verb.
+    const fn systemctl_verb(self) -> &'static str {
+        match self {
+            Self::Restart => "restart",
+            Self::Start => "start",
+        }
+    }
+
+    /// The past-tense word for the receipt line ("restarted" / "started").
+    #[must_use]
+    pub const fn past_tense(self) -> &'static str {
+        match self {
+            Self::Restart => "restarted",
+            Self::Start => "started",
+        }
+    }
+}
+
+/// A service-manager invocation: the program and its full argument vector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagerCommand {
+    /// The manager binary (`systemctl` / `launchctl`).
+    pub program: String,
+    /// Its arguments, in order.
+    pub args: Vec<String>,
+}
+
+impl ManagerCommand {
+    /// Build a command from borrowed parts.
+    fn new(program: &str, args: &[&str]) -> Self {
+        Self {
+            program: program.to_string(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+        }
+    }
+
+    /// The command as it would be typed, for the CLI note.
+    #[must_use]
+    pub fn rendered(&self) -> String {
+        if self.args.is_empty() {
+            self.program.clone()
+        } else {
+            format!("{} {}", self.program, self.args.join(" "))
+        }
+    }
+}
+
+/// What a bounce verb should do on this host (ws49-04a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BouncePlan {
+    /// Hand the start to the service manager with this invocation.
+    Delegate(ManagerCommand),
+    /// Nothing installed (or no usable manager target) — take the direct path,
+    /// byte-identical to the pre-04a behavior.
+    Direct,
+}
+
+/// The pure bounce decision: `(installed manager, domain uid, verb) → plan`.
+///
+/// `installed` is [`installed_unit`]'s manager kind — `None` when nothing is
+/// installed. The predicate is **installed**, never installed+active: a
+/// `restart` against an installed-but-inactive unit starts it, and that healing
+/// is the whole point (the 2026-08-04 rig specimen an active-gated delegation
+/// would never have healed).
+///
+/// `uid` is the launchd domain's user (the owner of the installed plist); it is
+/// unused for systemd, and a launchd install whose uid could not be read plans
+/// [`BouncePlan::Direct`] rather than guessing a domain target.
+///
+/// Pure and platform-independent, so both platforms' command shapes are pinned
+/// by tests on either host. RECORDED GAP (the ws49-04 honesty bar): the launchd
+/// arm is command CONTENT only — this worker runs Linux, so live `launchctl`
+/// behavior is unverified. Its known corner: `kickstart` addresses a service
+/// already bootstrapped into the GUI domain, so a plist on disk that the session
+/// never loaded fails the invocation — which lands on the fallthrough (a printed
+/// note plus the direct spawn), never on a daemon-less machine.
+#[must_use]
+pub fn bounce_plan(
+    installed: Option<ManagerKind>,
+    uid: Option<u32>,
+    verb: BounceVerb,
+) -> BouncePlan {
+    match installed {
+        None => BouncePlan::Direct,
+        Some(ManagerKind::Systemd) => BouncePlan::Delegate(ManagerCommand::new(
+            "systemctl",
+            &["--user", verb.systemctl_verb(), SYSTEMD_UNIT_NAME],
+        )),
+        Some(ManagerKind::Launchd) => {
+            let Some(uid) = uid else {
+                return BouncePlan::Direct;
+            };
+            // `kickstart` addresses the agent in its GUI domain; `-k` kills a
+            // running instance first (the restart), its absence starts one that
+            // is not running (the start).
+            let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
+            let args: Vec<&str> = match verb {
+                BounceVerb::Restart => vec!["kickstart", "-k", &target],
+                BounceVerb::Start => vec!["kickstart", &target],
+            };
+            BouncePlan::Delegate(ManagerCommand::new("launchctl", &args))
+        }
+    }
+}
+
+/// The outcome of handing a bounce to the service manager (ws49-04a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delegation {
+    /// The manager accepted the bounce (exit 0).
+    Took,
+    /// The manager could not take it — the reason, for the printed note. The
+    /// caller falls through to the direct path: a headless login with no user
+    /// manager, or a PATH without `systemctl`, must never strand a machine
+    /// daemon-less.
+    Failed(String),
+}
+
+/// Run a planned manager invocation, classifying the result.
+///
+/// Platform-independent (it only spawns what the plan named), so the
+/// failure leg — the fallthrough's trigger — is unit-testable on any host.
+#[must_use]
+pub fn run_manager_command(cmd: &ManagerCommand) -> Delegation {
+    match std::process::Command::new(&cmd.program)
+        .args(&cmd.args)
+        .stdin(std::process::Stdio::null())
+        .output()
+    {
+        Ok(o) if o.status.success() => Delegation::Took,
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let detail = stderr.trim();
+            let detail = if detail.is_empty() {
+                format!("exit {}", o.status)
+            } else {
+                detail.to_string()
+            };
+            Delegation::Failed(format!("`{}` did not succeed ({detail})", cmd.rendered()))
+        }
+        Err(e) => Delegation::Failed(format!("could not run `{}` ({e})", cmd.rendered())),
+    }
+}
+
+/// The uid that owns `path` — the launchd domain target's user (macOS).
+///
+/// Read from the installed plist itself: the agent belongs to whoever installed
+/// it, and `MetadataExt` is safe under `forbid(unsafe_code)` (no `libc` FFI, no
+/// new dependency).
+#[cfg(target_os = "macos")]
+fn owner_uid(path: &std::path::Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.uid())
+}
+
+/// The domain uid (non-macOS — no manager needs one).
+///
+/// Whole-function `const fn` stub per the standing platform-split line; systemd
+/// addresses the unit by name inside the caller's own user manager.
+#[cfg(not(target_os = "macos"))]
+const fn owner_uid(_path: &std::path::Path) -> Option<u32> {
+    None
+}
+
+/// This host's bounce plan for `verb`, resolved through the installed-unit seam.
+#[must_use]
+pub fn current_bounce_plan(verb: BounceVerb) -> BouncePlan {
+    let Some(unit) = installed_unit() else {
+        return BouncePlan::Direct;
+    };
+    bounce_plan(Some(unit.kind), owner_uid(&unit.path), verb)
+}
+
+/// Whether a daemon is answering its IPC socket right now (Unix).
+///
+/// The liveness fact behind both the delegated-start wait and the doctor
+/// supervision-drift check — a socket probe, not a snapshot read, so a
+/// `state.json` left behind by a dead daemon cannot read as "running".
+#[cfg(unix)]
+#[must_use]
+pub fn daemon_running() -> bool {
+    crate::router::daemon_answers()
+}
+
+/// Whether a daemon is answering its IPC socket (non-Unix — never).
+///
+/// Whole-function `const fn` stub per the standing platform-split line.
+#[cfg(not(unix))]
+#[must_use]
+pub const fn daemon_running() -> bool {
+    false
+}
+
+/// How long to wait for a manager-started daemon to answer its socket.
+const DELEGATED_START_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The poll interval inside [`DELEGATED_START_WINDOW`].
+const DELEGATED_START_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Hand `verb`'s start to an installed service manager (ws49-04a).
+///
+/// Returns `true` when the manager took the bounce — the caller is done, and the
+/// daemon that comes up is the manager's child. Returns `false` when there is
+/// nothing installed to delegate to, or when the manager invocation failed: both
+/// mean "carry on with the direct path", and the failure is printed on `out`
+/// first so the degrade is visible rather than silent.
+///
+/// On a taken bounce this waits — bounded — for the daemon to answer its IPC
+/// socket, so the printed receipt is a fact and not a hope. A manager that
+/// accepted the bounce but produced no daemon inside the window is reported as
+/// exactly that; it is NOT followed by a direct spawn, which would race the
+/// manager's own restart policy.
+pub fn delegate_bounce(out: &mut Output, verb: BounceVerb) -> bool {
+    let BouncePlan::Delegate(cmd) = current_bounce_plan(verb) else {
+        return false;
+    };
+    let manager = manager_label();
+    let _ = out.writeln(format_args!("Delegating to {manager}: {}", cmd.rendered()));
+    match run_manager_command(&cmd) {
+        Delegation::Took => {
+            if wait_for_daemon() {
+                let _ = out.writeln(format_args!(
+                    "Daemon {} under {manager} (supervised)",
+                    verb.past_tense(),
+                ));
+            } else {
+                let _ = out.writeln(format_args!(
+                    "note: {manager} took the bounce but the daemon has not answered \
+                     its socket yet — `catenary service status` to check the unit",
+                ));
+            }
+            true
+        }
+        Delegation::Failed(reason) => {
+            let _ = out.writeln(format_args!(
+                "note: {reason} — starting an unsupervised daemon instead",
+            ));
+            false
+        }
+    }
+}
+
+/// Poll for the daemon's IPC socket inside [`DELEGATED_START_WINDOW`].
+fn wait_for_daemon() -> bool {
+    let deadline = std::time::Instant::now() + DELEGATED_START_WINDOW;
+    loop {
+        if daemon_running() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(DELEGATED_START_POLL);
+    }
 }
 
 /// Runs `systemctl --user <args>`, reporting the outcome (Linux).
@@ -658,6 +1121,200 @@ mod tests {
             plist.trim_end().ends_with("</plist>"),
             "plist close:\n{plist}"
         );
+    }
+
+    // ── the bounce plan (ws49-04a): both platforms, pinned on either host ──
+
+    /// The rendered manager invocation of a delegating plan; `None` when the
+    /// plan chose the direct path.
+    fn delegated(plan: &BouncePlan) -> Option<String> {
+        match plan {
+            BouncePlan::Delegate(cmd) => Some(cmd.rendered()),
+            BouncePlan::Direct => None,
+        }
+    }
+
+    /// The reason of a failed delegation; `None` when the manager took it.
+    fn failure_reason(outcome: Delegation) -> Option<String> {
+        match outcome {
+            Delegation::Failed(reason) => Some(reason),
+            Delegation::Took => None,
+        }
+    }
+
+    #[test]
+    fn nothing_installed_plans_the_direct_path() {
+        assert_eq!(
+            bounce_plan(None, Some(501), BounceVerb::Restart),
+            BouncePlan::Direct,
+            "with no unit installed the bounce is byte-identical to pre-04a",
+        );
+        assert_eq!(
+            bounce_plan(None, None, BounceVerb::Start),
+            BouncePlan::Direct,
+        );
+    }
+
+    #[test]
+    fn installed_systemd_restart_delegates_to_systemctl_user_restart() {
+        let plan = bounce_plan(Some(ManagerKind::Systemd), None, BounceVerb::Restart);
+        assert_eq!(
+            delegated(&plan).as_deref(),
+            Some("systemctl --user restart catenary.service"),
+            "the ruling's Linux command shape",
+        );
+    }
+
+    #[test]
+    fn installed_systemd_start_delegates_to_systemctl_user_start() {
+        let plan = bounce_plan(Some(ManagerKind::Systemd), None, BounceVerb::Start);
+        assert_eq!(
+            delegated(&plan).as_deref(),
+            Some("systemctl --user start catenary.service"),
+        );
+    }
+
+    #[test]
+    fn installed_launchd_restart_kickstarts_with_k_in_the_gui_domain() {
+        // macOS command CONTENT only — live launchd behavior is not verifiable
+        // on this worker's Linux host (the recorded honesty gap).
+        let plan = bounce_plan(Some(ManagerKind::Launchd), Some(501), BounceVerb::Restart);
+        assert_eq!(
+            delegated(&plan),
+            Some(format!("launchctl kickstart -k gui/501/{LAUNCHD_LABEL}")),
+        );
+    }
+
+    #[test]
+    fn installed_launchd_start_kickstarts_without_k() {
+        let plan = bounce_plan(Some(ManagerKind::Launchd), Some(501), BounceVerb::Start);
+        assert_eq!(
+            delegated(&plan),
+            Some(format!("launchctl kickstart gui/501/{LAUNCHD_LABEL}")),
+            "start omits the kill flag",
+        );
+    }
+
+    #[test]
+    fn launchd_without_a_domain_uid_falls_back_to_direct() {
+        assert_eq!(
+            bounce_plan(Some(ManagerKind::Launchd), None, BounceVerb::Restart),
+            BouncePlan::Direct,
+            "an unreadable owner uid must not become a guessed domain target",
+        );
+    }
+
+    #[test]
+    fn the_predicate_is_installed_not_installed_and_active() {
+        // The 2026-08-04 rig specimen: unit installed and enabled, Active:
+        // inactive, the daemon detached. Nothing in the plan's inputs can carry
+        // activity — delegation is decided by installation alone, and
+        // restart-on-inactive starts the unit. That healing is the point.
+        let plan = bounce_plan(Some(ManagerKind::Systemd), None, BounceVerb::Restart);
+        assert!(
+            matches!(plan, BouncePlan::Delegate(_)),
+            "installed + inactive must still delegate",
+        );
+    }
+
+    // ── delegation outcome: the fallthrough's trigger ─────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn a_manager_that_cannot_run_reports_failure_for_the_fallthrough() {
+        let cmd = ManagerCommand::new("catenary-no-such-service-manager", &["restart"]);
+        let reason = failure_reason(run_manager_command(&cmd))
+            .expect("a missing manager binary cannot take a bounce");
+        assert!(
+            reason.contains("catenary-no-such-service-manager"),
+            "the note names the invocation: {reason}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_manager_that_exits_nonzero_reports_failure_for_the_fallthrough() {
+        let cmd = ManagerCommand::new("sh", &["-c", "echo no user bus >&2; exit 1"]);
+        let reason = failure_reason(run_manager_command(&cmd))
+            .expect("a non-zero manager exit cannot take a bounce");
+        assert!(
+            reason.contains("no user bus"),
+            "the note carries the manager's own stderr: {reason}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_manager_that_succeeds_takes_the_bounce() {
+        let cmd = ManagerCommand::new("sh", &["-c", "exit 0"]);
+        assert_eq!(run_manager_command(&cmd), Delegation::Took);
+    }
+
+    // ── currency inputs (ws49-04a doctor half) ────────────────────────────
+
+    #[test]
+    fn systemd_unit_target_reads_back_the_exec_start_binary() {
+        let unit = systemd_unit("/home/u/.local/bin/catenary");
+        assert_eq!(
+            unit_target(ManagerKind::Systemd, &unit),
+            Some("/home/u/.local/bin/catenary"),
+            "the generator's ExecStart round-trips through the parser",
+        );
+    }
+
+    #[test]
+    fn launchd_plist_target_reads_back_the_first_program_argument() {
+        let plist = launchd_plist("/opt/homebrew/bin/catenary");
+        assert_eq!(
+            unit_target(ManagerKind::Launchd, &plist),
+            Some("/opt/homebrew/bin/catenary"),
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_target_reads_as_none() {
+        assert_eq!(unit_target(ManagerKind::Systemd, "[Unit]\n"), None);
+        assert_eq!(unit_target(ManagerKind::Launchd, "<plist></plist>"), None);
+    }
+
+    #[test]
+    fn render_unit_dispatches_to_the_platform_generator() {
+        assert_eq!(
+            render_unit(ManagerKind::Systemd, "/x/catenary"),
+            systemd_unit("/x/catenary"),
+        );
+        assert_eq!(
+            render_unit(ManagerKind::Launchd, "/x/catenary"),
+            launchd_plist("/x/catenary"),
+        );
+    }
+
+    #[test]
+    fn active_words_classify_across_both_manager_vocabularies() {
+        assert!(reads_active("active"), "systemd, up");
+        assert!(reads_active("activating"), "systemd, coming up");
+        assert!(reads_active("yes"), "launchd, loaded");
+        assert!(!reads_active("inactive"), "the rig specimen's word");
+        assert!(!reads_active("failed"));
+        assert!(!reads_active("no"));
+    }
+
+    #[test]
+    fn manager_kinds_name_their_service_and_artifact() {
+        assert_eq!(ManagerKind::Systemd.service_name(), SYSTEMD_UNIT_NAME);
+        assert_eq!(ManagerKind::Launchd.service_name(), LAUNCHD_LABEL);
+        assert_eq!(ManagerKind::Systemd.artifact(), "unit");
+        assert_eq!(ManagerKind::Launchd.artifact(), "plist");
+        assert_eq!(
+            manager_label(),
+            manager_kind().map_or("unsupported", ManagerKind::label)
+        );
+    }
+
+    #[test]
+    fn unit_paths_dispatch_by_manager_kind() {
+        assert_eq!(unit_path_for(ManagerKind::Systemd), systemd_unit_path());
+        assert_eq!(unit_path_for(ManagerKind::Launchd), launchd_plist_path());
     }
 
     // ── path isolation: an isolate_env test never touches the real homes ──

@@ -2229,6 +2229,13 @@ fn drain_db_at(db: &Path) -> u64 {
 /// up or a fresh one was started. Synchronous (no tokio runtime): the start
 /// path is blocking socket I/O and a process spawn.
 ///
+/// Supervision-aware (ws49-04a): with a service unit installed and NO daemon
+/// answering, the start is handed to the manager (`systemctl --user start` /
+/// `launchctl kickstart`) so the daemon it brings up is supervised. A daemon
+/// that is *already* up is left exactly as it is — adopting an unsupervised one
+/// is `restart`'s job, and `catenary doctor` names that window in between. A
+/// manager invocation that fails prints its reason and falls through here.
+///
 /// # Errors
 ///
 /// Returns an error if the intent marker cannot be cleared or the daemon
@@ -2236,10 +2243,17 @@ fn drain_db_at(db: &Path) -> u64 {
 #[cfg(unix)]
 fn run_start(out: &mut cli::Output) -> Result<()> {
     use catenary_cli::router::DaemonStartOutcome;
+    use catenary_cli::service::BounceVerb;
 
     // `start` is the one resume verb: clear any declared stop/quit intent
     // before bringing the daemon up (pulse 04).
     catenary_cli::daemon_intent::clear()?;
+
+    if !catenary_cli::router::daemon_answers()
+        && catenary_cli::service::delegate_bounce(out, BounceVerb::Start)
+    {
+        return Ok(());
+    }
 
     match catenary_cli::router::ensure_daemon_running()? {
         DaemonStartOutcome::AlreadyRunning => {
@@ -2319,12 +2333,28 @@ async fn run_stop(out: &mut cli::Output, force: bool) -> Result<()> {
 /// census zero: it does not depend on any live bridge respawning it. No
 /// confirmation prompt — a restart is a bounce, not an outage.
 ///
+/// Supervision-aware (ws49-04a): with a service unit installed, the START half
+/// of the bounce is handed to the manager (`systemctl --user restart` /
+/// `launchctl kickstart -k`), so the daemon that comes back is the manager's
+/// child instead of a detached process the unit's `Restart=on-failure` policy
+/// will never relaunch. The STOP half stays direct and runs FIRST: the daemon
+/// this must stop may be exactly the unsupervised one the 2026-08-04 specimen
+/// describes — a process the manager does not own and therefore cannot stop —
+/// and a manager asked to start on top of a live socket would produce a second
+/// daemon, not a healing. Stopping here and delegating the start is the
+/// automated form of the manual heal (`catenary stop && systemctl --user start
+/// catenary`). Delegation keys on *installed*, never active, so an
+/// installed-but-inactive unit is healed rather than stepped around; a failed
+/// manager invocation prints its reason and falls through to the direct spawn.
+///
 /// # Errors
 ///
 /// Returns an error if the marker cannot be cleared, the shutdown request
 /// fails after connecting, or the new daemon cannot be started.
 #[cfg(unix)]
 async fn run_restart(out: &mut cli::Output) -> Result<()> {
+    use catenary_cli::service::BounceVerb;
+
     // A leftover stop/quit marker would misread this bounce as a declared
     // outage: clear it FIRST so the death that follows reads as a crash and
     // bridges reconnect through it.
@@ -2342,6 +2372,15 @@ async fn run_restart(out: &mut cli::Output) -> Result<()> {
         wait_daemon_teardown(ack.pid).await;
     } else {
         let _ = out.writeln(format_args!("No daemon was running"));
+    }
+
+    // Supervision-aware start half (ws49-04a): the socket is free now, so an
+    // installed manager can bring the new daemon up as its own child. Returns
+    // false when nothing is installed or the manager invocation failed — both
+    // fall through to the direct spawn below, which is the pre-04a behavior
+    // byte for byte.
+    if catenary_cli::service::delegate_bounce(out, BounceVerb::Restart) {
+        return Ok(());
     }
 
     // Start the new daemon ourselves — the census-zero leg: with no live

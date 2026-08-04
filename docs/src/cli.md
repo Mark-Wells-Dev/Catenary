@@ -597,6 +597,20 @@ installed binary.
 catenary restart   # bounce: old daemon down, new daemon up, bridges reattach
 ```
 
+**With a service installed** (see [`catenary service`](#catenary-service)),
+`start` and `restart` do not step around your service manager. `restart` stops
+the running daemon as usual and then hands the *start* to the manager
+(`systemctl --user restart catenary.service` / `launchctl kickstart -k`), so the
+daemon that comes back is supervised — that adoption also heals a daemon that was
+running outside the manager. `start` delegates the same way when no daemon is
+answering; one that is already up is left exactly as it is. Delegation keys on
+the unit being **installed**, not on it being active, so a bounce starts an
+inactive unit rather than spawning around it. If the manager cannot be reached
+(a headless login with no user bus, a `PATH` without `systemctl`), the reason is
+printed and the daemon is started directly instead — a bounce never leaves you
+daemon-less. `catenary stop` is unchanged: a clean stop under
+`Restart=on-failure` stays stopped.
+
 `catenary quit` is the shutdown verb: it records the `quit` marker, then stops
 the daemon — live bridges end their sessions at socket loss, and new ones exit
 at spawn. Affected sessions show catenary as a failed MCP server until
@@ -640,6 +654,15 @@ The service is an **upgrade, not a requirement**. With none installed, the
 Catenary works whether or not you install the service. `catenary doctor` reports
 the service state and, when a daemon is up, its idle footprint (the RSS figure
 the arena cap bounds).
+
+`service install` is **idempotent**, and that re-run is the cure for a stale
+unit. An installed unit is a snapshot: it drifts when a newer Catenary changes
+what it would write, and when the binary path it baked at install time moves.
+`catenary doctor` checks both — it regenerates the unit from this build and
+compares it with the installed file, and compares the installed target with the
+binary the running daemon was started from — and names either drift once, calmly.
+It also names the supervision gap: a daemon running while the installed unit sits
+inactive is up but unsupervised, and the next `catenary restart` adopts it.
 
 Writing the unit and starting it are separate steps: the unit/plist file is the
 durable artifact and always lands, while the live enable/start leg rides your

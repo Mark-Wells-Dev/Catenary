@@ -130,7 +130,7 @@ pub async fn run_doctor(out: &mut Output, project_root: &Path, show_diff: bool) 
     // service manager, so surface whether the service is installed and — when a
     // daemon is up — its idle resident set (the figure MALLOC_ARENA_MAX=2
     // bounds). Daemon down ⇒ no snapshot ⇒ no footprint.
-    render_service_section(out);
+    render_service_section(out, show_diff);
     let _ = out.writeln(format_args!(""));
 
     // Config migration walk — runs before the load so its rename guidance can
@@ -339,7 +339,8 @@ async fn gather_probe_feed(
     ProbeFeed::new(statuses, active_languages, daemon_version).with_provenance(provenance)
 }
 
-/// Render the service state + the idle daemon's footprint (ws49-04).
+/// Render the service state + the idle daemon's footprint (ws49-04), then the
+/// currency and supervision-drift findings (ws49-04a).
 ///
 /// The daemon runs always-on under a per-user service manager (`catenary
 /// service install`), so this reports whether the service is installed and, when
@@ -348,11 +349,18 @@ async fn gather_probe_feed(
 /// `/proc/<pid>/statm` by the pid on the snapshot, the ws49-02 helper's method
 /// parameterized by pid (Linux only; `None` elsewhere, and the line simply omits
 /// the figure). Daemon down ⇒ no snapshot ⇒ no footprint, honestly.
-fn render_service_section(out: &mut Output) {
+///
+/// The findings underneath come from [`crate::health::service_checks`]: this
+/// gathers the observation — the installed file, what this build's generators
+/// would write **for that file's own target**, the baked target, the running
+/// daemon's binary, and the manager's active word — and the model decides. Every
+/// input it cannot read stays `None`, and the matching check simply does not
+/// fire.
+fn render_service_section(out: &mut Output, show_diff: bool) {
     let _ = out.writeln(format_args!("{}:", out.colors.bold("Service")));
-    let installed = crate::service::is_installed();
+    let unit = crate::service::installed_unit();
     let manager = crate::service::manager_label();
-    if installed {
+    if unit.is_some() {
         let _ = out.writeln(format_args!(
             "  {} installed ({manager})",
             out.colors.green("✓"),
@@ -365,10 +373,10 @@ fn render_service_section(out: &mut Output) {
         ));
     }
 
-    match read_snapshot()
+    let daemon_pid = read_snapshot()
         .map(|s| s.daemon.pid)
-        .filter(|pid| *pid != 0)
-    {
+        .filter(|pid| *pid != 0);
+    match daemon_pid {
         Some(pid) => match crate::service::idle_footprint_bytes(pid) {
             Some(bytes) => {
                 let _ = out.writeln(format_args!(
@@ -390,6 +398,51 @@ fn render_service_section(out: &mut Output) {
             ));
         }
     }
+
+    render_findings(out, &service_findings(unit.as_ref(), daemon_pid), show_diff);
+}
+
+/// Gather the service observation and ask the model for its findings.
+///
+/// Kept beside the renderer because every read here is an I/O fact — the
+/// installed file, the manager's state, the daemon's `/proc` link — while the
+/// judgment lives in [`crate::health::service_checks`]. `expected` is
+/// regenerated for the **installed file's own target**, so template drift is
+/// diagnosed independently of where the binary lives.
+fn service_findings(
+    unit: Option<&crate::service::InstalledUnit>,
+    daemon_pid: Option<u32>,
+) -> Vec<Finding> {
+    let Some(unit) = unit else {
+        return Vec::new();
+    };
+    let installed = std::fs::read_to_string(&unit.path).ok();
+    let installed_target = installed
+        .as_deref()
+        .and_then(|c| crate::service::unit_target(unit.kind, c))
+        .map(str::to_string);
+    let expected = installed_target
+        .as_deref()
+        .map(|target| crate::service::render_unit(unit.kind, target));
+    let running_binary = daemon_pid.and_then(crate::service::daemon_binary);
+    let path = unit.path.display().to_string();
+
+    crate::health::service_checks::service_findings(
+        &crate::health::service_checks::ServiceObservation {
+            manager: unit.kind.label(),
+            artifact: unit.kind.artifact(),
+            installed_path: Some(&path),
+            installed: installed.as_deref(),
+            expected: expected.as_deref(),
+            installed_target: installed_target.as_deref(),
+            running_binary: running_binary.as_deref(),
+            manager_active: crate::service::active_state()
+                .map(|raw| crate::service::reads_active(&raw)),
+            // The socket probe, not the snapshot pid: a `state.json` a dead
+            // daemon left behind must never read as "running unsupervised".
+            daemon_running: crate::service::daemon_running(),
+        },
+    )
 }
 
 /// Format a byte count as a one-decimal MiB string (e.g. `82.4 MiB`).
