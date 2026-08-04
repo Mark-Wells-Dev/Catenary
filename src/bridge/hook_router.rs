@@ -667,6 +667,18 @@ impl HookRouter {
             path.to_path_buf(),
             existed_at_record,
         );
+        // The mtime trail's perpetual canary (bug 146 stage 2). Only an
+        // ENTRY-CHANGING write is evidence about a device's directory-mtime
+        // semantics: a **creation** (nothing at the path when we recorded it),
+        // or a **rename-class** write — the host's Edit/Write tools are
+        // atomic-rename (bug 34's evidence), which is what `verb == "edited"`
+        // marks here. A shell redirect over an existing file (`verb ==
+        // "wrote"`) writes in place, and no filesystem moves the parent
+        // directory's mtime for that — booking it would false-demote every
+        // healthy device on its first redirect write.
+        if !existed_at_record || verb == "edited" {
+            self.session.client_manager.note_entry_changing_write(path);
+        }
         self.session
             .set_last_action(format!("{verb} {}", self.session.display_path(path)));
         debug!(

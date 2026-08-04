@@ -117,7 +117,6 @@ where
             pattern,
             roots,
             &WalkOptions::default(),
-            None,
             catenary_cli::hitstream::WalkTier::Dig,
             lint,
             cli_reader,
@@ -212,7 +211,6 @@ impl BatchEnricher for SlowFirstBatch {
     async fn enrich(
         &self,
         hits: Vec<WireHit>,
-        _observed: Vec<(PathBuf, i64)>,
         _weight: Option<catenary_cli::hitstream::EnrichmentWeight>,
         _tier: catenary_cli::hitstream::WalkTier,
     ) -> anyhow::Result<Vec<AnnotatedHit>> {
@@ -325,7 +323,6 @@ async fn daemon_absent_and_unknown_method_degrade_identically() -> Result<()> {
             "needle",
             &roots,
             &WalkOptions::default(),
-            None,
             catenary_cli::hitstream::WalkTier::Dig,
             None,
             cli_reader,
@@ -385,7 +382,6 @@ async fn silent_daemon_deadline_completes_unannotated() -> Result<()> {
             "needle",
             &roots,
             &WalkOptions::default(),
-            None,
             catenary_cli::hitstream::WalkTier::Dig,
             None,
             cli_reader,
@@ -539,7 +535,6 @@ impl BatchEnricher for RecordingEnricher {
     async fn enrich(
         &self,
         hits: Vec<WireHit>,
-        _observed: Vec<(PathBuf, i64)>,
         _weight: Option<catenary_cli::hitstream::EnrichmentWeight>,
         _tier: catenary_cli::hitstream::WalkTier,
     ) -> anyhow::Result<Vec<AnnotatedHit>> {

@@ -224,16 +224,16 @@ or external tools.
 
 Most LSP clients use a background file watcher (inotify on Linux,
 FSEvents on macOS) that fires events continuously over the whole
-workspace. Catenary doesn't — it detects changes by walking at query
-time, the same walk `grep`/`glob`/`diagnostics` already perform:
+workspace. Catenary doesn't — it looks at query time, at the moment a
+server is about to be consulted:
 
 - **Zero idle overhead.** No background watcher over workspace files, no
   recursive inotify watches, no file-descriptor budget to manage.
   Between tool calls, Catenary does nothing.
 - **No sub-`O(tree)` consumer to accelerate.** `grep` is `O(tree)` and
   asks a fresh question each time, so an incremental change feed would
-  not speed it up. Walking on demand yields change detection for free,
-  off work the query already does.
+  not speed it up. Observing on demand costs a handful of targeted stats
+  at the moment they are needed.
 - **No watch limits.** Large monorepos can exceed the default inotify
   watch limit; Catenary never hits it because it registers no recursive
   workspace watches. Directory walking uses the `ignore` crate (already a
@@ -248,28 +248,51 @@ a bounded, non-recursive directory-deletion watch on subagent worktree
 roots, for teardown — not workspace-file watching. See [Logging, Hooks &
 TUI](logging-hooks-tui.md#worktree-root-teardown).)
 
-### Walk-on-demand change detection
+### Observation-on-demand change detection
 
-`FilesystemManager` detects changes by walking on demand and diffing
-against a per-root mtime baseline:
+`FilesystemManager` detects changes by observing on demand and diffing
+against a per-root mtime baseline. Every observation is made **by the
+daemon**, and each source states its own coverage — a search's filter is
+never mistaken for a claim about the tree (bug 146):
 
-1. **First walk is the baseline.** There is no separate seed step. The
-   first walk of a root records `(path, mtime)` for every file (stat-only,
-   no content read; `.gitignore` respected via the `ignore` crate) and
-   establishes that root's baseline.
+- the **supplemental watch probe**, one stat per registered pattern, run
+  per nudge — and the deletion authority for those patterns: a stat-miss
+  on a baselined path it looked for is a `Deleted`;
+- the **hit files** of a query, statted at enrichment time — request-time
+  consistency of exactly what is being asked about;
+- the **open-document sweep**, one stat per held-open document, which
+  force-closes any whose file is gone;
+- the **diagnose round's `stat_walk`**, unfiltered over the edited roots
+  — the one walk with whole-root coverage, and so the one that reaps
+  wholesale.
 
-2. **`diff_and_update` on each walk.** A later walk compares the current
-   `(path, mtime)` against the baseline, produces a change set —
+The CLI's `grep`/`glob` walks contribute none of this: they stream hits
+and nothing else.
+
+1. **First observation is the baseline.** There is no separate seed step.
+   The first observation of a root records `(path, mtime)` (stat-only, no
+   content read) and establishes that root's baseline.
+
+2. **`diff_and_update` on each nudge.** A later observation compares the
+   current `(path, mtime)` against the baseline, produces a change set —
    `Created`, `Changed`, or `Deleted` — then merges the new mtimes back
-   into the baseline. (The first walk's whole observation is reported as
-   `Changed` — the cold snapshot.)
+   into the baseline. (The first observation is reported as `Changed` —
+   the cold snapshot.) Deletions come from the two sources that know
+   absence first-hand: the probe's targeted stat-misses
+   (`condemn_absent`) and the diagnose walk's reap
+   (`diff_update_and_reap`).
 
-3. **Per-server routing.** Each covering server's registered watchers
-   are snapshotted; observations are filtered to the union of their
-   globs, then fanned out so each server receives only the changes that
-   match its own globs *and* watch-kind mask (create / change / delete).
-   Servers register interest via `client/registerCapability` for
-   `workspace/didChangeWatchedFiles`.
+3. **Per-server delivery frontiers.** Observation advances the shared
+   baseline once and journals what changed, generation-keyed. Delivery
+   is then per server: each **instance** drains its own frontier — the
+   **net** diff since it was last told — filtered to its own globs *and*
+   watch-kind mask (create / change / delete). Net, so a path's history
+   collapses to one delivery, and a file created and deleted between two
+   of a server's consultations is never mentioned to it at all: the
+   delete/create flap dies structurally rather than by heuristic. A
+   dropped notify rewinds only the failing instance's frontier; no other
+   server is re-told anything. Servers register interest via
+   `client/registerCapability` for `workspace/didChangeWatchedFiles`.
 
 4. **Two dispatch forms, keyed on open state** (the watch-before-query
    invariant: Catenary is the single disk walker, and pending disk

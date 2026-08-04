@@ -187,7 +187,11 @@ impl GlobPattern {
 ///
 /// The URI is percent-decoded (e.g. `%20` → a space) so a `baseUri` like
 /// `file:///home/u/my%20project` resolves to the real `/home/u/my project`.
-fn uri_to_path(uri: &str) -> Result<PathBuf> {
+///
+/// Crate-visible since bug 146: the open-document sweep stats the paths behind
+/// the URIs a client holds open, and it must decode them exactly as watcher
+/// bases are decoded — one converter, no second spelling to drift.
+pub(crate) fn uri_to_path(uri: &str) -> Result<PathBuf> {
     let encoded = uri
         .strip_prefix("file://")
         .ok_or_else(|| anyhow!("expected file:// URI, got: {uri}"))?;

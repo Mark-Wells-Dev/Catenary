@@ -60,9 +60,7 @@ use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
 use super::SourceLines;
-use super::filesystem_manager::{
-    FilesystemManager, STAT_RETRY_ATTEMPTS, format_file_size, mtime_nanos,
-};
+use super::filesystem_manager::{FilesystemManager, STAT_RETRY_ATTEMPTS, format_file_size};
 use super::session::{ArgResolution, ExcludeSet, expand_glob_patterns_grouped_cancellable};
 use crate::hitstream::AnnotatedHit;
 use crate::symbol_index::Symbol;
@@ -239,12 +237,6 @@ pub struct GlobPlan {
     /// broken symlinks, and snapshot sidecars — the retired executor's
     /// enrich-always set.
     pub enrich_files: Vec<PathBuf>,
-    /// The scoped-nudge observations (WS31 ticket 04): each resolved file, and
-    /// each resolved directory's immediate entries, with walk-time mtimes.
-    /// Shipped on the first annotation batch so the daemon's changed-set nudge
-    /// lands before any outline is derived (the executor's nudge-then-anchor
-    /// order). Add/update only — a scoped walk never reaps.
-    pub observations: Vec<(PathBuf, i64)>,
     /// Whether the query resolved a listing shape (a matched directory, or
     /// more than one matched file) — the ruled listing-weight default. A
     /// single matched file is the file-outline shape and keeps the full tree.
@@ -284,22 +276,15 @@ pub fn build_glob_plan(
         &cancel,
     );
     // Apply the compiled exclude to the pattern's matches (bug 73): filtering
-    // here — before the flat set feeds the scoped observations and the layout
-    // loop — keeps the listing, the nudge, and `--count` (which filters
-    // identically) in agreement, and leaves a fully-excluded pattern with an
-    // empty set, so it reports the honest `no matches for pattern` rather than
-    // vanishing.
+    // here — before the layout loop — keeps the listing and `--count` (which
+    // filters identically) in agreement, and leaves a fully-excluded pattern
+    // with an empty set, so it reports the honest `no matches for pattern`
+    // rather than vanishing.
     apply_exclude_to_groups(fs_manager, &mut groups, exclude);
     let resolved: Vec<PathBuf> = groups
         .iter()
         .flat_map(|g| g.resolved.iter().cloned())
         .collect();
-
-    // The scoped-nudge observations (WS31 ticket 04), gathered under the same
-    // visibility and exclude filters the listing applies. They ride the first
-    // annotation batch.
-    let observations =
-        collect_scoped_observations(&resolved, include_gitignored, include_hidden, exclude);
 
     // The ruled weight shape: exactly one matched path, and it is a file →
     // the file-outline shape (full tree by default). Anything else — a
@@ -312,7 +297,6 @@ pub fn build_glob_plan(
         dir_hints: Vec::new(),
         metachar_names: Vec::new(),
         enrich_files: Vec::new(),
-        observations,
         listing_shape,
     };
     let mut enrich_seen: HashSet<PathBuf> = HashSet::new();
@@ -1124,126 +1108,6 @@ fn path_is_file_or_symlink_with_retry_with(
         }
     }
     false
-}
-
-/// Collects the `(absolute path, mtime)` observations for glob's scoped walk —
-/// the files within the glob pattern (WS31 ticket 04).
-///
-/// For a resolved **file** path: the file itself. For a resolved **directory**
-/// path: its immediate entries (max depth 1), honoring the query's
-/// gitignore/hidden visibility and the `exclude` filter so the observation set
-/// matches what the listing surfaces. Per-file stats are the portable
-/// correctness path (a content edit advances the file mtime, not the parent dir
-/// mtime). Unreadable entries are skipped.
-///
-/// Observations are keyed by each entry's **canonical** real path (falling back
-/// to the literal path only if `canonicalize` fails) so they agree with grep's
-/// (`WalkBuilder::new(root)`) and diagnostics' (`stat_walk`) walks, which run
-/// with `follow_links` **off** and therefore never descend an in-tree
-/// symlink-to-dir — they only ever observe the real path. Keying literally
-/// would double-key the same physical file (`linkdir/x` here, `realdir/x`
-/// there): the orphan literal entry is never re-observed by a non-following
-/// walk and gets phantom-reaped `Deleted` (WS31-review F2; reverses the pass-1
-/// "canonicalize-nowhere" call). A symlink target *outside* every root
-/// canonicalizes outside → [`resolve_root`] in the caller returns `None` → the
-/// entry is correctly dropped (following such a target is opt-in via
-/// `--follow-links`, fs-coherence ticket 07).
-fn collect_scoped_observations(
-    resolved: &[PathBuf],
-    include_gitignored: bool,
-    include_hidden: bool,
-    exclude: &ExcludeSet,
-) -> Vec<(PathBuf, i64)> {
-    let mut observed: Vec<(PathBuf, i64)> = Vec::new();
-    // One tracked-set consultation for every resolved directory (misc 227). The
-    // posture must match the listing's, or the observation set and the surfaced
-    // set disagree — and a baseline the reaping full walk cannot re-observe
-    // phantom-reaps a live file as `Deleted`.
-    let tracked = crate::tracked::TrackedHidden::new();
-    for path in resolved {
-        // Directories first — `is_dir()` follows symlinks, so a symlink-to-dir
-        // routes here and is walked at its literal path; each entry is then
-        // canonicalized to its real path so its rel key matches grep/diagnostics.
-        // This dir-first order matches `handle_literal_paths` so the listing and
-        // the nudge classify a symlink-to-dir the same way (WS31-review walk-2).
-        if path.is_dir() {
-            // Canonicalize the dir arg ONCE (resolving a symlink-to-dir and any
-            // symlink prefix components). A direct, non-symlink child's real path
-            // is then `canonical_dir.join(leaf)` — no per-entry `canonicalize`
-            // syscall on top of the mandatory `metadata()` (WS31-review c1r-2).
-            // Only a child that is *itself* a symlink still needs a per-entry
-            // canonicalize to resolve its target. `None` when the dir itself
-            // can't canonicalize → fall back to per-entry resolution.
-            let canonical_dir = path.canonicalize().ok();
-            let mut builder = WalkBuilder::new(path);
-            builder.max_depth(Some(1)).git_ignore(!include_gitignored);
-            crate::tracked::apply_hidden_posture(&mut builder, path, !include_hidden, &tracked);
-            let walker = builder.build();
-            for entry in walker.flatten() {
-                let entry_is_symlink = entry.path_is_symlink();
-                let entry_path = entry.into_path();
-                if entry_path.as_path() == path.as_path() {
-                    continue;
-                }
-                if exclude.is_match(&entry_path, path) {
-                    continue;
-                }
-                // Only regular files carry an mtime worth diffing; the per-file
-                // stat is the correctness path. Key by the canonical real path.
-                if let Ok(md) = std::fs::metadata(&entry_path)
-                    && md.is_file()
-                {
-                    // A non-symlink child under an already-canonical dir: its real
-                    // path is `canonical_dir/leaf`, no extra syscall. Otherwise
-                    // (symlinked child, or the dir didn't canonicalize) resolve
-                    // per-entry. A confirmed-present entry whose canonicalize
-                    // fails is OMITTED, never literal-keyed — a scoped walk that
-                    // drops an entry can't phantom-reap it, and the next clean
-                    // glob re-observes the canonical key (WS31-review T2/F2).
-                    let key = match (&canonical_dir, entry_is_symlink) {
-                        (Some(dir), false) => entry_path
-                            .file_name()
-                            .map(|leaf| dir.join(leaf))
-                            .or_else(|| canonical_key(&entry_path)),
-                        _ => canonical_key(&entry_path),
-                    };
-                    if let Some(key) = key {
-                        observed.push((key, mtime_nanos(&md)));
-                    }
-                }
-            }
-        } else if path_is_file_or_symlink_with_retry(path) {
-            // An actual file or a symlink-to-file: record the canonical path.
-            // A broken symlink stats as an error here and is skipped. A
-            // confirmed-present file whose canonicalize fails is OMITTED, never
-            // literal-keyed, so a later full walk can't phantom-reap it
-            // (WS31-review T2/F2).
-            if let Ok(md) = std::fs::metadata(path)
-                && let Some(key) = canonical_key(path)
-            {
-                observed.push((key, mtime_nanos(&md)));
-            }
-        }
-    }
-    observed
-}
-
-/// Canonicalizes an observed entry's path to its real path, returning `None`
-/// when `canonicalize` fails.
-///
-/// Used to key glob's changed-set observations by the same real path
-/// grep/diagnostics' non-following walks produce, so the same physical file is
-/// never double-keyed (WS31-review F2). The caller invokes this only for an entry
-/// it has already confirmed present (metadata `Ok`), so a `canonicalize` failure
-/// here (EACCES on a parent, a symlink component swapped mid-walk, or a TOCTOU
-/// removal) must NOT fall back to the literal path: literal-keying a
-/// link-traversed orphan re-creates F2 (the orphan is never re-observed by a
-/// non-following walk and is phantom-reaped `Deleted`). Returning `None` makes
-/// the caller OMIT the observation — a scoped walk that drops an entry cannot
-/// phantom-reap it, and the next clean glob re-observes the canonical key
-/// (WS31-review T2).
-fn canonical_key(path: &Path) -> Option<PathBuf> {
-    path.canonicalize().ok()
 }
 
 /// Whether a path component carries a glob metacharacter (`* ? [ {`).
@@ -2261,75 +2125,6 @@ mod tests {
         assert_eq!(out, "\tnested.rs  (10 lines)\n");
     }
 
-    // ─── collect_scoped_observations — canonicalization divergence (R5 L7) ──
-
-    /// C1/F2 — for a symlinked directory arg, `collect_scoped_observations` must
-    /// yield the contained file at its CANONICAL `realdir/x.<EXT>` path, matching
-    /// grep's (`WalkBuilder::new(root)`) and diagnostics' (`stat_walk`) walks,
-    /// which never descend an in-tree symlink-to-dir (`follow_links` off) and so
-    /// observe only the real path.
-    ///
-    /// This REVERSES the pass-1 "canonicalize-nowhere" call (L7). The pass-1
-    /// premise — that grep/diagnostics key the file under `linkdir/x.<EXT>` — was
-    /// wrong: those walks never follow the in-tree link, so they only ever
-    /// produce `realdir/x.<EXT>`. Keying glob's observation literally
-    /// (`linkdir/x.<EXT>`) double-keyed the same physical file, and the orphan
-    /// `linkdir/x.<EXT>` baseline entry was phantom-reaped by the next full walk
-    /// (F2). The decided fix canonicalizes glob's observed entries to the real
-    /// path, so all three surfaces agree on `realdir/x.<EXT>`.
-    #[test]
-    #[cfg(unix)]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn ws31_review_r5_symlinked_glob_arg_single_baseline_key() {
-        use std::os::unix::fs::symlink;
-
-        let tmp = tempfile::tempdir().expect("create tempdir");
-        // Canonicalize the tempdir base once so the ONLY symlink in play is
-        // `linkdir` (some platforms route `/tmp` through a symlink; on Linux it
-        // is real, but canonicalizing the base keeps the comparison robust).
-        let base = tmp.path().canonicalize().expect("canonicalize base");
-
-        let realdir = base.join("realdir");
-        std::fs::create_dir(&realdir).expect("create realdir");
-        let real_file = realdir.join("x.ws31ext");
-        std::fs::write(&real_file, "fn x\n").expect("write file");
-
-        let linkdir = base.join("linkdir");
-        symlink(&realdir, &linkdir).expect("create linkdir symlink");
-        // The literal (link-traversed) path glob USED to record — the bug.
-        let literal_file = linkdir.join("x.ws31ext");
-        // The canonical path grep/diagnostics record — the single correct key.
-        let canonical_file = realdir.join("x.ws31ext");
-
-        // include_hidden / include_gitignored so neither visibility filter hides
-        // the entry; the file itself is non-hidden, but this keeps it unambiguous.
-        let observed = collect_scoped_observations(
-            std::slice::from_ref(&linkdir),
-            true,
-            true,
-            &ExcludeSet::default(),
-        );
-
-        // Regression guard: the contained file must be observed at its CANONICAL
-        // `realdir/x.<EXT>` path (the grep/diagnostics baseline key) — glob
-        // canonicalizes its entries so it matches. Pre-fix (C1/F2) it recorded
-        // the literal link-traversed `linkdir/x.<EXT>` instead.
-        assert!(
-            observed.iter().any(|(p, _)| *p == canonical_file),
-            "glob's scoped observation must record the contained file at its \
-             CANONICAL path (realdir/x.<EXT>), matching grep/diagnostics' \
-             non-following walks; got: {observed:?}"
-        );
-
-        // The divergence must be gone: no observation under the literal
-        // link-traversed path once glob canonicalizes its entries.
-        assert!(
-            !observed.iter().any(|(p, _)| *p == literal_file),
-            "no observation should surface under the literal link-traversed path \
-             once glob canonicalizes its entries; got: {observed:?}"
-        );
-    }
-
     // ─── count_glob_paths — dispatch parity with the plan build (WS31-review D1) ──
 
     /// T1 (retargeted for the VERBS one-verb form) — a symlink-to-dir pattern is
@@ -2376,44 +2171,6 @@ mod tests {
             count, 1,
             "a self-matching directory pattern counts once (the match set), \
              not its {N} listed entries; only the listing descends. got {count}"
-        );
-    }
-
-    /// T2 — `canonical_key`'s present-entry contract: it returns `Some(real)` on
-    /// success and `None` on a canonicalize failure, so the caller OMITS an
-    /// uncanonicalizable-but-present entry rather than literal-keying it (which
-    /// would re-create the F2 phantom-reap). A deterministic canonicalize failure
-    /// on a genuinely *present* file is not portably stageable in a unit test
-    /// (it needs an EACCES-on-parent / mid-walk symlink swap), so this asserts
-    /// the helper's failure path directly: an unresolvable path → `None`
-    /// (the omit signal), a present real path → `Some(canonical)`
-    /// (land-with-fix per the D1 spec).
-    #[test]
-    #[allow(clippy::expect_used, reason = "test assertions")]
-    fn ws31_review_d_present_uncanonicalizable_dropped() {
-        let tmp = tempfile::tempdir().expect("create tempdir");
-        let base = tmp.path().canonicalize().expect("canonicalize base");
-
-        // Unresolvable path (no such entry): canonicalize fails → `None`. This is
-        // the signal the caller turns into an OMIT — never a literal-keyed orphan
-        // (the F2 phantom-reap the literal fallback used to cause).
-        let missing = base.join("does_not_exist.ws31ext");
-        assert_eq!(
-            canonical_key(&missing),
-            None,
-            "an uncanonicalizable path must yield None (omit), not a literal key: {}",
-            missing.display()
-        );
-
-        // A present real file canonicalizes to itself (the dir is already
-        // canonical) → `Some(real)`, so a clean observation is still keyed.
-        let real_file = base.join("present.ws31ext");
-        std::fs::write(&real_file, "x\n").expect("write file");
-        assert_eq!(
-            canonical_key(&real_file),
-            Some(real_file.clone()),
-            "a present, resolvable path must yield Some(canonical): {}",
-            real_file.display()
         );
     }
 

@@ -148,6 +148,61 @@ fn bug143_dotfile_marker_watch_delivers_its_change() -> Result<()> {
     Ok(())
 }
 
+/// Bug 146 stage 2 — the mtime trail: a marker created in a **brand-new nested
+/// directory** is delivered at the very next nudge.
+///
+/// Before the trail, the probe's marker candidates were the directories some
+/// walk happened to mention, so a marker in a directory nobody had walked was
+/// in nobody's candidate list until a wholesale pass learned it. The trail
+/// closes that: creating `crates/new/` moves its parent's mtime, the parent is
+/// the only directory readdir'd, the new subtree unfolds down its own path, and
+/// the marker inside it is probed on the spot. No walk feeds this — the query
+/// that triggers it hits a completely unrelated file.
+#[test]
+fn bug146_new_nested_marker_is_discovered_at_the_next_nudge() -> Result<()> {
+    let dir = common::canonical_tempdir()?;
+    let log_path = dir.path().join("notifications.jsonl");
+    seed_probe_bait(dir.path(), MOCK_LANG_A)?;
+    // The only file any query here matches — it lives at the root and has
+    // nothing to do with the nested directory below.
+    std::fs::write(dir.path().join(format!("a.{MOCK_LANG_A}")), "needle\n")?;
+
+    let log_arg = log_path.to_str().context("log path")?;
+    let lsp = mockls_lsp_arg(
+        MOCK_LANG_A,
+        &format!(
+            "--register-file-watchers --watcher-glob **/marker.toml \
+             --watcher-kind 7 --notification-log {log_arg}"
+        ),
+    );
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    // Nudge #1 seeds the trail with the directories that exist now.
+    let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
+
+    // A whole new subcrate appears — directory and marker both new, and two
+    // levels below anything the trail has seen.
+    let nested = dir.path().join("crates/new");
+    std::fs::create_dir_all(&nested)?;
+    std::fs::write(nested.join("marker.toml"), "artifacts = []\n")?;
+    let marker_uri = format!("file://{}/crates/new/marker.toml", dir.path().display());
+
+    // Nudge #2: the trail discovers the new directories and probes the marker.
+    let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
+
+    let changes = wait_for_change(&log_path, &marker_uri, 1);
+    let log = read_merged_log(&log_path);
+    assert!(
+        count_changes(&changes, &marker_uri, 1) >= 1,
+        "a marker in a brand-new nested directory must be discovered by the \
+         mtime trail at the next nudge and routed as Created(1). \
+         changes={changes:?}, log:\n{log}"
+    );
+    Ok(())
+}
+
 /// A registered literal path inside a gitignored tree must be observed.
 ///
 /// The rust-analyzer / clangd shape: build artifacts (`OUT_DIR` products,

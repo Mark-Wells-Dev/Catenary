@@ -71,7 +71,6 @@ fn hitstream_exchange_weighted(
     let batch = HitFrame::Batch {
         seq: 0,
         hits: hits.to_vec(),
-        observed: Vec::new(),
         weight,
         tier: catenary_cli::hitstream::WalkTier::Dig,
     };

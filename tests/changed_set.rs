@@ -51,15 +51,23 @@ fn seed_probe_bait(dir: &std::path::Path, lang: &str) -> Result<()> {
     Ok(())
 }
 
-/// Cold baseline ⇒ the first enriched grep sends every registered-glob file
-/// once as `Changed` (`FileChangeType` 2). The first walk *is* the snapshot.
+/// Cold baseline ⇒ the first enriched grep sends its hit files once as
+/// `Changed` (`FileChangeType` 2). The first walk *is* the snapshot.
+///
+/// Since bug 146 the candidate set a query contributes is its **hit files**,
+/// statted daemon-side, not every file its walk visited: a search walk's yield
+/// is what the pattern matched inside what the `--type`/`--glob` filter
+/// admitted, which is not coverage of anything. (The wholesale snapshot of a
+/// root is the diagnose round's unfiltered `stat_walk`; registered patterns a
+/// search can never see are the supplemental probe's.) Both fixture files
+/// therefore carry the needle.
 #[test]
-fn first_walk_sends_full_candidate_set() -> Result<()> {
+fn first_walk_sends_its_hit_files() -> Result<()> {
     let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
     seed_probe_bait(dir.path(), MOCK_LANG_A)?;
     std::fs::write(dir.path().join(format!("a.{MOCK_LANG_A}")), "needle\n")?;
-    std::fs::write(dir.path().join(format!("b.{MOCK_LANG_A}")), "other\n")?;
+    std::fs::write(dir.path().join(format!("b.{MOCK_LANG_A}")), "needle too\n")?;
 
     let log_arg = log_path.to_str().context("log path")?;
     let lsp = mockls_lsp_arg(
@@ -586,26 +594,36 @@ fn no_lsp_query_no_nudge() -> Result<()> {
     Ok(())
 }
 
-// ── Deletion reaping — full walks only (ticket 04) ───────────────────────
+// ── Deletion delivery — the probe and the diagnose walk (bug 146) ────────
 
-/// Enriched grep is a `Full` walk: after seeding the baseline, deleting a
-/// tracked `.MOCK_LANG_A` file and re-running grep reaps it — the covering
-/// server receives `Deleted` (wire `FileChangeType` 3) for the gone file.
+/// The supplemental probe is the deletion authority on the search surfaces
+/// (bug 146): a grep delivers `Deleted(3)` for a registered marker that is
+/// gone from disk, because the probe stat'd that exact path and found nothing
+/// — not because a walk failed to mention it.
+///
+/// This replaces the old "enriched grep is a Full walk, so it reaps" pin. That
+/// premise was the filed bug: a walk's yield is bounded by its filter, so
+/// treating it as coverage condemned every watched file the filter hid. The
+/// deletion still arrives on the same surface, at the same moment — it is now
+/// proven by a targeted look.
 #[test]
-fn enriched_grep_full_walk_reaps_deletion() -> Result<()> {
+fn grep_probe_delivers_a_watched_deletion() -> Result<()> {
     let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
+    seed_probe_bait(dir.path(), MOCK_LANG_A)?;
+    // The searched file (the query's own hit) and the watched marker, which no
+    // query ever hits — only the probe looks at it.
     let keep = dir.path().join(format!("keep.{MOCK_LANG_A}"));
-    let gone = dir.path().join(format!("gone.{MOCK_LANG_A}"));
+    let marker = dir.path().join("marker.toml");
     std::fs::write(&keep, "needle\n")?;
-    std::fs::write(&gone, "needle\n")?;
+    std::fs::write(&marker, "artifacts = []\n")?;
 
     let log_arg = log_path.to_str().context("log path")?;
-    // kind 7 (ALL) ⇒ registers Delete, so it receives reaped deletions.
+    // kind 7 (ALL) ⇒ registers Delete, so it receives the deletion.
     let lsp = mockls_lsp_arg(
         MOCK_LANG_A,
         &format!(
-            "--register-file-watchers --watcher-glob **/*.{MOCK_LANG_A} \
+            "--register-file-watchers --watcher-glob **/marker.toml \
              --watcher-kind 7 --notification-log {log_arg}"
         ),
     );
@@ -613,22 +631,22 @@ fn enriched_grep_full_walk_reaps_deletion() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    // First grep seeds the baseline (both files recorded synchronously).
+    let marker_uri = format!("file://{}/marker.toml", dir.path().display());
+
+    // Walk #1 seeds the baseline: the probe finds the marker (cold `Changed`).
+    let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
+    let _ = wait_for_change(&log_path, &marker_uri, 2);
+
+    // Delete it, then query again: the probe looks where it was told to look,
+    // finds nothing, and the baselined path is condemned.
+    std::fs::remove_file(&marker)?;
     let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
 
-    // Delete the tracked file, then run grep again — the full walk reaps it.
-    std::fs::remove_file(&gone)?;
-    let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
-
-    let gone_uri = format!("file://{}/gone.{MOCK_LANG_A}", dir.path().display());
-
-    // Poll the live log until the reaped Deleted(3) lands (positive completion
-    // signal), then assert. No fixed sleep, no shutdown/flush race.
-    let changes = wait_for_change(&log_path, &gone_uri, 3);
+    let changes = wait_for_change(&log_path, &marker_uri, 3);
     let log = read_merged_log(&log_path);
     assert!(
-        changes.iter().any(|(u, t)| *u == gone_uri && *t == 3),
-        "a full enriched-grep walk must reap the deleted file as Deleted(3). \
+        changes.iter().any(|(u, t)| *u == marker_uri && *t == 3),
+        "a probe stat-miss on a baselined watched path must deliver Deleted(3). \
          changes={changes:?}, log:\n{log}"
     );
     Ok(())
@@ -681,29 +699,30 @@ fn diagnostics_full_walk_reaps_deletion() -> Result<()> {
 }
 
 /// A Delete-only watcher (kind 4 — no Create/Change bit) must still get its
-/// matched files into the per-root baseline while present, so a later full walk
-/// can reap their deletion. On the first walk (file present) the Delete-only
+/// matched files into the per-root baseline while present, so their deletion
+/// can be delivered later. On the first walk (file present) the Delete-only
 /// server receives NOTHING — it didn't ask for Create/Change, so routing
-/// kind-filters the cold `Changed` snapshot away. After deletion the second full
-/// walk reaps the gone file as `Deleted` (wire `FileChangeType` 3).
+/// kind-filters the cold `Changed` snapshot away. After deletion the probe's
+/// stat-miss delivers `Deleted` (wire `FileChangeType` 3).
 #[test]
-fn delete_only_watcher_reaps_deletion() -> Result<()> {
+fn delete_only_watcher_receives_the_deletion() -> Result<()> {
     let dir = common::canonical_tempdir()?;
     let log_path = dir.path().join("notifications.jsonl");
-    // `keep` survives so the post-deletion grep still matches a file under the
-    // root, running the full walk that reaps `gone`.
+    seed_probe_bait(dir.path(), MOCK_LANG_A)?;
+    // `keep` is the query's hit, so the post-deletion grep still nudges this
+    // root; `marker` is the watched path, seen only by the probe.
     let keep = dir.path().join(format!("keep.{MOCK_LANG_A}"));
-    let gone = dir.path().join(format!("gone.{MOCK_LANG_A}"));
+    let marker = dir.path().join("marker.toml");
     std::fs::write(&keep, "needle\n")?;
-    std::fs::write(&gone, "needle\n")?;
+    std::fs::write(&marker, "artifacts = []\n")?;
 
     let log_arg = log_path.to_str().context("log path")?;
     // kind 4 (Delete only) — no Create/Change bit. Files must still be baselined
-    // while present so the reaping sweep can later emit their deletion.
+    // while present so the later stat-miss has something to condemn.
     let lsp = mockls_lsp_arg(
         MOCK_LANG_A,
         &format!(
-            "--register-file-watchers --watcher-glob **/*.{MOCK_LANG_A} \
+            "--register-file-watchers --watcher-glob **/marker.toml \
              --watcher-kind 4 --notification-log {log_arg}"
         ),
     );
@@ -711,39 +730,175 @@ fn delete_only_watcher_reaps_deletion() -> Result<()> {
     let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
     bridge.initialize()?;
 
-    let gone_uri = format!("file://{}/gone.{MOCK_LANG_A}", dir.path().display());
+    let marker_uri = format!("file://{}/marker.toml", dir.path().display());
 
-    // First grep seeds the baseline (the file IS baselined even though this
+    // First grep seeds the baseline (the marker IS baselined even though this
     // watcher is Delete-only). Routing kind-filters the cold `Changed` snapshot
-    // away, so the Delete-only server must receive NOTHING for `gone` on walk #1.
+    // away, so the Delete-only server must receive NOTHING on walk #1.
     let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
 
-    // Delete the tracked file, then run grep again — the full walk reaps it.
-    std::fs::remove_file(&gone)?;
+    // Delete the watched file, then query again — the probe finds it gone.
+    std::fs::remove_file(&marker)?;
     let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
 
-    // Poll until `gone` is reaped as Deleted(3) — the positive completion signal
-    // from walk #2. Walk #1 precedes walk #2 on the FIFO mockls pipe, so once the
-    // Deleted(3) is logged, anything walk #1 routed for `gone` is already written
-    // too. That lets the absence below (walk #1 routed no Create/Change for `gone`)
-    // be checked over the SAME snapshot — no fixed-sleep absence guess.
-    let changes = wait_for_change(&log_path, &gone_uri, 3);
+    // Poll until the Deleted(3) lands — the positive completion signal from
+    // walk #2. Walk #1 precedes walk #2 on the FIFO mockls pipe, so once the
+    // Deleted(3) is logged, anything walk #1 routed for the marker is already
+    // written too. That lets the absence below be checked over the SAME
+    // snapshot — no fixed-sleep absence guess.
+    let changes = wait_for_change(&log_path, &marker_uri, 3);
     let log = read_merged_log(&log_path);
 
-    // The Delete-only watcher's baselined file is reaped as Deleted(3).
     assert!(
-        changes.iter().any(|(u, t)| *u == gone_uri && *t == 3),
-        "a Delete-only watcher's baselined file must be reaped as Deleted(3) on \
-         the full walk after deletion. changes={changes:?}, log:\n{log}"
+        changes.iter().any(|(u, t)| *u == marker_uri && *t == 3),
+        "a Delete-only watcher's baselined file must be delivered as Deleted(3) \
+         once the probe finds it gone. changes={changes:?}, log:\n{log}"
     );
-    // The Delete-only watcher received NOTHING for `gone` while it was present:
-    // its ONLY entry for `gone` is the Deleted(3) — never a Create(1)/Change(2)
-    // from the cold walk #1 (kind-filtered away).
+    // The Delete-only watcher received NOTHING while the file was present: its
+    // ONLY entry is the Deleted(3) — never a Create(1)/Change(2) from the cold
+    // walk (kind-filtered away).
     assert!(
-        !changes.iter().any(|(u, t)| *u == gone_uri && *t != 3),
+        !changes.iter().any(|(u, t)| *u == marker_uri && *t != 3),
         "a Delete-only watcher must receive NOTHING for a present file (no \
          Create/Change from the cold walk) — only its later Deleted(3). \
          changes={changes:?}, log:\n{log}"
+    );
+    Ok(())
+}
+
+// ── bug 146 — a filtered pathless grep condemns nothing ──────────────────
+
+/// Bug 146, the filed repro: a **filtered** pathless grep must not condemn what
+/// its filter kept it from seeing.
+///
+/// The walk is narrowed by `--glob`/`--type` *before* it runs, so a baselined
+/// watched file outside the filter is never yielded. Claiming full reap
+/// authority over the cwd then diffed it as absent and delivered a phantom
+/// `Deleted(3)`, which the next unfiltered walk answered with a matching
+/// `Created(1)` — a delete/create flap on a file that never changed, and (the
+/// worse half, found by the held branch's repro) a `close_document_on_disk_delete`
+/// on files that still existed.
+///
+/// Fixture: `keep.MOCK_LANG_A` (watched, outside the filter) and `code.rs`
+/// (inside it, so the filtered grep still hits something and still nudges).
+#[test]
+fn filtered_pathless_grep_does_not_condemn_a_file_outside_the_filter() -> Result<()> {
+    let dir = common::canonical_tempdir()?;
+    let log_path = dir.path().join("notifications.jsonl");
+    seed_probe_bait(dir.path(), MOCK_LANG_A)?;
+    let keep = dir.path().join(format!("keep.{MOCK_LANG_A}"));
+    let code = dir.path().join("code.rs");
+    std::fs::write(&keep, "needle\n")?;
+    std::fs::write(&code, "needle\n")?;
+
+    let log_arg = log_path.to_str().context("log path")?;
+    // kind 7 (ALL) ⇒ registers Delete, so a phantom condemnation would be
+    // delivered and visible here.
+    let lsp = mockls_lsp_arg(
+        MOCK_LANG_A,
+        &format!(
+            "--register-file-watchers --watcher-glob **/*.{MOCK_LANG_A} \
+             --watcher-kind 7 --notification-log {log_arg}"
+        ),
+    );
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    let keep_uri = format!("file://{}/keep.{MOCK_LANG_A}", dir.path().display());
+
+    // Walk #1 — unfiltered and pathless: `keep` is a hit, so it is baselined.
+    let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
+    poll_log_until(&log_path, |c| {
+        c.iter().any(|(u, t)| *u == keep_uri && *t == 2)
+    });
+
+    // Walk #2 — pathless but filtered to `*.rs`: it yields `code.rs` only.
+    // `keep` is outside the walk's visibility and must not be condemned.
+    let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle", "globs": ["*.rs"] }))?;
+
+    // Walk #3 — unfiltered again, with a brand-new watched file as the positive
+    // FIFO completion anchor: mockls reads one pipe in order, so once `tail`'s
+    // Created(1) is logged, anything walks #2 and #3 routed for `keep` is
+    // already written too — the absences below are checked over that snapshot.
+    let tail = dir.path().join(format!("tail.{MOCK_LANG_A}"));
+    std::fs::write(&tail, "needle\n")?;
+    let tail_uri = format!("file://{}/tail.{MOCK_LANG_A}", dir.path().display());
+    let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
+    let changes = wait_for_change(&log_path, &tail_uri, 1);
+    let log = read_merged_log(&log_path);
+
+    assert!(
+        !changes.iter().any(|(u, t)| *u == keep_uri && *t == 3),
+        "a filtered pathless grep must NOT condemn a live baselined file its \
+         filter hid from the walk. changes={changes:?}, log:\n{log}"
+    );
+    assert!(
+        !changes.iter().any(|(u, t)| *u == keep_uri && *t == 1),
+        "the unfiltered walk that follows must not re-announce a never-changed \
+         file as Created(1) — that is the other half of the phantom flap. \
+         changes={changes:?}, log:\n{log}"
+    );
+    Ok(())
+}
+
+/// Bug 146's second consequence, found by the held branch's live repro: the
+/// phantom condemnation ran `close_document_on_disk_delete` on files that still
+/// existed — a filtered grep was tearing down live document sync, not just
+/// flapping watchers.
+///
+/// `keep` is enriched by walk #1, so the server holds it open; walk #2's filter
+/// then hides it. A condemnation would force-close it — `didClose` on a file
+/// that is still on disk is the failure, and it is what the held branch's live
+/// repro caught.
+#[test]
+fn filtered_pathless_grep_never_force_closes_a_live_document() -> Result<()> {
+    let dir = common::canonical_tempdir()?;
+    let log_path = dir.path().join("notifications.jsonl");
+    seed_probe_bait(dir.path(), MOCK_LANG_A)?;
+    let code = dir.path().join("code.rs");
+    std::fs::write(&code, "needle\n")?;
+    std::fs::write(dir.path().join(format!("keep.{MOCK_LANG_A}")), "needle\n")?;
+
+    let log_arg = log_path.to_str().context("log path")?;
+    let lsp = mockls_lsp_arg(
+        MOCK_LANG_A,
+        &format!(
+            "--register-file-watchers --watcher-glob **/*.{MOCK_LANG_A} \
+             --watcher-kind 7 --notification-log {log_arg}"
+        ),
+    );
+    let root = dir.path().to_str().context("root path")?;
+    let mut bridge = BridgeProcess::spawn(&[&lsp], root)?;
+    bridge.initialize()?;
+
+    let keep_uri = format!("file://{}/keep.{MOCK_LANG_A}", dir.path().display());
+
+    // Walk #1 — unfiltered: `keep` is a hit, so it is baselined AND opened for
+    // enrichment. It stays open (held for reuse).
+    let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
+    poll_log_until(&log_path, |c| {
+        c.iter().any(|(u, t)| *u == keep_uri && *t == 2)
+    });
+
+    // Walk #2 — filtered to `*.rs`, which hides `keep` from the walk entirely.
+    let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle", "globs": ["*.rs"] }))?;
+
+    // Walk #3 with a new watched file: the FIFO completion anchor, exactly as
+    // above — once its Created(1) is logged, walk #2's traffic is all written.
+    let tail = dir.path().join(format!("tail.{MOCK_LANG_A}"));
+    std::fs::write(&tail, "needle\n")?;
+    let tail_uri = format!("file://{}/tail.{MOCK_LANG_A}", dir.path().display());
+    let _ = bridge.call_tool_text("grep", &json!({ "pattern": "needle" }))?;
+    let _ = wait_for_change(&log_path, &tail_uri, 1);
+
+    let log = read_merged_log(&log_path);
+    assert!(
+        !log.lines().any(|line| {
+            line.contains("textDocument/didClose") && line.contains(keep_uri.as_str())
+        }),
+        "a filtered grep must never force-close a document whose file is still \
+         on disk — the document-sync half of bug 146. log:\n{log}"
     );
     Ok(())
 }

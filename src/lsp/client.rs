@@ -1199,6 +1199,21 @@ impl LspClient {
         self.open_documents.contains_key(uri)
     }
 
+    /// Snapshots the URIs this client currently holds open — the
+    /// open-document sweep's domain (bug 146).
+    ///
+    /// A held-open document cannot outlive its file, and the sweep is what
+    /// notices: per nudge it stats these paths and force-closes
+    /// ([`Self::close_document_on_disk_delete`]) any that are gone. That duty
+    /// used to fall out of the search walk's reap — which is precisely how a
+    /// filtered grep came to tear down live document sync for files that
+    /// still existed. Open documents are few and daemon-known, so the sweep
+    /// is bounded by what the daemon itself opened.
+    #[must_use]
+    pub fn open_document_uris(&self) -> Vec<String> {
+        self.open_documents.keys().cloned().collect()
+    }
+
     /// Plans this round's sync for `uri` against the change gate
     /// (diagnostics-debt 01). Read-only: nothing is recorded until
     /// [`Self::commit_document_sync`] confirms the send succeeded.

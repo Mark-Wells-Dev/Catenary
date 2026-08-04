@@ -49,14 +49,13 @@ use super::frame::{
 pub trait BatchEnricher: Send + Sync {
     /// Enriches one batch's hits, returning the annotated hits in the same order.
     ///
-    /// `observed` is the batch's WS31 observation slice — every file the walk
-    /// visited since the previous batch, with walk-time mtimes (ws43-02): the
-    /// production enricher feeds it to the changed-set nudge *before* deriving
-    /// anchors, exactly the executor's nudge-then-anchor order, and falls back
-    /// to nudging the hit paths when it is empty (an old CLI). This future is
-    /// what the budget times out. A pass-through implementation returns
-    /// immediately; a real one awaits enrichment and returns whatever it
-    /// resolved within the time it was given (the caller applies the budget).
+    /// The batch carries hits and nothing else (bug 146): the production
+    /// enricher nudges the changed set from its OWN observations — the hit
+    /// files' fresh stats — *before* deriving anchors, keeping the
+    /// nudge-then-anchor order. This future is what the budget times out. A
+    /// pass-through implementation returns immediately; a real one awaits
+    /// enrichment and returns whatever it resolved within the time it was
+    /// given (the caller applies the budget).
     ///
     /// `weight` is the batch's requested enrichment weight (ws43-03): `None`
     /// for a grep batch (anchor enrichment), `Some` for a glob batch — the
@@ -72,31 +71,9 @@ pub trait BatchEnricher: Send + Sync {
     fn enrich(
         &self,
         hits: Vec<super::WireHit>,
-        observed: Vec<(std::path::PathBuf, i64)>,
         weight: Option<EnrichmentWeight>,
         tier: WalkTier,
     ) -> impl Future<Output = Result<Vec<AnnotatedHit>>> + Send;
-
-    /// Consumes the walk's WS31 observation set from the [`HitFrame::End`]
-    /// terminator (ws43-02 reap parity): every file the CLI walk visited, plus
-    /// the reap-eligibility scopes of a pathless full walk.
-    ///
-    /// The production enricher feeds these to the root tracker's changed-set
-    /// diff — the same once-per-walk nudge/reap rule the retired grep executor
-    /// ran. The default is a no-op (the pass-through/protocol-test spelling),
-    /// so an enricher that has no tracker degrades to the per-batch
-    /// add/update-only nudge. Infallible by design: a failed nudge must never
-    /// tear down the annotation stream.
-    ///
-    /// [`HitFrame::End`]: super::HitFrame::End
-    fn observe_walk(
-        &self,
-        observed: Vec<(std::path::PathBuf, i64)>,
-        reap_scopes: Option<Vec<std::path::PathBuf>>,
-    ) -> impl Future<Output = ()> + Send {
-        let _ = (observed, reap_scopes);
-        async {}
-    }
 }
 
 /// The pass-through enricher: wraps every hit with no anchor, immediately.
@@ -111,7 +88,6 @@ impl BatchEnricher for PassThroughEnricher {
     async fn enrich(
         &self,
         hits: Vec<super::WireHit>,
-        _observed: Vec<(std::path::PathBuf, i64)>,
         _weight: Option<EnrichmentWeight>,
         _tier: WalkTier,
     ) -> Result<Vec<AnnotatedHit>> {
@@ -133,7 +109,6 @@ pub async fn annotate_batch<E: BatchEnricher>(
     enricher: &E,
     seq: u64,
     hits: Vec<super::WireHit>,
-    observed: Vec<(std::path::PathBuf, i64)>,
     weight: Option<EnrichmentWeight>,
     tier: WalkTier,
     budget: Duration,
@@ -146,7 +121,7 @@ pub async fn annotate_batch<E: BatchEnricher>(
         .map(AnnotatedHit::passthrough)
         .collect();
 
-    match tokio::time::timeout(budget, enricher.enrich(hits, observed, weight, tier)).await {
+    match tokio::time::timeout(budget, enricher.enrich(hits, weight, tier)).await {
         Ok(Ok(annotated)) => AnnotatedBatch {
             seq,
             hits: annotated,
@@ -216,33 +191,21 @@ where
             HitFrame::Batch {
                 seq,
                 hits,
-                observed,
                 weight,
                 tier,
             } => {
                 // read → await (budgeted) → write. No lock guard is held across
                 // this await (the skeleton holds none; the ruled law binds the
                 // real enricher too).
-                let batch =
-                    annotate_batch(enricher, seq, hits, observed, weight, tier, budget).await;
+                let batch = annotate_batch(enricher, seq, hits, weight, tier, budget).await;
                 super::write_frame(writer, &AnnotationFrame::Batch { batch }).await?;
                 emitted += 1;
             }
-            HitFrame::End {
-                batches,
-                observed,
-                reap_scopes,
-            } => {
+            HitFrame::End { batches } => {
                 debug_assert_eq!(emitted, batches, "annotated every batch the CLI sent");
-                // The walk-level observation nudge (ws43-02 reap parity) runs
-                // BEFORE the terminator is written, so a CLI that has read the
-                // annotation terminator knows the nudge — including any reap —
-                // has already landed (the deterministic ordering the reap pin
-                // relies on). Empty observations (a zero-match walk, or an old
-                // CLI) make this a no-op.
-                if !observed.is_empty() || reap_scopes.is_some() {
-                    enricher.observe_walk(observed, reap_scopes).await;
-                }
+                // No walk-level nudge: the terminator carries no observations
+                // (bug 146). Whatever freshening this query owed its servers
+                // rode each batch's own nudge, ahead of that batch's anchors.
                 super::write_frame(writer, &AnnotationFrame::End { batches: emitted })
                     .await
                     .context("write annotation terminator")?;
@@ -309,7 +272,6 @@ mod tests {
         async fn enrich(
             &self,
             hits: Vec<WireHit>,
-            _observed: Vec<(std::path::PathBuf, i64)>,
             _weight: Option<EnrichmentWeight>,
             _tier: WalkTier,
         ) -> Result<Vec<AnnotatedHit>> {
@@ -324,7 +286,6 @@ mod tests {
         async fn enrich(
             &self,
             _hits: Vec<WireHit>,
-            _observed: Vec<(std::path::PathBuf, i64)>,
             _weight: Option<EnrichmentWeight>,
             _tier: WalkTier,
         ) -> Result<Vec<AnnotatedHit>> {
@@ -338,7 +299,6 @@ mod tests {
             &PassThroughEnricher,
             0,
             hits(3),
-            Vec::new(),
             None,
             WalkTier::Dig,
             Duration::from_secs(5),
@@ -366,7 +326,6 @@ mod tests {
             &SlowEnricher,
             5,
             hits(4),
-            Vec::new(),
             None,
             WalkTier::Dig,
             Duration::from_millis(20),
@@ -387,7 +346,6 @@ mod tests {
             &FailingEnricher,
             2,
             hits(2),
-            Vec::new(),
             None,
             WalkTier::Dig,
             Duration::from_secs(5),

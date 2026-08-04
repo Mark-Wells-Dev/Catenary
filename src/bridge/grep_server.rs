@@ -390,25 +390,27 @@ pub(super) async fn anchor_context(
 /// Routes the WS31 changed-set nudge (Consumer A) for a set of observed files
 /// under the walk-breadth gate (ticket 04).
 ///
-/// `observed_files` are `(absolute path, mtime-nanos)` observations — every
-/// file the CLI walk visited (the walk-level `observe_walk` nudge, shipped on
-/// the `End` terminator) or the canonical hit paths of one batch, freshly
-/// statted (the annotator's per-batch nudge). They are grouped by registered
-/// root (root-relative), diffed against the per-root baseline, and the delta
-/// routed per server. A root with no covering server is `WalkBreadth::None` —
-/// the `(no LSP)` case — and is skipped entirely (no diff, no nudge).
+/// `observed_files` are `(absolute path, mtime-nanos)` observations — the
+/// canonical hit paths of one annotation batch, freshly statted daemon-side.
+/// They are grouped by registered root (root-relative), diffed against the
+/// per-root baseline, and the delta routed per server. A root with no covering
+/// server is `WalkBreadth::None` — the `(no LSP)` case — and is skipped
+/// entirely (no diff, no nudge).
 ///
-/// Reaping is gated per-root by whether the walk actually spanned the whole
-/// registered root (WS31-review C1): `reap_scopes`, when `Some`, carries the
-/// canonicalized scopes a *pathless* walk covered, and a root reaps only when
-/// one of them is an ancestor-or-equal of it. `None` — a path-scoped query, or
-/// the annotator's per-batch nudge, whose hit set never proves absence — is
-/// add/update only, exactly like a scoped `glob`.
+/// **The search path never reaps** (bug 146). A hit set is not coverage: it is
+/// what the pattern matched, inside whatever the query's `--type`/`--glob`
+/// filter admitted, so nothing in it can prove a baseline entry gone. Claiming
+/// otherwise is exactly the filed bug — a `--type rust` grep condemning every
+/// baselined `Cargo.toml`/`.lattice.toml` as `Deleted(3)`, and force-closing
+/// live documents on the way. Deletion authority lives where coverage is
+/// self-known: the supplemental watch probe (targeted stats over registered
+/// patterns), the open-document sweep, and the diagnose round's unfiltered
+/// `stat_walk` — all inside
+/// [`nudge_changed_set`](crate::lsp::manager::LspClientManager::nudge_changed_set).
 pub(super) async fn nudge_observed_files(
     client_manager: &LspClientManager,
     fs_manager: &FilesystemManager,
     observed_files: &[(PathBuf, i64)],
-    reap_scopes: Option<&[PathBuf]>,
 ) {
     let mut by_root: HashMap<PathBuf, Vec<(PathBuf, i64)>> = HashMap::new();
     for (abs, mtime) in observed_files {
@@ -433,14 +435,10 @@ pub(super) async fn nudge_observed_files(
         if !breadth.runs_engine() {
             continue;
         }
-        // Only reap when the walk truly covered the whole root: a pathless
-        // walk whose scope is an ancestor-or-equal of this registered root. A
-        // subtree walk cannot assert that an unvisited baseline entry is gone.
-        let covered_whole_root =
-            reap_scopes.is_some_and(|scopes| scopes.iter().any(|scope| root.starts_with(scope)));
-        let reap = breadth.reaps() && covered_whole_root;
+        // Never reaps: `false` is the search path's standing posture, not a
+        // per-query decision (bug 146).
         client_manager
-            .nudge_changed_set(root, observed, &no_exclude, reap)
+            .nudge_changed_set(root, observed, &no_exclude, false)
             .await;
     }
 }

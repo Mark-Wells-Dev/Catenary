@@ -245,28 +245,105 @@ struct Covering {
     /// 01). Never locked while the clients registry lock is held (bug 104).
     client: Arc<Mutex<LspClient>>,
     name: String,
+    /// The full instance identity (`language/server/scope`) — the delivery
+    /// frontier's key (bug 146 stage 3). It must be the INSTANCE, not the
+    /// server name: one server can have several instances covering a root
+    /// (a parent-scoped one and a subdirectory-scoped one), and each has its
+    /// own idea of what it has been told.
+    key: String,
     watchers: Vec<crate::lsp::server::ParsedWatcher>,
 }
 
-/// Stats one supplemental watch-probe candidate and records it if it is a
-/// present regular file the main walk did not already observe (bug 143).
+/// The union of every covering server's probe plan for one root — what the
+/// supplemental leg has been authorized to look at (bug 143's registration-driven
+/// ruling, collected once per nudge).
+///
+/// Collected before any I/O so the caller can decide what the plan needs: a
+/// plan with no markers never touches the mtime trail, and an empty plan skips
+/// the probe entirely.
+#[derive(Debug, Default)]
+struct ProbePlan {
+    /// Literal candidate paths (absolute, or root-relative): one stat each.
+    literals: BTreeSet<PathBuf>,
+    /// `**/NAME` marker names: stat'd in every known directory.
+    markers: BTreeSet<PathBuf>,
+    /// `baseUri`-anchored directories that genuinely need recursion: enumerated
+    /// whole, filters off.
+    walk_dirs: BTreeSet<PathBuf>,
+}
+
+impl ProbePlan {
+    /// Whether this plan asks for nothing at all.
+    fn is_empty(&self) -> bool {
+        self.literals.is_empty() && self.markers.is_empty() && self.walk_dirs.is_empty()
+    }
+
+    /// Unions the plans every covering server's watchers carry.
+    fn collect(covering: &[Covering]) -> Self {
+        let mut plan = Self::default();
+        for c in covering {
+            for watcher in &c.watchers {
+                let watcher_plan = watcher.probe();
+                if watcher_plan.is_empty() {
+                    // A wildcarded name with no `baseUri` anchor: nothing
+                    // supplemental is affordable for it (that would be a second
+                    // full walk), so it is served by the edit path's wholesale
+                    // sweep and by the hit files a query touches.
+                    continue;
+                }
+                plan.literals.extend(watcher_plan.paths().iter().cloned());
+                plan.markers.extend(watcher_plan.suffixes().iter().cloned());
+                plan.walk_dirs.extend(watcher_plan.dirs().iter().cloned());
+            }
+        }
+        plan
+    }
+}
+
+/// What the probe's own observations amount to for one root (bug 143 + 146).
+///
+/// The probe is the deletion authority for watched patterns, so it must report
+/// both halves of what it saw: the files it *found* (ordinary observations,
+/// merged into the nudge's set) and the baselined paths it *looked for and did
+/// not find* (condemnations). The second half is what makes deletion delivery
+/// independent of any walk's claimed coverage — the probe states its coverage
+/// by construction, one stat per named path.
+#[derive(Debug, Default)]
+struct ProbeObservations {
+    /// Present files the probe found, as `(root-relative path, mtime)`.
+    present: Vec<(PathBuf, i64)>,
+    /// Baselined root-relative paths the probe stat'd and found absent.
+    /// Condemned as `Deleted` — see
+    /// [`condemn_absent`](crate::bridge::filesystem_manager::FilesystemManager::condemn_absent).
+    absent: Vec<PathBuf>,
+}
+
+/// Stats one supplemental watch-probe candidate: records a present regular file
+/// the caller did not already observe (bug 143), and condemns a **baselined**
+/// path the stat could not find (bug 146).
 ///
 /// Absence is the expected answer for most candidates (a marker name probed in
-/// a directory that has none), and an absent path must contribute nothing — a
-/// probe never invents a baseline member. The stat is the shared
-/// [`stat_with_retry`] so the sub-millisecond atomic-rename window that would
-/// otherwise read as "absent" (and, on a reaping sweep, as a deletion) is closed
-/// the same way every walk surface closes it (WS31-review H1).
+/// a directory that has none), and an absent path that was never baselined
+/// contributes nothing — a probe never invents a baseline member, and never
+/// announces the deletion of a file no server was told about. An absent path
+/// that IS baselined is the deletion signal: we looked exactly there, and it is
+/// gone. The stat is the shared [`stat_with_retry`] so the sub-millisecond
+/// atomic-rename window that would otherwise read as "absent" — and therefore
+/// as a deletion — is closed the same way every observation surface closes it
+/// (WS31-review H1).
 ///
 /// A candidate outside `root` is dropped: the per-root baseline keys
 /// root-relative paths, so a path with no root-relative form has no
-/// representation in the model (bug 143's out-of-root leg, flagged not invented).
+/// representation in the model (bug 143's out-of-root leg, flagged not
+/// invented; bug 152 tracks server-scoped probe targets for out-of-root
+/// watchers).
 fn probe_watched_path(
     root: &Path,
     abs: &Path,
     walked: &HashSet<&Path>,
+    baselined: &HashSet<&Path>,
     recorded: &mut HashSet<PathBuf>,
-    extra: &mut Vec<(PathBuf, i64)>,
+    out: &mut ProbeObservations,
 ) {
     let Ok(rel) = abs.strip_prefix(root) else {
         return;
@@ -275,13 +352,21 @@ fn probe_watched_path(
         return;
     }
     let Some(metadata) = stat_with_retry(abs) else {
+        // Looked there, found nothing. Only a path the baseline holds is a
+        // deletion; anything else is a marker name that simply is not in this
+        // directory.
+        if baselined.contains(rel) {
+            recorded.insert(rel.to_path_buf());
+            out.absent.push(rel.to_path_buf());
+        }
         return;
     };
     if !metadata.is_file() {
         return;
     }
     recorded.insert(rel.to_path_buf());
-    extra.push((rel.to_path_buf(), mtime_nanos(&metadata)));
+    out.present
+        .push((rel.to_path_buf(), mtime_nanos(&metadata)));
 }
 
 /// How wide the changed-set engine should walk for a given command — the
@@ -887,6 +972,11 @@ pub struct LspClientManager {
     /// read on the spawn path is lock-free. Unset in doctor/CLI/test contexts,
     /// where nothing kicks.
     auto_install: std::sync::OnceLock<JitAutoInstall>,
+    /// The supplemental probe's mtime trail (bug 146): the known-directory set
+    /// per root plus the per-device trust ledger that licenses skipping a
+    /// readdir. Read on every nudge that has a `**/NAME` marker to serve, and
+    /// written by the edit path's canary bookings.
+    watch_trail: crate::lsp::watch_trail::WatchTrail,
 }
 
 impl LspClientManager {
@@ -916,7 +1006,20 @@ impl LspClientManager {
             snapshot: None,
             teardown_timings: TeardownTimings::PRODUCTION,
             auto_install: std::sync::OnceLock::new(),
+            watch_trail: crate::lsp::watch_trail::WatchTrail::default(),
         }
+    }
+
+    /// Books an entry-changing write on the probe's mtime trail (bug 146).
+    ///
+    /// The edit path's canary: a booked write that we KNOW changes a directory
+    /// entry — a creation, or a rename-class write (host `Edit`/`Write` are
+    /// atomic-rename per bug 34) — is ground truth about whether this device's
+    /// directory mtimes track child changes. In-place overwrites must NOT be
+    /// booked here; see
+    /// [`note_entry_changing_write`](crate::lsp::watch_trail::WatchTrail::note_entry_changing_write).
+    pub fn note_entry_changing_write(&self, path: &Path) {
+        self.watch_trail.note_entry_changing_write(path);
     }
 
     /// Wires the daemon's background auto-installer onto the spawn path —
@@ -2035,6 +2138,9 @@ impl LspClientManager {
         // root (path-keyed caches NOT folded onto `Root`; same leak/staleness
         // reasons as the sync_roots cleanup).
         self.fs.remove_root_baseline(root);
+        // …and the probe's directory trail for it (bug 146): a remount starts
+        // cold, exactly like the baseline.
+        self.watch_trail.forget_root(root);
 
         // Shut down per-root instances bound to the removed root.
         self.shutdown_root_instances(root).await;
@@ -2127,6 +2233,7 @@ impl LspClientManager {
         // exactly as unreachable.
         for removed in to_remove.iter().chain(orphaned.iter()) {
             self.fs.remove_root_baseline(removed);
+            self.watch_trail.forget_root(removed);
         }
 
         // Shut down per-root instances for removed roots and orphaned scopes.
@@ -4156,6 +4263,7 @@ impl LspClientManager {
                 server: client.server().clone(),
                 client: Arc::clone(&client_mutex),
                 name: client.server_name().to_string(),
+                key: key.to_string(),
                 watchers,
             });
             drop(client);
@@ -4219,79 +4327,89 @@ impl LspClientManager {
     /// - a wildcarded name that is not `baseUri`-anchored (`**/*.rs`, `**/*.md`)
     ///   plans nothing — the main walk already serves it in search posture.
     ///
-    /// **Reap safety.** The result is merged into the walk's observation set
-    /// before the baseline diff, so a supplementally-observed path is a normal
-    /// baseline member and a reaping sweep may delete it. Every leg is therefore
-    /// deterministic and un-truncated: a probe that finds nothing contributes
-    /// nothing (the file is genuinely absent), and enumerated dir-walk entries
-    /// follow the walks' "stat-with-retry, sentinel on miss, **never omit**"
-    /// contract (WS31-review H1) so a racing stat cannot false-reap them.
+    /// **Deletion authority (bug 146).** The probe does not merely widen an
+    /// observation set — it *is* the deletion authority for watched patterns.
+    /// A stat-miss on a path the baseline holds is a deletion of the same
+    /// epistemic grade as a dirent's presence is a creation: we looked exactly
+    /// there. This is deliberately independent of any walk's reap scope, and
+    /// the search walks now carry none at all — a search walk's yield is what
+    /// its pattern matched inside what its `--type`/`--glob` filter admitted,
+    /// which is not coverage and cannot condemn anything (the filed bug).
+    /// Every leg states its own coverage: the literal and marker legs by
+    /// naming one path per stat, the `baseUri` dir leg by enumerating a
+    /// directory whole (so a baselined member it did not enumerate is gone —
+    /// including the case where the directory itself was removed).
+    /// Enumerated dir-walk entries follow the "stat-with-retry, sentinel on
+    /// miss, **never omit**" contract (WS31-review H1) so a racing stat cannot
+    /// false-condemn them.
     ///
     /// **Out-of-root paths are dropped.** The per-root baseline keys
     /// root-relative paths and `changed_file_uri` rebuilds the URI by joining
     /// them onto the root, so a path outside `root` (rust-analyzer's
     /// `/home/…/.config/rust-analyzer` watcher) has no representation in the
-    /// model. It is skipped here rather than modelled by invention — flagged for
-    /// a maintainer ruling (bug 143).
+    /// model. It is skipped here rather than modelled by invention (bug 143;
+    /// bug 152 carries the server-scoped-probe-target design that would give
+    /// such watchers a home — nothing is built for it here).
     fn supplemental_watch_observations(
         root: &Path,
-        covering: &[Covering],
+        plan: &ProbePlan,
         observed: &[(PathBuf, i64)],
-    ) -> Vec<(PathBuf, i64)> {
-        let mut literals: BTreeSet<PathBuf> = BTreeSet::new();
-        let mut markers: BTreeSet<PathBuf> = BTreeSet::new();
-        let mut walk_dirs: BTreeSet<PathBuf> = BTreeSet::new();
-        for c in covering {
-            for watcher in &c.watchers {
-                let plan = watcher.probe();
-                if plan.is_empty() {
-                    // A wildcarded name with no `baseUri` anchor: the main walk
-                    // serves it in search posture and nothing supplemental is
-                    // affordable (that would be a second full walk).
-                    continue;
-                }
-                literals.extend(plan.paths().iter().cloned());
-                markers.extend(plan.suffixes().iter().cloned());
-                walk_dirs.extend(plan.dirs().iter().cloned());
-            }
-        }
-        if literals.is_empty() && markers.is_empty() && walk_dirs.is_empty() {
-            return Vec::new();
+        baselined: &[PathBuf],
+        marker_dirs: &[PathBuf],
+    ) -> ProbeObservations {
+        let ProbePlan {
+            literals,
+            markers,
+            walk_dirs,
+        } = plan;
+        let mut out = ProbeObservations::default();
+        if plan.is_empty() {
+            return out;
         }
 
-        // Paths the main walk already observed need no probe — it saw them in
-        // search posture and its entry is authoritative.
+        // Paths this nudge already observed present need no probe — the caller
+        // just stat'd them (hit files, or the diagnose round's walk).
         let walked: HashSet<&Path> = observed.iter().map(|(rel, _)| rel.as_path()).collect();
+        let baseline_set: HashSet<&Path> = baselined.iter().map(PathBuf::as_path).collect();
         let mut recorded: HashSet<PathBuf> = HashSet::new();
-        let mut extra: Vec<(PathBuf, i64)> = Vec::new();
 
-        for literal in &literals {
+        for literal in literals {
             let abs = if literal.is_absolute() {
                 literal.clone()
             } else {
                 root.join(literal)
             };
-            probe_watched_path(root, &abs, &walked, &mut recorded, &mut extra);
+            probe_watched_path(root, &abs, &walked, &baseline_set, &mut recorded, &mut out);
         }
 
         if !markers.is_empty() {
-            // The root, plus every directory the main walk already visited.
+            // `marker_dirs` is the mtime trail's known-directory set (bug 146
+            // stage 2): the root plus every directory the trail has discovered,
+            // including ones created since the last nudge — the trail readdirs
+            // exactly the directories whose mtime moved, so discovery costs
+            // nothing when nothing changed. A directory the baseline knows but
+            // the trail does not (an excluded tree served by another leg) joins
+            // the candidate set too, so no already-baselined marker loses its
+            // probe.
             let mut dirs: BTreeSet<&Path> = BTreeSet::new();
             dirs.insert(Path::new(""));
-            for (rel, _) in observed {
+            for dir in marker_dirs {
+                dirs.insert(dir.as_path());
+            }
+            for rel in baselined {
                 if let Some(parent) = rel.parent() {
                     dirs.insert(parent);
                 }
             }
             for dir in dirs {
-                for marker in &markers {
+                for marker in markers {
                     let abs = root.join(dir).join(marker);
-                    probe_watched_path(root, &abs, &walked, &mut recorded, &mut extra);
+                    probe_watched_path(root, &abs, &walked, &baseline_set, &mut recorded, &mut out);
                 }
             }
         }
 
-        for dir in &walk_dirs {
+        for dir in walk_dirs {
             if dir == root || !dir.starts_with(root) {
                 debug!(
                     source = Source::LspDispatch.as_str(),
@@ -4309,6 +4427,7 @@ impl LspClientManager {
                 .git_exclude(false)
                 .parents(false)
                 .build();
+            let mut enumerated: HashSet<PathBuf> = HashSet::new();
             for entry in defiltered.flatten() {
                 if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                     continue;
@@ -4316,17 +4435,93 @@ impl LspClientManager {
                 let Ok(rel) = entry.path().strip_prefix(root) else {
                     continue;
                 };
+                enumerated.insert(rel.to_path_buf());
                 if walked.contains(rel) || !recorded.insert(rel.to_path_buf()) {
                     continue;
                 }
                 // Enumerated present ⇒ never omitted (WS31-review H1): a racing
                 // stat records the sentinel rather than dropping the file, which
-                // a reaping sweep would read as a deletion.
-                extra.push((rel.to_path_buf(), observe_mtime(entry.path())));
+                // would read as a deletion below.
+                out.present
+                    .push((rel.to_path_buf(), observe_mtime(entry.path())));
+            }
+            // This leg enumerated the directory WHOLE, filters off, so its
+            // coverage is the whole subtree: a baselined member it did not
+            // enumerate is gone. A deleted directory reports every member —
+            // the enumeration is simply empty.
+            let Ok(dir_rel) = dir.strip_prefix(root) else {
+                continue;
+            };
+            for rel in baselined {
+                if rel.starts_with(dir_rel)
+                    && !enumerated.contains(rel)
+                    && !walked.contains(rel.as_path())
+                    && recorded.insert(rel.clone())
+                {
+                    out.absent.push(rel.clone());
+                }
             }
         }
 
-        extra
+        out
+    }
+
+    /// Force-closes any document a server holds open whose file is gone from
+    /// disk — the open-document sweep (bug 146), run once per nudge.
+    ///
+    /// A held-open document cannot outlive its file: the text the server is
+    /// treating as authoritative describes something that no longer exists, so
+    /// the document is closed (owners dropped with it) via
+    /// [`close_document_on_disk_delete`](crate::lsp::client::LspClient::close_document_on_disk_delete).
+    ///
+    /// This duty used to fall out of the search walk's reap, which is how a
+    /// **filtered** grep came to tear down live document sync for files that
+    /// still existed — the reap condemned everything the filter had hidden,
+    /// and every condemned open document was force-closed. Here the question
+    /// is asked directly of each open path, one stat each, so the answer can
+    /// only ever be about that path. Bounded by what the daemon itself opened
+    /// (open documents are few and daemon-known).
+    ///
+    /// The stats run with **no client lock held**: the URIs are snapshotted
+    /// under a brief lock, stat'd outside it, and only a confirmed-deleted set
+    /// re-acquires the lock to close (bug 104's discipline — and no syscalls
+    /// under a lock other callers need).
+    async fn sweep_open_documents(&self, root: &Path) {
+        for (key, client_mutex) in self.rooted_clients().await {
+            if !key.scope.root_path().is_some_and(|r| r.starts_with(root)) {
+                continue;
+            }
+            let uris = {
+                let client = client_mutex.lock().await;
+                if !client.is_alive() {
+                    drop(client);
+                    continue;
+                }
+                let uris = client.open_document_uris();
+                drop(client);
+                uris
+            };
+            let deleted: Vec<String> = uris
+                .into_iter()
+                .filter(|uri| {
+                    crate::lsp::glob::uri_to_path(uri).is_ok_and(|path| {
+                        path.starts_with(root) && stat_with_retry(&path).is_none()
+                    })
+                })
+                .collect();
+            if deleted.is_empty() {
+                continue;
+            }
+            let mut client = client_mutex.lock().await;
+            for uri in &deleted {
+                debug!(
+                    source = Source::LspDispatch.as_str(),
+                    "open-document sweep closes {uri}: its file is gone from disk",
+                );
+                client.close_document_on_disk_delete(uri).await;
+            }
+            drop(client);
+        }
     }
 
     /// Diffs one coherence walk's observations against the per-root baseline and
@@ -4334,11 +4529,13 @@ impl LspClientManager {
     /// every server that received changes (WS31 Consumer A — the precise,
     /// per-server changed-set nudge).
     ///
-    /// `observed` is the set of `(root-relative path, mtime)` pairs the walk
-    /// visited, widened by the supplemental observation leg
+    /// `observed` is the set of `(root-relative path, mtime)` pairs the caller
+    /// stat'd — one annotation batch's hit files, or the diagnose round's own
+    /// unfiltered walk — widened by the supplemental probe
     /// ([`supplemental_watch_observations`](Self::supplemental_watch_observations),
-    /// bug 143) so the registered patterns the search-posture walk cannot see —
-    /// dotfiles, gitignored paths — are observed too.
+    /// bug 143) so the registered patterns no search walk can see — dotfiles,
+    /// gitignored paths — are observed too, and narrowed by the probe's
+    /// condemnations (bug 146), the deletion authority for those patterns.
     ///
     /// `exclude` maps a root-relative path to the **server names that receive it
     /// via document-sync** this round (the diagnostics edited-set, which rides
@@ -4381,14 +4578,16 @@ impl LspClientManager {
     /// gets nothing. With no changes since the last walk, step 3 yields an empty
     /// set and nothing is sent (the bug-38 no-repeat property).
     ///
-    /// `reap` selects the diff variant (WS31 ticket 04): a **full** walk
-    /// ([`WalkBreadth::Full`] — enriched `grep`, `diagnostics`) passes `true`,
-    /// so any baseline entry the walk did not visit is reaped as
-    /// [`ChangeKind::Deleted`] (wire `FileChangeType` 3, gated by the `Delete`
-    /// watch-kind bit). A **scoped** observation set (`glob`'s annotation
-    /// batches, and the annotator's per-batch nudges) passes `false`
-    /// (add/update only): it cannot assert a baseline entry outside its scope
-    /// is gone, so it must never reap.
+    /// `reap` selects the diff variant, and since bug 146 exactly one caller
+    /// passes `true`: the **diagnose round**, whose daemon-side unfiltered
+    /// `stat_walk` covers the whole root and knows that first-hand, so any
+    /// baseline entry it did not visit is reaped as [`ChangeKind::Deleted`]
+    /// (wire `FileChangeType` 3, gated by the `Delete` watch-kind bit). The
+    /// **search** surfaces pass `false`, always: a hit set inside a
+    /// `--type`/`--glob` filter is not coverage and can never assert absence.
+    /// Deletions still reach watchers from the search surfaces — through the
+    /// probe's condemnations (step 3b), which are targeted looks rather than
+    /// coverage claims.
     ///
     /// **Delivery is best-effort and the per-root baseline is shared.** Step 3
     /// advances the baseline **once**, *before* the per-server notify loop, and
@@ -4423,6 +4622,12 @@ impl LspClientManager {
         exclude: &HashMap<PathBuf, BTreeSet<String>>,
         reap: bool,
     ) {
+        // Step 0: the open-document sweep (bug 146). Document lifecycle is a
+        // daemon-internal consumer of deletions, and it is asked directly —
+        // one stat per open document — rather than falling out of a walk's
+        // reap claim.
+        self.sweep_open_documents(root).await;
+
         // Step 1: snapshot covering servers + their watchers. Lock each client
         // only briefly to clone the (server Arc, name, watcher list) — no lock
         // is held across the diff, the union filter, the notify, or the settle.
@@ -4432,24 +4637,37 @@ impl LspClientManager {
             return;
         }
 
-        // Step 1b: the supplemental observation leg (bug 143). The walk that
-        // produced `observed` ran in search posture, so whatever the union of
-        // registered globs asks for in a hidden or gitignored path was never
-        // looked at. Serve those patterns here, filters off, and merge the
-        // result into the walk's set before the union filter — from step 2 on
-        // they are ordinary observations.
-        let supplemental = Self::supplemental_watch_observations(root, &covering, observed);
-        let observed: Cow<'_, [(PathBuf, i64)]> = if supplemental.is_empty() {
+        // Step 1b: the supplemental probe (bug 143, promoted to the deletion
+        // authority by bug 146). `observed` is a targeted set — the hit files
+        // of one annotation batch, or the diagnose round's own walk — so the
+        // registered patterns it does not cover were never looked at. The
+        // probe looks, filters off, one stat per named path: what it finds
+        // merges into the observation set (from step 2 on they are ordinary
+        // observations), and what it looked for and did NOT find is condemned
+        // in step 3b.
+        let baselined = self.fs.baseline_paths(root);
+        let plan = ProbePlan::collect(&covering);
+        // The mtime trail runs only for a plan that has marker names to place
+        // (bug 146 stage 2). It costs one lstat per known directory and a
+        // readdir only where one moved, so a root whose watchers are all
+        // literal/`baseUri` pays nothing for it.
+        let marker_dirs = if plan.markers.is_empty() {
+            Vec::new()
+        } else {
+            self.watch_trail.refresh(root)
+        };
+        let probe =
+            Self::supplemental_watch_observations(root, &plan, observed, &baselined, &marker_dirs);
+        let observed: Cow<'_, [(PathBuf, i64)]> = if probe.present.is_empty() {
             Cow::Borrowed(observed)
         } else {
             debug!(
                 source = Source::LspDispatch.as_str(),
-                "supplemental watch observation added {} path(s) the search-posture \
-                 walk could not see",
-                supplemental.len(),
+                "supplemental watch probe observed {} path(s) no query walk could see",
+                probe.present.len(),
             );
             let mut merged = observed.to_vec();
-            merged.extend(supplemental);
+            merged.extend(probe.present.iter().cloned());
             Cow::Owned(merged)
         };
 
@@ -4479,17 +4697,32 @@ impl LspClientManager {
             .cloned()
             .collect();
 
-        // Step 3: diff + merge into the per-root baseline. A full walk reaps
-        // deletions (baseline entries the complete walk did not visit); a scoped
-        // walk records and updates only.
-        let change_set = if reap {
+        // Step 3: diff + merge into the per-root baseline. The diagnose round's
+        // unfiltered walk reaps (it knows its own coverage first-hand: every
+        // baseline entry it did not visit is gone); every other surface records
+        // and updates only.
+        let mut change_set = if reap {
             self.fs.diff_update_and_reap(root, &watched)
         } else {
             self.fs.diff_and_update(root, &watched)
         };
-        if change_set.is_empty() {
-            return;
-        }
+
+        // Step 3b: the probe's condemnations (bug 146). Each is a path the
+        // probe stat'd by name and did not find, which the baseline still
+        // holds — a deletion proven by a targeted look, not inferred from a
+        // walk's absence of mention. After a reaping walk these are usually
+        // already gone from the baseline, so this adds nothing; on the search
+        // surfaces it is the whole deletion story for probe-covered patterns.
+        change_set
+            .changes
+            .extend(self.fs.condemn_absent(root, &probe.absent));
+
+        // Step 3c: journal this round's changes (bug 146 stage 3). Observation
+        // has now advanced the SHARED baseline exactly once; what each server
+        // has been told is a separate, per-server question, answered by the
+        // frontier drain below. `floor` is where a server first seen at this
+        // nudge starts.
+        let floor = self.fs.journal_changes(root, &change_set.changes);
 
         // Step 4 + 5: per-server routing then settle.
         //
@@ -4511,12 +4744,23 @@ impl LspClientManager {
         //   at each dispatch (here, and at diagnostics round start) IS the
         //   detection.
         for c in &covering {
+            // This server's OWN frontier: the net diff of everything journalled
+            // since it was last told, not this round's diff. A server that was
+            // already up to date drains nothing (so nudges 2..N of a query
+            // burst induce no work anywhere), and a file created and deleted
+            // between two of its deliveries is never mentioned to it at all —
+            // the flap dies in the coalescing, not in a heuristic.
+            let pending = self.fs.drain_frontier(root, &c.key, floor);
+            if pending.is_empty() {
+                continue;
+            }
+
             // Each routed entry carries its true wire `FileChangeType`, matching
             // the semantic kind that passed this server's watch-kind mask. The
-            // `&Change` is retained so a failed delivery can revert exactly the
-            // entries this server should have received (F4 recovery, below).
+            // `&Change` is retained so a failed delivery can rewind exactly this
+            // server's frontier (the recovery below).
             let mut candidates: Vec<(String, u8, &Change)> = Vec::new();
-            for change in &change_set.changes {
+            for change in &pending {
                 // Suppressed only for the servers this round document-syncs the
                 // file to — a watching server that is never sent the document
                 // still needs the watched-files route (bug 143).
@@ -4579,9 +4823,10 @@ impl LspClientManager {
                             server = c.name.as_str(),
                             "changed-set nudge didChange relay dropped: {e}",
                         );
-                        // Same F4 recovery as the watched-files leg: revert so
-                        // the next walk re-emits.
-                        self.fs.revert_baseline_changes(root, &[(*change).clone()]);
+                        // Same recovery as the watched-files leg: rewind THIS
+                        // server's frontier so its next drain re-derives what
+                        // it missed. No other server is disturbed.
+                        self.fs.rewind_frontier(root, &c.key, floor);
                     }
                 }
             }
@@ -4609,22 +4854,26 @@ impl LspClientManager {
                     server = c.name.as_str(),
                     "changed-set nudge notify dropped: {e}",
                 );
-                // F4: the per-root baseline already advanced (step 3) and is
-                // shared across every covering server, so a dropped notify would
-                // otherwise lose these changes for this server permanently — the
-                // next walk diffs against the advanced baseline and emits nothing
-                // (even across respawn; the baseline is torn down only on
-                // `catenary unpin`). Revert exactly the entries routed here so the NEXT
-                // walk re-emits them to all covering servers (an idempotent
-                // duplicate to servers that did receive it). Best-effort: see
-                // `revert_baseline_changes` for the Deleted (full-walk-only)
-                // limitation.
-                let reverted: Vec<Change> = routed.iter().map(|(_, _, ch)| (*ch).clone()).collect();
-                self.fs.revert_baseline_changes(root, &reverted);
+                // The shared baseline already advanced (step 3), so a dropped
+                // notify would otherwise lose these changes for this server
+                // permanently. Rewind THIS server's frontier to where it stood
+                // before the drain: its next consultation re-derives exactly
+                // what it missed — net, so a path that has moved on again
+                // arrives once, in its current shape — and no other server is
+                // re-told anything (bug 146 stage 3; before frontiers this had
+                // to rewind the shared baseline, splashing every covering
+                // server).
+                self.fs.rewind_frontier(root, &c.key, floor);
             }
 
             self.settle_after_nudge(c).await;
         }
+
+        // Retire frontiers for servers that no longer cover this root, and
+        // prune journal entries every live frontier has passed — in the steady
+        // state that empties the journal each nudge.
+        let live: HashSet<String> = covering.iter().map(|c| c.key.clone()).collect();
+        self.fs.retain_frontiers(root, &live);
     }
 
     /// Settles one covering server after a changed-set dispatch: waits for it

@@ -2971,18 +2971,9 @@ struct HitstreamAnnotator<'a> {
 
 #[cfg(unix)]
 impl crate::hitstream::BatchEnricher for HitstreamAnnotator<'_> {
-    /// The walk-level observation nudge (ws43-02 reap parity) delegates
-    /// straight to the migrated enricher — no auto-mount here: observations
-    /// are coherence bookkeeping for roots already served, not a query that
-    /// earns a mount, exactly as the executor's nudge never mounted.
-    async fn observe_walk(&self, observed: Vec<(PathBuf, i64)>, reap_scopes: Option<Vec<PathBuf>>) {
-        self.inner.observe_walk(observed, reap_scopes).await;
-    }
-
     async fn enrich(
         &self,
         hits: Vec<crate::hitstream::WireHit>,
-        observed: Vec<(PathBuf, i64)>,
         weight: Option<crate::hitstream::EnrichmentWeight>,
         tier: crate::hitstream::WalkTier,
     ) -> Result<Vec<crate::hitstream::frame::AnnotatedHit>> {
@@ -3003,7 +2994,7 @@ impl crate::hitstream::BatchEnricher for HitstreamAnnotator<'_> {
                 .collect();
             ensure_ephemeral_mounts(self.ctx, &touched, Instant::now(), "").await;
         }
-        self.inner.enrich(hits, observed, weight, tier).await
+        self.inner.enrich(hits, weight, tier).await
     }
 }
 

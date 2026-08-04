@@ -238,8 +238,7 @@ pub fn stdout_unannotated<W: std::io::Write>(
 /// (the caller's cue for a one-line stderr advisory — results are complete
 /// either way), and the lint sink's advisory lines (ws43-04).
 pub struct DaemonStreamReport {
-    /// The walk summary (batch count, skips). `observed` has been taken — it
-    /// was shipped on the [`HitFrame::End`] terminator.
+    /// The walk summary (batch count, skips).
     pub summary: super::engine::WalkSummary,
     /// True when the annotation stream faulted or stalled and the remainder of
     /// the results were emitted unannotated in place. Never fewer results.
@@ -280,10 +279,10 @@ pub struct DaemonStreamReport {
 /// switches to the degrade path in place: the retained batches and the rest of
 /// the walk emit with their daemon parts unannotated (lint annotations
 /// survive — they never depended on the daemon), in order, with nothing
-/// duplicated and nothing dropped. `reap_scopes` rides the [`HitFrame::End`]
-/// terminator with the walk's observation set (ws43-02 reap parity); a
-/// zero-match walk ships neither (executor parity — a query with no matches
-/// never nudged). `tier` is the walk's anchor-decided enrichment tier
+/// duplicated and nothing dropped. The stream carries hits only (bug 146): no
+/// observation set, no reap claim — a walk's filtered yield was never its
+/// coverage, and the daemon observes for itself, targeted.
+/// `tier` is the walk's anchor-decided enrichment tier
 /// (brackets 04), computed at planning time and stamped on every batch — a
 /// dig batch serializes byte-identically to the pre-tier wire.
 ///
@@ -307,7 +306,6 @@ pub async fn daemon_stream<R, Wr, Wo>(
     pattern: &str,
     roots: &[std::path::PathBuf],
     options: &super::engine::WalkOptions,
-    reap_scopes: Option<Vec<PathBuf>>,
     tier: WalkTier,
     lint: Option<LintAnnotator>,
     reader: R,
@@ -369,11 +367,11 @@ where
     let writer_task = tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
         let mut writer = writer;
-        while let Some(mut batch) = staged_rx.recv().await {
+        while let Some(batch) = staged_rx.recv().await {
             // The daemon's share of the batch: everything the lint mask did
             // not claim. A lint-only batch still ships its (hit-less) frame so
-            // the observation nudge lands and the annotation stream stays
-            // seq-contiguous — the lint-covered HITS never touch the daemon.
+            // the annotation stream stays seq-contiguous — the lint-covered
+            // HITS never touch the daemon.
             let daemon_hits: Vec<WireHit> = batch
                 .hits
                 .iter()
@@ -384,10 +382,6 @@ where
             let frame_batch = HitFrame::Batch {
                 seq: batch.seq,
                 hits: daemon_hits,
-                // Observations ride the wire only — the retention copy exists
-                // to re-emit HITS on a degrade, and a degraded stream nudges
-                // nothing.
-                observed: std::mem::take(&mut batch.observed),
                 // Grep batches are weight-less: anchor enrichment, the
                 // pre-ws43-03 wire, byte-identical.
                 weight: None,
@@ -413,7 +407,7 @@ where
                 }
             }
         }
-        let mut summary = walk_task
+        let summary = walk_task
             .await
             .context("join walk task")?
             .context("walk for daemon stream")?;
@@ -421,19 +415,8 @@ where
         // the terminator — if we are still healthy — is on the wire next).
         drop(retain_tx);
         if !writer_degraded.load(Ordering::Acquire) {
-            // Reap parity (ws43-02): the observation set and the pathless-walk
-            // reap scopes ride the terminator. A zero-match walk ships neither —
-            // executor parity: a query with no matches never nudged.
-            let (observed, reap_scopes) = if summary.batches == 0 {
-                (Vec::new(), None)
-            } else {
-                (std::mem::take(&mut summary.observed), reap_scopes)
-            };
-            let end = HitFrame::End {
-                batches: summary.batches,
-                observed,
-                reap_scopes,
-            };
+            // The terminator carries the batch count and nothing else (bug 146).
+            let end = HitFrame::end(summary.batches);
             let bounded =
                 tokio::time::timeout(STREAM_READ_DEADLINE, super::write_frame(&mut writer, &end))
                     .await;
@@ -733,11 +716,9 @@ pub async fn lint_stream<Wo: std::io::Write>(
 /// there is no line-at-a-time emission to pipeline into), so this just chunks
 /// the file set into [`HIT_BATCH_SIZE`] batches — each hit a `line 0` marker
 /// for one file — stamps every batch with the CLI-computed `weight` and the
-/// anchor-decided `tier` (brackets 04), ships the scoped-nudge `observations`
-/// on the first batch (so the daemon's changed-set nudge lands before any
-/// outline is derived; a sweep's daemon side skips the nudge), and terminates
-/// with a reap-scope-less `End` (a scoped walk never proves absence, so glob
-/// never reaps).
+/// anchor-decided `tier` (brackets 04), and terminates with a plain `End`.
+/// Like grep's stream it carries hits only (bug 146): the daemon nudges from
+/// the batch's own files, statted on its side of the socket.
 ///
 /// The writer runs as its own task so a large listing cannot deadlock against
 /// the daemon's replies; the reader (this task) collects annotation batches
@@ -754,7 +735,6 @@ pub async fn annotate_paths<R, Wr>(
     reader: R,
     writer: Wr,
     files: &[PathBuf],
-    observations: Vec<(PathBuf, i64)>,
     weight: EnrichmentWeight,
     tier: WalkTier,
 ) -> (Vec<AnnotatedHit>, bool)
@@ -786,24 +766,18 @@ where
     // Writer half: its own task, bounded per write, so a peer that stops
     // reading can never wedge the exchange — the reader's deadline then
     // degrades it.
-    let mut observations = Some(observations);
     let frames: Vec<HitFrame> = batches
         .into_iter()
         .enumerate()
         .map(|(seq, hits)| HitFrame::Batch {
             seq: seq as u64,
             hits,
-            observed: observations.take().unwrap_or_default(),
             weight: Some(weight),
             // The walk's anchor-decided tier (brackets 04): the pattern base's
             // declaration, stamped on every batch.
             tier,
         })
-        .chain(std::iter::once(HitFrame::End {
-            batches: total,
-            observed: Vec::new(),
-            reap_scopes: None,
-        }))
+        .chain(std::iter::once(HitFrame::end(total)))
         .collect();
     let writer_task = tokio::spawn(async move {
         let mut writer = writer;
@@ -1009,7 +983,6 @@ mod tests {
             tokio::io::BufReader::new(cli_reads),
             cli_writes,
             &files,
-            vec![(PathBuf::from("/w/f0.rs"), 7)],
             crate::hitstream::EnrichmentWeight::Listing,
             WalkTier::Dig,
         )
@@ -1040,7 +1013,6 @@ mod tests {
             tokio::io::BufReader::new(cli_reads),
             cli_writes,
             &files,
-            Vec::new(),
             crate::hitstream::EnrichmentWeight::Listing,
             WalkTier::Dig,
         )
@@ -1073,7 +1045,6 @@ mod tests {
             tokio::io::BufReader::new(cli_reads),
             cli_writes,
             &files,
-            Vec::new(),
             crate::hitstream::EnrichmentWeight::Outline,
             WalkTier::Dig,
         )

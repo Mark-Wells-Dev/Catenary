@@ -142,7 +142,12 @@ pub(crate) struct ChangeSet {
 }
 
 impl ChangeSet {
-    /// Returns `true` when no path changed since the last walk.
+    /// Returns `true` when no path changed since the last observation.
+    ///
+    /// Test-only since bug 146 stage 3: the delivery path no longer asks. An
+    /// empty round still drains every server's frontier, because "nothing
+    /// changed just now" says nothing about what a given server has been told.
+    #[cfg(test)]
     pub const fn is_empty(&self) -> bool {
         self.changes.is_empty()
     }
@@ -468,6 +473,35 @@ pub struct FilesystemManager {
     /// don't contend; the outer lock only fetches/creates the inner `Arc<Mutex>`
     /// and is never held across the walk or an `.await`.
     last_seen: LastSeen,
+    /// Per-root delivery journal — the per-server frontiers (bug 146 stage 3).
+    /// Observation advances the shared baseline once; delivery is drained per
+    /// server from here, so a server is told each change exactly once and a
+    /// change that came and went between two of its consultations is never
+    /// told at all. Same lock discipline as `last_seen`.
+    journals: Mutex<HashMap<PathBuf, Arc<Mutex<RootJournal>>>>,
+}
+
+/// One root's delivery journal (bug 146 stage 3).
+///
+/// The baseline answers *what does disk look like now*; this answers *what has
+/// each server been told*. Splitting them is what makes delivery per-server:
+/// observation from any source (the probe, hit-file stats, the open-document
+/// sweep, the diagnose walk) appends here once, and each server drains its own
+/// frontier when it is about to be consulted.
+#[derive(Debug, Default)]
+struct RootJournal {
+    /// Monotonic generation, bumped once per recorded change set.
+    generation: u64,
+    /// Recorded changes with the generation that carried them, oldest first.
+    /// Pruned to what the furthest-behind live server still needs.
+    entries: Vec<(u64, Change)>,
+    /// Per-server delivery frontier: the last generation this server has been
+    /// told about, keyed by **instance** identity (`language/server/scope`).
+    /// It must be the instance, not the server name: one server can have
+    /// several instances covering a root — a parent-scoped one and a
+    /// subdirectory-scoped one — and each has its own idea of what it has been
+    /// told.
+    frontiers: HashMap<String, u64>,
 }
 
 /// Cache entry storing classification results keyed by mtime.
@@ -492,6 +526,7 @@ impl Default for FilesystemManager {
             classification: ClassificationTables::default(),
             root_generations: std::sync::Mutex::new(HashMap::new()),
             last_seen: Mutex::new(HashMap::new()),
+            journals: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -515,6 +550,7 @@ impl FilesystemManager {
             classification,
             root_generations: std::sync::Mutex::new(HashMap::new()),
             last_seen: Mutex::new(HashMap::new()),
+            journals: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1065,6 +1101,233 @@ impl FilesystemManager {
         ChangeSet { changes }
     }
 
+    // ── Per-server delivery frontiers (bug 146 stage 3) ───────────────
+
+    /// Fetches (creating if needed) a root's delivery journal.
+    fn journal_for(&self, root: &Path) -> Arc<Mutex<RootJournal>> {
+        let mut outer = self.journals.lock().unwrap_or_else(PoisonError::into_inner);
+        let journal = Arc::clone(outer.entry(root.to_path_buf()).or_default());
+        drop(outer);
+        journal
+    }
+
+    /// Records one observation round's changes on `root`'s delivery journal and
+    /// returns the generation that was current **before** them — the floor a
+    /// server not yet on the journal starts from.
+    ///
+    /// The floor matters: a server first seen at this nudge is told this
+    /// round's changes and nothing older. It has just been consulted for the
+    /// first time in this root's life (or has just come back), and the history
+    /// before that is not news to it — its own startup index covered it.
+    ///
+    /// An empty change set bumps nothing: generations count *deliveries owed*,
+    /// not nudges, which is exactly why nudges 2..N of a query burst deliver
+    /// nothing at all.
+    pub(crate) fn journal_changes(&self, root: &Path, changes: &[Change]) -> u64 {
+        let journal = self.journal_for(root);
+        let mut journal = journal.lock().unwrap_or_else(PoisonError::into_inner);
+        let floor = journal.generation;
+        if changes.is_empty() {
+            return floor;
+        }
+        let generation = floor.saturating_add(1);
+        journal.generation = generation;
+        for change in changes {
+            journal.entries.push((generation, change.clone()));
+        }
+        floor
+    }
+
+    /// Drains `server`'s frontier on `root`: the **net** diff of everything
+    /// journalled since it was last told, with its frontier advanced to the
+    /// current generation.
+    ///
+    /// Net, not replayed — the coalescing is the point. Per path, the first and
+    /// last kinds since the frontier decide one delivery:
+    ///
+    /// | first → last | delivered | why |
+    /// |---|---|---|
+    /// | Created → Deleted | *nothing* | it came and went; this server never knew it existed |
+    /// | Created → anything | `Created` | it is new to this server, whatever happened after |
+    /// | Deleted → Deleted | `Deleted` | it is gone |
+    /// | Deleted → Created/Changed | `Changed` | it exists again, with content this server has not seen |
+    /// | Changed → Deleted | `Deleted` | it is gone |
+    /// | Changed → anything | `Changed` | new content |
+    ///
+    /// The `Created → Deleted` row is where the delete/create flap dies
+    /// structurally: no ordering luck, no suppression heuristic — a server
+    /// simply is not told about a file whose whole life fell between two of its
+    /// consultations.
+    ///
+    /// `floor` seeds a server that has no frontier yet (see
+    /// [`journal_changes`](Self::journal_changes)).
+    pub(crate) fn drain_frontier(&self, root: &Path, server: &str, floor: u64) -> Vec<Change> {
+        let journal = self.journal_for(root);
+        let mut journal = journal.lock().unwrap_or_else(PoisonError::into_inner);
+        let from = *journal.frontiers.entry(server.to_string()).or_insert(floor);
+        let generation = journal.generation;
+        if from >= generation {
+            return Vec::new();
+        }
+
+        // First and last kind per path, in journal order.
+        let mut order: Vec<PathBuf> = Vec::new();
+        let mut seen: HashMap<PathBuf, (ChangeKind, ChangeKind)> = HashMap::new();
+        for (entry_gen, change) in &journal.entries {
+            if *entry_gen <= from {
+                continue;
+            }
+            seen.entry(change.rel.clone())
+                .and_modify(|(_, last)| *last = change.kind)
+                .or_insert_with(|| {
+                    order.push(change.rel.clone());
+                    (change.kind, change.kind)
+                });
+        }
+        journal.frontiers.insert(server.to_string(), generation);
+        drop(journal);
+
+        order
+            .into_iter()
+            .filter_map(|rel| {
+                let (first, last) = *seen.get(&rel)?;
+                let kind = match (first, last) {
+                    // Whole life between two consultations: say nothing.
+                    (ChangeKind::Created, ChangeKind::Deleted) => return None,
+                    (ChangeKind::Created, _) => ChangeKind::Created,
+                    (_, ChangeKind::Deleted) => ChangeKind::Deleted,
+                    // Back from the dead, or plain new content: either way it
+                    // exists and carries content this server has not seen.
+                    (ChangeKind::Deleted | ChangeKind::Changed, _) => ChangeKind::Changed,
+                };
+                Some(Change { rel, kind })
+            })
+            .collect()
+    }
+
+    /// Rewinds `server`'s frontier to `generation` — the delivery-failure
+    /// recovery (bug 146 stage 3).
+    ///
+    /// A dropped notify is one server's problem, so it is one server's rewind:
+    /// its next drain re-derives exactly what it missed, and no other server is
+    /// re-told anything. (Before frontiers this had to be done by reverting the
+    /// **shared** baseline, which re-emitted to every covering server.)
+    pub(crate) fn rewind_frontier(&self, root: &Path, server: &str, generation: u64) {
+        let journal = self.journal_for(root);
+        let mut journal = journal.lock().unwrap_or_else(PoisonError::into_inner);
+        journal
+            .frontiers
+            .entry(server.to_string())
+            .and_modify(|f| *f = (*f).min(generation))
+            .or_insert(generation);
+    }
+
+    /// Retires frontiers for servers no longer covering `root` and prunes
+    /// journal entries every live frontier has passed.
+    ///
+    /// The journal is bounded by what the furthest-behind live server still
+    /// needs — in the steady state (every covering server drained this round)
+    /// that is nothing, so it empties each nudge. A server that goes away stops
+    /// holding history: if it comes back it is a first-seen server again, told
+    /// the current round and nothing older.
+    pub(crate) fn retain_frontiers(&self, root: &Path, live: &HashSet<String>) {
+        let journal = self.journal_for(root);
+        let mut journal = journal.lock().unwrap_or_else(PoisonError::into_inner);
+        journal.frontiers.retain(|name, _| live.contains(name));
+        let keep_from = journal
+            .frontiers
+            .values()
+            .copied()
+            .min()
+            .unwrap_or(u64::MAX);
+        journal
+            .entries
+            .retain(|(entry_gen, _)| *entry_gen > keep_from);
+    }
+
+    /// A server's current delivery frontier on `root` (test observable).
+    #[cfg(test)]
+    pub(crate) fn frontier_of(&self, root: &Path, server: &str) -> u64 {
+        let journal = self.journal_for(root);
+        let journal = journal.lock().unwrap_or_else(PoisonError::into_inner);
+        journal.frontiers.get(server).copied().unwrap_or(0)
+    }
+
+    /// Snapshots a root's baselined relative paths — the probe's candidate
+    /// domain (bug 146).
+    ///
+    /// The supplemental watch probe is the deletion authority for watched
+    /// patterns, and it can only condemn what it *looked at*. Two of its legs
+    /// need the baseline to know where to look: the marker leg probes each
+    /// known directory for each registered marker name, and the condemnation
+    /// test asks whether a probed-and-absent path was ever baselined. Both
+    /// read this snapshot; the lock is held only for the clone, never across
+    /// the stats that follow (the probe's I/O runs outside every baseline
+    /// lock).
+    ///
+    /// Empty for a root with no baseline yet — a cold root has nothing to
+    /// condemn.
+    pub(crate) fn baseline_paths(&self, root: &Path) -> Vec<PathBuf> {
+        let inner = {
+            let outer = self
+                .last_seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(inner) = outer.get(root).map(Arc::clone) else {
+                return Vec::new();
+            };
+            drop(outer);
+            inner
+        };
+        let baseline = inner.lock().unwrap_or_else(PoisonError::into_inner);
+        baseline.keys().cloned().collect()
+    }
+
+    /// Condemns paths the caller **looked at and did not find** (bug 146):
+    /// each one still present in the baseline is dropped from it and returned
+    /// as a [`ChangeKind::Deleted`] change.
+    ///
+    /// This is deletion by *targeted observation* rather than by a walk's
+    /// claimed coverage. The caller — the supplemental watch probe — states
+    /// its own coverage by construction: it condemns a path only after a stat
+    /// of that exact path missed, so reap authority can never exceed
+    /// observation coverage the way a filtered walk's did. A path absent from
+    /// the baseline yields nothing (there is no deletion to announce for a
+    /// file no server was ever told about).
+    ///
+    /// **Lock discipline:** identical to the diff paths — the outer lock is
+    /// held only to fetch the per-root `Arc<Mutex<…>>`, the inner only for the
+    /// removals. No I/O and no `.await` inside either: the stats that decided
+    /// these paths ran in the caller, before this is called.
+    pub(crate) fn condemn_absent(&self, root: &Path, absent: &[PathBuf]) -> Vec<Change> {
+        if absent.is_empty() {
+            return Vec::new();
+        }
+        let inner = {
+            let outer = self
+                .last_seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(inner) = outer.get(root).map(Arc::clone) else {
+                return Vec::new();
+            };
+            drop(outer);
+            inner
+        };
+        let mut baseline = inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut changes = Vec::new();
+        for rel in absent {
+            if baseline.remove(rel).is_some() {
+                changes.push(Change {
+                    rel: rel.clone(),
+                    kind: ChangeKind::Deleted,
+                });
+            }
+        }
+        drop(baseline);
+        changes
+    }
+
     /// Drops a root's changed-set baseline and generation counter.
     ///
     /// Called from the `sync_roots` `to_remove` cleanup when a root leaves the
@@ -1078,104 +1341,16 @@ impl FilesystemManager {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(root);
+        // The delivery journal goes with it: a re-mounted root starts cold for
+        // every server, exactly as its baseline does.
+        self.journals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(root);
         self.root_generations
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(root);
-    }
-
-    /// Reverts a set of just-merged changes in a root's baseline so the **next**
-    /// walk re-emits them with the **same `FileChangeType`** they originally
-    /// carried (WS31-review F4 / WS31-review-D D2 — best-effort, kind-faithful
-    /// delivery recovery).
-    ///
-    /// [`nudge_changed_set`](crate::lsp::manager::LspClientManager::nudge_changed_set)
-    /// advances the per-root baseline **once** (steps via
-    /// [`diff_and_update`](Self::diff_and_update) /
-    /// [`diff_update_and_reap`](Self::diff_update_and_reap)) *before* the
-    /// per-server notify loop, and that baseline is **shared** across every server
-    /// covering the root. So a `workspace/didChangeWatchedFiles` notify that fails
-    /// for one covering server would otherwise lose those changes for it
-    /// permanently: the next walk diffs against the already-advanced shared
-    /// baseline and emits nothing (even across a respawn — the baseline is torn
-    /// down only by [`remove_root_baseline`](Self::remove_root_baseline) on
-    /// `catenary unpin`). Reverting the affected entries makes the next walk re-emit them
-    /// to **all** covering servers; a duplicate `didChangeWatchedFiles` to a server
-    /// that already received the change is harmless/idempotent. Delivery is
-    /// **best-effort**, and because the baseline is shared a revert may re-notify a
-    /// *healthy* covering server too (an idempotent duplicate, not a loss).
-    ///
-    /// The revert is **kind-faithful**: it branches on the original
-    /// [`ChangeKind`] so the next walk re-derives the same wire `FileChangeType`
-    /// rather than collapsing every kind to a re-`Created`:
-    /// - [`ChangeKind::Created`] — the entry was newly inserted, so it is
-    ///   **removed**. The next walk finds it absent from a populated baseline ⇒
-    ///   re-emits [`ChangeKind::Created`].
-    /// - [`ChangeKind::Changed`] — the entry's mtime advanced. It is **re-inserted
-    ///   at the [`OBSERVED_STAT_MISS_MTIME`] sentinel** (`i64::MIN`, below every
-    ///   real mtime), NOT removed. The next walk sees the key **present** with a
-    ///   real `mtime > sentinel` ⇒ re-emits [`ChangeKind::Changed`]. (Removing it
-    ///   would key it absent and re-emit a spurious `Created`, mis-serving a
-    ///   single-kind watcher — the bug this fix closes.)
-    /// - [`ChangeKind::Deleted`] — the reaping sweep already removed the entry and
-    ///   the file is gone from disk, so removal would re-emit nothing (a walk never
-    ///   observes a deleted file). The entry is **re-inserted** at the sentinel so
-    ///   the next **full** walk's reaping sweep — which reaps any baseline entry
-    ///   the walk did not visit — re-routes [`ChangeKind::Deleted`].
-    ///
-    /// Two inherent residuals (not fully closable; documented honestly):
-    /// 1. A reverted `Deleted` re-routes only on a **full** walk (`reap = true`);
-    ///    a scoped walk never reaps, so a `Deleted` lost to a notify failure on a
-    ///    scoped-only surface waits for the next `grep`/`diagnostics` full walk. If
-    ///    the file **reappears** before that full walk, a scoped walk that observes
-    ///    it re-emits [`ChangeKind::Changed`] (key present at the sentinel,
-    ///    `mtime > sentinel`), not [`ChangeKind::Created`] — a present key cannot
-    ///    also signal "absent". For a Create-only watcher this is an
-    ///    *under*-notification (no creation event), not a duplicate.
-    /// 2. **Scoped-only orphan sentinel.** A reverted `Deleted` on a root that is
-    ///    only ever *globbed* (scoped, never reaps) leaves the sentinel entry in
-    ///    the baseline indefinitely: a scoped walk that does not observe the path
-    ///    cannot reap it (reaping an unobserved entry is exactly the phantom-reap a
-    ///    scoped walk is forbidden from doing, and would also evict a
-    ///    legitimately-pending `Deleted` awaiting a full walk). The entry is
-    ///    self-healing only if the path reappears and a scoped walk observes it
-    ///    (then re-emitted as `Changed` per residual 1) or a full walk eventually
-    ///    runs. Eviction-on-scoped-walk was rejected for this reason.
-    pub(crate) fn revert_baseline_changes(&self, root: &Path, changes: &[Change]) {
-        let inner = {
-            let outer = self
-                .last_seen
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            // No baseline for the root ⇒ nothing to revert (it was torn down, or
-            // the root was never walked).
-            let Some(inner) = outer.get(root).map(Arc::clone) else {
-                return;
-            };
-            drop(outer);
-            inner
-        };
-
-        let mut baseline = inner.lock().unwrap_or_else(PoisonError::into_inner);
-        for change in changes {
-            match change.kind {
-                ChangeKind::Created => {
-                    // Key absent ⇒ the next walk re-derives Created. (A populated
-                    // baseline + an absent key is a genuine `Created`.)
-                    baseline.remove(&change.rel);
-                }
-                ChangeKind::Changed | ChangeKind::Deleted => {
-                    // Key PRESENT at the `i64::MIN` sentinel (below every real
-                    // mtime). For a reverted Changed the next walk sees the key
-                    // present with `mtime > sentinel` ⇒ re-emits Changed (NOT
-                    // Created — the kind-faithful fix). For a reverted Deleted the
-                    // file is gone, so the next FULL walk's reaping sweep — which
-                    // reaps any baseline entry the walk did not visit — re-routes
-                    // Deleted.
-                    baseline.insert(change.rel.clone(), OBSERVED_STAT_MISS_MTIME);
-                }
-            }
-        }
     }
 
     /// Returns `true` if a changed-set baseline exists for the root (test-only).
@@ -2546,262 +2721,181 @@ mod tests {
         assert!(mgr.diff_and_update(&root_a, &observed).is_empty());
     }
 
-    /// WS31-review C3 (F4) — land-with-fix unit on the evict-on-failure logic.
-    ///
-    /// `nudge_changed_set` advances the per-root baseline once (step 3), then
-    /// fans the delta out to each covering server (step 4); the baseline is
-    /// **shared** across all covering servers. A notify failure to one server
-    /// would, absent recovery, lose those changes for it permanently — the next
-    /// walk diffs against the already-advanced baseline and emits nothing. The fix
-    /// reverts exactly the changes routed to the failed server via
-    /// [`revert_baseline_changes`], so a re-diff against an **unchanged** FS
-    /// re-emits them. This pins that re-emit contract directly (the integration
-    /// path can't observe a forced notify failure without a new mockls capability
-    /// — see the C3 ticket testability note — so this lands with the fix, the same
-    /// precedent as L1/L4/N2/C1-F1).
-    ///
-    /// Covers all three [`ChangeKind`]s: a Created/Changed entry is removed so the
-    /// next diff re-emits it; a Deleted entry (already dropped by the reap sweep)
-    /// is re-inserted with the sentinel so the next **full** walk's reap sweep
-    /// re-emits the deletion while the file stays gone.
+    // ── Per-server delivery frontiers (bug 146 stage 3) ───────────────
+
+    /// Records one round of changes and returns the pre-round generation.
+    fn journal(mgr: &FilesystemManager, root: &Path, changes: &[Change]) -> u64 {
+        mgr.journal_changes(root, changes)
+    }
+
+    /// One change, spelled compactly.
+    fn change(rel: &str, kind: ChangeKind) -> Change {
+        Change {
+            rel: PathBuf::from(rel),
+            kind,
+        }
+    }
+
+    /// Delivery is per server: each drains its own frontier, so a change is
+    /// delivered to a server exactly once no matter how many other servers have
+    /// already taken it, and a server already current takes nothing.
     #[test]
-    fn ws31_review_c3_notify_failure_reemits() {
+    fn each_server_drains_its_own_frontier_exactly_once() {
         let mgr = FilesystemManager::new();
         let root = PathBuf::from("/root");
+        let floor = journal(&mgr, &root, &[change("a.rs", ChangeKind::Changed)]);
 
-        // ── Created/Changed: revert removes the entry ⇒ next walk re-emits ──
-        // First walk seeds the baseline (cold snapshot). The root key now exists,
-        // so a later-walk absent path is a genuine Created.
-        let _ = mgr.diff_update_and_reap(&root, &[(PathBuf::from("a.rs"), 100)]);
-        // Second walk: a new file `b.rs` ⇒ Created, merged into the baseline.
-        let observed = vec![(PathBuf::from("a.rs"), 100), (PathBuf::from("b.rs"), 200)];
-        let set = mgr.diff_update_and_reap(&root, &observed);
-        let created: Vec<&Change> = set
-            .changes
-            .iter()
-            .filter(|c| c.kind == ChangeKind::Created)
-            .collect();
-        assert_eq!(created.len(), 1, "b.rs is the only Created");
-        assert_eq!(created[0].rel, PathBuf::from("b.rs"));
-
-        // Pre-revert sanity: a re-diff against the SAME observation is empty (the
-        // baseline already absorbed b.rs — exactly the bug-38 no-repeat property
-        // that loses the change if delivery failed).
+        let first = mgr.drain_frontier(&root, "alpha", floor);
+        assert_eq!(first.len(), 1, "alpha is told once");
         assert!(
-            mgr.diff_update_and_reap(&root, &observed).is_empty(),
-            "without revert, the advanced baseline silently swallows the change"
+            mgr.drain_frontier(&root, "alpha", floor).is_empty(),
+            "and never again — a drained frontier is current"
         );
-
-        // Simulate the failed-notify recovery: revert the change routed to the
-        // failed server. The next walk over the UNCHANGED FS must re-emit it.
-        let reverted = vec![Change {
-            rel: PathBuf::from("b.rs"),
-            kind: ChangeKind::Created,
-        }];
-        mgr.revert_baseline_changes(&root, &reverted);
-        let reemit = mgr.diff_update_and_reap(&root, &observed);
-        let reemit_rels: Vec<&PathBuf> = reemit.changes.iter().map(|c| &c.rel).collect();
+        let other = mgr.drain_frontier(&root, "beta", floor);
         assert_eq!(
-            reemit_rels,
-            vec![&PathBuf::from("b.rs")],
-            "the reverted Created must re-emit on the next walk; a.rs must not"
-        );
-
-        // ── Deleted: revert re-inserts the entry ⇒ next full walk re-reaps ──
-        // Drop b.rs from disk: a full walk reaps it (Deleted, baseline entry
-        // removed).
-        let reaped = mgr.diff_update_and_reap(&root, &[(PathBuf::from("a.rs"), 100)]);
-        assert!(
-            reaped
-                .changes
-                .iter()
-                .any(|c| c.rel == Path::new("b.rs") && c.kind == ChangeKind::Deleted),
-            "b.rs gone from disk ⇒ reaped as Deleted: {:?}",
-            reaped.changes
-        );
-        // Without revert, the Deleted does not re-emit (entry already dropped).
-        assert!(
-            mgr.diff_update_and_reap(&root, &[(PathBuf::from("a.rs"), 100)])
-                .is_empty(),
-            "a reaped Deleted does not re-emit on its own"
-        );
-
-        // Simulate the failed-notify recovery for the Deleted change.
-        let reverted_del = vec![Change {
-            rel: PathBuf::from("b.rs"),
-            kind: ChangeKind::Deleted,
-        }];
-        mgr.revert_baseline_changes(&root, &reverted_del);
-        // Next full walk with b.rs still absent ⇒ Deleted re-emitted.
-        let reemit_del = mgr.diff_update_and_reap(&root, &[(PathBuf::from("a.rs"), 100)]);
-        assert!(
-            reemit_del
-                .changes
-                .iter()
-                .any(|c| c.rel == Path::new("b.rs") && c.kind == ChangeKind::Deleted),
-            "the reverted Deleted must re-reap on the next full walk: {:?}",
-            reemit_del.changes
+            other.len(),
+            1,
+            "beta's delivery is independent of alpha's: {other:?}"
         );
     }
 
-    /// `revert_baseline_changes` is a no-op for an unknown root and for an empty
-    /// change set — it must never spuriously re-emit unrelated baseline entries.
+    /// A file created and deleted between two of a server's consultations is
+    /// never mentioned to it. The flap dies in the coalescing — no ordering
+    /// luck, no suppression heuristic.
     #[test]
-    fn revert_baseline_changes_is_scoped_and_safe() {
+    fn created_then_deleted_between_consultations_delivers_nothing() {
         let mgr = FilesystemManager::new();
         let root = PathBuf::from("/root");
+        let floor = journal(&mgr, &root, &[change("tmp.rs", ChangeKind::Created)]);
+        let _ = journal(&mgr, &root, &[change("tmp.rs", ChangeKind::Deleted)]);
 
-        // No baseline yet ⇒ reverting against an unknown root is a no-op.
-        mgr.revert_baseline_changes(
-            &root,
-            &[Change {
-                rel: PathBuf::from("a.rs"),
-                kind: ChangeKind::Created,
-            }],
-        );
         assert!(
-            !mgr.has_baseline_for_test(&root),
-            "reverting against an unknown root must not create a baseline"
-        );
-
-        // Seed two files, then revert only `a.rs`: `b.rs` must stay quiet.
-        let observed = vec![(PathBuf::from("a.rs"), 100), (PathBuf::from("b.rs"), 100)];
-        let _ = mgr.diff_and_update(&root, &observed);
-        mgr.revert_baseline_changes(
-            &root,
-            &[Change {
-                rel: PathBuf::from("a.rs"),
-                kind: ChangeKind::Changed,
-            }],
-        );
-        let reemit = mgr.diff_and_update(&root, &observed);
-        let reemit_rels: Vec<&PathBuf> = reemit.changes.iter().map(|c| &c.rel).collect();
-        assert_eq!(
-            reemit_rels,
-            vec![&PathBuf::from("a.rs")],
-            "only the reverted entry re-emits; an empty revert leaves the rest quiet"
+            mgr.drain_frontier(&root, "alpha", floor).is_empty(),
+            "a file whose whole life fell between two consultations is not news"
         );
     }
 
-    /// WS31-review-D D2 (T3) — the notify-failure revert must be **kind-faithful**:
-    /// a reverted change re-emits on the next walk with the SAME `ChangeKind` it
-    /// originally carried, so a single-kind watcher is not mis-served. Seeds a
-    /// baseline, drives each of the three kinds through a diff, reverts it, then
-    /// re-diffs against the **same unchanged** observation set and asserts the
-    /// re-emitted kind matches the original.
-    ///
-    /// The load-bearing case is **Changed**: a reverted Changed must re-emit as
-    /// Changed, not Created. The fix re-inserts a reverted Changed at the
-    /// `OBSERVED_STAT_MISS_MTIME` sentinel (key present, `mtime > sentinel` ⇒
-    /// Changed) instead of removing it (key absent ⇒ a spurious Created that
-    /// mis-served a single-kind watcher).
+    /// The rest of the coalescing table: several journalled kinds collapse to
+    /// the one delivery that describes the file's net move.
     #[test]
-    fn ws31_review_d_revert_preserves_change_kind() {
-        // ── Created: a reverted Created re-emits Created. ──────────────────
-        {
+    fn net_diff_collapses_a_paths_history_to_one_delivery() {
+        let cases = [
+            (
+                vec![ChangeKind::Created, ChangeKind::Changed],
+                Some(ChangeKind::Created),
+            ),
+            (
+                vec![ChangeKind::Changed, ChangeKind::Changed],
+                Some(ChangeKind::Changed),
+            ),
+            (
+                vec![ChangeKind::Changed, ChangeKind::Deleted],
+                Some(ChangeKind::Deleted),
+            ),
+            // Back from the dead: the server knew a version, was told nothing,
+            // and the file now exists with content it has not seen.
+            (
+                vec![ChangeKind::Deleted, ChangeKind::Created],
+                Some(ChangeKind::Changed),
+            ),
+            (vec![ChangeKind::Created, ChangeKind::Deleted], None),
+        ];
+        for (history, expected) in cases {
             let mgr = FilesystemManager::new();
             let root = PathBuf::from("/root");
-            // First walk seeds the baseline (cold snapshot); the new path on the
-            // second walk is a genuine Created.
-            let seed = vec![(PathBuf::from("a.rs"), 100)];
-            let _ = mgr.diff_and_update(&root, &seed);
-            let with_new = vec![(PathBuf::from("a.rs"), 100), (PathBuf::from("new.rs"), 100)];
-            let created = mgr.diff_and_update(&root, &with_new);
-            let new_change = created
-                .changes
-                .iter()
-                .find(|c| c.rel == Path::new("new.rs"))
-                .expect("new.rs routed");
+            let mut floor = None;
+            for kind in &history {
+                let before = journal(&mgr, &root, &[change("f.rs", *kind)]);
+                floor.get_or_insert(before);
+            }
+            let drained = mgr.drain_frontier(&root, "alpha", floor.unwrap_or(0));
             assert_eq!(
-                new_change.kind,
-                ChangeKind::Created,
-                "a path absent from a populated baseline is Created"
-            );
-            mgr.revert_baseline_changes(&root, std::slice::from_ref(new_change));
-            let reemit = mgr.diff_and_update(&root, &with_new);
-            let reemitted = reemit
-                .changes
-                .iter()
-                .find(|c| c.rel == Path::new("new.rs"))
-                .expect("reverted Created re-emits");
-            assert_eq!(
-                reemitted.kind,
-                ChangeKind::Created,
-                "a reverted Created must re-emit as Created"
+                drained.first().map(|c| c.kind),
+                expected,
+                "history {history:?} must collapse to {expected:?}, got {drained:?}"
             );
         }
+    }
 
-        // ── Changed: a reverted Changed re-emits Changed (THE fix). ────────
-        {
-            let mgr = FilesystemManager::new();
-            let root = PathBuf::from("/root");
-            let at_100 = vec![(PathBuf::from("a.rs"), 100)];
-            let _ = mgr.diff_and_update(&root, &at_100);
-            let at_200 = vec![(PathBuf::from("a.rs"), 200)];
-            let changed = mgr.diff_and_update(&root, &at_200);
-            let change = changed
-                .changes
-                .iter()
-                .find(|c| c.rel == Path::new("a.rs"))
-                .expect("a.rs routed as a mtime advance");
-            assert_eq!(
-                change.kind,
-                ChangeKind::Changed,
-                "an mtime advance on an existing baseline entry is Changed"
-            );
-            mgr.revert_baseline_changes(&root, std::slice::from_ref(change));
-            // Re-diff against the SAME unchanged observation (mtime 200).
-            let reemit = mgr.diff_and_update(&root, &at_200);
-            let reemitted = reemit
-                .changes
-                .iter()
-                .find(|c| c.rel == Path::new("a.rs"))
-                .expect("reverted Changed re-emits");
-            assert_eq!(
-                reemitted.kind,
-                ChangeKind::Changed,
-                "a reverted Changed must re-emit as Changed, not Created"
-            );
-        }
+    /// A dropped notify rewinds only the failing server: its next drain
+    /// re-derives what it missed, and no other server is re-told anything.
+    #[test]
+    fn a_rewound_frontier_redelivers_only_to_that_server() {
+        let mgr = FilesystemManager::new();
+        let root = PathBuf::from("/root");
+        let floor = journal(&mgr, &root, &[change("a.rs", ChangeKind::Changed)]);
 
-        // ── Deleted: a reverted Deleted re-routes Deleted on the next full
-        //    walk's reaping sweep. ───────────────────────────────────────────
-        {
-            let mgr = FilesystemManager::new();
-            let root = PathBuf::from("/root");
-            // First walk seeds two files; the gone.rs entry is reaped when the
-            // next full walk omits it.
-            let both = vec![
-                (PathBuf::from("a.rs"), 100),
-                (PathBuf::from("gone.rs"), 100),
-            ];
-            let _ = mgr.diff_update_and_reap(&root, &both);
-            let only_a = vec![(PathBuf::from("a.rs"), 100)];
-            let deleted = mgr.diff_update_and_reap(&root, &only_a);
-            let del = deleted
-                .changes
-                .iter()
-                .find(|c| c.rel == Path::new("gone.rs"))
-                .expect("gone.rs reaped as Deleted");
-            assert_eq!(
-                del.kind,
-                ChangeKind::Deleted,
-                "a baseline entry a full walk did not visit is Deleted"
-            );
-            mgr.revert_baseline_changes(&root, std::slice::from_ref(del));
-            // The next full walk still omits gone.rs ⇒ re-reaps it as Deleted.
-            let reemit = mgr.diff_update_and_reap(&root, &only_a);
-            let reemitted = reemit
-                .changes
-                .iter()
-                .find(|c| c.rel == Path::new("gone.rs"))
-                .expect("reverted Deleted re-routes on the next full walk");
-            assert_eq!(
-                reemitted.kind,
-                ChangeKind::Deleted,
-                "a reverted Deleted must re-route as Deleted"
-            );
-        }
+        assert_eq!(mgr.drain_frontier(&root, "alpha", floor).len(), 1);
+        assert_eq!(mgr.drain_frontier(&root, "beta", floor).len(), 1);
+
+        // alpha's notify failed.
+        mgr.rewind_frontier(&root, "alpha", floor);
+        assert_eq!(
+            mgr.drain_frontier(&root, "alpha", floor).len(),
+            1,
+            "the failed server re-derives its missed delivery"
+        );
+        assert!(
+            mgr.drain_frontier(&root, "beta", floor).is_empty(),
+            "a healthy server is not splashed by another's failure"
+        );
+    }
+
+    /// A server first seen at this round starts at the round's floor: it is
+    /// told this round and nothing older (its own startup index covered that).
+    #[test]
+    fn a_first_seen_server_starts_at_the_current_round() {
+        let mgr = FilesystemManager::new();
+        let root = PathBuf::from("/root");
+        let _ = journal(&mgr, &root, &[change("old.rs", ChangeKind::Changed)]);
+        let floor = journal(&mgr, &root, &[change("new.rs", ChangeKind::Changed)]);
+
+        let drained = mgr.drain_frontier(&root, "latecomer", floor);
+        assert_eq!(drained.len(), 1, "only this round: {drained:?}");
+        assert_eq!(drained[0].rel, PathBuf::from("new.rs"));
+    }
+
+    /// The journal is bounded by what the furthest-behind live server needs:
+    /// once every live server has drained, it empties. A server that stops
+    /// covering the root stops holding history.
+    #[test]
+    fn retain_frontiers_prunes_history_and_retires_departed_servers() {
+        let mgr = FilesystemManager::new();
+        let root = PathBuf::from("/root");
+        let floor = journal(&mgr, &root, &[change("a.rs", ChangeKind::Changed)]);
+        let _ = mgr.drain_frontier(&root, "alpha", floor);
+        let _ = mgr.drain_frontier(&root, "gone", floor);
+
+        let live: HashSet<String> = std::iter::once("alpha".to_string()).collect();
+        mgr.retain_frontiers(&root, &live);
+        assert_eq!(
+            mgr.frontier_of(&root, "gone"),
+            0,
+            "departed frontier retired"
+        );
+
+        // A fresh round: alpha (still live) drains it; the departed server, if
+        // it returns, is a first-seen server again.
+        let floor = journal(&mgr, &root, &[change("b.rs", ChangeKind::Changed)]);
+        assert_eq!(mgr.drain_frontier(&root, "alpha", floor).len(), 1);
+    }
+
+    /// An observation round with no changes bumps no generation, so a server
+    /// that is already current is asked for nothing — nudges 2..N of a query
+    /// burst induce no delivery at all.
+    #[test]
+    fn an_empty_round_delivers_nothing_and_advances_no_generation() {
+        let mgr = FilesystemManager::new();
+        let root = PathBuf::from("/root");
+        let floor = journal(&mgr, &root, &[change("a.rs", ChangeKind::Changed)]);
+        let _ = mgr.drain_frontier(&root, "alpha", floor);
+
+        let next_floor = journal(&mgr, &root, &[]);
+        assert_eq!(next_floor, floor + 1, "no changes ⇒ no new generation");
+        assert!(
+            mgr.drain_frontier(&root, "alpha", next_floor).is_empty(),
+            "an already-current server takes nothing from an empty round"
+        );
     }
 
     /// C1/F1 (helper isolation unit) — the shared per-file observation step

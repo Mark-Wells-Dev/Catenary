@@ -2932,7 +2932,6 @@ async fn run_grep(
     let mut anchored_out = AnchorFirstWriter::new(std::io::stdout(), anchor);
     let stream_result = if queried && !search_roots.is_empty() {
         let mut result_sink = catenary_cli::hitstream::ResultSink::new(&mut anchored_out);
-        let reap_scopes = paths.is_empty().then(|| vec![canonical_cwd.clone()]);
         let report = match connection {
             Some((daemon_reader, daemon_writer)) => {
                 // The tier disclosure (brackets 04): a daemon-served sweep is
@@ -2946,7 +2945,6 @@ async fn run_grep(
                     &pattern,
                     &search_roots,
                     &options,
-                    reap_scopes,
                     tier,
                     lint_annotator,
                     daemon_reader,
@@ -3555,15 +3553,8 @@ async fn run_glob(
             if tier.is_sweep() {
                 emit_sweep_marker();
             }
-            let (hits, degraded) = annotate_paths(
-                reader,
-                writer,
-                &plan.enrich_files,
-                plan.observations.clone(),
-                weight,
-                tier,
-            )
-            .await;
+            let (hits, degraded) =
+                annotate_paths(reader, writer, &plan.enrich_files, weight, tier).await;
             if degraded {
                 // The mid-stream degrade advisory: the listing is complete,
                 // enrichment is not — never silent (stderr only, so stdout

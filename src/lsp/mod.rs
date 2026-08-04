@@ -40,6 +40,9 @@ pub mod state;
 pub(crate) mod types;
 /// Supplemental watch-observation probe planning (bug 143).
 pub(crate) mod watch_probe;
+/// The probe's mtime trail: directory discovery without traversal, and the
+/// per-device trust lifecycle that licenses it (bug 146).
+pub(crate) mod watch_trail;
 
 /// Shared test helpers for LSP unit tests.
 ///

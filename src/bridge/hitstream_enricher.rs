@@ -34,8 +34,8 @@
 //!   `documentSymbol`-class outlines/anchors from the rootless single-file
 //!   singletons via the bracket seam
 //!   ([`LspClientManager::with_single_file_bracket`]), at most one singleton
-//!   per language. NO pool readiness, NO WS31 nudge (per-batch or walk-end —
-//!   the nudge routes traffic to root instances), NO symbol-index population,
+//!   per language. NO pool readiness, NO WS31 nudge (the nudge routes traffic
+//!   to root instances), NO symbol-index population,
 //!   NO per-hit-root spawns; the router-level query auto-mount is skipped for
 //!   sweep batches too. A hit whose language has no capable singleton renders
 //!   raw immediately — degrade is capability-shaped, never timeout-shaped
@@ -51,32 +51,22 @@
 //!    wraps this whole future, so a cold pool can blow the first batch's budget
 //!    into a pass-through verdict while the pool warms — later batches then
 //!    enrich. Degrade-only, never fewer hits.
-//! 2. **The WS31 observation nudge** — the batch's shipped observation slice
-//!    (every file the CLI walk visited since the previous batch, walk-time
-//!    mtimes) feeds the root tracker's changed-set diff before this batch's
-//!    anchors/outlines are derived — the executor's nudge-then-anchor order,
-//!    and on a cold root the first nudge is still the cold snapshot
-//!    (first-walk `Changed`). Add/update only: a per-batch slice never proves
-//!    absence, so it never reaps. A batch from an old CLI ships no
-//!    observations; the nudge degrades to the batch's canonical hit paths,
-//!    statted fresh. (Residual: a cold walk long enough to span several
-//!    batches classifies files first seen in later batches as `Created` — the
-//!    baseline warmed mid-walk. The retired executor's single post-walk nudge
-//!    classified them `Changed`; either kind invalidates the server's view of
-//!    the file.)
+//! 2. **The hit-file nudge** — the batch's own files, statted **here**, feed
+//!    the root tracker's changed-set diff before this batch's anchors/outlines
+//!    are derived (the nudge-then-anchor order). This is the only observation
+//!    the search path contributes, and it is request-time consistency of
+//!    exactly what is being asked about — bug 26's `ensure_symbols` mtime
+//!    backstop is the precedent seam. The walk ships nothing (bug 146): its
+//!    filtered yield was never coverage, and treating it as such condemned
+//!    every watched file the filter hid. Add/update only — a hit set never
+//!    proves absence, so it never reaps; deletion authority belongs to the
+//!    supplemental probe, the open-document sweep, and the diagnose round's
+//!    unfiltered walk.
 //! 3. **Anchors or outlines** — the shared [`anchor_context`]
 //!    populates/refreshes the symbol index and classifies per-file coverage;
 //!    each hit maps onto the wire [`AnnotatedHit`]: the tri-state anchor
 //!    (`#trail` / top-level / `#?`) for grep, or the outline body /
 //!    suppression flag / could-not-enrich state for glob.
-//!
-//! At the walk's end ([`BatchEnricher::observe_walk`]) the accumulated
-//! observations — every batch's slice plus the terminator's tail — run the
-//! executor's once-per-walk nudge with the pathless-walk reap rule, so a
-//! deleted file a full grep walk no longer visits is reaped exactly as before.
-//! Glob ships no reap scopes (a scoped walk never proves absence), so its
-//! terminator skips the walk-level nudge — its per-batch nudges are the whole
-//! story, exactly the retired executor's scoped-nudge semantics.
 //!
 //! Paths are canonical by contract: canonicalization is CLI-side, at the walk
 //! ingestion seam ([`crate::hitstream::canonicalize_hit_path`] for grep, the
@@ -112,7 +102,7 @@ use crate::symbol_index::{Symbol, SymbolIndex};
 /// outline-suppression matchers — and runs the shared enrichment core per
 /// batch. Built per `tool/hitstream` connection via
 /// [`Session::hitstream_enricher`](super::session::Session::hitstream_enricher),
-/// so the observation accumulator below is one walk's.
+/// so one enricher serves one walk.
 pub struct HitstreamEnricher {
     /// Shared LSP server pool (lookups, readiness waits, the changed-set nudge).
     client_manager: Arc<LspClientManager>,
@@ -125,20 +115,6 @@ pub struct HitstreamEnricher {
     /// explicit user opt-out, `[tools.glob] outline_suppress`). Symbols remain
     /// available; the hit is flagged `suppressed` instead of outlined.
     outline_suppress: Vec<globset::GlobMatcher>,
-    /// Every observation the batches shipped, accumulated for the walk-end
-    /// reap diff (the executor's once-per-walk nudge needs the FULL visited
-    /// set — reaping against a partial set would false-delete the rest).
-    /// Bounded by the walk's visited-file count, the executor's own
-    /// accumulation shape. The guard is never held across an await.
-    seen: std::sync::Mutex<Vec<(PathBuf, i64)>>,
-    /// Whether this walk declared the sweep tier (brackets 04). Set by the
-    /// first sweep batch — the tier is per-walk (one enricher serves one
-    /// `tool/hitstream` connection, and there are no mid-stream flips) — and
-    /// read by [`BatchEnricher::observe_walk`], whose terminator carries no
-    /// tier: a sweep's walk-end nudge/reap is skipped entirely, because the
-    /// nudge routes `didChangeWatchedFiles` traffic to root instances and the
-    /// sweep path never touches one.
-    sweep_walk: std::sync::atomic::AtomicBool,
 }
 
 impl HitstreamEnricher {
@@ -155,16 +131,13 @@ impl HitstreamEnricher {
             fs_manager,
             symbol_index,
             outline_suppress,
-            seen: std::sync::Mutex::new(Vec::new()),
-            sweep_walk: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// The shared per-batch preamble: pool readiness (bounded), the WS31
-    /// observation nudge (before anchors/outlines — the executor's order), and
-    /// the walk-end accumulation. Returns the batch's distinct canonical
-    /// paths in a deterministic order.
-    async fn prepare_batch(&self, hits: &[WireHit], observed: Vec<(PathBuf, i64)>) -> Vec<PathBuf> {
+    /// The shared per-batch preamble: pool readiness (bounded) and the
+    /// hit-file nudge (before anchors/outlines — the nudge-then-anchor order).
+    /// Returns the batch's distinct canonical paths in a deterministic order.
+    async fn prepare_batch(&self, hits: &[WireHit]) -> Vec<PathBuf> {
         // The batch's distinct files, in a deterministic order. Hit paths are
         // canonical by contract (CLI-side canonicalization at the walk seam).
         let paths: Vec<PathBuf> = hits
@@ -182,38 +155,21 @@ impl HitstreamEnricher {
             .ensure_and_wait_for_paths_bounded(&paths, crate::lsp::manager::QUERY_ENRICHMENT_BUDGET)
             .await;
 
-        // The WS31 observation nudge, BEFORE this batch's anchors/outlines
-        // (the executor's nudge-then-anchor order): the batch's shipped
-        // observation slice feeds the changed-set diff so the enrichment is
-        // derived from post-edit content, and a cold root's first nudge is the
-        // cold snapshot. Fallback for an old CLI that ships no observations:
-        // the batch's hit paths, statted fresh (a stat that misses is simply
-        // omitted — with reaping off, omission can never fabricate a
-        // deletion). Add/update only (`reap_scopes: None`): a partial set
-        // never proves a baseline entry is gone.
-        let batch_observed: Vec<(PathBuf, i64)> = if observed.is_empty() {
-            paths
-                .iter()
-                .filter_map(|p| stat_with_retry(p).map(|md| (p.clone(), mtime_nanos(&md))))
-                .collect()
-        } else {
-            observed
-        };
-        nudge_observed_files(
-            &self.client_manager,
-            &self.fs_manager,
-            &batch_observed,
-            None,
-        )
-        .await;
-        // Accumulate for the walk-end reap diff (guard scoped, no await held).
-        {
-            let mut seen = self
-                .seen
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            seen.extend(batch_observed);
-        }
+        // The hit-file nudge, BEFORE this batch's anchors/outlines (the
+        // nudge-then-anchor order): the batch's own files, statted here, feed
+        // the changed-set diff so the enrichment is derived from post-edit
+        // content — request-time consistency of exactly what is being asked
+        // about (bug 26's `ensure_symbols` mtime backstop is the precedent).
+        // A stat that misses is simply omitted: search-path observations are
+        // add/update only, so an omission can never fabricate a deletion. The
+        // nudge also runs the daemon's own deletion authority for this root
+        // (the supplemental probe and the open-document sweep) — see
+        // `nudge_changed_set`.
+        let batch_observed: Vec<(PathBuf, i64)> = paths
+            .iter()
+            .filter_map(|p| stat_with_retry(p).map(|md| (p.clone(), mtime_nanos(&md))))
+            .collect();
+        nudge_observed_files(&self.client_manager, &self.fs_manager, &batch_observed).await;
 
         paths
     }
@@ -308,7 +264,7 @@ impl HitstreamEnricher {
     /// The anchor declared this walk a sweep, so the batch preamble the dig
     /// tier runs is skipped whole: NO pool readiness (no per-hit-root
     /// spawns), NO WS31 nudge (the nudge routes traffic to root instances),
-    /// NO symbol-index population, NO walk-end accumulation. Each distinct
+    /// NO symbol-index population. Each distinct
     /// file is answered file-grade — its `documentSymbol` outline from a
     /// rootless singleton, one bracket per file on the enrichment lane
     /// ([`Self::single_file_symbols`]) — at a bounded cost of at most one
@@ -321,11 +277,6 @@ impl HitstreamEnricher {
         hits: Vec<WireHit>,
         weight: Option<EnrichmentWeight>,
     ) -> Vec<AnnotatedHit> {
-        // Remember the walk's declaration for the tier-less terminator
-        // (`observe_walk` skips the nudge/reap on a sweep).
-        self.sweep_walk
-            .store(true, std::sync::atomic::Ordering::Release);
-
         let paths: Vec<PathBuf> = hits
             .iter()
             .map(|h| h.path.clone())
@@ -428,48 +379,9 @@ impl HitstreamEnricher {
 }
 
 impl BatchEnricher for HitstreamEnricher {
-    /// The walk-level observation nudge (ws43-02 reap parity): the accumulated
-    /// batch observations plus the terminator's tail — the CLI walk's full
-    /// visited-file set — fed once per walk to the shared
-    /// [`nudge_observed_files`] with the executor's exact reap rule:
-    /// `reap_scopes` is `Some` only for a pathless walk, and reaping still
-    /// gates per-root on whole-root coverage inside the shared core. This is
-    /// the once-after-the-walk nudge the retired executor ran; the per-batch
-    /// nudges in [`Self::enrich`] stay add/update-only (a partial set never
-    /// proves absence).
-    ///
-    /// A **sweep** walk (brackets 04) skips this entirely: the nudge routes
-    /// `didChangeWatchedFiles` traffic (and, for a pathless walk, the reap
-    /// diff) to root instances, and the sweep path never touches one. The
-    /// terminator carries no tier, so the walk's declaration is read from the
-    /// batches ([`Self::sweep_walk`] — one enricher, one walk, no mid-stream
-    /// flips).
-    async fn observe_walk(&self, observed: Vec<(PathBuf, i64)>, reap_scopes: Option<Vec<PathBuf>>) {
-        if self.sweep_walk.load(std::sync::atomic::Ordering::Acquire) {
-            return;
-        }
-        let full: Vec<(PathBuf, i64)> = {
-            let mut seen = self
-                .seen
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            seen.extend(observed);
-            std::mem::take(&mut *seen)
-            // Guard dropped here — never held across the await below.
-        };
-        nudge_observed_files(
-            &self.client_manager,
-            &self.fs_manager,
-            &full,
-            reap_scopes.as_deref(),
-        )
-        .await;
-    }
-
     async fn enrich(
         &self,
         hits: Vec<WireHit>,
-        observed: Vec<(PathBuf, i64)>,
         weight: Option<EnrichmentWeight>,
         tier: WalkTier,
     ) -> Result<Vec<AnnotatedHit>> {
@@ -480,7 +392,7 @@ impl BatchEnricher for HitstreamEnricher {
             return Ok(self.enrich_sweep(hits, weight).await);
         }
 
-        let paths = self.prepare_batch(&hits, observed).await;
+        let paths = self.prepare_batch(&hits).await;
 
         // The shared anchor core: symbol population + per-file coverage, then
         // the weight-selected projection. No lock guard is held across an
@@ -620,9 +532,7 @@ mod tests {
     /// manager, as a mounted board would have them — spawns ZERO root
     /// instances. Covered-language hits come back file-grade through the one
     /// rootless singleton (the `#scope` trail from mockls's `documentSymbol`),
-    /// an uncovered-language hit renders raw immediately, and the walk-end
-    /// observation nudge is a no-op (no root-instance traffic, nothing
-    /// spawned).
+    /// and an uncovered-language hit renders raw immediately.
     #[tokio::test]
     async fn sweep_across_projects_spawns_no_root_instances() {
         let (_tmp, a, b, uncovered) = sweep_fixture();
@@ -641,7 +551,7 @@ mod tests {
         // Line 2 (1-based) sits inside `fn alpha`; line 6 is top-level.
         let hits = vec![hit(&a, 2), hit(&a, 6), hit(&b, 2), hit(&uncovered, 1)];
         let annotated = enricher
-            .enrich(hits, Vec::new(), None, WalkTier::Sweep)
+            .enrich(hits, None, WalkTier::Sweep)
             .await
             .expect("sweep enrich");
 
@@ -666,16 +576,6 @@ mod tests {
         );
 
         assert_no_root_instances(&manager, 1).await;
-
-        // The walk-end nudge of a sweep is skipped whole — no root-instance
-        // traffic, and still nothing root-scoped in the pool.
-        enricher
-            .observe_walk(
-                vec![(a.clone(), 1), (b.clone(), 1)],
-                Some(vec![a.parent().expect("proj a").to_path_buf()]),
-            )
-            .await;
-        assert_no_root_instances(&manager, 1).await;
     }
 
     /// Conscious conservatism (proof e): a sweep whose hits ALL land in one
@@ -696,7 +596,7 @@ mod tests {
         let enricher = HitstreamEnricher::new(Arc::clone(&manager), fs, None, Vec::new());
 
         let annotated = enricher
-            .enrich(vec![hit(&a, 2)], Vec::new(), None, WalkTier::Sweep)
+            .enrich(vec![hit(&a, 2)], None, WalkTier::Sweep)
             .await
             .expect("sweep enrich");
         assert_eq!(
@@ -724,7 +624,6 @@ mod tests {
         let annotated = enricher
             .enrich(
                 vec![hit(&a, 0), hit(&uncovered, 0)],
-                Vec::new(),
                 Some(EnrichmentWeight::Listing),
                 WalkTier::Sweep,
             )

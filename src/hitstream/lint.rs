@@ -67,9 +67,6 @@ pub struct LintedBatch {
     /// Annotations for the masked hits, in hit order (`lint.len()` equals the
     /// mask's `true` count).
     pub lint: Vec<AnnotatedHit>,
-    /// The WS31 observation slice riding this batch (ships to the daemon on
-    /// the batch frame; lint routing never consumes it).
-    pub observed: Vec<(PathBuf, i64)>,
 }
 
 /// One file's lint outcome for this run.
@@ -294,8 +291,7 @@ pub async fn lint_stage(
     mut rx: tokio::sync::mpsc::Receiver<HitBatch>,
     tx: tokio::sync::mpsc::Sender<LintedBatch>,
 ) -> Vec<String> {
-    while let Some(mut batch) = rx.recv().await {
-        let observed = std::mem::take(&mut batch.observed);
+    while let Some(batch) = rx.recv().await {
         let lint_mask: Vec<bool> = match annotator.as_mut() {
             Some(annotator) => batch
                 .hits
@@ -324,7 +320,6 @@ pub async fn lint_stage(
             hits: batch.hits,
             lint_mask,
             lint,
-            observed,
         };
         if tx.send(linted).await.is_err() {
             // Downstream gone (sink error / teardown): stop consuming.
