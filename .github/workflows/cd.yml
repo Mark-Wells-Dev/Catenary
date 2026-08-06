@@ -123,6 +123,28 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # The source-of-trust asset for downstream SOURCE builds (pkgbuilds'
+      # catenary source package): GitHub's codeload archive bytes are not
+      # guaranteed stable and no authoritative hash for them is published
+      # anywhere, so the release freezes its own tarball at upload and ships
+      # the same .sha256 sidecar the binary assets carry. The prefix keeps
+      # the codeload layout (Catenary-<ver>/) so pkgbuilds only swaps its
+      # source URL. git archive of the tag contains Cargo.lock, so the
+      # --locked source build works from this tarball exactly as from
+      # codeload. The homebrew-tap bump keys on explicit platform asset
+      # names (darwin_asset/linux_asset), so the new asset cannot confuse
+      # it; scoop-bucket carries no catenary manifest.
+      - name: Package Source Tarball
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          git archive --format=tar.gz \
+            --prefix="Catenary-${version}/" \
+            -o "artifacts/catenary-src-${version}.tar.gz" \
+            "$GITHUB_REF_NAME"
+          sha256sum "artifacts/catenary-src-${version}.tar.gz" \
+            > "artifacts/catenary-src-${version}.tar.gz.sha256"
+          cat "artifacts/catenary-src-${version}.tar.gz.sha256"
+
       - name: Create Release
         run: >-
           gh release create "${{ github.ref_name }}" artifacts/*
